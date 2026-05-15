@@ -1,0 +1,30 @@
+# Rust / Cargo build artifacts
+target/
+**/*.rs.bk
+
+# Node / pnpm
+node_modules/
+dist/
+
+# Tauri dev
+src-tauri/WixTools/
+
+# SQLite databases and secrets (never commit)
+*.db
+*.db-shm
+*.db-wal
+keys.json
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build outputs
+*.msi

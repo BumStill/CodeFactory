@@ -1,0 +1,108 @@
+{
+  "generator": "codex-delivery-governance",
+  "version": "2026-05-11",
+  "governance_version": "2026-05-11",
+  "required_files": [
+    "AGENTS.md",
+    "docs/repo-quick-profile.md",
+    "docs/planning-agent.md",
+    "docs/development-agent.md",
+    "docs/qa-acceptance-agent.md",
+    "docs/release-ops-agent.md",
+    "docs/repo-governance-profile.md",
+    "docs/specs/architecture-constraints.md",
+    "docs/specs/business-capabilities.md",
+    "docs/specs/feature-specs/README.md",
+    "docs/specs/feature-specs/mvp-agent-client.md",
+    "docs/specs/feature-specs/testing-matrix-template.md",
+    "docs/specs/feature-specs/requirements-traceability-template.md",
+    "docs/specs/feature-specs/payload-harness-template.md",
+    "docs/specs/feature-specs/viewport-harness-template.md",
+    "docs/specs/feature-specs/evidence-pack-template.md",
+    "docs/evidence-packs/README.md",
+    "docs/long-tasks/README.md",
+    "docs/long-tasks/task-record-template.md",
+    ".codex/governance/baseline-manifest.json",
+    ".github/workflows/governance-baseline.yml",
+    ".github/workflows/governed-delivery.yml",
+    "tools/governance/validate_repo_governance_baseline.py",
+    "tools/governance/check_repo_governance.ps1",
+    "tools/governance/diagnose_release_latency.py",
+    "tools/governance/validate_long_task_record.py"
+  ],
+  "required_markers": {
+    "AGENTS.md": [
+      "codex-delivery-governance",
+      "multi-project-harness-standard.md",
+      "repo-quick-profile.md",
+      "repo-governance-profile.md",
+      "planning-agent.md",
+      "development-agent.md",
+      "qa-acceptance-agent.md",
+      "release-ops-agent.md",
+      "governance-change-control.md",
+      "Spec Harness",
+      "Compatibility Harness",
+      "Release Harness",
+      "Observation Harness",
+      "long tasks",
+      "governed CI/CD"
+    ],
+    "docs/repo-quick-profile.md": [
+      "Task Entry",
+      "Load First",
+      "Harness Triggers",
+      "Minimum Evidence"
+    ],
+    "docs/planning-agent.md": [
+      "Requirements Traceability",
+      "Primary User Path",
+      "Applicable Harnesses",
+      "Payload Harness",
+      "Viewport Harness"
+    ],
+    "docs/development-agent.md": [
+      "Req ID",
+      "structure guards",
+      "behavior validation",
+      "Long Task"
+    ],
+    "docs/qa-acceptance-agent.md": [
+      "Primary User Path",
+      "Viewport Harness",
+      "Evidence Pack"
+    ],
+    "docs/release-ops-agent.md": [
+      "evidence pack",
+      "/health",
+      "/build_info",
+      "deployment latency",
+      "live verification"
+    ],
+    ".github/workflows/governance-baseline.yml": [
+      "validate_repo_governance_baseline.py",
+      "pull_request",
+      "push"
+    ],
+    ".github/workflows/governed-delivery.yml": [
+      "validate_repo_governance_baseline.py",
+      "diagnose_release_latency.py",
+      "workflow_dispatch"
+    ],
+    "docs/specs/feature-specs/mvp-agent-client.md": [
+      "Requirements Traceability",
+      "Primary User Path",
+      "Applicable Harnesses",
+      "Evidence Pack Requirements",
+      "CF-MVP-R1"
+    ]
+  },
+  "repo_profile_markers": [
+    "Adopted Governance Version",
+    "Global Governance Sources",
+    "Propagation Policy",
+    "Surface ID",
+    "Path ID",
+    "Role Gate"
+  ]
+}

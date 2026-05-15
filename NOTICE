@@ -1,0 +1,22 @@
+CodeFactory
+Copyright 2026 CodeFactory Contributors
+
+This product includes software developed by third parties.
+Key dependencies and their licenses:
+
+- Tauri (Apache-2.0 / MIT)         https://tauri.app
+- React (MIT)                       https://react.dev
+- Tailwind CSS (MIT)                https://tailwindcss.com
+- Shiki (MIT)                       https://shiki.matsu.io
+- xterm.js (MIT)                    https://xtermjs.org
+- Zustand (MIT)                     https://github.com/pmndrs/zustand
+- diff2html (MIT)                   https://diff2html.xyz
+- Lucide React (ISC)                https://lucide.dev
+- sqlx (MIT / Apache-2.0)          https://github.com/launchbadge/sqlx
+- reqwest (MIT / Apache-2.0)       https://github.com/seanmonstar/reqwest
+- tokio (MIT)                       https://tokio.rs
+- keyring (MIT / Apache-2.0)       https://github.com/hwchen/keyring-rs
+- walkdir (MIT / Unlicense)        https://github.com/BurntSushi/walkdir
+- globset (MIT / Unlicense)        https://github.com/BurntSushi/ripgrep
+
+Full dependency license details are available in Cargo.lock and pnpm-lock.yaml.

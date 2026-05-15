@@ -1,0 +1,16 @@
+name: governed-delivery
+
+on:
+  workflow_dispatch:
+
+jobs:
+  governed-delivery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python tools/governance/validate_repo_governance_baseline.py
+      - run: powershell -ExecutionPolicy Bypass -File tools/governance/check_repo_governance.ps1
+      - run: python tools/governance/diagnose_release_latency.py --help

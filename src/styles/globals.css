@@ -1,0 +1,37 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    background-color: #0d0d0d;
+    color: #e5e5e5;
+    font-family: Inter, system-ui, sans-serif;
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3a3a3a; }
+
+  /* Selection */
+  ::selection { background: #3b82f620; }
+
+  /* Remove default outline, add custom */
+  :focus-visible { outline: 1px solid #3b82f6; outline-offset: 2px; }
+}
+
+@layer utilities {
+  .no-drag { -webkit-app-region: no-drag; }
+  .drag     { -webkit-app-region: drag; }
+}
