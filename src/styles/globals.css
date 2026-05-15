@@ -35,3 +35,34 @@
   .no-drag { -webkit-app-region: no-drag; }
   .drag     { -webkit-app-region: drag; }
 }
+
+/* ── Spec Workbench preview styles ─────────────────────────────────────────── */
+.spec-preview h1,
+.spec-preview h2,
+.spec-preview h3,
+.spec-preview h4,
+.spec-preview h5,
+.spec-preview h6 {
+  font-weight: 600;
+  color: #e2e2e2;
+  margin-top: 1.25em;
+  margin-bottom: 0.4em;
+}
+.spec-preview h1 { font-size: 1.5em; border-bottom: 1px solid #2a2a2a; padding-bottom: 0.3em; }
+.spec-preview h2 { font-size: 1.2em; }
+.spec-preview h3 { font-size: 1.05em; }
+.spec-preview p { color: #c0c0c0; line-height: 1.65; margin: 0.5em 0; font-size: 0.85em; }
+.spec-preview ul, .spec-preview ol { padding-left: 1.5em; margin: 0.5em 0; }
+.spec-preview li { color: #c0c0c0; line-height: 1.6; font-size: 0.85em; }
+.spec-preview strong { color: #e2e2e2; }
+.spec-preview em { color: #aaa; }
+.spec-preview hr { border: none; border-top: 1px solid #2a2a2a; margin: 1em 0; }
+.spec-preview pre { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 6px; padding: 0.75em 1em; overflow-x: auto; margin: 0.75em 0; }
+.spec-preview code.code-block { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.8em; color: #c9d1d9; white-space: pre; }
+.spec-preview code.inline-code { background: #1e1e1e; border: 1px solid #333; border-radius: 3px; padding: 0.1em 0.4em; font-family: 'JetBrains Mono', monospace; font-size: 0.8em; color: #c9d1d9; }
+.spec-preview table.md-table { border-collapse: collapse; width: 100%; margin: 0.75em 0; font-size: 0.82em; }
+.spec-preview table.md-table th, .spec-preview table.md-table td { border: 1px solid #2a2a2a; padding: 0.4em 0.75em; text-align: left; color: #c0c0c0; }
+.spec-preview table.md-table th { background: #1a1a1a; color: #e2e2e2; font-weight: 600; }
+.spec-preview table.md-table tr:hover td { background: #1a1a1a; }
+.spec-preview .decision-callout { display: flex; align-items: flex-start; gap: 0.5em; background: #2a1e00; border: 1px solid #5a3c00; border-radius: 6px; padding: 0.6em 0.9em; margin: 0.6em 0; font-size: 0.82em; color: #e8c97a; }
+.spec-preview .decision-icon { font-size: 1em; flex-shrink: 0; }

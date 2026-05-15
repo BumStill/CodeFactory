@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "zustand";
-import { invoke, onStream } from "../lib/tauri";
+import { invoke, onStream, onSessionUpdated } from "../lib/tauri";
 import type { Message, Session, StreamEvent, ModelInfo } from "../lib/tauri";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -38,6 +38,7 @@ interface ChatStore {
   updateActiveSessionModel: (modelId: string) => Promise<void>;
 
   _unlisten?: UnlistenFn;
+  _unlistenSessionUpdated?: UnlistenFn;
   _streamingMsgId?: string;
 }
 
@@ -86,11 +87,23 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   sendMessage: async (content) => {
-    const { activeSession, _unlisten } = get();
+    const { activeSession, _unlisten, _unlistenSessionUpdated } = get();
     if (!activeSession || get().streaming) return;
 
-    // Cancel any previous listener
+    // Cancel any previous listeners
     _unlisten?.();
+    _unlistenSessionUpdated?.();
+
+    // Subscribe to session title update events before sending
+    const unlistenSessionUpdated = await onSessionUpdated(activeSession.id, (session) => {
+      set((s) => ({
+        activeSession: s.activeSession?.id === session.id ? session : s.activeSession,
+        sessions: s.sessions.map((existing) =>
+          existing.id === session.id ? session : existing
+        ),
+      }));
+    });
+    set({ _unlistenSessionUpdated: unlistenSessionUpdated });
 
     const userMsg: UIMessage = {
       id: crypto.randomUUID(),

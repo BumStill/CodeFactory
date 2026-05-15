@@ -1,0 +1,6 @@
+[
+  { "name": "component", "description": "生成 React 组件", "template": "Create a React component for: {input}" },
+  { "name": "hook", "description": "生成 custom hook", "template": "Create a React custom hook for: {input}" },
+  { "name": "refactor-to-hooks", "description": "重构为 hooks 风格", "template": "Refactor the following to use React hooks: {input}" },
+  { "name": "add-tests", "description": "添加组件测试", "template": "Add tests for the following React component: {input}" }
+]

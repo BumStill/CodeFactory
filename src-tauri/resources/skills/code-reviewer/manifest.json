@@ -1,0 +1,9 @@
+{
+  "id": "code-reviewer",
+  "name": "代码审查员",
+  "description": "全面的代码审查，关注正确性、安全性、性能和可读性",
+  "version": "1.0.0",
+  "author": "CodeFactory",
+  "tags": ["review", "quality", "security"],
+  "enabled": false
+}

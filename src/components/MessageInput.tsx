@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useRef, useState, KeyboardEvent } from "react";
+import { useRef, useState, useEffect, KeyboardEvent } from "react";
 import { Send, Square } from "lucide-react";
 import {
   filterSlashCommandSuggestions,
@@ -7,18 +7,48 @@ import {
   type ParsedSlashCommand,
 } from "../stores/slashCommands";
 
+interface SkillSlashCommand {
+  name: string;
+  description: string;
+  template: string;
+}
+
 interface Props {
   onSend: (text: string) => void;
   onCommand?: (command: ParsedSlashCommand) => void | Promise<void>;
   onCancel: () => void;
   streaming: boolean;
   disabled: boolean;
+  /** When set, this text will be appended to the current input value. */
+  pendingInsert?: string;
+  /** Called after pendingInsert has been consumed. */
+  onInsertConsumed?: () => void;
+  /** Extra slash commands from enabled skills */
+  skillSlashCommands?: SkillSlashCommand[];
 }
 
-export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled }: Props) {
+export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [] }: Props) {
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
-  const suggestions = filterSlashCommandSuggestions(value);
+
+  useEffect(() => {
+    if (!pendingInsert) return;
+    setValue((prev) => (prev ? `${prev} ${pendingInsert}` : pendingInsert));
+    onInsertConsumed?.();
+    ref.current?.focus();
+  }, [pendingInsert]);
+
+  // Merge builtin + skill slash command suggestions
+  const builtinSuggestions = filterSlashCommandSuggestions(value);
+  const skillSuggestions = value.startsWith("/") && !value.includes(" ")
+    ? skillSlashCommands
+        .filter((c) => `/${c.name}`.startsWith(value.toLowerCase()))
+        .map((c) => ({ name: c.name, usage: `/${c.name}`, description: c.description, argumentHint: "{input}" as string | undefined }))
+    : [];
+  const suggestions = [
+    ...builtinSuggestions,
+    ...skillSuggestions.filter((s) => !builtinSuggestions.some((b) => b.name === s.name)),
+  ];
   const commandCandidate = parseSlashCommand(value.trim());
   const canSubmit = Boolean(value.trim()) && (!disabled || Boolean(commandCandidate));
 

@@ -1,0 +1,9 @@
+{
+  "id": "react-expert",
+  "name": "React 专家",
+  "description": "专注 React/TypeScript 开发，熟悉 hooks、状态管理、性能优化",
+  "version": "1.0.0",
+  "author": "CodeFactory",
+  "tags": ["frontend", "react", "typescript"],
+  "enabled": false
+}

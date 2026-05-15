@@ -1,0 +1,5 @@
+[
+  { "name": "review", "description": "审查代码", "template": "Review the following code: {input}" },
+  { "name": "security-check", "description": "安全检查", "template": "Perform a security review of: {input}" },
+  { "name": "performance-check", "description": "性能检查", "template": "Analyze performance of: {input}" }
+]

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod db;
+pub mod tasks;
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,10 @@ pub struct Session {
     pub updated_at: i64,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
+    /// If this session was spawned by a subagent, the id of its parent (root) session.
+    /// Top-level chat sessions have this set to `None` and should be shown in the sidebar.
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

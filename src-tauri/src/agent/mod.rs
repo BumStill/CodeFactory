@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
+pub mod anthropic_client;
+pub mod hooks;
+pub mod scheduler;
+pub mod subagent;
+pub mod verification;
+
 use chrono::Utc;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -12,8 +18,9 @@ use tokio::sync::RwLock;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::config::settings::{PermissionPolicy, Settings};
+use crate::config::settings::{ApiStyle, PermissionPolicy, Settings};
 use crate::errors::Result;
+use crate::mcp::McpManager;
 use crate::openrouter::types::*;
 use crate::storage::Message;
 use crate::tools::{self, ExecCtx};
@@ -33,10 +40,12 @@ pub struct AgentLoop {
     model_id: String,
     base_url: String,
     api_key: String,
+    api_style: ApiStyle,
     cwd: PathBuf,
     http: Client,
     settings: Arc<RwLock<Settings>>,
     pending_permissions: PendingPermissionMap,
+    mcp_manager: Arc<McpManager>,
 }
 
 impl AgentLoop {
@@ -47,9 +56,11 @@ impl AgentLoop {
         model_id: String,
         base_url: String,
         api_key: String,
+        api_style: ApiStyle,
         cwd: PathBuf,
         settings: Arc<RwLock<Settings>>,
         pending_permissions: PendingPermissionMap,
+        mcp_manager: Arc<McpManager>,
     ) -> Self {
         Self {
             app,
@@ -58,20 +69,55 @@ impl AgentLoop {
             model_id,
             base_url,
             api_key,
+            api_style,
             cwd,
             http: Client::new(),
             settings,
             pending_permissions,
+            mcp_manager,
         }
     }
 
     pub async fn run(&mut self, history: Vec<Message>) -> Result<()> {
-        let mut messages = self.build_messages(history);
-        let tool_defs = tools::all_definitions();
+        let mut tool_defs = tools::all_definitions();
+        // Append MCP tools as additional tool definitions
+        let mcp_tools = self.mcp_manager.list_all_tools().await;
+        for mcp_tool in &mcp_tools {
+            tool_defs.push(mcp_tool_to_definition(mcp_tool));
+        }
         let event_name = format!("stream:{}", self.session_id);
+        let base_prompt = build_system_prompt(&self.cwd);
+        let system_prompt =
+            crate::commands::skills::get_active_system_prompt(&base_prompt, &self.app).await;
+        let api_style = self.api_style.clone();
+
+        match api_style {
+            ApiStyle::Openai => {
+                self.run_openai(history, &tool_defs, &event_name, &system_prompt)
+                    .await
+            }
+            ApiStyle::Anthropic => {
+                self.run_anthropic(history, &tool_defs, &event_name, &system_prompt)
+                    .await
+            }
+        }
+    }
+
+    async fn run_openai(
+        &mut self,
+        history: Vec<Message>,
+        tool_defs: &[ToolDefinition],
+        event_name: &str,
+        system_prompt: &str,
+    ) -> Result<()> {
+        let mut messages = self.build_openai_messages(history, system_prompt);
+        let hook_runner = {
+            let settings = self.settings.read().await;
+            hooks::HookRunner::from_settings(&settings, self.app.clone())
+        };
 
         for _ in 0..MAX_ITERATIONS {
-            let (text, tool_calls, usage) = self.call_model(&messages, &tool_defs).await?;
+            let (text, tool_calls, usage) = self.call_openai_model(&messages, tool_defs, event_name).await?;
 
             // Persist assistant turn — include tool_calls so history can be
             // reconstructed faithfully when the session is resumed.
@@ -176,6 +222,35 @@ impl AgentLoop {
                     continue;
                 }
 
+                // Pre-tool hook: may cancel
+                let pre_allowed = hook_runner
+                    .fire(hooks::HookEvent::PreTool {
+                        tool_name: tc.function.name.clone(),
+                        args: args.clone(),
+                    })
+                    .await;
+                if !pre_allowed {
+                    let content = "Tool call cancelled by hook.".to_string();
+                    self.app
+                        .emit(
+                            &event_name,
+                            StreamEvent::ToolResult {
+                                tool_call_id: tc.id.clone(),
+                                content: content.clone(),
+                                is_error: true,
+                            },
+                        )
+                        .ok();
+                    result_messages.push(ChatMessage {
+                        role: "tool".into(),
+                        content: MessageContent::Text(content),
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                        name: Some(tc.function.name.clone()),
+                    });
+                    continue;
+                }
+
                 let full_access = {
                     let settings = self.settings.read().await;
                     settings.permissions.full_access
@@ -185,7 +260,27 @@ impl AgentLoop {
                     full_access,
                 };
 
-                let output = tools::dispatch(&tc.function.name, args, &ctx).await?;
+                let tool_start = std::time::Instant::now();
+                // Check if this is an MCP tool
+                let mcp_server = self.mcp_manager.find_tool_server(&tc.function.name).await;
+                let output = if let Some(server_id) = mcp_server {
+                    match self.mcp_manager.call_tool(&server_id, &tc.function.name, args).await {
+                        Ok(text) => tools::ToolOutput::ok(text),
+                        Err(e) => tools::ToolOutput::err(format!("MCP error: {e}")),
+                    }
+                } else {
+                    tools::dispatch(&tc.function.name, args, &ctx).await?
+                };
+                let duration_ms = tool_start.elapsed().as_millis() as u64;
+
+                // Post-tool hook
+                hook_runner
+                    .fire(hooks::HookEvent::PostTool {
+                        tool_name: tc.function.name.clone(),
+                        result: output.content.chars().take(500).collect(),
+                        duration_ms,
+                    })
+                    .await;
 
                 self.app
                     .emit(
@@ -272,12 +367,12 @@ impl AgentLoop {
         }
     }
 
-    async fn call_model(
+    async fn call_openai_model(
         &self,
         messages: &[ChatMessage],
         tool_defs: &[ToolDefinition],
+        event_name: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>)> {
-        let event_name = format!("stream:{}", self.session_id);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let req = ChatRequest {
@@ -398,10 +493,10 @@ impl AgentLoop {
         Ok(())
     }
 
-    fn build_messages(&self, history: Vec<Message>) -> Vec<ChatMessage> {
+    fn build_openai_messages(&self, history: Vec<Message>, system_prompt: &str) -> Vec<ChatMessage> {
         let mut msgs = vec![ChatMessage {
             role: "system".into(),
-            content: MessageContent::Text(build_system_prompt(&self.cwd)),
+            content: MessageContent::Text(system_prompt.to_string()),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -446,6 +541,331 @@ impl AgentLoop {
             }
         }
         msgs
+    }
+
+    // ── Anthropic-specific helpers ────────────────────────────────────────────
+
+    /// Build the Anthropic `messages` array from stored history.
+    /// System prompt is passed separately; tool results use `user` role
+    /// with `tool_result` content blocks.
+    fn build_anthropic_messages(&self, history: Vec<Message>) -> Vec<serde_json::Value> {
+        let mut msgs: Vec<serde_json::Value> = Vec::new();
+
+        for m in history {
+            match m.role.as_str() {
+                "tool" => {
+                    let (tool_call_id, content) = parse_tool_message_content(&m.content);
+                    msgs.push(serde_json::json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_call_id,
+                            "content": content,
+                        }]
+                    }));
+                }
+                "assistant" => {
+                    // Reconstruct content array: text + tool_use blocks
+                    let tool_calls: Vec<ToolCall> = m
+                        .tool_calls
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_default();
+
+                    let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+                    if !m.content.is_empty() {
+                        content_blocks.push(serde_json::json!({
+                            "type": "text",
+                            "text": m.content,
+                        }));
+                    }
+                    for tc in &tool_calls {
+                        let input: serde_json::Value =
+                            serde_json::from_str(&tc.function.arguments)
+                                .unwrap_or(serde_json::json!({}));
+                        content_blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.function.name,
+                            "input": input,
+                        }));
+                    }
+                    if content_blocks.is_empty() {
+                        content_blocks.push(serde_json::json!({ "type": "text", "text": "" }));
+                    }
+                    msgs.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": content_blocks,
+                    }));
+                }
+                "system" => {
+                    // System is passed as a top-level param, skip inline.
+                }
+                _ => {
+                    // user messages
+                    msgs.push(serde_json::json!({
+                        "role": m.role,
+                        "content": m.content,
+                    }));
+                }
+            }
+        }
+        msgs
+    }
+
+    async fn run_anthropic(
+        &mut self,
+        history: Vec<Message>,
+        tool_defs: &[ToolDefinition],
+        event_name: &str,
+        system_prompt: &str,
+    ) -> Result<()> {
+        let mut messages = self.build_anthropic_messages(history);
+        let hook_runner = {
+            let settings = self.settings.read().await;
+            hooks::HookRunner::from_settings(&settings, self.app.clone())
+        };
+
+        for _ in 0..MAX_ITERATIONS {
+            let resp = anthropic_client::stream_anthropic(
+                &self.http,
+                &self.base_url,
+                &self.api_key,
+                &self.model_id,
+                system_prompt,
+                messages.clone(),
+                tool_defs,
+                &self.app,
+                event_name,
+            )
+            .await?;
+
+            let text = resp.text;
+            let tool_calls = resp.tool_calls;
+
+            // Persist assistant turn
+            if !text.is_empty() || !tool_calls.is_empty() {
+                self.persist_message(
+                    "assistant",
+                    &text,
+                    None,
+                    if tool_calls.is_empty() { None } else { Some(&tool_calls) },
+                )
+                .await?;
+            }
+
+            if tool_calls.is_empty() {
+                self.app
+                    .emit(
+                        event_name,
+                        StreamEvent::Done {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        },
+                    )
+                    .ok();
+                break;
+            }
+
+            // Build assistant message with tool_use blocks for Anthropic
+            let mut assistant_content: Vec<serde_json::Value> = Vec::new();
+            if !text.is_empty() {
+                assistant_content.push(serde_json::json!({ "type": "text", "text": text }));
+            }
+            for tc in &tool_calls {
+                let input: serde_json::Value =
+                    serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or(serde_json::json!({}));
+                assistant_content.push(serde_json::json!({
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "input": input,
+                }));
+            }
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": assistant_content,
+            }));
+
+            // Execute tools and collect tool_result blocks
+            let mut tool_result_blocks: Vec<serde_json::Value> = Vec::new();
+
+            for tc in &tool_calls {
+                let args: serde_json::Value =
+                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+
+                let bash_cmd = if tc.function.name == "bash" {
+                    args.get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+
+                let permission_policy = {
+                    let settings = self.settings.read().await;
+                    settings.permissions.clone()
+                };
+                let decision =
+                    decide_permission(&permission_policy, &tc.function.name, bash_cmd.as_deref());
+
+                let denial_content = match decision {
+                    PermissionDecision::Allow => None,
+                    PermissionDecision::Ask => {
+                        if self.request_permission(event_name, tc, args.clone()).await {
+                            None
+                        } else {
+                            Some(
+                                "Tool call denied by user. Please try a different approach."
+                                    .to_string(),
+                            )
+                        }
+                    }
+                    PermissionDecision::Deny(reason) => {
+                        tracing::warn!("Tool '{}' denied: {reason}", tc.function.name);
+                        Some(format!(
+                            "Tool call denied: {reason}. Please try a different approach."
+                        ))
+                    }
+                };
+
+                if let Some(content) = denial_content {
+                    self.app
+                        .emit(
+                            event_name,
+                            StreamEvent::ToolResult {
+                                tool_call_id: tc.id.clone(),
+                                content: content.clone(),
+                                is_error: true,
+                            },
+                        )
+                        .ok();
+                    tool_result_blocks.push(serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": tc.id,
+                        "content": content,
+                    }));
+                    continue;
+                }
+
+                // Pre-tool hook: may cancel
+                let pre_allowed = hook_runner
+                    .fire(hooks::HookEvent::PreTool {
+                        tool_name: tc.function.name.clone(),
+                        args: args.clone(),
+                    })
+                    .await;
+                if !pre_allowed {
+                    let content = "Tool call cancelled by hook.".to_string();
+                    self.app
+                        .emit(
+                            event_name,
+                            StreamEvent::ToolResult {
+                                tool_call_id: tc.id.clone(),
+                                content: content.clone(),
+                                is_error: true,
+                            },
+                        )
+                        .ok();
+                    tool_result_blocks.push(serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": tc.id,
+                        "content": content,
+                    }));
+                    continue;
+                }
+
+                let full_access = {
+                    let settings = self.settings.read().await;
+                    settings.permissions.full_access
+                };
+                let ctx = ExecCtx {
+                    cwd: self.cwd.clone(),
+                    full_access,
+                };
+
+                let tool_start = std::time::Instant::now();
+                // Check if this is an MCP tool
+                let mcp_server = self.mcp_manager.find_tool_server(&tc.function.name).await;
+                let output = if let Some(server_id) = mcp_server {
+                    match self.mcp_manager.call_tool(&server_id, &tc.function.name, args).await {
+                        Ok(text) => tools::ToolOutput::ok(text),
+                        Err(e) => tools::ToolOutput::err(format!("MCP error: {e}")),
+                    }
+                } else {
+                    tools::dispatch(&tc.function.name, args, &ctx).await?
+                };
+                let duration_ms = tool_start.elapsed().as_millis() as u64;
+
+                // Post-tool hook
+                hook_runner
+                    .fire(hooks::HookEvent::PostTool {
+                        tool_name: tc.function.name.clone(),
+                        result: output.content.chars().take(500).collect(),
+                        duration_ms,
+                    })
+                    .await;
+
+                self.app
+                    .emit(
+                        event_name,
+                        StreamEvent::ToolResult {
+                            tool_call_id: tc.id.clone(),
+                            content: output.content.clone(),
+                            is_error: output.is_error,
+                        },
+                    )
+                    .ok();
+
+                // Persist tool result to DB
+                let now = Utc::now().timestamp_millis();
+                let msg_id = Uuid::new_v4().to_string();
+                let tool_content = serde_json::json!({
+                    "tool_call_id": tc.id,
+                    "content": output.content
+                })
+                .to_string();
+                sqlx::query(
+                    "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
+                )
+                .bind(&msg_id)
+                .bind(&self.session_id)
+                .bind("tool")
+                .bind(&tool_content)
+                .bind(now)
+                .execute(&self.db)
+                .await?;
+
+                tool_result_blocks.push(serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tc.id,
+                    "content": output.content,
+                }));
+            }
+
+            // Append a single user message with all tool_result blocks
+            if !tool_result_blocks.is_empty() {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": tool_result_blocks,
+                }));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Convert an MCP tool descriptor into the OpenAI-compatible ToolDefinition format.
+fn mcp_tool_to_definition(tool: &crate::mcp::McpTool) -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".into(),
+        function: FunctionDefinition {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters: tool.input_schema.clone(),
+        },
     }
 }
 

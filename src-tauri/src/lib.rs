@@ -3,6 +3,8 @@ mod agent;
 mod commands;
 mod config;
 mod errors;
+mod git_remote;
+mod mcp;
 mod openrouter;
 mod secrets;
 mod storage;
@@ -42,11 +44,40 @@ pub fn run() {
 
             let pool = tauri::async_runtime::block_on(storage::db::connect(&db_url))?;
 
+            // Create a single McpManager and wrap in Arc so it can be shared with
+            // the startup task and also managed by Tauri.
+            let mcp_manager = Arc::new(mcp::McpManager::new());
+
+            // Auto-start enabled MCP servers in background
+            let enabled_servers: Vec<_> = settings
+                .mcp_servers
+                .iter()
+                .filter(|s| s.enabled)
+                .cloned()
+                .collect();
+            {
+                let mcp_clone = Arc::clone(&mcp_manager);
+                tauri::async_runtime::spawn(async move {
+                    for cfg in enabled_servers {
+                        if let Err(e) = mcp_clone.start_server(cfg.clone()).await {
+                            tracing::warn!("Failed to start MCP server '{}': {e}", cfg.id);
+                        }
+                    }
+                });
+            }
+
             app.manage(AppState {
                 db: Arc::new(RwLock::new(pool)),
                 settings: Arc::new(RwLock::new(settings)),
                 pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             });
+            // Manage the Arc so all commands share the same McpManager instance.
+            app.manage(mcp_manager);
+            app.manage(commands::terminal::TerminalState::new());
+            // Phase 2: per-session scheduler cancel flags.
+            let scheduler_handles: commands::tasks::SchedulerHandles =
+                Arc::new(Mutex::new(HashMap::new()));
+            app.manage(scheduler_handles);
 
             Ok(())
         })
@@ -62,9 +93,78 @@ pub fn run() {
             commands::session::get_session,
             commands::session::delete_session,
             commands::session::update_session_model,
+            commands::session::update_session_title,
             commands::session::get_messages,
             commands::chat::send_message,
             commands::chat::respond_to_permission,
+            commands::files::list_dir,
+            commands::terminal::terminal_create,
+            commands::terminal::terminal_write,
+            commands::terminal::terminal_resize,
+            commands::terminal::terminal_kill,
+            commands::git::git_status,
+            commands::git::git_log,
+            commands::git::git_branches,
+            commands::git::git_diff,
+            commands::git::git_file_diff,
+            commands::git::git_add,
+            commands::git::git_commit,
+            commands::git::git_checkout,
+            commands::git::git_create_branch,
+            commands::git::git_push,
+            commands::git::git_pull,
+            commands::tasks::create_task_tree,
+            commands::tasks::list_tasks,
+            commands::tasks::get_task_detail,
+            commands::tasks::get_task_dependencies,
+            commands::tasks::start_implementation,
+            commands::tasks::cancel_implementation,
+            commands::tasks::get_verification_results,
+            commands::tasks::run_verification_now,
+            commands::specs::list_specs,
+            commands::specs::get_spec,
+            commands::specs::save_spec,
+            commands::specs::create_spec,
+            commands::specs::delete_spec,
+            commands::specs::approve_spec,
+            commands::specs::spec_ai_assist,
+            commands::evidence::generate_evidence_pack,
+            commands::evidence::list_evidence_packs,
+            commands::evidence::get_evidence_pack,
+            commands::evidence::open_evidence_pack_dir,
+            commands::skills::list_skills,
+            commands::skills::get_skill,
+            commands::skills::enable_skill,
+            commands::skills::disable_skill,
+            commands::skills::install_skill_from_url,
+            commands::skills::delete_skill,
+            commands::skills::list_slash_commands,
+            commands::skills::fetch_marketplace_skills,
+            commands::skills::install_marketplace_skill,
+            commands::hooks::list_hooks,
+            commands::hooks::add_hook,
+            commands::hooks::update_hook,
+            commands::hooks::delete_hook,
+            commands::hooks::test_hook,
+            commands::mcp::list_mcp_servers,
+            commands::mcp::add_mcp_server,
+            commands::mcp::update_mcp_server,
+            commands::mcp::delete_mcp_server,
+            commands::mcp::enable_mcp_server,
+            commands::mcp::disable_mcp_server,
+            commands::mcp::list_mcp_tools,
+            commands::mcp::test_mcp_tool,
+            commands::git_remote::list_git_remotes,
+            commands::git_remote::add_git_remote,
+            commands::git_remote::delete_git_remote,
+            commands::git_remote::test_git_remote,
+            commands::git_remote::list_issues,
+            commands::git_remote::get_issue,
+            commands::git_remote::create_issue,
+            commands::git_remote::list_prs,
+            commands::git_remote::create_pr,
+            commands::git_remote::list_repos,
+            commands::git_remote::issue_to_spec,
         ])
         .run(tauri::generate_context!())
         .expect("error while running CodeFactory");

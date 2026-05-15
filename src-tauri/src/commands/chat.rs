@@ -3,8 +3,11 @@ use chrono::Utc;
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
+use std::sync::Arc;
+
 use crate::agent::AgentLoop;
 use crate::errors::AppError;
+use crate::mcp::McpManager;
 use crate::openrouter::types::StreamEvent;
 use crate::AppState;
 
@@ -31,11 +34,12 @@ pub async fn send_message(
     session_id: String,
     content: String,
     state: State<'_, AppState>,
+    mcp: State<'_, Arc<McpManager>>,
 ) -> Result<(), AppError> {
     let settings = state.settings.read().await.clone();
 
     // Persist user message
-    {
+    let is_first_message = {
         let pool = state.db.read().await;
         let msg_id = Uuid::new_v4().to_string();
         let now = Utc::now().timestamp_millis();
@@ -49,7 +53,16 @@ pub async fn send_message(
         .bind(now)
         .execute(&*pool)
         .await?;
-    }
+
+        // Check if this is the first message in the session
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+        )
+        .bind(&session_id)
+        .fetch_one(&*pool)
+        .await?;
+        count.0 == 1
+    };
 
     // Fetch session for cwd + model
     let session = {
@@ -60,12 +73,54 @@ pub async fn send_message(
             .await?
     };
 
+    // Auto-update title from first message content
+    if is_first_message {
+        let new_title: String = content
+            .split_whitespace()
+            .take(6)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(40)
+            .collect::<String>()
+            .trim()
+            .to_string();
+
+        if !new_title.is_empty() {
+            let pool = state.db.read().await;
+            let now = Utc::now().timestamp_millis();
+            if let Ok(()) = sqlx::query(
+                "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(&new_title)
+            .bind(now)
+            .bind(&session_id)
+            .execute(&*pool)
+            .await
+            .map(|_| ())
+            {
+                if let Ok(updated_session) = sqlx::query_as::<_, crate::storage::Session>(
+                    "SELECT * FROM sessions WHERE id = ?",
+                )
+                .bind(&session_id)
+                .fetch_one(&*pool)
+                .await
+                {
+                    let event_name = format!("session_updated:{}", session_id);
+                    app.emit(&event_name, &updated_session).ok();
+                }
+            }
+        }
+    }
+
     // Resolve endpoint + key
     let endpoint = settings
         .endpoints
         .get(&settings.default_endpoint)
         .ok_or_else(|| AppError::Other("No default endpoint configured".into()))?
         .clone();
+
+    let api_style = endpoint.api_style.clone();
 
     let key_ref = endpoint
         .key_ref
@@ -102,6 +157,7 @@ pub async fn send_message(
     let db = state.db.read().await.clone();
     let settings_state = state.settings.clone();
     let pending_permissions = state.pending_permissions.clone();
+    let mcp_manager: Arc<McpManager> = Arc::clone(&mcp);
 
     // Spawn agent loop (non-blocking); emit Error event to frontend if it fails
     let app_clone = app.clone();
@@ -115,9 +171,11 @@ pub async fn send_message(
             session.model_id,
             endpoint.base_url,
             api_key,
+            api_style,
             std::path::PathBuf::from(session.cwd),
             settings_state,
             pending_permissions,
+            mcp_manager,
         );
         if let Err(e) = agent.run(history).await {
             tracing::error!("Agent loop error: {e:#}");

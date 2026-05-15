@@ -1,0 +1,6 @@
+[
+  { "name": "commit", "description": "生成提交信息", "template": "Write a conventional commit message for: {input}" },
+  { "name": "branch", "description": "建议分支名", "template": "Suggest a kebab-case branch name for: {input}" },
+  { "name": "pr-draft", "description": "起草 PR 描述", "template": "Write a pull request description for: {input}" },
+  { "name": "changelog", "description": "生成 changelog", "template": "Generate a changelog entry for: {input}" }
+]

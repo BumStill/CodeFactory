@@ -1,0 +1,9 @@
+{
+  "id": "git-workflow",
+  "name": "Git 工作流专家",
+  "description": "遵循 conventional commits，擅长分支管理、提交规范和 PR 流程",
+  "version": "1.0.0",
+  "author": "CodeFactory",
+  "tags": ["git", "workflow", "devops"],
+  "enabled": false
+}

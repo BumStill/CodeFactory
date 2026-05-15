@@ -1,0 +1,1 @@
+{ "full_access": false, "allow": ["read_file", "glob", "grep", "list_dir"], "ask": [], "deny": ["write_file", "edit_file", "bash"] }

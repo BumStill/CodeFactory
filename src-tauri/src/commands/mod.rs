@@ -1,5 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod chat;
+pub mod evidence;
+pub mod files;
+pub mod git;
+pub mod git_remote;
+pub mod hooks;
+pub mod mcp;
 pub mod models;
 pub mod session;
 pub mod settings;
+pub mod skills;
+pub mod specs;
+pub mod tasks;
+pub mod terminal;
