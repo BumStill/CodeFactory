@@ -76,5 +76,5 @@ RUST_MIN_STACK = "33554432"
           tagName: ${{ github.ref_name }}
           releaseName: 'CodeFactory ${{ github.ref_name }}'
           releaseBody: 'See CHANGELOG for details.'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false

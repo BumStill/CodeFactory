@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  build:
+  check:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,15 +37,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Type-check frontend
-        run: pnpm tsc --noEmit
+        run: pnpm exec tsc --noEmit
 
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: v__VERSION__
-          releaseName: CodeFactory v__VERSION__
-          releaseBody: Automated release
-          releaseDraft: true
-          prerelease: false
+      - name: Cargo check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
