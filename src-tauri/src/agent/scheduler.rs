@@ -87,6 +87,35 @@ impl TaskScheduler {
     ) -> Result<(), AppError> {
         let semaphore = Arc::new(Semaphore::new(self.max_parallel));
 
+        // Write shared brief listing all tasks for parallel subagents to read
+        {
+            let all_tasks = tasks::list_all_tasks_for_session(&self.pool, &session_id)
+                .await
+                .unwrap_or_default();
+            if !all_tasks.is_empty() {
+                // Determine a common cwd (use first task's cwd)
+                let cwd = all_tasks[0].cwd.clone();
+                let brief_path = format!("{}/_codefactory_brief.md", cwd);
+                let mut brief_content = format!(
+                    "# CodeFactory Shared Brief\n\
+                     Session: {}\n\n\
+                     ## Parallel Tasks\n\n",
+                    session_id
+                );
+                for (i, t) in all_tasks.iter().enumerate() {
+                    brief_content.push_str(&format!(
+                        "### Task {} — {}\n{}\n\n",
+                        i + 1,
+                        t.title,
+                        t.description
+                    ));
+                }
+                brief_content
+                    .push_str("## Task Results\n\n_(will be updated as tasks complete)_\n");
+                let _ = std::fs::write(&brief_path, &brief_content);
+            }
+        }
+
         loop {
             // 1. Honour cancellation (after letting in-flight tasks drain).
             if self.cancel_flag.load(Ordering::SeqCst) {
@@ -390,6 +419,30 @@ impl TaskScheduler {
                             tasks::mark_task_completed(&pool, &task_id, &result_json)
                                 .await
                                 .ok();
+                            // Append result to shared brief
+                            let brief_path =
+                                format!("{}/_codefactory_brief.md", task_cwd);
+                            if std::path::Path::new(&brief_path).exists() {
+                                let result_entry = format!(
+                                    "\n### \u{2705} {} \u{2014} done\n{}\n",
+                                    task_title,
+                                    result
+                                        .summary
+                                        .chars()
+                                        .take(500)
+                                        .collect::<String>()
+                                );
+                                if let Ok(mut existing) =
+                                    std::fs::read_to_string(&brief_path)
+                                {
+                                    existing = existing.replace(
+                                        "_(will be updated as tasks complete)_",
+                                        "",
+                                    );
+                                    existing.push_str(&result_entry);
+                                    let _ = std::fs::write(&brief_path, &existing);
+                                }
+                            }
                             emit_task(
                                 &app,
                                 &session_id_for_task,
@@ -411,6 +464,26 @@ impl TaskScheduler {
                             tasks::mark_task_failed(&pool, &task_id, &err)
                                 .await
                                 .ok();
+                            // Append failure to shared brief
+                            let brief_path =
+                                format!("{}/_codefactory_brief.md", task_cwd);
+                            if std::path::Path::new(&brief_path).exists() {
+                                let result_entry = format!(
+                                    "\n### \u{274c} {} \u{2014} failed\n{}\n",
+                                    task_title,
+                                    err.chars().take(300).collect::<String>()
+                                );
+                                if let Ok(mut existing) =
+                                    std::fs::read_to_string(&brief_path)
+                                {
+                                    existing = existing.replace(
+                                        "_(will be updated as tasks complete)_",
+                                        "",
+                                    );
+                                    existing.push_str(&result_entry);
+                                    let _ = std::fs::write(&brief_path, &existing);
+                                }
+                            }
                             emit_task(
                                 &app,
                                 &session_id_for_task,
@@ -432,6 +505,26 @@ impl TaskScheduler {
                             tasks::mark_task_failed(&pool, &task_id, &err)
                                 .await
                                 .ok();
+                            // Append failure to shared brief
+                            let brief_path =
+                                format!("{}/_codefactory_brief.md", task_cwd);
+                            if std::path::Path::new(&brief_path).exists() {
+                                let result_entry = format!(
+                                    "\n### \u{274c} {} \u{2014} failed\n{}\n",
+                                    task_title,
+                                    err.chars().take(300).collect::<String>()
+                                );
+                                if let Ok(mut existing) =
+                                    std::fs::read_to_string(&brief_path)
+                                {
+                                    existing = existing.replace(
+                                        "_(will be updated as tasks complete)_",
+                                        "",
+                                    );
+                                    existing.push_str(&result_entry);
+                                    let _ = std::fs::write(&brief_path, &existing);
+                                }
+                            }
                             emit_task(
                                 &app,
                                 &session_id_for_task,

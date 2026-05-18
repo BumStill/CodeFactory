@@ -320,6 +320,24 @@ fn render_brief(brief: &SubagentBrief) -> String {
         out.push('\n');
     }
 
+    // Include shared context from the brief file if it exists
+    let brief_file = format!("{}/_codefactory_brief.md", brief.cwd);
+    if let Ok(content) = std::fs::read_to_string(&brief_file) {
+        if content.len() > 100 {
+            // Cap at 3000 chars to avoid token bloat
+            let capped = if content.len() > 3000 {
+                &content[..3000]
+            } else {
+                &content
+            };
+            out.push_str("\n## Shared Project Brief\n");
+            out.push_str(capped);
+            out.push_str(
+                "\n\n_Other parallel tasks are listed above \u{2014} coordinate to avoid conflicts._\n",
+            );
+        }
+    }
+
     out.push_str(
         "\n## Reporting\n\
          When done, end with a short final message that summarizes what you did, \

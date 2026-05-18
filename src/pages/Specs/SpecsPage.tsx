@@ -500,38 +500,74 @@ function FrontmatterPanel({ meta, onApprove, onStartImplementation }: Frontmatte
 
 // ── ImplementationModal ───────────────────────────────────────────────────────
 
+interface DecomposedTask {
+  tmp_id: string;
+  title: string;
+  description: string;
+  dependencies: string[];
+}
+
 interface ImplementationModalProps {
   meta: SpecMeta;
+  specContent: string;
   sessionId: string;
   cwd: string;
   onConfirm: () => void;
   onCancel: () => void;
 }
 
-function ImplementationModal({ meta, sessionId, cwd, onConfirm, onCancel }: ImplementationModalProps) {
+function ImplementationModal({ meta, specContent, sessionId, cwd, onConfirm, onCancel }: ImplementationModalProps) {
   const { createTaskTree, start } = useTasksStore();
+  const [phase, setPhase] = useState<"decomposing" | "review">("decomposing");
+  const [tasks, setTasks] = useState<DecomposedTask[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  useEffect(() => {
+    const decompose = async () => {
+      try {
+        const result = await invoke<DecomposedTask[]>("decompose_spec_to_tasks", {
+          specContent,
+        });
+        setTasks(result);
+        setPhase("review");
+      } catch (e) {
+        // Fallback: single task
+        setTasks([{
+          tmp_id: "t-0",
+          title: meta.title,
+          description: `Implement spec ${meta.req_id ?? ""}: ${meta.title}`,
+          dependencies: [],
+        }]);
+        setPhase("review");
+      }
+    };
+    decompose();
+  }, []);
+
+  const updateTask = (idx: number, field: "title" | "description", value: string) => {
+    setTasks(prev => prev.map((t, i) => i === idx ? { ...t, [field]: value } : t));
+  };
+
+  const deleteTask = (idx: number) => {
+    setTasks(prev => prev.filter((_, i) => i !== idx));
+  };
+
   const handleConfirm = async () => {
+    if (tasks.length === 0) return;
     setBusy(true);
     setError(null);
     try {
-      const tasks = meta.acceptance_criteria.length > 0
-        ? meta.acceptance_criteria.map((criterion, i) => ({
-            tmp_id: `t-${i}`,
-            title: criterion,
-            description: `Implement and verify: ${criterion}`,
-            cwd,
-          }))
-        : [{
-            tmp_id: "t-0",
-            title: meta.title,
-            description: `Implement spec ${meta.req_id ?? ""}: ${meta.title}`,
-            cwd,
-          }];
-
-      await createTaskTree(sessionId, tasks, []);
+      const taskDefs = tasks.map(t => ({
+        tmp_id: t.tmp_id,
+        title: t.title,
+        description: t.description,
+        cwd,
+      }));
+      const deps = tasks.flatMap(t =>
+        t.dependencies.map(dep => ({ task_tmp_id: t.tmp_id, depends_on_tmp_id: dep }))
+      );
+      await createTaskTree(sessionId, taskDefs, deps);
       await start(sessionId, meta.req_id ?? undefined, meta.title);
       onConfirm();
     } catch (e) {
@@ -542,41 +578,72 @@ function ImplementationModal({ meta, sessionId, cwd, onConfirm, onCancel }: Impl
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-      <div className="w-96 rounded-xl border border-border bg-surface-2 shadow-2xl p-5 space-y-4">
+      <div className="w-[520px] rounded-xl border border-border bg-surface-2 shadow-2xl p-5 space-y-4">
         <h2 className="text-sm font-semibold text-gray-200">Start Implementation</h2>
-        <p className="text-xs text-gray-400">
-          AI will decompose this spec into{" "}
-          <strong className="text-gray-200">
-            {Math.max(meta.acceptance_criteria.length, 1)} task
-            {meta.acceptance_criteria.length !== 1 ? "s" : ""}
-          </strong>{" "}
-          based on acceptance criteria and begin implementation. Continue?
-        </p>
-        {meta.acceptance_criteria.length > 0 && (
-          <ul className="space-y-1 text-xs text-gray-500">
-            {meta.acceptance_criteria.map((c, i) => (
-              <li key={i} className="flex gap-1">
-                <span>•</span><span>{c}</span>
-              </li>
-            ))}
-          </ul>
+
+        {phase === "decomposing" ? (
+          <div className="flex flex-col items-center justify-center py-8 gap-3 text-xs text-gray-400">
+            <div className="w-5 h-5 border-2 border-gray-500 border-t-blue-400 rounded-full animate-spin" />
+            <span>🤖 AI is decomposing your spec into tasks...</span>
+          </div>
+        ) : (
+          <>
+            <p className="text-xs text-gray-400">
+              Review and edit the tasks below, then confirm to begin implementation.
+            </p>
+            <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
+              {tasks.map((task, idx) => (
+                <div key={task.tmp_id} className="rounded-lg border border-border bg-surface-3 p-3 space-y-1.5">
+                  <div className="flex items-center gap-2">
+                    <input
+                      value={task.title}
+                      onChange={e => updateTask(idx, "title", e.target.value)}
+                      className="flex-1 text-xs font-medium text-gray-200 bg-transparent border-b border-transparent hover:border-border focus:border-border focus:outline-none py-0.5"
+                    />
+                    <button
+                      onClick={() => deleteTask(idx)}
+                      className="text-gray-600 hover:text-red-400 transition-colors flex-shrink-0"
+                      title="Remove task"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                  <textarea
+                    value={task.description}
+                    onChange={e => updateTask(idx, "description", e.target.value)}
+                    rows={2}
+                    className="w-full text-xs text-gray-400 bg-transparent border border-transparent hover:border-border focus:border-border focus:outline-none resize-none rounded px-1 py-0.5"
+                  />
+                  {task.dependencies.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {task.dependencies.map(dep => (
+                        <span key={dep} className="text-[10px] bg-surface-1 text-gray-500 border border-border rounded px-1.5 py-0.5">
+                          after {dep}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+            {error && <p className="text-xs text-red-400">{error}</p>}
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={onCancel}
+                className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirm}
+                disabled={busy || tasks.length === 0}
+                className="px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
+              >
+                {busy ? "Starting..." : "Confirm & Start"}
+              </button>
+            </div>
+          </>
         )}
-        {error && <p className="text-xs text-red-400">{error}</p>}
-        <div className="flex justify-end gap-2">
-          <button
-            onClick={onCancel}
-            className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleConfirm}
-            disabled={busy}
-            className="px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
-          >
-            {busy ? "Starting..." : "Confirm"}
-          </button>
-        </div>
       </div>
     </div>
   );
@@ -1080,6 +1147,7 @@ export function SpecsPage({ onBack }: SpecsPageProps) {
       {implModal && activeSpec && activeSession && (
         <ImplementationModal
           meta={activeSpec.meta}
+          specContent={activeSpec.content}
           sessionId={activeSession.id}
           cwd={cwd}
           onConfirm={() => {

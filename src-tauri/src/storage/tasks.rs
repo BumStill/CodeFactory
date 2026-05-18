@@ -197,6 +197,19 @@ pub async fn list_session_tasks(
     Ok(rows)
 }
 
+pub async fn list_all_tasks_for_session(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Vec<TaskRun>> {
+    let rows = sqlx::query_as::<_, TaskRun>(
+        "SELECT * FROM task_runs WHERE session_id = ? ORDER BY created_at ASC",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 pub async fn get_task(pool: &SqlitePool, id: &str) -> Result<Option<TaskRun>> {
     let row = sqlx::query_as::<_, TaskRun>("SELECT * FROM task_runs WHERE id = ?")
         .bind(id)

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
+import { createHighlighter, type Highlighter } from "shiki";
 import { ToolCallCard } from "./ToolCallCard";
 import type { UIMessage } from "../stores/chat";
 
@@ -8,6 +10,69 @@ interface Props {
   messages: UIMessage[];
   streaming: boolean;
 }
+
+// Singleton highlighter — created once, reused across renders
+let _hlPromise: Promise<Highlighter> | null = null;
+function getHighlighter(): Promise<Highlighter> {
+  if (!_hlPromise) {
+    _hlPromise = createHighlighter({
+      themes: ["github-dark"],
+      langs: [
+        "typescript", "javascript", "tsx", "jsx",
+        "rust", "python", "bash", "sh", "json",
+        "yaml", "toml", "html", "css", "sql",
+        "markdown", "go", "java", "cpp", "c",
+      ],
+    });
+  }
+  return _hlPromise;
+}
+
+function CodeBlock({ lang, code }: { lang: string; code: string }) {
+  const [html, setHtml] = useState<string | null>(null);
+
+  useEffect(() => {
+    getHighlighter().then((hl) => {
+      try {
+        const resolved = hl.getLoadedLanguages().includes(lang as never) ? lang : "text";
+        setHtml(hl.codeToHtml(code, { lang: resolved, theme: "github-dark" }));
+      } catch {
+        setHtml(null);
+      }
+    });
+  }, [lang, code]);
+
+  if (!html) {
+    return (
+      <pre className="bg-[#0d1117] rounded-md p-3 overflow-x-auto text-xs leading-relaxed">
+        <code>{code}</code>
+      </pre>
+    );
+  }
+
+  return (
+    <div
+      className="rounded-md overflow-x-auto text-xs [&>pre]:p-3 [&>pre]:!bg-[#0d1117]"
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  );
+}
+
+const markdownComponents: Components = {
+  code({ className, children, ...props }) {
+    const match = /language-(\w+)/.exec(className || "");
+    const isBlock = !!match;
+    const code = String(children).replace(/\n$/, "");
+    if (isBlock) {
+      return <CodeBlock lang={match![1]} code={code} />;
+    }
+    return (
+      <code className="bg-surface-3 px-1 py-0.5 rounded text-xs font-mono text-gray-200" {...props}>
+        {children}
+      </code>
+    );
+  },
+};
 
 export function MessageList({ messages, streaming }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -56,8 +121,8 @@ function MessageRow({ msg }: { msg: UIMessage }) {
               <ToolCallCard key={tc.id} tc={tc} />
             ))}
             {msg.content && (
-              <div className="prose prose-invert prose-sm max-w-none">
-                <ReactMarkdown>{msg.content}</ReactMarkdown>
+              <div className="prose prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent">
+                <ReactMarkdown components={markdownComponents}>{msg.content}</ReactMarkdown>
               </div>
             )}
           </div>

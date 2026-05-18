@@ -128,6 +128,7 @@ pub fn run() {
             commands::specs::delete_spec,
             commands::specs::approve_spec,
             commands::specs::spec_ai_assist,
+            commands::specs::decompose_spec_to_tasks,
             commands::evidence::generate_evidence_pack,
             commands::evidence::list_evidence_packs,
             commands::evidence::get_evidence_pack,
