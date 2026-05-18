@@ -2,16 +2,20 @@
 import { useState, useRef, useEffect } from "react";
 import { ChevronDown } from "lucide-react";
 import { useChatStore } from "../stores/chat";
+import { useSettingsStore } from "../stores/settings";
 
 export function ModelPicker() {
   const { models, activeModel, updateActiveSessionModel, loadModels } = useChatStore();
+  const { settings } = useSettingsStore();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const ref = useRef<HTMLDivElement>(null);
 
+  // Reload model list whenever the active endpoint changes
   useEffect(() => {
-    if (models.length === 0) loadModels("openrouter");
-  }, []);
+    const ep = settings?.default_endpoint ?? "openrouter";
+    loadModels(ep);
+  }, [settings?.default_endpoint]);
 
   useEffect(() => {
     const close = (e: MouseEvent) => {
