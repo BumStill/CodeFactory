@@ -924,19 +924,69 @@ fn parse_tool_message_content(raw: &str) -> (String, String) {
     (String::new(), raw.to_string())
 }
 
+/// Read at most `max_chars` UTF-8 chars from a file, appending "…" if truncated.
+fn read_file_capped(path: &Path, max_chars: usize) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    if raw.len() <= max_chars {
+        Some(raw)
+    } else {
+        // Truncate at a char boundary
+        let truncated: String = raw.chars().take(max_chars).collect();
+        Some(format!("{truncated}\n[… truncated]"))
+    }
+}
+
+/// Detect primary project type and return (label, config_file_path).
+fn detect_project_config(cwd: &Path) -> Option<(&'static str, std::path::PathBuf)> {
+    let candidates: &[(&str, &str)] = &[
+        ("Rust (Cargo.toml)", "Cargo.toml"),
+        ("Node.js (package.json)", "package.json"),
+        ("Python (pyproject.toml)", "pyproject.toml"),
+        ("Python (setup.py)", "setup.py"),
+        ("Go (go.mod)", "go.mod"),
+    ];
+    for (label, file) in candidates {
+        let path = cwd.join(file);
+        if path.exists() {
+            return Some((label, path));
+        }
+    }
+    None
+}
+
 fn build_system_prompt(cwd: &Path) -> String {
     let mut prompt = SYSTEM_PROMPT.to_string();
-    let memory_path = cwd.join("CODEFACTORY.md");
-    let Ok(memory) = std::fs::read_to_string(&memory_path) else {
-        return prompt;
-    };
-    let memory = memory.trim();
-    if memory.is_empty() {
-        return prompt;
+
+    // ── 1. Project memory (CODEFACTORY.md) ──────────────────────────────────
+    if let Some(memory) = read_file_capped(&cwd.join("CODEFACTORY.md"), 4000) {
+        let memory = memory.trim();
+        if !memory.is_empty() {
+            prompt.push_str("\n\n# Project Memory (CODEFACTORY.md)\n");
+            prompt.push_str(memory);
+        }
     }
 
-    prompt.push_str("\n\n# Project Memory (CODEFACTORY.md)\n");
-    prompt.push_str(memory);
+    // ── 2. README ────────────────────────────────────────────────────────────
+    for readme in &["README.md", "README.txt", "readme.md"] {
+        if let Some(content) = read_file_capped(&cwd.join(readme), 3000) {
+            prompt.push_str(&format!("\n\n# Project README ({readme})\n"));
+            prompt.push_str(&content);
+            break; // only first found
+        }
+    }
+
+    // ── 3. Project config (Cargo.toml / package.json / etc.) ────────────────
+    if let Some((label, config_path)) = detect_project_config(cwd) {
+        if let Some(content) = read_file_capped(&config_path, 2000) {
+            prompt.push_str(&format!("\n\n# Project Config — {label}\n```\n"));
+            prompt.push_str(&content);
+            prompt.push_str("\n```");
+        }
+    }
+
     prompt
 }
 
