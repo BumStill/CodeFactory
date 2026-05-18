@@ -26,7 +26,7 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      # Cache cargo registry + git index (shared across all projects on this runner)
+      # Cache cargo registry + git index
       - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
@@ -37,7 +37,7 @@ jobs:
           key: cargo-registry-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: cargo-registry-
 
-      # Cache compiled dependencies in target/ (the biggest win)
+      # Cache compiled dependencies in target/
       - name: Cache Rust build artifacts
         uses: swatinem/rust-cache@v2
         with:
@@ -47,8 +47,8 @@ jobs:
       # Cache pnpm store
       - name: Get pnpm store path
         id: pnpm-cache
-        run: echo "store=$(pnpm store path)" >> $env:GITHUB_OUTPUT
         shell: pwsh
+        run: echo "store=$(pnpm store path)" >> $env:GITHUB_OUTPUT
 
       - name: Cache pnpm store
         uses: actions/cache@v4
@@ -56,14 +56,6 @@ jobs:
           path: ${{ steps.pnpm-cache.outputs.store }}
           key: pnpm-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: pnpm-
-
-      - name: Configure Cargo for CI
-        shell: pwsh
-        run: |
-          Set-Content -Path .cargo/config.toml -Encoding utf8 -Value @'
-[env]
-RUST_MIN_STACK = "33554432"
-'@
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile

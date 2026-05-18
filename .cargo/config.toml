@@ -1,9 +1,5 @@
-# Increase rustc thread stack to 32MB.
+# Increase rustc thread stack to 32 MB.
 # Needed on Windows MSVC: icu_normalizer_data / icu_properties_data embed
-# large Unicode tables and exhaust the default 8MB stack, causing
-# STATUS_STACK_BUFFER_OVERRUN and corrupt .rmeta stubs.
+# large Unicode tables and exhaust the default 8 MB stack.
 [env]
 RUST_MIN_STACK = "33554432"
-
-[target.x86_64-pc-windows-msvc]
-linker = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\link.exe'
