@@ -26,6 +26,8 @@ pub fn openai_tools_to_anthropic(tools: &[ToolDefinition]) -> Vec<serde_json::Va
 pub struct AnthropicResponse {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
 }
 
 pub async fn stream_anthropic(
@@ -70,6 +72,9 @@ pub async fn stream_anthropic(
     // current block index and type
     let mut current_block_idx: usize = 0;
     let mut current_block_type: Option<String> = None;
+    // token usage (populated from message_start / message_delta events)
+    let mut input_tokens: i64 = 0;
+    let mut output_tokens: i64 = 0;
 
     while let Some(chunk) = byte_stream.next().await {
         let bytes = chunk?;
@@ -174,8 +179,20 @@ pub async fn stream_anthropic(
                         }
                     }
                 }
-                "message_delta" | "message_stop" => {
-                    // Nothing extra needed; we detect completion via stream end.
+                "message_start" => {
+                    // {"type":"message_start","message":{"usage":{"input_tokens":N,...}}}
+                    if let Some(u) = event.pointer("/message/usage/input_tokens").and_then(|v| v.as_i64()) {
+                        input_tokens = u;
+                    }
+                }
+                "message_delta" => {
+                    // {"type":"message_delta","usage":{"output_tokens":N}}
+                    if let Some(u) = event.pointer("/usage/output_tokens").and_then(|v| v.as_i64()) {
+                        output_tokens = u;
+                    }
+                }
+                "message_stop" => {
+                    // Nothing extra needed.
                 }
                 _ => {}
             }
@@ -200,5 +217,7 @@ pub async fn stream_anthropic(
     Ok(AnthropicResponse {
         text: text_buf,
         tool_calls,
+        input_tokens,
+        output_tokens,
     })
 }

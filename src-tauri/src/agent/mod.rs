@@ -134,6 +134,8 @@ impl AgentLoop {
             if tool_calls.is_empty() {
                 // Emit Done with accumulated usage if we have it
                 if let Some(u) = &usage {
+                    let inp = u.prompt_tokens as i64;
+                    let out = u.completion_tokens as i64;
                     self.app
                         .emit(
                             &event_name,
@@ -143,6 +145,22 @@ impl AgentLoop {
                             },
                         )
                         .ok();
+                    // Persist cost entry and notify frontend to refresh stats
+                    let settings = self.settings.read().await;
+                    let endpoint = settings.default_endpoint.clone();
+                    drop(settings);
+                    if let Err(e) = crate::commands::costs::record_cost_entry(
+                        &self.db,
+                        &self.session_id,
+                        &self.model_id,
+                        &endpoint,
+                        inp,
+                        out,
+                    ).await {
+                        tracing::warn!("Failed to record cost entry: {e}");
+                    } else {
+                        self.app.emit("token-usage-recorded", &self.session_id).ok();
+                    }
                 }
                 break;
             }
@@ -655,15 +673,33 @@ impl AgentLoop {
             }
 
             if tool_calls.is_empty() {
+                let inp = resp.input_tokens;
+                let out = resp.output_tokens;
                 self.app
                     .emit(
                         event_name,
                         StreamEvent::Done {
-                            input_tokens: 0,
-                            output_tokens: 0,
+                            input_tokens: inp as u32,
+                            output_tokens: out as u32,
                         },
                     )
                     .ok();
+                // Persist cost entry
+                let settings = self.settings.read().await;
+                let endpoint = settings.default_endpoint.clone();
+                drop(settings);
+                if let Err(e) = crate::commands::costs::record_cost_entry(
+                    &self.db,
+                    &self.session_id,
+                    &self.model_id,
+                    &endpoint,
+                    inp,
+                    out,
+                ).await {
+                    tracing::warn!("Failed to record cost entry (anthropic): {e}");
+                } else {
+                    self.app.emit("token-usage-recorded", &self.session_id).ok();
+                }
                 break;
             }
 

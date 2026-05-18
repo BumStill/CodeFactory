@@ -26,6 +26,7 @@ import { useGitRemoteStore } from "../../stores/gitRemote";
 import { invoke } from "../../lib/tauri";
 import type { GitRemoteConfig, GitProvider } from "../../lib/tauri";
 import Terminal from "../../components/Terminal";
+import { TokenCostBar } from "../../components/TokenCostBar";
 
 interface ChatPageProps {
   onOpenSpecs?: () => void;
@@ -74,7 +75,6 @@ export function ChatPage({ onOpenSpecs, onOpenSkills }: ChatPageProps) {
     await createSession(dir as string, activeModel);
   };
 
-  const cost = estimateCost(activeModel, inputTokenTotal, outputTokenTotal);
   const fullAccess = settings?.permissions.full_access ?? false;
 
   const allowWithFullAccess = async () => {
@@ -262,14 +262,8 @@ export function ChatPage({ onOpenSpecs, onOpenSkills }: ChatPageProps) {
           }}
         />
 
-        {/* Status bar */}
-        {(inputTokenTotal > 0 || outputTokenTotal > 0) && (
-          <div className="flex items-center gap-3 px-4 py-1 border-t border-border text-xs text-gray-700 bg-surface-1 shrink-0 select-none">
-            <span>↑ {inputTokenTotal.toLocaleString()} tokens</span>
-            <span>↓ {outputTokenTotal.toLocaleString()} tokens</span>
-            {cost != null && <span>≈ ${cost}</span>}
-          </div>
-        )}
+        {/* Token cost status bar */}
+        <TokenCostBar sessionId={activeSession?.id} />
 
         {/* Input */}
         <MessageInput
@@ -895,12 +889,3 @@ function AddRemoteForm({
   );
 }
 
-function estimateCost(model: string, inputTok: number, outputTok: number): string | null {
-  if (inputTok === 0 && outputTok === 0) return null;
-  // Very rough: $3/M input, $15/M output for Opus-class models
-  const isOpus = model.includes("opus") || model.includes("gpt-4");
-  const inputPrice = isOpus ? 3 : 0.5;
-  const outputPrice = isOpus ? 15 : 1.5;
-  const cost = (inputTok / 1_000_000) * inputPrice + (outputTok / 1_000_000) * outputPrice;
-  return cost.toFixed(4);
-}
