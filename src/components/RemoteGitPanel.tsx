@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { invoke } from "../lib/tauri";
 import { useGitRemoteStore } from "../stores/gitRemote";
-import type { RemoteIssue, RemotePR, GitRemoteConfig } from "../lib/tauri";
+import type { RemoteIssue, GitRemoteConfig } from "../lib/tauri";
 
 // ── Open URL in system browser ────────────────────────────────────────────────
 

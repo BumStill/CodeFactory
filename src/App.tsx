@@ -3,10 +3,11 @@ import { useState } from "react";
 import { ChatPage } from "./pages/Chat/ChatPage";
 import { SpecsPage } from "./pages/Specs/SpecsPage";
 import { SkillsPage } from "./pages/Skills/SkillsPage";
+import { SettingsPage } from "./pages/Settings/SettingsPage";
 import { ToastContainer } from "./components/Toast";
 import { EvidenceViewer } from "./components/EvidenceViewer";
 
-export type AppView = "chat" | "specs" | "skills";
+export type AppView = "chat" | "specs" | "skills" | "settings";
 
 export default function App() {
   const [view, setView] = useState<AppView>("chat");
@@ -14,12 +15,14 @@ export default function App() {
 
   return (
     <>
-      {view === "specs" && <SpecsPage onBack={() => setView("chat")} />}
-      {view === "skills" && <SkillsPage onBack={() => setView("chat")} />}
+      {view === "specs"    && <SpecsPage    onBack={() => setView("chat")} />}
+      {view === "skills"   && <SkillsPage   onBack={() => setView("chat")} />}
+      {view === "settings" && <SettingsPage onBack={() => setView("chat")} />}
       {view === "chat" && (
         <ChatPage
           onOpenSpecs={() => setView("specs")}
           onOpenSkills={() => setView("skills")}
+          onOpenSettings={() => setView("settings")}
         />
       )}
 

@@ -80,6 +80,7 @@ export interface Settings {
   shell: {
     shell: string;
   };
+  auto_create_pr: boolean;
 }
 
 // ── Git ─────────────────────────────────────────────────────────────────────
