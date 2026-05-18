@@ -13,6 +13,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history needed for git-cliff
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -63,6 +65,16 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v3
+        id: cliff
+        with:
+          config: cliff.toml
+          args: --latest --strip all
+        env:
+          OUTPUT: RELEASE_NOTES.md
+          GITHUB_REPO: ${{ github.repository }}
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -70,6 +82,6 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'CodeFactory ${{ github.ref_name }}'
-          releaseBody: 'See CHANGELOG for details.'
+          releaseBody: ${{ steps.cliff.outputs.content }}
           releaseDraft: false
           prerelease: false
