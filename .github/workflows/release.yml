@@ -44,6 +44,13 @@ jobs:
   build-windows:
     runs-on: windows-latest
     needs: changelog
+    # Belt-and-suspenders: GitHub sometimes drops the top-level `permissions:`
+    # for jobs with `needs:` dependencies, causing tauri-action's
+    # "create release" API call to fail with 403 ("Resource not accessible
+    # by integration"). Declaring it again per-job is harmless and guarantees
+    # the contents:write scope is in effect.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
