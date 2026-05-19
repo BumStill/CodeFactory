@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+use std::collections::HashSet;
+
 use tauri::State;
 
 use crate::errors::AppError;
@@ -16,6 +18,23 @@ pub async fn list_models(
         .get(&endpoint_name)
         .ok_or_else(|| AppError::Other(format!("Unknown endpoint: {endpoint_name}")))?;
 
+    // ── 1. Build user-defined entries (always present, never fails) ──────────
+    let mut merged: Vec<ModelInfo> = endpoint
+        .custom_models
+        .iter()
+        .map(|m| ModelInfo {
+            id: m.id.clone(),
+            name: m.name.clone().unwrap_or_else(|| m.id.clone()),
+            context_length: m.context_length.unwrap_or(0),
+            pricing: None,
+            supported_parameters: None,
+            is_custom: true,
+        })
+        .collect();
+
+    let custom_ids: HashSet<String> = merged.iter().map(|m| m.id.clone()).collect();
+
+    // ── 2. Try to fetch remote /models — failures are non-fatal ──────────────
     let key_ref = endpoint
         .key_ref
         .clone()
@@ -23,5 +42,26 @@ pub async fn list_models(
     let api_key = crate::secrets::get_key(&key_ref)?.unwrap_or_default();
 
     let client = crate::openrouter::OpenRouterClient::new(&endpoint.base_url, api_key);
-    client.list_models().await
+    match client.list_models().await {
+        Ok(remote) => {
+            // Custom entries take precedence — skip any remote id already covered.
+            for m in remote {
+                if !custom_ids.contains(&m.id) {
+                    merged.push(ModelInfo {
+                        is_custom: false,
+                        ..m
+                    });
+                }
+            }
+        }
+        Err(err) => {
+            // Endpoint may not implement /models (LMStudio, Ollama, private gateways).
+            // Log and return whatever custom models the user configured.
+            tracing::warn!(
+                "list_models: remote fetch failed for endpoint '{endpoint_name}': {err}"
+            );
+        }
+    }
+
+    Ok(merged)
 }

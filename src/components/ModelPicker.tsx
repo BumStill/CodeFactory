@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useState, useRef, useEffect } from "react";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, Sparkles } from "lucide-react";
 import { useChatStore } from "../stores/chat";
 import { useSettingsStore } from "../stores/settings";
 
@@ -26,12 +26,18 @@ export function ModelPicker() {
   }, []);
 
   const displayed = activeModel.split("/").pop() ?? activeModel;
-  const filtered = models.filter(
-    (m) =>
-      !query ||
-      m.id.toLowerCase().includes(query.toLowerCase()) ||
-      m.name.toLowerCase().includes(query.toLowerCase())
-  );
+  const filtered = models
+    .filter(
+      (m) =>
+        !query ||
+        m.id.toLowerCase().includes(query.toLowerCase()) ||
+        m.name.toLowerCase().includes(query.toLowerCase())
+    )
+    .sort((a, b) => {
+      // Custom models first, then alphabetical by id
+      if (!!a.is_custom !== !!b.is_custom) return a.is_custom ? -1 : 1;
+      return a.id.localeCompare(b.id);
+    });
 
   return (
     <div ref={ref} className="relative">
@@ -58,12 +64,19 @@ export function ModelPicker() {
             {filtered.slice(0, 50).map((m) => (
               <li key={m.id}>
                 <button
-                  className={`w-full text-left px-3 py-1.5 text-xs hover:bg-surface-3 transition-colors truncate ${
+                  className={`flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-xs hover:bg-surface-3 transition-colors ${
                     m.id === activeModel ? "text-accent" : "text-gray-300"
                   }`}
                   onClick={() => { updateActiveSessionModel(m.id); setOpen(false); }}
+                  title={m.id}
                 >
-                  {m.id}
+                  {m.is_custom && (
+                    <Sparkles
+                      size={10}
+                      className="shrink-0 text-amber-400"
+                    />
+                  )}
+                  <span className="truncate">{m.id}</span>
                 </button>
               </li>
             ))}

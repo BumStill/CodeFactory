@@ -70,6 +70,21 @@ pub struct Endpoint {
     pub key_ref: Option<String>,
     #[serde(default)]
     pub api_style: ApiStyle,
+    /// User-defined models bound to this endpoint. Merged with the remote
+    /// /models list when the user opens the model picker.
+    #[serde(default)]
+    pub custom_models: Vec<CustomModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomModel {
+    /// The exact string passed as `model` in chat completion requests.
+    pub id: String,
+    /// Optional display name (falls back to `id` when empty/missing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +110,7 @@ impl Default for Settings {
                 base_url: "https://openrouter.ai/api/v1".into(),
                 key_ref: Some("codefactory.endpoint.openrouter".into()),
                 api_style: ApiStyle::Openai,
+                custom_models: vec![],
             },
         );
         Self {

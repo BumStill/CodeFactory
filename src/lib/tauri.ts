@@ -57,14 +57,23 @@ export interface ModelInfo {
   name: string;
   context_length: number;
   pricing?: { prompt: string; completion: string };
+  /** True when this entry came from Endpoint.custom_models. */
+  is_custom?: boolean;
 }
 
 export type ApiStyle = "openai" | "anthropic";
+
+export interface CustomModel {
+  id: string;
+  name?: string;
+  context_length?: number;
+}
 
 export interface Endpoint {
   base_url: string;
   key_ref?: string;
   api_style: ApiStyle;
+  custom_models?: CustomModel[];
 }
 
 export interface Settings {

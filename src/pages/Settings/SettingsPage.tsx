@@ -7,7 +7,7 @@ import { invoke } from "../../lib/tauri";
 import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
-import type { Settings, Endpoint, ApiStyle, GitRemoteConfig, GitProvider } from "../../lib/tauri";
+import type { Settings, Endpoint, ApiStyle, CustomModel, GitRemoteConfig, GitProvider } from "../../lib/tauri";
 
 interface Props {
   onBack: () => void;
@@ -100,6 +100,94 @@ interface EndpointDraft {
   api_style: ApiStyle;
   api_key: string;   // loaded/saved separately via keychain
   key_ref?: string;  // e.g. "codefactory.endpoint.myname"
+  custom_models: CustomModel[];
+}
+
+// ── Custom Models sub-editor (nested in EndpointCard) ────────────────────────
+
+function CustomModelsEditor({
+  models,
+  onChange,
+}: {
+  models: CustomModel[];
+  onChange: (next: CustomModel[]) => void;
+}) {
+  const [expanded, setExpanded] = useState(models.length > 0);
+
+  const updateAt = (idx: number, patch: Partial<CustomModel>) =>
+    onChange(models.map((m, i) => (i === idx ? { ...m, ...patch } : m)));
+
+  const removeAt = (idx: number) =>
+    onChange(models.filter((_, i) => i !== idx));
+
+  const addNew = () =>
+    onChange([...models, { id: "", name: "" }]);
+
+  return (
+    <div className="space-y-1.5 pt-1 border-t border-border/60">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center justify-between text-[11px] text-gray-500 hover:text-gray-300"
+      >
+        <span>
+          Custom Models
+          {models.length > 0 && (
+            <span className="ml-1.5 text-[10px] text-gray-600">({models.length})</span>
+          )}
+        </span>
+        <ChevronDown
+          size={11}
+          className={`transition-transform ${expanded ? "rotate-180" : ""}`}
+        />
+      </button>
+
+      {expanded && (
+        <div className="space-y-1.5">
+          {models.length === 0 && (
+            <div className="text-[11px] text-gray-600 italic">
+              No custom models yet. Useful for LMStudio / Ollama / private gateways
+              that don't expose <code>/models</code>.
+            </div>
+          )}
+
+          {models.map((m, idx) => (
+            <div key={idx} className="flex items-center gap-1.5">
+              <input
+                value={m.id}
+                onChange={(e) => updateAt(idx, { id: e.target.value })}
+                placeholder="model-id (e.g. llama3.1:8b)"
+                className="flex-[2] bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
+              />
+              <input
+                value={m.name ?? ""}
+                onChange={(e) =>
+                  updateAt(idx, { name: e.target.value || undefined })
+                }
+                placeholder="display name (optional)"
+                className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
+              />
+              <button
+                onClick={() => removeAt(idx)}
+                className="p-1 text-gray-600 hover:text-red-400 transition-colors"
+                title="Remove"
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
+          ))}
+
+          <button
+            type="button"
+            onClick={addNew}
+            className="flex items-center gap-1 text-[11px] text-accent hover:text-accent-hover"
+          >
+            <Plus size={11} /> Add model
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function EndpointCard({
@@ -123,7 +211,8 @@ function EndpointCard({
   const dirty =
     local.base_url !== draft.base_url ||
     local.api_style !== draft.api_style ||
-    local.api_key !== draft.api_key;
+    local.api_key !== draft.api_key ||
+    JSON.stringify(local.custom_models) !== JSON.stringify(draft.custom_models);
 
   const handleSave = async () => {
     setSaving(true);
@@ -214,6 +303,12 @@ function EndpointCard({
         </div>
       </div>
 
+      {/* Custom Models */}
+      <CustomModelsEditor
+        models={local.custom_models}
+        onChange={(custom_models) => setLocal({ ...local, custom_models })}
+      />
+
       {dirty && (
         <div className="flex justify-end">
           <button
@@ -250,7 +345,7 @@ function AddEndpointModal({
     if (!k) { setErr("Name required"); return; }
     if (existing.includes(k)) { setErr(`"${k}" already exists`); return; }
     if (!url.trim()) { setErr("Base URL required"); return; }
-    onAdd(k, { base_url: url.trim(), api_style: style });
+    onAdd(k, { base_url: url.trim(), api_style: style, custom_models: [] });
     onClose();
   };
 
@@ -434,6 +529,7 @@ export function SettingsPage({ onBack }: Props) {
           api_style: ep.api_style,
           api_key: apiKey,
           key_ref: ep.key_ref,
+          custom_models: ep.custom_models ?? [],
         };
         return draft;
       })
@@ -464,18 +560,34 @@ export function SettingsPage({ onBack }: Props) {
       await saveApiKey(keyRef, draft.api_key);
     }
 
-    // Rebuild endpoints map
+    // Rebuild endpoints map.
+    // Filter out blank rows before persisting so trailing empty "Add model"
+    // entries don't pollute the model picker.
+    const cleanedModels = draft.custom_models
+      .map((m) => ({ ...m, id: m.id.trim() }))
+      .filter((m) => m.id.length > 0);
+
     const newEndpoints: Record<string, Endpoint> = { ...settings.endpoints };
     newEndpoints[draft.key] = {
       base_url: draft.base_url,
       api_style: draft.api_style,
       key_ref: keyRef,
+      custom_models: cleanedModels,
     };
     await save({ ...settings, endpoints: newEndpoints });
 
-    // Update local drafts state
+    // Tell the chat store to reload models so the picker reflects the change
+    // immediately — without waiting for endpoint switch.
+    const chatState = useChatStore.getState();
+    chatState.loadModels(settings.default_endpoint);
+
+    // Update local drafts state with the cleaned (id-trimmed, blank-stripped) model list
     setEndpointDrafts((prev) =>
-      prev.map((d) => (d.key === draft.key ? { ...draft, key_ref: keyRef } : d))
+      prev.map((d) =>
+        d.key === draft.key
+          ? { ...draft, key_ref: keyRef, custom_models: cleanedModels }
+          : d,
+      ),
     );
   };
 
@@ -496,7 +608,13 @@ export function SettingsPage({ onBack }: Props) {
     await save({ ...settings, endpoints: newEndpoints });
     setEndpointDrafts((prev) => [
       ...prev,
-      { key, base_url: ep.base_url, api_style: ep.api_style, api_key: "" },
+      {
+        key,
+        base_url: ep.base_url,
+        api_style: ep.api_style,
+        api_key: "",
+        custom_models: ep.custom_models ?? [],
+      },
     ]);
   };
 

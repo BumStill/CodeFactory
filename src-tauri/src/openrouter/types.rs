@@ -129,6 +129,10 @@ pub struct ModelInfo {
     pub pricing: Option<ModelPricing>,
     #[serde(default)]
     pub supported_parameters: Option<Vec<String>>,
+    /// True when this entry came from `Endpoint.custom_models` rather than
+    /// the remote `/models` API. The frontend uses this to label / highlight.
+    #[serde(default)]
+    pub is_custom: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
