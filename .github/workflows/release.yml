@@ -9,7 +9,10 @@ permissions:
   contents: write
 
 jobs:
-  # ── Step 1: generate release notes on Linux (git-cliff needs Docker) ───────
+  # ── Step 1: generate release notes from conventional commits ───────────────
+  # We install git-cliff from its prebuilt binary (taiki-e/install-action)
+  # instead of running orhun/git-cliff-action, whose Docker base image
+  # (Debian buster) is EOL and breaks the apt-get build.
   changelog:
     runs-on: ubuntu-latest
     outputs:
@@ -19,12 +22,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Generate release notes
-        uses: orhun/git-cliff-action@v3
-        id: cliff
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
         with:
-          config: cliff.toml
-          args: --latest --strip all
+          tool: git-cliff
+
+      - name: Generate release notes
+        id: cliff
+        shell: bash
+        run: |
+          git-cliff --latest --strip all -o RELEASE_NOTES.md
+          {
+            echo 'content<<RELEASE_NOTES_EOF'
+            cat RELEASE_NOTES.md
+            echo 'RELEASE_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+          echo "---- preview ----"
+          cat RELEASE_NOTES.md
 
   # ── Step 2: build Windows installer and publish release ───────────────────
   build-windows:
