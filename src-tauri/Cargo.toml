@@ -48,3 +48,13 @@ codegen-units = 1
 lto           = "thin"
 opt-level     = "s"
 strip         = true
+
+# CI-only profile: optimises for build time, not binary size.
+# Same runtime behaviour as `release` (opt-level=s, panic=abort, strip),
+# but skips LTO and uses 16 codegen units so rustc parallelises properly.
+# Binary ends up ~1MB larger; users won't notice.
+# Used by the GitHub Actions release workflow via `--profile release-ci`.
+[profile.release-ci]
+inherits      = "release"
+codegen-units = 16
+lto           = false

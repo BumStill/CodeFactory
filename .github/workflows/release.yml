@@ -77,6 +77,16 @@ jobs:
         with:
           workspaces: src-tauri -> target
           cache-on-failure: true
+          # Bust the cache when the release profile changes, otherwise
+          # version-bump commits frequently land in a cold cache.
+          key: profile-release-ci
+
+      # sccache caches compilation outputs across runs, even when Cargo.lock
+      # changes (e.g. on every version bump). Combined with the rust-cache
+      # above (which caches whole target/ when keys match), this gives us a
+      # second tier of caching that's resilient to lockfile churn.
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
       - name: Get pnpm store path
         id: pnpm-cache
@@ -97,9 +107,19 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Route all rustc invocations through sccache so artifacts persist
+          # across runs via GitHub Actions Cache.
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+          # Disable incremental compilation — incompatible with sccache and
+          # not useful in a fresh CI checkout anyway.
+          CARGO_INCREMENTAL: "0"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'CodeFactory ${{ github.ref_name }}'
           releaseBody: ${{ needs.changelog.outputs.content }}
           releaseDraft: false
           prerelease: false
+          # Use the CI-optimised profile: codegen-units=16 + no LTO trades
+          # ~1MB of binary size for ~50% shorter compile time.
+          args: --profile release-ci
