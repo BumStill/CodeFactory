@@ -51,13 +51,17 @@ pub struct ChatRequest {
     pub stream: bool,
     pub temperature: f32,
     pub max_tokens: u32,
+    /// OpenAI-standard streaming usage-reporting toggle. Supported by
+    /// OpenRouter, DeepSeek, OpenAI, Together, Fireworks, etc. Avoid the
+    /// OpenRouter-only `usage: { include: true }` field — providers like
+    /// DeepSeek reject unknown top-level fields with HTTP 400.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<UsageOptions>,
+    pub stream_options: Option<StreamOptions>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct UsageOptions {
-    pub include: bool,
+pub struct StreamOptions {
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

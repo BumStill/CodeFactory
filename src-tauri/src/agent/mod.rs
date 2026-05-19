@@ -401,7 +401,7 @@ impl AgentLoop {
             stream: true,
             temperature: 0.2,
             max_tokens: 8192,
-            usage: Some(UsageOptions { include: true }),
+            stream_options: Some(StreamOptions { include_usage: true }),
         };
 
         let response = self
