@@ -121,12 +121,17 @@ jobs:
           # Disable incremental compilation — incompatible with sccache and
           # not useful in a fresh CI checkout anyway.
           CARGO_INCREMENTAL: "0"
+          # Override `release` profile to optimise for CI build time instead
+          # of binary size. We can't use `tauri build --profile release-ci`
+          # because tauri 2's CLI doesn't expose --profile at the top level
+          # (only via `-- --profile`, which gets mangled by pnpm). Env-var
+          # overrides bypass the parser entirely. Trades ~1MB of binary size
+          # for ~50% shorter compile time.
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          CARGO_PROFILE_RELEASE_LTO: "false"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'CodeFactory ${{ github.ref_name }}'
           releaseBody: ${{ needs.changelog.outputs.content }}
           releaseDraft: false
           prerelease: false
-          # Use the CI-optimised profile: codegen-units=16 + no LTO trades
-          # ~1MB of binary size for ~50% shorter compile time.
-          args: --profile release-ci
