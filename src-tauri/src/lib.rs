@@ -18,6 +18,46 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 
 pub type PendingPermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
+/// Make a once-per-day copy of the SQLite DB so a botched schema migration
+/// or accidental delete isn't unrecoverable. Files named
+/// `codefactory.db.backup-YYYYMMDD`; older than 7 days are pruned.
+///
+/// Best-effort: if any step fails (no DB yet, permission error, etc.) we
+/// just log and continue — backups are an extra safety net, not a hard dep.
+fn backup_db_daily(data_dir: &std::path::Path, db_path: &std::path::Path) -> std::io::Result<()> {
+    // No DB yet → nothing to back up (fresh install).
+    if !db_path.exists() {
+        return Ok(());
+    }
+
+    // Local date as YYYYMMDD — chrono is already a dependency.
+    let today = chrono::Local::now().format("%Y%m%d").to_string();
+    let backup_path = data_dir.join(format!("codefactory.db.backup-{today}"));
+
+    // Skip if we already snapshotted today.
+    if !backup_path.exists() {
+        std::fs::copy(db_path, &backup_path)?;
+        tracing::info!("db backup written: {}", backup_path.display());
+    }
+
+    // Prune backups older than 7 days. Tolerate per-entry errors so one
+    // stuck file doesn't block the rest.
+    let cutoff = chrono::Local::now() - chrono::Duration::days(7);
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(date_str) = name.strip_prefix("codefactory.db.backup-") else { continue };
+            // Parse YYYYMMDD; ignore malformed.
+            let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y%m%d") else { continue };
+            let backup_local = date.and_hms_opt(0, 0, 0).unwrap();
+            if backup_local < cutoff.naive_local() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub struct AppState {
     pub db: Arc<RwLock<SqlitePool>>,
     pub settings: Arc<RwLock<config::Settings>>,
@@ -35,11 +75,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir().expect("app data dir unavailable");
             std::fs::create_dir_all(&data_dir)?;
 
-            let db_url = format!("sqlite:{}", data_dir.join("codefactory.db").display());
+            // Rolling daily DB backup — one snapshot per day, 7-day retention.
+            // Best-effort: failures are logged and never block startup.
+            let db_path = data_dir.join("codefactory.db");
+            if let Err(e) = backup_db_daily(&data_dir, &db_path) {
+                tracing::warn!("db backup skipped: {e}");
+            }
+
+            let db_url = format!("sqlite:{}", db_path.display());
             let settings = config::settings::load();
 
             let pool = tauri::async_runtime::block_on(storage::db::connect(&db_url))?;

@@ -134,7 +134,22 @@ impl Default for Settings {
     }
 }
 
+/// Active settings location. Lives alongside the SQLite DB under the Tauri
+/// identifier-based app data directory so a single folder covers all user
+/// state — survives upgrades and uninstalls cleanly.
+///
+/// Windows: `%APPDATA%\com.codefactory.app\settings.json`
 pub fn config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("com.codefactory.app")
+        .join("settings.json")
+}
+
+/// Legacy path used by versions ≤ 0.3.3 (productName-based folder, separate
+/// from the DB). Kept only so [`load`] can migrate old installs forward on
+/// the first launch after upgrading.
+fn legacy_config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("CodeFactory")
@@ -142,8 +157,38 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn load() -> Settings {
-    let path = config_path();
-    std::fs::read_to_string(&path)
+    let new_path = config_path();
+
+    // One-shot migration: if there's a settings.json in the legacy location
+    // but none at the new one, copy it across and rename the original to
+    // .migrated-backup so the user can tell what happened (and we never
+    // accidentally re-migrate over fresher data).
+    let legacy = legacy_config_path();
+    if legacy.exists() && !new_path.exists() {
+        if let Some(parent) = new_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::copy(&legacy, &new_path) {
+            Ok(_) => {
+                let backup = legacy.with_extension("json.migrated-backup");
+                let _ = std::fs::rename(&legacy, &backup);
+                tracing::info!(
+                    "settings: migrated {} -> {}",
+                    legacy.display(),
+                    new_path.display()
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "settings: migration {} -> {} failed: {e}",
+                    legacy.display(),
+                    new_path.display()
+                );
+            }
+        }
+    }
+
+    std::fs::read_to_string(&new_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
