@@ -6,6 +6,7 @@ import { SkillsPage } from "./pages/Skills/SkillsPage";
 import { SettingsPage } from "./pages/Settings/SettingsPage";
 import { ToastContainer } from "./components/Toast";
 import { EvidenceViewer } from "./components/EvidenceViewer";
+import { UpdaterBanner } from "./components/UpdaterBanner";
 
 export type AppView = "chat" | "specs" | "skills" | "settings";
 
@@ -15,6 +16,7 @@ export default function App() {
 
   return (
     <>
+      <UpdaterBanner />
       {view === "specs"    && <SpecsPage    onBack={() => setView("chat")} />}
       {view === "skills"   && <SkillsPage   onBack={() => setView("chat")} />}
       {view === "settings" && <SettingsPage onBack={() => setView("chat")} />}

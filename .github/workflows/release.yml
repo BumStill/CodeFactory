@@ -129,6 +129,11 @@ jobs:
           # for ~50% shorter compile time.
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           CARGO_PROFILE_RELEASE_LTO: "false"
+          # Sign the installer + emit latest.json so the in-app updater can
+          # verify and download the new version. Keys generated locally via
+          # `tauri signer generate`; private key stored as a repo secret.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'CodeFactory ${{ github.ref_name }}'

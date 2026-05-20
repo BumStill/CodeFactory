@@ -57,6 +57,17 @@
                                    "certificateThumbprint":  null,
                                    "digestAlgorithm":  "sha256",
                                    "timestampUrl":  ""
-                               }
-               }
+                               },
+                   "createUpdaterArtifacts":  true
+               },
+    "plugins":  {
+                    "updater":  {
+                                    "active":  true,
+                                    "endpoints":  [
+                                                      "https://github.com/BumStill/CodeFactory/releases/latest/download/latest.json"
+                                                  ],
+                                    "dialog":  false,
+                                    "pubkey":  "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNFRTMxMUJEOTc5NjNCOTkKUldTWk81YVh2UkhqUHJDZmczY040cUc0eFNvaG1SL3BHT2F0aWk1UWhEcjBFUk0zM1NteFVLeU4K"
+                                }
+                }
 }
