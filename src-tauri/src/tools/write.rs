@@ -2,7 +2,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{unified_diff_for_path, ExecCtx, ToolOutput};
+use super::{file_lock, unified_diff_for_path, ExecCtx, ToolOutput};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
@@ -36,11 +36,17 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     };
 
     let path = ctx.cwd.join(&a.path);
-    let original = std::fs::read_to_string(&path).unwrap_or_default();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, &a.content)?;
+
+    // Serialise read+write per-file so a parallel edit on the same file can't
+    // race with us. Different files still run fully in parallel.
+    let _guard = file_lock::acquire(&path).await;
+
+    let original = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+
+    // atomic_write handles mkdir, write to temp file, and atomic rename with
+    // Windows sharing-violation retry.
+    file_lock::atomic_write(&path, a.content.as_bytes()).await?;
+
     let diff = unified_diff_for_path(&a.path, &original, &a.content);
     Ok(ToolOutput::ok(format!(
         "Written {} bytes to {}\n\n```diff\n{diff}```",

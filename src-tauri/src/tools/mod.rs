@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod bash;
 pub mod edit;
+pub mod file_lock;
 pub mod glob;
 pub mod grep;
 pub mod read;

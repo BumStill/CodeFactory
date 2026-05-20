@@ -2,7 +2,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{unified_diff_for_path, ExecCtx, ToolOutput};
+use super::{file_lock, unified_diff_for_path, ExecCtx, ToolOutput};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
@@ -41,7 +41,13 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     };
 
     let path = ctx.cwd.join(&a.path);
-    let original = match std::fs::read_to_string(&path) {
+
+    // Hold the per-file lock across the read+modify+write cycle so concurrent
+    // edits to the same file serialise (otherwise one writer's changes get
+    // clobbered by the other's read-then-write).
+    let _guard = file_lock::acquire(&path).await;
+
+    let original = match tokio::fs::read_to_string(&path).await {
         Ok(s) => s,
         Err(e) => {
             return Ok(ToolOutput::err(format!(
@@ -69,7 +75,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         original.replacen(&a.old_string, &a.new_string, 1)
     };
 
-    std::fs::write(&path, &updated)?;
+    file_lock::atomic_write(&path, updated.as_bytes()).await?;
     let diff = unified_diff_for_path(&a.path, &original, &updated);
     Ok(ToolOutput::ok(format!(
         "Edited {}\n\n```diff\n{diff}```",
