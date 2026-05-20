@@ -22,9 +22,15 @@ export default {
       },
       keyframes: {
         blink: { "0%,100%": { opacity: 1 }, "50%": { opacity: 0 } },
+        // Classic typing-dots bounce — 3 dots offset by 150ms each
+        "typing-dot": {
+          "0%, 80%, 100%": { transform: "scale(0.6)", opacity: "0.4" },
+          "40%":           { transform: "scale(1.0)", opacity: "1"   },
+        },
       },
       animation: {
         blink: "blink 1s step-end infinite",
+        "typing-dot": "typing-dot 1.2s ease-in-out infinite",
       },
     },
   },

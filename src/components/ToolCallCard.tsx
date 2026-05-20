@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useState } from "react";
-import { ChevronDown, ChevronRight, Terminal, AlertCircle, CheckCircle, ShieldQuestion } from "lucide-react";
+import {
+  ChevronDown, ChevronRight,
+  AlertCircle, CheckCircle, ShieldQuestion,
+  FileText, Edit3, Save, TerminalSquare, Search, FolderTree,
+  Globe, Wrench, Bot,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type { ToolCallState } from "../stores/chat";
 import { DiffViewer, parseUnifiedDiffResult } from "./DiffViewer";
 
@@ -8,10 +14,99 @@ interface Props {
   tc: ToolCallState;
 }
 
+// ── Per-tool styling ────────────────────────────────────────────────────────
+// Maps the tool name to an icon + accent color. Unknown tools fall back to
+// a generic wrench. Keep the icon set lean — the goal is visual diff between
+// "read", "edit/write" and "execute", not encyclopedia coverage.
+interface ToolStyle {
+  icon: LucideIcon;
+  iconClass: string;
+}
+
+function styleForTool(name: string): ToolStyle {
+  switch (name) {
+    case "read_file":
+    case "read":
+      return { icon: FileText, iconClass: "text-blue-400" };
+    case "write_file":
+    case "write":
+      return { icon: Save, iconClass: "text-green-400" };
+    case "edit_file":
+    case "edit":
+      return { icon: Edit3, iconClass: "text-amber-400" };
+    case "bash":
+    case "exec":
+      return { icon: TerminalSquare, iconClass: "text-purple-400" };
+    case "grep":
+      return { icon: Search, iconClass: "text-cyan-400" };
+    case "glob":
+    case "list_files":
+      return { icon: FolderTree, iconClass: "text-cyan-400" };
+    case "fetch":
+    case "web_fetch":
+    case "web_search":
+      return { icon: Globe, iconClass: "text-pink-400" };
+    case "spawn_subagent":
+    case "task":
+      return { icon: Bot, iconClass: "text-fuchsia-400" };
+    default:
+      return { icon: Wrench, iconClass: "text-accent" };
+  }
+}
+
+// ── One-line summary of tool arguments (for collapsed view) ─────────────────
+function summarizeArgs(name: string, raw: string): string | null {
+  try {
+    const args = JSON.parse(raw);
+    switch (name) {
+      case "read_file":
+      case "read":
+        if (args.offset != null || args.limit != null) {
+          const start = args.offset ?? 1;
+          const end = args.limit ? start + args.limit - 1 : "…";
+          return `${args.path} (${start}-${end})`;
+        }
+        return args.path ?? null;
+      case "write_file":
+      case "write":
+        return args.path ?? null;
+      case "edit_file":
+      case "edit": {
+        const len = (args.old_string ?? "").length;
+        return args.path ? `${args.path} (${len}b → ${(args.new_string ?? "").length}b)` : null;
+      }
+      case "bash":
+      case "exec":
+        return args.command ?? null;
+      case "grep":
+        return args.pattern ? `"${args.pattern}"${args.path ? ` in ${args.path}` : ""}` : null;
+      case "glob":
+      case "list_files":
+        return args.pattern ?? args.path ?? null;
+      case "fetch":
+      case "web_fetch":
+        return args.url ?? null;
+      case "web_search":
+        return args.query ?? null;
+      case "spawn_subagent":
+      case "task":
+        return args.title ?? args.description ?? null;
+      default:
+        // Generic fallback: try common path/command/query fields
+        return args.path ?? args.command ?? args.query ?? args.url ?? args.title ?? null;
+    }
+  } catch {
+    return null;
+  }
+}
+
 export function ToolCallCard({ tc }: Props) {
   const [open, setOpen] = useState(false);
   const parsedDiff = tc.result == null ? null : parseUnifiedDiffResult(tc.result);
   const hasDiff = (parsedDiff?.files.length ?? 0) > 0;
+
+  const { icon: Icon, iconClass } = styleForTool(tc.name);
+  const summary = summarizeArgs(tc.name, tc.args ?? "");
 
   const statusIcon =
     tc.status === "waiting_permission" ? (
@@ -25,22 +120,22 @@ export function ToolCallCard({ tc }: Props) {
     );
 
   return (
-    <div className="my-1 rounded border border-border bg-surface-2 text-xs font-mono">
+    <div className="my-1 rounded border border-border bg-surface-2 text-xs">
       <button
         className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-surface-3 transition-colors"
         onClick={() => setOpen((o) => !o)}
       >
-        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-        <Terminal size={12} className="text-accent shrink-0" />
-        <span className="text-gray-300 truncate">{tc.name}</span>
-        <span className="rounded bg-surface-4 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-gray-500">
-          {labelForStatus(tc.status)}
-        </span>
-        <span className="ml-auto">{statusIcon}</span>
+        {open ? <ChevronDown size={12} className="text-gray-600 shrink-0" /> : <ChevronRight size={12} className="text-gray-600 shrink-0" />}
+        <Icon size={12} className={`${iconClass} shrink-0`} />
+        <span className="text-gray-300 font-mono shrink-0">{tc.name}</span>
+        {summary && (
+          <span className="text-gray-500 font-mono truncate min-w-0">· {summary}</span>
+        )}
+        <span className="ml-auto shrink-0">{statusIcon}</span>
       </button>
 
       {open && (
-        <div className="border-t border-border px-3 py-2 space-y-2">
+        <div className="border-t border-border px-3 py-2 space-y-2 font-mono">
           {tc.args && (
             <div>
               <div className="text-gray-500 mb-1">input</div>
@@ -66,21 +161,6 @@ export function ToolCallCard({ tc }: Props) {
       )}
     </div>
   );
-}
-
-function labelForStatus(status: ToolCallState["status"]): string {
-  switch (status) {
-    case "waiting_permission":
-      return "waiting";
-    case "running":
-      return "running";
-    case "done":
-      return "done";
-    case "error":
-      return "error";
-    case "denied":
-      return "denied";
-  }
 }
 
 function formatArgs(raw: string): string {
