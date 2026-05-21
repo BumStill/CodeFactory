@@ -28,6 +28,8 @@ export type StreamEvent =
   | { type: "tool_result"; tool_call_id: string; content: string; is_error: boolean }
   | { type: "permission_request"; tool_call_id: string; tool_name: string; args: unknown }
   | { type: "done"; input_tokens: number; output_tokens: number }
+  | { type: "context_usage"; used_tokens: number; limit_tokens: number }
+  | { type: "context_compressed"; elided_count: number; tokens_freed: number }
   | { type: "error"; message: string };
 
 export interface Session {

@@ -23,6 +23,8 @@ interface ChatStore {
   inputTokenTotal: number;
   outputTokenTotal: number;
   pendingPermission: PendingPermission | null;
+  contextUsage: { used: number; limit: number } | null;
+  compressionToast: { elidedCount: number; tokensFreed: number; id: number } | null;
 
   loadSessions: () => Promise<void>;
   createSession: (cwd: string, model: string) => Promise<Session>;
@@ -52,6 +54,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   inputTokenTotal: 0,
   outputTokenTotal: 0,
   pendingPermission: null,
+  contextUsage: null,
+  compressionToast: null,
 
   loadSessions: async () => {
     const sessions = await invoke<Session[]>("list_sessions");
@@ -75,6 +79,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       inputTokenTotal: 0,
       outputTokenTotal: 0,
       pendingPermission: null,
+      contextUsage: null,
+      compressionToast: null,
     });
   },
 
@@ -207,6 +213,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       inputTokenTotal: 0,
       outputTokenTotal: 0,
       pendingPermission: null,
+      contextUsage: null,
+      compressionToast: null,
     });
   },
 }));

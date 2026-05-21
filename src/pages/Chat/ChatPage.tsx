@@ -25,6 +25,7 @@ import { useSkillsStore } from "../../stores/skills";
 import { invoke } from "../../lib/tauri";
 import Terminal from "../../components/Terminal";
 import { TokenCostBar } from "../../components/TokenCostBar";
+import { ContextUsageBar } from "../../components/ContextUsageBar";
 
 interface ChatPageProps {
   onOpenSpecs?: () => void;
@@ -238,7 +239,11 @@ export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPage
         </header>
 
         {/* Messages */}
-        <MessageList messages={messages} streaming={streaming} />
+        <MessageList
+          messages={messages}
+          streaming={streaming}
+          onUsePrompt={(text) => setPendingInsert(text)}
+        />
 
         {/* Git status bar */}
         <GitStatusBar
@@ -259,6 +264,12 @@ export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPage
             setRemoteGitOpen((v) => !v);
           }}
         />
+
+        {/* Live context-window usage bar (with compression toast) */}
+        <ContextUsageBar />
+
+        {/* Context window usage (above token cost) */}
+        <ContextUsageBar />
 
         {/* Token cost status bar */}
         <TokenCostBar sessionId={activeSession?.id} />

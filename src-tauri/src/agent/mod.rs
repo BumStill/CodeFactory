@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod anthropic_client;
+pub mod context;
 pub mod hooks;
 pub mod scheduler;
 pub mod subagent;
@@ -117,7 +118,49 @@ impl AgentLoop {
         };
 
         for _ in 0..MAX_ITERATIONS {
+            // ── Context-window management ────────────────────────────────────
+            // Estimate prompt tokens before sending. If we're over 75% of the
+            // model's window, elide oversized tool results from the older
+            // half. Notify the UI so the user knows what happened.
+            let context_limit = {
+                let settings = self.settings.read().await;
+                let endpoint = settings.default_endpoint.clone();
+                context::resolve_context_length(&settings, &endpoint, &self.model_id, None)
+            };
+            let compression = context::compress_if_needed(
+                std::mem::take(&mut messages),
+                system_prompt,
+                context_limit,
+            );
+            messages = compression.messages;
+            if compression.compressed {
+                self.app
+                    .emit(
+                        event_name,
+                        StreamEvent::ContextCompressed {
+                            elided_count: compression.elided_count,
+                            tokens_freed: compression.tokens_freed,
+                        },
+                    )
+                    .ok();
+            }
+
             let (text, tool_calls, usage) = self.call_openai_model(&messages, tool_defs, event_name).await?;
+
+            // Emit real (provider-reported) context-usage right after each
+            // round-trip so the UI bar tracks actual usage, not just our
+            // estimate. The estimate is only used to *trigger* compression.
+            if let Some(u) = &usage {
+                self.app
+                    .emit(
+                        event_name,
+                        StreamEvent::ContextUsage {
+                            used_tokens: u.prompt_tokens,
+                            limit_tokens: context_limit,
+                        },
+                    )
+                    .ok();
+            }
 
             // Persist assistant turn — include tool_calls so history can be
             // reconstructed faithfully when the session is resumed.
@@ -411,8 +454,11 @@ impl AgentLoop {
             .header("X-Title", "CodeFactory")
             .json(&req)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        // Capture the response body on HTTP errors so the user sees the
+        // provider's actual rejection reason (bad model id, unsupported
+        // field, etc.) rather than just "HTTP 400".
+        let response = crate::http_util::check_status(response).await?;
 
         let mut byte_stream = response.bytes_stream();
         let mut text_buf = String::new();
@@ -645,6 +691,19 @@ impl AgentLoop {
         };
 
         for _ in 0..MAX_ITERATIONS {
+            // We don't run elision compression on the Anthropic path because
+            // its messages are serde_json::Value-shaped, not ChatMessage.
+            // The OpenAI path is the primary one for now (OpenRouter,
+            // DeepSeek, local models). We do still report context usage
+            // when Anthropic returns input_tokens, so the UI bar stays
+            // accurate. TODO: port elision to work on Value-shaped messages
+            // for Anthropic users.
+            let context_limit = {
+                let settings = self.settings.read().await;
+                let endpoint = settings.default_endpoint.clone();
+                context::resolve_context_length(&settings, &endpoint, &self.model_id, None)
+            };
+
             let resp = anthropic_client::stream_anthropic(
                 &self.http,
                 &self.base_url,
@@ -657,6 +716,19 @@ impl AgentLoop {
                 event_name,
             )
             .await?;
+
+            // Emit context usage if Anthropic reported it (it sets 0 when missing)
+            if resp.input_tokens > 0 {
+                self.app
+                    .emit(
+                        event_name,
+                        StreamEvent::ContextUsage {
+                            used_tokens: resp.input_tokens.max(0) as u32,
+                            limit_tokens: context_limit,
+                        },
+                    )
+                    .ok();
+            }
 
             let text = resp.text;
             let tool_calls = resp.tool_calls;

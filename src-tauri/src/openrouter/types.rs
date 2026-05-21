@@ -184,6 +184,20 @@ pub enum StreamEvent {
         input_tokens: u32,
         output_tokens: u32,
     },
+    /// Snapshot of how much of the model's context window the last prompt
+    /// occupied. Emitted after every assistant turn (whenever we get a
+    /// `prompt_tokens` reading back from the provider).
+    ContextUsage {
+        used_tokens: u32,
+        limit_tokens: u32,
+    },
+    /// Notification that the older half of the conversation was compressed
+    /// to fit the window. Frontend can toast this so the user knows why a
+    /// previous tool result now shows "[elided]".
+    ContextCompressed {
+        elided_count: usize,
+        tokens_freed: u32,
+    },
     Error {
         message: String,
     },

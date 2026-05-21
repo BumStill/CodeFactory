@@ -28,6 +28,8 @@ function baseState(): ChatEventState {
     inputTokenTotal: 0,
     outputTokenTotal: 0,
     pendingPermission: null,
+    contextUsage: null,
+    compressionToast: null,
   };
 }
 

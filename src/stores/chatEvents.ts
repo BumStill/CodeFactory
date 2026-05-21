@@ -26,12 +26,28 @@ export interface UIMessage {
   createdAt: number;
 }
 
+export interface ContextUsage {
+  used: number;
+  limit: number;
+}
+
+export interface CompressionToast {
+  elidedCount: number;
+  tokensFreed: number;
+  /** Monotonic id so React shows a new toast even if the values match. */
+  id: number;
+}
+
 export interface ChatEventState {
   messages: UIMessage[];
   streaming: boolean;
   inputTokenTotal: number;
   outputTokenTotal: number;
   pendingPermission: PendingPermission | null;
+  /** Last reported provider-side prompt_tokens / resolved model limit. */
+  contextUsage: ContextUsage | null;
+  /** Set whenever the backend just elided messages; UI shows a toast. */
+  compressionToast: CompressionToast | null;
 }
 
 export function reduceChatStreamEvent(
@@ -120,6 +136,44 @@ export function reduceChatStreamEvent(
             ? { ...m, content: m.content + `\n\nError: ${event.message}` }
             : m,
         ),
+      };
+
+    case "context_usage":
+      return {
+        ...state,
+        contextUsage: {
+          used: event.used_tokens,
+          limit: event.limit_tokens,
+        },
+      };
+
+    case "context_compressed":
+      return {
+        ...state,
+        compressionToast: {
+          elidedCount: event.elided_count,
+          tokensFreed: event.tokens_freed,
+          id: Date.now(),
+        },
+      };
+
+    case "context_usage":
+      return {
+        ...state,
+        contextUsage: {
+          used: event.used_tokens,
+          limit: event.limit_tokens,
+        },
+      };
+
+    case "context_compressed":
+      return {
+        ...state,
+        compressionToast: {
+          elidedCount: event.elided_count,
+          tokensFreed: event.tokens_freed,
+          id: Date.now(),
+        },
       };
 
     case "tool_call_args_delta":
