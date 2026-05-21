@@ -1,6 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
-import { Sparkles, FolderOpen, Clock, ArrowRight } from "lucide-react";
+import { FolderOpen, Clock, ArrowRight } from "lucide-react";
 import { useChatStore } from "../stores/chat";
+
+/**
+ * In-line render of the app's "Crystallization" gem mark — same geometry
+ * as the OS icon (rotated rhombus with two facets, the upper one bright,
+ * the lower one slightly recessed). Kept as SVG rather than importing the
+ * PNG so it scales crisply, stays in lockstep with the brand if the icon
+ * is ever redesigned, and avoids an asset-bundling round-trip through
+ * the Tauri side.
+ */
+function GemMark({ size = 28 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 56 56"
+      width={size}
+      height={size}
+      className="drop-shadow-sm"
+      aria-hidden
+    >
+      <g transform="rotate(7 28 28)">
+        {/* Upper facet — fully bright */}
+        <polygon points="27.2,8 41,28 15,28" fill="#fff" />
+        {/* Lower facet — slightly translucent so the facet seam reads */}
+        <polygon points="41,28 28.6,48 15,28" fill="#fff" fillOpacity="0.88" />
+      </g>
+    </svg>
+  );
+}
 
 interface Props {
   /**
@@ -50,7 +77,7 @@ export function WelcomeScreen({ onUsePrompt }: Props) {
         {/* Hero */}
         <div className="text-center space-y-2">
           <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-br from-orange-500 to-red-600 shadow-lg">
-            <Sparkles size={26} className="text-white" />
+            <GemMark size={32} />
           </div>
           <h1 className="text-2xl font-semibold text-gray-100">CodeFactory</h1>
           <p className="text-sm text-gray-500">
