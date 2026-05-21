@@ -23,16 +23,14 @@ impl OpenRouterClient {
 
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
         let url = format!("{}/models", self.base_url);
-        let resp: ModelsResponse = self
+        let response = self
             .http
             .get(&url)
             .bearer_auth(&self.api_key)
             .header("X-Title", "CodeFactory")
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let resp: ModelsResponse = crate::http_util::check_status(response).await?.json().await?;
         Ok(resp.data)
     }
 
@@ -55,8 +53,8 @@ impl OpenRouterClient {
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let response = crate::http_util::check_status(response).await?;
 
         let mut stream = response.bytes_stream();
 

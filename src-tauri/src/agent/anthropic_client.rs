@@ -61,8 +61,8 @@ pub async fn stream_anthropic(
         .header("content-type", "application/json")
         .json(&body)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let response = crate::http_util::check_status(response).await?;
 
     let mut byte_stream = response.bytes_stream();
 

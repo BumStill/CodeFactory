@@ -450,7 +450,7 @@ pub async fn spec_ai_assist(
     };
 
     let client = Client::new();
-    let resp = client
+    let response = client
         .post(&url)
         .bearer_auth(&api_key)
         .header("X-Title", "CodeFactory")
@@ -458,10 +458,14 @@ pub async fn spec_ai_assist(
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("API error: {e}"))?
-        .json::<AiResponse>()
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+    // Use check_status so the provider's actual error message surfaces in the
+    // UI (e.g. "model 'xxx' not found") instead of a generic "HTTP 400".
+    let response = crate::http_util::check_status(response)
+        .await
+        .map_err(|e| e.to_string())?;
+    let resp: AiResponse = response
+        .json()
         .await
         .map_err(|e| format!("JSON parse error: {e}"))?;
 
@@ -540,7 +544,7 @@ Spec:\n\
     };
 
     let client = Client::new();
-    let resp = client
+    let response = client
         .post(&url)
         .bearer_auth(&api_key)
         .header("X-Title", "CodeFactory")
@@ -548,10 +552,14 @@ Spec:\n\
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("API error: {e}"))?
-        .json::<AiResponse>()
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+    // Use check_status so the provider's actual error message surfaces in the
+    // UI (e.g. "model 'xxx' not found") instead of a generic "HTTP 400".
+    let response = crate::http_util::check_status(response)
+        .await
+        .map_err(|e| e.to_string())?;
+    let resp: AiResponse = response
+        .json()
         .await
         .map_err(|e| format!("JSON parse error: {e}"))?;
 
