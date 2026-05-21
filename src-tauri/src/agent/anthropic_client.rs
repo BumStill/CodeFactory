@@ -80,9 +80,20 @@ pub async fn stream_anthropic(
     let mut input_tokens: i64 = 0;
     let mut output_tokens: i64 = 0;
 
+    // SSE line buffering — see agent/mod.rs for full rationale.
+    // TL;DR: SSE events split across TCP chunks must be reassembled, or
+    // every cross-chunk event gets silently dropped, corrupting tool args.
+    let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
+
     while let Some(chunk) = byte_stream.next().await {
         let bytes = chunk?;
-        for line in String::from_utf8_lossy(&bytes).lines() {
+        byte_buffer.extend_from_slice(&bytes);
+
+        while let Some(nl_pos) = byte_buffer.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = byte_buffer.drain(..=nl_pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
+            let line = line.trim_end_matches('\r');
+
             let Some(data) = line.strip_prefix("data:") else {
                 continue;
             };
@@ -92,6 +103,7 @@ pub async fn stream_anthropic(
             }
 
             let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+                tracing::warn!("dropped malformed Anthropic SSE event (len={})", data.len());
                 continue;
             };
 

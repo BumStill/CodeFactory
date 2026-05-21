@@ -145,7 +145,7 @@ impl AgentLoop {
                     .ok();
             }
 
-            let (text, tool_calls, usage) = self.call_openai_model(&messages, tool_defs, event_name).await?;
+            let (text, tool_calls, usage, reasoning) = self.call_openai_model(&messages, tool_defs, event_name).await?;
 
             // Emit real (provider-reported) context-usage right after each
             // round-trip so the UI bar tracks actual usage, not just our
@@ -162,14 +162,16 @@ impl AgentLoop {
                     .ok();
             }
 
-            // Persist assistant turn — include tool_calls so history can be
-            // reconstructed faithfully when the session is resumed.
-            if !text.is_empty() || !tool_calls.is_empty() {
+            // Persist assistant turn — include tool_calls AND reasoning_content
+            // so history reconstructs faithfully. Reasoning replay is required
+            // by DeepSeek's reasoner family.
+            if !text.is_empty() || !tool_calls.is_empty() || reasoning.is_some() {
                 self.persist_message(
                     "assistant",
                     &text,
                     usage.as_ref(),
                     if tool_calls.is_empty() { None } else { Some(&tool_calls) },
+                    reasoning.as_deref(),
                 )
                 .await?;
             }
@@ -279,6 +281,7 @@ impl AgentLoop {
                         tool_calls: None,
                         tool_call_id: Some(tc.id.clone()),
                         name: Some(tc.function.name.clone()),
+                    reasoning_content: None,
                     });
                     continue;
                 }
@@ -308,6 +311,7 @@ impl AgentLoop {
                         tool_calls: None,
                         tool_call_id: Some(tc.id.clone()),
                         name: Some(tc.function.name.clone()),
+                    reasoning_content: None,
                     });
                     continue;
                 }
@@ -379,6 +383,7 @@ impl AgentLoop {
                     tool_calls: None,
                     tool_call_id: Some(tc.id.clone()),
                     name: Some(tc.function.name.clone()),
+                    reasoning_content: None,
                 });
             }
 
@@ -388,6 +393,7 @@ impl AgentLoop {
                 tool_calls: Some(tool_calls),
                 tool_call_id: None,
                 name: None,
+                reasoning_content: reasoning,
             });
             messages.extend(result_messages);
         }
@@ -433,7 +439,7 @@ impl AgentLoop {
         messages: &[ChatMessage],
         tool_defs: &[ToolDefinition],
         event_name: &str,
-    ) -> Result<(String, Vec<ToolCall>, Option<Usage>)> {
+    ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         // Strip OpenRouter-style "vendor/" prefix when talking to a direct
@@ -469,19 +475,47 @@ impl AgentLoop {
 
         let mut byte_stream = response.bytes_stream();
         let mut text_buf = String::new();
+        let mut reasoning_buf = String::new();
         let mut tc_map: HashMap<u32, (String, String, String)> = HashMap::new();
         let mut usage: Option<Usage> = None;
 
+        // SSE line buffering — critical correctness fix.
+        //
+        // The previous implementation processed each TCP chunk as a self-
+        // contained block of lines: `from_utf8_lossy(&bytes).lines()`.
+        // When a single SSE event ("data: {...}\n") straddled two chunks,
+        // chunk-1 ended with a truncated JSON line that failed to parse
+        // and was silently skipped, and chunk-2 started mid-string also
+        // failing — the entire event was dropped. The symptoms in
+        // production: bash commands missing characters (`Select-Object`
+        // becoming `Select-Obj`), file writes losing trailing content,
+        // parallel tool-call arguments arriving as malformed JSON, all
+        // diagnosed by the user as "the tool corrupted my command/file".
+        //
+        // The fix: keep a byte buffer across chunks. Cut lines only at
+        // real `\n` boundaries. `\n` is a single ASCII byte, so partial
+        // UTF-8 sequences never sit on a cut point and from_utf8_lossy
+        // never sees an incomplete codepoint.
+        let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
+
         while let Some(chunk) = byte_stream.next().await {
             let bytes = chunk?;
-            for line in String::from_utf8_lossy(&bytes).lines() {
+            byte_buffer.extend_from_slice(&bytes);
+
+            while let Some(nl_pos) = byte_buffer.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = byte_buffer.drain(..=nl_pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
+                let line = line.trim_end_matches('\r'); // SSE may use CRLF
+
                 let Some(data) = line.strip_prefix("data: ") else {
                     continue;
                 };
                 if data.trim() == "[DONE]" {
+                    byte_buffer.clear();
                     break;
                 }
                 let Ok(sc) = serde_json::from_str::<StreamChunk>(data) else {
+                    tracing::warn!("dropped malformed SSE data line (len={})", data.len());
                     continue;
                 };
                 if let Some(u) = sc.usage {
@@ -494,6 +528,14 @@ impl AgentLoop {
                             .emit(&event_name, StreamEvent::TextDelta { content: t.clone() })
                             .ok();
                         text_buf.push_str(&t);
+                    }
+                    // DeepSeek reasoner family streams a separate reasoning_content
+                    // field. Accumulate it for replay on subsequent turns. We don't
+                    // stream it to the UI as TextDelta — keeping the chain-of-thought
+                    // out of the visible chat is the right default; expose later via
+                    // a "show reasoning" toggle if users want it.
+                    if let Some(r) = delta.reasoning_content.filter(|s| !s.is_empty()) {
+                        reasoning_buf.push_str(&r);
                     }
                     if let Some(tcs) = delta.tool_calls {
                         for tc in tcs {
@@ -529,7 +571,8 @@ impl AgentLoop {
             .collect();
         tool_calls.sort_by_key(|tc| tc.id.clone());
 
-        Ok((text_buf, tool_calls, usage))
+        let reasoning = if reasoning_buf.is_empty() { None } else { Some(reasoning_buf) };
+        Ok((text_buf, tool_calls, usage, reasoning))
     }
 
     async fn persist_message(
@@ -538,6 +581,7 @@ impl AgentLoop {
         content: &str,
         usage: Option<&Usage>,
         tool_calls: Option<&[ToolCall]>,
+        reasoning_content: Option<&str>,
     ) -> Result<()> {
         let msg_id = Uuid::new_v4().to_string();
         let now = Utc::now().timestamp_millis();
@@ -548,8 +592,8 @@ impl AgentLoop {
             .map(|tcs| serde_json::to_string(tcs).unwrap_or_default());
 
         sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, input_tokens, output_tokens, tool_calls, created_at) \
-             VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages (id, session_id, role, content, input_tokens, output_tokens, tool_calls, reasoning_content, created_at) \
+             VALUES (?,?,?,?,?,?,?,?,?)",
         )
         .bind(&msg_id)
         .bind(&self.session_id)
@@ -558,6 +602,7 @@ impl AgentLoop {
         .bind(input_tok)
         .bind(output_tok)
         .bind(tool_calls_json)
+        .bind(reasoning_content)
         .bind(now)
         .execute(&self.db)
         .await?;
@@ -571,6 +616,7 @@ impl AgentLoop {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+                    reasoning_content: None,
         }];
 
         for m in history {
@@ -584,6 +630,7 @@ impl AgentLoop {
                         tool_calls: None,
                         tool_call_id: Some(tool_call_id),
                         name: None,
+                    reasoning_content: None,
                     });
                 }
                 "assistant" => {
@@ -598,6 +645,9 @@ impl AgentLoop {
                         tool_calls,
                         tool_call_id: None,
                         name: None,
+                        // Replay reasoning_content verbatim so DeepSeek reasoner
+                        // models don't 400 on the next turn.
+                        reasoning_content: m.reasoning_content,
                     });
                 }
                 _ => {
@@ -607,6 +657,7 @@ impl AgentLoop {
                         tool_calls: None,
                         tool_call_id: None,
                         name: None,
+                    reasoning_content: None,
                     });
                 }
             }
@@ -740,13 +791,16 @@ impl AgentLoop {
             let text = resp.text;
             let tool_calls = resp.tool_calls;
 
-            // Persist assistant turn
+            // Persist assistant turn (Anthropic path — no separate reasoning
+            // stream; Claude's extended thinking goes via the same `content`
+            // for tool use turns)
             if !text.is_empty() || !tool_calls.is_empty() {
                 self.persist_message(
                     "assistant",
                     &text,
                     None,
                     if tool_calls.is_empty() { None } else { Some(&tool_calls) },
+                    None,
                 )
                 .await?;
             }
