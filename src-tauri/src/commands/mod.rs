@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+pub mod backup;
 pub mod chat;
 pub mod costs;
 pub mod evidence;

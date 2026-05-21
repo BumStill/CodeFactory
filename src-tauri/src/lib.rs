@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod errors;
 mod git_remote;
+mod http_util;
 mod mcp;
 mod openrouter;
 mod secrets;
@@ -136,6 +137,9 @@ pub fn run() {
             commands::settings::get_api_key,
             commands::settings::save_api_key,
             commands::settings::delete_api_key,
+            commands::backup::export_user_data,
+            commands::backup::import_user_data,
+            commands::backup::get_data_dir,
             commands::models::list_models,
             commands::session::list_sessions,
             commands::session::create_session,

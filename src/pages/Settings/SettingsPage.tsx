@@ -849,6 +849,8 @@ export function SettingsPage({ onBack }: Props) {
                 {generalSaved ? <><Check size={11} /> Saved</> : "Save"}
               </button>
             </div>
+
+            <DataSection />
           </div>
         )}
 
@@ -1222,6 +1224,127 @@ function AddRemoteForm({
           {saving ? "Adding…" : "Add Remote"}
         </button>
       </div>
+    </div>
+  );
+}
+
+// ── DataSection — export / import / show data dir ────────────────────────────
+
+import { save as saveDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
+import { Download as DownloadIcon, Upload as UploadIcon, FolderOpen } from "lucide-react";
+
+function DataSection() {
+  const [dataDir, setDataDir] = useState<string>("");
+  const [busy, setBusy] = useState<"export" | "import" | null>(null);
+  const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+
+  useEffect(() => {
+    invoke<string>("get_data_dir").then(setDataDir).catch(() => {});
+  }, []);
+
+  const showMsg = (kind: "ok" | "err", text: string) => {
+    setMsg({ kind, text });
+    setTimeout(() => setMsg(null), 4000);
+  };
+
+  const handleExport = async () => {
+    const path = await saveDialog({
+      defaultPath: `codefactory-backup-${new Date().toISOString().slice(0, 10)}.cfbkp`,
+      filters: [{ name: "CodeFactory backup", extensions: ["cfbkp"] }],
+    });
+    if (!path) return;
+    setBusy("export");
+    try {
+      const r = await invoke<{ path: string; size_bytes: number }>("export_user_data", {
+        targetPath: path,
+      });
+      showMsg("ok", `Exported ${(r.size_bytes / 1024 / 1024).toFixed(2)} MB to ${r.path}`);
+    } catch (e) {
+      showMsg("err", String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleImport = async () => {
+    const path = await openDialog({
+      multiple: false,
+      filters: [{ name: "CodeFactory backup", extensions: ["cfbkp"] }],
+    });
+    if (!path || typeof path !== "string") return;
+    if (
+      !confirm(
+        "Restoring will overwrite your current settings and sessions. The old files will be saved with a .pre-restore-<timestamp> suffix in the data directory. Continue?",
+      )
+    ) {
+      return;
+    }
+    setBusy("import");
+    try {
+      const r = await invoke<{ restored_settings: boolean; restored_db: boolean }>(
+        "import_user_data",
+        { sourcePath: path },
+      );
+      const parts: string[] = [];
+      if (r.restored_settings) parts.push("settings");
+      if (r.restored_db) parts.push("sessions");
+      showMsg(
+        "ok",
+        `Restored ${parts.join(" + ")}. Restart the app to take effect.`,
+      );
+    } catch (e) {
+      showMsg("err", String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="pt-4 mt-4 border-t border-border space-y-3">
+      <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Data</h2>
+
+      <div className="rounded-lg border border-border bg-surface-1 p-3 space-y-2">
+        <div className="text-[11px] text-gray-500">Storage location</div>
+        <div className="flex items-center gap-2 font-mono text-[11px] text-gray-300">
+          <FolderOpen size={11} className="text-gray-600 shrink-0" />
+          <span className="truncate" title={dataDir}>{dataDir || "loading…"}</span>
+        </div>
+        <p className="text-[11px] text-gray-600 leading-relaxed">
+          All sessions, messages, and settings live here. Survives uninstall and reinstall.
+          API keys are stored separately in Windows Credential Manager and are not part of backups.
+        </p>
+      </div>
+
+      <div className="flex gap-2">
+        <button
+          onClick={handleExport}
+          disabled={busy !== null}
+          className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded border border-border bg-surface-1 hover:bg-surface-3 text-xs text-gray-200 transition-colors disabled:opacity-50"
+        >
+          <DownloadIcon size={12} />
+          {busy === "export" ? "Exporting…" : "Export backup"}
+        </button>
+        <button
+          onClick={handleImport}
+          disabled={busy !== null}
+          className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded border border-border bg-surface-1 hover:bg-surface-3 text-xs text-gray-200 transition-colors disabled:opacity-50"
+        >
+          <UploadIcon size={12} />
+          {busy === "import" ? "Restoring…" : "Restore from backup"}
+        </button>
+      </div>
+
+      {msg && (
+        <div
+          className={`text-[11px] rounded border px-2.5 py-1.5 ${
+            msg.kind === "ok"
+              ? "border-green-500/30 bg-green-500/10 text-green-300"
+              : "border-red-500/30 bg-red-500/10 text-red-300"
+          }`}
+        >
+          {msg.text}
+        </div>
+      )}
     </div>
   );
 }
