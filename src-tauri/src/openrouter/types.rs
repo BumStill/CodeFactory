@@ -11,6 +11,12 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Reasoning trace from "thinking-mode" models (DeepSeek reasoner family,
+    /// Claude extended-thinking, etc.). When this field is present on an
+    /// assistant message that's being replayed, the provider requires us
+    /// to echo it back verbatim — omitting it triggers HTTP 400.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +104,10 @@ pub struct Delta {
     pub role: Option<String>,
     pub content: Option<String>,
     pub tool_calls: Option<Vec<ToolCallDelta>>,
+    /// Streamed reasoning trace (DeepSeek `deepseek-reasoner` etc.).
+    /// Accumulated separately from `content` and persisted/replayed on
+    /// subsequent turns.
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

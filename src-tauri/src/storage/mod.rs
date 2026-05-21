@@ -31,6 +31,10 @@ pub struct Message {
     pub output_tokens: Option<i64>,
     /// Serialised `Vec<ToolCall>` JSON; only set on assistant messages that invoked tools.
     pub tool_calls: Option<String>,
+    /// Reasoning trace from thinking-mode models (DeepSeek reasoner, etc).
+    /// Must be replayed back to the API on subsequent turns or the provider
+    /// rejects the request with HTTP 400.
+    pub reasoning_content: Option<String>,
     pub created_at: i64,
 }
 

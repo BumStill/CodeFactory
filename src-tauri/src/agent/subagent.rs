@@ -157,6 +157,7 @@ pub async fn run_subagent(
         input_tokens: None,
         output_tokens: None,
         tool_calls: None,
+        reasoning_content: None,
         created_at: now,
     }];
 
