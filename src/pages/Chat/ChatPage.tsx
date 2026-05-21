@@ -268,9 +268,6 @@ export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPage
         {/* Live context-window usage bar (with compression toast) */}
         <ContextUsageBar />
 
-        {/* Context window usage (above token cost) */}
-        <ContextUsageBar />
-
         {/* Token cost status bar */}
         <TokenCostBar sessionId={activeSession?.id} />
 

@@ -28,7 +28,11 @@ use crate::config::Settings;
 use crate::openrouter::types::{ChatMessage, MessageContent};
 
 /// Conservative window when nothing is known about the model.
-pub const FALLBACK_CONTEXT_LENGTH: u32 = 16_384;
+/// 128K is the modern baseline (GPT-4o, Claude, Gemini, DeepSeek-v4-pro all
+/// at or above this). Going lower triggers spurious compression and shows
+/// "100%" too early — see the user report where a 60K prompt against the
+/// old 16K fallback showed 375 % usage and triggered phantom compression.
+pub const FALLBACK_CONTEXT_LENGTH: u32 = 128_000;
 
 /// Compression kicks in above this fraction of the window. 0.75 leaves
 /// headroom for the system prompt, tool definitions, and the new user
@@ -39,9 +43,10 @@ pub const COMPRESSION_TRIGGER: f32 = 0.75;
 /// short results saves nothing and hurts the model's ability to use them.
 pub const MIN_ELIDE_TOKENS: u32 = 200;
 
-/// Resolve the active context window for `(endpoint, model_id)` by
-/// checking the endpoint's custom_models override first, then any cached
-/// remote /models entries (if the caller passes them in), else the fallback.
+/// Resolve the active context window for `(endpoint, model_id)`.
+///
+/// Order: user-provided custom_models[].context_length > cached /models
+/// entry > pattern-match against well-known model families > fallback.
 pub fn resolve_context_length(
     settings: &Settings,
     endpoint_name: &str,
@@ -71,7 +76,59 @@ pub fn resolve_context_length(
         }
     }
 
+    // 3. Pattern-match against known model families. Direct providers don't
+    //    expose /models or return context_length, so without this the UI bar
+    //    shows nonsense like "60K / 16K = 375 %" for a real 128K-context call.
+    if let Some(n) = guess_context_from_name(model_id) {
+        return n;
+    }
+
     FALLBACK_CONTEXT_LENGTH
+}
+
+/// Best-effort context-length lookup from a model id string. Tuned for the
+/// providers our users actually hit. Update as new families ship.
+fn guess_context_from_name(model_id: &str) -> Option<u32> {
+    let id = model_id.to_lowercase();
+    let id = id.split('/').last().unwrap_or(&id); // strip vendor prefix if any
+
+    // Anthropic Claude family — 200K across the board for current models
+    if id.contains("claude") {
+        return Some(200_000);
+    }
+
+    // Google Gemini — 1M+ for Pro, 1M for Flash
+    if id.contains("gemini") {
+        if id.contains("pro") { return Some(2_000_000); }
+        return Some(1_000_000);
+    }
+
+    // DeepSeek family
+    if id.starts_with("deepseek") {
+        if id.contains("v4") { return Some(131_072); }
+        if id.contains("v3") || id.contains("chat") || id.contains("reasoner") {
+            return Some(65_536);
+        }
+        return Some(65_536);
+    }
+
+    // OpenAI family
+    if id.starts_with("gpt-4") || id.contains("gpt-4o") || id.contains("o1") || id.contains("o3") {
+        return Some(128_000);
+    }
+    if id.starts_with("gpt-3.5") {
+        return Some(16_385);
+    }
+
+    // Qwen / Yi / Llama large-context — common Chinese-vendor families
+    if id.contains("qwen") || id.contains("yi-") {
+        return Some(128_000);
+    }
+    if id.contains("llama-3") || id.contains("llama3") {
+        return Some(128_000);
+    }
+
+    None
 }
 
 /// Quick char→token estimate. Real BPE tokenization varies 1.0-1.5×
