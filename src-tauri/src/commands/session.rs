@@ -94,7 +94,49 @@ pub async fn update_session_model(
         .bind(&session_id)
         .fetch_one(&*pool)
         .await?;
+
+    // Mirror the choice to the endpoint's active_model so it persists across
+    // app restarts AND survives the user switching to a different endpoint
+    // and back — the bug we're fixing in this release.
+    {
+        let mut settings = state.settings.write().await;
+        let endpoint_name = settings.default_endpoint.clone();
+        if settings.set_active_model(&endpoint_name, &model_id) {
+            // Best-effort persist — failure here doesn't undo the DB write.
+            if let Err(e) = crate::config::settings::save(&settings) {
+                tracing::warn!("Failed to persist active_model: {e}");
+            }
+        }
+    }
+
     Ok(session)
+}
+
+/// Explicit endpoint-scoped model setter. Used by the ModelPicker when the
+/// user picks a model without an active session, and by Settings when the
+/// user changes their default per-endpoint.
+#[tauri::command]
+pub async fn set_endpoint_active_model(
+    endpoint_name: String,
+    model_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    let mut settings = state.settings.write().await;
+    if settings.set_active_model(&endpoint_name, &model_id) {
+        crate::config::settings::save(&settings)?;
+    }
+    Ok(())
+}
+
+/// Read the active model for a given endpoint. Used by the frontend to
+/// auto-update the picker when the user switches endpoints.
+#[tauri::command]
+pub async fn get_endpoint_active_model(
+    endpoint_name: String,
+    state: State<'_, AppState>,
+) -> Result<String, AppError> {
+    let settings = state.settings.read().await;
+    Ok(settings.active_model_for(&endpoint_name))
 }
 
 #[tauri::command]

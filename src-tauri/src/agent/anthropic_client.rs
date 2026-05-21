@@ -43,6 +43,10 @@ pub async fn stream_anthropic(
 ) -> Result<AnthropicResponse> {
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
 
+    // Same prefix-stripping safeguard as the OpenAI path — see normalize_model_id
+    // doc-comment for why this is here.
+    let model = crate::config::settings::normalize_model_id(model, base_url);
+
     let anthropic_tools = openai_tools_to_anthropic(tools);
 
     let body = serde_json::json!({

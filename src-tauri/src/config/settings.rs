@@ -74,6 +74,15 @@ pub struct Endpoint {
     /// /models list when the user opens the model picker.
     #[serde(default)]
     pub custom_models: Vec<CustomModel>,
+    /// The model the user currently has selected when this endpoint is
+    /// active. Each endpoint remembers its own choice so switching
+    /// endpoints doesn't carry an incompatible model id along.
+    ///
+    /// Optional for backward compatibility — the migration in
+    /// [`load`] back-fills this from the legacy top-level `default_model`
+    /// for whichever endpoint was the default at the time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +120,7 @@ impl Default for Settings {
                 key_ref: Some("codefactory.endpoint.openrouter".into()),
                 api_style: ApiStyle::Openai,
                 custom_models: vec![],
+                active_model: Some("anthropic/claude-opus-4-7".into()),
             },
         );
         Self {
@@ -188,10 +198,96 @@ pub fn load() -> Settings {
         }
     }
 
-    std::fs::read_to_string(&new_path)
+    let mut settings: Settings = std::fs::read_to_string(&new_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    // Schema migration v0.3.5 -> v0.3.6:
+    //   Promote the legacy top-level `default_model` into the matching
+    //   endpoint's `active_model` field (per-endpoint model selection).
+    //   Only fills endpoints that don't already have one — never
+    //   overwrites a user choice.
+    let legacy_default = settings.default_model.clone();
+    let default_ep = settings.default_endpoint.clone();
+    if let Some(ep) = settings.endpoints.get_mut(&default_ep) {
+        if ep.active_model.is_none() && !legacy_default.is_empty() {
+            ep.active_model = Some(legacy_default);
+        }
+    }
+    // For every other endpoint that has no active_model yet, leave it
+    // None — the resolver will fall back to "first custom_model or
+    // first remote model" when the user switches there.
+
+    settings
+}
+
+impl Settings {
+    /// Resolve the active model id for a given endpoint.
+    ///
+    /// Order of precedence:
+    /// 1. The endpoint's own `active_model` field (preferred — per-endpoint memory)
+    /// 2. The endpoint's first `custom_models` entry (user knows it exists)
+    /// 3. The legacy top-level `default_model` (back-compat only)
+    /// 4. Empty string (caller must handle "no model" UI)
+    ///
+    /// Never returns an OpenRouter-prefixed id for a non-OpenRouter endpoint
+    /// when one isn't appropriate — but normalisation of arbitrary ids is
+    /// the caller's job (see [`normalize_model_id`]).
+    pub fn active_model_for(&self, endpoint_name: &str) -> String {
+        if let Some(ep) = self.endpoints.get(endpoint_name) {
+            if let Some(m) = &ep.active_model {
+                if !m.is_empty() {
+                    return m.clone();
+                }
+            }
+            if let Some(first) = ep.custom_models.first() {
+                return first.id.clone();
+            }
+        }
+        if !self.default_model.is_empty() {
+            return self.default_model.clone();
+        }
+        String::new()
+    }
+
+    /// Set the active model for an endpoint. Returns true if anything changed.
+    pub fn set_active_model(&mut self, endpoint_name: &str, model_id: &str) -> bool {
+        if let Some(ep) = self.endpoints.get_mut(endpoint_name) {
+            if ep.active_model.as_deref() != Some(model_id) {
+                ep.active_model = Some(model_id.to_string());
+                // Mirror to the legacy field when this is the active endpoint
+                // so older code reading `default_model` still sees a sane value.
+                if endpoint_name == self.default_endpoint {
+                    self.default_model = model_id.to_string();
+                }
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Strip an OpenRouter-style `vendor/` prefix from a model id when the
+/// target endpoint isn't OpenRouter. Direct provider APIs (DeepSeek,
+/// Anthropic, OpenAI, etc.) reject ids like `deepseek/deepseek-v4-pro`
+/// because the leading vendor segment is OpenRouter's own routing
+/// convention, not part of the canonical model name.
+///
+/// Safety: only strips when there's a clear vendor prefix AND the URL
+/// isn't openrouter.ai. Pass-through for everything else, including
+/// ids that legitimately contain slashes downstream of the vendor part.
+pub fn normalize_model_id(model_id: &str, base_url: &str) -> String {
+    if base_url.contains("openrouter.ai") {
+        return model_id.to_string();
+    }
+    // Only strip the very first segment; preserve everything after.
+    if let Some((_, rest)) = model_id.split_once('/') {
+        if !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
+    model_id.to_string()
 }
 
 pub fn save(settings: &Settings) -> crate::errors::Result<()> {

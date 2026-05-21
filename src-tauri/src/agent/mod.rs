@@ -436,8 +436,15 @@ impl AgentLoop {
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>)> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
+        // Strip OpenRouter-style "vendor/" prefix when talking to a direct
+        // provider API. Defensive against ids that linger from earlier
+        // OpenRouter use after the user switches endpoint.
+        let outbound_model = crate::config::settings::normalize_model_id(
+            &self.model_id, &self.base_url,
+        );
+
         let req = ChatRequest {
-            model: self.model_id.clone(),
+            model: outbound_model,
             messages: messages.to_vec(),
             tools: Some(tool_defs.to_vec()),
             tool_choice: Some(serde_json::json!("auto")),

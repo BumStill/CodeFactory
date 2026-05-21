@@ -146,6 +146,8 @@ pub fn run() {
             commands::session::get_session,
             commands::session::delete_session,
             commands::session::update_session_model,
+            commands::session::set_endpoint_active_model,
+            commands::session::get_endpoint_active_model,
             commands::session::update_session_title,
             commands::session::get_messages,
             commands::chat::send_message,

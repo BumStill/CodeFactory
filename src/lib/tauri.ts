@@ -76,6 +76,10 @@ export interface Endpoint {
   key_ref?: string;
   api_style: ApiStyle;
   custom_models?: CustomModel[];
+  /** Per-endpoint remembered model selection — set when the user picks one
+   * in the ModelPicker or Settings. Auto-applies on endpoint switch so the
+   * previous endpoint's id (often vendor-prefixed) doesn't carry over. */
+  active_model?: string;
 }
 
 export interface Settings {

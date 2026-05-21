@@ -631,6 +631,18 @@ export function SettingsPage({ onBack }: Props) {
 
   const handleSaveGeneral = async () => {
     if (!generalDraft) return;
+
+    // Also persist as the active endpoint's per-endpoint model so the choice
+    // sticks even when the user switches default_endpoint and back.
+    try {
+      await invoke("set_endpoint_active_model", {
+        endpointName: settings.default_endpoint,
+        modelId: generalDraft.default_model,
+      });
+    } catch (e) {
+      console.warn("set_endpoint_active_model failed", e);
+    }
+
     await save({
       ...settings,
       default_model: generalDraft.default_model,

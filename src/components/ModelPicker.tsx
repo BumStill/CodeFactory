@@ -3,18 +3,29 @@ import { useState, useRef, useEffect } from "react";
 import { ChevronDown, Sparkles } from "lucide-react";
 import { useChatStore } from "../stores/chat";
 import { useSettingsStore } from "../stores/settings";
+import { invoke } from "../lib/tauri";
 
 export function ModelPicker() {
-  const { models, activeModel, updateActiveSessionModel, loadModels } = useChatStore();
-  const { settings } = useSettingsStore();
+  const { models, activeModel, updateActiveSessionModel, loadModels, setModel } = useChatStore();
+  const { settings, load: reloadSettings } = useSettingsStore();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const ref = useRef<HTMLDivElement>(null);
 
-  // Reload model list whenever the active endpoint changes
+  // When the active endpoint changes:
+  //   1. Reload the model list for that endpoint
+  //   2. Pull the endpoint's remembered active_model and swap the chat
+  //      store to it — so we don't carry over a vendor-prefixed id from a
+  //      previous OpenRouter session into a direct-DeepSeek run, which
+  //      was the root cause of the v0.3.5 400 reports.
   useEffect(() => {
     const ep = settings?.default_endpoint ?? "openrouter";
     loadModels(ep);
+    invoke<string>("get_endpoint_active_model", { endpointName: ep })
+      .then((m) => {
+        if (m && m !== activeModel) setModel(m);
+      })
+      .catch(() => { /* first run / endpoint without a saved model */ });
   }, [settings?.default_endpoint]);
 
   useEffect(() => {
@@ -67,7 +78,18 @@ export function ModelPicker() {
                   className={`flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-xs hover:bg-surface-3 transition-colors ${
                     m.id === activeModel ? "text-accent" : "text-gray-300"
                   }`}
-                  onClick={() => { updateActiveSessionModel(m.id); setOpen(false); }}
+                  onClick={async () => {
+                    const ep = settings?.default_endpoint ?? "openrouter";
+                    // Persist as the endpoint's active model so the choice
+                    // survives endpoint switches and app restarts.
+                    await invoke("set_endpoint_active_model", {
+                      endpointName: ep,
+                      modelId: m.id,
+                    }).catch(() => { /* best-effort */ });
+                    updateActiveSessionModel(m.id);
+                    await reloadSettings(); // pull fresh endpoint state
+                    setOpen(false);
+                  }}
                   title={m.id}
                 >
                   {m.is_custom && (
