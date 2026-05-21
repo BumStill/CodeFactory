@@ -5,11 +5,14 @@ import type { Components } from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
 import { Check, Copy, ChevronDown } from "lucide-react";
 import { ToolCallCard } from "./ToolCallCard";
+import { WelcomeScreen } from "./WelcomeScreen";
 import type { UIMessage } from "../stores/chat";
 
 interface Props {
   messages: UIMessage[];
   streaming: boolean;
+  /** Called when the user picks an example prompt from the welcome screen. */
+  onUsePrompt?: (text: string) => void;
 }
 
 // ── Shiki singleton ──────────────────────────────────────────────────────────
@@ -207,18 +210,11 @@ function TypingDots() {
 }
 
 // ── Main component ───────────────────────────────────────────────────────────
-export function MessageList({ messages, streaming }: Props) {
+export function MessageList({ messages, streaming, onUsePrompt }: Props) {
   const { scrollerRef, sentinelRef, pinned, jumpToBottom } = useStickyAutoScroll();
 
   if (messages.length === 0) {
-    return (
-      <div className="flex flex-1 items-center justify-center text-gray-600 select-none">
-        <div className="text-center space-y-1">
-          <div className="text-2xl font-semibold text-gray-500">CodeFactory</div>
-          <div className="text-sm">Start a conversation or open a project folder</div>
-        </div>
-      </div>
-    );
+    return <WelcomeScreen onUsePrompt={onUsePrompt} />;
   }
 
   const visible = messages.filter((m) => m.role !== "tool" && m.role !== "system");
