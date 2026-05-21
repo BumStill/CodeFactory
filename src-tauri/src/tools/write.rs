@@ -2,7 +2,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{file_lock, unified_diff_for_path, ExecCtx, ToolOutput};
+use super::{file_lock, path_sanity, unified_diff_for_path, ExecCtx, ToolOutput};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
@@ -41,6 +41,14 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     };
 
     let path = ctx.cwd.join(&a.path);
+
+    // Hallucinated-path guard: catch obvious typos against existing siblings
+    // before any IO. Returns a corrective suggestion so the model can retry
+    // with the right path on the next turn. Genuine new directories with
+    // distinct names (no near-neighbour) sail through.
+    if let Some(s) = path_sanity::check(&path) {
+        return Ok(ToolOutput::err(path_sanity::format_error(&s, &path, "write_file")));
+    }
 
     // Serialise read+write per-file so a parallel edit on the same file can't
     // race with us. Different files still run fully in parallel.

@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 
-use super::{ExecCtx, ToolOutput};
+use super::{path_sanity, ExecCtx, ToolOutput};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
@@ -44,10 +44,15 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) => {
+            // If the path doesn't exist, see if it looks like a typo of a
+            // real file and suggest the correction in the error.
+            if let Some(s) = path_sanity::check(&path) {
+                return Ok(ToolOutput::err(path_sanity::format_error(&s, &path, "read_file")));
+            }
             return Ok(ToolOutput::err(format!(
                 "Cannot open {}: {e}",
                 path.display()
-            )))
+            )));
         }
     };
 

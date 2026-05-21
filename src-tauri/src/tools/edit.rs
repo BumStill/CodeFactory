@@ -2,7 +2,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{file_lock, unified_diff_for_path, ExecCtx, ToolOutput};
+use super::{file_lock, path_sanity, unified_diff_for_path, ExecCtx, ToolOutput};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
@@ -55,10 +55,15 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let original = match tokio::fs::read_to_string(&path).await {
         Ok(s) => s,
         Err(e) => {
+            // Typo-detection: catch hallucinated paths early with a useful
+            // correction instead of a bare "file not found".
+            if let Some(s) = path_sanity::check(&path) {
+                return Ok(ToolOutput::err(path_sanity::format_error(&s, &path, "edit_file")));
+            }
             return Ok(ToolOutput::err(format!(
                 "Cannot read {}: {e}",
                 path.display()
-            )))
+            )));
         }
     };
 
