@@ -50,8 +50,13 @@ pub fn definition() -> ToolDefinition {
 }
 
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
-    let Ok(a) = serde_json::from_value::<Args>(args) else {
-        return Ok(ToolOutput::err("Invalid arguments"));
+    let a: Args = match serde_json::from_value(args.clone()) {
+        Ok(v) => v,
+        Err(e) => return Ok(ToolOutput::err(format!(
+            "Invalid arguments for bash: {e}. Received: {}",
+            serde_json::to_string(&args).unwrap_or_else(|_| "<unprintable>".into())
+                .chars().take(300).collect::<String>(),
+        ))),
     };
 
     let cmd_lower = a.command.to_lowercase();

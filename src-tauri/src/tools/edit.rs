@@ -36,8 +36,13 @@ pub fn definition() -> ToolDefinition {
 }
 
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
-    let Ok(a) = serde_json::from_value::<Args>(args) else {
-        return Ok(ToolOutput::err("Invalid arguments"));
+    let a: Args = match serde_json::from_value(args.clone()) {
+        Ok(v) => v,
+        Err(e) => return Ok(ToolOutput::err(format!(
+            "Invalid arguments for edit_file: {e}. Received: {}",
+            serde_json::to_string(&args).unwrap_or_else(|_| "<unprintable>".into())
+                .chars().take(300).collect::<String>(),
+        ))),
     };
 
     let path = ctx.cwd.join(&a.path);
@@ -75,7 +80,21 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         original.replacen(&a.old_string, &a.new_string, 1)
     };
 
-    file_lock::atomic_write(&path, updated.as_bytes()).await?;
+    let expected_bytes = updated.as_bytes();
+    file_lock::atomic_write(&path, expected_bytes).await?;
+
+    // Read-back integrity check (see write.rs for rationale).
+    let actual = tokio::fs::read(&path).await?;
+    if actual != expected_bytes {
+        return Ok(ToolOutput::err(format!(
+            "edit_file integrity check failed for {}: expected {} bytes, found {} bytes. \
+             Re-issue the edit.",
+            path.display(),
+            expected_bytes.len(),
+            actual.len(),
+        )));
+    }
+
     let diff = unified_diff_for_path(&a.path, &original, &updated);
     Ok(ToolOutput::ok(format!(
         "Edited {}\n\n```diff\n{diff}```",

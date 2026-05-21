@@ -31,8 +31,13 @@ pub fn definition() -> ToolDefinition {
 }
 
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
-    let Ok(a) = serde_json::from_value::<Args>(args) else {
-        return Ok(ToolOutput::err("Invalid arguments"));
+    let a: Args = match serde_json::from_value(args.clone()) {
+        Ok(v) => v,
+        Err(e) => return Ok(ToolOutput::err(format!(
+            "Invalid arguments for write_file: {e}. Received: {}",
+            serde_json::to_string(&args).unwrap_or_else(|_| "<unprintable>".into())
+                .chars().take(300).collect::<String>(),
+        ))),
     };
 
     let path = ctx.cwd.join(&a.path);
@@ -45,7 +50,26 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 
     // atomic_write handles mkdir, write to temp file, and atomic rename with
     // Windows sharing-violation retry.
-    file_lock::atomic_write(&path, a.content.as_bytes()).await?;
+    let expected_bytes = a.content.as_bytes();
+    file_lock::atomic_write(&path, expected_bytes).await?;
+
+    // Read back and verify byte-for-byte. The user reported a class of bugs
+    // where write_file appeared to succeed but the on-disk content was
+    // missing characters / had stray edits. Most root causes were upstream
+    // (SSE chunk truncation, since fixed), but a post-write hash check is
+    // cheap insurance and produces an actionable error instead of silent
+    // corruption when it does happen.
+    let actual = tokio::fs::read(&path).await?;
+    if actual != expected_bytes {
+        return Ok(ToolOutput::err(format!(
+            "write_file integrity check failed for {}: expected {} bytes, found {} bytes on disk. \
+             This usually means the upstream tool-call arguments arrived corrupted. \
+             Re-issue the write with the exact content.",
+            path.display(),
+            expected_bytes.len(),
+            actual.len(),
+        )));
+    }
 
     let diff = unified_diff_for_path(&a.path, &original, &a.content);
     Ok(ToolOutput::ok(format!(
