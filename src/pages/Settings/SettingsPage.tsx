@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ArrowLeft, Plus, Trash2, Eye, EyeOff, Check, AlertCircle, ChevronDown,
 } from "lucide-react";
@@ -411,86 +411,6 @@ function AddEndpointModal({
   );
 }
 
-// ── Inline model selector for General tab ─────────────────────────────────────
-
-interface ModelSelectorProps {
-  value: string;
-  endpointName: string;
-  onChange: (id: string) => void;
-}
-
-function ModelSelector({ value, endpointName, onChange }: ModelSelectorProps) {
-  const [models, setModels] = useState<Array<{ id: string; name: string }>>([]);
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState("");
-  const [loading, setLoading] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-
-  // Load model list when dropdown opens (or endpoint changes)
-  useEffect(() => {
-    setLoading(true);
-    invoke<Array<{ id: string; name: string }>>("list_models", { endpointName })
-      .then(setModels)
-      .catch(() => setModels([]))
-      .finally(() => setLoading(false));
-  }, [endpointName]);
-
-  useEffect(() => {
-    const close = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", close);
-    return () => document.removeEventListener("mousedown", close);
-  }, []);
-
-  const displayed = value.split("/").pop() || value || "Select model…";
-  const filtered = models.filter(
-    (m) => !query || m.id.toLowerCase().includes(query.toLowerCase()) || m.name.toLowerCase().includes(query.toLowerCase())
-  );
-
-  return (
-    <div ref={ref} className="relative">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center justify-between gap-2 bg-surface-3 border border-border rounded px-3 py-1.5 text-xs text-gray-200 hover:border-accent/40 transition-colors"
-      >
-        <span className="truncate text-left">{displayed}</span>
-        <ChevronDown size={12} className="flex-shrink-0 text-gray-500" />
-      </button>
-      {open && (
-        <div className="absolute left-0 top-full mt-1 z-50 w-full rounded-lg border border-border bg-surface-2 shadow-xl">
-          <div className="p-2 border-b border-border">
-            <input
-              autoFocus
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search models…"
-              className="w-full bg-surface-3 rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none"
-            />
-          </div>
-          <ul className="max-h-56 overflow-y-auto py-1">
-            {loading && <li className="px-3 py-2 text-xs text-gray-600">Loading…</li>}
-            {!loading && filtered.length === 0 && (
-              <li className="px-3 py-2 text-xs text-gray-600">No models found</li>
-            )}
-            {filtered.slice(0, 60).map((m) => (
-              <li key={m.id}>
-                <button
-                  className={`w-full text-left px-3 py-1.5 text-xs hover:bg-surface-3 transition-colors truncate ${
-                    m.id === value ? "text-accent" : "text-gray-300"
-                  }`}
-                  onClick={() => { onChange(m.id); setQuery(""); setOpen(false); }}
-                >
-                  {m.id}
-                </button>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </div>
-  );
-}
 
 // ── Main Settings Page ────────────────────────────────────────────────────────
 
@@ -632,34 +552,15 @@ export function SettingsPage({ onBack }: Props) {
   const handleSaveGeneral = async () => {
     if (!generalDraft) return;
 
-    // Also persist as the active endpoint's per-endpoint model so the choice
-    // sticks even when the user switches default_endpoint and back.
-    try {
-      await invoke("set_endpoint_active_model", {
-        endpointName: settings.default_endpoint,
-        modelId: generalDraft.default_model,
-      });
-    } catch (e) {
-      console.warn("set_endpoint_active_model failed", e);
-    }
-
+    // We dropped the "Default Model" UI control; model selection is fully
+    // per-endpoint now (see ModelPicker in the chat header). Only shell +
+    // auto_create_pr remain on this tab. Keep default_model untouched in
+    // settings.json — it stays as a back-compat fallback for Settings::active_model_for.
     await save({
       ...settings,
-      default_model: generalDraft.default_model,
       shell: { shell: generalDraft.shell },
       auto_create_pr: generalDraft.auto_create_pr,
     } as Settings & { auto_create_pr: boolean });
-
-    // Sync to chat store: if no active session, update the displayed model immediately;
-    // if there is an active session, only update if user is still on the default
-    // (i.e. the session model matches the old default, meaning they haven't customised it).
-    const chatState = useChatStore.getState();
-    if (!chatState.activeSession) {
-      chatState.setModel(generalDraft.default_model);
-    } else if (chatState.activeModel === settings.default_model) {
-      // Session was still using the global default — follow the change
-      chatState.setModel(generalDraft.default_model);
-    }
 
     setGeneralSaved(true);
     setTimeout(() => setGeneralSaved(false), 1500);
@@ -808,16 +709,10 @@ export function SettingsPage({ onBack }: Props) {
               General
             </h2>
 
-            <div className="space-y-1">
-              <label className="text-xs text-gray-500">Default Model</label>
-              <ModelSelector
-                value={generalDraft.default_model}
-                endpointName={settings.default_endpoint}
-                onChange={(id) => setGeneralDraft({ ...generalDraft, default_model: id })}
-              />
-              <p className="text-[11px] text-gray-600">
-                Used when creating a new session. Existing sessions keep their own model.
-              </p>
+            <div className="rounded-lg border border-border bg-surface-1 px-3 py-2.5 text-[11px] text-gray-500 leading-5">
+              <span className="text-gray-300 font-medium">Active model</span> is now per-endpoint.
+              Pick it from the model dropdown in the chat header — each endpoint
+              remembers its own choice. Manage endpoints in the <span className="text-gray-300">Endpoints</span> tab.
             </div>
 
             <div className="space-y-1">

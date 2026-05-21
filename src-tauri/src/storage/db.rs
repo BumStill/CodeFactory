@@ -148,3 +148,118 @@ async fn ensure_column(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    /// Synthesise the exact "old user DB" shape from the v0.3.7 regression:
+    /// `messages` table predates the `reasoning_content` column, but the
+    /// Message struct expects it. This test reproduces the bug and asserts
+    /// that `ensure_schema` repairs the schema in place.
+    #[tokio::test]
+    async fn ensure_schema_recovers_pre_reasoning_messages_table() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+
+        // Old schema: messages without tool_calls or reasoning_content columns.
+        sqlx::query(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                role TEXT,
+                content TEXT,
+                model_id TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                created_at INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Seed a row so the post-sync SELECT * has something to find.
+        sqlx::query("INSERT INTO messages (id, session_id, role, content, created_at) VALUES ('m1','s1','user','hi',1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        ensure_schema(&pool).await.expect("ensure_schema OK");
+
+        // The repaired schema must expose both the columns the app code
+        // requires today — otherwise SELECT * → struct FromRow blows up
+        // exactly like in production.
+        let cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('messages')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(cols.contains(&"tool_calls".to_string()),
+            "ensure_schema must add tool_calls column. Got: {cols:?}");
+        assert!(cols.contains(&"reasoning_content".to_string()),
+            "ensure_schema must add reasoning_content column. Got: {cols:?}");
+
+        // The seeded row's data must survive the ALTER TABLE.
+        let role: String = sqlx::query_scalar("SELECT role FROM messages WHERE id='m1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(role, "user");
+    }
+
+    /// ensure_schema must be safe to run twice — startup may execute it on
+    /// every launch.
+    #[tokio::test]
+    async fn ensure_schema_is_idempotent() {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE messages (id TEXT)").execute(&pool).await.unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+
+        let cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('messages')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        // No duplicate columns (sqlite would have errored if we double-added).
+        assert_eq!(
+            cols.iter().filter(|c| *c == "reasoning_content").count(),
+            1
+        );
+    }
+
+    /// Fresh-install path: ensure_schema must also create the satellite
+    /// tables the application uses but that aren't in 0001_init.sql any
+    /// more (cost_entries, task_runs, task_dependencies).
+    #[tokio::test]
+    async fn ensure_schema_creates_satellite_tables_on_fresh_db() {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // No tables at all — pretend this is a brand-new DB created after
+        // 0001_init.sql ran.
+        sqlx::query("CREATE TABLE messages (id TEXT)").execute(&pool).await.unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+
+        for table in ["cost_entries", "task_runs", "task_dependencies"] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(exists, 1, "ensure_schema must create {table}");
+        }
+    }
+}

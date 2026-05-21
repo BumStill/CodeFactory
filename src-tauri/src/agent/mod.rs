@@ -3,6 +3,7 @@ pub mod anthropic_client;
 pub mod context;
 pub mod hooks;
 pub mod scheduler;
+pub mod sse_buffer;
 pub mod subagent;
 pub mod verification;
 
