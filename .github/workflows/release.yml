@@ -35,6 +35,10 @@ jobs:
           {
             echo 'content<<RELEASE_NOTES_EOF'
             cat RELEASE_NOTES.md
+            # Trailing newline if the file didn't end with one — otherwise
+            # the delimiter line below gets concatenated onto the last
+            # content line and GHA fails with "matching delimiter not found".
+            [ -n "$(tail -c 1 RELEASE_NOTES.md)" ] && echo
             echo 'RELEASE_NOTES_EOF'
           } >> "$GITHUB_OUTPUT"
           echo "---- preview ----"
