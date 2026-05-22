@@ -150,19 +150,33 @@ const markdownComponents: Components = {
 };
 
 // ── Stick-to-bottom auto-scroll ──────────────────────────────────────────────
-// Behavior:
-//   - Near bottom (< 60px): instant scroll-to-bottom on content growth.
+// Behaviour:
+//   - Near bottom (< 60px): instant scroll-to-bottom whenever content grows.
 //   - Scrolled up: hands-off; show a "Jump to latest" floating button.
-// Uses ResizeObserver on a sentinel div, so it fires on actual DOM height
-// changes (per-token streaming, shiki async highlight, image loads), not just
-// when React's `messages` reference changes.
-function useStickyAutoScroll() {
+//   - Switching to another session: always jump to the bottom (the previous
+//     session's "scrolled-up" state must not leak across).
+//
+// Implementation notes:
+//   - We use MutationObserver on the scroller's subtree, not ResizeObserver
+//     on a sentinel. Sentinels never change their own dimensions when content
+//     above grows, so a ResizeObserver on the sentinel never fired — the
+//     symptom users hit was "stream output doesn't follow scrolling".
+//   - MutationObserver with subtree + characterData catches every per-token
+//     content mutation as well as new message blocks getting appended.
+//   - `conversationKey` lets the caller signal a hard session boundary so we
+//     reset pin state and scroll to the bottom unconditionally.
+function useStickyAutoScroll(conversationKey: string | null) {
   const scrollerRef = useRef<HTMLDivElement>(null);
-  const sentinelRef = useRef<HTMLDivElement>(null);
   const [pinned, setPinned] = useState(true);
   const pinnedRef = useRef(true);
   pinnedRef.current = pinned;
 
+  // Track which conversation we're currently rendering. When this changes
+  // we treat it as a fresh viewport: re-pin and snap to the bottom on the
+  // next paint.
+  const prevKeyRef = useRef<string | null>(null);
+
+  // User scroll handler — manages pin state only.
   useEffect(() => {
     const el = scrollerRef.current;
     if (!el) return;
@@ -174,19 +188,50 @@ function useStickyAutoScroll() {
     return () => el.removeEventListener("scroll", onScroll);
   }, []);
 
+  // Content-growth observer — fires on any DOM mutation inside the scroller.
   useLayoutEffect(() => {
     const scroller = scrollerRef.current;
-    const sentinel = sentinelRef.current;
-    if (!scroller || !sentinel) return;
+    if (!scroller) return;
 
-    const obs = new ResizeObserver(() => {
+    const stickToBottom = () => {
       if (pinnedRef.current) {
         scroller.scrollTop = scroller.scrollHeight;
       }
+    };
+
+    const obs = new MutationObserver(stickToBottom);
+    obs.observe(scroller, {
+      childList: true,
+      subtree: true,
+      characterData: true,
     });
-    obs.observe(sentinel);
+
+    // Initial paint: snap to bottom so reloaded conversations land at the
+    // latest message instead of at the top.
+    requestAnimationFrame(stickToBottom);
+
     return () => obs.disconnect();
   }, []);
+
+  // Session-switch effect: force re-pin and jump to bottom when the
+  // conversation identity changes. Runs after the new messages have been
+  // committed to the DOM so scrollHeight reflects them.
+  useLayoutEffect(() => {
+    if (prevKeyRef.current === conversationKey) return;
+    prevKeyRef.current = conversationKey;
+    const el = scrollerRef.current;
+    if (!el) return;
+    setPinned(true);
+    pinnedRef.current = true;
+    // Two RAFs: first for the layout, second for any post-layout shiki
+    // highlight that bumped heights a hair more.
+    requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+      requestAnimationFrame(() => {
+        el.scrollTop = el.scrollHeight;
+      });
+    });
+  }, [conversationKey]);
 
   const jumpToBottom = useCallback(() => {
     const el = scrollerRef.current;
@@ -195,7 +240,7 @@ function useStickyAutoScroll() {
     setPinned(true);
   }, []);
 
-  return { scrollerRef, sentinelRef, pinned, jumpToBottom };
+  return { scrollerRef, pinned, jumpToBottom };
 }
 
 // ── Typing dots — replaces the block cursor ──────────────────────────────────
@@ -211,7 +256,12 @@ function TypingDots() {
 
 // ── Main component ───────────────────────────────────────────────────────────
 export function MessageList({ messages, streaming, onUsePrompt }: Props) {
-  const { scrollerRef, sentinelRef, pinned, jumpToBottom } = useStickyAutoScroll();
+  // Use the first message's id as the conversation identity. Different
+  // sessions have different first messages → the scroll hook treats it as a
+  // session change and re-pins to the bottom. Empty list → null (fine; no
+  // scroller rendered anyway).
+  const conversationKey = messages[0]?.id ?? null;
+  const { scrollerRef, pinned, jumpToBottom } = useStickyAutoScroll(conversationKey);
 
   if (messages.length === 0) {
     return <WelcomeScreen onUsePrompt={onUsePrompt} />;
@@ -234,7 +284,6 @@ export function MessageList({ messages, streaming, onUsePrompt }: Props) {
             isStreamingTail={streaming && msg.id === lastAssistantId}
           />
         ))}
-        <div ref={sentinelRef} aria-hidden className="h-0" />
       </div>
 
       {!pinned && (
