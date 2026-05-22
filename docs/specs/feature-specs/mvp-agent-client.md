@@ -10,7 +10,7 @@
 | CF-MVP-R1 | 能像 Claude Code 一样在本地项目里工作 | 会话绑定 cwd，并允许模型读取、搜索、理解项目上下文 | desktop-ui + tauri-backend + tool-runtime | 读取真实测试项目，断言 cwd、文件列表和上下文摘要字段 | planning |
 | CF-MVP-R2 | 模型层接 OpenRouter，可切换模型 | 支持模型列表、模型选择、chat completions、SSE 流式输出和 usage 统计 | desktop-ui + tauri-backend + openrouter-api | 代表性响应样本断言 model route、delta、tool_calls、usage/cost | development |
 | CF-MVP-R3 | 本地 Agent 能读写文件和跑命令 | 工具系统支持读、写、编辑、搜索、列目录和受控命令执行 | tool-runtime + desktop-ui | 工具 route selection、权限决策、输出字段和失败路径测试 | development |
-| CF-MVP-R4 | 所有破坏性操作可控可审计 | 写文件、编辑、命令执行默认 ask，危险命令 deny，工具调用入库 | desktop-ui + tauri-backend + sqlite-store | 权限弹窗截图、deny/ask/allow 字段断言、审计记录断言 | qa |
+| CF-MVP-R4 | 所有破坏性操作可控可审计 | 写文件、编辑、命令执行默认 ask，危险命令 deny；高风险 shell 命令在 Full access mode 下仍必须 ask；工具调用入库 | desktop-ui + tauri-backend + sqlite-store | 权限弹窗截图、deny/ask/allow 字段断言、shell 审计字段断言、审计记录断言 | qa |
 | CF-MVP-R6 | 用户需要在可信项目里减少权限确认打断 | 提供 Full access mode，开启后绕过配置型 ask 提示，但仍强制执行 hard deny、危险命令 deny 和 cwd 边界，并在 UI 中清楚标识风险 | desktop-ui + tauri-backend + tool-runtime | 权限策略单测、cwd 越界失败测试、设置 UI 截图、权限事件归并测试 | qa |
 | CF-MVP-R5 | Windows 原生发布可验证 | 可构建 Windows 安装包并安装后跑通主路径 smoke | release-artifact + desktop-ui | 安装包版本、签名状态、启动、build metadata、主路径 live verification | release |
 
@@ -34,6 +34,8 @@ P1: 用户打开 CodeFactory，选择项目工作目录和 OpenRouter 模型，�
 | Failure path | 用户拒绝写文件 | 工具结果返回拒绝，模型收到拒绝观察，不改文件 | 权限字段断言 + 文件未变 |
 | Failure path | 用户开启 Full access mode 后再次发起 ask 工具 | 配置型 ask 提示被绕过，工具仍有卡片和审计状态 | 权限策略单测 + 设置 UI 截图 |
 | Failure path | Full access mode 下工具请求 cwd 外路径或命中危险命令 deny | 工具返回错误，不读取、不搜索、不写入 cwd 外文件，危险命令不执行 | Rust 工具测试 + 权限策略单测 |
+| Failure path | Full access mode 下模型提出高风险 shell 命令 | 系统仍进入 ask 路径；用户未允许前不执行命令 | 权限策略单测 + 权限弹窗证据 |
+| Observation path | bash 命令执行完成 | 工具结果包含 cwd、exit_code、risk 等最小审计字段 | Rust 工具测试 + SQLite/tool result 抽样 |
 | Compatibility path | 旧会话数据库启动 | 自动迁移或明确阻塞，不丢历史消息 | migration 测试 |
 | Release path | 安装包启动后执行 P1 smoke | 版本可见，主窗口可用，主路径通过或记录 blocker | 安装证据 + live verification |
 

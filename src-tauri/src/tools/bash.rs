@@ -6,22 +6,12 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use super::{ExecCtx, ToolOutput};
+use super::{shell_policy, ExecCtx, ToolOutput};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
 const OUTPUT_LIMIT: usize = 30_000;
 const TIMEOUT_SECS: u64 = 120;
-
-// Commands that are always denied regardless of user permissions.
-static DENY_LIST: &[&str] = &[
-    "rm -rf /",
-    "format ",
-    "del /f /s /q c:\\",
-    "reg delete hklm",
-    "shutdown",
-    "rd /s /q c:\\",
-];
 
 #[derive(Deserialize)]
 struct Args {
@@ -64,14 +54,13 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         }
     };
 
-    let cmd_lower = a.command.to_lowercase();
-    for denied in DENY_LIST {
-        if cmd_lower.contains(denied) {
-            return Ok(ToolOutput::err(format!(
-                "Command denied by safety policy: matches '{denied}'"
-            )));
-        }
+    let policy = shell_policy::classify_command(&a.command);
+    if let shell_policy::ShellCommandPolicy::Deny { reason } = policy {
+        return Ok(ToolOutput::err(format!(
+            "Command denied by safety policy: {reason}"
+        )));
     }
+    let risk = policy.risk();
 
     let result = timeout(
         Duration::from_secs(TIMEOUT_SECS),
@@ -98,6 +87,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                 combined.truncate(OUTPUT_LIMIT);
                 combined.push_str("\n[output truncated]");
             }
+            append_audit(&mut combined, &ctx.cwd, output.status.code(), risk);
 
             let is_error = !output.status.success();
             if is_error {
@@ -107,6 +97,18 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             }
         }
     }
+}
+
+fn append_audit(
+    output: &mut String,
+    cwd: &std::path::Path,
+    exit_code: Option<i32>,
+    risk: shell_policy::ShellRisk,
+) {
+    if !output.ends_with('\n') && !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str(&shell_policy::audit_footer(cwd, exit_code, risk));
 }
 
 #[cfg(test)]
@@ -132,5 +134,29 @@ mod tests {
 
         assert!(output.is_error);
         assert!(output.content.contains("Command denied by safety policy"));
+    }
+
+    #[tokio::test]
+    async fn successful_command_output_includes_shell_audit_metadata() {
+        let cwd = std::env::temp_dir().join(format!("codefactory-bash-audit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+
+        let output = execute(
+            json!({
+                "command": "Write-Output 'ok'",
+            }),
+            &ExecCtx { cwd: cwd.clone() },
+        )
+        .await
+        .expect("tool returns output");
+
+        let _ = std::fs::remove_dir_all(cwd);
+
+        assert!(!output.is_error);
+        assert!(output.content.contains("ok"));
+        assert!(output.content.contains("[shell-audit]"));
+        assert!(output.content.contains("risk=low"));
+        assert!(output.content.contains("exit_code=0"));
+        assert!(output.content.contains("cwd="));
     }
 }
