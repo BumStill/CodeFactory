@@ -146,6 +146,45 @@ describe("useStickyAutoScroll", () => {
     expect(handle.scroller.scrollTop).toBe(1800);
   });
 
+  it("ignores the scroll event the browser fires in response to our own programmatic scroll", async () => {
+    // The exact bug we shipped in v0.3.16: every programmatic scrollTop
+    // write makes the browser dispatch a scroll event. Without filtering
+    // it out, onScroll concludes "near bottom → pinned=true", and the
+    // moment the user tries to wheel up the next MutationObserver tick
+    // snaps them right back. The fix is in lastSetScrollTop + the
+    // ignoreScrollUntil window.
+    const { handle } = renderHarness("session-1");
+    setLayout(handle.scroller, { scrollHeight: 3000, clientHeight: 600, scrollTop: 0 });
+    await flushAsync();
+    expect(handle.scroller.scrollTop).toBe(3000);
+
+    // Simulate the browser's auto-fired scroll event echoing the value we
+    // just set. It must NOT flip pinned (we're at the bottom already, but
+    // more importantly the event itself isn't a user signal).
+    await act(async () => { handle.scroller.dispatchEvent(new Event("scroll")); });
+    expect(handle.pinned()).toBe(true);
+
+    // Now the user wheels up — different scrollTop than the one we wrote.
+    // Pinned must flip to false.
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 800, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.pinned()).toBe(false);
+
+    // And the very next MutationObserver tick from streaming content
+    // must NOT yank them back to the bottom.
+    setLayout(handle.scroller, { scrollHeight: 9000, clientHeight: 600 });
+    await act(async () => {
+      const node = document.createElement("p");
+      node.textContent = "more streaming";
+      handle.scroller.appendChild(node);
+    });
+    await flushAsync();
+    expect(handle.scroller.scrollTop).toBe(800);
+    expect(handle.pinned()).toBe(false);
+  });
+
   it("stops auto-scrolling once the user scrolls up", async () => {
     const { handle } = renderHarness("session-1");
     setLayout(handle.scroller, { scrollHeight: 3000, clientHeight: 600, scrollTop: 0 });
