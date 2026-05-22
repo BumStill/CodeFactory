@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
 import { ModelPicker } from "../../components/ModelPicker";
+import { UpdateStatusPill } from "../../components/UpdateStatusPill";
 import { PermissionDialog } from "../../components/PermissionDialog";
 import { FileTree } from "../../components/FileTree";
 import { GitStatusBar } from "../../components/GitStatusBar";
@@ -198,6 +199,7 @@ export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPage
           <span className="text-xs text-gray-600 truncate flex-1">
             {activeSession?.cwd ?? "No project open"}
           </span>
+          <UpdateStatusPill />
           <ModelPicker />
           <button
             onClick={() => setTerminalOpen((o) => !o)}

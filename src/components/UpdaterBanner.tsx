@@ -1,89 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useState } from "react";
-import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
+import { useEffect } from "react";
 import { Download, X, RefreshCw, CheckCircle, AlertCircle } from "lucide-react";
-
-type Phase =
-  | { kind: "idle" }
-  | { kind: "available"; update: Update }
-  | { kind: "downloading"; received: number; total: number | null }
-  | { kind: "installing" }
-  | { kind: "ready" }
-  | { kind: "error"; message: string };
+import { useUpdaterStore } from "../stores/updater";
 
 /**
- * Background updater banner.
- * - On mount: silently checks the configured endpoint
- * - If newer version available: shows a non-blocking banner
- * - User clicks Update → download with progress → install → relaunch
- * - User clicks Dismiss → hidden for this session (re-check next launch)
+ * Floating update banner — appears top-right when a new version is
+ * available. Mounts the global updater poll on first render. Re-checks
+ * automatically every 30 min in addition to the manual button in
+ * Settings → About.
  */
 export function UpdaterBanner() {
-  const [phase, setPhase] = useState<Phase>({ kind: "idle" });
-  const [dismissed, setDismissed] = useState(false);
+  const phase = useUpdaterStore((s) => s.phase);
+  const dismissedVersion = useUpdaterStore((s) => s.dismissedVersion);
+  const initialize = useUpdaterStore((s) => s.initialize);
+  const install = useUpdaterStore((s) => s.install);
+  const dismiss = useUpdaterStore((s) => s.dismiss);
 
-  useEffect(() => {
-    // Skip in dev (updater endpoint isn't reachable for unsigned dev builds anyway).
-    // Use a runtime check via window.__TAURI_INTERNALS__ rather than import.meta.env
-    // so we don't need to wire vite/client types here.
-    if ((import.meta as { env?: { DEV?: boolean } }).env?.DEV) return;
+  useEffect(() => { void initialize(); }, [initialize]);
 
-    let cancelled = false;
-    (async () => {
-      try {
-        const update = await check();
-        if (cancelled) return;
-        if (update?.available) {
-          setPhase({ kind: "available", update });
-        }
-      } catch (err) {
-        // Network errors or no-update-available are silent — don't alarm the user.
-        // Only log so dev can see it via DevTools.
-        console.warn("[updater] check failed:", err);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  if (dismissed) return null;
-  if (phase.kind === "idle") return null;
-
-  const handleInstall = async () => {
-    if (phase.kind !== "available") return;
-    const update = phase.update;
-    try {
-      setPhase({ kind: "downloading", received: 0, total: null });
-      await update.downloadAndInstall((event) => {
-        switch (event.event) {
-          case "Started":
-            setPhase({ kind: "downloading", received: 0, total: event.data.contentLength ?? null });
-            break;
-          case "Progress":
-            setPhase((p) =>
-              p.kind === "downloading"
-                ? { ...p, received: p.received + event.data.chunkLength }
-                : p,
-            );
-            break;
-          case "Finished":
-            setPhase({ kind: "installing" });
-            break;
-        }
-      });
-      setPhase({ kind: "ready" });
-      // Give the user a beat to see "Restarting..." before relaunch
-      setTimeout(() => relaunch().catch(console.error), 800);
-    } catch (err) {
-      setPhase({
-        kind: "error",
-        message: err instanceof Error ? err.message : String(err),
-      });
-    }
-  };
+  // Banner is visible only during user-actionable phases. "checking" /
+  // "up_to_date" / "idle" / "error" stay in the header pill instead so the
+  // banner doesn't flicker every poll cycle.
+  const visible =
+    (phase.kind === "available" && phase.update.version !== dismissedVersion) ||
+    phase.kind === "downloading" ||
+    phase.kind === "installing" ||
+    phase.kind === "ready";
+  if (!visible) return null;
 
   return (
     <div className="fixed top-3 right-3 z-50 w-80 rounded-lg border border-accent/40 bg-surface-2 shadow-2xl overflow-hidden">
@@ -102,22 +45,22 @@ export function UpdaterBanner() {
               )}
             </div>
             <button
-              onClick={() => setDismissed(true)}
+              onClick={dismiss}
               className="p-0.5 text-gray-600 hover:text-gray-300 transition-colors"
-              title="Dismiss until next launch"
+              title="Dismiss this version"
             >
               <X size={12} />
             </button>
           </div>
           <div className="flex border-t border-border">
             <button
-              onClick={() => setDismissed(true)}
+              onClick={dismiss}
               className="flex-1 py-1.5 text-[11px] text-gray-500 hover:bg-surface-3 transition-colors"
             >
               Later
             </button>
             <button
-              onClick={handleInstall}
+              onClick={() => void install()}
               className="flex-1 py-1.5 text-[11px] text-accent font-medium hover:bg-accent/10 transition-colors border-l border-border"
             >
               Install now
@@ -163,18 +106,13 @@ export function UpdaterBanner() {
         </div>
       )}
 
-      {phase.kind === "error" && (
-        <div className="p-3 space-y-2">
-          <div className="flex items-start gap-2 text-xs text-red-400">
-            <AlertCircle size={12} className="shrink-0 mt-0.5" />
-            <span className="flex-1 break-words">Update failed: {phase.message}</span>
-          </div>
-          <button
-            onClick={() => setDismissed(true)}
-            className="w-full py-1 text-[11px] text-gray-500 hover:bg-surface-3 transition-colors rounded"
-          >
-            Dismiss
-          </button>
+      {/* error phase intentionally not shown in the floating banner — it
+          sits in the header pill so transient network errors don't yank
+          attention with a giant popup. */}
+      {false && phase.kind === "error" && (
+        <div className="p-3 flex items-start gap-2 text-xs text-red-400">
+          <AlertCircle size={12} className="shrink-0 mt-0.5" />
+          <span className="flex-1 break-words">Update failed</span>
         </div>
       )}
     </div>
