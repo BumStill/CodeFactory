@@ -1,6 +1,6 @@
 [package]
 name = "codefactory"
-version = "0.3.13"
+version = "0.3.14"
 description = "AI coding assistant for Windows powered by OpenRouter"
 authors = []
 edition = "2021"
@@ -23,7 +23,7 @@ tauri-plugin-process = "2"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Trimmed tokio feature set — was "full" which pulls every subsystem
+# Trimmed tokio feature set 鈥?was "full" which pulls every subsystem
 # including net/signal/parking_lot/test-util we don't use. Audit-based
 # minimum: rt-multi-thread (tokio::spawn), macros (#[tokio::main/test]),
 # sync (Mutex/RwLock/oneshot), time (sleep/timeout), fs (atomic_write
