@@ -2,7 +2,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{file_lock, path_sanity, unified_diff_for_path, ExecCtx, ToolOutput};
+use super::{file_lock, path_sanity, test_path, unified_diff_for_path, ExecCtx, ToolOutput};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
@@ -101,10 +101,16 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     }
 
     let diff = unified_diff_for_path(&a.path, &original, &updated);
-    Ok(ToolOutput::ok(format!(
+    let mut body = format!(
         "Edited {}\n\n```diff\n{diff}```",
         path.display()
-    )))
+    );
+    // Test-file discipline reminder — see test_path::TEST_MODIFIED_BANNER
+    // and the system-prompt TDD section for the contract.
+    if test_path::is_test_path(&std::path::Path::new(&a.path)) {
+        body = format!("{}\n{}", test_path::TEST_MODIFIED_BANNER, body);
+    }
+    Ok(ToolOutput::ok(body))
 }
 
 #[cfg(test)]

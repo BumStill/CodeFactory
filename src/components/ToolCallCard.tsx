@@ -100,6 +100,31 @@ function summarizeArgs(name: string, raw: string): string | null {
   }
 }
 
+// Heuristic — mirrors src-tauri/src/tools/test_path.rs. Used by ToolCallCard
+// to visually flag write/edit on test files so the user can immediately
+// spot AI touching their tests and verify the justification.
+function isTestPathFromArgs(toolName: string, raw: string): boolean {
+  if (toolName !== "write_file" && toolName !== "edit_file" &&
+      toolName !== "write" && toolName !== "edit") {
+    return false;
+  }
+  try {
+    const args = JSON.parse(raw);
+    const path: string | undefined = args.path;
+    if (!path) return false;
+    const p = path.replace(/\\/g, "/").toLowerCase();
+    if (/(^|\/)(tests?|__tests__|specs?)\//.test(p)) return true;
+    if (/\.(test|spec)\.(ts|tsx|js|jsx|mjs)$/.test(p)) return true;
+    if (/(^|\/)test_[^/]+\.py$/.test(p)) return true;
+    if (/_test\.(py|go)$/.test(p)) return true;
+    if (/_spec\.rb$/.test(p)) return true;
+    if (/(test|tests)\.java$/.test(p)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export function ToolCallCard({ tc }: Props) {
   const [open, setOpen] = useState(false);
   const parsedDiff = tc.result == null ? null : parseUnifiedDiffResult(tc.result);
@@ -107,6 +132,7 @@ export function ToolCallCard({ tc }: Props) {
 
   const { icon: Icon, iconClass } = styleForTool(tc.name);
   const summary = summarizeArgs(tc.name, tc.args ?? "");
+  const isTestMod = isTestPathFromArgs(tc.name, tc.args ?? "");
 
   const statusIcon =
     tc.status === "waiting_permission" ? (
@@ -119,8 +145,14 @@ export function ToolCallCard({ tc }: Props) {
       <span className="w-3 h-3 rounded-full border border-accent animate-pulse shrink-0" />
     );
 
+  // Test-file edits get an amber border so the user can spot AI touching
+  // tests at a glance and double-check the justification.
+  const borderClass = isTestMod
+    ? "border-amber-500/60 bg-amber-500/5"
+    : "border-border bg-surface-2";
+
   return (
-    <div className="my-1 rounded border border-border bg-surface-2 text-xs">
+    <div className={`my-1 rounded border ${borderClass} text-xs`}>
       <button
         className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-surface-3 transition-colors"
         onClick={() => setOpen((o) => !o)}
@@ -128,6 +160,11 @@ export function ToolCallCard({ tc }: Props) {
         {open ? <ChevronDown size={12} className="text-gray-600 shrink-0" /> : <ChevronRight size={12} className="text-gray-600 shrink-0" />}
         <Icon size={12} className={`${iconClass} shrink-0`} />
         <span className="text-gray-300 font-mono shrink-0">{tc.name}</span>
+        {isTestMod && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-medium shrink-0">
+            test
+          </span>
+        )}
         {summary && (
           <span className="text-gray-500 font-mono truncate min-w-0">· {summary}</span>
         )}

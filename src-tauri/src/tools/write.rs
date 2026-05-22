@@ -2,7 +2,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{file_lock, path_sanity, unified_diff_for_path, ExecCtx, ToolOutput};
+use super::{file_lock, path_sanity, test_path, unified_diff_for_path, ExecCtx, ToolOutput};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
@@ -80,11 +80,18 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     }
 
     let diff = unified_diff_for_path(&a.path, &original, &a.content);
-    Ok(ToolOutput::ok(format!(
+    let mut body = format!(
         "Written {} bytes to {}\n\n```diff\n{diff}```",
         a.content.len(),
         path.display()
-    )))
+    );
+    // If we just touched a test file, prepend the discipline banner so the
+    // model sees it in its own context and is obliged (by the system
+    // prompt) to justify the change.
+    if test_path::is_test_path(&std::path::Path::new(&a.path)) {
+        body = format!("{}\n{}", test_path::TEST_MODIFIED_BANNER, body);
+    }
+    Ok(ToolOutput::ok(body))
 }
 
 #[cfg(test)]

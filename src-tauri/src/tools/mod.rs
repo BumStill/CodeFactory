@@ -6,6 +6,7 @@ pub mod glob;
 pub mod grep;
 pub mod path_sanity;
 pub mod read;
+pub mod test_path;
 pub mod write;
 
 use serde::{Deserialize, Serialize};
