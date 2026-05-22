@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
 import { Check, Copy, ChevronDown } from "lucide-react";
 import { ToolCallCard } from "./ToolCallCard";
 import { WelcomeScreen } from "./WelcomeScreen";
+import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import type { UIMessage } from "../stores/chat";
 
 interface Props {
@@ -148,100 +149,6 @@ const markdownComponents: Components = {
   strong: ({ children }) => <strong className="font-semibold text-gray-100">{children}</strong>,
   em: ({ children }) => <em className="italic text-gray-200">{children}</em>,
 };
-
-// ── Stick-to-bottom auto-scroll ──────────────────────────────────────────────
-// Behaviour:
-//   - Near bottom (< 60px): instant scroll-to-bottom whenever content grows.
-//   - Scrolled up: hands-off; show a "Jump to latest" floating button.
-//   - Switching to another session: always jump to the bottom (the previous
-//     session's "scrolled-up" state must not leak across).
-//
-// Implementation notes:
-//   - We use MutationObserver on the scroller's subtree, not ResizeObserver
-//     on a sentinel. Sentinels never change their own dimensions when content
-//     above grows, so a ResizeObserver on the sentinel never fired — the
-//     symptom users hit was "stream output doesn't follow scrolling".
-//   - MutationObserver with subtree + characterData catches every per-token
-//     content mutation as well as new message blocks getting appended.
-//   - `conversationKey` lets the caller signal a hard session boundary so we
-//     reset pin state and scroll to the bottom unconditionally.
-function useStickyAutoScroll(conversationKey: string | null) {
-  const scrollerRef = useRef<HTMLDivElement>(null);
-  const [pinned, setPinned] = useState(true);
-  const pinnedRef = useRef(true);
-  pinnedRef.current = pinned;
-
-  // Track which conversation we're currently rendering. When this changes
-  // we treat it as a fresh viewport: re-pin and snap to the bottom on the
-  // next paint.
-  const prevKeyRef = useRef<string | null>(null);
-
-  // User scroll handler — manages pin state only.
-  useEffect(() => {
-    const el = scrollerRef.current;
-    if (!el) return;
-    const onScroll = () => {
-      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-      if (nearBottom !== pinnedRef.current) setPinned(nearBottom);
-    };
-    el.addEventListener("scroll", onScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onScroll);
-  }, []);
-
-  // Content-growth observer — fires on any DOM mutation inside the scroller.
-  useLayoutEffect(() => {
-    const scroller = scrollerRef.current;
-    if (!scroller) return;
-
-    const stickToBottom = () => {
-      if (pinnedRef.current) {
-        scroller.scrollTop = scroller.scrollHeight;
-      }
-    };
-
-    const obs = new MutationObserver(stickToBottom);
-    obs.observe(scroller, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
-
-    // Initial paint: snap to bottom so reloaded conversations land at the
-    // latest message instead of at the top.
-    requestAnimationFrame(stickToBottom);
-
-    return () => obs.disconnect();
-  }, []);
-
-  // Session-switch effect: force re-pin and jump to bottom when the
-  // conversation identity changes. Runs after the new messages have been
-  // committed to the DOM so scrollHeight reflects them.
-  useLayoutEffect(() => {
-    if (prevKeyRef.current === conversationKey) return;
-    prevKeyRef.current = conversationKey;
-    const el = scrollerRef.current;
-    if (!el) return;
-    setPinned(true);
-    pinnedRef.current = true;
-    // Two RAFs: first for the layout, second for any post-layout shiki
-    // highlight that bumped heights a hair more.
-    requestAnimationFrame(() => {
-      el.scrollTop = el.scrollHeight;
-      requestAnimationFrame(() => {
-        el.scrollTop = el.scrollHeight;
-      });
-    });
-  }, [conversationKey]);
-
-  const jumpToBottom = useCallback(() => {
-    const el = scrollerRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
-    setPinned(true);
-  }, []);
-
-  return { scrollerRef, pinned, jumpToBottom };
-}
 
 // ── Typing dots — replaces the block cursor ──────────────────────────────────
 function TypingDots() {

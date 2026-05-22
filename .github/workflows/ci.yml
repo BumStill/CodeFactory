@@ -39,6 +39,12 @@ jobs:
       - name: Type-check frontend
         run: pnpm exec tsc --noEmit
 
+      # Frontend regression tests (Vitest + jsdom + React Testing Library).
+      # Currently covers the stick-to-bottom scroll hook, which shipped
+      # broken in v0.3.7 and v0.3.9 before tests existed.
+      - name: Vitest
+        run: pnpm test
+
       - name: Cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
