@@ -82,6 +82,24 @@ export interface Endpoint {
   active_model?: string;
 }
 
+// ── Checkpoints (git-backed rollback) ──────────────────────────────────────
+
+export interface CheckpointInfo {
+  id: string;
+  session_id: string;
+  message_id: string | null;
+  cwd: string;
+  git_sha: string;
+  label: string;
+  created_at: string;
+  reverted: boolean;
+}
+
+export interface CheckpointFileChange {
+  path: string;
+  status: "added" | "modified" | "deleted" | "renamed" | "typechange";
+}
+
 export interface Settings {
   endpoints: Record<string, Endpoint>;
   default_endpoint: string;

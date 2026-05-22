@@ -8,6 +8,7 @@ import { ModelPicker } from "../../components/ModelPicker";
 import { UpdateStatusPill } from "../../components/UpdateStatusPill";
 import { PermissionDialog } from "../../components/PermissionDialog";
 import { FileTree } from "../../components/FileTree";
+import { CheckpointsPanel } from "../../components/CheckpointsPanel";
 import { GitStatusBar } from "../../components/GitStatusBar";
 import { GitChangesPanel } from "../../components/GitChangesPanel";
 import { GitHistoryPanel } from "../../components/GitHistoryPanel";
@@ -182,6 +183,7 @@ export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPage
               onSelectFile={(path) => setPendingInsert(path)}
             />
           )}
+          <CheckpointsPanel sessionId={activeSession?.id ?? null} />
         </aside>
       )}
 

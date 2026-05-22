@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod anthropic_client;
+pub mod checkpoint;
 pub mod context;
 pub mod hooks;
 pub mod scheduler;

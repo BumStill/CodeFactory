@@ -113,6 +113,28 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     .execute(pool)
     .await?;
 
+    // Per-message git checkpoints: every user message that kicks off
+    // agent work captures the working tree state so the user can revert
+    // any wrong-direction change with one click. See agent/checkpoint.rs
+    // for the snapshot mechanics.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS checkpoints (
+            id          TEXT PRIMARY KEY,
+            session_id  TEXT NOT NULL,
+            message_id  TEXT,
+            cwd         TEXT NOT NULL,
+            git_sha     TEXT NOT NULL,
+            label       TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            reverted    INTEGER NOT NULL DEFAULT 0
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id)")
+        .execute(pool)
+        .await?;
+
     // ── Per-column adds for messages — covers the v0.3.7 regression and
     //    any prior divergence between code and old DBs.
     ensure_column(pool, "messages", "tool_calls", "TEXT").await?;

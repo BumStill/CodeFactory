@@ -73,6 +73,42 @@ pub async fn send_message(
             .await?
     };
 
+    // Auto-checkpoint: capture the working-tree snapshot before the agent
+    // starts so the user can revert with one click if anything goes wrong.
+    // Best-effort: failures (non-git cwd, missing git binary, locked refs)
+    // log and continue — we don't want to block the chat over a missing
+    // safety net.
+    {
+        use std::path::Path;
+        let label: String = content.chars().take(80).collect();
+        match crate::agent::checkpoint::create(Path::new(&session.cwd), &label) {
+            Ok(Some(sha)) => {
+                let cp_id = Uuid::new_v4().to_string();
+                let now = Utc::now().to_rfc3339();
+                let pool = state.db.read().await;
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO checkpoints (id, session_id, message_id, cwd, git_sha, label, created_at, reverted)
+                     VALUES (?, ?, NULL, ?, ?, ?, ?, 0)",
+                )
+                .bind(&cp_id)
+                .bind(&session_id)
+                .bind(&session.cwd)
+                .bind(&sha)
+                .bind(&label)
+                .bind(&now)
+                .execute(&*pool)
+                .await
+                {
+                    tracing::warn!("checkpoint INSERT failed: {e}");
+                } else {
+                    app.emit("checkpoint-created", &session_id).ok();
+                }
+            }
+            Ok(None) => {} // cwd not a git repo — silently skip
+            Err(e) => tracing::warn!("checkpoint create failed: {e}"),
+        }
+    }
+
     // Auto-update title from first message content
     if is_first_message {
         let new_title: String = content
