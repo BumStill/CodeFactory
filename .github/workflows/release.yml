@@ -83,19 +83,21 @@ jobs:
           key: cargo-registry-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: cargo-registry-
 
-      - name: Cache Rust build artifacts
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri -> target
-          cache-on-failure: true
-          # Bust the cache when the release profile changes, otherwise
-          # version-bump commits frequently land in a cold cache.
-          key: profile-release-ci
+      # Note: swatinem/rust-cache was removed here. Its key is hashed on
+      # Cargo.lock; we bump Cargo.lock on every release tag, so the cache
+      # always missed on restore and the post-job step still spent ~2.5 min
+      # writing a fresh cache that the next release would also miss.
+      # sccache below caches at the per-object level and *is* resilient to
+      # Cargo.lock churn, so it's the right tool for this workflow.
 
-      # sccache caches compilation outputs across runs, even when Cargo.lock
-      # changes (e.g. on every version bump). Combined with the rust-cache
-      # above (which caches whole target/ when keys match), this gives us a
-      # second tier of caching that's resilient to lockfile churn.
+      # sccache caches individual compilation outputs across runs, surviving
+      # version-bump Cargo.lock churn. mozilla-actions/sccache-action is the
+      # right tool here even though its install step takes ~90s — it's the
+      # only sccache installer that also exports the ACTIONS_CACHE_URL /
+      # ACTIONS_RUNTIME_TOKEN env vars sccache needs to talk to GHA's cache
+      # backend. taiki-e/install-action would be faster to install but
+      # sccache would then have no cache backend and silently degrade to
+      # local-only mode — losing all cross-run benefit.
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.6
 
