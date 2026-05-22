@@ -52,21 +52,24 @@ pub fn definition() -> ToolDefinition {
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let a: Args = match serde_json::from_value(args.clone()) {
         Ok(v) => v,
-        Err(e) => return Ok(ToolOutput::err(format!(
-            "Invalid arguments for bash: {e}. Received: {}",
-            serde_json::to_string(&args).unwrap_or_else(|_| "<unprintable>".into())
-                .chars().take(300).collect::<String>(),
-        ))),
+        Err(e) => {
+            return Ok(ToolOutput::err(format!(
+                "Invalid arguments for bash: {e}. Received: {}",
+                serde_json::to_string(&args)
+                    .unwrap_or_else(|_| "<unprintable>".into())
+                    .chars()
+                    .take(300)
+                    .collect::<String>(),
+            )))
+        }
     };
 
     let cmd_lower = a.command.to_lowercase();
-    if !ctx.full_access {
-        for denied in DENY_LIST {
-            if cmd_lower.contains(denied) {
-                return Ok(ToolOutput::err(format!(
-                    "Command denied by safety policy: matches '{denied}'"
-                )));
-            }
+    for denied in DENY_LIST {
+        if cmd_lower.contains(denied) {
+            return Ok(ToolOutput::err(format!(
+                "Command denied by safety policy: matches '{denied}'"
+            )));
         }
     }
 
@@ -103,5 +106,31 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                 Ok(ToolOutput::ok(combined))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn full_access_still_honors_built_in_deny_list() {
+        let cwd = std::env::temp_dir().join(format!("codefactory-bash-deny-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+
+        let output = execute(
+            json!({
+                "command": "Write-Output 'shutdown'",
+            }),
+            &ExecCtx { cwd: cwd.clone() },
+        )
+        .await
+        .expect("tool returns output");
+
+        let _ = std::fs::remove_dir_all(cwd);
+
+        assert!(output.is_error);
+        assert!(output.content.contains("Command denied by safety policy"));
     }
 }

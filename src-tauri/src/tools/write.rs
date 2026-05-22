@@ -2,7 +2,9 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{file_lock, path_sanity, test_path, unified_diff_for_path, ExecCtx, ToolOutput};
+use super::{
+    file_lock, path_sanity, test_path, unified_diff_for_path, workspace_path, ExecCtx, ToolOutput,
+};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
@@ -21,7 +23,7 @@ pub fn definition() -> ToolDefinition {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path":    { "type": "string" },
+                    "path":    { "type": "string", "description": "Workspace-relative path, or an absolute path inside the workspace" },
                     "content": { "type": "string" }
                 },
                 "required": ["path", "content"]
@@ -33,21 +35,33 @@ pub fn definition() -> ToolDefinition {
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let a: Args = match serde_json::from_value(args.clone()) {
         Ok(v) => v,
-        Err(e) => return Ok(ToolOutput::err(format!(
-            "Invalid arguments for write_file: {e}. Received: {}",
-            serde_json::to_string(&args).unwrap_or_else(|_| "<unprintable>".into())
-                .chars().take(300).collect::<String>(),
-        ))),
+        Err(e) => {
+            return Ok(ToolOutput::err(format!(
+                "Invalid arguments for write_file: {e}. Received: {}",
+                serde_json::to_string(&args)
+                    .unwrap_or_else(|_| "<unprintable>".into())
+                    .chars()
+                    .take(300)
+                    .collect::<String>(),
+            )))
+        }
     };
 
-    let path = ctx.cwd.join(&a.path);
+    let path = match workspace_path::resolve_writable(&ctx.cwd, &a.path) {
+        Ok(path) => path,
+        Err(err) => return Ok(ToolOutput::err(err.message())),
+    };
 
     // Hallucinated-path guard: catch obvious typos against existing siblings
     // before any IO. Returns a corrective suggestion so the model can retry
     // with the right path on the next turn. Genuine new directories with
     // distinct names (no near-neighbour) sail through.
     if let Some(s) = path_sanity::check(&path) {
-        return Ok(ToolOutput::err(path_sanity::format_error(&s, &path, "write_file")));
+        return Ok(ToolOutput::err(path_sanity::format_error(
+            &s,
+            &path,
+            "write_file",
+        )));
     }
 
     // Serialise read+write per-file so a parallel edit on the same file can't
@@ -116,10 +130,7 @@ mod tests {
                 "path": "notes.txt",
                 "content": "alpha\nnew\n"
             }),
-            &ExecCtx {
-                cwd: cwd.clone(),
-                full_access: false,
-            },
+            &ExecCtx { cwd: cwd.clone() },
         )
         .await
         .expect("write succeeds");
@@ -134,5 +145,30 @@ mod tests {
         assert!(output.content.contains(" alpha"));
         assert!(output.content.contains("-old"));
         assert!(output.content.contains("+new"));
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_parent_traversal_outside_workspace() {
+        let root = temp_dir();
+        let cwd = root.join("workspace");
+        std::fs::create_dir_all(&cwd).expect("create workspace");
+        let outside = root.join("owned.txt");
+
+        let output = execute(
+            json!({
+                "path": "../owned.txt",
+                "content": "owned"
+            }),
+            &ExecCtx { cwd },
+        )
+        .await
+        .expect("tool returns output");
+
+        let outside_exists = outside.exists();
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(output.is_error);
+        assert!(output.content.contains("outside the workspace"));
+        assert!(!outside_exists);
     }
 }

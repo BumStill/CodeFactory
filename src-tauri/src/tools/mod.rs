@@ -7,6 +7,7 @@ pub mod grep;
 pub mod path_sanity;
 pub mod read;
 pub mod test_path;
+pub mod workspace_path;
 pub mod write;
 
 use serde::{Deserialize, Serialize};
@@ -46,7 +47,6 @@ impl ToolOutput {
 
 pub struct ExecCtx {
     pub cwd: PathBuf,
-    pub full_access: bool,
 }
 
 pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
