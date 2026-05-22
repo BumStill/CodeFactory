@@ -47,6 +47,14 @@ export function useStickyAutoScroll(conversationKey: string | null) {
   const pinnedRef = useRef(true);
   pinnedRef.current = pinned;
 
+  // True iff content has grown since the user scrolled away from the
+  // bottom. Drives the "↓ New content" pulse on the floating jump button
+  // so the user can tell when there's something fresh to see vs just
+  // being above the conversation tail.
+  const [hasNewContent, setHasNewContent] = useState(false);
+  const hasNewContentRef = useRef(false);
+  hasNewContentRef.current = hasNewContent;
+
   const prevKeyRef = useRef<string | null>(null);
 
   // Programmatic-scroll guard. We need to ignore the scroll event the
@@ -98,6 +106,12 @@ export function useStickyAutoScroll(conversationKey: string | null) {
         // re-pin before React commits the state).
         pinnedRef.current = nearBottom;
         setPinned(nearBottom);
+        // Scrolling back into the pin zone clears the "new content"
+        // indicator — the user has seen the latest tail.
+        if (nearBottom && hasNewContentRef.current) {
+          hasNewContentRef.current = false;
+          setHasNewContent(false);
+        }
       }
     };
     el.addEventListener("scroll", onScroll, { passive: true });
@@ -113,6 +127,13 @@ export function useStickyAutoScroll(conversationKey: string | null) {
     if (!scroller) return;
 
     const onMutation = () => {
+      // Content grew while the user was scrolled up — surface the "new
+      // content" indicator. (When pinned, we just snap to it; no need
+      // to highlight anything.)
+      if (!pinnedRef.current && !hasNewContentRef.current) {
+        hasNewContentRef.current = true;
+        setHasNewContent(true);
+      }
       stickToBottomIfPinned();
       requestAnimationFrame(stickToBottomIfPinned);
     };
@@ -150,8 +171,21 @@ export function useStickyAutoScroll(conversationKey: string | null) {
     if (!el) return;
     pinnedRef.current = true;
     setPinned(true);
+    if (hasNewContentRef.current) {
+      hasNewContentRef.current = false;
+      setHasNewContent(false);
+    }
     programmaticScrollTo(el.scrollHeight);
   }, [programmaticScrollTo]);
 
-  return { scrollerRef, pinned, jumpToBottom };
+  // Reset hasNewContent when the conversation changes — the badge would
+  // otherwise persist across session switches and lie about what's fresh.
+  useLayoutEffect(() => {
+    if (hasNewContentRef.current) {
+      hasNewContentRef.current = false;
+      setHasNewContent(false);
+    }
+  }, [conversationKey]);
+
+  return { scrollerRef, pinned, hasNewContent, jumpToBottom };
 }

@@ -172,7 +172,7 @@ export function MessageList({ messages, streaming, cwd, onUsePrompt }: Props) {
   // session change and re-pins to the bottom. Empty list → null (fine; no
   // scroller rendered anyway).
   const conversationKey = messages[0]?.id ?? null;
-  const { scrollerRef, pinned, jumpToBottom } = useStickyAutoScroll(conversationKey);
+  const { scrollerRef, pinned, hasNewContent, jumpToBottom } = useStickyAutoScroll(conversationKey);
 
   if (messages.length === 0) {
     return <WelcomeScreen onUsePrompt={onUsePrompt} />;
@@ -201,9 +201,19 @@ export function MessageList({ messages, streaming, cwd, onUsePrompt }: Props) {
       {!pinned && (
         <button
           onClick={jumpToBottom}
-          className="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1 px-2.5 py-1 rounded-full border border-border bg-surface-2 text-[11px] text-gray-300 shadow-lg hover:bg-surface-3 transition-colors"
+          className={
+            hasNewContent
+              ? "absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-accent/60 bg-accent/15 text-accent text-[11px] font-medium shadow-lg hover:bg-accent/25 transition-colors animate-pulse"
+              : "absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1 px-2.5 py-1 rounded-full border border-border bg-surface-2 text-[11px] text-gray-300 shadow-lg hover:bg-surface-3 transition-colors"
+          }
+          title={
+            hasNewContent
+              ? "New content arrived — click to jump to the latest and resume auto-scroll"
+              : "Jump to the latest message and resume auto-scroll"
+          }
         >
-          <ChevronDown size={12} /> Jump to latest
+          <ChevronDown size={12} />
+          {hasNewContent ? "New content" : "Jump to latest"}
         </button>
       )}
     </div>

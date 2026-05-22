@@ -20,6 +20,7 @@ import { useStickyAutoScroll } from "./useStickyAutoScroll";
 interface HarnessHandle {
   scroller: HTMLDivElement;
   pinned: () => boolean;
+  hasNewContent: () => boolean;
   jumpToBottom: () => void;
 }
 
@@ -27,12 +28,13 @@ function Harness(props: {
   conversationKey: string | null;
   onMount: (h: HarnessHandle) => void;
   pinnedRef: { current: boolean };
+  hasNewContentRef: { current: boolean };
 }) {
-  const { scrollerRef, pinned, jumpToBottom } = useStickyAutoScroll(props.conversationKey);
-  // Keep an external mirror of `pinned` so the test handle's `pinned()` getter
-  // returns the up-to-date value across re-renders (not a stale closure value
-  // captured at first render).
+  const { scrollerRef, pinned, hasNewContent, jumpToBottom } = useStickyAutoScroll(props.conversationKey);
+  // Mirror live state so the test handle returns up-to-date values across
+  // re-renders (not stale closures captured at first render).
   props.pinnedRef.current = pinned;
+  props.hasNewContentRef.current = hasNewContent;
 
   // Expose the handle ONCE after the ref has been attached. useEffect runs
   // after the DOM commit, so scrollerRef.current is non-null here.
@@ -41,11 +43,10 @@ function Harness(props: {
       props.onMount({
         scroller: scrollerRef.current,
         pinned: () => props.pinnedRef.current,
+        hasNewContent: () => props.hasNewContentRef.current,
         jumpToBottom,
       });
     }
-    // We want to expose exactly once per mount. jumpToBottom is stable
-    // (wrapped in useCallback by the hook), so this dep list is fine.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -83,13 +84,20 @@ interface RenderResult {
 function renderHarness(initialKey: string | null = "session-1"): RenderResult {
   let handle: HarnessHandle | null = null;
   const pinnedRef = { current: true };
+  const hasNewContentRef = { current: false };
   const onMount = (h: HarnessHandle) => { handle = h; };
-  const utils = render(<Harness conversationKey={initialKey} onMount={onMount} pinnedRef={pinnedRef} />);
+  const utils = render(
+    <Harness conversationKey={initialKey} onMount={onMount}
+             pinnedRef={pinnedRef} hasNewContentRef={hasNewContentRef} />
+  );
   if (!handle) throw new Error("Harness did not provide handle");
   return {
     handle,
     rerender: (key) =>
-      utils.rerender(<Harness conversationKey={key} onMount={onMount} pinnedRef={pinnedRef} />),
+      utils.rerender(
+        <Harness conversationKey={key} onMount={onMount}
+                 pinnedRef={pinnedRef} hasNewContentRef={hasNewContentRef} />
+      ),
   };
 }
 
@@ -267,5 +275,98 @@ describe("useStickyAutoScroll", () => {
     await act(async () => { handle.jumpToBottom(); });
     expect(handle.scroller.scrollTop).toBe(5000);
     expect(handle.pinned()).toBe(true);
+  });
+
+  it("sets hasNewContent when content grows while user is scrolled up", async () => {
+    // Reproduces the v0.3.17 gap: the floating button said "Jump to latest"
+    // but gave the user no signal that there was actually new content. The
+    // hook now tracks growth-while-unpinned so the UI can show a different,
+    // attention-grabbing style.
+    const { handle } = renderHarness("session-1");
+    setLayout(handle.scroller, { scrollHeight: 3000, clientHeight: 600 });
+    await flushAsync();
+    expect(handle.hasNewContent()).toBe(false);
+
+    // User scrolls up.
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 500, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.pinned()).toBe(false);
+    // Nothing has grown yet — no badge.
+    expect(handle.hasNewContent()).toBe(false);
+
+    // Streaming token arrives while the user is still up-top.
+    setLayout(handle.scroller, { scrollHeight: 6000, clientHeight: 600 });
+    await act(async () => {
+      const node = document.createElement("p");
+      node.textContent = "fresh streaming text";
+      handle.scroller.appendChild(node);
+    });
+    await flushAsync();
+
+    // Now the badge should be active.
+    expect(handle.hasNewContent()).toBe(true);
+    // And we must still not have yanked the user back.
+    expect(handle.scroller.scrollTop).toBe(500);
+  });
+
+  it("clears hasNewContent when the user clicks jump-to-bottom", async () => {
+    const { handle } = renderHarness("session-1");
+    setLayout(handle.scroller, { scrollHeight: 3000, clientHeight: 600 });
+    await flushAsync();
+
+    // Scroll up, then receive new content.
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 500, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    setLayout(handle.scroller, { scrollHeight: 6000, clientHeight: 600 });
+    await act(async () => {
+      const node = document.createElement("p");
+      node.textContent = "more";
+      handle.scroller.appendChild(node);
+    });
+    await flushAsync();
+    expect(handle.hasNewContent()).toBe(true);
+
+    // Click jump-to-bottom — should snap to actual current scrollHeight
+    // (not the stale "old bottom") AND clear the badge AND re-pin.
+    await act(async () => { handle.jumpToBottom(); });
+    expect(handle.scroller.scrollTop).toBe(6000);
+    expect(handle.pinned()).toBe(true);
+    expect(handle.hasNewContent()).toBe(false);
+  });
+
+  it("clears hasNewContent when the user manually scrolls back near the bottom", async () => {
+    // The other re-pin path: instead of clicking the button, the user just
+    // scrolls back down. As long as they get within the 60px stick zone of
+    // the *current* scrollHeight, both pin state and the new-content badge
+    // should reset.
+    const { handle } = renderHarness("session-1");
+    setLayout(handle.scroller, { scrollHeight: 3000, clientHeight: 600 });
+    await flushAsync();
+
+    // Up + growth
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 200, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    setLayout(handle.scroller, { scrollHeight: 6000, clientHeight: 600 });
+    await act(async () => {
+      const node = document.createElement("p");
+      node.textContent = "more";
+      handle.scroller.appendChild(node);
+    });
+    await flushAsync();
+    expect(handle.hasNewContent()).toBe(true);
+
+    // Manually scroll back into the pin zone (6000 - 5380 - 600 = 20, < 60).
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 5380, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.pinned()).toBe(true);
+    expect(handle.hasNewContent()).toBe(false);
   });
 });
