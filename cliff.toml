@@ -7,6 +7,25 @@ body = """
 - {% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.message | upper_first }}
 {% endfor %}
 {% endfor %}\
+
+---
+
+### Install
+
+Download `CodeFactory_X.Y.Z_x64-setup.exe` below and run it.
+
+**Windows SmartScreen warning is expected on first install** — the app isn't
+signed with a paid Authenticode certificate yet. Click **More info → Run anyway**.
+After this first install, in-app auto-updates are verified via the Tauri
+signature (`.sig`) against an embedded public key and don't trigger the warning.
+
+For verification:
+```pwsh
+Get-FileHash CodeFactory_*_x64-setup.exe
+```
+
+See the [README](https://github.com/BumStill/CodeFactory#install) for the
+code-signing roadmap.
 """
 trim = true
 footer = ""

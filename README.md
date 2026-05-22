@@ -52,9 +52,40 @@ Download `CodeFactory_X.Y.Z_x64-setup.exe` from
 [Releases](https://github.com/BumStill/CodeFactory/releases/latest) and run it.
 No admin rights required.
 
+> **Windows SmartScreen warning is expected on first run.** CodeFactory
+> isn't currently signed with a paid Authenticode certificate (working on
+> it — see [#code-signing](#code-signing-status)), so SmartScreen treats
+> it as an unrecognised app. To install:
+>
+> 1. Click **More info** on the blue SmartScreen popup
+> 2. Click **Run anyway**
+>
+> If you'd like extra confidence before doing that, you can verify the
+> installer's integrity:
+>
+> ```pwsh
+> # The expected SHA-256 is published in each release's asset list:
+> # https://github.com/BumStill/CodeFactory/releases/latest
+> Get-FileHash CodeFactory_*_x64-setup.exe
+> ```
+>
+> Updates installed via the in-app updater bypass this dialog because
+> the updater verifies the Tauri signature (`.sig`) against the embedded
+> public key — only the first manual install gets the warning.
+
 On first launch you'll be prompted for an API key. Anything OpenAI-compatible
 works — OpenRouter is the easiest if you want access to multiple frontier
 models with one key.
+
+### Code-signing status
+
+Authenticode signing is on the near-term roadmap. The plan:
+
+- **Now**: unsigned NSIS installer + Tauri-signed updates (good enough for
+  technical users who can dismiss SmartScreen once)
+- **Next**: apply for [SignPath.io](https://signpath.io/) free OSS code
+  signing (eliminates the SmartScreen warning at no cost)
+- **Later**: full EV cert if download volume justifies the spend
 
 ## Quick start
 
