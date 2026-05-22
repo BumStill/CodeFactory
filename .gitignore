@@ -8,6 +8,7 @@ dist/
 
 # Tauri dev
 src-tauri/WixTools/
+.codex/run-logs/
 
 # SQLite databases and secrets (never commit)
 *.db

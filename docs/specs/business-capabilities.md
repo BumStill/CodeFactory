@@ -25,6 +25,8 @@
 - 提供受控 PowerShell/cmd/Git Bash 执行。
 - 提供内嵌终端 UI。
 - 命令白名单、黑名单、hard deny 和 cwd 限制必须可审计；Full access mode 不得关闭这些硬边界。
+- 高风险命令（例如递归删除、`git reset --hard`、注册表删除、管道执行脚本）在 Full access mode 下仍必须进入 ask 或 deny 路径。
+- `bash` 工具结果必须包含最小审计元数据：实际 cwd、退出码和风险等级。
 
 ## C6 发布与更新
 - 构建 Windows 安装包。

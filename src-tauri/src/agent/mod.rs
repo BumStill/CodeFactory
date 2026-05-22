@@ -1207,6 +1207,22 @@ fn decide_permission(
     tool_name: &str,
     cmd: Option<&str>,
 ) -> PermissionDecision {
+    if tool_name == "bash" {
+        if let Some(command) = cmd {
+            match crate::tools::shell_policy::classify_command(command) {
+                crate::tools::shell_policy::ShellCommandPolicy::Deny { reason } => {
+                    return PermissionDecision::Deny(format!(
+                        "Denied by shell safety policy: {reason}"
+                    ));
+                }
+                crate::tools::shell_policy::ShellCommandPolicy::Ask { .. } => {
+                    return PermissionDecision::Ask;
+                }
+                crate::tools::shell_policy::ShellCommandPolicy::Allow { .. } => {}
+            }
+        }
+    }
+
     let key = match cmd {
         Some(c) => format!("{}({})", tool_name, c),
         None => tool_name.to_string(),
@@ -1287,6 +1303,32 @@ mod tests {
         assert_eq!(
             decide_permission(&policy, "write_file", None),
             PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn full_access_requires_ask_for_high_risk_shell_commands() {
+        let mut policy = policy(&[], &[], &[]);
+        policy.full_access = true;
+        assert_eq!(
+            decide_permission(
+                &policy,
+                "bash",
+                Some("Remove-Item -Recurse -Force .\\dist")
+            ),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn hard_denied_shell_commands_are_denied_before_full_access() {
+        let mut policy = policy(&[], &[], &[]);
+        policy.full_access = true;
+        assert_eq!(
+            decide_permission(&policy, "bash", Some("shutdown /s /t 0")),
+            PermissionDecision::Deny(
+                "Denied by shell safety policy: matches permanent deny 'shutdown'".into()
+            )
         );
     }
 

@@ -6,6 +6,7 @@ pub mod glob;
 pub mod grep;
 pub mod path_sanity;
 pub mod read;
+pub mod shell_policy;
 pub mod test_path;
 pub mod workspace_path;
 pub mod write;
