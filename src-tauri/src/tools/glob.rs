@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use walkdir::WalkDir;
 
-use super::{ExecCtx, ToolOutput};
+use super::{workspace_path, ExecCtx, ToolOutput};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
@@ -25,7 +25,7 @@ pub fn definition() -> ToolDefinition {
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string" },
-                    "path":    { "type": "string", "description": "Search root (default: cwd)" }
+                    "path":    { "type": "string", "description": "Search root inside the workspace (default: cwd)" }
                 },
                 "required": ["pattern"]
             }),
@@ -39,8 +39,14 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     };
 
     let root = match &a.path {
-        Some(p) => ctx.cwd.join(p),
-        None => ctx.cwd.clone(),
+        Some(p) => match workspace_path::resolve_existing(&ctx.cwd, p) {
+            Ok(path) => path,
+            Err(err) => return Ok(ToolOutput::err(err.message())),
+        },
+        None => match workspace_path::resolve_existing(&ctx.cwd, ".") {
+            Ok(path) => path,
+            Err(err) => return Ok(ToolOutput::err(err.message())),
+        },
     };
 
     let glob = match Glob::new(&a.pattern) {
@@ -70,4 +76,34 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     matches.truncate(500);
 
     Ok(ToolOutput::ok(matches.join("\n")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn glob_rejects_search_root_outside_workspace() {
+        let root =
+            std::env::temp_dir().join(format!("codefactory-glob-boundary-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::write(root.join("outside.rs"), "fn secret() {}").expect("seed outside file");
+
+        let output = execute(
+            json!({
+                "pattern": "**/*.rs",
+                "path": ".."
+            }),
+            &ExecCtx { cwd: workspace },
+        )
+        .await
+        .expect("tool returns output");
+
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(output.is_error);
+        assert!(output.content.contains("outside the workspace"));
+    }
 }

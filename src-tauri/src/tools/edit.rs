@@ -2,7 +2,9 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{file_lock, path_sanity, test_path, unified_diff_for_path, ExecCtx, ToolOutput};
+use super::{
+    file_lock, path_sanity, test_path, unified_diff_for_path, workspace_path, ExecCtx, ToolOutput,
+};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
@@ -24,7 +26,7 @@ pub fn definition() -> ToolDefinition {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path":        { "type": "string" },
+                    "path":        { "type": "string", "description": "Workspace-relative path, or an absolute path inside the workspace" },
                     "old_string":  { "type": "string" },
                     "new_string":  { "type": "string" },
                     "replace_all": { "type": "boolean", "default": false }
@@ -38,14 +40,33 @@ pub fn definition() -> ToolDefinition {
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let a: Args = match serde_json::from_value(args.clone()) {
         Ok(v) => v,
-        Err(e) => return Ok(ToolOutput::err(format!(
-            "Invalid arguments for edit_file: {e}. Received: {}",
-            serde_json::to_string(&args).unwrap_or_else(|_| "<unprintable>".into())
-                .chars().take(300).collect::<String>(),
-        ))),
+        Err(e) => {
+            return Ok(ToolOutput::err(format!(
+                "Invalid arguments for edit_file: {e}. Received: {}",
+                serde_json::to_string(&args)
+                    .unwrap_or_else(|_| "<unprintable>".into())
+                    .chars()
+                    .take(300)
+                    .collect::<String>(),
+            )))
+        }
     };
 
-    let path = ctx.cwd.join(&a.path);
+    let path = match workspace_path::resolve_existing(&ctx.cwd, &a.path) {
+        Ok(path) => path,
+        Err(err) => {
+            if let Some(path) = err.path() {
+                if let Some(s) = path_sanity::check(path) {
+                    return Ok(ToolOutput::err(path_sanity::format_error(
+                        &s,
+                        path,
+                        "edit_file",
+                    )));
+                }
+            }
+            return Ok(ToolOutput::err(err.message()));
+        }
+    };
 
     // Hold the per-file lock across the read+modify+write cycle so concurrent
     // edits to the same file serialise (otherwise one writer's changes get
@@ -58,7 +79,11 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             // Typo-detection: catch hallucinated paths early with a useful
             // correction instead of a bare "file not found".
             if let Some(s) = path_sanity::check(&path) {
-                return Ok(ToolOutput::err(path_sanity::format_error(&s, &path, "edit_file")));
+                return Ok(ToolOutput::err(path_sanity::format_error(
+                    &s,
+                    &path,
+                    "edit_file",
+                )));
             }
             return Ok(ToolOutput::err(format!(
                 "Cannot read {}: {e}",
@@ -101,10 +126,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     }
 
     let diff = unified_diff_for_path(&a.path, &original, &updated);
-    let mut body = format!(
-        "Edited {}\n\n```diff\n{diff}```",
-        path.display()
-    );
+    let mut body = format!("Edited {}\n\n```diff\n{diff}```", path.display());
     // Test-file discipline reminder — see test_path::TEST_MODIFIED_BANNER
     // and the system-prompt TDD section for the contract.
     if test_path::is_test_path(&std::path::Path::new(&a.path)) {
@@ -137,10 +159,7 @@ mod tests {
                 "old_string": "old_call();",
                 "new_string": "new_call();"
             }),
-            &ExecCtx {
-                cwd: cwd.clone(),
-                full_access: false,
-            },
+            &ExecCtx { cwd: cwd.clone() },
         )
         .await
         .expect("edit succeeds");
@@ -156,5 +175,32 @@ mod tests {
         assert!(output.content.contains("-    old_call();"));
         assert!(output.content.contains("+    new_call();"));
         assert!(output.content.contains(" }"));
+    }
+
+    #[tokio::test]
+    async fn edit_file_rejects_parent_traversal_outside_workspace() {
+        let root = temp_dir();
+        let cwd = root.join("workspace");
+        std::fs::create_dir_all(&cwd).expect("create workspace");
+        let outside = root.join("outside.txt");
+        std::fs::write(&outside, "old").expect("seed outside file");
+
+        let output = execute(
+            json!({
+                "path": "../outside.txt",
+                "old_string": "old",
+                "new_string": "new"
+            }),
+            &ExecCtx { cwd },
+        )
+        .await
+        .expect("tool returns output");
+
+        let outside_content = std::fs::read_to_string(&outside).expect("read outside file");
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(output.is_error);
+        assert!(output.content.contains("outside the workspace"));
+        assert_eq!(outside_content, "old");
     }
 }

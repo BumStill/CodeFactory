@@ -382,13 +382,8 @@ impl AgentLoop {
                     continue;
                 }
 
-                let full_access = {
-                    let settings = self.settings.read().await;
-                    settings.permissions.full_access
-                };
                 let ctx = ExecCtx {
                     cwd: self.cwd.clone(),
-                    full_access,
                 };
 
                 let tool_start = std::time::Instant::now();
@@ -1011,13 +1006,8 @@ impl AgentLoop {
                     continue;
                 }
 
-                let full_access = {
-                    let settings = self.settings.read().await;
-                    settings.permissions.full_access
-                };
                 let ctx = ExecCtx {
                     cwd: self.cwd.clone(),
-                    full_access,
                 };
 
                 let tool_start = std::time::Instant::now();
@@ -1217,10 +1207,6 @@ fn decide_permission(
     tool_name: &str,
     cmd: Option<&str>,
 ) -> PermissionDecision {
-    if policy.full_access {
-        return PermissionDecision::Allow;
-    }
-
     let key = match cmd {
         Some(c) => format!("{}({})", tool_name, c),
         None => tool_name.to_string(),
@@ -1230,6 +1216,10 @@ fn decide_permission(
         if glob_match(pattern, &key) || glob_match(pattern, tool_name) {
             return PermissionDecision::Deny(format!("Denied by policy: matches '{pattern}'"));
         }
+    }
+
+    if policy.full_access {
+        return PermissionDecision::Allow;
     }
 
     for pattern in &policy.allow {
@@ -1281,11 +1271,21 @@ mod tests {
     }
 
     #[test]
-    fn full_access_bypasses_configured_ask_and_deny_rules() {
-        let mut policy = policy(&[], &["bash"], &["bash(*)"]);
+    fn full_access_honors_configured_deny_rules() {
+        let mut policy = policy(&[], &["bash"], &["bash"]);
         policy.full_access = true;
         assert_eq!(
             decide_permission(&policy, "bash", Some("pnpm build")),
+            PermissionDecision::Deny("Denied by policy: matches 'bash'".into())
+        );
+    }
+
+    #[test]
+    fn full_access_allows_unmatched_tools_without_asking() {
+        let mut policy = policy(&[], &["bash"], &[]);
+        policy.full_access = true;
+        assert_eq!(
+            decide_permission(&policy, "write_file", None),
             PermissionDecision::Allow
         );
     }

@@ -14,7 +14,7 @@
 - 注册 `read_file`、`write_file`、`edit_file`、`glob`、`grep`、`list_dir`、`bash` 等工具。
 - 每个工具声明风险等级、JSON Schema、权限策略和输出限制。
 - 文件写入和命令执行必须展示 diff 或参数摘要并等待用户确认。
-- Full access mode 可在可信项目中绕过配置型权限提示，但必须在 UI 中清楚展示风险，并保留工具卡片和审计状态。
+- Full access mode 表示可信项目内的低打扰执行模式，可绕过配置型 ask 提示，但不得绕过 hard deny、危险命令 deny 或用户选择的 cwd 边界。
 
 ## C4 会话与审计
 - 持久化 session、message、tool_call、成本和耗时。
@@ -24,7 +24,7 @@
 ## C5 命令执行与终端
 - 提供受控 PowerShell/cmd/Git Bash 执行。
 - 提供内嵌终端 UI。
-- 命令白名单、黑名单和 cwd 限制必须可审计。
+- 命令白名单、黑名单、hard deny 和 cwd 限制必须可审计；Full access mode 不得关闭这些硬边界。
 
 ## C6 发布与更新
 - 构建 Windows 安装包。
