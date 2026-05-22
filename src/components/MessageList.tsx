@@ -7,11 +7,15 @@ import { Check, Copy, ChevronDown } from "lucide-react";
 import { ToolCallCard } from "./ToolCallCard";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
+import { RememberButton } from "./RememberButton";
 import type { UIMessage } from "../stores/chat";
 
 interface Props {
   messages: UIMessage[];
   streaming: boolean;
+  /** Working directory of the active session — used to scope the
+   *  "Remember" button's writes to the right project-memory file. */
+  cwd?: string | null;
   /** Called when the user picks an example prompt from the welcome screen. */
   onUsePrompt?: (text: string) => void;
 }
@@ -162,7 +166,7 @@ function TypingDots() {
 }
 
 // ── Main component ───────────────────────────────────────────────────────────
-export function MessageList({ messages, streaming, onUsePrompt }: Props) {
+export function MessageList({ messages, streaming, cwd, onUsePrompt }: Props) {
   // Use the first message's id as the conversation identity. Different
   // sessions have different first messages → the scroll hook treats it as a
   // session change and re-pins to the bottom. Empty list → null (fine; no
@@ -189,6 +193,7 @@ export function MessageList({ messages, streaming, onUsePrompt }: Props) {
             key={msg.id}
             msg={msg}
             isStreamingTail={streaming && msg.id === lastAssistantId}
+            cwd={cwd ?? null}
           />
         ))}
       </div>
@@ -205,7 +210,7 @@ export function MessageList({ messages, streaming, onUsePrompt }: Props) {
   );
 }
 
-function MessageRow({ msg, isStreamingTail }: { msg: UIMessage; isStreamingTail: boolean }) {
+function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreamingTail: boolean; cwd: string | null }) {
   const isUser = msg.role === "user";
 
   if (isUser) {
@@ -219,9 +224,12 @@ function MessageRow({ msg, isStreamingTail }: { msg: UIMessage; isStreamingTail:
   }
 
   const showThinkingHint = isStreamingTail && !msg.content && (!msg.toolCalls || msg.toolCalls.length === 0);
+  // Show Remember only once streaming has settled — a half-written
+  // message isn't worth saving as a fact.
+  const showRemember = !!cwd && !isStreamingTail && !!msg.content;
 
   return (
-    <div className="text-sm text-gray-200 space-y-1.5">
+    <div className="group text-sm text-gray-200 space-y-1.5">
       {msg.toolCalls?.map((tc) => (
         <ToolCallCard key={tc.id} tc={tc} />
       ))}
@@ -234,6 +242,11 @@ function MessageRow({ msg, isStreamingTail }: { msg: UIMessage; isStreamingTail:
       {showThinkingHint && (
         <div className="text-xs text-gray-500 inline-flex items-center">
           Thinking <TypingDots />
+        </div>
+      )}
+      {showRemember && (
+        <div className="flex justify-end pt-0.5">
+          <RememberButton cwd={cwd} suggestedText={msg.content} />
         </div>
       )}
     </div>

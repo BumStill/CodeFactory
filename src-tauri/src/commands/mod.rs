@@ -9,6 +9,7 @@ pub mod git;
 pub mod git_remote;
 pub mod hooks;
 pub mod mcp;
+pub mod memory;
 pub mod models;
 pub mod session;
 pub mod settings;

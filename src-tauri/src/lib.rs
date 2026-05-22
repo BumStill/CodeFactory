@@ -144,6 +144,8 @@ pub fn run() {
             commands::checkpoints::list_checkpoints,
             commands::checkpoints::checkpoint_changeset,
             commands::checkpoints::revert_checkpoint,
+            commands::memory::read_project_memory,
+            commands::memory::append_project_memory,
             commands::models::list_models,
             commands::session::list_sessions,
             commands::session::create_session,

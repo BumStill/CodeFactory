@@ -245,6 +245,7 @@ export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPage
         <MessageList
           messages={messages}
           streaming={streaming}
+          cwd={activeSession?.cwd ?? null}
           onUsePrompt={(text) => setPendingInsert(text)}
         />
 

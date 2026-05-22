@@ -100,6 +100,14 @@ export interface CheckpointFileChange {
   status: "added" | "modified" | "deleted" | "renamed" | "typechange";
 }
 
+// ── Project memory (.codefactory/memory.md) ────────────────────────────────
+
+export interface ProjectMemory {
+  path: string;
+  content: string;
+  exists: boolean;
+}
+
 export interface Settings {
   endpoints: Record<string, Endpoint>;
   default_endpoint: string;
