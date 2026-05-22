@@ -157,25 +157,6 @@ export function reduceChatStreamEvent(
         },
       };
 
-    case "context_usage":
-      return {
-        ...state,
-        contextUsage: {
-          used: event.used_tokens,
-          limit: event.limit_tokens,
-        },
-      };
-
-    case "context_compressed":
-      return {
-        ...state,
-        compressionToast: {
-          elidedCount: event.elided_count,
-          tokensFreed: event.tokens_freed,
-          id: Date.now(),
-        },
-      };
-
     case "tool_call_args_delta":
     case "tool_call_end":
       return state;
