@@ -24,7 +24,6 @@ import {
 import { useSkillsStore } from "../../stores/skills";
 import { invoke } from "../../lib/tauri";
 import Terminal from "../../components/Terminal";
-import { TokenCostBar } from "../../components/TokenCostBar";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
 
 interface ChatPageProps {
@@ -265,11 +264,8 @@ export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPage
           }}
         />
 
-        {/* Live context-window usage bar (with compression toast) */}
-        <ContextUsageBar />
-
-        {/* Token cost status bar */}
-        <TokenCostBar sessionId={activeSession?.id} />
+        {/* Combined token totals + context-window usage bar */}
+        <ContextUsageBar sessionId={activeSession?.id} />
 
         {/* Input */}
         <MessageInput

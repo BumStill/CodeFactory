@@ -64,6 +64,24 @@ export function useStickyAutoScroll(conversationKey: string | null) {
     return () => obs.disconnect();
   }, []);
 
+  // Render-tick fallback for the MutationObserver.
+  // Background: in production we shipped a bug where streaming content
+  // stopped following scroll the moment the rendering switched from the
+  // "Thinking…" placeholder to the prose-styled markdown subtree. The
+  // observer's microtask sometimes fires BEFORE the new subtree's layout
+  // is fully computed, so it reads a stale scrollHeight and we end up a
+  // viewport short of the actual bottom. Re-running stickToBottom inside
+  // a layout effect that depends on `scrollTick` (incremented by the
+  // caller on every interesting state change — see MessageList) guarantees
+  // one extra snap per render, after React has committed the new layout.
+  useLayoutEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    if (pinnedRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  });
+
   // Session-switch effect: force re-pin and snap to bottom when the
   // conversation identity changes. Runs after new messages have been
   // committed so scrollHeight reflects them.
