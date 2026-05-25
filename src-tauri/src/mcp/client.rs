@@ -6,6 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::config::settings::McpServerConfig;
+use crate::util::no_window::NoWindow;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpTool {
@@ -26,7 +27,7 @@ pub struct McpClient {
 
 impl McpClient {
     pub async fn spawn(config: McpServerConfig) -> crate::errors::Result<Self> {
-        let mut cmd = Command::new(&config.command);
+        let mut cmd = Command::new(&config.command).no_window();
         cmd.args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

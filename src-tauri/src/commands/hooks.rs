@@ -4,6 +4,7 @@ use tauri::State;
 
 use crate::config::settings;
 use crate::AppState;
+use crate::util::no_window::NoWindow;
 
 // ── Hook data structures ──────────────────────────────────────────────────────
 
@@ -100,7 +101,7 @@ pub async fn test_hook(id: String, state: State<'_, AppState>) -> Result<String,
             Ok(format!("Appended test entry to {path}"))
         }
         HookAction::RunCommand { command, cwd } => {
-            let output = std::process::Command::new("powershell")
+            let output = std::process::Command::new("powershell").no_window()
                 .args(["-NonInteractive", "-Command", command])
                 .current_dir(cwd.as_deref().unwrap_or("."))
                 .output()

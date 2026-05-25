@@ -13,6 +13,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::errors::AppError;
 use crate::storage::tasks;
 use crate::AppState;
+use crate::util::no_window::NoWindow;
 
 // ── Data structures ───────────────────────────────────────────────────────────
 
@@ -200,7 +201,7 @@ pub async fn collect_evidence_pack(
     let mut files_changed_out: Vec<serde_json::Value> = Vec::new();
     for file_path in &changed_paths {
         // Try to get git diff for this file
-        let diff = Command::new("git")
+        let diff = Command::new("git").no_window()
             .current_dir(cwd)
             .args(["diff", "HEAD~1", "--", file_path])
             .output()
@@ -268,7 +269,7 @@ pub async fn collect_evidence_pack(
             .unwrap_or_default();
 
         if !dt.is_empty() {
-            let git_log_out = Command::new("git")
+            let git_log_out = Command::new("git").no_window()
                 .current_dir(cwd)
                 .args([
                     "log",
@@ -688,7 +689,7 @@ pub async fn get_evidence_pack(path: String) -> Result<EvidencePack, String> {
 
 #[tauri::command]
 pub async fn open_evidence_pack_dir(path: String) -> Result<(), String> {
-    Command::new("explorer")
+    Command::new("explorer").no_window()
         .arg(&path)
         .spawn()
         .map_err(|e| e.to_string())?;

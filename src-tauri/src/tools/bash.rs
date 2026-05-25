@@ -6,6 +6,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::util::no_window::NoWindow;
+
 use super::{shell_policy, ExecCtx, ToolOutput};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
@@ -65,6 +67,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let result = timeout(
         Duration::from_secs(TIMEOUT_SECS),
         Command::new("powershell")
+            .no_window()
             .args(["-NonInteractive", "-NoProfile", "-Command", &a.command])
             .current_dir(&ctx.cwd)
             .stdout(Stdio::piped())

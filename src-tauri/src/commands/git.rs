@@ -14,6 +14,7 @@ use serde::Serialize;
 use std::process::Command;
 
 use git2::{BranchType, DiffFormat, DiffOptions, Repository, Status, StatusOptions};
+use crate::util::no_window::NoWindow;
 
 // ── Types serialized to the frontend ────────────────────────────────────────
 
@@ -115,7 +116,7 @@ fn classify_workdir_status(s: Status) -> Option<&'static str> {
 /// Convenience: run `git` CLI with given args in `cwd`, returning stdout on
 /// success or a combined-error string on failure.
 fn run_git(cwd: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = Command::new("git").no_window()
         .current_dir(cwd)
         .args(args)
         .output()

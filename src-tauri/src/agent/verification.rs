@@ -14,6 +14,7 @@ use std::process::Stdio;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 use tokio::time::{timeout, Duration};
+use crate::util::no_window::NoWindow;
 
 /// Timeout for every command-based check.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -238,7 +239,7 @@ async fn run_command_check(
     let task_result = if !shell_args.is_empty() {
         // Direct invocation: first element is the binary.
         let (prog, args) = shell_args.split_first().expect("shell_args non-empty");
-        let mut cmd = tokio::process::Command::new(prog);
+        let mut cmd = tokio::process::Command::new(prog).no_window();
         cmd.args(args)
             .current_dir(cwd)
             .stdout(Stdio::piped())
@@ -266,7 +267,7 @@ async fn run_command_check(
         let cmd_owned = cmd_str.to_string();
         let cwd_owned = cwd.to_string();
         timeout(CHECK_TIMEOUT, async move {
-            let mut cmd = tokio::process::Command::new("cmd");
+            let mut cmd = tokio::process::Command::new("cmd").no_window();
             cmd.args(["/C", &cmd_owned])
                 .current_dir(&cwd_owned)
                 .stdout(Stdio::piped())

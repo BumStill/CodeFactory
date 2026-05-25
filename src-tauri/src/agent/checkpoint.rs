@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::util::no_window::NoWindow;
+
 /// Snapshot of a workspace at a point in time. Stored in DB so the UI
 /// can list per-session checkpoints and offer revert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +75,7 @@ pub fn create(cwd: &Path, label: &str) -> CheckpointResult<Option<String>> {
     // git stash create: returns a SHA when there's something to stash,
     // empty when the tree is already clean.
     let out = Command::new("git")
+        .no_window()
         .args(["stash", "create"])
         .arg("--include-untracked")
         .current_dir(cwd)
@@ -91,6 +94,7 @@ pub fn create(cwd: &Path, label: &str) -> CheckpointResult<Option<String>> {
         // anchors are easy to enumerate or clean up later.
         let ref_name = format!("refs/codefactory/checkpoints/{}", &stash_sha[..12]);
         let _ = Command::new("git")
+        .no_window()
             .args(["update-ref", &ref_name, &stash_sha])
             .current_dir(cwd)
             .output();
@@ -101,6 +105,7 @@ pub fn create(cwd: &Path, label: &str) -> CheckpointResult<Option<String>> {
     // Working tree was clean. Use HEAD's SHA so the checkpoint still has
     // a stable handle the user can compare against later.
     let head = Command::new("git")
+        .no_window()
         .args(["rev-parse", "HEAD"])
         .current_dir(cwd)
         .output()
@@ -127,6 +132,7 @@ pub fn revert(cwd: &Path, git_sha: &str) -> CheckpointResult<()> {
 
     // Validate the sha resolves to something we can read.
     let cat = Command::new("git")
+        .no_window()
         .args(["cat-file", "-e", git_sha])
         .current_dir(cwd)
         .output()
@@ -143,6 +149,7 @@ pub fn revert(cwd: &Path, git_sha: &str) -> CheckpointResult<()> {
     // the merge of the index + worktree changes; checking it out is the
     // right "restore to that snapshot" semantics.
     let restore = Command::new("git")
+        .no_window()
         .args(["restore", "--source", git_sha, "--worktree", "--", "."])
         .current_dir(cwd)
         .output()
@@ -161,6 +168,7 @@ pub fn changeset(cwd: &Path, git_sha: &str) -> CheckpointResult<Vec<CheckpointFi
         return Ok(vec![]);
     }
     let out = Command::new("git")
+        .no_window()
         .args(["diff", "--name-status", git_sha, "--"])
         .current_dir(cwd)
         .output()
@@ -197,6 +205,7 @@ fn is_git_repo(cwd: &Path) -> bool {
     let p: PathBuf = cwd.join(".git");
     p.exists()
         || Command::new("git")
+        .no_window()
             .args(["rev-parse", "--git-dir"])
             .current_dir(cwd)
             .output()
@@ -211,15 +220,21 @@ mod tests {
     use std::process::Command;
 
     fn init_repo(dir: &Path) {
-        Command::new("git").args(["init"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["config", "user.name", "t"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+        .no_window().args(["init"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+        .no_window().args(["config", "user.email", "t@t"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+        .no_window().args(["config", "user.name", "t"]).current_dir(dir).output().unwrap();
         // Disable Windows autocrlf so byte-exact comparisons in the asserts
         // below don't break on CRLF translation.
-        Command::new("git").args(["config", "core.autocrlf", "false"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+        .no_window().args(["config", "core.autocrlf", "false"]).current_dir(dir).output().unwrap();
         fs::write(dir.join("a.txt"), "hello\n").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+        .no_window().args(["add", "."]).current_dir(dir).output().unwrap();
+        Command::new("git")
+        .no_window().args(["commit", "-m", "init"]).current_dir(dir).output().unwrap();
     }
 
     fn tmp() -> PathBuf {

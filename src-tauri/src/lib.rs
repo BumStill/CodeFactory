@@ -10,6 +10,7 @@ mod openrouter;
 mod secrets;
 mod storage;
 mod tools;
+mod util;
 
 use sqlx::SqlitePool;
 use std::collections::HashMap;

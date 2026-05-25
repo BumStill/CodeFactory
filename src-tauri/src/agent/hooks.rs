@@ -7,6 +7,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::commands::hooks::{HookAction, HookConfig};
 use crate::config::settings::Settings;
+use crate::util::no_window::NoWindow;
 
 // ── Hook event types ──────────────────────────────────────────────────────────
 
@@ -141,7 +142,7 @@ impl HookRunner {
 
             HookAction::RunCommand { command, cwd } => {
                 let is_pre_tool = matches!(event, HookEvent::PreTool { .. });
-                let result = std::process::Command::new("powershell")
+                let result = std::process::Command::new("powershell").no_window()
                     .args(["-NonInteractive", "-Command", command])
                     .current_dir(cwd.as_deref().unwrap_or("."))
                     .output();
@@ -176,7 +177,7 @@ impl HookRunner {
                         .replace("{task_title}", summary)
                         .replace("{task_id}", task_id)
                         .replace("{req_id}", task_id);
-                    let _ = std::process::Command::new("powershell")
+                    let _ = std::process::Command::new("powershell").no_window()
                         .args([
                             "-NonInteractive",
                             "-Command",

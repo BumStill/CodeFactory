@@ -20,6 +20,7 @@ use crate::commands::evidence;
 use crate::errors::AppError;
 use crate::storage::tasks::{self, TaskRun};
 use crate::AppState;
+use crate::util::no_window::NoWindow;
 
 /// Map of session_id -> cancel flag for the running scheduler. When the user
 /// hits Cancel we flip the flag and drop the entry. The actual scheduler task
@@ -304,7 +305,7 @@ async fn auto_create_pr_if_configured(
     }
 
     // Get current branch.
-    let branch_output = std::process::Command::new("git")
+    let branch_output = std::process::Command::new("git").no_window()
         .current_dir(cwd)
         .args(["branch", "--show-current"])
         .output();
