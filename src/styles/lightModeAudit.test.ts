@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// @vitest-environment node
 //
 // Light-mode contrast guard.
 //
@@ -13,7 +14,7 @@
 // This test was added after v0.5.1, where the chat surface looked broken
 // in light mode because 9+ components used unconditional light text shades.
 
-import { describe, it, expect } from "vitest";
+import { describe, it } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -63,7 +64,7 @@ describe("light-mode contrast audit", () => {
 
     for (const file of walk(SRC)) {
       const lines = readFileSync(file, "utf8").split("\n");
-      lines.forEach((line, idx) => {
+      lines.forEach((line: string, idx: number) => {
         const matches = [...line.matchAll(FORBIDDEN_PATTERN)];
         if (matches.length === 0) return;
 
