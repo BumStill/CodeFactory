@@ -161,7 +161,7 @@ export function ToolCallCard({ tc }: Props) {
         <Icon size={12} className={`${iconClass} shrink-0`} />
         <span className="text-gray-300 font-mono shrink-0">{tc.name}</span>
         {isTestMod && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-medium shrink-0">
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-800 dark:text-amber-300 font-medium shrink-0">
             test
           </span>
         )}
@@ -187,7 +187,7 @@ export function ToolCallCard({ tc }: Props) {
               {hasDiff ? (
                 <DiffViewer output={tc.result} />
               ) : (
-                <pre className={`whitespace-pre-wrap break-all ${tc.isError ? "text-red-300" : "text-gray-300"}`}>
+                <pre className={`whitespace-pre-wrap break-all ${tc.isError ? "text-red-700 dark:text-red-300" : "text-gray-300"}`}>
                   {tc.result.slice(0, 2000)}
                   {tc.result.length > 2000 && "\n[truncated]"}
                 </pre>

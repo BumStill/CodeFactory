@@ -102,7 +102,7 @@ const markdownComponents: Components = {
       return <CodeBlock lang={match![1]} code={code} />;
     }
     return (
-      <code className="bg-surface-3 px-1 py-0.5 rounded text-[12px] font-mono text-amber-200" {...props}>
+      <code className="bg-surface-3 px-1 py-0.5 rounded text-[12px] font-mono text-amber-700 dark:text-amber-200" {...props}>
         {children}
       </code>
     );
@@ -244,7 +244,7 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
         <ToolCallCard key={tc.id} tc={tc} />
       ))}
       {msg.content && (
-        <div className="prose prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+        <div className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
           <ReactMarkdown components={markdownComponents}>{msg.content}</ReactMarkdown>
           {isStreamingTail && <TypingDots />}
         </div>

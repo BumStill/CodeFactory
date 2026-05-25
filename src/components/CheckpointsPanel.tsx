@@ -181,7 +181,7 @@ function RevertConfirmModal({ cp, onCancel, onDone }: {
 
         <div className="px-4 py-3 flex-1 overflow-y-auto">
           {error ? (
-            <div className="flex items-start gap-2 p-2 rounded bg-rose-500/10 border border-rose-500/40 text-xs text-rose-300">
+            <div className="flex items-start gap-2 p-2 rounded bg-rose-500/10 border border-rose-500/40 text-xs text-rose-800 dark:text-rose-300">
               <AlertCircle size={12} className="shrink-0 mt-0.5" />
               <span className="flex-1 break-words">{error}</span>
             </div>
@@ -220,7 +220,7 @@ function RevertConfirmModal({ cp, onCancel, onDone }: {
           <button
             onClick={handleRevert}
             disabled={busy || changes === null || changes.length === 0}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-amber-500/20 text-amber-300 border border-amber-500/40 rounded hover:bg-amber-500/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-amber-500/20 text-amber-800 dark:text-amber-300 border border-amber-500/40 rounded hover:bg-amber-500/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
             <RotateCcw size={11} />
             {busy ? "Reverting…" : "Revert"}

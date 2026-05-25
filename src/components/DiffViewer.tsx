@@ -34,9 +34,9 @@ export function DiffViewer({ output }: Props) {
       {parsed.files.map((file, fileIndex) => (
         <div key={`${file.oldPath}-${file.newPath}-${fileIndex}`} className="overflow-hidden rounded border border-border">
           <div className="flex items-center gap-2 border-b border-border bg-surface-3 px-2 py-1 text-gray-400">
-            <span className="truncate text-red-300">{file.oldPath}</span>
+            <span className="truncate text-red-700 dark:text-red-300">{file.oldPath}</span>
             <span className="text-gray-600">to</span>
-            <span className="truncate text-green-300">{file.newPath}</span>
+            <span className="truncate text-green-700 dark:text-green-300">{file.newPath}</span>
           </div>
           <div className="max-h-80 overflow-auto bg-surface-1">
             {file.lines.map((line, lineIndex) => (
@@ -105,11 +105,11 @@ export function parseUnifiedDiffResult(output: string): ParsedDiffResult {
 function classForLine(kind: DiffLineKind): string {
   switch (kind) {
     case "added":
-      return "bg-green-950/30 text-green-200";
+      return "bg-green-100 text-green-800 dark:bg-green-950/30 dark:text-green-200";
     case "removed":
-      return "bg-red-950/30 text-red-200";
+      return "bg-red-100 text-red-800 dark:bg-red-950/30 dark:text-red-200";
     case "hunk":
-      return "bg-blue-950/30 text-blue-300";
+      return "bg-blue-100 text-blue-800 dark:bg-blue-950/30 dark:text-blue-300";
     case "meta":
       return "text-gray-500";
     case "context":
