@@ -338,6 +338,89 @@ describe("useStickyAutoScroll", () => {
     expect(handle.hasNewContent()).toBe(false);
   });
 
+  it("re-pins when the user scrolls down toward a tail that has grown beyond their old position", async () => {
+    // The scenario users actually run into during long streams:
+    //   1. They scroll up while content is being streamed.
+    //   2. The stream keeps growing — scrollHeight is now much further
+    //      down than where they stopped.
+    //   3. They scroll back DOWN to the latest message.
+    //   4. Because the tail kept moving, their scroll position no longer
+    //      fits inside a 60px-from-actual-bottom window.
+    // With a single tight threshold the user could never re-pin without
+    // perfectly hitting the moving target. The fix: a wider stick zone
+    // when the scroll direction is downward (catching up to streaming).
+    const { handle } = renderHarness("session-1");
+    setLayout(handle.scroller, { scrollHeight: 3000, clientHeight: 600 });
+    await flushAsync();
+
+    // Scroll up first.
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 500, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.pinned()).toBe(false);
+
+    // Stream balloons the content — scrollHeight grows past their position.
+    setLayout(handle.scroller, { scrollHeight: 10000, clientHeight: 600 });
+    await act(async () => {
+      const block = document.createElement("div");
+      block.textContent = "lots of streaming";
+      handle.scroller.appendChild(block);
+    });
+    await flushAsync();
+    expect(handle.hasNewContent()).toBe(true);
+    expect(handle.scroller.scrollTop).toBe(500); // user untouched
+
+    // User scrolls back down — lands ~150px from current bottom (within
+    // the 240px catch-up zone but well outside the old 60px window).
+    // Distance: 10000 - 9250 - 600 = 150.
+    await act(async () => {
+      // First a smaller down-step so the direction detector sees "down"
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 5000, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 9250, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+
+    // Re-pinned because the down-scroll widened the threshold to 240.
+    expect(handle.pinned()).toBe(true);
+    expect(handle.hasNewContent()).toBe(false);
+
+    // Next streaming token must auto-snap to the true bottom.
+    setLayout(handle.scroller, { scrollHeight: 12000, clientHeight: 600 });
+    await act(async () => {
+      const block = document.createElement("div");
+      block.textContent = "more";
+      handle.scroller.appendChild(block);
+    });
+    await flushAsync();
+    expect(handle.scroller.scrollTop).toBe(12000);
+  });
+
+  it("does NOT re-pin when scrolling UP into the wider catch-up zone", async () => {
+    // The flip side of the previous test: a wider threshold is correct
+    // for downward catch-up but would be wrong for upward scrolls — if
+    // user wheels up 200px the system shouldn't say "still pinned" and
+    // ignore them. Up direction must keep the tight 60px window.
+    const { handle } = renderHarness("session-1");
+    setLayout(handle.scroller, { scrollHeight: 3000, clientHeight: 600 });
+    await flushAsync();
+    expect(handle.pinned()).toBe(true);
+    expect(handle.scroller.scrollTop).toBe(3000);
+
+    // Wheel up by 200px — within the down-direction 240px zone but
+    // clearly "the user left the bottom" if interpreted as upward.
+    // Distance from bottom: 3000 - 2200 - 600 = 200.
+    await act(async () => {
+      // Two events so direction detector sees "up" (newTop < lastTop)
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 2900, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 2200, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.pinned()).toBe(false);
+  });
+
   it("clears hasNewContent when the user manually scrolls back near the bottom", async () => {
     // The other re-pin path: instead of clicking the button, the user just
     // scrolls back down. As long as they get within the 60px stick zone of

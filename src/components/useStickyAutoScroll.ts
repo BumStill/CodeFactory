@@ -71,6 +71,13 @@ export function useStickyAutoScroll(conversationKey: string | null) {
   const lastSetScrollTop = useRef(-1);
   const ignoreScrollUntil = useRef(0);
 
+  // Last user scrollTop so we can detect scroll direction. Streaming
+  // produces a "moving bottom" — when the user scrolls *toward* the tail
+  // we use a wider re-pin threshold so they can actually catch up; when
+  // they scroll *away* (up), a tight threshold keeps them detached the
+  // moment they leave the stick zone.
+  const lastUserScrollTop = useRef(0);
+
   const programmaticScrollTo = useCallback((y: number) => {
     const el = scrollerRef.current;
     if (!el) return;
@@ -99,16 +106,30 @@ export function useStickyAutoScroll(conversationKey: string | null) {
       const insideWindow = Date.now() < ignoreScrollUntil.current;
       if (positionMatches && insideWindow) return;
 
-      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+      const newTop = el.scrollTop;
+      // Direction. "still" treated as "down" because the user is
+      // probably done scrolling; we want to re-pin generously.
+      const scrollingUp = newTop < lastUserScrollTop.current - 1;
+      lastUserScrollTop.current = newTop;
+
+      const distFromBottom = el.scrollHeight - newTop - el.clientHeight;
+      // The whole point of two thresholds: streaming pushes scrollHeight
+      // faster than a wheel can keep up, so chasing the tail with a 60px
+      // window is impossible. When the user is scrolling DOWN they get a
+      // 240px catch-up zone; up-scroll keeps the tight 60px so leaving
+      // the stick zone is definitive.
+      const threshold = scrollingUp ? 60 : 240;
+      const nearBottom = distFromBottom < threshold;
+
       if (nearBottom !== pinnedRef.current) {
         // Update ref synchronously so any MutationObserver hit in the same
         // microtask sees the new value (without this they could race and
         // re-pin before React commits the state).
         pinnedRef.current = nearBottom;
         setPinned(nearBottom);
-        // Scrolling back into the pin zone clears the "new content"
-        // indicator — the user has seen the latest tail.
         if (nearBottom && hasNewContentRef.current) {
+          // Scrolled back into pin zone — user has caught up to the tail,
+          // the "new content" indicator's purpose is served.
           hasNewContentRef.current = false;
           setHasNewContent(false);
         }
