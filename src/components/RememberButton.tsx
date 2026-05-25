@@ -60,7 +60,7 @@ export function RememberButton({ cwd, suggestedText }: Props) {
     return (
       <button
         onClick={handleOpen}
-        className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-gray-600 hover:text-amber-300 hover:bg-amber-500/10"
+        className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-gray-600 hover:text-amber-800 dark:hover:text-amber-300 hover:bg-amber-500/10"
         title="Append a fact to .codefactory/memory.md — auto-injected into every future session"
       >
         <Brain size={11} />
@@ -71,7 +71,7 @@ export function RememberButton({ cwd, suggestedText }: Props) {
 
   return (
     <div className="mt-1 rounded border border-amber-500/40 bg-amber-500/5 p-2 space-y-2">
-      <div className="text-[11px] text-amber-300 flex items-center gap-1.5">
+      <div className="text-[11px] text-amber-800 dark:text-amber-300 flex items-center gap-1.5">
         <Brain size={11} />
         Save to project memory
       </div>
@@ -102,7 +102,7 @@ export function RememberButton({ cwd, suggestedText }: Props) {
         <button
           onClick={() => void handleSave()}
           disabled={saving || !text.trim()}
-          className="flex items-center gap-1 px-2 py-1 rounded text-[11px] bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 disabled:opacity-40 disabled:cursor-not-allowed"
+          className="flex items-center gap-1 px-2 py-1 rounded text-[11px] bg-amber-500/20 text-amber-800 dark:text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 disabled:opacity-40 disabled:cursor-not-allowed"
         >
           <Check size={10} />
           {saving ? "Saving…" : "Save"}

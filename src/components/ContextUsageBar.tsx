@@ -128,7 +128,7 @@ export function ContextUsageBar({ sessionId }: Props) {
       {/* Compression toast — middle, transient */}
       {showToast && toast && (
         <span
-          className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 text-[10px]"
+          className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-800 dark:text-amber-300 text-[10px]"
           title={`Freed ~${fmtTokens(toast.tokensFreed)} tokens`}
         >
           compressed {toast.elidedCount} old result{toast.elidedCount === 1 ? "" : "s"}

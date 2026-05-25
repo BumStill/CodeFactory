@@ -41,7 +41,7 @@ export function UpdateStatusPill() {
 
   if (phase.kind === "installing" || phase.kind === "ready") {
     return (
-      <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-500/15 text-[11px] text-emerald-300">
+      <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-500/15 text-[11px] text-emerald-800 dark:text-emerald-300">
         <Check size={11} />
         {phase.kind === "installing" ? "Installing…" : "Restarting…"}
       </span>

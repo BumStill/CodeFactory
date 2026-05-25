@@ -37,7 +37,7 @@ export function PermissionDialog({
             {formatToolArgs(request.args)}
           </pre>
           {fullAccess && (
-            <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+            <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
               Full access is enabled. Future matching tool calls can run without this prompt.
             </div>
           )}
@@ -60,7 +60,7 @@ export function PermissionDialog({
           </button>
           <button
             onClick={onAllowFullAccess}
-            className="inline-flex items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-100 hover:bg-amber-500/20"
+            className="inline-flex items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-900 dark:text-amber-100 hover:bg-amber-500/20"
           >
             <Unlock size={13} />
             Full access and allow

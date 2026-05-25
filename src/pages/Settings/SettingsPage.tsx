@@ -1347,8 +1347,8 @@ function DataSection() {
         <div
           className={`text-[11px] rounded border px-2.5 py-1.5 ${
             msg.kind === "ok"
-              ? "border-green-500/30 bg-green-500/10 text-green-300"
-              : "border-red-500/30 bg-red-500/10 text-red-300"
+              ? "border-green-500/30 bg-green-500/10 text-green-800 dark:text-green-300"
+              : "border-red-500/30 bg-red-500/10 text-red-800 dark:text-red-300"
           }`}
         >
           {msg.text}
