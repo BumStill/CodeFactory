@@ -168,6 +168,9 @@ impl Default for Settings {
             mcp_servers: vec![],
             git_remotes: vec![],
             auto_create_pr: false,
+            theme: Theme::Dark,
+            font_family: default_font_family(),
+            font_size: default_font_size(),
         }
     }
 }
