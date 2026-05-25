@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useRef, useState } from "react";
-import { FolderOpen, Plus, Trash2, Settings, TerminalSquare, BookOpen, Puzzle } from "lucide-react";
+import React, { useEffect, useRef, useState } from "react";
+import { FolderOpen, Plus, Trash2, Settings, TerminalSquare, BookOpen, Puzzle, Moon, Sun, Monitor } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
@@ -15,6 +15,7 @@ import { GitHistoryPanel } from "../../components/GitHistoryPanel";
 import { RemoteGitPanel } from "../../components/RemoteGitPanel";
 import { useChatStore } from "../../stores/chat";
 import { useSettingsStore } from "../../stores/settings";
+import type { Theme } from "../../lib/tauri";
 import { useGitStore } from "../../stores/git";
 import {
   formatCostFeedback,
@@ -43,7 +44,7 @@ export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPage
     addLocalAssistantMessage, clearVisibleConversation, updateActiveSessionModel,
   } = useChatStore();
 
-  const { settings, load: loadSettings, save: saveSettings } = useSettingsStore();
+  const { settings, load: loadSettings, save: saveSettings, setTheme } = useSettingsStore();
   const { skills, loadSkills } = useSkillsStore();
   const { status: gitStatus } = useGitStore();
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -232,6 +233,29 @@ export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPage
               <Puzzle size={14} />
             </button>
           )}
+          {/* Theme toggle — dark / light / system */}
+          <div className="flex items-center rounded border border-border overflow-hidden">
+            {(
+              [
+                { value: "dark",   Icon: Moon,    label: "深色" },
+                { value: "light",  Icon: Sun,     label: "浅色" },
+                { value: "system", Icon: Monitor, label: "跟随系统" },
+              ] as { value: Theme; Icon: React.ElementType; label: string }[]
+            ).map(({ value, Icon, label }) => (
+              <button
+                key={value}
+                onClick={() => setTheme(value)}
+                title={label}
+                className={`p-1 transition-colors ${
+                  settings?.theme === value
+                    ? "bg-surface-3 text-accent"
+                    : "text-gray-600 hover:text-gray-300 hover:bg-surface-3"
+                }`}
+              >
+                <Icon size={13} />
+              </button>
+            ))}
+          </div>
           <button
             onClick={onOpenSettings}
             className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
