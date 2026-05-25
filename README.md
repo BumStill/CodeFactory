@@ -117,6 +117,10 @@ pnpm tauri build
 
 Output lands in `src-tauri/target/release/bundle/nsis/`.
 
+For a deeper walkthrough of the codebase layout, test commands, and
+where runtime data lives, see [DEVELOPMENT.md](DEVELOPMENT.md).
+Release / versioning policy lives in [VERSIONING.md](VERSIONING.md).
+
 ## Data & privacy
 
 Everything lives on your machine:
