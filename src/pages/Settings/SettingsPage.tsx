@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   ArrowLeft, Plus, Trash2, Eye, EyeOff, Check, AlertCircle, ChevronDown,
 } from "lucide-react";
@@ -13,7 +13,7 @@ interface Props {
   onBack: () => void;
 }
 
-type Tab = "endpoints" | "permissions" | "general" | "hooks" | "remotes";
+type Tab = "endpoints" | "permissions" | "general" | "hooks" | "remotes" | "appearance";
 
 // ── Hooks types ───────────────────────────────────────────────────────────────
 
@@ -572,6 +572,7 @@ export function SettingsPage({ onBack }: Props) {
     { id: "endpoints", label: "Endpoints" },
     { id: "permissions", label: "Permissions" },
     { id: "general", label: "General" },
+    { id: "appearance", label: "外观" },
     { id: "hooks", label: "Hooks" },
     { id: "remotes", label: "Remotes" },
   ];
@@ -760,6 +761,9 @@ export function SettingsPage({ onBack }: Props) {
             <DataSection />
           </div>
         )}
+
+        {/* ── Appearance ── */}
+        {tab === "appearance" && <AppearanceTab />}
 
         {/* ── Hooks ── */}
         {tab === "hooks" && <HooksTab />}
@@ -1131,6 +1135,104 @@ function AddRemoteForm({
           {saving ? "Adding…" : "Add Remote"}
         </button>
       </div>
+    </div>
+  );
+}
+
+// ── AppearanceTab — theme / font / font-size ─────────────────────────────────
+
+import { Moon, Sun, Monitor } from "lucide-react";
+import {
+  FONT_FAMILIES,
+  FONT_FAMILY_LABELS,
+  FONT_SIZE_MIN,
+  FONT_SIZE_MAX,
+} from "../../stores/settings";
+import type { Theme } from "../../lib/tauri";
+
+function AppearanceTab() {
+  const { settings, setTheme, setFontFamily, setFontSize } = useSettingsStore();
+  if (!settings) return null;
+
+  const themeOptions: { value: Theme; Icon: React.ElementType; label: string }[] = [
+    { value: "dark",   Icon: Moon,    label: "深色" },
+    { value: "light",  Icon: Sun,     label: "浅色" },
+    { value: "system", Icon: Monitor, label: "跟随系统" },
+  ];
+
+  return (
+    <div className="max-w-sm space-y-8">
+
+      {/* Theme */}
+      <div>
+        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">主题</h2>
+        <div className="flex gap-2">
+          {themeOptions.map(({ value, Icon, label }) => (
+            <button
+              key={value}
+              onClick={() => setTheme(value)}
+              className={`flex flex-col items-center gap-1.5 px-4 py-3 rounded-lg border transition-colors text-xs font-medium flex-1 ${
+                settings.theme === value
+                  ? "border-accent bg-surface-3 text-accent"
+                  : "border-border bg-surface-2 text-gray-400 hover:border-gray-500 hover:text-gray-300"
+              }`}
+            >
+              <Icon size={16} />
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Font family */}
+      <div>
+        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">字体</h2>
+        <div className="flex flex-col gap-2">
+          {Object.entries(FONT_FAMILY_LABELS).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setFontFamily(key)}
+              className={`flex items-center justify-between px-3 py-2 rounded-lg border text-xs transition-colors ${
+                settings.font_family === key
+                  ? "border-accent bg-surface-3 text-gray-200"
+                  : "border-border bg-surface-2 text-gray-400 hover:border-gray-500 hover:text-gray-300"
+              }`}
+            >
+              <span>{label}</span>
+              <span
+                className="text-gray-500"
+                style={{ fontFamily: FONT_FAMILIES[key] }}
+              >
+                Aa Bb Cc
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Font size */}
+      <div>
+        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
+          字号 <span className="text-gray-300 font-mono normal-case font-normal ml-1">{settings.font_size}px</span>
+        </h2>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-gray-500 w-6 text-right">{FONT_SIZE_MIN}</span>
+          <input
+            type="range"
+            min={FONT_SIZE_MIN}
+            max={FONT_SIZE_MAX}
+            step={1}
+            value={settings.font_size}
+            onChange={(e) => setFontSize(Number(e.target.value))}
+            className="flex-1 accent-accent"
+          />
+          <span className="text-xs text-gray-500 w-6">{FONT_SIZE_MAX}</span>
+        </div>
+        <p className="mt-2 text-xs text-gray-500" style={{ fontSize: settings.font_size }}>
+          预览：这是 {settings.font_size}px 的正文文字效果
+        </p>
+      </div>
+
     </div>
   );
 }

@@ -108,6 +108,8 @@ export interface ProjectMemory {
   exists: boolean;
 }
 
+export type Theme = 'dark' | 'light' | 'system';
+
 export interface Settings {
   endpoints: Record<string, Endpoint>;
   default_endpoint: string;
@@ -122,6 +124,9 @@ export interface Settings {
     shell: string;
   };
   auto_create_pr: boolean;
+  theme: Theme;
+  font_family: string;
+  font_size: number;
 }
 
 // ── Git ─────────────────────────────────────────────────────────────────────

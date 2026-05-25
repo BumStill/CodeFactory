@@ -48,6 +48,34 @@ pub struct Settings {
     pub git_remotes: Vec<GitRemoteConfig>,
     #[serde(default)]
     pub auto_create_pr: bool,
+    #[serde(default)]
+    pub theme: Theme,
+    #[serde(default = "default_font_family")]
+    pub font_family: String,
+    #[serde(default = "default_font_size")]
+    pub font_size: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    Dark,
+    Light,
+    System,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme::Dark
+    }
+}
+
+fn default_font_family() -> String {
+    "inter".into()
+}
+
+fn default_font_size() -> u8 {
+    14
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -140,6 +168,9 @@ impl Default for Settings {
             mcp_servers: vec![],
             git_remotes: vec![],
             auto_create_pr: false,
+            theme: Theme::Dark,
+            font_family: default_font_family(),
+            font_size: default_font_size(),
         }
     }
 }
