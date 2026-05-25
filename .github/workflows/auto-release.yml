@@ -1,0 +1,110 @@
+name: Auto Release
+
+# Triggers after CI passes on main. Determines version slot from the
+# squash-merge commit message (conventional commits), bumps all three
+# version files, pushes a vX.Y.Z tag, and lets release.yml do the rest.
+#
+# Infinite-loop guard: version-bump commits start with
+# "chore: bump version to" — this workflow skips them.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Only proceed when CI actually passed, and skip version-bump commits
+    if: |
+      github.event.workflow_run.conclusion == 'success' &&
+      !startsWith(github.event.workflow_run.head_commit.message, 'chore: bump version to')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use a PAT so the tag push can trigger release.yml.
+          # GITHUB_TOKEN pushes are intentionally blocked from triggering
+          # further workflows (GitHub's loop-prevention mechanism).
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine version slot
+        id: slot
+        env:
+          MSG: ${{ github.event.workflow_run.head_commit.message }}
+        run: |
+          # feat!: or "BREAKING CHANGE" anywhere in message → major
+          if echo "$MSG" | grep -qE '^feat[^:]*!:|BREAKING[ -]CHANGE'; then
+            echo "slot=major" >> "$GITHUB_OUTPUT"
+          # feat: or feat(scope): → minor
+          elif echo "$MSG" | grep -qE '^feat(\([^)]+\))?:'; then
+            echo "slot=minor" >> "$GITHUB_OUTPUT"
+          # everything else (fix, chore, perf, docs, refactor, test…) → patch
+          else
+            echo "slot=patch" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Commit: $MSG"
+          echo "Slot  : $(cat $GITHUB_OUTPUT | grep slot | cut -d= -f2)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Resolve next version
+        id: ver
+        run: |
+          LAST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          CURRENT="${LAST#v}"
+          IFS='.' read -r MAJ MIN PAT <<< "$CURRENT"
+          SLOT="${{ steps.slot.outputs.slot }}"
+          case "$SLOT" in
+            major) NEW="$((MAJ+1)).0.0" ;;
+            minor) NEW="$MAJ.$((MIN+1)).0" ;;
+            patch) NEW="$MAJ.$MIN.$((PAT+1))" ;;
+          esac
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW"    >> "$GITHUB_OUTPUT"
+          echo "Last: $LAST  Slot: $SLOT  Next: v$NEW"
+
+      - name: Bump version files
+        env:
+          NEW: ${{ steps.ver.outputs.version }}
+        run: |
+          # package.json
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('package.json','utf8'));
+            p.version = '$NEW';
+            fs.writeFileSync('package.json', JSON.stringify(p,null,2)+'\n');
+          "
+          # src-tauri/Cargo.toml  (first [package] version line only)
+          sed -i "0,/^version = \"[^\"]*\"/{s//version = \"$NEW\"/}" src-tauri/Cargo.toml
+          # src-tauri/tauri.conf.json
+          node -e "
+            const fs = require('fs');
+            const c = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json','utf8'));
+            c.version = '$NEW';
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(c,null,2)+'\n');
+          "
+
+      - name: Commit, tag, push
+        env:
+          NEW: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json
+          git commit -m "chore: bump version to $NEW"
+          git tag "$TAG"
+          git push origin main
+          git push origin "$TAG"
