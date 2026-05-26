@@ -96,7 +96,7 @@ mod tests {
                 "pattern": "**/*.rs",
                 "path": ".."
             }),
-            &ExecCtx { cwd: workspace, db: None },
+            &ExecCtx::new(workspace, None),
         )
         .await
         .expect("tool returns output");

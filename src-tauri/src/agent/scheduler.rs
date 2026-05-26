@@ -111,6 +111,15 @@ impl TaskScheduler {
                         t.description
                     ));
                 }
+                if let Some(context) =
+                    tasks::TaskConnectorContext::from_json(all_tasks[0].task_context_json.as_deref())
+                {
+                    let rendered = context.render_markdown();
+                    if !rendered.is_empty() {
+                        brief_content.push_str(&rendered);
+                        brief_content.push('\n');
+                    }
+                }
                 brief_content
                     .push_str("## Task Results\n\n_(will be updated as tasks complete)_\n");
                 let _ = std::fs::write(&brief_path, &brief_content);
@@ -248,11 +257,16 @@ impl TaskScheduler {
                                 "read_file".into(),
                                 "glob".into(),
                                 "grep".into(),
+                                "kb_search".into(),
+                                "kb_get_chunk".into(),
                                 "write_file".into(),
                                 "edit_file".into(),
                                 "bash".into(),
                             ],
                             acceptance_criteria: None,
+                            connector_context: tasks::TaskConnectorContext::from_json(
+                                task.task_context_json.as_deref(),
+                            ),
                         };
 
                         // Emit progress so the dashboard knows we're retrying.

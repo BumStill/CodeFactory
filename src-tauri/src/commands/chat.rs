@@ -212,6 +212,7 @@ pub async fn send_message(
             settings_state,
             pending_permissions,
             mcp_manager,
+            None,
         );
         if let Err(e) = agent.run(history).await {
             tracing::error!("Agent loop error: {e:#}");

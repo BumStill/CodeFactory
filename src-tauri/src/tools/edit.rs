@@ -159,7 +159,7 @@ mod tests {
                 "old_string": "old_call();",
                 "new_string": "new_call();"
             }),
-            &ExecCtx { cwd: cwd.clone(), db: None },
+            &ExecCtx::new(cwd.clone(), None),
         )
         .await
         .expect("edit succeeds");
@@ -191,7 +191,7 @@ mod tests {
                 "old_string": "old",
                 "new_string": "new"
             }),
-            &ExecCtx { cwd, db: None },
+            &ExecCtx::new(cwd, None),
         )
         .await
         .expect("tool returns output");

@@ -22,11 +22,12 @@ use tauri::AppHandle;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::agent::AgentLoop;
+use crate::agent::{AgentExecutionContext, AgentLoop};
 use crate::config::settings::{ApiStyle, Settings};
 use crate::errors::{AppError, Result};
 use crate::mcp::McpManager;
 use crate::storage::Message;
+use crate::storage::tasks::TaskConnectorContext;
 use crate::PendingPermissionMap;
 
 /// Brief handed to a subagent. The brief MUST be self-contained — the
@@ -46,6 +47,9 @@ pub struct SubagentBrief {
     pub allowed_tools: Vec<String>,
     /// Optional acceptance criteria the subagent should self-verify against.
     pub acceptance_criteria: Option<String>,
+    /// Connector scope selected by the parent task. Persisted before execution
+    /// and rendered into the brief so tool access is explicit.
+    pub connector_context: Option<TaskConnectorContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -181,6 +185,15 @@ pub async fn run_subagent(
         settings_lock,
         pending_perms.clone(),
         mcp_manager,
+        Some(AgentExecutionContext {
+            parent_session_id: Some(parent_session_id.to_string()),
+            task_id: Some(brief.task_id.clone()),
+            knowledge_library_ids: brief
+                .connector_context
+                .as_ref()
+                .map(|ctx| ctx.knowledge_library_ids())
+                .unwrap_or_default(),
+        }),
     );
 
     // Hard wall-clock cap per subagent. Without this an unbounded
@@ -335,6 +348,14 @@ fn render_brief(brief: &SubagentBrief) -> String {
         out.push_str("\n## Acceptance criteria\n");
         out.push_str(criteria);
         out.push('\n');
+    }
+
+    if let Some(context) = &brief.connector_context {
+        let rendered = context.render_markdown();
+        if !rendered.is_empty() {
+            out.push('\n');
+            out.push_str(&rendered);
+        }
     }
 
     if let Some(ctx) = &brief.parent_summary {

@@ -7,6 +7,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::process::Command;
 use tauri::{AppHandle, Emitter, State};
 
@@ -42,6 +43,7 @@ pub struct EvidencePack {
     pub manifest: EvidencePackMeta,
     pub summary_md: String,
     pub tool_calls: Vec<serde_json::Value>,
+    pub knowledge_refs: Vec<serde_json::Value>,
     pub files_changed: Vec<serde_json::Value>,
     pub verification: Vec<serde_json::Value>,
     pub git_commits: Vec<serde_json::Value>,
@@ -181,7 +183,79 @@ pub async fn collect_evidence_pack(
         std::fs::write(format!("{}/tool_calls.jsonl", evidence_dir), jsonl)?;
     }
 
-    // 6. Collect files changed by scanning tool calls for write_file/edit_file
+    // 6. Collect knowledge retrieval events. These are the field-level proof
+    // that a task used a scoped personal knowledge library instead of an
+    // invisible prompt injection.
+    let mut seen_retrieval_ids: HashSet<String> = HashSet::new();
+    let mut knowledge_refs_out: Vec<serde_json::Value> = Vec::new();
+    let mut retrieval_rows: Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        i64,
+    )> = sqlx::query_as(
+        "SELECT id, session_id, task_id, query, filters_json, result_refs_json, created_at, latency_ms
+         FROM retrieval_events
+         WHERE session_id = ?
+         ORDER BY created_at ASC",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    for task in &task_runs {
+        let mut task_rows: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+            i64,
+        )> = sqlx::query_as(
+            "SELECT id, session_id, task_id, query, filters_json, result_refs_json, created_at, latency_ms
+             FROM retrieval_events
+             WHERE task_id = ?
+             ORDER BY created_at ASC",
+        )
+        .bind(&task.id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        retrieval_rows.append(&mut task_rows);
+    }
+    for (id, event_session_id, task_id, query, filters_json, refs_json, created_at, latency_ms) in
+        retrieval_rows
+    {
+        if !seen_retrieval_ids.insert(id.clone()) {
+            continue;
+        }
+        let filters: serde_json::Value =
+            serde_json::from_str(&filters_json).unwrap_or(serde_json::Value::Null);
+        let refs: serde_json::Value =
+            serde_json::from_str(&refs_json).unwrap_or(serde_json::Value::Array(Vec::new()));
+        knowledge_refs_out.push(serde_json::json!({
+            "id": id,
+            "session_id": event_session_id,
+            "task_id": task_id,
+            "query": query,
+            "filters": filters,
+            "result_refs": refs,
+            "created_at": created_at,
+            "latency_ms": latency_ms,
+        }));
+    }
+    std::fs::write(
+        format!("{}/knowledge_refs.json", evidence_dir),
+        serde_json::to_string_pretty(&knowledge_refs_out)?,
+    )?;
+
+    // 7. Collect files changed by scanning tool calls for write_file/edit_file
     let mut changed_paths: Vec<String> = Vec::new();
     for tc in &tool_calls_out {
         let name = tc.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
@@ -221,7 +295,7 @@ pub async fn collect_evidence_pack(
         serde_json::to_string_pretty(&files_changed_out)?,
     )?;
 
-    // 7. Collect verification results
+    // 8. Collect verification results
     let mut verification_out: Vec<serde_json::Value> = Vec::new();
     let mut all_verif_passed = true;
     for task in &task_runs {
@@ -252,7 +326,7 @@ pub async fn collect_evidence_pack(
         serde_json::to_string_pretty(&verification_out)?,
     )?;
 
-    // 8. Git commits since session was created
+    // 9. Git commits since session was created
     let session_created: Option<(i64,)> =
         sqlx::query_as("SELECT created_at FROM sessions WHERE id = ?")
             .bind(session_id)
@@ -302,7 +376,7 @@ pub async fn collect_evidence_pack(
         serde_json::to_string_pretty(&git_commits_out)?,
     )?;
 
-    // 9. AI collaboration metadata
+    // 10. AI collaboration metadata
     let model: String = messages
         .iter()
         .find(|(_, role, _, _, _, _, _)| role == "assistant")
@@ -354,7 +428,7 @@ pub async fn collect_evidence_pack(
         serde_json::to_string_pretty(&ai_collab)?,
     )?;
 
-    // 10. Compute stats for manifest
+    // 11. Compute stats for manifest
     let completed_tasks = task_runs.iter().filter(|t| t.status == "completed").count();
     let failed_tasks = task_runs.iter().filter(|t| t.status == "failed").count();
     let total_tasks = task_runs.len();
@@ -396,7 +470,7 @@ pub async fn collect_evidence_pack(
 
     let completed_at_str = Utc::now().to_rfc3339();
 
-    // 11. Write summary.md following the evidence-pack template
+    // 12. Write summary.md following the evidence-pack template
     let summary_md = build_summary_md(
         spec_req_id,
         spec_title,
@@ -413,10 +487,11 @@ pub async fn collect_evidence_pack(
         &task_runs,
         &git_commits_out,
         &ai_collab,
+        knowledge_refs_out.len(),
     );
     std::fs::write(format!("{}/summary.md", evidence_dir), &summary_md)?;
 
-    // 12. Write manifest.json
+    // 13. Write manifest.json
     let manifest = EvidencePackMeta {
         spec_req_id: spec_req_id.to_string(),
         spec_title: spec_title.to_string(),
@@ -460,6 +535,7 @@ fn build_summary_md(
     task_runs: &[crate::storage::tasks::TaskRun],
     git_commits: &[serde_json::Value],
     ai_collab: &serde_json::Value,
+    knowledge_refs_count: usize,
 ) -> String {
     let verif_str = if verification_passed { "PASSED" } else { "FAILED / NOT RUN" };
     let model = ai_collab.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -511,6 +587,7 @@ r#"# Evidence Pack — {spec_req_id}: {spec_title}
 - Duration: {duration_minutes:.1} minutes
 - Total tool calls: {total_tool_calls}
 - Files changed: {files_changed}
+- Knowledge retrieval events: {knowledge_refs_count}
 
 ## Task Execution
 
@@ -556,6 +633,7 @@ r#"# Evidence Pack — {spec_req_id}: {spec_title}
         duration_minutes = duration_minutes,
         total_tool_calls = total_tool_calls,
         files_changed = files_changed,
+        knowledge_refs_count = knowledge_refs_count,
         tasks_section = tasks_section,
         total_tasks = total_tasks,
         completed_tasks = completed_tasks,
@@ -664,6 +742,7 @@ pub async fn get_evidence_pack(path: String) -> Result<EvidencePack, String> {
     };
 
     let files_changed = parse_json_array("files_changed.json");
+    let knowledge_refs = parse_json_array("knowledge_refs.json");
     let verification = parse_json_array("verification.json");
     let git_commits = parse_json_array("git_commits.json");
 
@@ -680,6 +759,7 @@ pub async fn get_evidence_pack(path: String) -> Result<EvidencePack, String> {
         manifest,
         summary_md,
         tool_calls,
+        knowledge_refs,
         files_changed,
         verification,
         git_commits,

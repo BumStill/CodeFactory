@@ -35,7 +35,14 @@ import { useSettingsStore } from "../../stores/settings";
 import { useTasksStore } from "../../stores/tasks";
 import { useSkillsStore } from "../../stores/skills";
 import { useKnowledgeStore } from "../../stores/knowledge";
-import type { KnowledgeLibrary, Theme, TaskRun, TaskInput, TaskDep } from "../../lib/tauri";
+import type {
+  KnowledgeLibrary,
+  TaskConnectorContext,
+  Theme,
+  TaskRun,
+  TaskInput,
+  TaskDep,
+} from "../../lib/tauri";
 
 interface DecomposedTask {
   tmp_id: string;
@@ -194,6 +201,7 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
 
   const handleConfirm = async (decomposed: DecomposedTask[]) => {
     const cwd = activeSession?.cwd ?? "";
+    const knowledgeLibraries = libraries.filter((library) => library.enabled);
     const inputs: TaskInput[] = decomposed.map((d) => ({
       tmp_id: d.tmp_id,
       title: d.title,
@@ -206,7 +214,12 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
         depends_on_tmp_id: depId,
       }))
     );
-    await createTaskTree(sessionId, inputs, deps);
+    await createTaskTree(
+      sessionId,
+      inputs,
+      deps,
+      buildTaskConnectorContext(knowledgeLibraries),
+    );
     setCreatorOpen(false);
   };
 
@@ -374,16 +387,7 @@ function TaskCreatorModal({ cwd, knowledgeLibraries, onCancel, onConfirm }: Task
         <div className="flex-1 overflow-y-auto p-4">
           {phase === "input" && (
             <>
-              <div className="mb-3 flex flex-wrap items-center gap-2">
-                <span className="inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-2 py-1 text-[11px] text-gray-400">
-                  <BookOpen size={11} className="text-accent" />
-                  知识库 {knowledgeLibraries.length}
-                </span>
-                <span className="inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-2 py-1 text-[11px] text-gray-400">
-                  <Puzzle size={11} className="text-accent" />
-                  Tools 可审计
-                </span>
-              </div>
+              <KnowledgeContextPanel knowledgeLibraries={knowledgeLibraries} />
               <textarea
                 autoFocus
                 value={request}
@@ -415,52 +419,55 @@ function TaskCreatorModal({ cwd, knowledgeLibraries, onCancel, onConfirm }: Task
           )}
 
           {phase === "review" && (
-            <ol className="space-y-2">
-              {tasks.map((t, i) => (
-                <li
-                  key={t.tmp_id}
-                  className="border border-border rounded-lg bg-surface-2 p-3"
-                >
-                  <div className="flex items-start gap-2">
-                    <span className="text-[11px] font-mono text-gray-500 mt-1 w-5 text-right shrink-0">
-                      {i + 1}
-                    </span>
-                    <div className="flex-1 space-y-1.5">
-                      <input
-                        type="text"
-                        value={t.title}
-                        onChange={(e) => updateTask(i, { title: e.target.value })}
-                        className="w-full bg-transparent border-0 border-b border-transparent focus:border-accent text-sm font-medium text-gray-200 outline-none"
-                      />
-                      <textarea
-                        value={t.description}
-                        onChange={(e) => updateTask(i, { description: e.target.value })}
-                        rows={2}
-                        className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-[12px] text-gray-300 outline-none focus:border-accent resize-y"
-                      />
-                      {t.dependencies.length > 0 && (
-                        <div className="text-[10px] text-gray-500">
-                          依赖：{t.dependencies.join(", ")}
-                        </div>
-                      )}
+            <div className="space-y-3">
+              <KnowledgeContextPanel knowledgeLibraries={knowledgeLibraries} compact />
+              <ol className="space-y-2">
+                {tasks.map((t, i) => (
+                  <li
+                    key={t.tmp_id}
+                    className="border border-border rounded-lg bg-surface-2 p-3"
+                  >
+                    <div className="flex items-start gap-2">
+                      <span className="text-[11px] font-mono text-gray-500 mt-1 w-5 text-right shrink-0">
+                        {i + 1}
+                      </span>
+                      <div className="flex-1 space-y-1.5">
+                        <input
+                          type="text"
+                          value={t.title}
+                          onChange={(e) => updateTask(i, { title: e.target.value })}
+                          className="w-full bg-transparent border-0 border-b border-transparent focus:border-accent text-sm font-medium text-gray-200 outline-none"
+                        />
+                        <textarea
+                          value={t.description}
+                          onChange={(e) => updateTask(i, { description: e.target.value })}
+                          rows={2}
+                          className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-[12px] text-gray-300 outline-none focus:border-accent resize-y"
+                        />
+                        {t.dependencies.length > 0 && (
+                          <div className="text-[10px] text-gray-500">
+                            依赖：{t.dependencies.join(", ")}
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => removeTask(i)}
+                        disabled={busy}
+                        className="p-1 rounded text-gray-600 hover:text-red-700 dark:hover:text-red-400 hover:bg-surface-3 disabled:opacity-40"
+                        title="移除"
+                      >
+                        <Trash2 size={12} />
+                      </button>
                     </div>
-                    <button
-                      onClick={() => removeTask(i)}
-                      disabled={busy}
-                      className="p-1 rounded text-gray-600 hover:text-red-700 dark:hover:text-red-400 hover:bg-surface-3 disabled:opacity-40"
-                      title="移除"
-                    >
-                      <Trash2 size={12} />
-                    </button>
-                  </div>
-                </li>
-              ))}
-              {tasks.length === 0 && (
-                <p className="text-center text-xs text-gray-500 py-8">
-                  全部移除了。返回重新描述。
-                </p>
-              )}
-            </ol>
+                  </li>
+                ))}
+                {tasks.length === 0 && (
+                  <p className="text-center text-xs text-gray-500 py-8">
+                    全部移除了。返回重新描述。
+                  </p>
+                )}
+              </ol>
+            </div>
           )}
         </div>
 
@@ -529,6 +536,11 @@ function buildTaskTree(tasks: TaskRun[]): { task: TaskRun; depth: number }[] {
 
 function TaskRow({ task, depth }: { task: TaskRun; depth: number }) {
   const Icon = statusIcon(task.status);
+  const context = parseTaskConnectorContext(task.task_context_json);
+  const knowledgeCount = context.knowledge_libraries.length;
+  const hasUnindexed = context.knowledge_libraries.some((library) =>
+    !["ready", "completed", "completed_with_errors"].includes(library.scan_status),
+  );
   return (
     <li
       className="group flex items-start gap-2 px-1.5 py-1 rounded hover:bg-surface-3 transition-colors cursor-default"
@@ -540,9 +552,23 @@ function TaskRow({ task, depth }: { task: TaskRun; depth: number }) {
           task.status === "running" ? "animate-spin" : ""
         }`}
       />
-      <span className="text-[11px] text-gray-300 leading-snug line-clamp-2 flex-1">
-        {task.title}
-      </span>
+      <div className="min-w-0 flex-1">
+        <span className="block text-[11px] text-gray-300 leading-snug line-clamp-2">
+          {task.title}
+        </span>
+        {knowledgeCount > 0 && (
+          <div
+            className="mt-0.5 flex items-center gap-1 text-[9px] text-gray-600"
+            title={context.knowledge_libraries
+              .map((library) => `${library.name} · ${scanStatusText(library.scan_status)}`)
+              .join("\n")}
+          >
+            <BookOpen size={9} className="shrink-0 text-accent" />
+            <span>知识库 {knowledgeCount}</span>
+            {hasUnindexed && <span className="text-amber-700 dark:text-amber-300">待索引</span>}
+          </div>
+        )}
+      </div>
     </li>
   );
 }
@@ -769,8 +795,89 @@ function ConnectorsColumn() {
 function scanStatusText(status: string): string {
   switch (status) {
     case "ready": return "已索引";
+    case "completed": return "已索引";
+    case "completed_with_errors": return "部分失败";
     case "scanning": return "扫描中";
     case "failed": return "扫描失败";
+    case "idle": return "待扫描";
     default: return "待扫描";
   }
+}
+
+function buildTaskConnectorContext(libraries: KnowledgeLibrary[]): TaskConnectorContext {
+  return {
+    knowledge_libraries: libraries.map((library) => ({
+      id: library.id,
+      name: library.name,
+      root_path: library.root_path,
+      scan_status: library.scan_status,
+      last_scan_at: library.last_scan_at,
+    })),
+  };
+}
+
+function parseTaskConnectorContext(raw: string | null): TaskConnectorContext {
+  if (!raw) return { knowledge_libraries: [] };
+  try {
+    const parsed = JSON.parse(raw) as Partial<TaskConnectorContext>;
+    return {
+      knowledge_libraries: Array.isArray(parsed.knowledge_libraries)
+        ? parsed.knowledge_libraries.filter((library) => library && typeof library.id === "string")
+        : [],
+    };
+  } catch {
+    return { knowledge_libraries: [] };
+  }
+}
+
+function KnowledgeContextPanel({
+  knowledgeLibraries,
+  compact = false,
+}: {
+  knowledgeLibraries: KnowledgeLibrary[];
+  compact?: boolean;
+}) {
+  const hasWarnings = knowledgeLibraries.some((library) =>
+    !["ready", "completed", "completed_with_errors"].includes(library.scan_status),
+  );
+  return (
+    <section className={`${compact ? "mb-0" : "mb-3"} rounded border border-border bg-surface-2 px-3 py-2`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex items-center gap-1.5 text-[11px] font-medium text-gray-300">
+          <BookOpen size={11} className="text-accent" />
+          任务上下文
+        </div>
+        <span className="inline-flex items-center gap-1 rounded border border-border bg-surface-1 px-2 py-0.5 text-[10px] text-gray-500">
+          知识库 {knowledgeLibraries.length}
+        </span>
+        <span className="inline-flex items-center gap-1 rounded border border-border bg-surface-1 px-2 py-0.5 text-[10px] text-gray-500">
+          <Puzzle size={10} className="text-accent" />
+          kb_search / kb_get_chunk
+        </span>
+        {hasWarnings && (
+          <span className="inline-flex items-center gap-1 text-[10px] text-amber-700 dark:text-amber-300">
+            <AlertTriangle size={10} />
+            有知识库尚未完成索引
+          </span>
+        )}
+      </div>
+      {knowledgeLibraries.length > 0 && (
+        <ul className="mt-2 grid gap-1 sm:grid-cols-2">
+          {knowledgeLibraries.map((library) => (
+            <li
+              key={library.id}
+              className="min-w-0 rounded border border-border bg-surface-1 px-2 py-1"
+              title={library.root_path}
+            >
+              <div className="truncate text-[11px] text-gray-300">{library.name}</div>
+              <div className="flex items-center gap-1 text-[9px] text-gray-600">
+                <span className="truncate">{scanStatusText(library.scan_status)}</span>
+                {library.last_scan_at && <span className="shrink-0">已扫描</span>}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
 }

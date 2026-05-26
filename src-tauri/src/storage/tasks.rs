@@ -12,6 +12,66 @@ use sqlx::SqlitePool;
 
 use crate::errors::Result;
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TaskKnowledgeLibraryContext {
+    pub id: String,
+    pub name: String,
+    pub root_path: String,
+    pub scan_status: String,
+    pub last_scan_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TaskConnectorContext {
+    #[serde(default)]
+    pub knowledge_libraries: Vec<TaskKnowledgeLibraryContext>,
+}
+
+impl TaskConnectorContext {
+    pub fn is_empty(&self) -> bool {
+        self.knowledge_libraries.is_empty()
+    }
+
+    pub fn from_json(raw: Option<&str>) -> Option<Self> {
+        let raw = raw?;
+        serde_json::from_str(raw).ok()
+    }
+
+    pub fn knowledge_library_ids(&self) -> Vec<String> {
+        self.knowledge_libraries
+            .iter()
+            .filter(|library| !library.id.trim().is_empty())
+            .map(|library| library.id.clone())
+            .collect()
+    }
+
+    pub fn render_markdown(&self) -> String {
+        if self.knowledge_libraries.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "## Enabled connectors\n\nPersonal knowledge libraries are enabled for this task. \
+             Use `kb_search` to retrieve source-grounded snippets and `kb_get_chunk` only for \
+             chunks returned by search. Cite source paths plus page or slide numbers in your summary.\n\n",
+        );
+        for library in &self.knowledge_libraries {
+            out.push_str(&format!(
+                "- {} (`{}`): status `{}`, root `{}`{}\n",
+                library.name,
+                library.id,
+                library.scan_status,
+                library.root_path,
+                library
+                    .last_scan_at
+                    .as_ref()
+                    .map(|scan| format!(", last scan `{scan}`"))
+                    .unwrap_or_default()
+            ));
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TaskRun {
     pub id: String,
@@ -32,14 +92,16 @@ pub struct TaskRun {
     pub attempt_count: i32,
     /// JSON array of VerificationResult (Phase 3). NULL when not yet run.
     pub verification_results: Option<String>,
+    /// JSON TaskConnectorContext persisted at task creation time.
+    pub task_context_json: Option<String>,
 }
 
 pub async fn insert_task(pool: &SqlitePool, task: &TaskRun) -> Result<()> {
     sqlx::query(
         "INSERT INTO task_runs (id, session_id, title, description, status, cwd, parent_task_id, \
          sub_session_id, created_at, started_at, completed_at, result, error, attempt_count, \
-         verification_results) \
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         verification_results, task_context_json) \
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&task.id)
     .bind(&task.session_id)
@@ -56,6 +118,7 @@ pub async fn insert_task(pool: &SqlitePool, task: &TaskRun) -> Result<()> {
     .bind(&task.error)
     .bind(task.attempt_count)
     .bind(&task.verification_results)
+    .bind(&task.task_context_json)
     .execute(pool)
     .await?;
     Ok(())
