@@ -16,6 +16,7 @@ import userEvent from "@testing-library/user-event";
 // factory can capture our mocks instead of crashing on TDZ access.
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
+  openDialog: vi.fn(),
   createTaskTree: vi.fn().mockResolvedValue(["id-0", "id-1"]),
   loadTasks: vi.fn(),
   subscribe: vi.fn().mockResolvedValue(() => {}),
@@ -25,6 +26,10 @@ vi.mock("../../lib/tauri", async (orig) => {
   const real = (await orig()) as Record<string, unknown>;
   return { ...real, invoke: mocks.invoke };
 });
+
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: mocks.openDialog,
+}));
 
 vi.mock("../../stores/chat", () => ({
   useChatStore: () => ({
@@ -90,10 +95,28 @@ vi.mock("../../stores/skills", () => ({
 
 import { WorkspacePage } from "./WorkspacePage";
 
+const sampleLibrary = {
+  id: "kb-1",
+  name: "历史方案库",
+  root_path: "/Users/x/Knowledge",
+  enabled: true,
+  created_at: "2026-05-26T00:00:00Z",
+  last_scan_at: "2026-05-26T00:01:00Z",
+  scan_status: "ready",
+};
+
 describe("AI task decomposition flow", () => {
 
   beforeEach(() => {
     mocks.invoke.mockReset();
+    mocks.openDialog.mockReset();
+    mocks.openDialog.mockResolvedValue(null);
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_knowledge_libraries") {
+        return Promise.resolve([sampleLibrary]);
+      }
+      return Promise.resolve(undefined);
+    });
     mocks.createTaskTree.mockClear();
   });
 
@@ -101,6 +124,9 @@ describe("AI task decomposition flow", () => {
     const user = userEvent.setup();
 
     mocks.invoke.mockImplementation((cmd: string, args: { request?: string }) => {
+      if (cmd === "list_knowledge_libraries") {
+        return Promise.resolve([sampleLibrary]);
+      }
       if (cmd === "decompose_request_to_tasks") {
         expect(args.request).toBe("做一个本地记账 app");
         return Promise.resolve([
@@ -160,10 +186,18 @@ describe("AI task decomposition flow", () => {
   it("user can remove a decomposed task before confirming", async () => {
     const user = userEvent.setup();
 
-    mocks.invoke.mockResolvedValue([
-      { tmp_id: "t-0", title: "Task A", description: "A", dependencies: [] },
-      { tmp_id: "t-1", title: "Task B", description: "B", dependencies: [] },
-    ]);
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_knowledge_libraries") {
+        return Promise.resolve([sampleLibrary]);
+      }
+      if (cmd === "decompose_request_to_tasks") {
+        return Promise.resolve([
+          { tmp_id: "t-0", title: "Task A", description: "A", dependencies: [] },
+          { tmp_id: "t-1", title: "Task B", description: "B", dependencies: [] },
+        ]);
+      }
+      return Promise.resolve(undefined);
+    });
 
     render(
       <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} />,
@@ -188,6 +222,48 @@ describe("AI task decomposition flow", () => {
     const [, tasks] = mocks.createTaskTree.mock.calls[0];
     expect(tasks).toHaveLength(1);
     expect(tasks[0].title).toBe("Task B");
+  });
+
+  it("shows knowledge libraries as task connectors and scans on demand", async () => {
+    const user = userEvent.setup();
+
+    mocks.invoke.mockImplementation((cmd: string, args: { libraryId?: string }) => {
+      if (cmd === "list_knowledge_libraries") {
+        return Promise.resolve([sampleLibrary]);
+      }
+      if (cmd === "scan_knowledge_library") {
+        expect(args.libraryId).toBe("kb-1");
+        return Promise.resolve({
+          library_id: "kb-1",
+          scanned_files: 3,
+          indexed_documents: 2,
+          failed_documents: 1,
+          chunks_indexed: 16,
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} />,
+    );
+
+    const library = await screen.findByText("历史方案库");
+    expect(library).toBeInTheDocument();
+    expect(screen.getByText("1 个知识库")).toBeInTheDocument();
+
+    const scanButton = screen.getByTitle("扫描知识库");
+    await user.click(scanButton);
+
+    await waitFor(() => {
+      expect(mocks.invoke).toHaveBeenCalledWith("scan_knowledge_library", {
+        libraryId: "kb-1",
+      });
+    });
+    expect(await screen.findByText("2 文档 / 16 片段")).toBeInTheDocument();
+
+    await user.click(await screen.findByText(/点这里描述需求/));
+    expect(screen.getByText("知识库 1")).toBeInTheDocument();
   });
 
 });

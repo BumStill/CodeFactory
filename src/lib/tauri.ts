@@ -219,6 +219,26 @@ export interface TaskEventPayload {
   error?: string;
 }
 
+// ── Knowledge libraries ────────────────────────────────────────────────────
+
+export interface KnowledgeLibrary {
+  id: string;
+  name: string;
+  root_path: string;
+  enabled: boolean;
+  created_at: string;
+  last_scan_at: string | null;
+  scan_status: string;
+}
+
+export interface KnowledgeScanSummary {
+  library_id: string;
+  scanned_files: number;
+  indexed_documents: number;
+  failed_documents: number;
+  chunks_indexed: number;
+}
+
 export type TaskEventKind =
   | "task_started"
   | "task_progress"
