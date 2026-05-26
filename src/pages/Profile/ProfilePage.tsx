@@ -75,7 +75,7 @@ export function ProfilePage({ onBack }: ProfilePageProps) {
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto p-6 space-y-8">
 
-          <PreferencesSection />
+          <PreferencesSection selectedCwd={selectedCwd} />
 
           <ProjectMemorySection
             sessions={sessions}
@@ -92,36 +92,161 @@ export function ProfilePage({ onBack }: ProfilePageProps) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PreferencesSection — static placeholders until self-evolution wires this up
+// PreferencesSection — live key→value preferences from user_preferences table
 // ─────────────────────────────────────────────────────────────────────────────
 
-function PreferencesSection() {
+interface UserPreference {
+  cwd: string;
+  key: string;
+  value: string;
+  source: "user" | "ai" | "default";
+  updated_at: string;
+}
+
+// Friendly labels + hints for seeded keys. Unknown keys (added later by
+// AI suggestions or user) fall back to the raw key as the label.
+const PREF_LABELS: Record<string, { label: string; hint: string }> = {
+  autonomy_level:      { label: "自主程度", hint: "AI 多大程度上自主操作不询问" },
+  communication_style: { label: "沟通风格", hint: "AI 回复的详略偏好" },
+  testing_habit:       { label: "测试习惯", hint: "AI 主动加测试的时机" },
+  code_style:          { label: "代码风格", hint: "格式 / 命名 / 习惯偏好" },
+};
+
+const SOURCE_BADGE: Record<UserPreference["source"], { text: string; cls: string }> = {
+  user:    { text: "我设的",  cls: "bg-accent/15 text-accent" },
+  ai:      { text: "AI 学的", cls: "bg-purple-500/15 text-purple-700 dark:text-purple-300" },
+  default: { text: "默认",    cls: "bg-surface-3 text-gray-500" },
+};
+
+function PreferencesSection({ selectedCwd }: { selectedCwd: string | null }) {
+  const [prefs, setPrefs] = useState<UserPreference[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const reload = async (cwd: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const list = await invoke<UserPreference[]>("list_user_preferences", { cwd });
+      setPrefs(list);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (selectedCwd) reload(selectedCwd);
+  }, [selectedCwd]);
+
+  const handleUpdate = async (key: string, value: string) => {
+    if (!selectedCwd) return;
+    try {
+      await invoke("upsert_user_preference", {
+        cwd: selectedCwd,
+        key,
+        value,
+        source: "user",
+      });
+      // Optimistic local patch; refresh would also work but feels laggy.
+      setPrefs((prev) =>
+        prev.map((p) =>
+          p.key === key
+            ? { ...p, value, source: "user" as const, updated_at: new Date().toISOString() }
+            : p,
+        ),
+      );
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   return (
     <section>
       <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
         个人偏好
       </h2>
-      <div className="rounded-lg border border-border bg-surface-1 divide-y divide-border">
-        <PrefRow label="自主程度" value="中等" hint="重要操作需要确认，常规操作自主执行" />
-        <PrefRow label="沟通风格" value="简洁" hint="少废话、直接说结果，需要时再展开" />
-        <PrefRow label="测试习惯" value="TDD" hint="写新功能时先写测试" />
-        <PrefRow label="代码风格" value="（自动学习中）" hint="AI 会从你接受/拒绝的修改中归纳" />
-      </div>
+      {!selectedCwd ? (
+        <p className="text-xs text-gray-500 text-center py-6">选一个项目以查看偏好</p>
+      ) : loading ? (
+        <p className="text-xs text-gray-500 text-center py-6">加载中...</p>
+      ) : (
+        <div className="rounded-lg border border-border bg-surface-1 divide-y divide-border">
+          {prefs.map((p) => (
+            <PrefRow
+              key={p.key}
+              pref={p}
+              label={PREF_LABELS[p.key]?.label ?? p.key}
+              hint={PREF_LABELS[p.key]?.hint ?? "AI 学到的偏好"}
+              onUpdate={(v) => handleUpdate(p.key, v)}
+            />
+          ))}
+        </div>
+      )}
       <p className="mt-2 text-[11px] text-gray-500">
-        这些偏好将由「自进化」能力自动维护并接受你的修改。当前为占位值。
+        偏好会注入到每次 AI 调用中。AI 完成 session 后可能建议新偏好——到学习日志里采纳。
       </p>
+      {error && <p className="mt-2 text-xs text-red-700 dark:text-red-300">{error}</p>}
     </section>
   );
 }
 
-function PrefRow({ label, value, hint }: { label: string; value: string; hint: string }) {
+function PrefRow({
+  pref,
+  label,
+  hint,
+  onUpdate,
+}: {
+  pref: UserPreference;
+  label: string;
+  hint: string;
+  onUpdate: (v: string) => void;
+}) {
+  const [draft, setDraft] = useState(pref.value);
+  const [editing, setEditing] = useState(false);
+
+  useEffect(() => { setDraft(pref.value); }, [pref.value]);
+
+  const badge = SOURCE_BADGE[pref.source];
+
+  const commit = () => {
+    if (draft !== pref.value) onUpdate(draft);
+    setEditing(false);
+  };
+
   return (
     <div className="flex items-start gap-4 px-4 py-3">
       <div className="w-24 shrink-0">
         <div className="text-xs font-medium text-gray-300">{label}</div>
+        <span className={`mt-1 inline-block text-[9px] px-1.5 py-0.5 rounded ${badge.cls}`}>
+          {badge.text}
+        </span>
       </div>
-      <div className="flex-1">
-        <div className="text-sm text-gray-200">{value}</div>
+      <div className="flex-1 min-w-0">
+        {editing ? (
+          <input
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={commit}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commit();
+              else if (e.key === "Escape") {
+                setDraft(pref.value);
+                setEditing(false);
+              }
+            }}
+            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-sm text-gray-200 outline-none focus:border-accent"
+          />
+        ) : (
+          <button
+            onClick={() => setEditing(true)}
+            className="text-sm text-gray-200 hover:text-accent text-left w-full"
+          >
+            {pref.value || <span className="text-gray-500 italic">（点击设置）</span>}
+          </button>
+        )}
         <div className="text-[11px] text-gray-500 mt-0.5">{hint}</div>
       </div>
     </div>

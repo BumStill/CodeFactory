@@ -84,6 +84,7 @@ impl TaskScheduler {
         settings: Settings,
         app_handle: AppHandle,
         pending_perms: PendingPermissionMap,
+        interjections: crate::commands::interjections::InterjectionQueue,
     ) -> Result<(), AppError> {
         let semaphore = Arc::new(Semaphore::new(self.max_parallel));
 
@@ -171,6 +172,7 @@ impl TaskScheduler {
                 let settings = settings.clone();
                 let app = app_handle.clone();
                 let perms = pending_perms.clone();
+                let interjections_clone = interjections.clone();
                 let session_id_for_task = session_id.clone();
                 let running = self.running.clone();
                 let task_id = task.id.clone();
@@ -211,12 +213,35 @@ impl TaskScheduler {
                             task_description.clone()
                         };
 
+                        // Drain pending user interjections — they redirect
+                        // execution before this task starts. Picked up as
+                        // parent_summary so the subagent sees them as
+                        // session context, not as a direct task override.
+                        let pending_interjections =
+                            crate::commands::interjections::drain_for_session(
+                                &interjections_clone,
+                                &session_id_for_task,
+                            )
+                            .await;
+                        let parent_summary = if pending_interjections.is_empty() {
+                            None
+                        } else {
+                            let notes: Vec<String> = pending_interjections
+                                .iter()
+                                .map(|i| format!("- {}", i.message))
+                                .collect();
+                            Some(format!(
+                                "User redirections received before this task started:\n{}",
+                                notes.join("\n")
+                            ))
+                        };
+
                         let brief = SubagentBrief {
                             task_id: task_id.clone(),
                             title: task_title.clone(),
                             description,
                             cwd: task_cwd.clone(),
-                            parent_summary: None,
+                            parent_summary,
                             allowed_tools: vec![
                                 "read_file".into(),
                                 "glob".into(),

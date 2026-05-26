@@ -632,6 +632,7 @@ Spec:\n\
 #[tauri::command]
 pub async fn decompose_request_to_tasks(
     request: String,
+    cwd: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<DecomposedTask>, String> {
     let settings = state.settings.read().await.clone();
@@ -654,8 +655,24 @@ pub async fn decompose_request_to_tasks(
     let base_url = endpoint.base_url.trim_end_matches('/');
     let url = format!("{base_url}/chat/completions");
 
+    // Build user-context block once, prepend to the decomposition prompt
+    // so tasks reflect this user's preferences / past learnings / memory.
+    // Skip silently when cwd is missing (e.g. early callers) — task quality
+    // degrades to baseline rather than failing.
+    let user_context_block = if let Some(ref cwd_str) = cwd {
+        let pool = state.db.read().await;
+        crate::agent::user_context::build(&pool, cwd_str).await
+    } else {
+        String::new()
+    };
+    let user_context_prefix = if user_context_block.is_empty() {
+        String::new()
+    } else {
+        format!("{}\nUse the above to tailor task granularity, style, and acceptance criteria to this user.\n\n", user_context_block)
+    };
+
     let prompt = format!(
-        "You are a software project manager. The user is describing something they want built. \
+        "{user_context_prefix}You are a software project manager. The user is describing something they want built. \
 Decompose their request into a concrete, actionable task list a development team can execute.\n\n\
 Return ONLY a JSON array (no markdown fences, no explanation), like:\n\
 [\n  \

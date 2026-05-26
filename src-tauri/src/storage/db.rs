@@ -168,6 +168,25 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     .execute(pool)
     .await?;
 
+    // ── user_preferences: structured key→value the AI reads at
+    //    decomposition / execution time. Scoped per cwd so different
+    //    projects can have different defaults. `source` is one of:
+    //      'user'    — manually set in the Profile UI
+    //      'ai'      — proposed by post-mortem, user accepted
+    //      'default' — seeded by the app on first run
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_preferences (
+            cwd         TEXT NOT NULL,
+            key         TEXT NOT NULL,
+            value       TEXT NOT NULL,
+            source      TEXT NOT NULL DEFAULT 'user',
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (cwd, key)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 

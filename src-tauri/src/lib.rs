@@ -64,6 +64,7 @@ pub struct AppState {
     pub db: Arc<RwLock<SqlitePool>>,
     pub settings: Arc<RwLock<config::Settings>>,
     pub pending_permissions: PendingPermissionMap,
+    pub interjections: commands::interjections::InterjectionQueue,
 }
 
 pub fn run() {
@@ -121,6 +122,7 @@ pub fn run() {
                 db: Arc::new(RwLock::new(pool)),
                 settings: Arc::new(RwLock::new(settings)),
                 pending_permissions: Arc::new(Mutex::new(HashMap::new())),
+                interjections: Arc::new(Mutex::new(HashMap::new())),
             });
             // Manage the Arc so all commands share the same McpManager instance.
             app.manage(mcp_manager);
@@ -152,6 +154,11 @@ pub fn run() {
             commands::learning::accept_learning_event,
             commands::learning::reject_learning_event,
             commands::learning::run_postmortem,
+            commands::preferences::list_user_preferences,
+            commands::preferences::upsert_user_preference,
+            commands::preferences::delete_user_preference,
+            commands::interjections::queue_interjection,
+            commands::interjections::list_interjections,
             commands::models::list_models,
             commands::session::list_sessions,
             commands::session::create_session,
