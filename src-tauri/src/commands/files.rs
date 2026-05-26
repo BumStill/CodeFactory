@@ -91,3 +91,62 @@ fn read_dir_recursive(path: &str, depth: u32) -> Result<Vec<FileNode>, AppError>
 
     Ok(nodes)
 }
+
+// ── Chat attachments ─────────────────────────────────────────────────────────
+
+/// Saved attachment metadata returned to the UI so it can render a preview
+/// and build the markdown link that gets embedded in the outgoing message.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SavedAttachment {
+    /// Absolute path on disk, used for the `file://` markdown link.
+    pub path: String,
+    /// Filename only — what the user sees in the chip.
+    pub name: String,
+    pub size_bytes: usize,
+}
+
+/// Save a base64-encoded blob (typically a screenshot or dropped image)
+/// under `<cwd>/.codefactory/attachments/{epoch}-{rand}.{ext}` and return
+/// the new path. Idempotent on directory creation.
+///
+/// We intentionally do NOT inline the bytes into the message string —
+/// every base64 KB would become hundreds of model tokens. The message
+/// embeds a `file://` markdown link instead; vision-aware model routing
+/// is a follow-up PR.
+#[tauri::command]
+pub async fn save_chat_attachment(
+    cwd: String,
+    filename: String,
+    data_base64: String,
+) -> Result<SavedAttachment, String> {
+    use base64::{engine::general_purpose, Engine as _};
+    use std::path::PathBuf;
+
+    let dir = PathBuf::from(&cwd).join(".codefactory").join("attachments");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir failed: {e}"))?;
+
+    // Decode + sanitize filename. We keep only the extension from the
+    // caller; the basename is regenerated so user-supplied names can't
+    // path-traverse out of the attachments dir.
+    let bytes = general_purpose::STANDARD
+        .decode(&data_base64)
+        .map_err(|e| format!("base64 decode failed: {e}"))?;
+    let ext = PathBuf::from(&filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase())
+        .filter(|s| s.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| "bin".into());
+    let epoch = chrono::Utc::now().timestamp_millis();
+    let rand = uuid::Uuid::new_v4().simple().to_string();
+    let safe_name = format!("{epoch}-{}.{ext}", &rand[..8]);
+    let path = dir.join(&safe_name);
+
+    std::fs::write(&path, &bytes).map_err(|e| format!("write failed: {e}"))?;
+
+    Ok(SavedAttachment {
+        path: path.to_string_lossy().to_string(),
+        name: safe_name,
+        size_bytes: bytes.len(),
+    })
+}

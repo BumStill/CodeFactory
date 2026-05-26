@@ -452,4 +452,71 @@ describe("useStickyAutoScroll", () => {
     expect(handle.pinned()).toBe(true);
     expect(handle.hasNewContent()).toBe(false);
   });
+
+  // ── New regression: cosmetic re-renders must not light up the badge ────────
+
+  it("does NOT mark hasNewContent when a mutation happens but scrollHeight is unchanged (shiki / re-render)", async () => {
+    // Real failure mode in the running app: user scrolls up to read a long
+    // assistant message. The message contains a fenced code block. Shiki
+    // finishes async-highlighting → it swaps innerHTML of the <code>
+    // element → MutationObserver fires → the OLD code lit the "↓ 新内容"
+    // badge even though the rendered HEIGHT did not change and nothing
+    // new actually arrived.
+    //
+    // Discriminator: was there real growth? We track lastSeenScrollHeight
+    // at pin-loss and only flag hasNewContent when scrollHeight has grown
+    // past that baseline.
+    const { handle } = renderHarness("session-1");
+    setLayout(handle.scroller, { scrollHeight: 3000, clientHeight: 600 });
+    await flushAsync();
+
+    // User scrolls up to read.
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 500, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.pinned()).toBe(false);
+    expect(handle.hasNewContent()).toBe(false);
+
+    // Now simulate shiki rewriting an inner code node — same scrollHeight,
+    // different DOM. (Replacing innerHTML triggers childList+characterData
+    // mutations on the subtree.)
+    const codeNode = document.createElement("pre");
+    codeNode.innerHTML = "<code>before</code>";
+    await act(async () => { handle.scroller.appendChild(codeNode); });
+    // scrollHeight intentionally NOT bumped: this mutation does not add
+    // real new content for the user.
+    await act(async () => {
+      codeNode.innerHTML = "<code class='hl'><span>after</span></code>";
+    });
+    await flushAsync();
+
+    expect(handle.hasNewContent()).toBe(false);
+    expect(handle.scroller.scrollTop).toBe(500); // still at user's position
+  });
+
+  it("DOES mark hasNewContent when scrollHeight actually grows while user is up", async () => {
+    // Companion to the test above — make sure the discriminator doesn't
+    // suppress the real signal.
+    const { handle } = renderHarness("session-1");
+    setLayout(handle.scroller, { scrollHeight: 3000, clientHeight: 600 });
+    await flushAsync();
+
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 500, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.hasNewContent()).toBe(false);
+
+    // Real streaming growth — bumps scrollHeight past baseline.
+    setLayout(handle.scroller, { scrollHeight: 6000, clientHeight: 600 });
+    await act(async () => {
+      const node = document.createElement("p");
+      node.textContent = "fresh streaming";
+      handle.scroller.appendChild(node);
+    });
+    await flushAsync();
+    expect(handle.hasNewContent()).toBe(true);
+  });
+
 });

@@ -78,6 +78,14 @@ export function useStickyAutoScroll(conversationKey: string | null) {
   // moment they leave the stick zone.
   const lastUserScrollTop = useRef(0);
 
+  // scrollHeight observed at the moment the user lost pin. Only growth
+  // PAST this baseline counts as "new content" — re-renders that mutate
+  // the DOM without growing height (shiki finishing async highlight,
+  // React swapping attributes on existing nodes, typing-dot animation)
+  // should NOT light up the "new content" badge. See the bug-reproducer
+  // test in useStickyAutoScroll.test.tsx for the exact scenario.
+  const newContentBaseline = useRef(0);
+
   const programmaticScrollTo = useCallback((y: number) => {
     const el = scrollerRef.current;
     if (!el) return;
@@ -133,6 +141,11 @@ export function useStickyAutoScroll(conversationKey: string | null) {
           hasNewContentRef.current = false;
           setHasNewContent(false);
         }
+        if (!nearBottom) {
+          // Snapshot the scrollHeight at pin-loss so future mutations can
+          // tell "real growth" from "cosmetic re-render".
+          newContentBaseline.current = el.scrollHeight;
+        }
       }
     };
     el.addEventListener("scroll", onScroll, { passive: true });
@@ -148,10 +161,14 @@ export function useStickyAutoScroll(conversationKey: string | null) {
     if (!scroller) return;
 
     const onMutation = () => {
-      // Content grew while the user was scrolled up — surface the "new
-      // content" indicator. (When pinned, we just snap to it; no need
-      // to highlight anything.)
-      if (!pinnedRef.current && !hasNewContentRef.current) {
+      // Discriminator: only flag "new content" when scrollHeight has
+      // actually grown past the baseline captured at pin-loss. Pure
+      // DOM-mutation events (shiki, React re-renders) don't qualify.
+      if (
+        !pinnedRef.current &&
+        !hasNewContentRef.current &&
+        scroller.scrollHeight > newContentBaseline.current
+      ) {
         hasNewContentRef.current = true;
         setHasNewContent(true);
       }

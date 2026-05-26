@@ -177,6 +177,7 @@ pub fn run() {
             commands::chat::send_message,
             commands::chat::respond_to_permission,
             commands::files::list_dir,
+            commands::files::save_chat_attachment,
             commands::terminal::terminal_create,
             commands::terminal::terminal_write,
             commands::terminal::terminal_resize,

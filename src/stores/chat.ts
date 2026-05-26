@@ -13,6 +13,18 @@ import {
 
 export type { PendingPermission, ToolCallState, UIMessage };
 
+/** A message queued while the assistant was streaming. Drains FIFO when
+ *  streaming flips back to false. Capped client-side at QUEUE_MAX to
+ *  prevent runaway accidental enqueue. */
+export interface QueuedMessage {
+  id: string;
+  content: string;
+  /** Future: attachments. Kept optional so existing call sites need no change. */
+  enqueuedAt: number;
+}
+
+export const QUEUE_MAX = 5;
+
 interface ChatStore {
   sessions: Session[];
   activeSession: Session | null;
@@ -25,12 +37,20 @@ interface ChatStore {
   pendingPermission: PendingPermission | null;
   contextUsage: { used: number; limit: number } | null;
   compressionToast: { elidedCount: number; tokensFreed: number; id: number } | null;
+  /** Messages waiting to fire after the current stream finishes. */
+  queue: QueuedMessage[];
 
   loadSessions: () => Promise<void>;
   createSession: (cwd: string, model: string) => Promise<Session>;
   selectSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
   sendMessage: (content: string) => Promise<void>;
+  /** Send right now if idle, otherwise enqueue. Returns "sent" or "queued". */
+  sendOrQueue: (content: string) => Promise<"sent" | "queued" | "full">;
+  /** Remove a queued message before it fires. */
+  removeFromQueue: (id: string) => void;
+  /** Empty the queue without sending. */
+  clearQueue: () => void;
   loadModels: (endpoint: string) => Promise<void>;
   setModel: (modelId: string) => void;
   cancelStream: () => void;
@@ -56,6 +76,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   pendingPermission: null,
   contextUsage: null,
   compressionToast: null,
+  queue: [],
 
   loadSessions: async () => {
     const sessions = await invoke<Session[]>("list_sessions");
@@ -154,6 +175,30 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }
   },
 
+  sendOrQueue: async (content) => {
+    const text = content.trim();
+    if (!text) return "sent";
+    const { streaming, queue, sendMessage } = get();
+    if (!streaming) {
+      await sendMessage(text);
+      return "sent";
+    }
+    if (queue.length >= QUEUE_MAX) return "full";
+    set((s) => ({
+      queue: [
+        ...s.queue,
+        { id: crypto.randomUUID(), content: text, enqueuedAt: Date.now() },
+      ],
+    }));
+    return "queued";
+  },
+
+  removeFromQueue: (id) => {
+    set((s) => ({ queue: s.queue.filter((q) => q.id !== id) }));
+  },
+
+  clearQueue: () => set({ queue: [] }),
+
   loadModels: async (endpoint) => {
     try {
       const models = await invoke<ModelInfo[]>("list_models", { endpointName: endpoint });
@@ -223,9 +268,23 @@ function handleStreamEvent(
   event: StreamEvent,
   msgId: string,
   set: (fn: (s: ChatStore) => Partial<ChatStore>) => void,
-  _get: () => ChatStore
+  get: () => ChatStore
 ) {
+  const wasStreaming = get().streaming;
   set((s) => reduceChatStreamEvent(s, event, msgId));
+  // Queue drain — fire the next queued message as soon as the previous
+  // stream lands in a terminal state (done OR error). We delay one tick
+  // so the just-completed sendMessage's React state has a chance to
+  // settle and we don't re-enter mid-reducer-update.
+  if (wasStreaming && !get().streaming) {
+    const next = get().queue[0];
+    if (next) {
+      get().removeFromQueue(next.id);
+      setTimeout(() => {
+        void get().sendMessage(next.content);
+      }, 0);
+    }
+  }
 }
 
 function dbToUI(m: Message): UIMessage {

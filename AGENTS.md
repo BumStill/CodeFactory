@@ -44,6 +44,46 @@
 - 未运行验证命令时，不得声称完成，只能说明已修改并待验证。
 - 本仓库治理基线验证命令：`python tools/governance/validate_repo_governance_baseline.py`。
 
+### UX 行为变更必须实地验证（硬规则）
+
+**适用范围：** 任何会改变用户感知行为的 frontend 修改——
+滚动、聚焦、动画、布局、输入处理、拖拽、粘贴、键盘行为、stream 渲染、
+focus trap、modal 行为、文件附件流。
+
+**硬性要求：**
+- **不得仅靠 vitest / jsdom / 单元测试** 就声称完成。jsdom 不渲染 CSS、
+  不计算 layout、不处理真实滚动；通过的 unit test 完全可能对应一个
+  实际不工作的界面。
+- 必须在 `pnpm tauri dev` 或 `pnpm dev` 启动的真实 app 里执行
+  Primary User Path 中受影响的步骤，至少包含一种成功路径和一种边界
+  路径（如：自动滚动需要测「正常 stream 时尾巴跟随」+「我向上翻时
+  不要被强拉回」）。
+- PR 描述必须列出**实地走过的具体场景**，不能只写「测试通过」。
+- 修复 UX 回归（如 stick-to-bottom）时，必须先在真实 app 中复现 bug，
+  把复现路径写进 PR，再修，再用同样路径验证修复。
+- 实地无法验证（如 Windows 限定行为在 Mac 上）必须在 PR 写明哪些
+  场景没本地验证 + 为什么 + 替代证据（截图、日志、视频）。
+
+**历史教训（必须避免重蹈）：**
+stick-to-bottom 滚动行为从 v0.3.7 到 v0.3.20 反复修了 6 次，每次都
+有 vitest 回归测试通过，但实际 app 里依然有断裂场景。原因：测试只
+覆盖了 hook 的内部状态，没人在 app 里真正流式输出 + 翻阅 + 等待
+re-pin。**单元测试通过 ≠ 用户体验正确**。
+
+**harness 限制降级（agent CLI 跑在 macOS、目标是 Tauri 项目）：**
+Tauri dev 的 webview 进程在 macOS 后台 spawn 后无法被
+`computer-use.request_access` 识别（dev 二进制不在系统应用注册表里，
+只在 `/Applications` 的已签名 bundle 才能授权）。这种情况：
+- 在 PR description 写明 **"agent live verification not feasible
+  on Mac dev binary"**，附原因
+- 改为：**针对真实失败模式写单元测试**（不只是 happy path，要测
+  能触发已知 bug 的边界路径，例如「老 session 加载时初始锚定」、
+  「长 code block shiki 异步替换时不应触发 new content 指示」）
+- 列出 **scenarios needing manual verification**，让用户在
+  release MSI/dmg 里走一遍并回填结果
+- 之后再 push fix 前若实地验证仍未做，PR 标题加 `[unverified-live]`
+  前缀提醒
+
 ## 规格与长任务
 - 长期存在的业务能力、架构约束、主路径、兼容语义和验收基线必须写入 `docs/specs/`，不能只存在于一次性计划。
 - 长任务使用 `docs/long-tasks/` 记录；`long tasks` 只能在完成或有证据阻塞时停止。
