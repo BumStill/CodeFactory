@@ -8,7 +8,7 @@
 // Events are pulled from useTasksStore.executionLog which the subscribe
 // callback appends to as the Tauri events arrive.
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Play,
   CheckCircle2,
@@ -16,8 +16,11 @@ import {
   RefreshCw,
   ShieldCheck,
   Activity,
+  MessageSquarePlus,
+  Check,
 } from "lucide-react";
 import { useTasksStore, type ExecutionEvent } from "../stores/tasks";
+import { invoke } from "../lib/tauri";
 
 interface Props {
   sessionId: string;
@@ -68,6 +71,76 @@ export function ExecutionStream({ sessionId, hideWhenEmpty = true }: Props) {
         ))}
       </ol>
       <div ref={tailRef} />
+      {running && <InterjectionBar sessionId={sessionId} />}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// InterjectionBar — type a redirection while the scheduler runs. The note
+// is queued server-side and picked up before the NEXT task starts (we
+// can't safely surgery into a sub-agent mid-tool-call, see backend doc).
+// Sticky at the bottom of the stream so it's always reachable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function InterjectionBar({ sessionId }: { sessionId: string }) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [sentAt, setSentAt] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
+  const send = async () => {
+    const msg = text.trim();
+    if (!msg) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("queue_interjection", { sessionId, message: msg });
+      setText("");
+      setSentAt(Date.now());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const justSent = sentAt > 0 && Date.now() - sentAt < 3000;
+
+  return (
+    <div className="sticky bottom-0 z-10 border-t border-border bg-surface-2 px-3 py-2 flex items-center gap-2">
+      <MessageSquarePlus size={11} className="text-gray-500 shrink-0" />
+      <input
+        type="text"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            void send();
+          }
+        }}
+        placeholder="插嘴：让 AI 在下一个任务前改变方向…"
+        disabled={busy}
+        className="flex-1 bg-surface-1 border border-border rounded px-2 py-1 text-[11px] text-gray-200 outline-none focus:border-accent disabled:opacity-50"
+      />
+      {justSent && (
+        <span className="flex items-center gap-1 text-[10px] text-green-700 dark:text-green-400">
+          <Check size={10} /> 已加入下一任务
+        </span>
+      )}
+      <button
+        onClick={() => void send()}
+        disabled={busy || !text.trim()}
+        className="px-2 py-1 rounded bg-accent hover:bg-accent-hover text-white text-[10px] disabled:opacity-40"
+      >
+        发送
+      </button>
+      {error && (
+        <span className="text-[10px] text-red-700 dark:text-red-300 ml-2 truncate max-w-[180px]">
+          {error}
+        </span>
+      )}
     </div>
   );
 }

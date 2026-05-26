@@ -280,6 +280,7 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
       </div>
       {creatorOpen && (
         <TaskCreatorModal
+          cwd={activeSession?.cwd ?? null}
           onCancel={() => setCreatorOpen(false)}
           onConfirm={handleConfirm}
         />
@@ -293,11 +294,12 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface TaskCreatorModalProps {
+  cwd: string | null;
   onCancel: () => void;
   onConfirm: (tasks: DecomposedTask[]) => Promise<void>;
 }
 
-function TaskCreatorModal({ onCancel, onConfirm }: TaskCreatorModalProps) {
+function TaskCreatorModal({ cwd, onCancel, onConfirm }: TaskCreatorModalProps) {
   const [phase, setPhase] = useState<"input" | "decomposing" | "review">("input");
   const [request, setRequest] = useState("");
   const [tasks, setTasks] = useState<DecomposedTask[]>([]);
@@ -309,8 +311,12 @@ function TaskCreatorModal({ onCancel, onConfirm }: TaskCreatorModalProps) {
     setPhase("decomposing");
     setError(null);
     try {
+      // cwd lets the backend inject this user/project's context (memory,
+      // learnings, preferences) so the decomposition is tailored, not
+      // generic. Sent as null when no project is open — backend handles.
       const result = await invoke<DecomposedTask[]>("decompose_request_to_tasks", {
         request: request.trim(),
+        cwd,
       });
       setTasks(result);
       setPhase("review");

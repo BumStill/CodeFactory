@@ -153,6 +153,7 @@ pub async fn start_implementation(
     let pool = state.db.read().await.clone();
     let settings = state.settings.read().await.clone();
     let pending_perms = state.pending_permissions.clone();
+    let interjections = state.interjections.clone();
 
     let scheduler = Arc::new(TaskScheduler::new(pool.clone()));
     let cancel = scheduler.cancel_handle();
@@ -166,7 +167,13 @@ pub async fn start_implementation(
     let handles_clone = handles.inner().clone();
     tokio::spawn(async move {
         let result = scheduler
-            .run_session(session_id_clone.clone(), settings.clone(), app.clone(), pending_perms)
+            .run_session(
+                session_id_clone.clone(),
+                settings.clone(),
+                app.clone(),
+                pending_perms,
+                interjections,
+            )
             .await;
         if let Err(e) = result {
             tracing::error!("scheduler error for session {}: {:#}", session_id_clone, e);

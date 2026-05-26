@@ -6,6 +6,7 @@ pub mod hooks;
 pub mod scheduler;
 pub mod sse_buffer;
 pub mod subagent;
+pub mod user_context;
 pub mod verification;
 
 use chrono::Utc;
