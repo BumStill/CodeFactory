@@ -5,12 +5,13 @@ import { WorkspacePage } from "./pages/Workspace/WorkspacePage";
 import { SpecsPage } from "./pages/Specs/SpecsPage";
 import { SkillsPage } from "./pages/Skills/SkillsPage";
 import { SettingsPage } from "./pages/Settings/SettingsPage";
+import { ProfilePage } from "./pages/Profile/ProfilePage";
 import { ToastContainer } from "./components/Toast";
 import { EvidenceViewer } from "./components/EvidenceViewer";
 import { UpdaterBanner } from "./components/UpdaterBanner";
 import { useSettingsStore } from "./stores/settings";
 
-export type AppView = "home" | "workspace" | "specs" | "skills" | "settings";
+export type AppView = "home" | "workspace" | "specs" | "skills" | "settings" | "profile";
 
 export default function App() {
   const [view, setView] = useState<AppView>("home");
@@ -41,6 +42,7 @@ export default function App() {
           onOpenSpecs={() => setView("specs")}
           onOpenSkills={() => setView("skills")}
           onOpenSettings={() => setView("settings")}
+          onOpenProfile={() => setView("profile")}
         />
       )}
 
@@ -54,6 +56,7 @@ export default function App() {
 
       {view === "specs"    && <SpecsPage    onBack={backToHome} />}
       {view === "skills"   && <SkillsPage   onBack={backToHome} />}
+      {view === "profile"  && <ProfilePage  onBack={backToHome} />}
       {view === "settings" && <SettingsPage onBack={() => setView(activeProject ? "workspace" : "home")} />}
 
       {/* Global toast notifications for evidence pack events */}
