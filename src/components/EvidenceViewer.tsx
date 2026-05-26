@@ -16,6 +16,7 @@ import {
   Bot,
   Filter,
   AlertCircle,
+  BookOpen,
 } from "lucide-react";
 import { invoke } from "../lib/tauri";
 import { DiffViewer } from "./DiffViewer";
@@ -45,6 +46,7 @@ export interface EvidencePack {
   manifest: EvidencePackMeta;
   summary_md: string;
   tool_calls: ToolCallEntry[];
+  knowledge_refs?: KnowledgeRefEntry[];
   files_changed: FileChangedEntry[];
   verification: VerificationEntry[];
   git_commits: GitCommitEntry[];
@@ -58,6 +60,25 @@ interface ToolCallEntry {
   timestamp: string;
   task_id?: string;
   duration_ms?: number;
+}
+
+interface KnowledgeRefEntry {
+  id: string;
+  session_id?: string | null;
+  task_id?: string | null;
+  query: string;
+  filters?: Record<string, unknown>;
+  result_refs: KnowledgeRefSource[];
+  created_at: string;
+  latency_ms: number;
+}
+
+interface KnowledgeRefSource {
+  chunk_id?: string;
+  document_id?: string;
+  path?: string;
+  page?: number | null;
+  slide?: number | null;
 }
 
 interface FileChangedEntry {
@@ -123,6 +144,18 @@ function formatTs(ts: string): string {
   } catch {
     return ts;
   }
+}
+
+function sourceFileName(path: string | undefined): string {
+  if (!path) return "unknown source";
+  const normalized = path.replace(/\\/g, "/");
+  return normalized.split("/").filter(Boolean).pop() ?? path;
+}
+
+function sourceLocator(source: KnowledgeRefSource): string | null {
+  if (source.slide != null) return `slide ${source.slide}`;
+  if (source.page != null) return `page ${source.page}`;
+  return null;
 }
 
 // ── Simple markdown renderer (same logic as SpecsPage) ───────────────────────
@@ -411,9 +444,62 @@ function AiCollabTab({ data }: { data: AiCollaboration | null }) {
   );
 }
 
+function SourcesTab({ refs }: { refs: KnowledgeRefEntry[] }) {
+  if (refs.length === 0) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-gray-600 text-xs">
+        No knowledge sources recorded
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex-1 overflow-y-auto p-4 space-y-3">
+      {refs.map((ref) => (
+        <div key={ref.id} className="rounded border border-border bg-surface-2 p-3">
+          <div className="flex items-start gap-2">
+            <BookOpen size={14} className="text-emerald-400 shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-xs text-gray-200 font-medium truncate">{ref.query}</span>
+                <span className="text-[10px] text-gray-600 shrink-0">{ref.latency_ms}ms</span>
+              </div>
+              <div className="mt-1 text-[10px] text-gray-600">
+                {ref.result_refs.length} result{ref.result_refs.length === 1 ? "" : "s"}
+              </div>
+            </div>
+          </div>
+          <div className="mt-3 space-y-1.5">
+            {ref.result_refs.map((source, i) => (
+              <div key={`${source.chunk_id ?? source.document_id ?? source.path ?? "source"}-${i}`} className="rounded border border-border/70 bg-surface-1 px-2.5 py-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <FileText size={12} className="text-gray-500 shrink-0" />
+                  <span className="text-xs text-gray-300 font-medium truncate" title={source.path}>
+                    {sourceFileName(source.path)}
+                  </span>
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-gray-500 font-mono">
+                  {sourceLocator(source) && <span>{sourceLocator(source)}</span>}
+                  {source.chunk_id && <span>{source.chunk_id}</span>}
+                  {source.document_id && <span>doc {source.document_id}</span>}
+                </div>
+                {source.path && (
+                  <div className="mt-1 text-[10px] text-gray-600 font-mono truncate" title={source.path}>
+                    {source.path}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ── Main EvidenceViewer ───────────────────────────────────────────────────────
 
-type TabKey = "summary" | "tool_calls" | "files" | "verification" | "git" | "ai";
+type TabKey = "summary" | "tool_calls" | "sources" | "files" | "verification" | "git" | "ai";
 
 interface EvidenceViewerProps {
   packPath: string;
@@ -442,6 +528,7 @@ export function EvidenceViewer({ packPath, onClose }: EvidenceViewerProps) {
   const tabs: { key: TabKey; label: string; icon: React.ReactNode }[] = [
     { key: "summary", label: "Summary", icon: <FileText size={12} /> },
     { key: "tool_calls", label: `Tool Calls${pack ? ` (${pack.tool_calls.length})` : ""}`, icon: <Terminal size={12} /> },
+    { key: "sources", label: `Sources${pack ? ` (${pack.knowledge_refs?.length ?? 0})` : ""}`, icon: <BookOpen size={12} /> },
     { key: "files", label: `Files${pack ? ` (${pack.files_changed.length})` : ""}`, icon: <FileText size={12} /> },
     { key: "verification", label: "Verification", icon: <CheckCircle size={12} /> },
     { key: "git", label: `Git${pack ? ` (${pack.git_commits.length})` : ""}`, icon: <GitCommit size={12} /> },
@@ -449,7 +536,7 @@ export function EvidenceViewer({ packPath, onClose }: EvidenceViewerProps) {
   ];
 
   return (
-    <div className="fixed inset-y-0 right-0 z-40 flex flex-col w-[720px] border-l border-border bg-surface-0 shadow-2xl">
+    <div className="fixed inset-y-0 right-0 z-40 flex flex-col w-full max-w-full sm:w-[720px] border-l border-border bg-surface-0 shadow-2xl">
       {/* Header */}
       <div className="flex items-center gap-3 px-4 py-3 border-b border-border bg-surface-1 shrink-0">
         <div className="flex-1 min-w-0">
@@ -526,6 +613,7 @@ export function EvidenceViewer({ packPath, onClose }: EvidenceViewerProps) {
           <>
             {tab === "summary" && <SummaryTab md={pack.summary_md} />}
             {tab === "tool_calls" && <ToolCallsTab toolCalls={pack.tool_calls} />}
+            {tab === "sources" && <SourcesTab refs={pack.knowledge_refs ?? []} />}
             {tab === "files" && <FilesChangedTab files={pack.files_changed} />}
             {tab === "verification" && <VerificationTab items={pack.verification} />}
             {tab === "git" && <GitHistoryTab commits={pack.git_commits} />}

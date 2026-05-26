@@ -8,12 +8,19 @@
   - 多工具 Git 交付：每个开发任务在执行前同步分支，使用隔离分支或 worktree，验证后提交、推送、创建 PR，并按检查结果合并或交接。
 - 不在首期承诺云端同步、团队知识库、多用户权限系统、AppSource 上架、自动发布到生产安装包。
 
+### MVP 边界：本地文件参考优先
+- 这条能力的产品目标不是先做一个企业知识库平台，而是让用户在做事、办公和开发时能可靠参考自己的本地文件。
+- 首期必须先做到：本地文件夹可注册、文档可扫描、任务可调用 `kb_search` / `kb_get_chunk`、工具结果和 evidence pack 能看到文件路径、页码/slide、chunk 和 query。
+- 首期暂不做：团队空间、云同步、多租户权限、后台常驻索引平台、多向量数据库配置面板、知识库市场、完整 OCR/版式复刻。
+- 后续升级顺序：来源可见性 -> 解析质量 -> 检索质量/评价 -> PPT 规划和渲染复用 -> PowerPoint 本地插件桥接。
+
 ## 外部最佳实践基线
 - Office 插件使用 Microsoft Office Web Add-in 模型：PowerPoint task pane、ribbon command、Office.js API、本地开发 HTTPS、manifest sideload。
 - PowerPoint 内容插入首期使用 `PowerPoint.Presentation.insertSlidesFromBase64`，默认继承目标文档主题，提供保留源格式选项。
 - 知识库遵循 RAG 设计：文档解析、结构化 chunk、metadata 过滤、关键词检索、向量检索、来源引用、权限边界、检索事件审计。
 - 扩展协议优先兼容 MCP 的 Tools、Resources、Prompts 思路：工具可见、参数可审计、失败可回放，不把隐式能力塞进不可见 prompt。
 - Git 交付遵循 GitHub flow：短生命周期分支、PR、required checks、review/approval、合并后清理分支；本地 dirty tree 必须先被显式处理。
+- 2026-05-26 对比了 Open WebUI、AnythingLLM、LlamaIndex、Haystack、Khoj、OpenAI knowledge-retrieval 等 GitHub 项目的共同做法。CodeFactory 首期只吸收四点：local-first、来源引用、可审计 retrieval event、可替换解析/检索层；不照搬它们的平台化插件市场、多后端向量数据库矩阵、团队权限和托管同步。
 
 参考入口：
 - Microsoft Office Add-ins: `https://learn.microsoft.com/en-us/office/dev/add-ins/`
@@ -23,6 +30,12 @@
 - GitHub protected branches: `https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches`
 - PptxGenJS: `https://github.com/gitbrent/PptxGenJS`
 - Unstructured document partitioning: `https://docs.unstructured.io/open-source/core-functionality/partitioning`
+- Open WebUI: `https://github.com/open-webui/open-webui`
+- AnythingLLM: `https://github.com/Mintplex-Labs/anything-llm`
+- LlamaIndex: `https://github.com/run-llama/llama_index`
+- Haystack: `https://github.com/deepset-ai/haystack`
+- Khoj: `https://github.com/khoj-ai/khoj`
+- OpenAI knowledge-retrieval: `https://github.com/openai/openai-knowledge-retrieval`
 
 ## Requirements Traceability
 | Req ID | User request | Normalized requirement | Surfaces | Validation method | Owner |
