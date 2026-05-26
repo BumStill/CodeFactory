@@ -145,6 +145,29 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     //    miss it.
     ensure_column(pool, "task_runs", "verification_results", "TEXT").await?;
 
+    // ── learning_events: post-task observations the AI surfaces for
+    //    user approval. status: pending | accepted | rejected.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS learning_events (
+            id           TEXT PRIMARY KEY,
+            session_id   TEXT NOT NULL,
+            cwd          TEXT NOT NULL,
+            observation  TEXT NOT NULL,
+            suggestion   TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            created_at   TEXT NOT NULL,
+            decided_at   TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_learning_events_cwd_status \
+         ON learning_events(cwd, status)",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 

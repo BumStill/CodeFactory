@@ -43,6 +43,18 @@ export const useToastStore = create<ToastState>((set) => ({
 
 const POLL_INTERVAL_MS = 2000;
 
+/** A single live event emitted by the scheduler during task execution. */
+export interface ExecutionEvent {
+  id: string;
+  kind: "task_started" | "task_progress" | "task_completed" | "task_failed" | "task_retry" | "task_verification";
+  taskId: string;
+  title?: string;
+  message?: string;
+  result?: string;
+  error?: string;
+  at: number;
+}
+
 interface TasksState {
   /** Tasks keyed by session_id. */
   tasks: Record<string, TaskRun[]>;
@@ -52,6 +64,8 @@ interface TasksState {
   loading: Record<string, boolean>;
   /** Last error per session. */
   error: Record<string, string | null>;
+  /** Live execution event log keyed by session_id, append-only within a run. */
+  executionLog: Record<string, ExecutionEvent[]>;
 
   loadTasks: (sessionId: string) => Promise<void>;
   createTaskTree: (
@@ -64,6 +78,7 @@ interface TasksState {
   subscribe: (sessionId: string) => Promise<() => void>;
   subscribeEvidence: (sessionId: string) => Promise<() => void>;
   getTaskDependencies: (taskId: string) => Promise<string[]>;
+  clearExecutionLog: (sessionId: string) => void;
   reset: (sessionId: string) => void;
 }
 
@@ -72,6 +87,11 @@ export const useTasksStore = create<TasksState>((set, get) => ({
   running: {},
   loading: {},
   error: {},
+  executionLog: {},
+
+  clearExecutionLog: (sessionId) => {
+    set((s) => ({ executionLog: { ...s.executionLog, [sessionId]: [] } }));
+  },
 
   loadTasks: async (sessionId) => {
     set((s) => ({ loading: { ...s.loading, [sessionId]: true } }));
@@ -101,7 +121,11 @@ export const useTasksStore = create<TasksState>((set, get) => ({
   },
 
   start: async (sessionId, specReqId, specTitle) => {
-    set((s) => ({ running: { ...s.running, [sessionId]: true } }));
+    set((s) => ({
+      running: { ...s.running, [sessionId]: true },
+      // Fresh log each run — otherwise the UI shows stale events from past runs.
+      executionLog: { ...s.executionLog, [sessionId]: [] },
+    }));
     try {
       await invoke("start_implementation", {
         sessionId,
@@ -143,7 +167,26 @@ export const useTasksStore = create<TasksState>((set, get) => ({
 
     const unsubs: UnlistenFn[] = [];
     for (const k of kinds) {
-      const u = await listen<TaskEventPayload>(`${k}:${sessionId}`, () => {
+      const u = await listen<TaskEventPayload>(`${k}:${sessionId}`, (event) => {
+        // Append to the execution log so the UI can stream progress.
+        const payload = event.payload;
+        const entry: ExecutionEvent = {
+          id: `${k}-${payload.task_id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          kind: k,
+          taskId: payload.task_id,
+          title: payload.title,
+          message: payload.message,
+          result: payload.result,
+          error: payload.error,
+          at: Date.now(),
+        };
+        set((s) => {
+          const prev = s.executionLog[sessionId] ?? [];
+          // Cap log size to keep memory bounded even for very long runs.
+          // 500 entries × ~200 bytes ≈ 100 KB worst case, plenty for UX.
+          const next = [...prev, entry].slice(-500);
+          return { executionLog: { ...s.executionLog, [sessionId]: next } };
+        });
         refresh();
         if (k === "task_completed" || k === "task_failed") {
           // After a task ends, check if anything's still pending or running.
@@ -157,6 +200,17 @@ export const useTasksStore = create<TasksState>((set, get) => ({
               set((s) => ({
                 running: { ...s.running, [sessionId]: false },
               }));
+              // Self-evolution: one post-mortem pass per session run.
+              // Best-effort + capped at 500 tokens server-side — see
+              // src-tauri/src/commands/learning.rs for the token economy
+              // rationale. Failure is silent; the next session will retry.
+              const cwd = all[0]?.cwd;
+              if (cwd) {
+                invoke("run_postmortem", { sessionId, cwd }).catch((e) => {
+                  // eslint-disable-next-line no-console
+                  console.warn("postmortem failed (non-fatal)", e);
+                });
+              }
             }
           }, 100);
         }

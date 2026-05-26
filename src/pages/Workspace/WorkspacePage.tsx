@@ -16,12 +16,15 @@ import {
   Trash2,
   Wand2,
   X,
+  Play,
+  Square,
 } from "lucide-react";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
 import { ModelPicker } from "../../components/ModelPicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
+import { ExecutionStream } from "../../components/ExecutionStream";
 import { invoke } from "../../lib/tauri";
 import { useChatStore } from "../../stores/chat";
 import { useSettingsStore } from "../../stores/settings";
@@ -125,6 +128,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: Workspa
 
         {/* ─── Center: Execution stream + input ──────────────────────── */}
         <main className="flex-1 flex flex-col min-w-0">
+          <ExecutionStream sessionId={sessionId} />
           <MessageList
             messages={messages}
             streaming={streaming}
@@ -167,10 +171,13 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: Workspa
 // ─────────────────────────────────────────────────────────────────────────────
 
 function TasksColumn({ sessionId }: { sessionId: string }) {
-  const { tasks, loadTasks, subscribe, createTaskTree } = useTasksStore();
+  const { tasks, running, loadTasks, subscribe, createTaskTree, start, cancel } = useTasksStore();
   const { activeSession } = useChatStore();
   const sessionTasks: TaskRun[] = tasks[sessionId] ?? [];
+  const isRunning = running[sessionId] ?? false;
+  const pendingCount = sessionTasks.filter((t) => t.status === "pending").length;
   const [creatorOpen, setCreatorOpen] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
 
   useEffect(() => {
     loadTasks(sessionId);
@@ -197,18 +204,63 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
     setCreatorOpen(false);
   };
 
+  const handleStart = async () => {
+    setStartError(null);
+    try {
+      await start(sessionId);
+    } catch (e) {
+      setStartError(String(e));
+    }
+  };
+
+  const handleCancel = async () => {
+    try {
+      await cancel(sessionId);
+    } catch (e) {
+      setStartError(String(e));
+    }
+  };
+
   return (
     <>
-      <div className="flex items-center justify-between px-3 py-2 border-b border-border">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-border gap-2">
         <h2 className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">任务</h2>
-        <button
-          onClick={() => setCreatorOpen(true)}
-          className="p-0.5 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-          title="AI 拆解需求为任务"
-        >
-          <Plus size={12} />
-        </button>
+        <div className="flex items-center gap-1">
+          {isRunning ? (
+            <button
+              onClick={handleCancel}
+              className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-red-700 dark:text-red-300 bg-red-500/10 hover:bg-red-500/20 transition-colors"
+              title="取消执行"
+            >
+              <Square size={9} />
+              停止
+            </button>
+          ) : (
+            pendingCount > 0 && (
+              <button
+                onClick={handleStart}
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-white bg-accent hover:bg-accent-hover transition-colors"
+                title={`开始执行 ${pendingCount} 个待处理任务`}
+              >
+                <Play size={9} />
+                开始
+              </button>
+            )
+          )}
+          <button
+            onClick={() => setCreatorOpen(true)}
+            className="p-0.5 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+            title="AI 拆解需求为任务"
+          >
+            <Plus size={12} />
+          </button>
+        </div>
       </div>
+      {startError && (
+        <div className="px-3 py-2 text-[10px] text-red-700 dark:text-red-300 bg-red-500/10 border-b border-red-500/20">
+          {startError}
+        </div>
+      )}
       <div className="flex-1 overflow-y-auto p-2">
         {sessionTasks.length === 0 ? (
           <button

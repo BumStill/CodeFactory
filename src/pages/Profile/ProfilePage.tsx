@@ -5,11 +5,24 @@ import {
   Brain,
   Save,
   Check,
+  X,
   FolderOpen,
   Sparkles,
+  Loader2,
 } from "lucide-react";
 import { invoke } from "../../lib/tauri";
 import { useChatStore } from "../../stores/chat";
+
+interface LearningEvent {
+  id: string;
+  session_id: string;
+  cwd: string;
+  observation: string;
+  suggestion: string;
+  status: "pending" | "accepted" | "rejected";
+  created_at: string;
+  decided_at: string | null;
+}
 
 interface ProfilePageProps {
   onBack: () => void;
@@ -70,7 +83,7 @@ export function ProfilePage({ onBack }: ProfilePageProps) {
             onSelectCwd={setSelectedCwd}
           />
 
-          <LearningLogSection />
+          <LearningLogSection selectedCwd={selectedCwd} />
 
         </div>
       </div>
@@ -270,20 +283,172 @@ function ProjectMemorySection({
 // LearningLogSection — placeholder until self-evolution lands
 // ─────────────────────────────────────────────────────────────────────────────
 
-function LearningLogSection() {
+function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
+  const [events, setEvents] = useState<LearningEvent[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const reload = async (cwd: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const list = await invoke<LearningEvent[]>("list_learning_events", { cwd });
+      setEvents(list);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (selectedCwd) reload(selectedCwd);
+  }, [selectedCwd]);
+
+  const handleAccept = async (id: string) => {
+    setBusyId(id);
+    setError(null);
+    try {
+      await invoke("accept_learning_event", { eventId: id });
+      if (selectedCwd) await reload(selectedCwd);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleReject = async (id: string) => {
+    setBusyId(id);
+    setError(null);
+    try {
+      await invoke("reject_learning_event", { eventId: id });
+      if (selectedCwd) await reload(selectedCwd);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const pending = events.filter((e) => e.status === "pending");
+  const decided = events.filter((e) => e.status !== "pending");
+
   return (
     <section>
       <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
         学习日志
+        {pending.length > 0 && (
+          <span className="ml-2 text-[10px] font-normal text-accent normal-case">
+            {pending.length} 条待审
+          </span>
+        )}
       </h2>
-      <div className="rounded-lg border border-dashed border-border bg-surface-1 px-6 py-10 text-center">
-        <Sparkles size={20} className="text-gray-600 mx-auto mb-3" />
-        <p className="text-sm text-gray-400 font-medium mb-1">自进化能力开发中</p>
-        <p className="text-xs text-gray-500 max-w-md mx-auto leading-relaxed">
-          未来这里会显示 AI 从你的行为中归纳出的新事实，
-          每条都需要你确认后才会更新到上方的偏好与记忆中。
+
+      {!selectedCwd ? (
+        <p className="text-xs text-gray-500 text-center py-6">选一个项目以查看学习记录</p>
+      ) : loading ? (
+        <p className="text-xs text-gray-500 text-center py-6 flex items-center justify-center gap-2">
+          <Loader2 size={12} className="animate-spin" /> 加载中...
         </p>
-      </div>
+      ) : events.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-border bg-surface-1 px-6 py-10 text-center">
+          <Sparkles size={20} className="text-gray-600 mx-auto mb-3" />
+          <p className="text-sm text-gray-400 font-medium mb-1">暂无学习记录</p>
+          <p className="text-xs text-gray-500 max-w-md mx-auto leading-relaxed">
+            每个任务 session 结束后，AI 会自动总结观察到的事实，
+            出现在这里等你审核。审核通过的会写入项目记忆并影响未来对话。
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {pending.length > 0 && (
+            <div className="space-y-2">
+              {pending.map((e) => (
+                <LearningEventCard
+                  key={e.id}
+                  event={e}
+                  busy={busyId === e.id}
+                  onAccept={() => handleAccept(e.id)}
+                  onReject={() => handleReject(e.id)}
+                />
+              ))}
+            </div>
+          )}
+
+          {decided.length > 0 && (
+            <details className="rounded-lg border border-border bg-surface-1">
+              <summary className="px-4 py-2 text-xs text-gray-500 cursor-pointer hover:text-gray-300 select-none">
+                历史决定 ({decided.length})
+              </summary>
+              <ul className="border-t border-border divide-y divide-border">
+                {decided.map((e) => (
+                  <li key={e.id} className="px-4 py-2 text-[11px]">
+                    <span
+                      className={
+                        e.status === "accepted"
+                          ? "text-green-700 dark:text-green-400 mr-2"
+                          : "text-gray-500 mr-2"
+                      }
+                    >
+                      {e.status === "accepted" ? "✓ 采纳" : "✕ 拒绝"}
+                    </span>
+                    <span className="text-gray-400">{e.observation}</span>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
+
+      {error && (
+        <p className="mt-2 text-xs text-red-700 dark:text-red-300">{error}</p>
+      )}
     </section>
   );
 }
+
+function LearningEventCard({
+  event,
+  busy,
+  onAccept,
+  onReject,
+}: {
+  event: LearningEvent;
+  busy: boolean;
+  onAccept: () => void;
+  onReject: () => void;
+}) {
+  return (
+    <div className="rounded-lg border border-accent/40 bg-accent/5 p-4">
+      <div className="flex items-start gap-2 mb-2">
+        <Sparkles size={12} className="text-accent mt-0.5 shrink-0" />
+        <p className="text-xs text-gray-300 leading-relaxed">{event.observation}</p>
+      </div>
+      <div className="rounded bg-surface-2 border border-border px-3 py-2 mb-3">
+        <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">建议写入记忆</div>
+        <p className="text-[12px] text-gray-200 font-mono leading-relaxed">{event.suggestion}</p>
+      </div>
+      <div className="flex justify-end gap-2">
+        <button
+          onClick={onReject}
+          disabled={busy}
+          className="flex items-center gap-1 px-3 py-1 rounded text-xs text-gray-400 hover:bg-surface-3 disabled:opacity-40"
+        >
+          <X size={11} /> 拒绝
+        </button>
+        <button
+          onClick={onAccept}
+          disabled={busy}
+          className="flex items-center gap-1 px-3 py-1 rounded bg-accent hover:bg-accent-hover text-white text-xs disabled:opacity-40"
+        >
+          {busy ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />}
+          采纳并写入记忆
+        </button>
+      </div>
+    </div>
+  );
+}
+
