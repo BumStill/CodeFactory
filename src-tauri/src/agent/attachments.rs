@@ -146,11 +146,21 @@ fn find_file_image_links(text: &str) -> Vec<(usize, usize, String)> {
                     if let Some(url_rel_end) = text[url_start..].find(')') {
                         let url_end = url_start + url_rel_end;
                         let url = &text[url_start..url_end];
-                        if let Some(path) = url.strip_prefix("file://") {
-                            // file:// has three slashes for absolute path: file:///abs
-                            // We accept both file:///abs and file://abs (treated as abs).
-                            let path = path.trim_start_matches('/');
-                            let abs_path = format!("/{}", path);
+                        if let Some(raw) = url.strip_prefix("file://") {
+                            // Cross-platform unwrap:
+                            //   Unix  : "file:///abs/path"  → raw = "/abs/path"  → keep as-is
+                            //   Win   : "file:///C:/Users/..." → raw = "/C:/Users/..."
+                            //           → strip the leading '/' before drive letter
+                            // We accept both file:///… and file://… (lenient).
+                            let abs_path = if raw.len() >= 3
+                                && raw.starts_with('/')
+                                && raw.as_bytes()[2] == b':'
+                            {
+                                // Windows drive layout — drop the URI's leading slash.
+                                raw[1..].to_string()
+                            } else {
+                                raw.to_string()
+                            };
                             if has_image_extension(&abs_path) {
                                 out.push((i, url_end + 1, abs_path));
                             }
@@ -272,6 +282,35 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].r#type, "image_url");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn windows_drive_letter_url_unwraps_correctly() {
+        // Real failure mode from PR #20 CI: parser was prepending "/" to
+        // every URL, breaking "file:///C:/Users/..." into "/C:/Users/..."
+        // which doesn't open on Windows. We don't actually need a real
+        // Windows path here — we're testing the *parse*, the file just
+        // won't open (which is fine, ignores_missing_file behaviour).
+        let parsed = find_file_image_links(
+            "look ![s](file:///C:/Users/leo/x.png)",
+        );
+        assert_eq!(parsed.len(), 1);
+        // After unwrap, the leading slash before the drive letter is gone.
+        assert_eq!(parsed[0].2, "C:/Users/leo/x.png");
+
+        // Two-slash variant (browser-style relative): "file://C:/..." → keep as-is.
+        let parsed = find_file_image_links(
+            "![s](file://C:/Users/leo/y.png)",
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].2, "C:/Users/leo/y.png");
+
+        // Unix path control: must still get the leading slash back.
+        let parsed = find_file_image_links(
+            "![s](file:///var/x.png)",
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].2, "/var/x.png");
     }
 
     #[test]
