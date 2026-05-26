@@ -4,7 +4,7 @@ import {
   ChevronDown, ChevronRight,
   AlertCircle, CheckCircle, ShieldQuestion,
   FileText, Edit3, Save, TerminalSquare, Search, FolderTree,
-  Globe, Wrench, Bot,
+  Globe, Wrench, Bot, BookOpen,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { ToolCallState } from "../stores/chat";
@@ -21,6 +21,19 @@ interface Props {
 interface ToolStyle {
   icon: LucideIcon;
   iconClass: string;
+}
+
+interface KnowledgeSource {
+  chunk_id?: string;
+  document_id?: string;
+  path?: string;
+  title?: string | null;
+  kind?: string;
+  page?: number | null;
+  slide?: number | null;
+  heading?: string | null;
+  snippet?: string;
+  score?: number;
 }
 
 function styleForTool(name: string): ToolStyle {
@@ -49,6 +62,9 @@ function styleForTool(name: string): ToolStyle {
     case "spawn_subagent":
     case "task":
       return { icon: Bot, iconClass: "text-fuchsia-400" };
+    case "kb_search":
+    case "kb_get_chunk":
+      return { icon: BookOpen, iconClass: "text-emerald-400" };
     default:
       return { icon: Wrench, iconClass: "text-accent" };
   }
@@ -125,6 +141,83 @@ function isTestPathFromArgs(toolName: string, raw: string): boolean {
   }
 }
 
+function basename(path: string | undefined): string {
+  if (!path) return "unknown source";
+  const normalized = path.replace(/\\/g, "/");
+  return normalized.split("/").filter(Boolean).pop() ?? path;
+}
+
+function sourceDisplayName(source: KnowledgeSource): string {
+  if (source.path) return basename(source.path);
+  return source.title ?? source.document_id ?? source.chunk_id ?? "unknown source";
+}
+
+function parseKnowledgeSources(toolName: string, raw: string | null | undefined): KnowledgeSource[] {
+  if (!raw || (toolName !== "kb_search" && toolName !== "kb_get_chunk")) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    const candidates: unknown[] = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed?.results)
+        ? parsed.results
+        : [parsed];
+    return candidates.filter((item: unknown): item is KnowledgeSource => {
+      if (!item || typeof item !== "object") return false;
+      const source = item as Partial<KnowledgeSource>;
+      return Boolean(source.path || source.chunk_id || source.document_id);
+    });
+  } catch {
+    return [];
+  }
+}
+
+function sourceLocator(source: KnowledgeSource): string | null {
+  if (source.slide != null) return `slide ${source.slide}`;
+  if (source.page != null) return `page ${source.page}`;
+  return null;
+}
+
+function KnowledgeSourcesList({ sources }: { sources: KnowledgeSource[] }) {
+  return (
+    <div className="space-y-2 font-sans">
+      <div className="text-gray-500 text-[11px] font-medium">sources {sources.length}</div>
+      <div className="space-y-1.5">
+        {sources.map((source, i) => (
+          <div key={`${source.chunk_id ?? source.document_id ?? source.path ?? "source"}-${i}`} className="rounded border border-border bg-surface-1 px-2.5 py-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <BookOpen size={12} className="text-emerald-400 shrink-0" />
+              <span className="text-xs text-gray-200 font-medium truncate" title={source.path}>
+                {sourceDisplayName(source)}
+              </span>
+              {source.kind && (
+                <span className="text-[10px] uppercase text-gray-600 shrink-0">{source.kind}</span>
+              )}
+            </div>
+            <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-gray-500 font-mono">
+              {sourceLocator(source) && <span>{sourceLocator(source)}</span>}
+              {source.chunk_id && <span>{source.chunk_id}</span>}
+              {source.score != null && <span>score {source.score}</span>}
+            </div>
+            {(source.heading || source.title) && (
+              <div className="mt-1 text-[11px] text-gray-400 truncate">{source.heading || source.title}</div>
+            )}
+            {source.snippet && (
+              <div className="mt-1 text-[11px] text-gray-400 leading-relaxed whitespace-pre-wrap break-words">
+                {source.snippet}
+              </div>
+            )}
+            {source.path && (
+              <div className="mt-1 text-[10px] text-gray-600 font-mono truncate" title={source.path}>
+                {source.path}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function ToolCallCard({ tc }: Props) {
   const [open, setOpen] = useState(false);
   const parsedDiff = tc.result == null ? null : parseUnifiedDiffResult(tc.result);
@@ -133,6 +226,7 @@ export function ToolCallCard({ tc }: Props) {
   const { icon: Icon, iconClass } = styleForTool(tc.name);
   const summary = summarizeArgs(tc.name, tc.args ?? "");
   const isTestMod = isTestPathFromArgs(tc.name, tc.args ?? "");
+  const knowledgeSources = parseKnowledgeSources(tc.name, tc.result);
 
   const statusIcon =
     tc.status === "waiting_permission" ? (
@@ -184,7 +278,9 @@ export function ToolCallCard({ tc }: Props) {
               <div className={`mb-1 ${tc.isError ? "text-red-400" : "text-gray-500"}`}>
                 {tc.isError ? "error" : "output"}
               </div>
-              {hasDiff ? (
+              {knowledgeSources.length > 0 && !tc.isError ? (
+                <KnowledgeSourcesList sources={knowledgeSources} />
+              ) : hasDiff ? (
                 <DiffViewer output={tc.result} />
               ) : (
                 <pre className={`whitespace-pre-wrap break-all ${tc.isError ? "text-red-700 dark:text-red-300" : "text-gray-300"}`}>

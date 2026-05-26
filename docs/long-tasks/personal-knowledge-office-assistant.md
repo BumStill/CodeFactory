@@ -18,7 +18,7 @@
 
 ## Current State
 - Current phase: development
-- Current checkpoint: knowledge connector context/evidence slice implemented on branch `codex/knowledge-task-context`
+- Current checkpoint: knowledge source refs UI slice implemented on branch `codex/knowledge-source-refs`
 - Next owner: development
 - Updated at: 2026-05-26
 
@@ -32,6 +32,8 @@
 - 已完成知识库后端 MVP：新增知识库 SQLite schema、注册/列表/扫描/检索 Tauri commands、`kb_search`/`kb_get_chunk` Agent tools、DOCX/PPTX/PDF 极简文本抽取、检索审计事件。
 - 已完成知识库前端 connector MVP：Workspace 右栏显示个人知识库状态、添加入口、扫描按钮和扫描摘要；任务创建弹窗显示本次可见知识库数量，避免静默注入。
 - 已完成任务执行侧知识库上下文闭环：`create_task_tree` payload 持久化 `TaskConnectorContext`，TaskCreator/TaskRow 展示任务知识库范围，scheduler brief 显式暴露 `kb_search`/`kb_get_chunk`，知识库工具按任务 scope 限制检索并记录 `session_id`/`task_id`，evidence pack 输出 `knowledge_refs.json`。
+- 已完成知识库来源可见化切片：`kb_search` 工具结果展开时展示本地文件名、页码/slide、chunk、片段；Evidence Pack 增加 `Sources` 页签展示 `knowledge_refs.json` 中的 query、latency 和来源文件。
+- 已收窄 MVP 边界：首期目标是可靠参考本地文件做事、办公和开发，不先做团队知识库、云同步、多租户权限、后台索引平台或多向量数据库配置矩阵。
 
 ## Remaining Items
 - 规划阶段：
@@ -40,7 +42,7 @@
 - 开发阶段：
   - 补齐 secret migration 的集成测试：旧 `keys.json` 迁移、backup/import 脱敏、GitHub/GitLab header mock、OS credential store 失败路径。
   - 扩展知识库管理 UI：失败文件列表、引用来源卡片、禁用/启用开关和索引详情抽屉。
-  - 扩展执行流引用来源 UI：从 `retrieval_events`/`knowledge_refs.json` 展示具体文档、页码/slide、chunk 和检索 query。
+  - 扩展真实执行流聚合视图：在任务级时间线中汇总 `kb_search` / `knowledge_refs.json` 的来源统计，避免用户只在单个工具卡或 evidence pack 中查看。
   - 升级检索：FTS/向量检索、metadata filter、token budget、真实 PDF 解析质量和 Office XML 结构保留。
   - 实现 `pptx_plan.json` schema、renderer、PNG QA 和 artifact 管理。
   - 实现本地 HTTPS bridge service、pairing token、PowerPoint add-in manifest/task pane。
@@ -77,6 +79,12 @@
   - `/Users/leo/.cargo/bin/cargo test ensure_schema_creates_satellite_tables_on_fresh_db --lib`：通过，覆盖 `task_runs.task_context_json` 幂等 schema 创建。
   - `/Users/leo/.cargo/bin/cargo test kb_search_uses_attached_database_and_returns_source_json --lib`：先编译失败后通过；覆盖 `kb_search` 从 task scope 默认限制 library、写入 `retrieval_events.session_id/task_id/filters_json`。
   - `/Users/leo/.cargo/bin/cargo check`：通过，存在既有 warning。
+  - `pnpm test -- src/components/ToolCallCard.knowledge.test.tsx src/components/EvidenceViewer.knowledge.test.tsx`：先失败后通过；覆盖 `kb_search` 展开来源卡片和 Evidence Pack `Sources` 页签。
+  - Browser viewport check：隔离 worktree 本地 Vite visual harness（端口 5190），1366x768 与 390x768；确认 `kb_search` 来源卡片和 Evidence Pack `Sources` 页签中 `roadmap.pptx`、`slide 4`、`chunk-1`、`42ms` 可见，`scrollWidth == innerWidth`，无水平滚动；临时 harness 已删除。
+  - `pnpm test`：通过，13 files / 49 tests。
+  - `pnpm build`：通过，存在既有 large chunk warning。
+  - `python3 tools/governance/validate_repo_governance_baseline.py`：通过。
+  - `git diff --check`：通过。
 - Release evidence:
   - not live：尚未实现 PowerPoint 插件、安装包集成或真实 Office 主路径。
 - Blocking evidence:
@@ -85,8 +93,8 @@
 ## AI Collaboration
 - context scope: CodeFactory repo docs、当前任务执行/MCP/memory/Git remote 代码、secret store、Knowledge backend、Office Add-in/RAG/MCP/GitHub flow 外部设计基线。
 - assumptions: 首期以本地个人知识库为边界；知识库 MVP 先用本地 SQLite 表和极简 DOCX/PPTX/PDF 文本抽取，FTS/向量和高保真解析后续升级；PowerPoint 插件使用 Office Web Add-in；PPT 生成优先用 Node/PptxGenJS sidecar；Git 自动 merge 默认关闭。
-- review point: planning sub-agent 和 QA sub-agent 审阅规格；development/QA sub-agent 审阅 secret storage 前置切片风险；knowledge explorer sub-agent 审阅后端落点、schema 和测试风险；Workspace connector UI explorer 审阅 UI 接入点和 viewport 风险；knowledge task-context explorer 审阅任务 payload、ExecCtx、scheduler brief、evidence 和 viewport 风险。
-- validation result: Git remote secret migration targeted tests、knowledge backend targeted tests、knowledge connector UI/store tests、knowledge task context/evidence targeted tests、cargo check、frontend build/test、governance baseline 和 diff check 已通过；完整 Rust lib suite 存在既有跨平台 bash 测试失败；PowerPoint/知识库完整 UI 主路径仍是 `not live`。
+- review point: planning sub-agent 和 QA sub-agent 审阅规格；development/QA sub-agent 审阅 secret storage 前置切片风险；knowledge explorer sub-agent 审阅后端落点、schema 和测试风险；Workspace connector UI explorer 审阅 UI 接入点和 viewport 风险；knowledge task-context explorer 审阅任务 payload、ExecCtx、scheduler brief、evidence 和 viewport 风险；knowledge source refs explorer 审阅最小 UI 落点，建议只改 `ToolCallCard` 和 `EvidenceViewer`。
+- validation result: Git remote secret migration targeted tests、knowledge backend targeted tests、knowledge connector UI/store tests、knowledge task context/evidence targeted tests、knowledge source refs UI targeted tests、cargo check、frontend build/test、governance baseline 和 diff check 已通过；完整 Rust lib suite 存在既有跨平台 bash 测试失败；PowerPoint/知识库完整 UI 主路径仍是 `not live`。
 
 ## Stop Boundary
 - Do not stop after local-only validation.
