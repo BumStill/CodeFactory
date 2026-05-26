@@ -31,6 +31,16 @@ pub struct ContentPart {
     pub r#type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// OpenAI-compatible image content. When `type == "image_url"`, this
+    /// carries `{"url": "data:image/png;base64,..."}`. OpenRouter, OpenAI,
+    /// most providers honour this format directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<ImageUrl>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

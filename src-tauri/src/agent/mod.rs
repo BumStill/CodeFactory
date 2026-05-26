@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod anthropic_client;
+pub mod attachments;
 pub mod checkpoint;
 pub mod context;
 pub mod hooks;
@@ -741,13 +742,23 @@ impl AgentLoop {
                     });
                 }
                 _ => {
+                    // Convert markdown file:// image links → vision content
+                    // parts when present, leaving plain text untouched.
+                    // Missing files / unsupported types fall back to text
+                    // silently (see attachments::extract_openai_parts).
+                    let parts = attachments::extract_openai_parts(&m.content);
+                    let content = if parts.is_empty() {
+                        MessageContent::Text(m.content)
+                    } else {
+                        MessageContent::Parts(parts)
+                    };
                     msgs.push(ChatMessage {
                         role: m.role,
-                        content: MessageContent::Text(m.content),
+                        content,
                         tool_calls: None,
                         tool_call_id: None,
                         name: None,
-                    reasoning_content: None,
+                        reasoning_content: None,
                     });
                 }
             }
@@ -814,10 +825,17 @@ impl AgentLoop {
                     // System is passed as a top-level param, skip inline.
                 }
                 _ => {
-                    // user messages
+                    // user messages — convert markdown file:// image links
+                    // to Anthropic vision content blocks when present.
+                    let blocks = attachments::extract_anthropic_blocks(&m.content);
+                    let content = if blocks.is_empty() {
+                        serde_json::Value::String(m.content)
+                    } else {
+                        serde_json::Value::Array(blocks)
+                    };
                     msgs.push(serde_json::json!({
                         "role": m.role,
-                        "content": m.content,
+                        "content": content,
                     }));
                 }
             }
