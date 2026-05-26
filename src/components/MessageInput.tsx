@@ -1,16 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useRef, useState, useEffect, KeyboardEvent } from "react";
-import { Send, Square } from "lucide-react";
+import { useRef, useState, useEffect, KeyboardEvent, ClipboardEvent, DragEvent } from "react";
+import { Send, Square, Paperclip, X, Loader2 } from "lucide-react";
 import {
   filterSlashCommandSuggestions,
   parseSlashCommand,
   type ParsedSlashCommand,
 } from "../stores/slashCommands";
+import { invoke } from "../lib/tauri";
 
 interface SkillSlashCommand {
   name: string;
   description: string;
   template: string;
+}
+
+/** A file the user pasted or dropped — already persisted under
+ *  `<cwd>/.codefactory/attachments/`. Embedded into the outgoing message
+ *  as a markdown image link on send. */
+interface AttachmentChip {
+  id: string;
+  path: string;
+  name: string;
+  sizeBytes: number;
 }
 
 interface Props {
@@ -25,11 +36,19 @@ interface Props {
   onInsertConsumed?: () => void;
   /** Extra slash commands from enabled skills */
   skillSlashCommands?: SkillSlashCommand[];
+  /** cwd of the active session — required for attachment saves to land
+   *  in the right project's .codefactory/attachments dir. Without it,
+   *  paste/drop are silently ignored. */
+  cwd?: string | null;
 }
 
-export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [] }: Props) {
+export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd }: Props) {
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
+  const [attachments, setAttachments] = useState<AttachmentChip[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!pendingInsert) return;
@@ -37,6 +56,82 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
     onInsertConsumed?.();
     ref.current?.focus();
   }, [pendingInsert]);
+
+  // ── Attachment plumbing ──────────────────────────────────────────────
+  //
+  // Both paste and drag-drop funnel through saveAttachmentFile: turn a
+  // File into base64 → invoke the Tauri save_chat_attachment command →
+  // get back the on-disk path → add a chip. The actual markdown link
+  // is appended at SEND time, not now, so chips can be removed without
+  // hunting through the textarea content.
+  const saveAttachmentFile = async (file: File): Promise<void> => {
+    if (!cwd) {
+      setAttachError("打开一个项目后才能附加文件");
+      return;
+    }
+    setUploading(true);
+    setAttachError(null);
+    try {
+      const buf = await file.arrayBuffer();
+      // Browser-safe base64 of binary data.
+      let binary = "";
+      const bytes = new Uint8Array(buf);
+      const CHUNK = 0x8000;
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
+      }
+      const b64 = btoa(binary);
+      const saved = await invoke<AttachmentChip & { size_bytes: number }>(
+        "save_chat_attachment",
+        { cwd, filename: file.name || "pasted.png", dataBase64: b64 },
+      );
+      setAttachments((prev) => [
+        ...prev,
+        { id: crypto.randomUUID(), path: saved.path, name: saved.name, sizeBytes: saved.size_bytes },
+      ]);
+    } catch (e) {
+      setAttachError(String(e));
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of Array.from(items)) {
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (file) void saveAttachmentFile(file);
+        return;
+      }
+    }
+  };
+
+  const onDrop = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setDragOver(false);
+    const files = Array.from(e.dataTransfer?.files ?? []);
+    for (const f of files) {
+      // Cap per-file at 10 MB to avoid choking the IPC bridge on huge drops.
+      if (f.size > 10 * 1024 * 1024) {
+        setAttachError(`${f.name} 超过 10MB 上限，已跳过`);
+        continue;
+      }
+      void saveAttachmentFile(f);
+    }
+  };
+
+  const onDragOver = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    if (!dragOver) setDragOver(true);
+  };
+  const onDragLeave = () => setDragOver(false);
+
+  const removeAttachment = (id: string) => {
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+  };
 
   // Merge builtin + skill slash command suggestions
   const builtinSuggestions = filterSlashCommandSuggestions(value);
@@ -50,20 +145,38 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
     ...skillSuggestions.filter((s) => !builtinSuggestions.some((b) => b.name === s.name)),
   ];
   const commandCandidate = parseSlashCommand(value.trim());
-  const canSubmit = Boolean(value.trim()) && (!disabled || Boolean(commandCandidate));
 
   const submit = () => {
     const text = value.trim();
-    if (!text || streaming) return;
+    // Allow submission with attachments but no text — the markdown links
+    // appended below count as content for the model.
+    if (!text && attachments.length === 0) return;
     const command = parseSlashCommand(text);
-    if (!command && disabled) return;
-    setValue("");
-    ref.current!.style.height = "auto";
-    if (command && onCommand) {
+    // Slash commands run synchronously and are never queued — they would
+    // be confusing as deferred work (`/cwd` two stream-finishes later).
+    if (command) {
+      if (!onCommand) return;
+      setValue("");
+      setAttachments([]);
+      ref.current!.style.height = "auto";
       void onCommand(command);
       return;
     }
-    onSend(text);
+    if (disabled) return;
+    // Append attachment markdown links at send time so the user can
+    // freely remove chips before send without text-editing the textarea.
+    let outgoing = text;
+    if (attachments.length > 0) {
+      const links = attachments
+        .map((a) => `![${a.name}](file://${a.path})`)
+        .join("\n");
+      outgoing = text ? `${text}\n\n${links}` : links;
+    }
+    setValue("");
+    setAttachments([]);
+    setAttachError(null);
+    ref.current!.style.height = "auto";
+    onSend(outgoing);
   };
 
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -80,8 +193,19 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
     el.style.height = Math.min(el.scrollHeight, 200) + "px";
   };
 
+  // canSubmit recomputes with attachments too — a chip-only message is valid.
+  const hasContent = Boolean(value.trim()) || attachments.length > 0;
+  const submitReady = hasContent && (!disabled || Boolean(commandCandidate));
+
   return (
-    <div className="border-t border-border bg-surface-1 px-4 py-3">
+    <div
+      className={`border-t border-border bg-surface-1 px-4 py-3 transition-colors ${
+        dragOver ? "bg-accent/5" : ""
+      }`}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
       {suggestions.length > 0 && !streaming && (
         <div className="mb-2 max-h-48 overflow-auto rounded-lg border border-border bg-surface-2 shadow-xl">
           {suggestions.map((command) => (
@@ -100,28 +224,81 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
           ))}
         </div>
       )}
+      {/* Attachment chips — shown above the textarea, removable per chip */}
+      {(attachments.length > 0 || uploading || attachError) && (
+        <div className="mb-2 flex flex-wrap gap-1.5 items-center">
+          {attachments.map((a) => (
+            <span
+              key={a.id}
+              className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-surface-3 border border-border text-[11px] text-gray-300"
+              title={a.path}
+            >
+              <Paperclip size={10} className="text-accent" />
+              <span className="truncate max-w-[160px]">{a.name}</span>
+              <span className="text-gray-600 text-[10px]">
+                {(a.sizeBytes / 1024).toFixed(0)}KB
+              </span>
+              <button
+                onClick={() => removeAttachment(a.id)}
+                className="text-gray-500 hover:text-red-400"
+                title="移除"
+              >
+                <X size={10} />
+              </button>
+            </span>
+          ))}
+          {uploading && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-gray-500">
+              <Loader2 size={10} className="animate-spin" /> 保存中…
+            </span>
+          )}
+          {attachError && (
+            <span className="text-[11px] text-red-700 dark:text-red-300">{attachError}</span>
+          )}
+        </div>
+      )}
       <div className="flex items-end gap-2 rounded-xl border border-border bg-surface-2 px-3 py-2 focus-within:border-accent/50 transition-colors">
         <textarea
           ref={ref}
           value={value}
           onChange={(e) => { setValue(e.target.value); autoResize(); }}
           onKeyDown={onKey}
+          onPaste={onPaste}
           rows={1}
-          placeholder={disabled ? "Message or /cwd <path>" : "Message"}
+          placeholder={
+            dragOver
+              ? "松开以附加图片"
+              : disabled
+              ? "Message or /cwd <path>"
+              : "Message · 粘贴或拖拽图片附加"
+          }
           className="flex-1 resize-none bg-transparent text-sm text-gray-200 placeholder-gray-600 outline-none min-h-[24px] max-h-[200px] leading-6 disabled:opacity-40"
         />
+        {/* Two buttons during streaming: queue-send (default, primary)
+            and cancel-stream (secondary, square icon). Outside streaming
+            it's just the regular send. */}
+        {streaming && submitReady && (
+          <button
+            onClick={submit}
+            disabled={!submitReady}
+            className="shrink-0 rounded-lg p-1.5 transition-colors enabled:hover:bg-surface-4 text-accent"
+            title="排队（流式结束后自动发送）"
+          >
+            <Send size={16} />
+          </button>
+        )}
         <button
           onClick={streaming ? onCancel : submit}
-          disabled={!streaming && !canSubmit}
+          disabled={!streaming && !submitReady}
           className="shrink-0 rounded-lg p-1.5 transition-colors disabled:opacity-30
             enabled:hover:bg-surface-4 text-accent disabled:text-gray-600"
-          title={streaming ? "Cancel" : "Send (Enter)"}
+          title={streaming ? "Cancel stream" : "Send (Enter)"}
         >
           {streaming ? <Square size={16} /> : <Send size={16} />}
         </button>
       </div>
       <div className="mt-1 text-xs text-gray-700 text-right select-none">
-        Enter to send · Shift+Enter for newline
+        {streaming ? "Enter 排队 · Shift+Enter 换行" : "Enter 发送 · Shift+Enter 换行"}
       </div>
     </div>
   );

@@ -4,6 +4,7 @@ import { FolderOpen, Plus, Trash2, Settings, TerminalSquare, BookOpen, Puzzle, M
 import { open } from "@tauri-apps/plugin-dialog";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
+import { QueueBadge } from "../../components/QueueBadge";
 import { ModelPicker } from "../../components/ModelPicker";
 import { UpdateStatusPill } from "../../components/UpdateStatusPill";
 import { PermissionDialog } from "../../components/PermissionDialog";
@@ -37,10 +38,11 @@ interface ChatPageProps {
 
 export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPageProps) {
   const {
-    sessions, activeSession, messages, streaming,
+    sessions, activeSession, messages, streaming, queue,
     activeModel, inputTokenTotal, outputTokenTotal,
     loadSessions, createSession, selectSession, deleteSession,
-    sendMessage, cancelStream, pendingPermission, respondPermission,
+    sendMessage, sendOrQueue, cancelStream, removeFromQueue,
+    pendingPermission, respondPermission,
     addLocalAssistantMessage, clearVisibleConversation, updateActiveSessionModel,
   } = useChatStore();
 
@@ -296,9 +298,13 @@ export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPage
         {/* Combined token totals + context-window usage bar */}
         <ContextUsageBar sessionId={activeSession?.id} />
 
+        {queue.length > 0 && (
+          <QueueBadge queue={queue} onRemove={removeFromQueue} />
+        )}
+
         {/* Input */}
         <MessageInput
-          onSend={sendMessage}
+          onSend={(t) => void sendOrQueue(t)}
           onCommand={handleSlashCommand}
           onCancel={cancelStream}
           streaming={streaming}
@@ -306,6 +312,7 @@ export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPage
           pendingInsert={pendingInsert}
           onInsertConsumed={() => setPendingInsert(undefined)}
           skillSlashCommands={skillSlashCommands}
+          cwd={activeSession?.cwd ?? null}
         />
 
         {/* Terminal panel */}

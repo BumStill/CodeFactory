@@ -27,6 +27,7 @@ import { ContextUsageBar } from "../../components/ContextUsageBar";
 import { ExecutionStream } from "../../components/ExecutionStream";
 import { invoke } from "../../lib/tauri";
 import { useChatStore } from "../../stores/chat";
+import { QueueBadge } from "../../components/QueueBadge";
 import { useSettingsStore } from "../../stores/settings";
 import { useTasksStore } from "../../stores/tasks";
 import { useSkillsStore } from "../../stores/skills";
@@ -55,8 +56,8 @@ interface WorkspacePageProps {
  */
 export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: WorkspacePageProps) {
   const {
-    activeSession, messages, streaming,
-    selectSession, sendMessage, cancelStream,
+    activeSession, messages, streaming, queue,
+    selectSession, sendOrQueue, cancelStream, removeFromQueue,
     pendingPermission, respondPermission,
   } = useChatStore();
   const { settings, setTheme } = useSettingsStore();
@@ -136,13 +137,17 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: Workspa
             onUsePrompt={(text) => setPendingInsert(text)}
           />
           <ContextUsageBar sessionId={activeSession?.id} />
+          {queue.length > 0 && (
+            <QueueBadge queue={queue} onRemove={removeFromQueue} />
+          )}
           <MessageInput
-            onSend={sendMessage}
+            onSend={(t) => void sendOrQueue(t)}
             onCancel={cancelStream}
             streaming={streaming}
             disabled={!activeSession}
             pendingInsert={pendingInsert}
             onInsertConsumed={() => setPendingInsert(undefined)}
+            cwd={activeSession?.cwd ?? null}
           />
         </main>
 
