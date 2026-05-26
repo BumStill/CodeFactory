@@ -128,3 +128,93 @@ pub async fn get_monthly_cost(
         cost_usd: row.2,
     })
 }
+
+// ── Aggregations for the Cost Dashboard ──────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct CostByModel {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_usd: f64,
+    pub calls: i64,
+}
+
+/// Aggregate cost by model for a date scope.
+///
+/// `scope` is one of: "today", "month", "all". Anything else is treated as
+/// "all" — keeps the frontend tolerant. Returned in descending cost order
+/// so the top spenders are first.
+#[tauri::command]
+pub async fn get_costs_by_model(
+    scope: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<Vec<CostByModel>, AppError> {
+    let db = state.db.read().await;
+    let (where_clause, bind_val): (&str, Option<String>) = match scope.as_str() {
+        "today" => ("WHERE substr(created_at,1,10) = ?", Some(Utc::now().format("%Y-%m-%d").to_string())),
+        "month" => ("WHERE substr(created_at,1,7) = ?",  Some(Utc::now().format("%Y-%m").to_string())),
+        _       => ("", None),
+    };
+    let sql = format!(
+        "SELECT model, \
+                COALESCE(SUM(input_tokens),0)  AS input_tokens, \
+                COALESCE(SUM(output_tokens),0) AS output_tokens, \
+                COALESCE(SUM(cost_usd),0.0)    AS cost_usd, \
+                COUNT(*)                       AS calls \
+         FROM cost_entries {} \
+         GROUP BY model ORDER BY cost_usd DESC",
+        where_clause
+    );
+
+    let mut query = sqlx::query_as::<_, (String, i64, i64, f64, i64)>(&sql);
+    if let Some(v) = bind_val {
+        query = query.bind(v);
+    }
+    let rows = query.fetch_all(&*db).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(model, input_tokens, output_tokens, cost_usd, calls)| CostByModel {
+            model, input_tokens, output_tokens, cost_usd, calls,
+        })
+        .collect())
+}
+
+#[derive(Serialize)]
+pub struct RecentCostEntry {
+    pub id: String,
+    pub session_id: String,
+    pub model: String,
+    pub endpoint: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_usd: f64,
+    pub created_at: String,
+}
+
+/// Most-recent N cost entries (default 50). Cheap query — backs the
+/// "最近活动" list in the cost dashboard.
+#[tauri::command]
+pub async fn list_recent_cost_entries(
+    limit: Option<i64>,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<Vec<RecentCostEntry>, AppError> {
+    let db = state.db.read().await;
+    let lim = limit.unwrap_or(50).clamp(1, 500);
+    let rows = sqlx::query_as::<_, (String, String, String, String, i64, i64, f64, String)>(
+        "SELECT id, session_id, model, endpoint, input_tokens, output_tokens, cost_usd, created_at \
+         FROM cost_entries ORDER BY created_at DESC LIMIT ?",
+    )
+    .bind(lim)
+    .fetch_all(&*db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, session_id, model, endpoint, input_tokens, output_tokens, cost_usd, created_at)| {
+            RecentCostEntry {
+                id, session_id, model, endpoint,
+                input_tokens, output_tokens, cost_usd, created_at,
+            }
+        })
+        .collect())
+}

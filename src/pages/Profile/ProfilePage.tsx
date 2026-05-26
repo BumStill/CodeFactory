@@ -13,6 +13,7 @@ import {
 import { invoke } from "../../lib/tauri";
 import { useChatStore } from "../../stores/chat";
 import { useLearningStore, type LearningEvent } from "../../stores/learning";
+import { CostDashboardSection } from "../../components/CostDashboardSection";
 
 interface ProfilePageProps {
   onBack: () => void;
@@ -79,6 +80,8 @@ export function ProfilePage({ onBack }: ProfilePageProps) {
           />
 
           <LearningLogSection selectedCwd={selectedCwd} />
+
+          <CostDashboardSection />
 
         </div>
       </div>
