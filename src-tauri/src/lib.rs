@@ -5,6 +5,7 @@ mod config;
 mod errors;
 mod git_remote;
 mod http_util;
+mod knowledge;
 mod mcp;
 mod openrouter;
 mod secrets;
@@ -159,6 +160,10 @@ pub fn run() {
             commands::preferences::delete_user_preference,
             commands::interjections::queue_interjection,
             commands::interjections::list_interjections,
+            commands::knowledge::register_knowledge_library,
+            commands::knowledge::list_knowledge_libraries,
+            commands::knowledge::scan_knowledge_library,
+            commands::knowledge::search_knowledge,
             commands::models::list_models,
             commands::session::list_sessions,
             commands::session::create_session,

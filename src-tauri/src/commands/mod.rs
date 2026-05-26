@@ -9,6 +9,7 @@ pub mod git;
 pub mod git_remote;
 pub mod hooks;
 pub mod interjections;
+pub mod knowledge;
 pub mod learning;
 pub mod mcp;
 pub mod memory;

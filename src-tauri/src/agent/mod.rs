@@ -385,6 +385,7 @@ impl AgentLoop {
 
                 let ctx = ExecCtx {
                     cwd: self.cwd.clone(),
+                    db: Some(self.db.clone()),
                 };
 
                 let tool_start = std::time::Instant::now();
@@ -1009,6 +1010,7 @@ impl AgentLoop {
 
                 let ctx = ExecCtx {
                     cwd: self.cwd.clone(),
+                    db: Some(self.db.clone()),
                 };
 
                 let tool_start = std::time::Instant::now();

@@ -118,7 +118,7 @@ mod tests {
                 "pattern": "secret",
                 "path": ".."
             }),
-            &ExecCtx { cwd: workspace },
+            &ExecCtx { cwd: workspace, db: None },
         )
         .await
         .expect("tool returns output");
