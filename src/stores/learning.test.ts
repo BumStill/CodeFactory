@@ -90,12 +90,19 @@ describe("learning store", () => {
   });
 
   it("backend-fired event triggers a re-load", async () => {
-    // Capture the handler registered by listen()
+    // Capture the handler registered by listen(). Cast: listenMock was
+    // created with a 0-arg default, so overriding with the real 2-arg
+    // listener signature needs `as any` to keep strict TS happy without
+    // leaking jest-mock typing details everywhere.
     let handler: ((payload: { payload: unknown }) => void) | undefined;
-    listenMock.mockImplementationOnce(async (_name: string, cb: (payload: { payload: unknown }) => void) => {
-      handler = cb;
-      return () => {};
-    });
+    (listenMock as unknown as {
+      mockImplementationOnce: (fn: (...args: unknown[]) => unknown) => unknown;
+    }).mockImplementationOnce(
+      async (_name: unknown, cb: unknown) => {
+        handler = cb as (payload: { payload: unknown }) => void;
+        return () => {};
+      },
+    );
     await useLearningStore.getState().subscribe("/proj");
 
     // First load fired by subscribe... no it doesn't, subscribe doesn't auto-load.
