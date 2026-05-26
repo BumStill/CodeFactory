@@ -70,19 +70,20 @@ stick-to-bottom 滚动行为从 v0.3.7 到 v0.3.20 反复修了 6 次，每次�
 覆盖了 hook 的内部状态，没人在 app 里真正流式输出 + 翻阅 + 等待
 re-pin。**单元测试通过 ≠ 用户体验正确**。
 
-**harness 限制降级（agent CLI 跑在 macOS、目标是 Tauri 项目）：**
-Tauri dev 的 webview 进程在 macOS 后台 spawn 后无法被
-`computer-use.request_access` 识别（dev 二进制不在系统应用注册表里，
-只在 `/Applications` 的已签名 bundle 才能授权）。这种情况：
-- 在 PR description 写明 **"agent live verification not feasible
-  on Mac dev binary"**，附原因
-- 改为：**针对真实失败模式写单元测试**（不只是 happy path，要测
-  能触发已知 bug 的边界路径，例如「老 session 加载时初始锚定」、
-  「长 code block shiki 异步替换时不应触发 new content 指示」）
-- 列出 **scenarios needing manual verification**，让用户在
-  release MSI/dmg 里走一遍并回填结果
-- 之后再 push fix 前若实地验证仍未做，PR 标题加 `[unverified-live]`
-  前缀提醒
+**macOS 上的 dev binary 实地验证路径：**
+Tauri dev 二进制不在系统应用注册表里，`computer-use.request_access`
+默认找不到。仓库提供 `scripts/install-dev-app-wrapper.sh`：
+- 一次性运行：在 `/Applications/CodeFactoryDev.app` 装一个 wrapper
+  bundle，shim 调用 `pnpm tauri dev`，自带 ad-hoc 签名 + 注册 LaunchServices
+- 装好后 agent 可用 `request_access(["CodeFactoryDev"])` 拿到 `tier:"full"`
+  权限，screenshot/click/type/scroll 全部可用
+- 后续 UX 验证都以此为准；不再有"Mac dev binary 不能 live verify"借口
+
+如果出现新的 harness 限制（不是这个），可以临时降级为：
+- 在 PR description 写明 **"agent live verification not feasible"** + 具体原因
+- 改写**针对真实失败模式的单元测试**（不是 happy path）
+- 列出 **scenarios needing manual verification** 让用户在 release 上回填
+- **同时**：立刻把这个限制当成下一个 PR 的工程问题来解决，沉淀脚本/工具到仓库
 
 ## 规格与长任务
 - 长期存在的业务能力、架构约束、主路径、兼容语义和验收基线必须写入 `docs/specs/`，不能只存在于一次性计划。
