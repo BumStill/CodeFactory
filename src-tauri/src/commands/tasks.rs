@@ -329,9 +329,16 @@ async fn auto_create_pr_if_configured(
     }
 
     // Get default branch of the repo to use as base.
+    let token = match crate::config::settings::resolve_git_remote_token(&remote) {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::warn!("Auto-create PR skipped: {}", e);
+            return;
+        }
+    };
     let client = crate::git_remote::client::RemoteGitClient::new(
         &remote.base_url,
-        &remote.token,
+        &token,
         remote.provider.clone(),
     );
 

@@ -12,9 +12,10 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<Settings, AppErr
 
 #[tauri::command]
 pub async fn save_settings(
-    new_settings: Settings,
+    mut new_settings: Settings,
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
+    settings::persist_git_remote_inline_tokens(&mut new_settings)?;
     settings::save(&new_settings)?;
     *state.settings.write().await = new_settings;
     Ok(())

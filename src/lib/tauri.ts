@@ -263,6 +263,15 @@ export interface GitRemoteConfig {
   name: string;
   provider: GitProvider;
   base_url: string;
+  token_ref?: string;
+  default_repo: string | null;
+  has_token: boolean;
+}
+
+export interface AddGitRemoteRequest {
+  name: string;
+  provider: GitProvider;
+  base_url: string;
   token: string;
   default_repo: string | null;
 }

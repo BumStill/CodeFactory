@@ -17,9 +17,9 @@
   - 必须记录 blocker、失败证据、下一步命令或人工动作。
 
 ## Current State
-- Current phase: planning
-- Current checkpoint: feature spec and long-task record created
-- Next owner: planning
+- Current phase: development
+- Current checkpoint: secret storage preflight slice implemented on branch `codex/secret-token-migration`
+- Next owner: development
 - Updated at: 2026-05-26
 
 ## Completed Items
@@ -27,13 +27,15 @@
 - 已确定首期主路径：个人知识库检索辅助 PPT 生成、PowerPoint 插件调用本地服务、多工具 Git 交付。
 - 已建立 Req ID、Primary User Path、Applicable Harnesses、测试矩阵和证据包要求。
 - 已记录外部最佳实践基线：Office Web Add-in、Office.js、MCP、RAG、GitHub flow、PptxGenJS、Unstructured。
+- 已完成安全前置切片：API key 迁移到 OS credential store，Git remote settings 改为只持久化 `token_ref`，新增旧 Git token 迁移和 UI DTO 脱敏。
+- 已收紧 Git remote 运行时：远端操作按需通过 `token_ref` 解析 token；旧 inline token 未迁移成功时不再作为 fallback 使用。
 
 ## Remaining Items
 - 规划阶段：
   - 确认首期文档格式、embedding provider、PPT renderer、Office 插件分发方式。
   - 拆分实施规格：Knowledge MVP、PPT Renderer、Office Bridge、Git Delivery Orchestrator、Assistant Connectors UI。
 - 开发阶段：
-  - 先迁移 API/Git/Office token 到 OS credential store 或等价安全 secret store，settings 和文件型 `keys.json` 不再承载明文 token。
+  - 补齐 secret migration 的集成测试：旧 `keys.json` 迁移、backup/import 脱敏、GitHub/GitLab header mock、OS credential store 失败路径。
   - 新增 SQLite schema 和 settings 默认值迁移。
   - 实现知识库注册、扫描、解析、FTS/向量检索和知识库工具。
   - 实现 `pptx_plan.json` schema、renderer、PNG QA 和 artifact 管理。
@@ -54,16 +56,22 @@
 - Local evidence:
   - `docs/specs/feature-specs/personal-knowledge-office-assistant.md`
   - `docs/long-tasks/personal-knowledge-office-assistant.md`
+  - `/Users/leo/.cargo/bin/cargo test git_remote_ --lib`：通过，4 个 Git remote secret migration/脱敏测试。
+  - `/Users/leo/.cargo/bin/cargo check`：通过，存在既有 warning。
+  - `pnpm build`：通过。
+  - `pnpm test`：通过，7 files / 28 tests。
+  - `python3 tools/governance/validate_repo_governance_baseline.py`：通过。
+  - `git diff --check`：通过。
 - Release evidence:
   - not live：尚未实现 PowerPoint 插件、安装包集成或真实 Office 主路径。
 - Blocking evidence:
-  - None.
+  - `/Users/leo/.cargo/bin/cargo test --lib`：49/50 通过；既有 `tools::bash::tests::successful_command_output_includes_shell_audit_metadata` 在 macOS 上因测试固定调用 `powershell` 失败，未混入本切片修复。
 
 ## AI Collaboration
-- context scope: CodeFactory repo docs、当前任务执行/MCP/memory/Git remote 代码、Office Add-in/RAG/MCP/GitHub flow 外部设计基线。
+- context scope: CodeFactory repo docs、当前任务执行/MCP/memory/Git remote 代码、secret store、Office Add-in/RAG/MCP/GitHub flow 外部设计基线。
 - assumptions: 首期以本地个人知识库为边界；PowerPoint 插件使用 Office Web Add-in；PPT 生成优先用 Node/PptxGenJS sidecar；Git 自动 merge 默认关闭。
-- review point: planning sub-agent 和 QA sub-agent 审阅规格；实现前需要确认首期切片。
-- validation result: governance baseline 和 long-task validator 已通过；产品主路径仍是 `not live`。
+- review point: planning sub-agent 和 QA sub-agent 审阅规格；development/QA sub-agent 审阅 secret storage 前置切片风险。
+- validation result: Git remote secret migration targeted tests、cargo check、frontend build/test、governance baseline 和 diff check 已通过；完整 Rust lib suite 存在既有跨平台 bash 测试失败；产品主路径仍是 `not live`。
 
 ## Stop Boundary
 - Do not stop after local-only validation.
