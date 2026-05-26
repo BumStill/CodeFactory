@@ -493,6 +493,7 @@ pub struct DecomposedTask {
 #[tauri::command]
 pub async fn decompose_spec_to_tasks(
     spec_content: String,
+    cwd: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<DecomposedTask>, String> {
     let settings = state.settings.read().await.clone();
@@ -515,8 +516,27 @@ pub async fn decompose_spec_to_tasks(
     let base_url = endpoint.base_url.trim_end_matches('/');
     let url = format!("{base_url}/chat/completions");
 
+    // Inject user-context block (preferences + learnings + memory) when cwd is
+    // available — same contract as decompose_request_to_tasks. Spec-based
+    // decomposition was previously context-blind, so big-bang implementations
+    // ignored per-user style. Now they align.
+    let user_context_block = if let Some(ref cwd_str) = cwd {
+        let pool = state.db.read().await;
+        crate::agent::user_context::build(&pool, cwd_str).await
+    } else {
+        String::new()
+    };
+    let user_context_prefix = if user_context_block.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{}\nUse the above to tailor task granularity and style.\n\n",
+            user_context_block
+        )
+    };
+
     let prompt = format!(
-        "You are a software project manager. Decompose this spec into a concrete list of implementation tasks for a development team.\n\n\
+        "{user_context_prefix}You are a software project manager. Decompose this spec into a concrete list of implementation tasks for a development team.\n\n\
 Return ONLY a JSON array (no markdown fences, no explanation), like:\n\
 [\n  \
 {{\"tmp_id\": \"t-0\", \"title\": \"...\", \"description\": \"...\", \"dependencies\": []}},\n  \

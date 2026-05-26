@@ -526,8 +526,11 @@ function ImplementationModal({ meta, specContent, sessionId, cwd, onConfirm, onC
   useEffect(() => {
     const decompose = async () => {
       try {
+        // cwd lets the backend inject user context (preferences, learnings,
+        // memory.md) so task suggestions are tailored to this user.
         const result = await invoke<DecomposedTask[]>("decompose_spec_to_tasks", {
           specContent,
+          cwd,
         });
         setTasks(result);
         setPhase("review");
@@ -840,9 +843,13 @@ function ImportFromIssueModal({ cwd, onImported, onCancel }: ImportFromIssueModa
 
 interface SpecsPageProps {
   onBack: () => void;
+  /** Optional — when provided, ImplementationModal will navigate to the
+   *  workspace for this session after spec-impl confirms. Otherwise we
+   *  fall back to onBack (legacy behavior). */
+  onOpenWorkspace?: (sessionId: string) => void;
 }
 
-export function SpecsPage({ onBack }: SpecsPageProps) {
+export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
   const { activeSession } = useChatStore();
   const cwd = activeSession?.cwd ?? "";
 
@@ -1152,7 +1159,13 @@ export function SpecsPage({ onBack }: SpecsPageProps) {
           cwd={cwd}
           onConfirm={() => {
             setImplModal(false);
-            onBack(); // Navigate back to chat/tasks view
+            // Jump straight to the Workspace where the user can watch
+            // execution live, instead of bouncing through the home page.
+            if (onOpenWorkspace && activeSession) {
+              onOpenWorkspace(activeSession.id);
+            } else {
+              onBack();
+            }
           }}
           onCancel={() => setImplModal(false)}
         />

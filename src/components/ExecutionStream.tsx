@@ -18,6 +18,7 @@ import {
   Activity,
   MessageSquarePlus,
   Check,
+  FileDiff,
 } from "lucide-react";
 import { useTasksStore, type ExecutionEvent } from "../stores/tasks";
 import { invoke } from "../lib/tauri";
@@ -165,6 +166,12 @@ function TaskBlock({ taskId, events }: { taskId: string; events: ExecutionEvent[
     .find((e) => e.kind === "task_completed" || e.kind === "task_failed");
   const title =
     events.find((e) => e.title)?.title ?? `Task ${taskId.slice(0, 6)}`;
+  // task_completed may include the files the sub-agent touched + the cwd.
+  // We surface them as a collapsible "N changed files" section so the user
+  // can see what was actually written without spelunking through git.
+  const completedEvent = events.find((e) => e.kind === "task_completed");
+  const filesChanged = completedEvent?.filesChanged ?? [];
+  const cwd = completedEvent?.cwd;
 
   const Icon = lastTerminal
     ? lastTerminal.kind === "task_completed"
@@ -189,7 +196,87 @@ function TaskBlock({ taskId, events }: { taskId: string; events: ExecutionEvent[
           <EventRow key={e.id} event={e} />
         ))}
       </ul>
+      {filesChanged.length > 0 && cwd && (
+        <ChangedFilesPanel files={filesChanged} cwd={cwd} />
+      )}
     </li>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ChangedFilesPanel — collapsible list of files the sub-agent touched, with
+// per-file git diff fetched lazily on click. Keeps the AI's actual edits
+// visible to the user immediately after task_completed, no spelunking
+// required. Diff comes from the existing git_diff Tauri command and
+// renders as a fenced-monospace block (the existing DiffViewer expects
+// a structured parsed-diff format; we keep this lean and just show patch).
+// ─────────────────────────────────────────────────────────────────────────────
+
+function ChangedFilesPanel({ files, cwd }: { files: string[]; cwd: string }) {
+  const [open, setOpen] = useState(false);
+  const [activeFile, setActiveFile] = useState<string | null>(null);
+  const [diff, setDiff] = useState<string>("");
+  const [loadingFile, setLoadingFile] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadDiff = async (file: string) => {
+    if (activeFile === file) {
+      setActiveFile(null);
+      setDiff("");
+      return;
+    }
+    setActiveFile(file);
+    setLoadingFile(file);
+    setError(null);
+    try {
+      const patch = await invoke<string>("git_diff", { cwd, file });
+      setDiff(patch.trim() || "（无未提交改动；可能已被 checkpoint 提交）");
+    } catch (e) {
+      setError(String(e));
+      setDiff("");
+    } finally {
+      setLoadingFile(null);
+    }
+  };
+
+  return (
+    <div className="border-t border-border bg-surface-1">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center gap-1.5 px-2 py-1 text-[10px] text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+      >
+        <FileDiff size={10} />
+        <span>改动 {files.length} 个文件</span>
+        <span className="ml-auto">{open ? "收起" : "展开"}</span>
+      </button>
+      {open && (
+        <div className="px-2 pb-2 space-y-1">
+          {files.map((f) => (
+            <div key={f}>
+              <button
+                onClick={() => void loadDiff(f)}
+                className={`w-full flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded transition-colors text-left ${
+                  activeFile === f
+                    ? "bg-surface-3 text-accent"
+                    : "text-gray-400 hover:text-gray-200 hover:bg-surface-3"
+                }`}
+              >
+                <span className="font-mono truncate flex-1">{f}</span>
+                {loadingFile === f && <span className="text-[9px] text-gray-600">读取中...</span>}
+              </button>
+              {activeFile === f && (
+                <pre className="mt-1 mx-1 p-2 bg-surface-2 border border-border rounded text-[10px] font-mono text-gray-300 whitespace-pre-wrap break-all max-h-60 overflow-y-auto">
+                  {diff}
+                </pre>
+              )}
+            </div>
+          ))}
+          {error && (
+            <p className="text-[10px] text-red-700 dark:text-red-300 px-1">{error}</p>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 

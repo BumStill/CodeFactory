@@ -37,6 +37,12 @@ pub const DEFAULT_PREFERENCES: &[(&str, &str)] = &[
     ("code_style",        ""),
 ];
 
+/// Sentinel cwd value for the global scope. Preferences stored under this
+/// cwd are merged with per-project preferences at build time (project wins
+/// on conflict). Treated as a normal cwd row everywhere else — same table,
+/// same upsert/delete commands — which keeps the surface tiny.
+pub const GLOBAL_CWD: &str = "_global_";
+
 /// Ensure default rows exist for a cwd. Idempotent — runs on every
 /// list_user_preferences call so first-time projects auto-populate.
 async fn seed_defaults_if_empty(
