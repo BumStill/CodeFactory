@@ -12,6 +12,7 @@
 
 ## 当前规格
 - `mvp-agent-client.md`: CodeFactory MVP AI 编程 Agent 主路径规格。
+- `personal-knowledge-office-assistant.md`: 个人知识库、PowerPoint 插件和通用助手化规格。
 
 ## 模板
 - `requirements-traceability-template.md`

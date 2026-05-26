@@ -2,6 +2,7 @@
 import { create } from "zustand";
 import { invoke } from "../lib/tauri";
 import type {
+  AddGitRemoteRequest,
   GitRemoteConfig,
   RemoteIssue,
   RemotePR,
@@ -17,7 +18,7 @@ interface GitRemoteStore {
   error: string | null;
 
   loadRemotes: () => Promise<void>;
-  addRemote: (config: GitRemoteConfig) => Promise<void>;
+  addRemote: (config: AddGitRemoteRequest) => Promise<void>;
   deleteRemote: (id: string) => Promise<void>;
   testRemote: (id: string) => Promise<string>;
   loadIssues: (remoteId: string, repo: string, state: string) => Promise<void>;

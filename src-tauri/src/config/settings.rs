@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -12,14 +13,31 @@ pub enum GitProvider {
     Gitlab,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GitRemoteConfig {
     pub id: String,
     pub name: String,
     pub provider: GitProvider,
     pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<String>,
+    #[serde(default, skip_serializing)]
     pub token: String,
     pub default_repo: Option<String>,
+}
+
+impl fmt::Debug for GitRemoteConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitRemoteConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("token_ref", &self.token_ref)
+            .field("token", &"<redacted>")
+            .field("default_repo", &self.default_repo)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +85,89 @@ pub enum Theme {
 impl Default for Theme {
     fn default() -> Self {
         Theme::Dark
+    }
+}
+
+#[cfg(test)]
+mod git_remote_secret_tests {
+    use super::*;
+
+    #[test]
+    fn git_remote_legacy_token_gets_default_token_ref() {
+        let mut remote: GitRemoteConfig = serde_json::from_value(serde_json::json!({
+            "id": "remote-1",
+            "name": "GitHub",
+            "provider": "github",
+            "base_url": "https://api.github.com",
+            "token": "ghp_legacy",
+            "default_repo": "owner/repo"
+        }))
+        .expect("legacy remote config should deserialize");
+
+        let changed = normalize_git_remote_secret_refs(&mut remote);
+
+        assert!(changed, "legacy token should trigger a migration marker");
+        assert_eq!(
+            remote.token_ref.as_deref(),
+            Some("codefactory.git_remote.remote-1")
+        );
+        assert_eq!(remote.token, "ghp_legacy");
+    }
+
+    #[test]
+    fn git_remote_serialization_omits_plaintext_token() {
+        let remote = GitRemoteConfig {
+            id: "remote-1".into(),
+            name: "GitHub".into(),
+            provider: GitProvider::Github,
+            base_url: "https://api.github.com".into(),
+            token_ref: Some("codefactory.git_remote.remote-1".into()),
+            token: "ghp_secret".into(),
+            default_repo: Some("owner/repo".into()),
+        };
+
+        let json = serde_json::to_string(&remote).expect("serialize remote");
+
+        assert!(json.contains("token_ref"));
+        assert!(!json.contains("ghp_secret"));
+        assert!(!json.contains("\"token\""));
+    }
+
+    #[test]
+    fn git_remote_debug_omits_plaintext_token() {
+        let remote = GitRemoteConfig {
+            id: "remote-1".into(),
+            name: "GitHub".into(),
+            provider: GitProvider::Github,
+            base_url: "https://api.github.com".into(),
+            token_ref: None,
+            token: "ghp_secret".into(),
+            default_repo: Some("owner/repo".into()),
+        };
+
+        let debug = format!("{remote:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("ghp_secret"));
+    }
+
+    #[test]
+    fn git_remote_inline_token_without_ref_is_not_used() {
+        let remote = GitRemoteConfig {
+            id: "remote-1".into(),
+            name: "GitHub".into(),
+            provider: GitProvider::Github,
+            base_url: "https://api.github.com".into(),
+            token_ref: None,
+            token: "ghp_secret".into(),
+            default_repo: Some("owner/repo".into()),
+        };
+
+        let err = resolve_git_remote_token(&remote).expect_err("inline token should not be used");
+        let message = err.to_string();
+
+        assert!(message.contains("migration is required"));
+        assert!(!message.contains("ghp_secret"));
     }
 }
 
@@ -250,7 +351,75 @@ pub fn load() -> Settings {
     // None — the resolver will fall back to "first custom_model or
     // first remote model" when the user switches there.
 
+    match persist_git_remote_inline_tokens(&mut settings) {
+        Ok(true) => {
+            if let Err(e) = save(&settings) {
+                tracing::warn!("settings: failed to persist redacted git remote settings: {e}");
+            }
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!("settings: failed to migrate git remote token: {e}");
+        }
+    }
+
     settings
+}
+
+pub fn default_git_remote_token_ref(remote_id: &str) -> String {
+    format!("codefactory.git_remote.{remote_id}")
+}
+
+#[cfg(test)]
+fn normalize_git_remote_secret_refs(remote: &mut GitRemoteConfig) -> bool {
+    if remote.token_ref.is_none() && !remote.token.trim().is_empty() && !remote.id.is_empty() {
+        remote.token_ref = Some(default_git_remote_token_ref(&remote.id));
+        return true;
+    }
+    false
+}
+
+pub fn persist_git_remote_inline_tokens(settings: &mut Settings) -> crate::errors::Result<bool> {
+    let mut migrated = false;
+    for remote in &mut settings.git_remotes {
+        let token = remote.token.trim().to_string();
+        if token.is_empty() {
+            continue;
+        }
+
+        let token_ref = remote
+            .token_ref
+            .clone()
+            .unwrap_or_else(|| default_git_remote_token_ref(&remote.id));
+        crate::secrets::set_key(&token_ref, &token)?;
+        remote.token_ref = Some(token_ref);
+        remote.token.clear();
+        migrated = true;
+    }
+    Ok(migrated)
+}
+
+pub fn resolve_git_remote_token(remote: &GitRemoteConfig) -> crate::errors::Result<String> {
+    if let Some(token_ref) = &remote.token_ref {
+        return crate::secrets::get_key(token_ref)?.ok_or_else(|| {
+            crate::errors::AppError::Other(format!(
+                "Git remote token is missing for remote '{}' (key_ref '{}')",
+                remote.id, token_ref
+            ))
+        });
+    }
+
+    if !remote.token.trim().is_empty() {
+        return Err(crate::errors::AppError::Other(format!(
+            "Git remote '{}' still has a legacy inline token; migration is required before use",
+            remote.id
+        )));
+    }
+
+    Err(crate::errors::AppError::Other(format!(
+        "Git remote token is missing for remote '{}'",
+        remote.id
+    )))
 }
 
 impl Settings {

@@ -7,7 +7,7 @@ import { invoke } from "../../lib/tauri";
 import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
-import type { Settings, Endpoint, ApiStyle, CustomModel, GitRemoteConfig, GitProvider } from "../../lib/tauri";
+import type { Settings, Endpoint, ApiStyle, CustomModel, AddGitRemoteRequest, GitRemoteConfig, GitProvider } from "../../lib/tauri";
 
 interface Props {
   onBack: () => void;
@@ -1054,7 +1054,7 @@ function AddRemoteForm({
 }: {
   onAdded: () => void;
   onCancel: () => void;
-  addRemote: (config: GitRemoteConfig) => Promise<void>;
+  addRemote: (config: AddGitRemoteRequest) => Promise<void>;
 }) {
   const [name, setName]             = useState("");
   const [provider, setProvider]     = useState<GitProvider>("github");
@@ -1075,7 +1075,7 @@ function AddRemoteForm({
     setSaving(true); setErr(null);
     try {
       await addRemote({
-        id: "", name: name.trim(), provider,
+        name: name.trim(), provider,
         base_url: baseUrl.trim(), token: token.trim(),
         default_repo: defaultRepo.trim() || null,
       });
