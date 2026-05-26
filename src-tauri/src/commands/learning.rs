@@ -19,7 +19,7 @@ use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use tauri::{command, State};
+use tauri::{command, AppHandle, Emitter, State};
 use uuid::Uuid;
 
 use crate::commands::memory::{append_project_memory, ProjectMemory};
@@ -86,6 +86,7 @@ pub async fn list_learning_events(
 #[command]
 pub async fn accept_learning_event(
     event_id: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ProjectMemory, AppError> {
     let pool = state.db.read().await;
@@ -141,15 +142,26 @@ pub async fn accept_learning_event(
     .bind(&event_id)
     .execute(&*pool)
     .await?;
+    // Tell other open panels (Workspace right rail, second Profile window)
+    // to refresh — the row they're holding is now stale.
+    let event = format!("learning_events_updated:{}", cwd);
+    let _ = app.emit(&event, ());
     Ok(memory)
 }
 
 #[command]
 pub async fn reject_learning_event(
     event_id: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
     let pool = state.db.read().await;
+    // Capture cwd before update so we can emit the right per-cwd channel.
+    let cwd: String = sqlx::query_scalar("SELECT cwd FROM learning_events WHERE id = ?")
+        .bind(&event_id)
+        .fetch_one(&*pool)
+        .await
+        .unwrap_or_default();
     sqlx::query(
         "UPDATE learning_events SET status = 'rejected', decided_at = ? WHERE id = ?",
     )
@@ -157,6 +169,10 @@ pub async fn reject_learning_event(
     .bind(&event_id)
     .execute(&*pool)
     .await?;
+    if !cwd.is_empty() {
+        let event = format!("learning_events_updated:{}", cwd);
+        let _ = app.emit(&event, ());
+    }
     Ok(())
 }
 
@@ -213,6 +229,7 @@ struct PostmortemEntry {
 pub async fn run_postmortem(
     session_id: String,
     cwd: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<LearningEvent>, AppError> {
     // ── Gather a tiny summary: task titles + statuses + first 80 chars
@@ -411,6 +428,16 @@ Tasks from this session:\n{summary}"
             pref_key,
             pref_value,
         });
+    }
+
+    // Notify UI so the Profile page + Workspace "记忆增量" panel can
+    // refresh without polling. Per-cwd channel so two open projects
+    // don't interfere. Best-effort — emit failures are non-fatal.
+    if !created.is_empty() {
+        let event = format!("learning_events_updated:{}", cwd);
+        if let Err(e) = app.emit(&event, &created) {
+            tracing::warn!("emit {} failed: {}", event, e);
+        }
     }
 
     Ok(created)

@@ -264,6 +264,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 }));
 
+/** Throttle: don't fire post-mortem more than once every 5 minutes per
+ *  session. Saves tokens during back-and-forth chats. */
+const POSTMORTEM_THROTTLE_MS = 5 * 60 * 1000;
+/** Skip post-mortem unless the conversation has at least this many
+ *  messages — anything shorter has nothing useful to learn from. */
+const POSTMORTEM_MIN_MESSAGES = 3;
+const _lastPostmortemAt: Record<string, number> = {};
+
 function handleStreamEvent(
   event: StreamEvent,
   msgId: string,
@@ -283,6 +291,34 @@ function handleStreamEvent(
       setTimeout(() => {
         void get().sendMessage(next.content);
       }, 0);
+      return; // more conversation coming — defer post-mortem
+    }
+
+    // Chat-end post-mortem trigger. The Workspace already fires this
+    // after task trees settle (see stores/tasks.ts); here we cover
+    // free-form chat sessions too, since those produce just as many
+    // signals worth learning from. Guards:
+    //   - throttled per session to avoid burning tokens on rapid replies
+    //   - skip too-short conversations (< 3 messages = noise)
+    //   - skip 'error' terminations (the task path skips failures too)
+    const session = get().activeSession;
+    if (
+      session &&
+      event.type === "done" &&
+      get().messages.length >= POSTMORTEM_MIN_MESSAGES
+    ) {
+      const last = _lastPostmortemAt[session.id] ?? 0;
+      if (Date.now() - last >= POSTMORTEM_THROTTLE_MS) {
+        _lastPostmortemAt[session.id] = Date.now();
+        // Fire-and-forget; backend errors are logged but never block UX.
+        invoke("run_postmortem", {
+          sessionId: session.id,
+          cwd: session.cwd,
+        }).catch((e) => {
+          // eslint-disable-next-line no-console
+          console.warn("chat postmortem failed (non-fatal)", e);
+        });
+      }
     }
   }
 }
