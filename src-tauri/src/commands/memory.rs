@@ -52,6 +52,24 @@ pub async fn read_project_memory(cwd: String) -> Result<ProjectMemory, AppError>
 /// Append a fact to the project memory file, creating the directory and
 /// file if needed. Each entry is dated and separated by a blank line so
 /// the file stays readable as it grows.
+/// Overwrite the project memory file with arbitrary content. Used by the
+/// Profile page where the user edits their full memory as one document.
+/// Unlike `append_project_memory`, no header is prepended — whatever the
+/// caller passes is exactly what lands on disk.
+#[command]
+pub async fn write_project_memory(cwd: String, content: String) -> Result<ProjectMemory, AppError> {
+    let path = memory_path(Path::new(&cwd));
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&path, &content).await?;
+    Ok(ProjectMemory {
+        path: path.to_string_lossy().into_owned(),
+        content,
+        exists: true,
+    })
+}
+
 #[command]
 pub async fn append_project_memory(cwd: String, fact: String) -> Result<ProjectMemory, AppError> {
     let fact = fact.trim();

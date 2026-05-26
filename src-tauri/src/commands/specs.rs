@@ -621,3 +621,144 @@ Spec:\n\
         Ok(tasks)
     }
 }
+
+// ── AI request decomposition (raw NL → task tree) ────────────────────────────
+
+/// Decompose a free-form user request into a structured task list.
+///
+/// Like `decompose_spec_to_tasks` but for raw natural-language input that
+/// hasn't been formalized as a spec yet. Used from the Workspace TasksColumn
+/// when the user describes what they want to build directly.
+#[tauri::command]
+pub async fn decompose_request_to_tasks(
+    request: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<DecomposedTask>, String> {
+    let settings = state.settings.read().await.clone();
+    let ep_name = &settings.default_endpoint;
+    let model = settings.default_model.clone();
+
+    let endpoint = settings
+        .endpoints
+        .get(ep_name)
+        .ok_or_else(|| format!("Endpoint '{}' not configured", ep_name))?;
+
+    let api_key = if let Some(ref key_ref) = endpoint.key_ref {
+        crate::secrets::get_key(key_ref)
+            .map_err(|e| format!("Failed to load API key: {e}"))?
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let base_url = endpoint.base_url.trim_end_matches('/');
+    let url = format!("{base_url}/chat/completions");
+
+    let prompt = format!(
+        "You are a software project manager. The user is describing something they want built. \
+Decompose their request into a concrete, actionable task list a development team can execute.\n\n\
+Return ONLY a JSON array (no markdown fences, no explanation), like:\n\
+[\n  \
+{{\"tmp_id\": \"t-0\", \"title\": \"...\", \"description\": \"...\", \"dependencies\": []}},\n  \
+{{\"tmp_id\": \"t-1\", \"title\": \"...\", \"description\": \"...\", \"dependencies\": [\"t-0\"]}}\n\
+]\n\n\
+Rules:\n\
+- 3-7 tasks maximum — keep it tight and high-signal\n\
+- Each task is independently actionable, sized for one focused work session\n\
+- title: short imperative phrase (5-10 words), e.g. \"Set up database schema\"\n\
+- description: 1-2 sentences on what to implement and why\n\
+- dependencies: tmp_ids of tasks that must complete first (can be empty)\n\
+- Prefer concrete implementation tasks over abstract planning\n\
+- If the request is too vague to decompose, return a single task asking for clarification\n\n\
+User request:\n\
+{request}"
+    );
+
+    let request_body = AiRequest {
+        model,
+        messages: vec![AiMessage {
+            role: "user".into(),
+            content: prompt,
+        }],
+        stream: false,
+        temperature: 0.3,
+        max_tokens: 1024,
+    };
+
+    let client = Client::new();
+    let response = client
+        .post(&url)
+        .bearer_auth(&api_key)
+        .header("X-Title", "CodeFactory")
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+    let response = crate::http_util::check_status(response)
+        .await
+        .map_err(|e| e.to_string())?;
+    let resp: AiResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("JSON parse error: {e}"))?;
+
+    let text = resp
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|c| c.message.content)
+        .unwrap_or_default();
+
+    // Strip markdown fences if present
+    let json_str = {
+        let trimmed = text.trim();
+        let stripped = trimmed
+            .strip_prefix("```json")
+            .or_else(|| trimmed.strip_prefix("```"))
+            .map(|s| s.trim_end_matches("```").trim())
+            .unwrap_or(trimmed);
+        stripped.to_string()
+    };
+
+    let fallback = vec![DecomposedTask {
+        tmp_id: "t-0".into(),
+        title: "Clarify the request".into(),
+        description: format!("The AI couldn't decompose the request. Original input: {request}"),
+        dependencies: vec![],
+    }];
+
+    let parsed: Vec<serde_json::Value> = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(_) => return Ok(fallback),
+    };
+
+    if parsed.is_empty() {
+        return Ok(fallback);
+    }
+
+    let tasks: Vec<DecomposedTask> = parsed
+        .into_iter()
+        .filter_map(|v| {
+            let tmp_id = v["tmp_id"].as_str()?.to_string();
+            let title = v["title"].as_str()?.to_string();
+            let description = v["description"].as_str().unwrap_or("").to_string();
+            let dependencies = v["dependencies"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|d| d.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(DecomposedTask { tmp_id, title, description, dependencies })
+        })
+        .collect();
+
+    if tasks.is_empty() {
+        Ok(fallback)
+    } else {
+        Ok(tasks)
+    }
+}
+

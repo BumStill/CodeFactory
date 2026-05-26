@@ -23,6 +23,7 @@ interface HomePageProps {
   onOpenSpecs: () => void;
   onOpenSkills: () => void;
   onOpenSettings: () => void;
+  onOpenProfile: () => void;
 }
 
 /**
@@ -55,6 +56,7 @@ export function HomePage({
   onOpenSpecs,
   onOpenSkills,
   onOpenSettings,
+  onOpenProfile,
 }: HomePageProps) {
   const { sessions, loadSessions, createSession, activeModel } = useChatStore();
   const { settings, setTheme } = useSettingsStore();
@@ -76,8 +78,7 @@ export function HomePage({
   };
 
   const handleProfile = () => {
-    // TODO: user profile / memory view
-    alert("我的画像：即将上线");
+    onOpenProfile();
   };
 
   const recent = [...sessions]
