@@ -18,7 +18,14 @@ pub struct Session {
     /// Top-level chat sessions have this set to `None` and should be shown in the sidebar.
     #[serde(default)]
     pub parent_session_id: Option<String>,
+    /// "project" (full software-factory flow, default) or "quick" (one-off
+    /// ephemeral chat from Home's Quick Task entry). Quick sessions are
+    /// hidden from the Recent Projects list and reused across visits.
+    #[serde(default = "default_session_kind")]
+    pub kind: String,
 }
+
+fn default_session_kind() -> String { "project".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Message {

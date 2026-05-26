@@ -177,6 +177,10 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ensure_column(pool, "learning_events", "kind", "TEXT NOT NULL DEFAULT 'memory'").await?;
     ensure_column(pool, "learning_events", "pref_key", "TEXT").await?;
     ensure_column(pool, "learning_events", "pref_value", "TEXT").await?;
+    // 'project' (default) for full software-factory sessions, 'quick' for
+    // ephemeral one-off chats launched from the home page's Quick Task entry.
+    // List-sessions excludes 'quick' from the Recent Projects card.
+    ensure_column(pool, "sessions", "kind", "TEXT NOT NULL DEFAULT 'project'").await?;
 
     // ── user_preferences: structured key→value the AI reads at
     //    decomposition / execution time. Scoped per cwd so different
@@ -211,6 +215,13 @@ async fn ensure_column(
     let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
         .fetch_all(pool)
         .await?;
+    // PRAGMA returns 0 rows when the table doesn't exist. Don't try to
+    // ALTER a missing table — it would error. In production the table is
+    // created by the migration before ensure_schema runs; in tests the
+    // fixture may only create a subset of tables.
+    if rows.is_empty() {
+        return Ok(());
+    }
     let exists = rows.iter().any(|r| {
         r.try_get::<String, _>("name")
             .map(|n| n == column)

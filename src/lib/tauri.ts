@@ -41,6 +41,10 @@ export interface Session {
   updated_at: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  /** "project" (default) for full software-factory sessions, "quick" for
+   *  the single persistent ephemeral chat launched from Home's Quick Task.
+   *  Optional for backward compat — old code paths default to "project". */
+  kind?: "project" | "quick";
 }
 
 export interface Message {

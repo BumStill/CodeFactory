@@ -94,8 +94,16 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: Workspa
           <ChevronLeft size={14} />
         </button>
         <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium text-gray-200 truncate">
+          <div className="text-sm font-medium text-gray-200 truncate flex items-center gap-2">
             {activeSession?.title || "..."}
+            {activeSession?.kind === "quick" && (
+              <span
+                className="text-[9px] px-1.5 py-0.5 rounded bg-accent/15 text-accent font-normal"
+                title="一次性助手会话，不会出现在「最近项目」"
+              >
+                Quick
+              </span>
+            )}
           </div>
           <div className="text-[10px] text-gray-600 font-mono truncate">
             {activeSession?.cwd}
