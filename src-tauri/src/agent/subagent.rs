@@ -183,7 +183,29 @@ pub async fn run_subagent(
         mcp_manager,
     );
 
-    agent.run(history).await?;
+    // Hard wall-clock cap per subagent. Without this an unbounded
+    // tool-call loop (model keeps asking to read more files) can burn
+    // tokens and clock indefinitely. 10 minutes is generous for a real
+    // task but bounded enough to catch runaway behaviour.
+    const PER_TASK_TIMEOUT_SECS: u64 = 600;
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PER_TASK_TIMEOUT_SECS),
+        agent.run(history),
+    )
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => {
+            tracing::warn!(
+                "subagent task '{}' hit {}s wall-clock cap; aborting",
+                brief.title, PER_TASK_TIMEOUT_SECS
+            );
+            return Err(AppError::Other(format!(
+                "Task exceeded {}s execution cap and was aborted to prevent drift",
+                PER_TASK_TIMEOUT_SECS
+            )));
+        }
+    }
 
     // 5. Walk messages to produce a result summary.
     let result = summarize_run(pool, &sub_session_id).await?;

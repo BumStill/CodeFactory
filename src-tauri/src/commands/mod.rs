@@ -8,6 +8,7 @@ pub mod files;
 pub mod git;
 pub mod git_remote;
 pub mod hooks;
+pub mod learning;
 pub mod mcp;
 pub mod memory;
 pub mod models;

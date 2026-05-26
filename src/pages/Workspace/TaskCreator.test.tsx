@@ -64,13 +64,25 @@ vi.mock("../../stores/settings", () => ({
     setTheme: vi.fn(),
   }),
 }));
+// Two call shapes: the object-destructure form `const {tasks,...} = useTasksStore()`
+// (TasksColumn) and the selector form `useTasksStore(s => s.foo)` (ExecutionStream).
+// Detect by argument arity and respond appropriately.
+const fakeState = {
+  tasks: {} as Record<string, unknown[]>,
+  running: {} as Record<string, boolean>,
+  executionLog: {} as Record<string, unknown[]>,
+  loadTasks: mocks.loadTasks,
+  subscribe: mocks.subscribe,
+  createTaskTree: mocks.createTaskTree,
+  start: vi.fn(),
+  cancel: vi.fn(),
+};
 vi.mock("../../stores/tasks", () => ({
-  useTasksStore: () => ({
-    tasks: {},
-    loadTasks: mocks.loadTasks,
-    subscribe: mocks.subscribe,
-    createTaskTree: mocks.createTaskTree,
-  }),
+  useTasksStore: Object.assign(
+    <T,>(selector?: (s: typeof fakeState) => T): T | typeof fakeState =>
+      selector ? selector(fakeState) : fakeState,
+    { setState: vi.fn(), getState: () => fakeState },
+  ),
 }));
 vi.mock("../../stores/skills", () => ({
   useSkillsStore: () => ({ skills: [], loadSkills: vi.fn() }),
