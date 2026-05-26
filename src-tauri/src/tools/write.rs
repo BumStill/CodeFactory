@@ -130,7 +130,7 @@ mod tests {
                 "path": "notes.txt",
                 "content": "alpha\nnew\n"
             }),
-            &ExecCtx { cwd: cwd.clone() },
+            &ExecCtx { cwd: cwd.clone(), db: None },
         )
         .await
         .expect("write succeeds");
@@ -159,7 +159,7 @@ mod tests {
                 "path": "../owned.txt",
                 "content": "owned"
             }),
-            &ExecCtx { cwd },
+            &ExecCtx { cwd, db: None },
         )
         .await
         .expect("tool returns output");

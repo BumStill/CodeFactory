@@ -187,6 +187,8 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     .execute(pool)
     .await?;
 
+    crate::knowledge::ensure_schema(pool).await?;
+
     Ok(())
 }
 
@@ -315,7 +317,15 @@ mod tests {
 
         ensure_schema(&pool).await.unwrap();
 
-        for table in ["cost_entries", "task_runs", "task_dependencies"] {
+        for table in [
+            "cost_entries",
+            "task_runs",
+            "task_dependencies",
+            "knowledge_libraries",
+            "knowledge_documents",
+            "knowledge_chunks",
+            "retrieval_events",
+        ] {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
             )

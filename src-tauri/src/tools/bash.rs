@@ -128,7 +128,7 @@ mod tests {
             json!({
                 "command": "Write-Output 'shutdown'",
             }),
-            &ExecCtx { cwd: cwd.clone() },
+            &ExecCtx { cwd: cwd.clone(), db: None },
         )
         .await
         .expect("tool returns output");
@@ -148,7 +148,7 @@ mod tests {
             json!({
                 "command": "Write-Output 'ok'",
             }),
-            &ExecCtx { cwd: cwd.clone() },
+            &ExecCtx { cwd: cwd.clone(), db: None },
         )
         .await
         .expect("tool returns output");

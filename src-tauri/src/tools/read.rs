@@ -116,7 +116,7 @@ mod tests {
             json!({
                 "path": "../outside.txt",
             }),
-            &ExecCtx { cwd: workspace },
+            &ExecCtx { cwd: workspace, db: None },
         )
         .await
         .expect("tool returns output");

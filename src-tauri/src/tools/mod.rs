@@ -4,6 +4,7 @@ pub mod edit;
 pub mod file_lock;
 pub mod glob;
 pub mod grep;
+pub mod knowledge;
 pub mod path_sanity;
 pub mod read;
 pub mod shell_policy;
@@ -48,6 +49,7 @@ impl ToolOutput {
 
 pub struct ExecCtx {
     pub cwd: PathBuf,
+    pub db: Option<sqlx::SqlitePool>,
 }
 
 pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
@@ -57,6 +59,8 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         edit::definition(),
         glob::definition(),
         grep::definition(),
+        knowledge::search_definition(),
+        knowledge::get_chunk_definition(),
         bash::definition(),
     ]
 }
@@ -68,6 +72,8 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "edit_file" => edit::execute(args, ctx).await,
         "glob" => glob::execute(args, ctx).await,
         "grep" => grep::execute(args, ctx).await,
+        "kb_search" => knowledge::execute_search(args, ctx).await,
+        "kb_get_chunk" => knowledge::execute_get_chunk(args, ctx).await,
         "bash" => bash::execute(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),
     }

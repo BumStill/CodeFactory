@@ -18,7 +18,7 @@
 
 ## Current State
 - Current phase: development
-- Current checkpoint: secret storage preflight slice implemented on branch `codex/secret-token-migration`
+- Current checkpoint: knowledge backend MVP implemented on branch `codex/knowledge-base-mvp`
 - Next owner: development
 - Updated at: 2026-05-26
 
@@ -29,6 +29,7 @@
 - 已记录外部最佳实践基线：Office Web Add-in、Office.js、MCP、RAG、GitHub flow、PptxGenJS、Unstructured。
 - 已完成安全前置切片：API key 迁移到 OS credential store，Git remote settings 改为只持久化 `token_ref`，新增旧 Git token 迁移和 UI DTO 脱敏。
 - 已收紧 Git remote 运行时：远端操作按需通过 `token_ref` 解析 token；旧 inline token 未迁移成功时不再作为 fallback 使用。
+- 已完成知识库后端 MVP：新增知识库 SQLite schema、注册/列表/扫描/检索 Tauri commands、`kb_search`/`kb_get_chunk` Agent tools、DOCX/PPTX/PDF 极简文本抽取、检索审计事件。
 
 ## Remaining Items
 - 规划阶段：
@@ -36,8 +37,9 @@
   - 拆分实施规格：Knowledge MVP、PPT Renderer、Office Bridge、Git Delivery Orchestrator、Assistant Connectors UI。
 - 开发阶段：
   - 补齐 secret migration 的集成测试：旧 `keys.json` 迁移、backup/import 脱敏、GitHub/GitLab header mock、OS credential store 失败路径。
-  - 新增 SQLite schema 和 settings 默认值迁移。
-  - 实现知识库注册、扫描、解析、FTS/向量检索和知识库工具。
+  - 实现知识库管理 UI、扫描状态显示、失败文件列表和引用来源卡片。
+  - 将知识库工具加入任务启动前 connector 摘要，让用户明确看到启用范围。
+  - 升级检索：FTS/向量检索、metadata filter、token budget、真实 PDF 解析质量和 Office XML 结构保留。
   - 实现 `pptx_plan.json` schema、renderer、PNG QA 和 artifact 管理。
   - 实现本地 HTTPS bridge service、pairing token、PowerPoint add-in manifest/task pane。
   - 实现 Git preflight、branch/worktree、verification gate、finalize/PR/checks。
@@ -62,16 +64,19 @@
   - `pnpm test`：通过，7 files / 28 tests。
   - `python3 tools/governance/validate_repo_governance_baseline.py`：通过。
   - `git diff --check`：通过。
+  - `/Users/leo/.cargo/bin/cargo test knowledge --lib`：通过，覆盖 DOCX/PPTX/PDF 扫描、损坏文件不中断、`kb_search` tool 数据库检索和来源 JSON。
+  - `/Users/leo/.cargo/bin/cargo test ensure_schema_creates_satellite_tables_on_fresh_db --lib`：通过，覆盖知识库表的幂等 schema 创建。
+  - `/Users/leo/.cargo/bin/cargo check`：通过，存在既有 warning。
 - Release evidence:
   - not live：尚未实现 PowerPoint 插件、安装包集成或真实 Office 主路径。
 - Blocking evidence:
   - `/Users/leo/.cargo/bin/cargo test --lib`：49/50 通过；既有 `tools::bash::tests::successful_command_output_includes_shell_audit_metadata` 在 macOS 上因测试固定调用 `powershell` 失败，未混入本切片修复。
 
 ## AI Collaboration
-- context scope: CodeFactory repo docs、当前任务执行/MCP/memory/Git remote 代码、secret store、Office Add-in/RAG/MCP/GitHub flow 外部设计基线。
-- assumptions: 首期以本地个人知识库为边界；PowerPoint 插件使用 Office Web Add-in；PPT 生成优先用 Node/PptxGenJS sidecar；Git 自动 merge 默认关闭。
-- review point: planning sub-agent 和 QA sub-agent 审阅规格；development/QA sub-agent 审阅 secret storage 前置切片风险。
-- validation result: Git remote secret migration targeted tests、cargo check、frontend build/test、governance baseline 和 diff check 已通过；完整 Rust lib suite 存在既有跨平台 bash 测试失败；产品主路径仍是 `not live`。
+- context scope: CodeFactory repo docs、当前任务执行/MCP/memory/Git remote 代码、secret store、Knowledge backend、Office Add-in/RAG/MCP/GitHub flow 外部设计基线。
+- assumptions: 首期以本地个人知识库为边界；知识库 MVP 先用本地 SQLite 表和极简 DOCX/PPTX/PDF 文本抽取，FTS/向量和高保真解析后续升级；PowerPoint 插件使用 Office Web Add-in；PPT 生成优先用 Node/PptxGenJS sidecar；Git 自动 merge 默认关闭。
+- review point: planning sub-agent 和 QA sub-agent 审阅规格；development/QA sub-agent 审阅 secret storage 前置切片风险；knowledge explorer sub-agent 审阅后端落点、schema 和测试风险。
+- validation result: Git remote secret migration targeted tests、knowledge backend targeted tests、cargo check、frontend build/test、governance baseline 和 diff check 已通过；完整 Rust lib suite 存在既有跨平台 bash 测试失败；PowerPoint/知识库 UI 主路径仍是 `not live`。
 
 ## Stop Boundary
 - Do not stop after local-only validation.
