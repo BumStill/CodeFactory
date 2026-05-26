@@ -22,6 +22,11 @@ interface LearningEvent {
   status: "pending" | "accepted" | "rejected";
   created_at: string;
   decided_at: string | null;
+  /** "memory" appends suggestion to memory.md on accept.
+   *  "preference" upserts pref_key→pref_value into user_preferences. */
+  kind: "memory" | "preference";
+  pref_key: string | null;
+  pref_value: string | null;
 }
 
 interface ProfilePageProps {
@@ -118,10 +123,20 @@ const SOURCE_BADGE: Record<UserPreference["source"], { text: string; cls: string
   default: { text: "默认",    cls: "bg-surface-3 text-gray-500" },
 };
 
+/** Sentinel cwd value matching `commands::preferences::GLOBAL_CWD` on the
+ *  backend. Stored side-by-side with project rows in user_preferences;
+ *  the scheduler merges them with project-overrides-global semantics. */
+const GLOBAL_CWD = "_global_";
+
 function PreferencesSection({ selectedCwd }: { selectedCwd: string | null }) {
+  const [scope, setScope] = useState<"global" | "project">("global");
   const [prefs, setPrefs] = useState<UserPreference[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Resolve which cwd to query based on selected scope. When no project is
+  // open, project tab is disabled — global is always available.
+  const activeCwd = scope === "global" ? GLOBAL_CWD : selectedCwd;
 
   const reload = async (cwd: string) => {
     setLoading(true);
@@ -137,14 +152,14 @@ function PreferencesSection({ selectedCwd }: { selectedCwd: string | null }) {
   };
 
   useEffect(() => {
-    if (selectedCwd) reload(selectedCwd);
-  }, [selectedCwd]);
+    if (activeCwd) reload(activeCwd);
+  }, [activeCwd]);
 
   const handleUpdate = async (key: string, value: string) => {
-    if (!selectedCwd) return;
+    if (!activeCwd) return;
     try {
       await invoke("upsert_user_preference", {
-        cwd: selectedCwd,
+        cwd: activeCwd,
         key,
         value,
         source: "user",
@@ -162,13 +177,43 @@ function PreferencesSection({ selectedCwd }: { selectedCwd: string | null }) {
     }
   };
 
+  const projectDisabled = !selectedCwd;
+
   return (
     <section>
-      <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
-        个人偏好
-      </h2>
-      {!selectedCwd ? (
-        <p className="text-xs text-gray-500 text-center py-6">选一个项目以查看偏好</p>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+          个人偏好
+        </h2>
+        {/* Scope tabs — global vs current project. */}
+        <div className="flex items-center rounded border border-border overflow-hidden text-[10px]">
+          <button
+            onClick={() => setScope("global")}
+            className={`px-2 py-0.5 transition-colors ${
+              scope === "global"
+                ? "bg-surface-3 text-accent"
+                : "text-gray-500 hover:text-gray-300 hover:bg-surface-3"
+            }`}
+            title="所有项目共享的偏好"
+          >
+            全局
+          </button>
+          <button
+            onClick={() => !projectDisabled && setScope("project")}
+            disabled={projectDisabled}
+            className={`px-2 py-0.5 transition-colors ${
+              scope === "project"
+                ? "bg-surface-3 text-accent"
+                : "text-gray-500 hover:text-gray-300 hover:bg-surface-3 disabled:opacity-40 disabled:cursor-not-allowed"
+            }`}
+            title={projectDisabled ? "选一个项目后才能设置项目级偏好" : "覆盖全局的项目级偏好"}
+          >
+            当前项目
+          </button>
+        </div>
+      </div>
+      {scope === "project" && !selectedCwd ? (
+        <p className="text-xs text-gray-500 text-center py-6">选一个项目以查看项目偏好</p>
       ) : loading ? (
         <p className="text-xs text-gray-500 text-center py-6">加载中...</p>
       ) : (
@@ -185,7 +230,9 @@ function PreferencesSection({ selectedCwd }: { selectedCwd: string | null }) {
         </div>
       )}
       <p className="mt-2 text-[11px] text-gray-500">
-        偏好会注入到每次 AI 调用中。AI 完成 session 后可能建议新偏好——到学习日志里采纳。
+        {scope === "global"
+          ? "全局偏好对所有项目生效。当前项目可在「当前项目」标签下覆盖。"
+          : "项目偏好覆盖同 key 的全局偏好；其他 key 仍继承全局。"}
       </p>
       {error && <p className="mt-2 text-xs text-red-700 dark:text-red-300">{error}</p>}
     </section>
@@ -546,15 +593,33 @@ function LearningEventCard({
   onAccept: () => void;
   onReject: () => void;
 }) {
+  const isPref = event.kind === "preference";
   return (
     <div className="rounded-lg border border-accent/40 bg-accent/5 p-4">
       <div className="flex items-start gap-2 mb-2">
         <Sparkles size={12} className="text-accent mt-0.5 shrink-0" />
-        <p className="text-xs text-gray-300 leading-relaxed">{event.observation}</p>
+        <p className="text-xs text-gray-300 leading-relaxed flex-1">{event.observation}</p>
+        <span
+          className={`text-[9px] px-1.5 py-0.5 rounded shrink-0 ${
+            isPref
+              ? "bg-purple-500/15 text-purple-700 dark:text-purple-300"
+              : "bg-accent/15 text-accent"
+          }`}
+          title={isPref ? "采纳后写入「个人偏好」表" : "采纳后追加到 memory.md"}
+        >
+          {isPref ? "偏好" : "记忆"}
+        </span>
       </div>
       <div className="rounded bg-surface-2 border border-border px-3 py-2 mb-3">
-        <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">建议写入记忆</div>
+        <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">
+          {isPref ? "建议更新偏好" : "建议写入记忆"}
+        </div>
         <p className="text-[12px] text-gray-200 font-mono leading-relaxed">{event.suggestion}</p>
+        {isPref && event.pref_key && (
+          <p className="mt-1 text-[10px] text-gray-500 font-mono">
+            → {event.pref_key} = <span className="text-accent">{event.pref_value ?? ""}</span>
+          </p>
+        )}
       </div>
       <div className="flex justify-end gap-2">
         <button
@@ -570,7 +635,7 @@ function LearningEventCard({
           className="flex items-center gap-1 px-3 py-1 rounded bg-accent hover:bg-accent-hover text-white text-xs disabled:opacity-40"
         >
           {busy ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />}
-          采纳并写入记忆
+          {isPref ? "采纳并更新偏好" : "采纳并写入记忆"}
         </button>
       </div>
     </div>

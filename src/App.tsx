@@ -54,7 +54,7 @@ export default function App() {
         />
       )}
 
-      {view === "specs"    && <SpecsPage    onBack={backToHome} />}
+      {view === "specs"    && <SpecsPage    onBack={backToHome} onOpenWorkspace={openProject} />}
       {view === "skills"   && <SkillsPage   onBack={backToHome} />}
       {view === "profile"  && <ProfilePage  onBack={backToHome} />}
       {view === "settings" && <SettingsPage onBack={() => setView(activeProject ? "workspace" : "home")} />}

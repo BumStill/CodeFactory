@@ -52,6 +52,12 @@ export interface ExecutionEvent {
   message?: string;
   result?: string;
   error?: string;
+  /** Files the sub-agent touched. Populated on task_completed when the
+   *  agent ran write/edit tools. Undefined on other event kinds. */
+  filesChanged?: string[];
+  /** Working dir of the task. Surfaced alongside filesChanged so the UI
+   *  can call `git diff` in the right place when expanding the panel. */
+  cwd?: string;
   at: number;
 }
 
@@ -170,6 +176,15 @@ export const useTasksStore = create<TasksState>((set, get) => ({
       const u = await listen<TaskEventPayload>(`${k}:${sessionId}`, (event) => {
         // Append to the execution log so the UI can stream progress.
         const payload = event.payload;
+        // Backend may attach files_changed + cwd on task_completed only.
+        // Cast through Record because TaskEventPayload may not yet declare
+        // these fields in the local type; the wire format does include them.
+        const extra = payload as unknown as Record<string, unknown>;
+        const filesChanged = Array.isArray(extra.files_changed)
+          ? (extra.files_changed as string[])
+          : undefined;
+        const cwd = typeof extra.cwd === "string" ? extra.cwd : undefined;
+
         const entry: ExecutionEvent = {
           id: `${k}-${payload.task_id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           kind: k,
@@ -178,6 +193,8 @@ export const useTasksStore = create<TasksState>((set, get) => ({
           message: payload.message,
           result: payload.result,
           error: payload.error,
+          filesChanged,
+          cwd,
           at: Date.now(),
         };
         set((s) => {

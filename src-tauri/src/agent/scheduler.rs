@@ -163,6 +163,8 @@ impl TaskScheduler {
                         message: None,
                         result: None,
                         error: None,
+                        files_changed: None,
+                        cwd: None,
                     },
                 );
                 dispatched_any = true;
@@ -267,6 +269,8 @@ impl TaskScheduler {
                                     )),
                                     result: None,
                                     error: None,
+                                    files_changed: None,
+                                    cwd: None,
                                 },
                             );
                         }
@@ -301,6 +305,8 @@ impl TaskScheduler {
                                         )),
                                         result: None,
                                         error: None,
+                                        files_changed: None,
+                                        cwd: None,
                                     },
                                 );
                                 // Continue to next attempt.
@@ -340,6 +346,8 @@ impl TaskScheduler {
                                                 )),
                                                 result: None,
                                                 error: None,
+                                                files_changed: None,
+                                                cwd: None,
                                             },
                                         );
                                         if attempt < MAX_ATTEMPTS {
@@ -417,6 +425,8 @@ impl TaskScheduler {
                                             )),
                                             result: None,
                                             error: None,
+                                            files_changed: None,
+                                            cwd: None,
                                         },
                                     );
                                     continue;
@@ -478,6 +488,12 @@ impl TaskScheduler {
                                     message: None,
                                     result: Some(&result_json),
                                     error: None,
+                                    files_changed: if result.files_changed.is_empty() {
+                                        None
+                                    } else {
+                                        Some(result.files_changed.as_slice())
+                                    },
+                                    cwd: Some(&task_cwd),
                                 },
                             );
                         }
@@ -519,6 +535,8 @@ impl TaskScheduler {
                                     message: None,
                                     result: None,
                                     error: Some(&err),
+                                    files_changed: None,
+                                    cwd: None,
                                 },
                             );
                         }
@@ -560,6 +578,8 @@ impl TaskScheduler {
                                     message: None,
                                     result: None,
                                     error: Some(&err),
+                                    files_changed: None,
+                                    cwd: None,
                                 },
                             );
                         }
@@ -617,6 +637,8 @@ impl TaskScheduler {
                     message: None,
                     result: None,
                     error: Some("Cancelled by user before starting"),
+                    files_changed: None,
+                    cwd: None,
                 },
             );
         }
@@ -646,6 +668,15 @@ struct TaskEventPayload<'a> {
     result: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
+    /// Paths the sub-agent touched during this task — emitted on
+    /// task_completed so the UI can surface "AI changed N files" with a
+    /// drill-down to git diff. Empty/absent for other event kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files_changed: Option<&'a [String]>,
+    /// Working directory of the task — surfaced alongside files_changed
+    /// so the UI knows where to run git diff against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<&'a str>,
 }
 
 #[derive(Serialize, Clone)]

@@ -48,21 +48,47 @@ pub async fn build(pool: &SqlitePool, cwd: &str) -> String {
 }
 
 async fn build_preferences_section(pool: &SqlitePool, cwd: &str) -> Option<String> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
+    use crate::commands::preferences::GLOBAL_CWD;
+    use std::collections::HashMap;
+
+    // Two-tier resolution: global defaults + per-project overrides.
+    // Project wins on key conflicts so users can override globals locally
+    // (e.g. "I want TDD everywhere, but in this experimental repo I don't").
+    let global: Vec<(String, String)> = sqlx::query_as(
+        "SELECT key, value FROM user_preferences WHERE cwd = ? ORDER BY key",
+    )
+    .bind(GLOBAL_CWD)
+    .fetch_all(pool)
+    .await
+    .ok()?;
+
+    let project: Vec<(String, String)> = sqlx::query_as(
         "SELECT key, value FROM user_preferences WHERE cwd = ? ORDER BY key",
     )
     .bind(cwd)
     .fetch_all(pool)
     .await
     .ok()?;
-    let lines: Vec<String> = rows
+
+    // Merge: start with global, override with project entries.
+    let mut merged: HashMap<String, String> = HashMap::new();
+    for (k, v) in global.into_iter().chain(project.into_iter()) {
+        merged.insert(k, v);
+    }
+
+    let mut sorted: Vec<(String, String)> = merged
         .into_iter()
         .filter(|(_, v)| !v.trim().is_empty())
-        .map(|(k, v)| format!("- {}: {}", k, v))
         .collect();
-    if lines.is_empty() {
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if sorted.is_empty() {
         None
     } else {
+        let lines: Vec<String> = sorted
+            .iter()
+            .map(|(k, v)| format!("- {}: {}", k, v))
+            .collect();
         Some(format!("### Preferences\n{}", lines.join("\n")))
     }
 }
@@ -164,6 +190,39 @@ mod tests {
         .execute(&pool).await.unwrap();
         let s = build(&pool, "/proj").await;
         assert_eq!(s, "", "empty values should produce no preferences section");
+    }
+
+    #[tokio::test]
+    async fn project_preference_overrides_global() {
+        let pool = fresh_pool().await;
+        // Global says concise; project says verbose. Project must win.
+        sqlx::query(
+            "INSERT INTO user_preferences VALUES \
+             ('_global_','communication_style','concise','user','2026-01-01'), \
+             ('_global_','autonomy_level','low','user','2026-01-01'), \
+             ('/proj','communication_style','verbose','user','2026-01-02')",
+        )
+        .execute(&pool).await.unwrap();
+        let s = build(&pool, "/proj").await;
+        assert!(s.contains("communication_style: verbose"),
+            "project should override global, got: {s}");
+        assert!(!s.contains("communication_style: concise"),
+            "global must not leak through, got: {s}");
+        // Non-conflicting global still appears
+        assert!(s.contains("autonomy_level: low"),
+            "non-conflicting global must inherit, got: {s}");
+    }
+
+    #[tokio::test]
+    async fn global_only_works_without_project_prefs() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO user_preferences VALUES \
+             ('_global_','testing_habit','tdd','user','2026-01-01')",
+        )
+        .execute(&pool).await.unwrap();
+        let s = build(&pool, "/proj").await;
+        assert!(s.contains("testing_habit: tdd"));
     }
 
     #[tokio::test]

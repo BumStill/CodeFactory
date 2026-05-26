@@ -33,10 +33,23 @@ pub struct LearningEvent {
     pub cwd: String,
     pub observation: String,
     pub suggestion: String,
-    pub status: String, // pending | accepted | rejected
+    /// pending | accepted | rejected
+    pub status: String,
     pub created_at: String,
     pub decided_at: Option<String>,
+    /// 'memory' (default) appends to .codefactory/memory.md on accept.
+    /// 'preference' upserts pref_key→pref_value into user_preferences.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// Only populated when kind == 'preference'.
+    #[serde(default)]
+    pub pref_key: Option<String>,
+    /// Only populated when kind == 'preference'.
+    #[serde(default)]
+    pub pref_value: Option<String>,
 }
+
+fn default_kind() -> String { "memory".into() }
 
 // ── Queries ───────────────────────────────────────────────────────────────────
 
@@ -46,8 +59,9 @@ pub async fn list_learning_events(
     state: State<'_, AppState>,
 ) -> Result<Vec<LearningEvent>, AppError> {
     let pool = state.db.read().await;
-    let rows = sqlx::query_as::<_, (String, String, String, String, String, String, String, Option<String>)>(
-        "SELECT id, session_id, cwd, observation, suggestion, status, created_at, decided_at \
+    let rows = sqlx::query_as::<_, (String, String, String, String, String, String, String, Option<String>, String, Option<String>, Option<String>)>(
+        "SELECT id, session_id, cwd, observation, suggestion, status, created_at, decided_at, \
+                kind, pref_key, pref_value \
          FROM learning_events WHERE cwd = ? ORDER BY created_at DESC LIMIT 50",
     )
     .bind(&cwd)
@@ -55,43 +69,69 @@ pub async fn list_learning_events(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, session_id, cwd, observation, suggestion, status, created_at, decided_at)| {
+        .map(|(id, session_id, cwd, observation, suggestion, status, created_at, decided_at, kind, pref_key, pref_value)| {
             LearningEvent {
-                id,
-                session_id,
-                cwd,
-                observation,
-                suggestion,
-                status,
-                created_at,
-                decided_at,
+                id, session_id, cwd, observation, suggestion, status,
+                created_at, decided_at, kind, pref_key, pref_value,
             }
         })
         .collect())
 }
 
+/// Accept routes by kind. For 'memory' it appends to .codefactory/memory.md
+/// (original behaviour, returns the updated memory blob). For 'preference'
+/// it upserts pref_key→pref_value into user_preferences with source='ai'
+/// (returns an empty ProjectMemory — caller should refresh preferences
+/// instead). Either way the event is marked accepted in one transaction.
 #[command]
 pub async fn accept_learning_event(
     event_id: String,
     state: State<'_, AppState>,
 ) -> Result<ProjectMemory, AppError> {
     let pool = state.db.read().await;
-    let row: (String, String, String) = sqlx::query_as(
-        "SELECT cwd, suggestion, status FROM learning_events WHERE id = ?",
+    let row: (String, String, String, String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT cwd, suggestion, status, kind, pref_key, pref_value \
+         FROM learning_events WHERE id = ?",
     )
     .bind(&event_id)
     .fetch_one(&*pool)
     .await?;
-    if row.2 != "pending" {
+    let (cwd, suggestion, status, kind, pref_key, pref_value) = row;
+    if status != "pending" {
         return Err(AppError::Other(format!(
             "learning event {} already {}",
-            event_id, row.2
+            event_id, status
         )));
     }
 
-    // Drop the pool lock before re-acquiring inside append_project_memory.
-    drop(pool);
-    let memory = append_project_memory(row.0.clone(), row.1.clone()).await?;
+    let memory = match kind.as_str() {
+        "preference" => {
+            let key = pref_key.ok_or_else(|| AppError::Other(
+                "preference learning event missing pref_key".into(),
+            ))?;
+            let value = pref_value.unwrap_or_default();
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                "INSERT INTO user_preferences (cwd, key, value, source, updated_at) \
+                 VALUES (?,?,?,'ai',?) \
+                 ON CONFLICT(cwd, key) DO UPDATE SET \
+                   value = excluded.value, source = 'ai', updated_at = excluded.updated_at",
+            )
+            .bind(&cwd)
+            .bind(&key)
+            .bind(&value)
+            .bind(&now)
+            .execute(&*pool)
+            .await?;
+            // Return an empty memory blob — caller distinguishes by kind on UI side.
+            ProjectMemory { path: String::new(), content: String::new(), exists: false }
+        }
+        _ => {
+            // Drop the pool lock before re-acquiring inside append_project_memory.
+            drop(pool);
+            append_project_memory(cwd.clone(), suggestion.clone()).await?
+        }
+    };
 
     let pool = state.db.read().await;
     sqlx::query(
@@ -156,6 +196,12 @@ struct AiResponse {
 struct PostmortemEntry {
     observation: String,
     suggestion: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    pref_key: Option<String>,
+    #[serde(default)]
+    pref_value: Option<String>,
 }
 
 /// Run a single post-mortem pass over a finished session. Idempotent on
@@ -223,12 +269,27 @@ pub async fn run_postmortem(
 identify 0-3 NON-OBVIOUS observations about how this user works that would help future sessions. \
 Skip obvious things like \"the user wants working code\". Look for patterns: preferred libraries, \
 style choices, repeated mistakes worth avoiding, missing tests they had to ask for, etc.\n\n\
-Return ONLY a JSON array (no markdown fences). Each entry has \"observation\" (what you noticed) \
-and \"suggestion\" (a concrete one-line memory you'd add to help future sessions). \
+Each observation should be classified as ONE of:\n\
+  - \"memory\"     — a free-form fact / rule of thumb to remember (e.g. \"this project uses pnpm not npm\")\n\
+  - \"preference\" — a STRUCTURED user preference. Use this for stable per-user behavioural \
+    choices like autonomy level, communication style, testing habit, code style. Pick a snake_case \
+    pref_key (reuse existing if applicable: autonomy_level, communication_style, testing_habit, \
+    code_style) and a short pref_value (e.g. \"high\", \"verbose\", \"tdd\", \"prefer arrow fns\").\n\n\
+Return ONLY a JSON array (no markdown fences). Each entry has:\n\
+  - observation  (what you noticed)\n\
+  - suggestion   (one-line human-readable summary, shown in the UI)\n\
+  - kind         (\"memory\" or \"preference\")\n\
+  - pref_key     (snake_case key, REQUIRED when kind=\"preference\")\n\
+  - pref_value   (short value string, REQUIRED when kind=\"preference\")\n\n\
 If nothing notable, return [].\n\n\
-Example:\n\
-[{{\"observation\": \"User had to remind me twice to handle the empty-array case.\", \
-\"suggestion\": \"Always check empty-collection edge cases before claiming a function is done.\"}}]\n\n\
+Examples:\n\
+[\n\
+  {{\"observation\": \"User asked me to add tests after every implementation.\", \
+\"suggestion\": \"Use TDD by default.\", \"kind\": \"preference\", \
+\"pref_key\": \"testing_habit\", \"pref_value\": \"tdd\"}},\n\
+  {{\"observation\": \"This project uses pnpm not npm.\", \
+\"suggestion\": \"This project uses pnpm — never run npm commands here.\", \"kind\": \"memory\"}}\n\
+]\n\n\
 Tasks from this session:\n{summary}"
     );
 
@@ -306,11 +367,25 @@ Tasks from this session:\n{summary}"
         if obs.is_empty() || sug.is_empty() {
             continue;
         }
+        // Resolve kind defensively: only honour 'preference' when the
+        // structured payload is actually present, else fall back to memory.
+        // This protects against the model returning kind="preference" with
+        // a missing pref_key — the row would otherwise be unactionable.
+        let raw_kind = e.kind.as_deref().unwrap_or("memory");
+        let (kind, pref_key, pref_value): (&str, Option<String>, Option<String>) =
+            if raw_kind == "preference" && e.pref_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
+                let key = e.pref_key.as_ref().unwrap().trim().to_string();
+                let val = e.pref_value.unwrap_or_default().trim().to_string();
+                ("preference", Some(key), Some(val))
+            } else {
+                ("memory", None, None)
+            };
+
         let id = Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO learning_events \
-             (id, session_id, cwd, observation, suggestion, status, created_at) \
-             VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+             (id, session_id, cwd, observation, suggestion, status, created_at, kind, pref_key, pref_value) \
+             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&session_id)
@@ -318,6 +393,9 @@ Tasks from this session:\n{summary}"
         .bind(obs)
         .bind(sug)
         .bind(&now)
+        .bind(kind)
+        .bind(&pref_key)
+        .bind(&pref_value)
         .execute(&*pool)
         .await?;
         created.push(LearningEvent {
@@ -329,6 +407,9 @@ Tasks from this session:\n{summary}"
             status: "pending".into(),
             created_at: now.clone(),
             decided_at: None,
+            kind: kind.into(),
+            pref_key,
+            pref_value,
         });
     }
 

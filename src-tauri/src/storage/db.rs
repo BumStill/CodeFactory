@@ -167,6 +167,14 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     )
     .execute(pool)
     .await?;
+    // ── learning_events.kind: distinguishes free-form memory entries
+    //    from structured preference proposals. Existing rows default to
+    //    'memory' (their original semantics). For 'preference' rows,
+    //    pref_key / pref_value carry the structured payload — the
+    //    suggestion column still holds a human-readable rendering for UI.
+    ensure_column(pool, "learning_events", "kind", "TEXT NOT NULL DEFAULT 'memory'").await?;
+    ensure_column(pool, "learning_events", "pref_key", "TEXT").await?;
+    ensure_column(pool, "learning_events", "pref_value", "TEXT").await?;
 
     // ── user_preferences: structured key→value the AI reads at
     //    decomposition / execution time. Scoped per cwd so different
