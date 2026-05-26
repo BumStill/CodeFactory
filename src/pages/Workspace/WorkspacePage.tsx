@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect, useState } from "react";
 import {
+  AlertTriangle,
+  BookOpen,
   ChevronLeft,
   Settings as SettingsIcon,
   Moon,
@@ -12,6 +14,7 @@ import {
   Loader2,
   XCircle,
   Puzzle,
+  RefreshCw,
   Sparkles,
   Trash2,
   Wand2,
@@ -19,6 +22,7 @@ import {
   Play,
   Square,
 } from "lucide-react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
 import { ModelPicker } from "../../components/ModelPicker";
@@ -30,7 +34,8 @@ import { useChatStore } from "../../stores/chat";
 import { useSettingsStore } from "../../stores/settings";
 import { useTasksStore } from "../../stores/tasks";
 import { useSkillsStore } from "../../stores/skills";
-import type { Theme, TaskRun, TaskInput, TaskDep } from "../../lib/tauri";
+import { useKnowledgeStore } from "../../stores/knowledge";
+import type { KnowledgeLibrary, Theme, TaskRun, TaskInput, TaskDep } from "../../lib/tauri";
 
 interface DecomposedTask {
   tmp_id: string;
@@ -148,7 +153,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: Workspa
 
         {/* ─── Right: Active skills + memory ─────────────────────────── */}
         <aside className="w-60 shrink-0 border-l border-border bg-surface-1 flex flex-col">
-          <SkillsColumn />
+          <ConnectorsColumn />
         </aside>
       </div>
 
@@ -173,6 +178,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: Workspa
 function TasksColumn({ sessionId }: { sessionId: string }) {
   const { tasks, running, loadTasks, subscribe, createTaskTree, start, cancel } = useTasksStore();
   const { activeSession } = useChatStore();
+  const { libraries } = useKnowledgeStore();
   const sessionTasks: TaskRun[] = tasks[sessionId] ?? [];
   const isRunning = running[sessionId] ?? false;
   const pendingCount = sessionTasks.filter((t) => t.status === "pending").length;
@@ -281,6 +287,7 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
       {creatorOpen && (
         <TaskCreatorModal
           cwd={activeSession?.cwd ?? null}
+          knowledgeLibraries={libraries.filter((library) => library.enabled)}
           onCancel={() => setCreatorOpen(false)}
           onConfirm={handleConfirm}
         />
@@ -295,11 +302,12 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
 
 interface TaskCreatorModalProps {
   cwd: string | null;
+  knowledgeLibraries: KnowledgeLibrary[];
   onCancel: () => void;
   onConfirm: (tasks: DecomposedTask[]) => Promise<void>;
 }
 
-function TaskCreatorModal({ cwd, onCancel, onConfirm }: TaskCreatorModalProps) {
+function TaskCreatorModal({ cwd, knowledgeLibraries, onCancel, onConfirm }: TaskCreatorModalProps) {
   const [phase, setPhase] = useState<"input" | "decomposing" | "review">("input");
   const [request, setRequest] = useState("");
   const [tasks, setTasks] = useState<DecomposedTask[]>([]);
@@ -366,6 +374,16 @@ function TaskCreatorModal({ cwd, onCancel, onConfirm }: TaskCreatorModalProps) {
         <div className="flex-1 overflow-y-auto p-4">
           {phase === "input" && (
             <>
+              <div className="mb-3 flex flex-wrap items-center gap-2">
+                <span className="inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-2 py-1 text-[11px] text-gray-400">
+                  <BookOpen size={11} className="text-accent" />
+                  知识库 {knowledgeLibraries.length}
+                </span>
+                <span className="inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-2 py-1 text-[11px] text-gray-400">
+                  <Puzzle size={11} className="text-accent" />
+                  Tools 可审计
+                </span>
+              </div>
               <textarea
                 autoFocus
                 value={request}
@@ -548,54 +566,190 @@ function statusColor(status: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SkillsColumn — shows what capabilities are currently active
+// ConnectorsColumn — shows what capabilities are currently active
 // ─────────────────────────────────────────────────────────────────────────────
 
-function SkillsColumn() {
+function ConnectorsColumn() {
   const { skills, loadSkills } = useSkillsStore();
+  const {
+    libraries,
+    scanSummaries,
+    loading: knowledgeLoading,
+    scanning,
+    error: knowledgeError,
+    loadLibraries,
+    registerLibrary,
+    scanLibrary,
+  } = useKnowledgeStore();
+  const [libraryError, setLibraryError] = useState<string | null>(null);
 
-  useEffect(() => { loadSkills(); }, []);
+  useEffect(() => {
+    loadSkills();
+    void loadLibraries();
+  }, []);
 
   const enabled = skills.filter((s) => s.enabled);
+  const enabledLibraries = libraries.filter((library) => library.enabled);
+  const connectorCount = enabled.length + enabledLibraries.length;
+
+  const addLibrary = async () => {
+    setLibraryError(null);
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "选择知识库文件夹",
+      });
+      if (typeof selected !== "string") return;
+      const name = selected.split(/[\\/]/).filter(Boolean).pop() ?? "个人知识库";
+      await registerLibrary(name, selected);
+    } catch (e) {
+      setLibraryError(String(e));
+    }
+  };
+
+  const scan = async (libraryId: string) => {
+    setLibraryError(null);
+    try {
+      await scanLibrary(libraryId);
+    } catch (e) {
+      setLibraryError(String(e));
+    }
+  };
 
   return (
     <>
       <div className="flex items-center gap-1.5 px-3 py-2 border-b border-border">
         <Puzzle size={11} className="text-gray-500" />
         <h2 className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">
-          激活的能力
+          连接器
         </h2>
-        <span className="ml-auto text-[10px] text-gray-600">{enabled.length}</span>
+        <span className="ml-auto text-[10px] text-gray-600">{connectorCount}</span>
       </div>
       <div className="flex-1 overflow-y-auto p-2">
-        {enabled.length === 0 ? (
-          <div className="text-[11px] text-gray-600 text-center py-8 leading-relaxed">
-            没有激活的能力<br />
-            <span className="text-gray-700">到「技能库」里启用</span>
+        <section className="mb-3">
+          <div className="mb-1.5 flex items-center gap-1.5 px-1">
+            <BookOpen size={11} className="text-gray-500" />
+            <h3 className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">
+              个人知识库
+            </h3>
+            <span className="ml-auto text-[10px] text-gray-600">
+              {knowledgeLoading ? "..." : `${enabledLibraries.length} 个知识库`}
+            </span>
           </div>
-        ) : (
-          <ul className="space-y-1">
-            {enabled.map((s) => (
-              <li
-                key={s.id}
-                className="px-2 py-1.5 rounded border border-border bg-surface-2 hover:bg-surface-3 transition-colors"
-                title={s.description}
+          <div className="space-y-1">
+            {enabledLibraries.length === 0 ? (
+              <button
+                onClick={addLibrary}
+                className="w-full rounded border border-dashed border-border bg-surface-2 px-2 py-3 text-center text-[11px] text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
               >
-                <div className="flex items-center gap-1.5">
-                  <Sparkles size={9} className="text-accent shrink-0" />
-                  <span className="text-[11px] font-medium text-gray-300 truncate">
-                    {s.name}
-                  </span>
-                </div>
-                {s.description && (
-                  <p className="text-[10px] text-gray-600 mt-0.5 line-clamp-2 leading-tight">
-                    {s.description}
-                  </p>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
+                添加本地资料文件夹
+              </button>
+            ) : (
+              <>
+                <button
+                  onClick={addLibrary}
+                  className="flex w-full items-center justify-center gap-1 rounded border border-border bg-surface-2 px-2 py-1.5 text-[11px] text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+                >
+                  <Plus size={11} />
+                  添加知识库
+                </button>
+                <ul className="space-y-1">
+                  {enabledLibraries.map((library) => {
+                    const summary = scanSummaries[library.id];
+                    const isScanning = scanning[library.id] ?? false;
+                    return (
+                      <li
+                        key={library.id}
+                        className="rounded border border-border bg-surface-2 px-2 py-1.5"
+                        title={library.root_path}
+                      >
+                        <div className="flex items-start gap-1.5">
+                          <BookOpen size={10} className="mt-0.5 shrink-0 text-accent" />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-[11px] font-medium text-gray-300">
+                              {library.name}
+                            </div>
+                            <div className="truncate font-mono text-[9px] text-gray-600">
+                              {library.root_path}
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => void scan(library.id)}
+                            disabled={isScanning}
+                            className="rounded p-0.5 text-gray-600 hover:text-gray-300 hover:bg-surface-3 disabled:opacity-40"
+                            title="扫描知识库"
+                          >
+                            <RefreshCw
+                              size={11}
+                              className={isScanning ? "animate-spin" : ""}
+                            />
+                          </button>
+                        </div>
+                        <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-gray-600">
+                          <span className="truncate">
+                            {summary
+                              ? `${summary.indexed_documents} 文档 / ${summary.chunks_indexed} 片段`
+                              : scanStatusText(library.scan_status)}
+                          </span>
+                          {summary && summary.failed_documents > 0 && (
+                            <span className="inline-flex items-center gap-0.5 text-amber-700 dark:text-amber-300">
+                              <AlertTriangle size={9} />
+                              {summary.failed_documents} 失败
+                            </span>
+                          )}
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </>
+            )}
+          </div>
+          {(libraryError || knowledgeError) && (
+            <div className="mt-2 rounded border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-[10px] text-red-700 dark:text-red-300 break-words">
+              {libraryError || knowledgeError}
+            </div>
+          )}
+        </section>
+
+        <section>
+          <div className="mb-1.5 flex items-center gap-1.5 px-1">
+            <Sparkles size={11} className="text-gray-500" />
+            <h3 className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">
+              技能
+            </h3>
+            <span className="ml-auto text-[10px] text-gray-600">{enabled.length}</span>
+          </div>
+          {enabled.length === 0 ? (
+            <div className="text-[11px] text-gray-600 text-center py-5 leading-relaxed">
+              没有激活的技能<br />
+              <span className="text-gray-700">到「技能库」里启用</span>
+            </div>
+          ) : (
+            <ul className="space-y-1">
+              {enabled.map((s) => (
+                <li
+                  key={s.id}
+                  className="px-2 py-1.5 rounded border border-border bg-surface-2 hover:bg-surface-3 transition-colors"
+                  title={s.description}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <Sparkles size={9} className="text-accent shrink-0" />
+                    <span className="text-[11px] font-medium text-gray-300 truncate">
+                      {s.name}
+                    </span>
+                  </div>
+                  {s.description && (
+                    <p className="text-[10px] text-gray-600 mt-0.5 line-clamp-2 leading-tight">
+                      {s.description}
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
       </div>
 
       {/* Memory placeholder — to be filled when self-evolution lands */}
@@ -610,4 +764,13 @@ function SkillsColumn() {
       </div>
     </>
   );
+}
+
+function scanStatusText(status: string): string {
+  switch (status) {
+    case "ready": return "已索引";
+    case "scanning": return "扫描中";
+    case "failed": return "扫描失败";
+    default: return "待扫描";
+  }
 }
