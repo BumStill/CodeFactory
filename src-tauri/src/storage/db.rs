@@ -177,6 +177,10 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ensure_column(pool, "learning_events", "kind", "TEXT NOT NULL DEFAULT 'memory'").await?;
     ensure_column(pool, "learning_events", "pref_key", "TEXT").await?;
     ensure_column(pool, "learning_events", "pref_value", "TEXT").await?;
+    // 'project' (default) for full software-factory sessions, 'quick' for
+    // ephemeral one-off chats launched from the home page's Quick Task entry.
+    // List-sessions excludes 'quick' from the Recent Projects card.
+    ensure_column(pool, "sessions", "kind", "TEXT NOT NULL DEFAULT 'project'").await?;
 
     // ── user_preferences: structured key→value the AI reads at
     //    decomposition / execution time. Scoped per cwd so different

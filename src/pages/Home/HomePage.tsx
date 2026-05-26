@@ -16,7 +16,8 @@ import {
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../../stores/chat";
 import { useSettingsStore } from "../../stores/settings";
-import type { Theme } from "../../lib/tauri";
+import { invoke } from "../../lib/tauri";
+import type { Session, Theme } from "../../lib/tauri";
 
 interface HomePageProps {
   onOpenProject: (sessionId: string) => void;
@@ -72,9 +73,20 @@ export function HomePage({
     if (session) onOpenProject(session.id);
   };
 
-  const handleQuickTask = () => {
-    // TODO: ephemeral task mode that doesn't create a persistent project
-    alert("快速任务：即将上线");
+  const handleQuickTask = async () => {
+    // The backend returns the single persistent "quick" session, creating
+    // it under ~/.codefactory/quick on first use. Routing into the same
+    // Workspace as a regular project keeps the chat/queue/attachments UX
+    // consistent — quick tasks are just sessions with a kind flag.
+    try {
+      const session = await invoke<Session>("get_or_create_quick_session", {
+        modelId: activeModel,
+      });
+      onOpenProject(session.id);
+    } catch (e) {
+      // eslint-disable-next-line no-alert
+      alert(`快速任务启动失败：${String(e)}`);
+    }
   };
 
   const handleProfile = () => {

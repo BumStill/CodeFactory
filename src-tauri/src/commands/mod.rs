@@ -16,6 +16,8 @@ pub mod memory;
 pub mod models;
 pub mod preferences;
 pub mod session;
+#[cfg(test)]
+mod session_quick_tests;
 pub mod settings;
 pub mod skills;
 pub mod specs;

@@ -10,13 +10,69 @@ use crate::AppState;
 #[tauri::command]
 pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Session>, AppError> {
     let pool = state.db.read().await;
-    // Filter out subagent-spawned child sessions; only show top-level chats here.
+    // Filter out subagent-spawned child sessions AND ephemeral quick-task
+    // sessions; the home page Recent Projects list should only show
+    // "real" project sessions the user explicitly created.
     let sessions = sqlx::query_as::<_, Session>(
-        "SELECT * FROM sessions WHERE parent_session_id IS NULL ORDER BY updated_at DESC LIMIT 100",
+        "SELECT * FROM sessions \
+         WHERE parent_session_id IS NULL AND kind != 'quick' \
+         ORDER BY updated_at DESC LIMIT 100",
     )
     .fetch_all(&*pool)
     .await?;
     Ok(sessions)
+}
+
+/// Return the single persistent Quick Task session, creating it on first
+/// use. The cwd lives under the user's home so the AI has a safe scratch
+/// area (created on demand). Reused across visits — the user gets a
+/// continuous "scratch chat" history that doesn't pollute Recent Projects.
+#[tauri::command]
+pub async fn get_or_create_quick_session(
+    model_id: String,
+    state: State<'_, AppState>,
+) -> Result<Session, AppError> {
+    let pool = state.db.read().await;
+
+    // Try to find an existing quick session first.
+    if let Ok(existing) = sqlx::query_as::<_, Session>(
+        "SELECT * FROM sessions WHERE kind = 'quick' ORDER BY updated_at DESC LIMIT 1",
+    )
+    .fetch_one(&*pool)
+    .await
+    {
+        return Ok(existing);
+    }
+
+    // Create one. cwd = ~/.codefactory/quick — auto-mkdir so the agent's
+    // working directory is valid and write tools have a safe home.
+    let home = dirs::home_dir()
+        .ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
+    let quick_dir = home.join(".codefactory").join("quick");
+    std::fs::create_dir_all(&quick_dir).map_err(|e| {
+        AppError::Other(format!("create quick-task dir failed: {e}"))
+    })?;
+
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().timestamp_millis();
+    sqlx::query(
+        "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at, kind) \
+         VALUES (?,?,?,?,?,?,'quick')",
+    )
+    .bind(&id)
+    .bind("快速任务")
+    .bind(quick_dir.to_string_lossy().to_string())
+    .bind(&model_id)
+    .bind(now)
+    .bind(now)
+    .execute(&*pool)
+    .await?;
+
+    let session = sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&*pool)
+        .await?;
+    Ok(session)
 }
 
 #[tauri::command]

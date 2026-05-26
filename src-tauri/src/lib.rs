@@ -167,6 +167,7 @@ pub fn run() {
             commands::models::list_models,
             commands::session::list_sessions,
             commands::session::create_session,
+            commands::session::get_or_create_quick_session,
             commands::session::get_session,
             commands::session::delete_session,
             commands::session::update_session_model,
