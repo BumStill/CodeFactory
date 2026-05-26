@@ -3,6 +3,7 @@ import { create } from "zustand";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "../lib/tauri";
 import type {
+  TaskConnectorContext,
   TaskDep,
   TaskEventPayload,
   TaskInput,
@@ -78,6 +79,7 @@ interface TasksState {
     sessionId: string,
     tasks: TaskInput[],
     deps: TaskDep[],
+    context?: TaskConnectorContext,
   ) => Promise<string[]>;
   start: (sessionId: string, specReqId?: string, specTitle?: string) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
@@ -116,11 +118,12 @@ export const useTasksStore = create<TasksState>((set, get) => ({
     }
   },
 
-  createTaskTree: async (sessionId, tasks, deps) => {
+  createTaskTree: async (sessionId, tasks, deps, context) => {
     const ids = await invoke<string[]>("create_task_tree", {
       sessionId,
       tasksIn: tasks,
       dependencies: deps,
+      context: context ?? null,
     });
     await get().loadTasks(sessionId);
     return ids;

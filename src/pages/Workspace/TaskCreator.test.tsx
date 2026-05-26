@@ -158,6 +158,7 @@ describe("AI task decomposition flow", () => {
     // Both AI-suggested tasks appear, editable
     expect(screen.getByDisplayValue("搭项目骨架")).toBeInTheDocument();
     expect(screen.getByDisplayValue("做数据模型")).toBeInTheDocument();
+    expect(screen.getByText("任务上下文")).toBeInTheDocument();
 
     // User edits the first task's title
     const titleInput = screen.getByDisplayValue("搭项目骨架");
@@ -170,7 +171,7 @@ describe("AI task decomposition flow", () => {
 
     // createTaskTree called with edited title + correct deps
     await waitFor(() => expect(mocks.createTaskTree).toHaveBeenCalledTimes(1));
-    const [sessionId, tasks, deps] = mocks.createTaskTree.mock.calls[0];
+    const [sessionId, tasks, deps, context] = mocks.createTaskTree.mock.calls[0];
     expect(sessionId).toBe("s1");
     expect(tasks).toHaveLength(2);
     expect(tasks[0]).toMatchObject({
@@ -181,6 +182,17 @@ describe("AI task decomposition flow", () => {
     expect(deps).toEqual([
       { task_tmp_id: "t-1", depends_on_tmp_id: "t-0" },
     ]);
+    expect(context).toEqual({
+      knowledge_libraries: [
+        {
+          id: "kb-1",
+          name: "历史方案库",
+          root_path: "/Users/x/Knowledge",
+          scan_status: "ready",
+          last_scan_at: "2026-05-26T00:01:00Z",
+        },
+      ],
+    });
   });
 
   it("user can remove a decomposed task before confirming", async () => {

@@ -180,6 +180,18 @@ export interface VerificationResult {
   duration_ms: number;
 }
 
+export interface TaskKnowledgeLibraryContext {
+  id: string;
+  name: string;
+  root_path: string;
+  scan_status: string;
+  last_scan_at: string | null;
+}
+
+export interface TaskConnectorContext {
+  knowledge_libraries: TaskKnowledgeLibraryContext[];
+}
+
 export interface TaskRun {
   id: string;
   session_id: string;
@@ -197,6 +209,8 @@ export interface TaskRun {
   attempt_count: number;
   /** JSON-encoded Vec<VerificationResult>; null when not yet run. */
   verification_results: string | null;
+  /** JSON-encoded TaskConnectorContext; null when no connector scope is attached. */
+  task_context_json: string | null;
 }
 
 export interface TaskInput {

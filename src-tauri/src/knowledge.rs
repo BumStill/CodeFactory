@@ -49,6 +49,8 @@ pub struct KnowledgeSearchQuery {
     #[serde(default)]
     pub library_id: Option<String>,
     #[serde(default)]
+    pub library_ids: Option<Vec<String>>,
+    #[serde(default)]
     pub kind: Option<String>,
     #[serde(default)]
     pub top_k: Option<usize>,
@@ -289,15 +291,18 @@ pub async fn search(
          JOIN knowledge_documents d ON d.id = c.document_id
          WHERE d.status = 'indexed'",
     );
-    if query.library_id.is_some() {
-        rows_query.push_str(" AND d.library_id = ?");
+    let library_ids = effective_library_ids(&query);
+    if !library_ids.is_empty() {
+        rows_query.push_str(" AND d.library_id IN (");
+        rows_query.push_str(&vec!["?"; library_ids.len()].join(","));
+        rows_query.push(')');
     }
     if query.kind.is_some() {
         rows_query.push_str(" AND d.kind = ?");
     }
 
     let mut q = sqlx::query(&rows_query);
-    if let Some(library_id) = &query.library_id {
+    for library_id in &library_ids {
         q = q.bind(library_id);
     }
     if let Some(kind) = &query.kind {
@@ -368,6 +373,22 @@ pub async fn get_chunk(
         token_estimate: row.try_get("token_estimate")?,
         metadata_json: row.try_get("metadata_json")?,
     })
+}
+
+pub async fn chunk_library_id(
+    pool: &SqlitePool,
+    chunk_id: &str,
+) -> crate::errors::Result<String> {
+    let row: (String,) = sqlx::query_as(
+        "SELECT d.library_id
+         FROM knowledge_chunks c
+         JOIN knowledge_documents d ON d.id = c.document_id
+         WHERE c.id = ?",
+    )
+    .bind(chunk_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
 }
 
 async fn library_by_root(
@@ -775,6 +796,23 @@ fn query_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
+fn effective_library_ids(query: &KnowledgeSearchQuery) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(library_id) = &query.library_id {
+        if !library_id.trim().is_empty() {
+            ids.push(library_id.clone());
+        }
+    }
+    if let Some(library_ids) = &query.library_ids {
+        for library_id in library_ids {
+            if !library_id.trim().is_empty() && !ids.contains(library_id) {
+                ids.push(library_id.clone());
+            }
+        }
+    }
+    ids
+}
+
 fn make_snippet(text: &str, terms: &[String]) -> String {
     let lower = text.to_lowercase();
     let first_match = terms
@@ -815,6 +853,7 @@ async fn record_retrieval_event(
         .collect::<Vec<_>>();
     let filters = serde_json::json!({
         "library_id": query.library_id.as_ref(),
+        "library_ids": effective_library_ids(query),
         "kind": query.kind.as_ref(),
         "top_k": query.top_k,
     });
@@ -874,6 +913,7 @@ mod tests {
             super::KnowledgeSearchQuery {
                 query: "Atlas launch".into(),
                 library_id: Some(library.id.clone()),
+                library_ids: None,
                 kind: None,
                 top_k: Some(10),
                 session_id: None,

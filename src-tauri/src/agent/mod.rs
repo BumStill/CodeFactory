@@ -114,6 +114,14 @@ pub struct AgentLoop {
     settings: Arc<RwLock<Settings>>,
     pending_permissions: PendingPermissionMap,
     mcp_manager: Arc<McpManager>,
+    execution_context: Option<AgentExecutionContext>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentExecutionContext {
+    pub parent_session_id: Option<String>,
+    pub task_id: Option<String>,
+    pub knowledge_library_ids: Vec<String>,
 }
 
 impl AgentLoop {
@@ -129,6 +137,7 @@ impl AgentLoop {
         settings: Arc<RwLock<Settings>>,
         pending_permissions: PendingPermissionMap,
         mcp_manager: Arc<McpManager>,
+        execution_context: Option<AgentExecutionContext>,
     ) -> Self {
         Self {
             app,
@@ -143,6 +152,7 @@ impl AgentLoop {
             settings,
             pending_permissions,
             mcp_manager,
+            execution_context,
         }
     }
 
@@ -169,6 +179,13 @@ impl AgentLoop {
                     .await
             }
         }
+    }
+
+    fn audit_session_id(&self) -> String {
+        self.execution_context
+            .as_ref()
+            .and_then(|ctx| ctx.parent_session_id.clone())
+            .unwrap_or_else(|| self.session_id.clone())
     }
 
     async fn run_openai(
@@ -386,6 +403,16 @@ impl AgentLoop {
                 let ctx = ExecCtx {
                     cwd: self.cwd.clone(),
                     db: Some(self.db.clone()),
+                    session_id: Some(self.audit_session_id()),
+                    task_id: self
+                        .execution_context
+                        .as_ref()
+                        .and_then(|ctx| ctx.task_id.clone()),
+                    knowledge_library_ids: self
+                        .execution_context
+                        .as_ref()
+                        .map(|ctx| ctx.knowledge_library_ids.clone())
+                        .filter(|ids| !ids.is_empty()),
                 };
 
                 let tool_start = std::time::Instant::now();
@@ -1011,6 +1038,16 @@ impl AgentLoop {
                 let ctx = ExecCtx {
                     cwd: self.cwd.clone(),
                     db: Some(self.db.clone()),
+                    session_id: Some(self.audit_session_id()),
+                    task_id: self
+                        .execution_context
+                        .as_ref()
+                        .and_then(|ctx| ctx.task_id.clone()),
+                    knowledge_library_ids: self
+                        .execution_context
+                        .as_ref()
+                        .map(|ctx| ctx.knowledge_library_ids.clone())
+                        .filter(|ids| !ids.is_empty()),
                 };
 
                 let tool_start = std::time::Instant::now();

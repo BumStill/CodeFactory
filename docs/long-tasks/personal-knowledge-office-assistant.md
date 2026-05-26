@@ -18,7 +18,7 @@
 
 ## Current State
 - Current phase: development
-- Current checkpoint: knowledge connector UI implemented on branch `codex/knowledge-ui`
+- Current checkpoint: knowledge connector context/evidence slice implemented on branch `codex/knowledge-task-context`
 - Next owner: development
 - Updated at: 2026-05-26
 
@@ -31,6 +31,7 @@
 - 已收紧 Git remote 运行时：远端操作按需通过 `token_ref` 解析 token；旧 inline token 未迁移成功时不再作为 fallback 使用。
 - 已完成知识库后端 MVP：新增知识库 SQLite schema、注册/列表/扫描/检索 Tauri commands、`kb_search`/`kb_get_chunk` Agent tools、DOCX/PPTX/PDF 极简文本抽取、检索审计事件。
 - 已完成知识库前端 connector MVP：Workspace 右栏显示个人知识库状态、添加入口、扫描按钮和扫描摘要；任务创建弹窗显示本次可见知识库数量，避免静默注入。
+- 已完成任务执行侧知识库上下文闭环：`create_task_tree` payload 持久化 `TaskConnectorContext`，TaskCreator/TaskRow 展示任务知识库范围，scheduler brief 显式暴露 `kb_search`/`kb_get_chunk`，知识库工具按任务 scope 限制检索并记录 `session_id`/`task_id`，evidence pack 输出 `knowledge_refs.json`。
 
 ## Remaining Items
 - 规划阶段：
@@ -39,7 +40,7 @@
 - 开发阶段：
   - 补齐 secret migration 的集成测试：旧 `keys.json` 迁移、backup/import 脱敏、GitHub/GitLab header mock、OS credential store 失败路径。
   - 扩展知识库管理 UI：失败文件列表、引用来源卡片、禁用/启用开关和索引详情抽屉。
-  - 将知识库工具加入任务启动前 connector 摘要的后端 payload/evidence，让用户明确看到启用范围。
+  - 扩展执行流引用来源 UI：从 `retrieval_events`/`knowledge_refs.json` 展示具体文档、页码/slide、chunk 和检索 query。
   - 升级检索：FTS/向量检索、metadata filter、token budget、真实 PDF 解析质量和 Office XML 结构保留。
   - 实现 `pptx_plan.json` schema、renderer、PNG QA 和 artifact 管理。
   - 实现本地 HTTPS bridge service、pairing token、PowerPoint add-in manifest/task pane。
@@ -70,6 +71,12 @@
   - `/Users/leo/.cargo/bin/cargo check`：通过，存在既有 warning。
   - `pnpm test -- src/stores/knowledge.test.ts src/pages/Workspace/TaskCreator.test.tsx`：通过，8 files / 33 tests；覆盖知识库 store command 参数、扫描摘要、失败状态、Workspace connector 可见性和任务弹窗知识库摘要。
   - Browser viewport check：本地 Vite mock preview，1366x768 与 900x768；确认 Workspace 右栏知识库摘要、扫描结果、任务弹窗 `知识库 1` 可见，`scrollWidth == innerWidth`，无水平滚动。
+  - `pnpm test -- src/stores/tasks.test.ts src/pages/Workspace/TaskCreator.test.tsx`：先失败后通过；覆盖 `create_task_tree` payload 携带知识库 context、TaskCreator 审核页展示任务上下文。
+  - `pnpm test`：通过，9 files / 34 tests。
+  - `pnpm build`：通过，存在既有 large chunk warning。
+  - `/Users/leo/.cargo/bin/cargo test ensure_schema_creates_satellite_tables_on_fresh_db --lib`：通过，覆盖 `task_runs.task_context_json` 幂等 schema 创建。
+  - `/Users/leo/.cargo/bin/cargo test kb_search_uses_attached_database_and_returns_source_json --lib`：先编译失败后通过；覆盖 `kb_search` 从 task scope 默认限制 library、写入 `retrieval_events.session_id/task_id/filters_json`。
+  - `/Users/leo/.cargo/bin/cargo check`：通过，存在既有 warning。
 - Release evidence:
   - not live：尚未实现 PowerPoint 插件、安装包集成或真实 Office 主路径。
 - Blocking evidence:
@@ -78,8 +85,8 @@
 ## AI Collaboration
 - context scope: CodeFactory repo docs、当前任务执行/MCP/memory/Git remote 代码、secret store、Knowledge backend、Office Add-in/RAG/MCP/GitHub flow 外部设计基线。
 - assumptions: 首期以本地个人知识库为边界；知识库 MVP 先用本地 SQLite 表和极简 DOCX/PPTX/PDF 文本抽取，FTS/向量和高保真解析后续升级；PowerPoint 插件使用 Office Web Add-in；PPT 生成优先用 Node/PptxGenJS sidecar；Git 自动 merge 默认关闭。
-- review point: planning sub-agent 和 QA sub-agent 审阅规格；development/QA sub-agent 审阅 secret storage 前置切片风险；knowledge explorer sub-agent 审阅后端落点、schema 和测试风险；Workspace connector UI explorer 审阅 UI 接入点和 viewport 风险。
-- validation result: Git remote secret migration targeted tests、knowledge backend targeted tests、knowledge connector UI/store tests、cargo check、frontend build/test、governance baseline 和 diff check 已通过；完整 Rust lib suite 存在既有跨平台 bash 测试失败；PowerPoint/知识库完整 UI 主路径仍是 `not live`。
+- review point: planning sub-agent 和 QA sub-agent 审阅规格；development/QA sub-agent 审阅 secret storage 前置切片风险；knowledge explorer sub-agent 审阅后端落点、schema 和测试风险；Workspace connector UI explorer 审阅 UI 接入点和 viewport 风险；knowledge task-context explorer 审阅任务 payload、ExecCtx、scheduler brief、evidence 和 viewport 风险。
+- validation result: Git remote secret migration targeted tests、knowledge backend targeted tests、knowledge connector UI/store tests、knowledge task context/evidence targeted tests、cargo check、frontend build/test、governance baseline 和 diff check 已通过；完整 Rust lib suite 存在既有跨平台 bash 测试失败；PowerPoint/知识库完整 UI 主路径仍是 `not live`。
 
 ## Stop Boundary
 - Do not stop after local-only validation.

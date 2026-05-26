@@ -50,6 +50,22 @@ impl ToolOutput {
 pub struct ExecCtx {
     pub cwd: PathBuf,
     pub db: Option<sqlx::SqlitePool>,
+    pub session_id: Option<String>,
+    pub task_id: Option<String>,
+    pub knowledge_library_ids: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+impl ExecCtx {
+    pub fn new(cwd: PathBuf, db: Option<sqlx::SqlitePool>) -> Self {
+        Self {
+            cwd,
+            db,
+            session_id: None,
+            task_id: None,
+            knowledge_library_ids: None,
+        }
+    }
 }
 
 pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {

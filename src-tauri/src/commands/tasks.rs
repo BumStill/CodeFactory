@@ -18,7 +18,7 @@ use crate::agent::scheduler::TaskScheduler;
 use crate::agent::verification::{self, VerificationResult};
 use crate::commands::evidence;
 use crate::errors::AppError;
-use crate::storage::tasks::{self, TaskRun};
+use crate::storage::tasks::{self, TaskConnectorContext, TaskRun};
 use crate::AppState;
 use crate::util::no_window::NoWindow;
 
@@ -48,12 +48,17 @@ pub async fn create_task_tree(
     session_id: String,
     tasks_in: Vec<TaskInput>,
     dependencies: Vec<TaskDep>,
+    context: Option<TaskConnectorContext>,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, AppError> {
     let pool = state.db.read().await;
     let mut tmp_to_real: HashMap<String, String> = HashMap::new();
     let mut real_ids: Vec<String> = Vec::with_capacity(tasks_in.len());
     let now = Utc::now().to_rfc3339();
+    let task_context_json = match context.as_ref().filter(|ctx| !ctx.is_empty()) {
+        Some(ctx) => Some(serde_json::to_string(ctx)?),
+        None => None,
+    };
 
     for t in &tasks_in {
         let id = Uuid::new_v4().to_string();
@@ -74,6 +79,7 @@ pub async fn create_task_tree(
             error: None,
             attempt_count: 0,
             verification_results: None,
+            task_context_json: task_context_json.clone(),
         };
         tasks::insert_task(&pool, &row).await?;
         real_ids.push(id);

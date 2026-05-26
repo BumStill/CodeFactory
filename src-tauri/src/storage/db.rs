@@ -94,7 +94,8 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
             completed_at    TEXT,
             result          TEXT,
             error           TEXT,
-            attempt_count   INTEGER NOT NULL DEFAULT 0
+            attempt_count   INTEGER NOT NULL DEFAULT 0,
+            task_context_json TEXT
         )",
     )
     .execute(pool)
@@ -144,6 +145,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     //    the verification engine. Some older DBs and all fresh installs
     //    miss it.
     ensure_column(pool, "task_runs", "verification_results", "TEXT").await?;
+    ensure_column(pool, "task_runs", "task_context_json", "TEXT").await?;
 
     // ── learning_events: post-task observations the AI surfaces for
     //    user approval. status: pending | accepted | rejected.
@@ -343,5 +345,15 @@ mod tests {
             .unwrap();
             assert_eq!(exists, 1, "ensure_schema must create {table}");
         }
+
+        let task_cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('task_runs')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            task_cols.contains(&"task_context_json".to_string()),
+            "task_runs must persist connector context for task execution evidence. Got: {task_cols:?}"
+        );
     }
 }
