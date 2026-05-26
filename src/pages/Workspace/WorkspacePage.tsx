@@ -21,6 +21,7 @@ import {
   X,
   Play,
   Square,
+  Brain,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { MessageList } from "../../components/MessageList";
@@ -35,6 +36,7 @@ import { QueueBadge } from "../../components/QueueBadge";
 import { useSettingsStore } from "../../stores/settings";
 import { useTasksStore } from "../../stores/tasks";
 import { useSkillsStore } from "../../stores/skills";
+import { useLearningStore } from "../../stores/learning";
 import { useKnowledgeStore } from "../../stores/knowledge";
 import type {
   KnowledgeLibrary,
@@ -165,7 +167,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: Workspa
 
         {/* ─── Right: Active skills + memory ─────────────────────────── */}
         <aside className="w-60 shrink-0 border-l border-border bg-surface-1 flex flex-col">
-          <ConnectorsColumn />
+          <ConnectorsColumn cwd={activeSession?.cwd ?? null} />
         </aside>
       </div>
 
@@ -600,8 +602,31 @@ function statusColor(status: string): string {
 // ConnectorsColumn — shows what capabilities are currently active
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ConnectorsColumn() {
+// Stable empty array so selectors that fall back to it don't churn
+// referential equality every render and re-enter the store subscription.
+const EMPTY_LEARNING: LearningEventForSelector[] = [];
+
+type LearningEventForSelector = ReturnType<typeof useLearningStore.getState>["events"][string][number];
+
+function ConnectorsColumn({ cwd }: { cwd: string | null }) {
   const { skills, loadSkills } = useSkillsStore();
+  const learningEvents = useLearningStore(
+    (s) => (cwd ? s.events[cwd] ?? EMPTY_LEARNING : EMPTY_LEARNING),
+  );
+  const loadLearning = useLearningStore((s) => s.load);
+  const subscribeLearning = useLearningStore((s) => s.subscribe);
+  const acceptLearning = useLearningStore((s) => s.accept);
+  const rejectLearning = useLearningStore((s) => s.reject);
+
+  // Subscribe to learning events for the current cwd. The store dedups
+  // multiple subscribe() calls per cwd so this is safe to remount.
+  useEffect(() => {
+    if (!cwd) return;
+    void loadLearning(cwd);
+    let off: (() => void) | undefined;
+    subscribeLearning(cwd).then((u) => { off = u; });
+    return () => { off?.(); };
+  }, [cwd]);
   const {
     libraries,
     scanSummaries,
@@ -783,15 +808,76 @@ function ConnectorsColumn() {
         </section>
       </div>
 
-      {/* Memory placeholder — to be filled when self-evolution lands */}
-      <div className="border-t border-border px-3 py-3">
-        <div className="text-[10px] font-semibold uppercase tracking-wider text-gray-500 mb-1.5">
-          记忆增量
+      {/* Memory increments — live learning events for this cwd */}
+      <div className="border-t border-border px-3 py-3 max-h-[40%] overflow-y-auto">
+        <div className="flex items-center gap-1.5 mb-1.5">
+          <Brain size={11} className="text-gray-500" />
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">
+            记忆增量
+          </span>
+          {(() => {
+            const pending = learningEvents.filter((e) => e.status === "pending").length;
+            return pending > 0 ? (
+              <span className="ml-auto text-[10px] px-1.5 py-0.5 rounded bg-accent/15 text-accent">
+                {pending} 待审
+              </span>
+            ) : null;
+          })()}
         </div>
-        <p className="text-[10px] text-gray-600 leading-relaxed">
-          AI 在本次任务中学到的事会出现在这里。<br />
-          <span className="text-gray-700">（自进化能力开发中）</span>
-        </p>
+        {!cwd ? (
+          <p className="text-[10px] text-gray-600">开个项目后这里会显示 AI 学到的事</p>
+        ) : learningEvents.length === 0 ? (
+          <p className="text-[10px] text-gray-600 leading-relaxed">
+            AI 在本次会话中学到的事会出现在这里。<br />
+            <span className="text-gray-700">任务/会话结束后自动总结。</span>
+          </p>
+        ) : (
+          <ul className="space-y-1.5">
+            {learningEvents
+              .filter((e) => e.status === "pending")
+              .slice(0, 5)
+              .map((e) => (
+                <li
+                  key={e.id}
+                  className="rounded border border-accent/30 bg-accent/5 p-1.5 space-y-1"
+                >
+                  <p className="text-[10px] text-gray-300 leading-snug line-clamp-2">
+                    {e.observation}
+                  </p>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => cwd && void acceptLearning(e.id, cwd)}
+                      className="text-[9px] px-1.5 py-0.5 rounded bg-accent text-white hover:bg-accent-hover"
+                      title={e.kind === "preference" ? `更新偏好：${e.pref_key} = ${e.pref_value}` : "写入 memory.md"}
+                    >
+                      ✓ 采纳
+                    </button>
+                    <button
+                      onClick={() => cwd && void rejectLearning(e.id, cwd)}
+                      className="text-[9px] px-1.5 py-0.5 rounded text-gray-500 hover:bg-surface-3"
+                    >
+                      拒绝
+                    </button>
+                    <span className="ml-auto text-[8px] text-gray-600">
+                      {e.kind === "preference" ? "偏好" : "记忆"}
+                    </span>
+                  </div>
+                </li>
+              ))}
+            {learningEvents.filter((e) => e.status === "pending").length > 5 && (
+              <li className="text-[9px] text-gray-600 text-center pt-1">
+                还有 {learningEvents.filter((e) => e.status === "pending").length - 5} 条，
+                到「我的画像 → 学习日志」全部审批
+              </li>
+            )}
+            {learningEvents.filter((e) => e.status === "pending").length === 0 && (
+              <li className="text-[10px] text-gray-600">
+                所有学习事件已处理。
+                <span className="text-gray-700"> 已采纳 {learningEvents.filter((e) => e.status === "accepted").length} · 拒绝 {learningEvents.filter((e) => e.status === "rejected").length}</span>
+              </li>
+            )}
+          </ul>
+        )}
       </div>
     </>
   );

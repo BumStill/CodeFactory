@@ -12,22 +12,7 @@ import {
 } from "lucide-react";
 import { invoke } from "../../lib/tauri";
 import { useChatStore } from "../../stores/chat";
-
-interface LearningEvent {
-  id: string;
-  session_id: string;
-  cwd: string;
-  observation: string;
-  suggestion: string;
-  status: "pending" | "accepted" | "rejected";
-  created_at: string;
-  decided_at: string | null;
-  /** "memory" appends suggestion to memory.md on accept.
-   *  "preference" upserts pref_key→pref_value into user_preferences. */
-  kind: "memory" | "preference";
-  pref_key: string | null;
-  pref_value: string | null;
-}
+import { useLearningStore, type LearningEvent } from "../../stores/learning";
 
 interface ProfilePageProps {
   onBack: () => void;
@@ -43,9 +28,14 @@ interface ProjectMemory {
  * Profile — "我的画像".
  *
  * Three sections:
- *   • 个人偏好         — static placeholders (until self-evolution lands)
+ *   • 个人偏好         — live key→value, global + per-project, AI-suggested
  *   • 项目记忆 (.md)   — read / edit one project's memory.md at a time
- *   • 学习日志         — placeholder for self-evolution events
+ *   • 学习日志         — live learning events, grouped by session, with
+ *                        accept (→ memory.md / preferences) or reject
+ *
+ * All three are driven by user_preferences / learning_events backend tables
+ * and emit `learning_events_updated:{cwd}` so the Workspace right-rail
+ * panel stays in sync without polling.
  */
 export function ProfilePage({ onBack }: ProfilePageProps) {
   const { sessions, loadSessions } = useChatStore();
@@ -452,38 +442,49 @@ function ProjectMemorySection({
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LearningLogSection — placeholder until self-evolution lands
+// LearningLogSection — live learning events grouped by session
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// Pulls from the shared useLearningStore so this view stays in sync with the
+// Workspace right-rail panel — accept/reject in either place updates both.
+// Backend emits `learning_events_updated:{cwd}` after run_postmortem /
+// accept / reject so we don't poll.
+//
+// Grouping: pending events are flat (you act on them) but decided events
+// are grouped by session_id so historical exploration scales past a few
+// dozen runs without becoming a wall of cards.
+
+// Stable empty array for the selector fallback — see ConnectorsColumn
+// note in WorkspacePage.tsx; same Zustand-referential-equality trap.
+const EMPTY_LEARNING_EVENTS: LearningEvent[] = [];
 
 function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
-  const [events, setEvents] = useState<LearningEvent[]>([]);
-  const [loading, setLoading] = useState(false);
+  const events = useLearningStore(
+    (s) => (selectedCwd ? s.events[selectedCwd] ?? EMPTY_LEARNING_EVENTS : EMPTY_LEARNING_EVENTS),
+  );
+  const loading = useLearningStore((s) => (selectedCwd ? s.loading[selectedCwd] ?? false : false));
+  const load = useLearningStore((s) => s.load);
+  const subscribe = useLearningStore((s) => s.subscribe);
+  const accept = useLearningStore((s) => s.accept);
+  const reject = useLearningStore((s) => s.reject);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  const reload = async (cwd: string) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const list = await invoke<LearningEvent[]>("list_learning_events", { cwd });
-      setEvents(list);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
+  const [filter, setFilter] = useState<"all" | "memory" | "preference">("all");
 
   useEffect(() => {
-    if (selectedCwd) reload(selectedCwd);
+    if (!selectedCwd) return;
+    void load(selectedCwd);
+    let off: (() => void) | undefined;
+    subscribe(selectedCwd).then((u) => { off = u; });
+    return () => { off?.(); };
   }, [selectedCwd]);
 
   const handleAccept = async (id: string) => {
+    if (!selectedCwd) return;
     setBusyId(id);
     setError(null);
     try {
-      await invoke("accept_learning_event", { eventId: id });
-      if (selectedCwd) await reload(selectedCwd);
+      await accept(id, selectedCwd);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -492,11 +493,11 @@ function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
   };
 
   const handleReject = async (id: string) => {
+    if (!selectedCwd) return;
     setBusyId(id);
     setError(null);
     try {
-      await invoke("reject_learning_event", { eventId: id });
-      if (selectedCwd) await reload(selectedCwd);
+      await reject(id, selectedCwd);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -504,19 +505,49 @@ function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
     }
   };
 
-  const pending = events.filter((e) => e.status === "pending");
-  const decided = events.filter((e) => e.status !== "pending");
+  const filtered = filter === "all" ? events : events.filter((e) => e.kind === filter);
+  const pending = filtered.filter((e) => e.status === "pending");
+  const decided = filtered.filter((e) => e.status !== "pending");
+  // Group decided by session_id. Order: most-recent session first
+  // (by max created_at within the group).
+  const decidedBySession: Record<string, LearningEvent[]> = {};
+  for (const e of decided) {
+    (decidedBySession[e.session_id] ??= []).push(e);
+  }
+  const sessionGroups = Object.entries(decidedBySession).sort(
+    ([, a], [, b]) =>
+      (b[0]?.decided_at ?? b[0]?.created_at ?? "").localeCompare(
+        a[0]?.decided_at ?? a[0]?.created_at ?? "",
+      ),
+  );
 
   return (
     <section>
-      <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
-        学习日志
-        {pending.length > 0 && (
-          <span className="ml-2 text-[10px] font-normal text-accent normal-case">
-            {pending.length} 条待审
-          </span>
-        )}
-      </h2>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+          学习日志
+          {pending.length > 0 && (
+            <span className="ml-2 text-[10px] font-normal text-accent normal-case">
+              {pending.length} 条待审
+            </span>
+          )}
+        </h2>
+        <div className="flex items-center rounded border border-border overflow-hidden text-[10px]">
+          {(["all", "memory", "preference"] as const).map((f) => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={`px-2 py-0.5 transition-colors ${
+                filter === f
+                  ? "bg-surface-3 text-accent"
+                  : "text-gray-500 hover:text-gray-300 hover:bg-surface-3"
+              }`}
+            >
+              {f === "all" ? "全部" : f === "memory" ? "记忆" : "偏好"}
+            </button>
+          ))}
+        </div>
+      </div>
 
       {!selectedCwd ? (
         <p className="text-xs text-gray-500 text-center py-6">选一个项目以查看学习记录</p>
@@ -524,13 +555,15 @@ function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
         <p className="text-xs text-gray-500 text-center py-6 flex items-center justify-center gap-2">
           <Loader2 size={12} className="animate-spin" /> 加载中...
         </p>
-      ) : events.length === 0 ? (
+      ) : filtered.length === 0 ? (
         <div className="rounded-lg border border-dashed border-border bg-surface-1 px-6 py-10 text-center">
           <Sparkles size={20} className="text-gray-600 mx-auto mb-3" />
-          <p className="text-sm text-gray-400 font-medium mb-1">暂无学习记录</p>
+          <p className="text-sm text-gray-400 font-medium mb-1">
+            {events.length === 0 ? "暂无学习记录" : `没有「${filter === "memory" ? "记忆" : "偏好"}」类型的记录`}
+          </p>
           <p className="text-xs text-gray-500 max-w-md mx-auto leading-relaxed">
-            每个任务 session 结束后，AI 会自动总结观察到的事实，
-            出现在这里等你审核。审核通过的会写入项目记忆并影响未来对话。
+            每次任务 / 聊天 session 结束后，AI 自动总结观察到的事实，
+            出现在这里等你审核。审核通过的会写入项目记忆或偏好，影响未来对话。
           </p>
         </div>
       ) : (
@@ -549,27 +582,44 @@ function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
             </div>
           )}
 
-          {decided.length > 0 && (
+          {sessionGroups.length > 0 && (
             <details className="rounded-lg border border-border bg-surface-1">
               <summary className="px-4 py-2 text-xs text-gray-500 cursor-pointer hover:text-gray-300 select-none">
-                历史决定 ({decided.length})
+                历史决定 ({decided.length} · {sessionGroups.length} 个 session)
               </summary>
-              <ul className="border-t border-border divide-y divide-border">
-                {decided.map((e) => (
-                  <li key={e.id} className="px-4 py-2 text-[11px]">
-                    <span
-                      className={
-                        e.status === "accepted"
-                          ? "text-green-700 dark:text-green-400 mr-2"
-                          : "text-gray-500 mr-2"
-                      }
-                    >
-                      {e.status === "accepted" ? "✓ 采纳" : "✕ 拒绝"}
-                    </span>
-                    <span className="text-gray-400">{e.observation}</span>
-                  </li>
+              <div className="border-t border-border divide-y divide-border">
+                {sessionGroups.map(([sid, list]) => (
+                  <details key={sid} className="px-4 py-2 group" open>
+                    <summary className="text-[11px] text-gray-500 cursor-pointer hover:text-gray-300 select-none flex items-center gap-2">
+                      <span className="font-mono text-gray-600">{sid.slice(0, 8)}</span>
+                      <span className="text-gray-700">·</span>
+                      <span>{list.length} 条</span>
+                      <span className="ml-auto text-[10px] text-gray-600">
+                        {(list[0]?.decided_at ?? list[0]?.created_at ?? "").slice(0, 10)}
+                      </span>
+                    </summary>
+                    <ul className="mt-1.5 space-y-1">
+                      {list.map((e) => (
+                        <li key={e.id} className="text-[11px] pl-3">
+                          <span
+                            className={
+                              e.status === "accepted"
+                                ? "text-green-700 dark:text-green-400 mr-2"
+                                : "text-gray-500 mr-2"
+                            }
+                          >
+                            {e.status === "accepted" ? "✓" : "✕"}
+                          </span>
+                          <span className="text-[9px] text-gray-600 mr-1">
+                            {e.kind === "preference" ? "偏好" : "记忆"}
+                          </span>
+                          <span className="text-gray-400">{e.observation}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
                 ))}
-              </ul>
+              </div>
             </details>
           )}
         </div>

@@ -92,6 +92,25 @@ vi.mock("../../stores/tasks", () => ({
     { setState: vi.fn(), getState: () => fakeState },
   ),
 }));
+// Learning store calls Tauri listen() inside subscribe() — that fails in
+// jsdom because window.__TAURI_INTERNALS__ doesn't exist. Stub the whole
+// store so ConnectorsColumn renders cleanly without trying to set up a
+// real Tauri event listener.
+const fakeLearningState = {
+  events: {} as Record<string, unknown[]>,
+  loading: {} as Record<string, boolean>,
+  load: vi.fn(async () => []),
+  subscribe: vi.fn(async () => () => {}),
+  accept: vi.fn(async () => {}),
+  reject: vi.fn(async () => {}),
+};
+vi.mock("../../stores/learning", () => ({
+  useLearningStore: Object.assign(
+    <T,>(selector?: (s: typeof fakeLearningState) => T): T | typeof fakeLearningState =>
+      selector ? selector(fakeLearningState) : fakeLearningState,
+    { setState: vi.fn(), getState: () => fakeLearningState },
+  ),
+}));
 vi.mock("../../stores/skills", () => ({
   useSkillsStore: () => ({ skills: [], loadSkills: vi.fn() }),
 }));
