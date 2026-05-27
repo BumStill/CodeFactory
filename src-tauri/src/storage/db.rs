@@ -182,6 +182,13 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     // List-sessions excludes 'quick' from the Recent Projects card.
     ensure_column(pool, "sessions", "kind", "TEXT NOT NULL DEFAULT 'project'").await?;
 
+    // task_runs.acceptance_criteria_json: JSON Vec<String> set by the
+    // decompose commands at task creation time. The autonomous subagent
+    // reads it, must verify each criterion, and the scheduler post-task
+    // hook respawns the agent if any criterion isn't evidenced in the
+    // result. NULL on legacy rows = no-criteria back-compat.
+    ensure_column(pool, "task_runs", "acceptance_criteria_json", "TEXT").await?;
+
     // ── user_preferences: structured key→value the AI reads at
     //    decomposition / execution time. Scoped per cwd so different
     //    projects can have different defaults. `source` is one of:

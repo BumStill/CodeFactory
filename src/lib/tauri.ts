@@ -225,6 +225,11 @@ export interface TaskInput {
   title: string;
   description: string;
   cwd: string;
+  /** Concrete verifiable conditions for "done". One bullet each.
+   *  The autonomous agent loop reads these and MUST verify each
+   *  before reporting completion. Empty list is allowed but the
+   *  decompose commands always populate it. */
+  acceptance_criteria?: string[];
 }
 
 export interface TaskDep {

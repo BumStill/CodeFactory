@@ -152,8 +152,8 @@ describe("AI task decomposition flow", () => {
       if (cmd === "decompose_request_to_tasks") {
         expect(args.request).toBe("做一个本地记账 app");
         return Promise.resolve([
-          { tmp_id: "t-0", title: "搭项目骨架", description: "Vite + React", dependencies: [] },
-          { tmp_id: "t-1", title: "做数据模型",   description: "SQLite schema", dependencies: ["t-0"] },
+          { tmp_id: "t-0", title: "搭项目骨架", description: "Vite + React", dependencies: [], acceptance_criteria: ["pnpm dev 启动成功"] },
+          { tmp_id: "t-1", title: "做数据模型",   description: "SQLite schema", dependencies: ["t-0"], acceptance_criteria: ["cargo test schema 通过"] },
         ]);
       }
       return Promise.resolve(undefined);
@@ -226,8 +226,8 @@ describe("AI task decomposition flow", () => {
       }
       if (cmd === "decompose_request_to_tasks") {
         return Promise.resolve([
-          { tmp_id: "t-0", title: "Task A", description: "A", dependencies: [] },
-          { tmp_id: "t-1", title: "Task B", description: "B", dependencies: [] },
+          { tmp_id: "t-0", title: "Task A", description: "A", dependencies: [], acceptance_criteria: [] },
+          { tmp_id: "t-1", title: "Task B", description: "B", dependencies: [], acceptance_criteria: [] },
         ]);
       }
       return Promise.resolve(undefined);

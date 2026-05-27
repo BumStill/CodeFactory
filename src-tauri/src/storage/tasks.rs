@@ -94,14 +94,18 @@ pub struct TaskRun {
     pub verification_results: Option<String>,
     /// JSON TaskConnectorContext persisted at task creation time.
     pub task_context_json: Option<String>,
+    /// JSON Vec<String> of user-visible acceptance criteria the agent
+    /// must verify before declaring done. Drives autonomous-mode
+    /// completion check + scheduler-side respawn-on-incomplete loop.
+    pub acceptance_criteria_json: Option<String>,
 }
 
 pub async fn insert_task(pool: &SqlitePool, task: &TaskRun) -> Result<()> {
     sqlx::query(
         "INSERT INTO task_runs (id, session_id, title, description, status, cwd, parent_task_id, \
          sub_session_id, created_at, started_at, completed_at, result, error, attempt_count, \
-         verification_results, task_context_json) \
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         verification_results, task_context_json, acceptance_criteria_json) \
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&task.id)
     .bind(&task.session_id)
@@ -119,6 +123,7 @@ pub async fn insert_task(pool: &SqlitePool, task: &TaskRun) -> Result<()> {
     .bind(task.attempt_count)
     .bind(&task.verification_results)
     .bind(&task.task_context_json)
+    .bind(&task.acceptance_criteria_json)
     .execute(pool)
     .await?;
     Ok(())
