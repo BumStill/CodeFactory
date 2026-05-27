@@ -52,6 +52,11 @@ interface DecomposedTask {
   title: string;
   description: string;
   dependencies: string[];
+  /** Verifiable conditions for "done", populated by the decompose AI.
+   *  Shown in the TaskCreator review step so the user can audit / edit
+   *  before approving; persisted to task_runs and read back by the
+   *  autonomous subagent that must verify each criterion. */
+  acceptance_criteria: string[];
 }
 
 interface WorkspacePageProps {
@@ -222,6 +227,7 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
       title: d.title,
       description: d.description,
       cwd,
+      acceptance_criteria: d.acceptance_criteria,
     }));
     const deps: TaskDep[] = decomposed.flatMap((d) =>
       d.dependencies.map((depId) => ({
@@ -464,6 +470,14 @@ function TaskCreatorModal({ cwd, knowledgeLibraries, onCancel, onConfirm }: Task
                             依赖：{t.dependencies.join(", ")}
                           </div>
                         )}
+                        {/* Acceptance criteria — editable. The autonomous
+                            subagent reads these as the contract for "done"
+                            and verifies each before reporting completion. */}
+                        <AcceptanceEditor
+                          value={t.acceptance_criteria}
+                          onChange={(next) => updateTask(i, { acceptance_criteria: next })}
+                          disabled={busy}
+                        />
                       </div>
                       <button
                         onClick={() => removeTask(i)}
@@ -978,5 +992,95 @@ function KnowledgeContextPanel({
         </ul>
       )}
     </section>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AcceptanceEditor — inline list of "what makes this task done" bullets.
+// Used inside TaskCreator review step so users can audit / refine the
+// AI-proposed acceptance criteria before approving. The autonomous
+// subagent treats these as a hard contract: it must verify each line
+// before reporting completion.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function AcceptanceEditor({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: string[];
+  onChange: (next: string[]) => void;
+  disabled: boolean;
+}) {
+  const [draft, setDraft] = useState("");
+
+  const add = () => {
+    const v = draft.trim();
+    if (!v) return;
+    onChange([...value, v]);
+    setDraft("");
+  };
+  const remove = (i: number) => onChange(value.filter((_, idx) => idx !== i));
+  const update = (i: number, v: string) =>
+    onChange(value.map((x, idx) => (idx === i ? v : x)));
+
+  return (
+    <div className="mt-1 space-y-1">
+      <div className="text-[10px] text-gray-500 flex items-center gap-1">
+        <CheckCircle2 size={10} className="text-accent" />
+        验收条件（AI 必须逐条核对才算完成）
+      </div>
+      {value.length === 0 && (
+        <div className="text-[10px] text-amber-700 dark:text-amber-400 italic">
+          ⚠ 没有验收条件 — AI 可能凭感觉报完成。建议至少 1-2 条。
+        </div>
+      )}
+      <ul className="space-y-1">
+        {value.map((c, i) => (
+          <li key={i} className="flex items-start gap-1.5">
+            <span className="text-[10px] text-gray-600 mt-1.5">•</span>
+            <input
+              type="text"
+              value={c}
+              onChange={(e) => update(i, e.target.value)}
+              disabled={disabled}
+              className="flex-1 bg-surface-3 border border-border rounded px-1.5 py-0.5 text-[11px] text-gray-300 font-mono outline-none focus:border-accent disabled:opacity-40"
+            />
+            <button
+              onClick={() => remove(i)}
+              disabled={disabled}
+              className="p-0.5 rounded text-gray-600 hover:text-red-700 dark:hover:text-red-400 disabled:opacity-40"
+              title="移除"
+            >
+              <X size={10} />
+            </button>
+          </li>
+        ))}
+      </ul>
+      <div className="flex items-center gap-1.5 mt-1">
+        <input
+          type="text"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              add();
+            }
+          }}
+          disabled={disabled}
+          placeholder="加一条验收条件，例如：cargo test foo 通过"
+          className="flex-1 bg-surface-3 border border-border rounded px-1.5 py-0.5 text-[11px] text-gray-400 font-mono outline-none focus:border-accent placeholder-gray-600 disabled:opacity-40"
+        />
+        <button
+          onClick={add}
+          disabled={disabled || !draft.trim()}
+          className="p-0.5 rounded text-gray-600 hover:text-accent disabled:opacity-40"
+          title="添加"
+        >
+          <Plus size={11} />
+        </button>
+      </div>
+    </div>
   );
 }

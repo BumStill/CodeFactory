@@ -487,6 +487,14 @@ pub struct DecomposedTask {
     pub title: String,
     pub description: String,
     pub dependencies: Vec<String>,
+    /// Concrete, verifiable conditions under which the task is "done".
+    /// Each entry should ideally be an executable check (e.g. shell
+    /// command, test invocation) OR an unambiguous user-visible
+    /// behavior. The autonomous agent loop reads these from the
+    /// SubagentBrief and must verify each before reporting completion.
+    /// Empty list = back-compat fallback ("just do the description").
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
 }
 
 /// AI-powered task decomposition: takes spec content and returns a structured task list.
@@ -539,14 +547,15 @@ pub async fn decompose_spec_to_tasks(
         "{user_context_prefix}You are a software project manager. Decompose this spec into a concrete list of implementation tasks for a development team.\n\n\
 Return ONLY a JSON array (no markdown fences, no explanation), like:\n\
 [\n  \
-{{\"tmp_id\": \"t-0\", \"title\": \"...\", \"description\": \"...\", \"dependencies\": []}},\n  \
-{{\"tmp_id\": \"t-1\", \"title\": \"...\", \"description\": \"...\", \"dependencies\": [\"t-0\"]}}\n\
+{{\"tmp_id\": \"t-0\", \"title\": \"...\", \"description\": \"...\", \"dependencies\": [], \"acceptance_criteria\": [\"cargo test foo passes\", \"app shows X in light mode\"]}},\n  \
+{{\"tmp_id\": \"t-1\", \"title\": \"...\", \"description\": \"...\", \"dependencies\": [\"t-0\"], \"acceptance_criteria\": [\"pnpm test bar passes\"]}}\n\
 ]\n\n\
 Rules:\n\
 - 3-8 tasks maximum\n\
 - Each task should be independently actionable\n\
 - title: short (5-10 words), description: 1-2 sentences explaining what to implement\n\
 - dependencies: list tmp_ids of tasks that must complete before this one (can be empty)\n\
+- **acceptance_criteria (REQUIRED, 1-4 entries per task)**: concrete verifiable conditions. Prefer executable checks like a shell/test command (\"cargo test ...\", \"pnpm test path\", \"curl -fsS .../health returns 200\"). When the behavior is UI-visible, write the precise user-observable expectation (\"Home page shows new dark theme by default\", \"Pressing Enter while streaming queues the message\"). Avoid vague entries like \"works correctly\" or \"tests pass\" without a command.\n\
 - Focus on code changes, not process steps\n\n\
 Spec:\n\
 {spec_content}"
@@ -606,6 +615,7 @@ Spec:\n\
         title: "Implement spec".into(),
         description: "Implement the complete spec.".into(),
         dependencies: vec![],
+        acceptance_criteria: vec![],
     }];
 
     let parsed: Vec<serde_json::Value> = match serde_json::from_str(&json_str) {
@@ -631,7 +641,16 @@ Spec:\n\
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(DecomposedTask { tmp_id, title, description, dependencies })
+            let acceptance_criteria = v["acceptance_criteria"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|d| d.as_str().map(|s| s.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(DecomposedTask { tmp_id, title, description, dependencies, acceptance_criteria })
         })
         .collect();
 
@@ -696,8 +715,8 @@ pub async fn decompose_request_to_tasks(
 Decompose their request into a concrete, actionable task list a development team can execute.\n\n\
 Return ONLY a JSON array (no markdown fences, no explanation), like:\n\
 [\n  \
-{{\"tmp_id\": \"t-0\", \"title\": \"...\", \"description\": \"...\", \"dependencies\": []}},\n  \
-{{\"tmp_id\": \"t-1\", \"title\": \"...\", \"description\": \"...\", \"dependencies\": [\"t-0\"]}}\n\
+{{\"tmp_id\": \"t-0\", \"title\": \"...\", \"description\": \"...\", \"dependencies\": [], \"acceptance_criteria\": [\"cargo test foo passes\", \"app shows X in light mode\"]}},\n  \
+{{\"tmp_id\": \"t-1\", \"title\": \"...\", \"description\": \"...\", \"dependencies\": [\"t-0\"], \"acceptance_criteria\": [\"pnpm test bar passes\"]}}\n\
 ]\n\n\
 Rules:\n\
 - 3-7 tasks maximum — keep it tight and high-signal\n\
@@ -705,6 +724,7 @@ Rules:\n\
 - title: short imperative phrase (5-10 words), e.g. \"Set up database schema\"\n\
 - description: 1-2 sentences on what to implement and why\n\
 - dependencies: tmp_ids of tasks that must complete first (can be empty)\n\
+- **acceptance_criteria (REQUIRED, 1-4 entries per task)**: concrete verifiable conditions. Prefer executable checks (\"cargo test ...\", \"pnpm test path\", \"curl -fsS .../health returns 200\"). For UI behaviors use precise observable language (\"Cmd+V image paste shows file chip\", \"Theme toggle in header switches background instantly\"). Avoid vague entries like \"works correctly\".\n\
 - Prefer concrete implementation tasks over abstract planning\n\
 - If the request is too vague to decompose, return a single task asking for clarification\n\n\
 User request:\n\
@@ -763,6 +783,7 @@ User request:\n\
         title: "Clarify the request".into(),
         description: format!("The AI couldn't decompose the request. Original input: {request}"),
         dependencies: vec![],
+        acceptance_criteria: vec![],
     }];
 
     let parsed: Vec<serde_json::Value> = match serde_json::from_str(&json_str) {
@@ -788,7 +809,16 @@ User request:\n\
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(DecomposedTask { tmp_id, title, description, dependencies })
+            let acceptance_criteria = v["acceptance_criteria"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|d| d.as_str().map(|s| s.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(DecomposedTask { tmp_id, title, description, dependencies, acceptance_criteria })
         })
         .collect();
 

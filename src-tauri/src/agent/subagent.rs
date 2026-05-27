@@ -173,7 +173,13 @@ pub async fn run_subagent(
     // parent process's shared manager but the subagent runs in isolation).
     let mcp_manager = Arc::new(McpManager::new());
 
-    let mut agent = AgentLoop::new(
+    // Autonomous mode is the whole reason subagents exist — the user
+    // approved the plan at the parent level and is no longer in this
+    // turn. Without this, the subagent inherits the interactive
+    // SYSTEM_PROMPT which tells the model to stop and ask for
+    // confirmation (the v1.0 bug: tasks ended after ~30 seconds with
+    // "Ready to proceed?").
+    let mut agent = AgentLoop::new_with_mode(
         app_handle.clone(),
         pool.clone(),
         sub_session_id.clone(),
@@ -194,6 +200,7 @@ pub async fn run_subagent(
                 .map(|ctx| ctx.knowledge_library_ids())
                 .unwrap_or_default(),
         }),
+        crate::agent::AgentMode::Autonomous,
     );
 
     // Hard wall-clock cap per subagent. Without this an unbounded

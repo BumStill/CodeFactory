@@ -33,6 +33,17 @@ pub struct TaskInput {
     pub title: String,
     pub description: String,
     pub cwd: String,
+    /// One bullet per user-visible behavior that must hold for the task
+    /// to count as done. Examples:
+    ///   - "cargo test --package codefactory --lib settings::tests passes"
+    ///   - "Opening the app shows the new dark-mode theme by default"
+    /// The autonomous agent loop reads these from the SubagentBrief and
+    /// MUST verify each before reporting completion. The scheduler also
+    /// inspects them post-task and respawns the subagent if any are not
+    /// evidenced in the result. Empty list is allowed (back-compat) but
+    /// strongly discouraged — decompose commands now always populate it.
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +74,11 @@ pub async fn create_task_tree(
     for t in &tasks_in {
         let id = Uuid::new_v4().to_string();
         tmp_to_real.insert(t.tmp_id.clone(), id.clone());
+        let acceptance_json = if t.acceptance_criteria.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&t.acceptance_criteria).unwrap_or_else(|_| "[]".into()))
+        };
         let row = TaskRun {
             id: id.clone(),
             session_id: session_id.clone(),
@@ -80,6 +96,7 @@ pub async fn create_task_tree(
             attempt_count: 0,
             verification_results: None,
             task_context_json: task_context_json.clone(),
+            acceptance_criteria_json: acceptance_json,
         };
         tasks::insert_task(&pool, &row).await?;
         real_ids.push(id);

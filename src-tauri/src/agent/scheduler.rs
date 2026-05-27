@@ -190,6 +190,16 @@ impl TaskScheduler {
                 let task_cwd = task.cwd.clone();
                 let task_title = task.title.clone();
                 let task_description = task.description.clone();
+                // Parse acceptance_criteria_json (stored as JSON array) into a
+                // human-readable bullet block for the subagent brief. The
+                // autonomous prompt instructs the model to verify each one
+                // before reporting done.
+                let task_acceptance: Option<String> = task
+                    .acceptance_criteria_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"));
 
                 tokio::spawn(async move {
                     let _permit = permit; // released on drop
@@ -263,7 +273,7 @@ impl TaskScheduler {
                                 "edit_file".into(),
                                 "bash".into(),
                             ],
-                            acceptance_criteria: None,
+                            acceptance_criteria: task_acceptance.clone(),
                             connector_context: tasks::TaskConnectorContext::from_json(
                                 task.task_context_json.as_deref(),
                             ),

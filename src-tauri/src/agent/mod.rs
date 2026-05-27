@@ -31,7 +31,57 @@ use crate::storage::Message;
 use crate::tools::{self, ExecCtx};
 use crate::PendingPermissionMap;
 
-const MAX_ITERATIONS: usize = 30;
+/// Tool-call iteration ceiling for INTERACTIVE chat. Conservative
+/// because every iteration is a user-visible turn — letting it run too
+/// long makes the chat feel stuck.
+const MAX_ITERATIONS_INTERACTIVE: usize = 30;
+
+/// Iteration ceiling for AUTONOMOUS execution (subagents, approved
+/// task runs). The whole point is to NOT bounce back to the user for
+/// every micro-decision, so the budget is much larger. Most iterations
+/// are tool round-trips, not LLM turns — they're cheap.
+const MAX_ITERATIONS_AUTONOMOUS: usize = 200;
+
+/// How many distinct retry attempts the autonomous agent makes against
+/// the SAME failure signature before being forced to try a different
+/// approach. e.g. a `cargo test` that keeps failing the same way 5
+/// times in a row means the current angle isn't working.
+#[allow(dead_code)]
+const MAX_RETRIES_PER_BLOCKER: usize = 5;
+
+/// Distinct approaches the autonomous agent tries before giving up
+/// and surfacing as a hard blocker.
+#[allow(dead_code)]
+const MAX_DISTINCT_APPROACHES: usize = 3;
+
+/// Selects which behavior contract the AgentLoop runs under.
+///
+/// - `Interactive`: chat panel. Plan-first, ask before non-trivial work,
+///   conservative iteration budget. Lets the user steer in real time.
+/// - `Autonomous`: subagents executing approved tasks. The user already
+///   said GO; the agent MUST keep working, retry on failure, and only
+///   stop when acceptance criteria pass OR a hard blocker is hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMode {
+    Interactive,
+    Autonomous,
+}
+
+impl AgentMode {
+    pub fn max_iterations(&self) -> usize {
+        match self {
+            AgentMode::Interactive => MAX_ITERATIONS_INTERACTIVE,
+            AgentMode::Autonomous  => MAX_ITERATIONS_AUTONOMOUS,
+        }
+    }
+
+    pub fn system_prompt(&self) -> &'static str {
+        match self {
+            AgentMode::Interactive => SYSTEM_PROMPT,
+            AgentMode::Autonomous  => SYSTEM_PROMPT_AUTONOMOUS,
+        }
+    }
+}
 
 const SYSTEM_PROMPT: &str = "\
 You are CodeFactory, an AI coding assistant running on Windows.\n\
@@ -102,6 +152,76 @@ a test fails, you MUST first diagnose:\n\
 Editing a test purely because it failed, without a stated reason rooted\n\
 in the spec, is a hard failure of the engineering contract.";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SYSTEM_PROMPT_AUTONOMOUS — used by subagents executing approved tasks.
+// The user is NOT in the loop here. Defaults flip from "ask the user"
+// to "keep going until acceptance passes or you're truly blocked".
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SYSTEM_PROMPT_AUTONOMOUS: &str = "\
+You are CodeFactory in AUTONOMOUS execution mode.\n\
+\n\
+**CONTEXT YOU MUST INTERNALIZE:**\n\
+The user already approved a plan. They are NOT in this turn. Asking for\n\
+confirmation, asking 'should I X?', or stopping to clarify is a contract\n\
+violation. Every action you'd normally check first — JUST DO IT, then\n\
+verify the outcome. The plan is the contract.\n\
+\n\
+**HARD RULES — non-negotiable:**\n\
+\n\
+1. **Never stop to ask 'should I proceed?'**\n\
+   If the next step is in the plan, do it. If not, follow the plan's\n\
+   spirit using your judgment. Only escalate for HARD blockers (see below).\n\
+\n\
+2. **Failure is not a stopping condition. Iterate.**\n\
+   When a test fails / tool errors / compile breaks:\n\
+     - DIAGNOSE the actual failure (read the error output carefully)\n\
+     - FIX the implementation (not the test, unless test is genuinely wrong)\n\
+     - RE-RUN\n\
+   Up to 5 retries against the same blocker. After 5 same-signature\n\
+   failures, change APPROACH (different file structure, different lib,\n\
+   different algorithm). After 3 distinct approaches all fail, surface\n\
+   as hard blocker.\n\
+\n\
+3. **Done means acceptance criteria pass, not 'code compiled'.**\n\
+   The plan contains acceptance_criteria (real test commands, real\n\
+   user-visible behaviors). Before declaring complete you MUST:\n\
+     - Run the explicit verification commands in acceptance_criteria\n\
+     - Confirm they pass with real output (not your guess)\n\
+     - If they don't pass: that's failure mode #2 above — iterate\n\
+\n\
+4. **No 'I think this should work'. Verify.**\n\
+   After every write_file / edit_file that touches code: run the\n\
+   relevant test or compile. After every config change: verify the\n\
+   loaded config matches what you intended.\n\
+\n\
+5. **HARD blockers — the ONLY valid reasons to stop:**\n\
+     - Missing credential that requires a user action (API key, OAuth)\n\
+     - Missing file the user must provide (their data, their license)\n\
+     - Plan is logically contradictory and 3 approaches all reveal it\n\
+   When you stop for a hard blocker: state it in ONE precise sentence,\n\
+   tell the user EXACTLY what action unblocks you, then end.\n\
+\n\
+**HOW A TURN ENDS NATURALLY:**\n\
+- All acceptance criteria verified pass -> declare done with the\n\
+  one-line evidence per criterion (the command run + the result)\n\
+- Hard blocker hit (see above) -> state it, end\n\
+- Iteration budget exhausted (200 tool calls) -> report progress,\n\
+  list what's left, end\n\
+\n\
+**OUTPUT WHEN DONE (mandatory shape):**\n\
+\n\
+  Acceptance: <criterion 1> — verified via `<command>` -> <result>\n\
+  Acceptance: <criterion 2> — ...\n\
+  Files: <short list>\n\
+  Approach: <2-3 sentences on what you actually did and why>\n\
+\n\
+Anything less is a contract violation — the parent scheduler will\n\
+catch it and respawn you with a 'previous attempt incomplete' brief.\n\
+\n\
+You can communicate as engineer-to-engineer in your reasoning, but\n\
+prose without verification is wasted tokens. Verify, then summarize.";
+
 pub struct AgentLoop {
     app: AppHandle,
     db: SqlitePool,
@@ -116,6 +236,9 @@ pub struct AgentLoop {
     pending_permissions: PendingPermissionMap,
     mcp_manager: Arc<McpManager>,
     execution_context: Option<AgentExecutionContext>,
+    /// Selects iteration ceiling and system prompt. Interactive for
+    /// chat panel use, Autonomous for subagent / approved-task runs.
+    mode: AgentMode,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -140,6 +263,35 @@ impl AgentLoop {
         mcp_manager: Arc<McpManager>,
         execution_context: Option<AgentExecutionContext>,
     ) -> Self {
+        // Default to interactive — chat call sites get the existing
+        // behavior. Subagent + autonomous task runners call
+        // `new_with_mode` explicitly.
+        Self::new_with_mode(
+            app, db, session_id, model_id, base_url, api_key, api_style,
+            cwd, settings, pending_permissions, mcp_manager,
+            execution_context, AgentMode::Interactive,
+        )
+    }
+
+    /// Construct an agent loop with an explicit execution mode.
+    /// Autonomous mode is used by subagent runs where the user is no
+    /// longer in the turn and the agent must keep working until done.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_mode(
+        app: AppHandle,
+        db: SqlitePool,
+        session_id: String,
+        model_id: String,
+        base_url: String,
+        api_key: String,
+        api_style: ApiStyle,
+        cwd: PathBuf,
+        settings: Arc<RwLock<Settings>>,
+        pending_permissions: PendingPermissionMap,
+        mcp_manager: Arc<McpManager>,
+        execution_context: Option<AgentExecutionContext>,
+        mode: AgentMode,
+    ) -> Self {
         Self {
             app,
             db,
@@ -154,6 +306,7 @@ impl AgentLoop {
             pending_permissions,
             mcp_manager,
             execution_context,
+            mode,
         }
     }
 
@@ -165,7 +318,7 @@ impl AgentLoop {
             tool_defs.push(mcp_tool_to_definition(mcp_tool));
         }
         let event_name = format!("stream:{}", self.session_id);
-        let base_prompt = build_system_prompt(&self.cwd);
+        let base_prompt = build_system_prompt_for(self.mode, &self.cwd);
         let system_prompt =
             crate::commands::skills::get_active_system_prompt(&base_prompt, &self.app).await;
         let api_style = self.api_style.clone();
@@ -202,7 +355,7 @@ impl AgentLoop {
             hooks::HookRunner::from_settings(&settings, self.app.clone())
         };
 
-        for _ in 0..MAX_ITERATIONS {
+        for _ in 0..self.mode.max_iterations() {
             // ── Context-window management ────────────────────────────────────
             // Estimate prompt tokens before sending. If we're over 75% of the
             // model's window, elide oversized tool results from the older
@@ -856,7 +1009,7 @@ impl AgentLoop {
             hooks::HookRunner::from_settings(&settings, self.app.clone())
         };
 
-        for _ in 0..MAX_ITERATIONS {
+        for _ in 0..self.mode.max_iterations() {
             // We don't run elision compression on the Anthropic path because
             // its messages are serde_json::Value-shaped, not ChatMessage.
             // The OpenAI path is the primary one for now (OpenRouter,
@@ -1205,7 +1358,14 @@ fn detect_project_config(cwd: &Path) -> Option<(&'static str, std::path::PathBuf
 }
 
 fn build_system_prompt(cwd: &Path) -> String {
-    let mut prompt = SYSTEM_PROMPT.to_string();
+    build_system_prompt_for(AgentMode::Interactive, cwd)
+}
+
+/// Same as `build_system_prompt` but parameterized on the agent mode so
+/// subagent runs can switch to the autonomous contract without losing
+/// the project-memory / cwd appendices the interactive prompt builds.
+fn build_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
+    let mut prompt = mode.system_prompt().to_string();
 
     // ── 1. Project memory ──────────────────────────────────────────────────
     // Two locations supported:
@@ -1325,6 +1485,52 @@ fn glob_match(pattern: &str, input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── AgentMode contract tests ─────────────────────────────────────────
+    //
+    // The whole reason AgentMode exists is to flip two switches:
+    //   1. iteration budget — autonomous runs need 6x interactive
+    //   2. system prompt — autonomous tells the model "don't ask, iterate"
+    // These tests guard against accidentally regressing either by reverting
+    // a constant or losing the autonomous prompt branch.
+
+    #[test]
+    fn agent_mode_iteration_budgets_differ_significantly() {
+        let interactive = AgentMode::Interactive.max_iterations();
+        let autonomous = AgentMode::Autonomous.max_iterations();
+        // Autonomous must be MUCH larger — the goal is letting subagents
+        // run end-to-end without the 30-turn ceiling that caused tasks
+        // to abort mid-implementation in v1.0.x.
+        assert!(autonomous >= interactive * 4,
+            "autonomous budget ({autonomous}) must be at least 4× interactive ({interactive})");
+        assert!(autonomous >= 100,
+            "autonomous budget ({autonomous}) too small for real task work");
+    }
+
+    #[test]
+    fn agent_mode_autonomous_prompt_forbids_asking() {
+        let prompt = AgentMode::Autonomous.system_prompt();
+        // The whole spec for autonomous mode: the model must NOT stop to ask.
+        // If someone weakens these phrases, the v1.0 'stops every 30 seconds'
+        // bug returns silently.
+        assert!(prompt.contains("AUTONOMOUS"),
+            "autonomous prompt must self-identify as such");
+        assert!(prompt.contains("Never stop to ask"),
+            "autonomous prompt must explicitly forbid 'should I proceed?'");
+        assert!(prompt.contains("Failure is not a stopping condition"),
+            "autonomous prompt must mandate failure-iteration");
+        assert!(prompt.contains("acceptance criteria"),
+            "autonomous prompt must reference acceptance criteria");
+    }
+
+    #[test]
+    fn agent_mode_interactive_prompt_unchanged() {
+        // Interactive mode keeps the existing user-facing contract:
+        // plan-first, ask before non-trivial work.
+        let prompt = AgentMode::Interactive.system_prompt();
+        assert!(prompt.contains("Plan-first"),
+            "interactive prompt must keep plan-first guidance");
+    }
 
     fn policy(allow: &[&str], ask: &[&str], deny: &[&str]) -> PermissionPolicy {
         PermissionPolicy {
