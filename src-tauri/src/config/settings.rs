@@ -72,6 +72,11 @@ pub struct Settings {
     pub font_family: String,
     #[serde(default = "default_font_size")]
     pub font_size: u8,
+    /// True once the user has either finished or explicitly skipped the
+    /// first-run onboarding flow. Default-false on a clean install so the
+    /// overlay shows on first launch and never again.
+    #[serde(default)]
+    pub onboarded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -272,6 +277,7 @@ impl Default for Settings {
             theme: Theme::Dark,
             font_family: default_font_family(),
             font_size: default_font_size(),
+            onboarded: false,
         }
     }
 }
