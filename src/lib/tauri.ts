@@ -131,6 +131,9 @@ export interface Settings {
   theme: Theme;
   font_family: string;
   font_size: number;
+  /** True once the user has completed (or skipped) first-run onboarding.
+   *  Optional for backward compat — missing/false triggers the overlay. */
+  onboarded?: boolean;
 }
 
 // ── Git ─────────────────────────────────────────────────────────────────────

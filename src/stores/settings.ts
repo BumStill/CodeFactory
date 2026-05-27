@@ -82,7 +82,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   load: async () => {
     const s = await invoke<Settings>("get_settings");
-    // Fill in defaults for older configs that predate these fields
+    // Fill in defaults for older configs that predate these fields.
+    // `onboarded` left as-is — missing/false triggers the first-run overlay,
+    // which is the correct behaviour for both fresh installs and old
+    // upgrade-from-pre-onboarding-feature users (they get one trip
+    // through the wizard, then the flag persists).
     const merged: Settings = {
       ...s,
       theme: s.theme ?? "dark",
