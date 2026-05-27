@@ -14,7 +14,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ── Resolve current version ──────────────────────────────────────────────────
-LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+# Use the highest semver tag, not just the most-recent-by-commit-date.
+# The CI tagger can land out-of-order with manually-cut tags, and
+# `git describe` would otherwise pick a stale tag (e.g. v0.15.0)
+# while v0.20.0 already exists on the remote.
+LAST_TAG=$(git tag -l 'v*' \
+    | sort -V \
+    | tail -1)
+[ -z "$LAST_TAG" ] && LAST_TAG="v0.0.0"
 CURRENT="${LAST_TAG#v}"
 IFS='.' read -r C_MAJOR C_MINOR C_PATCH <<< "$CURRENT"
 
@@ -52,12 +59,15 @@ p.version = '$NEW';
 fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
 "
 
-# src-tauri/Cargo.toml  (first [package] block only)
-if [[ "$(uname)" == "Darwin" ]]; then
-  sed -i '' "0,/^version = \"[^\"]*\"/{s/^version = \"[^\"]*\"/version = \"$NEW\"/}" src-tauri/Cargo.toml
-else
-  sed -i "0,/^version = \"[^\"]*\"/{s/^version = \"[^\"]*\"/version = \"$NEW\"/}" src-tauri/Cargo.toml
-fi
+# src-tauri/Cargo.toml — replace ONLY the first `version = "x"` line so
+# we don't touch downstream `[dependencies] foo = { version = "..." }`
+# entries. perl works identically on macOS BSD + Linux GNU.
+perl -i -pe '
+  if (!$done && /^version = "[^"]*"/) {
+    s/^version = "[^"]*"/version = "'$NEW'"/;
+    $done = 1;
+  }
+' src-tauri/Cargo.toml
 
 # src-tauri/tauri.conf.json
 node -e "
