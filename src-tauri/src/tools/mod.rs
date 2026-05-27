@@ -6,6 +6,7 @@ pub mod glob;
 pub mod grep;
 pub mod knowledge;
 pub mod path_sanity;
+pub mod pptx;
 pub mod read;
 pub mod shell_policy;
 pub mod test_path;
@@ -78,6 +79,7 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         knowledge::search_definition(),
         knowledge::get_chunk_definition(),
         bash::definition(),
+        pptx::definition(),
     ]
 }
 
@@ -91,6 +93,7 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "kb_search" => knowledge::execute_search(args, ctx).await,
         "kb_get_chunk" => knowledge::execute_get_chunk(args, ctx).await,
         "bash" => bash::execute(args, ctx).await,
+        "write_pptx" => pptx::execute(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),
     }
 }
