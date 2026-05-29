@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod bash;
+pub mod docx;
 pub mod edit;
 pub mod file_lock;
 pub mod glob;
@@ -80,6 +81,7 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         knowledge::get_chunk_definition(),
         bash::definition(),
         pptx::definition(),
+        docx::definition(),
     ]
 }
 
@@ -94,6 +96,7 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "kb_get_chunk" => knowledge::execute_get_chunk(args, ctx).await,
         "bash" => bash::execute(args, ctx).await,
         "write_pptx" => pptx::execute(args, ctx).await,
+        "write_docx" => docx::execute(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),
     }
 }

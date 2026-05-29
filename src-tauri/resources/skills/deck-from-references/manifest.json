@@ -1,0 +1,9 @@
+{
+  "id": "deck-from-references",
+  "name": "从参考文档做 PPT / 报告",
+  "description": "把本地文件夹里的 doc / ppt / pdf 综合成一份新的 PPT 或 Word 文档。AI 会读、综合、写。",
+  "version": "1.0.0",
+  "author": "CodeFactory",
+  "tags": ["pptx", "docx", "knowledge", "synthesis"],
+  "enabled": true
+}
