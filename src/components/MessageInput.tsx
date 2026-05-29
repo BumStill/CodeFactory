@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useRef, useState, useEffect, KeyboardEvent, ClipboardEvent, DragEvent } from "react";
+import { useRef, useState, useEffect, ChangeEvent, KeyboardEvent, ClipboardEvent, DragEvent } from "react";
 import { Send, Square, Paperclip, X, Loader2 } from "lucide-react";
 import {
   filterSlashCommandSuggestions,
@@ -14,14 +14,28 @@ interface SkillSlashCommand {
   template: string;
 }
 
-/** A file the user pasted or dropped — already persisted under
- *  `<cwd>/.codefactory/attachments/`. Embedded into the outgoing message
- *  as a markdown image link on send. */
+/** A file the user pasted, dropped, or picked — already persisted under
+ *  `<cwd>/.codefactory/attachments/`. Images embed as markdown image links
+ *  (the agent reads them as vision blocks); documents embed as a labelled
+ *  path the agent can hand to read_pptx / read_file. */
 interface AttachmentChip {
   id: string;
   path: string;
   name: string;
   sizeBytes: number;
+}
+
+const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp"];
+const DOC_EXTS = ["pptx", "docx", "pdf"];
+const ACCEPT_ATTR = [...IMAGE_EXTS, ...DOC_EXTS].map((e) => `.${e}`).join(",");
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+function extOf(name: string): string {
+  const i = name.lastIndexOf(".");
+  return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
+}
+function isImageAttachment(name: string): boolean {
+  return IMAGE_EXTS.includes(extOf(name));
 }
 
 interface Props {
@@ -49,6 +63,7 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!pendingInsert) return;
@@ -85,9 +100,11 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
         "save_chat_attachment",
         { cwd, filename: file.name || "pasted.png", dataBase64: b64 },
       );
+      // Display the original filename (the on-disk name is a uuid); the
+      // original name's extension is what tells images from documents.
       setAttachments((prev) => [
         ...prev,
-        { id: crypto.randomUUID(), path: saved.path, name: saved.name, sizeBytes: saved.size_bytes },
+        { id: crypto.randomUUID(), path: saved.path, name: file.name || saved.name, sizeBytes: saved.size_bytes },
       ]);
     } catch (e) {
       setAttachError(String(e));
@@ -109,18 +126,27 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
     }
   };
 
-  const onDrop = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setDragOver(false);
-    const files = Array.from(e.dataTransfer?.files ?? []);
+  const enqueueFiles = (files: File[]) => {
     for (const f of files) {
-      // Cap per-file at 10 MB to avoid choking the IPC bridge on huge drops.
-      if (f.size > 10 * 1024 * 1024) {
-        setAttachError(`${f.name} 超过 10MB 上限，已跳过`);
+      // Cap per-file to avoid choking the IPC bridge on huge drops.
+      if (f.size > MAX_ATTACHMENT_BYTES) {
+        setAttachError(`${f.name} 超过 25MB 上限，已跳过`);
         continue;
       }
       void saveAttachmentFile(f);
     }
+  };
+
+  const onDrop = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setDragOver(false);
+    enqueueFiles(Array.from(e.dataTransfer?.files ?? []));
+  };
+
+  const onPickFiles = (e: ChangeEvent<HTMLInputElement>) => {
+    enqueueFiles(Array.from(e.target.files ?? []));
+    // Reset so picking the same file again still fires onChange.
+    e.target.value = "";
   };
 
   const onDragOver = (e: DragEvent<HTMLDivElement>) => {
@@ -163,14 +189,24 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
       return;
     }
     if (disabled) return;
-    // Append attachment markdown links at send time so the user can
-    // freely remove chips before send without text-editing the textarea.
+    // Append attachments at send time so the user can freely remove chips
+    // before send without text-editing the textarea. Images become vision
+    // markdown links; documents become a labelled path the agent reads with
+    // read_pptx (preserving-edit) or read_file (plain-text extraction).
     let outgoing = text;
     if (attachments.length > 0) {
-      const links = attachments
-        .map((a) => `![${a.name}](file://${a.path})`)
-        .join("\n");
-      outgoing = text ? `${text}\n\n${links}` : links;
+      const blocks: string[] = [];
+      const images = attachments.filter((a) => isImageAttachment(a.name));
+      const docs = attachments.filter((a) => !isImageAttachment(a.name));
+      for (const a of images) blocks.push(`![${a.name}](file://${a.path})`);
+      if (docs.length > 0) {
+        const lines = docs.map((a) => `- ${a.name} — 本地路径: ${a.path}`).join("\n");
+        blocks.push(
+          `已上传以下文件（.pptx 用 read_pptx 读结构后：edit_pptx 原地增强内容、format_pptx 统一美化排版；要总结/演讲稿就读取后在聊天框回答或 write_docx 生成。.docx/.pdf 用 read_file 提取文本）：\n${lines}`,
+        );
+      }
+      const appendix = blocks.join("\n\n");
+      outgoing = text ? `${text}\n\n${appendix}` : appendix;
     }
     setValue("");
     setAttachments([]);
@@ -258,6 +294,23 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
         </div>
       )}
       <div className="flex items-end gap-2 rounded-xl border border-border bg-surface-2 px-3 py-2 focus-within:border-accent/50 transition-colors">
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept={ACCEPT_ATTR}
+          className="hidden"
+          onChange={onPickFiles}
+        />
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={!cwd || uploading}
+          className="shrink-0 rounded-lg p-1.5 transition-colors enabled:hover:bg-surface-4 text-gray-500 disabled:opacity-30"
+          title={cwd ? "附加文件（图片 / pptx / docx / pdf）" : "打开项目后可附加文件"}
+        >
+          <Paperclip size={16} />
+        </button>
         <textarea
           ref={ref}
           value={value}
@@ -267,10 +320,10 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
           rows={1}
           placeholder={
             dragOver
-              ? "松开以附加图片"
+              ? "松开以附加文件"
               : disabled
               ? "Message or /cwd <path>"
-              : "Message · 粘贴或拖拽图片附加"
+              : "Message · 粘贴/拖拽/回形针附加文件（图片 · pptx · docx · pdf）"
           }
           className="flex-1 resize-none bg-transparent text-sm text-gray-200 placeholder-gray-600 outline-none min-h-[24px] max-h-[200px] leading-6 disabled:opacity-40"
         />

@@ -21,7 +21,9 @@ pub fn definition() -> ToolDefinition {
         r#type: "function".into(),
         function: FunctionDefinition {
             name: "read_file".into(),
-            description: "Read a file from disk. Returns line-numbered content.".into(),
+            description: "Read a file from disk. Returns line-numbered content. For Office \
+documents (.docx / .pptx / .pdf) it auto-extracts the plain text instead of raw bytes \
+(lossy — to edit a .pptx while preserving its design, use read_pptx + edit_pptx).".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -55,6 +57,31 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             return Ok(ToolOutput::err(err.message()));
         }
     };
+    // Office / PDF documents are zip/binary on disk — reading them line by
+    // line yields garbage. Auto-extract their text so the agent can "see"
+    // an uploaded .pptx/.docx/.pdf without a separate indexing step.
+    match crate::knowledge::extract_plain_text(&path) {
+        Ok(Some(text)) => {
+            let body = if text.trim().is_empty() {
+                "[no extractable text — the document may be image-only or empty]".to_string()
+            } else {
+                text
+            };
+            return Ok(ToolOutput::ok(format!(
+                "[extracted text from {}]\n\n{}",
+                path.display(),
+                body
+            )));
+        }
+        Ok(None) => {} // not a document type — fall through to plain read
+        Err(e) => {
+            return Ok(ToolOutput::err(format!(
+                "Failed to extract text from {}: {e}",
+                path.display()
+            )));
+        }
+    }
+
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) => {
