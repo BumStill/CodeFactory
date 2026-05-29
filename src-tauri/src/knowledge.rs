@@ -587,6 +587,41 @@ fn extract_document(path: &Path, kind: &str) -> crate::errors::Result<Vec<Extrac
     }
 }
 
+/// Extract readable plain text from a supported Office/PDF file
+/// (`.docx` / `.pptx` / `.pdf`). Returns `Ok(None)` when the extension
+/// isn't a supported document type so callers can fall back to byte
+/// reads. Slide/page markers are inlined so the model gets structure
+/// cues even though this is lossy (no per-shape addressing — use the
+/// `read_pptx` tool when you need to edit).
+pub fn extract_plain_text(path: &Path) -> crate::errors::Result<Option<String>> {
+    let Some(kind) = supported_kind(path) else {
+        return Ok(None);
+    };
+    let chunks = extract_document(path, kind)?;
+    let mut out = String::new();
+    let mut last_marker: Option<String> = None;
+    for chunk in &chunks {
+        let marker = match (chunk.slide, chunk.page) {
+            (Some(slide), _) => Some(format!("[Slide {slide}]")),
+            (_, Some(page)) => Some(format!("[Page {page}]")),
+            _ => None,
+        };
+        if marker != last_marker {
+            if let Some(m) = &marker {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(m);
+                out.push('\n');
+            }
+            last_marker = marker;
+        }
+        out.push_str(&chunk.text);
+        out.push('\n');
+    }
+    Ok(Some(out.trim().to_string()))
+}
+
 fn extract_docx(path: &Path) -> crate::errors::Result<Vec<ExtractedChunk>> {
     let file = std::fs::File::open(path)?;
     let mut archive = zip::ZipArchive::new(file)
