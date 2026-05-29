@@ -27,7 +27,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use super::{workspace_path, ExecCtx, ToolOutput};
@@ -46,6 +46,10 @@ struct ReadArgs {
     /// calling format_pptx.
     #[serde(default)]
     with_format: bool,
+    /// When true, estimate whether each text box overflows its frame and append
+    /// warnings. Use before/after format_pptx to catch text that won't fit.
+    #[serde(default)]
+    check_overflow: bool,
 }
 
 pub fn read_definition() -> ToolDefinition {
@@ -63,7 +67,8 @@ uploaded a deck and wants an enriched new version of it."
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Workspace-relative or absolute path to an existing .pptx." },
-                    "with_format": { "type": "boolean", "description": "Also report each paragraph's current font/size/color/bold/alignment — use before format_pptx to spot inconsistencies." }
+                    "with_format": { "type": "boolean", "description": "Also report each paragraph's current font/size/color/bold/alignment — use before format_pptx to spot inconsistencies." },
+                    "check_overflow": { "type": "boolean", "description": "Also estimate whether any text box overflows its frame (font too big / too much text) and warn. Approximate — there's no render engine." }
                 },
                 "required": ["path"]
             }),
@@ -104,6 +109,7 @@ pub async fn execute_read(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         rel_for_display(&path, ctx),
         slide_nos.len()
     ));
+    let mut overflow_hits = 0usize;
     for n in slide_nos {
         let name = format!("ppt/slides/slide{n}.xml");
         let mut xml = String::new();
@@ -115,6 +121,15 @@ pub async fn execute_read(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             continue;
         }
         outline_for_slide(&xml, n, a.with_format, &mut out);
+        if a.check_overflow {
+            let geom = resolve_layout_geometry(&mut archive, n);
+            let reports = slide_overflow_reports(&xml, &geom);
+            overflow_hits += reports.len();
+            out.push_str(&render_overflow(n, &reports));
+        }
+    }
+    if a.check_overflow && overflow_hits == 0 {
+        out.push_str("\nNo text-overflow risk detected (estimated — no render engine).\n");
     }
     Ok(ToolOutput::ok(out))
 }
@@ -544,10 +559,12 @@ fn repackage(
 // alignment / spacing), applied in place so theme, images and layout survive.
 //
 // Scope: we only rewrite *text* properties (`<a:rPr>` on every run + the
-// paragraph's `<a:pPr>`). We deliberately do NOT move or resize shapes — with no
-// render engine we can't see overflow, and nudging geometry blind is how decks
-// get broken. So "deep beautification" here means consistent typography and
-// rhythm, not re-layout.
+// paragraph's `<a:pPr>`). We deliberately do NOT move or resize shapes —
+// nudging geometry blind is how decks get broken. So "deep beautification" here
+// means consistent typography and rhythm, not re-layout. To make up for not
+// touching geometry, we *estimate* text overflow afterwards (see the overflow
+// section) and warn when a frame's text likely won't fit, so the caller can
+// dial the size back or trim content instead of shipping a clipped slide.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -689,7 +706,9 @@ theme, images and layout. Apply a list of `rules`; each targets paragraphs by `s
 bold, italic, color (hex), align, line_spacing (%), space_before/space_after (pt). Unset fields \
 are left untouched, so rules compose (e.g. one 'all' font rule + one 'title' size rule). Tip: call \
 read_pptx with with_format:true first to see current inconsistencies. NOTE: this only rewrites \
-text formatting — it never moves or resizes shapes, so it can't fix layout overflow."
+text formatting — it never moves or resizes shapes. It does, however, ESTIMATE text overflow after \
+applying your rules and warns when a frame's text likely won't fit its box, so you can lower the \
+size or trim content."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -774,6 +793,7 @@ pub async fn execute_format(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 
     let mut modified: HashMap<String, Vec<u8>> = HashMap::new();
     let mut total_paras = 0usize;
+    let mut overflow = String::new();
     for n in &slide_nos {
         let name = format!("ppt/slides/slide{n}.xml");
         let mut xml = String::new();
@@ -786,6 +806,11 @@ pub async fn execute_format(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         }
         match format_slide(&xml, *n, &a.rules) {
             Ok((new_xml, changed)) if changed > 0 => {
+                // Estimate overflow on the *formatted* XML so we catch sizes our
+                // own rules just pushed past the edge of the box.
+                let geom = resolve_layout_geometry(&mut archive, *n);
+                let reports = slide_overflow_reports(&new_xml, &geom);
+                overflow.push_str(&render_overflow(*n, &reports));
                 modified.insert(name, new_xml.into_bytes());
                 total_paras += changed;
             }
@@ -814,8 +839,13 @@ pub async fn execute_format(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         return Ok(ToolOutput::err(format!("write failed: {e}")));
     }
 
+    let overflow_section = if overflow.is_empty() {
+        "\nNo text-overflow risk detected after formatting (estimated — no render engine).".to_string()
+    } else {
+        format!("\n⚠ Overflow risk (estimated — no render engine):\n{}Lower the font size, shorten the text, or enlarge the box to resolve.", overflow.trim_end_matches('\n'))
+    };
     Ok(ToolOutput::ok(format!(
-        "Formatted {total_paras} paragraph(s) across {} slide(s) → {} ({} bytes). Theme, images and layout preserved.",
+        "Formatted {total_paras} paragraph(s) across {} slide(s) → {} ({} bytes). Theme, images and layout preserved.{overflow_section}",
         modified.len(),
         rel_for_display(&out_path, ctx),
         bytes.len()
@@ -1344,6 +1374,486 @@ fn xml_unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Overflow estimation (heuristic — there is no render engine here)
+//
+// We can't lay out glyphs, so we *estimate* whether a text frame's content fits
+// its box: take the box geometry (explicit on the shape, else inherited from the
+// slide layout placeholder), subtract insets, then sum an estimated wrapped-text
+// height paragraph-by-paragraph and compare. Conservative thresholds keep false
+// positives down; frames whose geometry we can't resolve are skipped rather than
+// guessed at, so we never emit a confidently-wrong warning.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const EMU_PER_PT: f64 = 12_700.0;
+const EMU_PER_CM: f64 = 360_000.0;
+/// Default text-frame insets (OOXML defaults): 0.1in left/right, 0.05in top/bottom.
+const DEFAULT_LR_INS_EMU: f64 = 91_440.0;
+const DEFAULT_TB_INS_EMU: f64 = 45_720.0;
+const DEFAULT_LINE_SPACING: f64 = 1.2;
+const DEFAULT_BODY_PT: f64 = 18.0;
+const DEFAULT_TITLE_PT: f64 = 44.0;
+/// How far past the box a clip/shrink frame may go before we warn (8% slack
+/// absorbs our estimation error so ordinary decks stay quiet).
+const OVERFLOW_MARGIN: f64 = 1.08;
+/// Looser threshold for grow-with-text shapes: the box itself expands, so only a
+/// big overrun risks spilling past the slide edge.
+const GROW_MARGIN: f64 = 1.20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Autofit {
+    /// `<a:noAutofit/>` or none — text keeps its size and clips/spills.
+    Clip,
+    /// `<a:normAutofit>` — PowerPoint shrinks the text to fit.
+    Shrink,
+    /// `<a:spAutoFit/>` — the shape grows to fit the text.
+    GrowShape,
+}
+
+#[derive(Debug)]
+struct OverflowReport {
+    frame: usize,
+    hint: Option<String>,
+    needed_pt: f64,
+    inner_pt: f64,
+    autofit: Autofit,
+}
+
+impl OverflowReport {
+    fn ratio(&self) -> f64 {
+        if self.inner_pt <= 0.0 {
+            0.0
+        } else {
+            self.needed_pt / self.inner_pt
+        }
+    }
+}
+
+/// Approximate advance width of a glyph in em units: CJK / full-width forms take
+/// a full em, everything else ~half. Crude but enough to tell "fits" from
+/// "doesn't" for mixed Latin/Chinese decks.
+fn glyph_em(c: char) -> f64 {
+    let u = c as u32;
+    let wide = matches!(u,
+        0x1100..=0x115F   // Hangul Jamo
+        | 0x2E80..=0x303E // CJK radicals .. punctuation
+        | 0x3041..=0x33FF // Hiragana/Katakana .. CJK compat
+        | 0x3400..=0x4DBF // CJK Ext A
+        | 0x4E00..=0x9FFF // CJK Unified
+        | 0xA000..=0xA4CF // Yi
+        | 0xAC00..=0xD7A3 // Hangul Syllables
+        | 0xF900..=0xFAFF // CJK Compat Ideographs
+        | 0xFE30..=0xFE4F // CJK Compat Forms
+        | 0xFF00..=0xFF60 // Fullwidth forms
+        | 0xFFE0..=0xFFE6
+    );
+    if wide {
+        1.0
+    } else {
+        0.5
+    }
+}
+
+fn text_em_width(s: &str) -> f64 {
+    s.chars().map(glyph_em).sum()
+}
+
+/// `(cx, cy)` of a shape's `<a:xfrm><a:ext>` in EMU, if it sets one explicitly.
+fn shape_ext(xml: &str, sp_inner: (usize, usize)) -> Option<(f64, f64)> {
+    let xfrm = find_simple_elements(xml, "a:xfrm", sp_inner)
+        .into_iter()
+        .next()?;
+    let region = xfrm.inner?;
+    let ext = find_simple_elements(xml, "a:ext", region).into_iter().next()?;
+    let tag = &xml[ext.outer.0..ext.outer.1];
+    let cx = attr_value(tag, "cx")?.parse::<f64>().ok()?;
+    let cy = attr_value(tag, "cy")?.parse::<f64>().ok()?;
+    Some((cx, cy))
+}
+
+struct BodyPr {
+    l: f64,
+    t: f64,
+    r: f64,
+    b: f64,
+    autofit: Autofit,
+}
+
+/// Read a text frame's `<a:bodyPr>` insets + autofit mode. Missing attrs fall
+/// back to OOXML defaults; a missing/`noAutofit` body is treated as Clip.
+fn body_pr(xml: &str, frame_inner: (usize, usize)) -> BodyPr {
+    let mut bp = BodyPr {
+        l: DEFAULT_LR_INS_EMU,
+        t: DEFAULT_TB_INS_EMU,
+        r: DEFAULT_LR_INS_EMU,
+        b: DEFAULT_TB_INS_EMU,
+        autofit: Autofit::Clip,
+    };
+    let Some(body) = find_simple_elements(xml, "a:bodyPr", frame_inner)
+        .into_iter()
+        .next()
+    else {
+        return bp;
+    };
+    let open_end = body.inner.map(|i| i.0).unwrap_or(body.outer.1);
+    let open = &xml[body.outer.0..open_end];
+    if let Some(v) = attr_value(open, "lIns").and_then(|s| s.parse().ok()) {
+        bp.l = v;
+    }
+    if let Some(v) = attr_value(open, "tIns").and_then(|s| s.parse().ok()) {
+        bp.t = v;
+    }
+    if let Some(v) = attr_value(open, "rIns").and_then(|s| s.parse().ok()) {
+        bp.r = v;
+    }
+    if let Some(v) = attr_value(open, "bIns").and_then(|s| s.parse().ok()) {
+        bp.b = v;
+    }
+    if let Some(inner) = body.inner {
+        let seg = &xml[inner.0..inner.1];
+        if seg.contains("<a:spAutoFit") {
+            bp.autofit = Autofit::GrowShape;
+        } else if seg.contains("<a:normAutofit") {
+            bp.autofit = Autofit::Shrink;
+        }
+    }
+    bp
+}
+
+/// `(type, idx)` of a shape's `<p:ph>` placeholder, if any.
+fn shape_ph(xml: &str, sp_inner: (usize, usize)) -> (Option<String>, Option<String>) {
+    let seg = &xml[sp_inner.0..sp_inner.1];
+    if let Some(rel) = seg.find("<p:ph") {
+        let start = sp_inner.0 + rel;
+        if let Some(gt) = xml[start..sp_inner.1].find('>') {
+            let tag = &xml[start..start + gt];
+            return (attr_value(tag, "type"), attr_value(tag, "idx"));
+        }
+    }
+    (None, None)
+}
+
+/// Stable key matching a slide placeholder to its layout placeholder. Title
+/// variants collapse together; bodies are keyed by `idx` (default 0).
+fn ph_key(ty: Option<&str>, idx: Option<&str>) -> String {
+    match ty {
+        Some("title") | Some("ctrTitle") => "title".to_string(),
+        Some("subTitle") => "subTitle".to_string(),
+        _ => format!("idx:{}", idx.unwrap_or("0")),
+    }
+}
+
+/// Largest run font size (pt) in a paragraph; falls back to `endParaRPr`, then a
+/// type-appropriate default.
+fn para_font_pt(xml: &str, para_inner: (usize, usize), is_title: bool) -> f64 {
+    let mut max_sz: Option<f64> = None;
+    for r in find_simple_elements(xml, "a:rPr", para_inner) {
+        let open_end = r.inner.map(|i| i.0).unwrap_or(r.outer.1);
+        let open = &xml[r.outer.0..open_end];
+        if let Some(pt) = attr_value(open, "sz").and_then(|s| s.parse::<f64>().ok()) {
+            let pt = pt / 100.0;
+            max_sz = Some(max_sz.map_or(pt, |m: f64| m.max(pt)));
+        }
+    }
+    if let Some(pt) = max_sz {
+        return pt;
+    }
+    for e in find_simple_elements(xml, "a:endParaRPr", para_inner) {
+        let open_end = e.inner.map(|i| i.0).unwrap_or(e.outer.1);
+        let open = &xml[e.outer.0..open_end];
+        if let Some(pt) = attr_value(open, "sz").and_then(|s| s.parse::<f64>().ok()) {
+            return pt / 100.0;
+        }
+    }
+    if is_title {
+        DEFAULT_TITLE_PT
+    } else {
+        DEFAULT_BODY_PT
+    }
+}
+
+enum LineHeight {
+    Factor(f64),
+    AbsolutePt(f64),
+}
+
+/// A paragraph's line spacing from `<a:pPr><a:lnSpc>` — percent (factor) or
+/// absolute points. Defaults to 1.2× when unset.
+fn para_line_height(xml: &str, para_inner: (usize, usize)) -> LineHeight {
+    if let Some(ppr) = find_simple_elements(xml, "a:pPr", para_inner)
+        .into_iter()
+        .next()
+    {
+        if let Some(inner) = ppr.inner {
+            if let Some(ln) = find_simple_elements(xml, "a:lnSpc", inner).into_iter().next() {
+                if let Some(lin) = ln.inner {
+                    if let Some(pct) = find_simple_elements(xml, "a:spcPct", lin).into_iter().next()
+                    {
+                        if let Some(v) = attr_value(&xml[pct.outer.0..pct.outer.1], "val")
+                            .and_then(|s| s.parse::<f64>().ok())
+                        {
+                            return LineHeight::Factor(v / 100_000.0);
+                        }
+                    }
+                    if let Some(pts) = find_simple_elements(xml, "a:spcPts", lin).into_iter().next()
+                    {
+                        if let Some(v) = attr_value(&xml[pts.outer.0..pts.outer.1], "val")
+                            .and_then(|s| s.parse::<f64>().ok())
+                        {
+                            return LineHeight::AbsolutePt(v / 100.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    LineHeight::Factor(DEFAULT_LINE_SPACING)
+}
+
+/// Space before/after a paragraph in points (`<a:spcBef>` / `<a:spcAft>`).
+/// `which` is "before" or "after"; percent values are taken relative to `font_pt`.
+fn para_space(xml: &str, para_inner: (usize, usize), which: &str, font_pt: f64) -> f64 {
+    let tag = if which == "before" {
+        "a:spcBef"
+    } else {
+        "a:spcAft"
+    };
+    if let Some(ppr) = find_simple_elements(xml, "a:pPr", para_inner)
+        .into_iter()
+        .next()
+    {
+        if let Some(inner) = ppr.inner {
+            if let Some(sp) = find_simple_elements(xml, tag, inner).into_iter().next() {
+                if let Some(spin) = sp.inner {
+                    if let Some(pts) = find_simple_elements(xml, "a:spcPts", spin).into_iter().next()
+                    {
+                        if let Some(v) = attr_value(&xml[pts.outer.0..pts.outer.1], "val")
+                            .and_then(|s| s.parse::<f64>().ok())
+                        {
+                            return v / 100.0;
+                        }
+                    }
+                    if let Some(pct) = find_simple_elements(xml, "a:spcPct", spin).into_iter().next()
+                    {
+                        if let Some(v) = attr_value(&xml[pct.outer.0..pct.outer.1], "val")
+                            .and_then(|s| s.parse::<f64>().ok())
+                        {
+                            return (v / 100_000.0) * font_pt;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    0.0
+}
+
+/// Estimated total text height (pt) for a frame: each paragraph wraps to
+/// `ceil(width / line_width)` lines, times its line height, plus before/after
+/// spacing.
+fn estimate_text_height_pt(
+    xml: &str,
+    frame_inner: (usize, usize),
+    is_title: bool,
+    inner_w_pt: f64,
+) -> f64 {
+    let paras = find_simple_elements(xml, "a:p", frame_inner);
+    let mut total = 0.0;
+    for para in &paras {
+        let default_pt = if is_title {
+            DEFAULT_TITLE_PT
+        } else {
+            DEFAULT_BODY_PT
+        };
+        let Some(inner) = para.inner else {
+            total += default_pt * DEFAULT_LINE_SPACING;
+            continue;
+        };
+        let font_pt = para_font_pt(xml, inner, is_title);
+        let em = text_em_width(&paragraph_text(xml, para));
+        // chars-per-line in em units (1 em ≈ font_pt wide)
+        let line_w_em = if inner_w_pt > 0.0 {
+            inner_w_pt / font_pt
+        } else {
+            0.0
+        };
+        let lines = if em <= 0.0 || line_w_em <= 0.0 {
+            1.0
+        } else {
+            (em / line_w_em).ceil().max(1.0)
+        };
+        let line_h = match para_line_height(xml, inner) {
+            LineHeight::Factor(f) => font_pt * f,
+            LineHeight::AbsolutePt(p) => p,
+        };
+        let before = para_space(xml, inner, "before", font_pt);
+        let after = para_space(xml, inner, "after", font_pt);
+        total += lines * line_h + before + after;
+    }
+    total
+}
+
+/// Per-slide overflow estimate. `layout_geom` supplies inherited placeholder
+/// geometry (ph_key → (cx, cy) EMU) for shapes that don't set their own.
+fn slide_overflow_reports(
+    xml: &str,
+    layout_geom: &HashMap<String, (f64, f64)>,
+) -> Vec<OverflowReport> {
+    let frames = find_simple_elements(xml, "p:txBody", (0, xml.len()));
+    let shapes = find_simple_elements(xml, "p:sp", (0, xml.len()));
+    let mut reports = Vec::new();
+
+    for (fi, frame) in frames.iter().enumerate() {
+        let Some(frame_inner) = frame.inner else {
+            continue;
+        };
+        // Owner = smallest p:sp enclosing this frame. Frames outside any p:sp
+        // (e.g. table/graphicFrame cells) have no simple box — skip them.
+        let Some(owner) = shapes
+            .iter()
+            .filter(|s| s.outer.0 <= frame.outer.0 && frame.outer.1 <= s.outer.1)
+            .min_by_key(|s| s.outer.1 - s.outer.0)
+        else {
+            continue;
+        };
+        let Some(owner_inner) = owner.inner else {
+            continue;
+        };
+
+        let (ty, idx) = shape_ph(xml, owner_inner);
+        let key = ph_key(ty.as_deref(), idx.as_deref());
+        let is_title = key == "title";
+
+        // Explicit shape geometry wins; else inherit from the layout placeholder.
+        // Unknown geometry → skip (better silent than confidently wrong).
+        let Some((cx, cy)) = shape_ext(xml, owner_inner).or_else(|| layout_geom.get(&key).copied())
+        else {
+            continue;
+        };
+
+        let bp = body_pr(xml, frame_inner);
+        let inner_w_pt = (cx - bp.l - bp.r).max(0.0) / EMU_PER_PT;
+        let inner_h_pt = (cy - bp.t - bp.b).max(0.0) / EMU_PER_PT;
+        if inner_w_pt <= 0.0 || inner_h_pt <= 0.0 {
+            continue;
+        }
+
+        let needed_pt = estimate_text_height_pt(xml, frame_inner, is_title, inner_w_pt);
+        let margin = match bp.autofit {
+            Autofit::GrowShape => GROW_MARGIN,
+            _ => OVERFLOW_MARGIN,
+        };
+        if needed_pt > inner_h_pt * margin {
+            reports.push(OverflowReport {
+                frame: fi,
+                hint: placeholder_hint(xml, frame.outer.0),
+                needed_pt,
+                inner_pt: inner_h_pt,
+                autofit: bp.autofit,
+            });
+        }
+    }
+    reports
+}
+
+/// Human-readable warnings for a slide's overflow reports. Empty string when the
+/// slide is clean (so callers can concatenate freely).
+fn render_overflow(slide_no: usize, reports: &[OverflowReport]) -> String {
+    let mut s = String::new();
+    for r in reports {
+        let need_cm = r.needed_pt * EMU_PER_PT / EMU_PER_CM;
+        let box_cm = r.inner_pt * EMU_PER_PT / EMU_PER_CM;
+        let pct = (r.ratio() * 100.0).round() as i64;
+        let hint = match &r.hint {
+            Some(h) => format!(" ({h})"),
+            None => String::new(),
+        };
+        let advice = match r.autofit {
+            Autofit::Clip => "text will clip — reduce the font size or trim content",
+            Autofit::Shrink => {
+                "PowerPoint will auto-shrink the text to fit (it may get quite small) — \
+                 trim content or enlarge the box"
+            }
+            Autofit::GrowShape => {
+                "the box grows with text, so it may extend past the slide edge — \
+                 check placement or trim content"
+            }
+        };
+        s.push_str(&format!(
+            "  ⚠ s{slide_no} frame {}{}: text needs ≈{:.1}cm but box is ≈{:.1}cm (~{}%); {}.\n",
+            r.frame, hint, need_cm, box_cm, pct, advice
+        ));
+    }
+    s
+}
+
+/// Build `ph_key → (cx, cy)` geometry from slide N's layout placeholders, so a
+/// slide placeholder that omits its own `<a:xfrm>` can inherit the box. Returns
+/// an empty map (→ those frames are skipped) if rels/layout can't be read.
+fn resolve_layout_geometry<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    slide_no: usize,
+) -> HashMap<String, (f64, f64)> {
+    let mut map = HashMap::new();
+    let rels_name = format!("ppt/slides/_rels/slide{slide_no}.xml.rels");
+    let mut rels = String::new();
+    if archive
+        .by_name(&rels_name)
+        .and_then(|mut f| f.read_to_string(&mut rels).map_err(zip::result::ZipError::from))
+        .is_err()
+    {
+        return map;
+    }
+    let Some(target) = layout_target(&rels) else {
+        return map;
+    };
+    let layout_name = normalize_ppt_part(&target);
+    let mut layout = String::new();
+    if archive
+        .by_name(&layout_name)
+        .and_then(|mut f| f.read_to_string(&mut layout).map_err(zip::result::ZipError::from))
+        .is_err()
+    {
+        return map;
+    }
+    for sp in find_simple_elements(&layout, "p:sp", (0, layout.len())) {
+        let Some(inner) = sp.inner else { continue };
+        let (ty, idx) = shape_ph(&layout, inner);
+        if ty.is_none() && idx.is_none() {
+            continue; // not a placeholder
+        }
+        if let Some(ext) = shape_ext(&layout, inner) {
+            map.entry(ph_key(ty.as_deref(), idx.as_deref()))
+                .or_insert(ext);
+        }
+    }
+    map
+}
+
+/// Target of the (first) slideLayout relationship in a slide's `.rels`.
+fn layout_target(rels_xml: &str) -> Option<String> {
+    for r in find_simple_elements(rels_xml, "Relationship", (0, rels_xml.len())) {
+        let tag = &rels_xml[r.outer.0..r.outer.1];
+        if attr_value(tag, "Type").is_some_and(|t| t.ends_with("slideLayout")) {
+            return attr_value(tag, "Target");
+        }
+    }
+    None
+}
+
+/// Resolve a slide-relative rels Target (e.g. `../slideLayouts/slideLayout1.xml`)
+/// to a package path (`ppt/slideLayouts/slideLayout1.xml`).
+fn normalize_ppt_part(target: &str) -> String {
+    let t = target.trim_start_matches('/');
+    if let Some(rest) = t.strip_prefix("../") {
+        format!("ppt/{rest}")
+    } else if t.starts_with("ppt/") {
+        t.to_string()
+    } else {
+        format!("ppt/slides/{t}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1688,5 +2198,233 @@ mod tests {
         assert!(s.contains("Brand New Title"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── overflow estimation ─────────────────────────────────────────────────
+
+    /// A 5cm × 1.27cm box (explicit geometry, noAutofit) holding a long 40pt line
+    /// — guaranteed to overflow many times over.
+    const SLIDE_TIGHT: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://a" xmlns:r="http://r" xmlns:p="http://p">
+<p:cSld><p:spTree>
+<p:sp><p:nvSpPr><p:cNvPr id="2" name="Box"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="457200"/></a:xfrm></p:spPr>
+<p:txBody><a:bodyPr lIns="91440" tIns="45720" rIns="91440" bIns="45720"><a:noAutofit/></a:bodyPr><a:p><a:r><a:rPr lang="en-US" sz="4000"/><a:t>This is a very long line of text that will definitely wrap many times and overflow the tiny box</a:t></a:r></a:p></p:txBody></p:sp>
+</p:spTree></p:cSld></p:sld>"#;
+
+    fn empty_geom() -> HashMap<String, (f64, f64)> {
+        HashMap::new()
+    }
+
+    fn zip_with(parts: &[(&str, &[u8])]) -> Vec<u8> {
+        let buf = Cursor::new(Vec::<u8>::new());
+        let mut zip = ZipWriter::new(buf);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, bytes) in parts {
+            zip.start_file::<_, ()>(*name, opts).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn glyph_widths_split_cjk_from_latin() {
+        assert_eq!(glyph_em('A'), 0.5);
+        assert_eq!(glyph_em(' '), 0.5);
+        assert_eq!(glyph_em('中'), 1.0);
+        assert_eq!(glyph_em('日'), 1.0);
+        assert_eq!(text_em_width("AB中"), 2.0); // 0.5 + 0.5 + 1.0
+    }
+
+    #[test]
+    fn ph_key_collapses_titles_and_keys_bodies_by_idx() {
+        assert_eq!(ph_key(Some("title"), None), "title");
+        assert_eq!(ph_key(Some("ctrTitle"), None), "title");
+        assert_eq!(ph_key(Some("subTitle"), None), "subTitle");
+        assert_eq!(ph_key(Some("body"), Some("1")), "idx:1");
+        assert_eq!(ph_key(None, Some("2")), "idx:2");
+        assert_eq!(ph_key(None, None), "idx:0");
+    }
+
+    #[test]
+    fn overflow_flagged_when_text_exceeds_box() {
+        let reports = slide_overflow_reports(SLIDE_TIGHT, &empty_geom());
+        assert_eq!(reports.len(), 1, "tiny box with long text should overflow");
+        assert_eq!(reports[0].frame, 0);
+        assert_eq!(reports[0].autofit, Autofit::Clip);
+        assert!(
+            reports[0].ratio() > 1.08,
+            "ratio {} should exceed margin",
+            reports[0].ratio()
+        );
+        let rendered = render_overflow(1, &reports);
+        assert!(rendered.contains("⚠ s1 frame 0"), "render: {rendered}");
+        assert!(rendered.contains("clip"), "clip advice missing: {rendered}");
+    }
+
+    #[test]
+    fn no_overflow_when_text_fits() {
+        let slide = r#"<p:sld xmlns:a="http://a" xmlns:p="http://p"><p:cSld><p:spTree>
+<p:sp><p:nvSpPr><p:cNvPr id="2"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+<p:spPr><a:xfrm><a:ext cx="8000000" cy="4000000"/></a:xfrm></p:spPr>
+<p:txBody><a:bodyPr><a:noAutofit/></a:bodyPr><a:p><a:r><a:rPr sz="1800"/><a:t>Short</a:t></a:r></a:p></p:txBody></p:sp>
+</p:spTree></p:cSld></p:sld>"#;
+        let reports = slide_overflow_reports(slide, &empty_geom());
+        assert!(reports.is_empty(), "roomy box should not overflow: {reports:?}");
+    }
+
+    #[test]
+    fn normautofit_reports_shrink() {
+        let slide = SLIDE_TIGHT.replace("<a:noAutofit/>", "<a:normAutofit/>");
+        let reports = slide_overflow_reports(&slide, &empty_geom());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].autofit, Autofit::Shrink);
+        let rendered = render_overflow(1, &reports);
+        assert!(rendered.contains("auto-shrink"), "shrink advice missing: {rendered}");
+    }
+
+    #[test]
+    fn unresolvable_geometry_is_skipped() {
+        // SLIDE1 frames are placeholders with no <a:xfrm>; with no layout geometry
+        // we must skip them rather than warn on a guess.
+        let reports = slide_overflow_reports(SLIDE1, &empty_geom());
+        assert!(
+            reports.is_empty(),
+            "frames without resolvable geometry must be skipped"
+        );
+    }
+
+    #[test]
+    fn inherited_geometry_from_layout_enables_overflow() {
+        let slide = r#"<p:sld xmlns:a="http://a" xmlns:p="http://p"><p:cSld><p:spTree>
+<p:sp><p:nvSpPr><p:cNvPr id="3"/><p:cNvSpPr/><p:nvPr><p:ph idx="1"/></p:nvPr></p:nvSpPr>
+<p:spPr/><p:txBody><a:bodyPr><a:noAutofit/></a:bodyPr><a:p><a:r><a:rPr sz="4000"/><a:t>Long long long long long long long long long long long text here</a:t></a:r></a:p></p:txBody></p:sp>
+</p:spTree></p:cSld></p:sld>"#;
+        // Without layout geometry → skipped (the shape has no <a:xfrm>).
+        assert!(slide_overflow_reports(slide, &empty_geom()).is_empty());
+        // With the placeholder box inherited from the layout → flagged.
+        let mut geom = HashMap::new();
+        geom.insert("idx:1".to_string(), (1828800.0, 457200.0));
+        let reports = slide_overflow_reports(slide, &geom);
+        assert_eq!(
+            reports.len(),
+            1,
+            "inherited geometry should let us detect overflow"
+        );
+    }
+
+    #[test]
+    fn layout_target_and_part_normalization() {
+        let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://x">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout3.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+</Relationships>"#;
+        assert_eq!(
+            layout_target(rels).as_deref(),
+            Some("../slideLayouts/slideLayout3.xml")
+        );
+        assert_eq!(
+            normalize_ppt_part("../slideLayouts/slideLayout3.xml"),
+            "ppt/slideLayouts/slideLayout3.xml"
+        );
+        assert_eq!(
+            normalize_ppt_part("ppt/slideLayouts/slideLayout3.xml"),
+            "ppt/slideLayouts/slideLayout3.xml"
+        );
+        assert_eq!(
+            normalize_ppt_part("/ppt/slideLayouts/slideLayout3.xml"),
+            "ppt/slideLayouts/slideLayout3.xml"
+        );
+    }
+
+    #[test]
+    fn resolve_layout_geometry_reads_layout() {
+        let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://x"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>"#;
+        let layout = r#"<p:sldLayout xmlns:a="http://a" xmlns:p="http://p"><p:cSld><p:spTree>
+<p:sp><p:nvSpPr><p:cNvPr id="2"/><p:cNvSpPr/><p:nvPr><p:ph idx="1"/></p:nvPr></p:nvSpPr>
+<p:spPr><a:xfrm><a:ext cx="1828800" cy="457200"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:p/></p:txBody></p:sp>
+<p:sp><p:nvSpPr><p:cNvPr id="3"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+<p:spPr><a:xfrm><a:ext cx="8000000" cy="900000"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:p/></p:txBody></p:sp>
+</p:spTree></p:cSld></p:sldLayout>"#;
+        let zip_bytes = zip_with(&[
+            ("ppt/slides/_rels/slide1.xml.rels", rels.as_bytes()),
+            ("ppt/slideLayouts/slideLayout1.xml", layout.as_bytes()),
+        ]);
+        let mut archive = ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+        let geom = resolve_layout_geometry(&mut archive, 1);
+        assert_eq!(geom.get("idx:1").copied(), Some((1828800.0, 457200.0)));
+        assert_eq!(geom.get("title").copied(), Some((8000000.0, 900000.0)));
+    }
+
+    #[tokio::test]
+    async fn read_pptx_check_overflow_flags_tight_box() {
+        let deck = make_deck(SLIDE_TIGHT);
+        let cwd = std::env::temp_dir().join(format!("cf-pptx-ovf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(cwd.join("deck.pptx"), &deck).unwrap();
+        let ctx = ExecCtx::new(cwd.clone(), None);
+
+        let res = execute_read(json!({ "path": "deck.pptx", "check_overflow": true }), &ctx)
+            .await
+            .unwrap();
+        assert!(!res.is_error, "read errored: {}", res.content);
+        assert!(res.content.contains("⚠"), "overflow warning missing: {}", res.content);
+        assert!(res.content.contains("frame 0"), "frame locator missing: {}", res.content);
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[tokio::test]
+    async fn read_pptx_check_overflow_clean_when_no_geometry() {
+        let deck = make_deck(SLIDE1); // placeholders, no resolvable geometry
+        let cwd = std::env::temp_dir().join(format!("cf-pptx-ovf2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(cwd.join("deck.pptx"), &deck).unwrap();
+        let ctx = ExecCtx::new(cwd.clone(), None);
+
+        let res = execute_read(json!({ "path": "deck.pptx", "check_overflow": true }), &ctx)
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        assert!(
+            res.content.contains("No text-overflow risk detected"),
+            "expected clean message: {}",
+            res.content
+        );
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[tokio::test]
+    async fn format_pptx_warns_on_overflow() {
+        let deck = make_deck(SLIDE_TIGHT);
+        let cwd = std::env::temp_dir().join(format!("cf-pptx-fmtovf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(cwd.join("deck.pptx"), &deck).unwrap();
+        let ctx = ExecCtx::new(cwd.clone(), None);
+
+        let res = execute_format(
+            json!({
+                "path": "deck.pptx",
+                "out_path": "deck-big.pptx",
+                "rules": [ { "scope": "all", "size": 80 } ]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "format errored: {}", res.content);
+        assert!(
+            res.content.contains("Overflow risk"),
+            "expected overflow warning: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("⚠ s1 frame 0"),
+            "expected frame locator: {}",
+            res.content
+        );
+
+        std::fs::remove_dir_all(&cwd).ok();
     }
 }
