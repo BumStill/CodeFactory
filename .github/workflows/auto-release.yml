@@ -97,13 +97,26 @@ jobs:
             c.version = '$NEW';
             fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(c,null,2)+'\n');
           "
+          # src-tauri/Cargo.lock — keep the committed lockfile in step with
+          # Cargo.toml. We patch the [[package]] codefactory version line directly
+          # (the line right after its `name =` line) rather than running
+          # `cargo update`: this job sets up no Rust toolchain or registry index,
+          # and a stray cargo could rewrite the lockfile format. A workspace
+          # member carries no checksum, so this one-line replace is byte-for-byte
+          # what cargo itself writes.
+          sed -i '/^name = "codefactory"$/{n;s/^version = ".*"/version = "'"$NEW"'"/}' src-tauri/Cargo.lock
+          # Fail fast if the lock didn't actually sync — never tag a release whose
+          # lockfile disagrees with its manifests.
+          grep -A1 '^name = "codefactory"$' src-tauri/Cargo.lock | grep -q "version = \"$NEW\"" || {
+            echo "::error::Cargo.lock codefactory entry did not sync to $NEW"; exit 1;
+          }
 
       - name: Commit, tag, push
         env:
           NEW: ${{ steps.ver.outputs.version }}
           TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json
+          git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/Cargo.lock
           git commit -m "chore: bump version to $NEW"
           git tag "$TAG"
           git push origin main
