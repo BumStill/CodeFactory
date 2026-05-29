@@ -35,7 +35,18 @@ use super::{path_sanity, workspace_path, ExecCtx, ToolOutput};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SlideLayout {
+    /// Standard layout: title at top, bullets below. Default.
+    #[default]
+    Content,
+    /// Section-divider: large centered title only, body ignored. Use
+    /// between major sections of a deck. Acts as a chapter cover.
+    Section,
+}
+
+#[derive(Deserialize, Debug, Default)]
 pub struct PptxSlide {
     /// Slide heading. Required, shown at the top.
     pub title: String,
@@ -43,6 +54,14 @@ pub struct PptxSlide {
     /// (title-only slide).
     #[serde(default)]
     pub bullets: Vec<String>,
+    /// Visual layout. Defaults to `content` (title + bullets). Use
+    /// `section` for chapter divider slides — big centered title only.
+    #[serde(default)]
+    pub layout: SlideLayout,
+    /// Speaker notes. Rendered in PowerPoint's presenter view and
+    /// notes pages, hidden in slide-show mode. Empty = no notes.
+    #[serde(default)]
+    pub notes: String,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +101,15 @@ first, then call this with the synthesized outline.".into(),
                                     "type": "array",
                                     "items": { "type": "string" },
                                     "description": "Body bullets (one entry per bullet). Empty = title-only slide.",
+                                },
+                                "layout": {
+                                    "type": "string",
+                                    "enum": ["content", "section"],
+                                    "description": "Visual layout. 'content' (default) = title + bullets. 'section' = chapter divider, big centered title only.",
+                                },
+                                "notes": {
+                                    "type": "string",
+                                    "description": "Speaker notes. Shown in presenter view / notes pages, hidden in slide show. Empty = no notes.",
                                 },
                             },
                             "required": ["title"],
@@ -190,18 +218,33 @@ fn build_pptx_bytes(slides: &[PptxSlide]) -> std::result::Result<Vec<u8>, String
         }};
     }
 
+    // Indexes of slides that carry speaker notes — used to emit notesSlide
+    // parts + presentation.xml content-type overrides only for those that
+    // need them (notesless slides skip the extra files entirely).
+    let notes_indexes: Vec<usize> = slides
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| if !s.notes.trim().is_empty() { Some(i) } else { None })
+        .collect();
+    let has_notes = !notes_indexes.is_empty();
+
     // ── Static infrastructure ─────────────────────────────────────────
-    write_part!("[Content_Types].xml", content_types_xml(slides.len()));
+    write_part!("[Content_Types].xml", content_types_xml(slides.len(), &notes_indexes));
     write_part!("_rels/.rels", REL_TOP);
     write_part!("docProps/app.xml", APP_XML);
     write_part!("docProps/core.xml", CORE_XML);
     write_part!("ppt/presentation.xml", presentation_xml(slides.len()));
-    write_part!("ppt/_rels/presentation.xml.rels", presentation_rels(slides.len()));
+    write_part!("ppt/_rels/presentation.xml.rels", presentation_rels(slides.len(), has_notes));
     write_part!("ppt/theme/theme1.xml", THEME_XML);
     write_part!("ppt/slideMasters/slideMaster1.xml", SLIDE_MASTER_XML);
     write_part!("ppt/slideMasters/_rels/slideMaster1.xml.rels", SLIDE_MASTER_RELS);
     write_part!("ppt/slideLayouts/slideLayout1.xml", SLIDE_LAYOUT_XML);
     write_part!("ppt/slideLayouts/_rels/slideLayout1.xml.rels", SLIDE_LAYOUT_RELS);
+
+    if has_notes {
+        write_part!("ppt/notesMasters/notesMaster1.xml", NOTES_MASTER_XML);
+        write_part!("ppt/notesMasters/_rels/notesMaster1.xml.rels", NOTES_MASTER_RELS);
+    }
 
     // ── Per-slide files ───────────────────────────────────────────────
     for (i, slide) in slides.iter().enumerate() {
@@ -209,7 +252,15 @@ fn build_pptx_bytes(slides: &[PptxSlide]) -> std::result::Result<Vec<u8>, String
         let slide_path = format!("ppt/slides/slide{n}.xml");
         let rels_path  = format!("ppt/slides/_rels/slide{n}.xml.rels");
         write_part!(&slide_path, slide_xml(slide));
-        write_part!(&rels_path, SLIDE_RELS);
+        // Only this slide's rels reference its notesSlide when notes exist.
+        let needs_notes = !slide.notes.trim().is_empty();
+        write_part!(&rels_path, slide_rels(needs_notes, n));
+        if needs_notes {
+            let notes_path = format!("ppt/notesSlides/notesSlide{n}.xml");
+            let notes_rels_path = format!("ppt/notesSlides/_rels/notesSlide{n}.xml.rels");
+            write_part!(&notes_path, notes_slide_xml(&slide.notes));
+            write_part!(&notes_rels_path, notes_slide_rels(n));
+        }
     }
 
     // `finish` consumes the writer and returns the underlying Cursor.
@@ -229,12 +280,22 @@ fn xml_escape(s: &str) -> String {
 
 // ── Dynamic XML templates ────────────────────────────────────────────────────
 
-fn content_types_xml(n: usize) -> String {
+fn content_types_xml(n: usize, notes_indexes: &[usize]) -> String {
     let mut overrides = String::new();
     for i in 1..=n {
         overrides.push_str(&format!(
             "<Override PartName=\"/ppt/slides/slide{i}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slide+xml\"/>"
         ));
+    }
+    // notesSlide overrides + a single notesMaster override (shared by all)
+    if !notes_indexes.is_empty() {
+        overrides.push_str("<Override PartName=\"/ppt/notesMasters/notesMaster1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml\"/>");
+        for idx in notes_indexes {
+            let n = idx + 1;
+            overrides.push_str(&format!(
+                "<Override PartName=\"/ppt/notesSlides/notesSlide{n}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml\"/>"
+            ));
+        }
     }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -271,7 +332,7 @@ fn presentation_xml(n: usize) -> String {
     )
 }
 
-fn presentation_rels(n: usize) -> String {
+fn presentation_rels(n: usize, has_notes: bool) -> String {
     let mut rels = String::from(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -283,16 +344,49 @@ fn presentation_rels(n: usize) -> String {
             "<Relationship Id=\"rId{r_id}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide{i}.xml\"/>"
         ));
     }
-    // Theme comes after slides in rId order
     let theme_rid = n + 2;
     rels.push_str(&format!(
         "<Relationship Id=\"rId{theme_rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme\" Target=\"theme/theme1.xml\"/>"
     ));
+    if has_notes {
+        let notes_master_rid = n + 3;
+        rels.push_str(&format!(
+            "<Relationship Id=\"rId{notes_master_rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesMaster\" Target=\"notesMasters/notesMaster1.xml\"/>"
+        ));
+    }
     rels.push_str("</Relationships>");
     rels
 }
 
 fn slide_xml(slide: &PptxSlide) -> String {
+    match slide.layout {
+        SlideLayout::Section => slide_xml_section(&slide.title),
+        SlideLayout::Content => slide_xml_content(slide),
+    }
+}
+
+/// Section-divider slide: single large centered title, no body. Used to
+/// visually break a deck into chapters.
+fn slide_xml_section(title: &str) -> String {
+    let t = xml_escape(title);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+<p:cSld><p:spTree>
+<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+<p:sp>
+<p:nvSpPr><p:cNvPr id="2" name="Section Title"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr><p:ph type="ctrTitle"/></p:nvPr></p:nvSpPr>
+<p:spPr><a:xfrm><a:off x="457200" y="2438400"/><a:ext cx="11277600" cy="1981200"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>
+<p:txBody><a:bodyPr anchor="ctr"/><a:lstStyle/><a:p><a:pPr algn="ctr"/><a:r><a:rPr lang="en-US" sz="6000" b="1" dirty="0"><a:solidFill><a:srgbClr val="2E74B5"/></a:solidFill></a:rPr><a:t>{t}</a:t></a:r></a:p></p:txBody>
+</p:sp>
+</p:spTree></p:cSld>
+<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
+</p:sld>"#
+    )
+}
+
+fn slide_xml_content(slide: &PptxSlide) -> String {
     let title = xml_escape(&slide.title);
     let mut body_paras = String::new();
     for bullet in &slide.bullets {
@@ -460,9 +554,69 @@ const SLIDE_LAYOUT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalo
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>
 </Relationships>"#;
 
-const SLIDE_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+fn slide_rels(needs_notes: bool, n: usize) -> String {
+    let mut s = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>"#,
+    );
+    if needs_notes {
+        s.push_str(&format!(
+            "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide\" Target=\"../notesSlides/notesSlide{n}.xml\"/>"
+        ));
+    }
+    s.push_str("</Relationships>");
+    s
+}
+
+/// Notes slide XML — single body shape holding the speaker note text.
+/// Office shows this in presenter view + notes page printout but never
+/// in slide show.
+fn notes_slide_xml(notes: &str) -> String {
+    let n = xml_escape(notes);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:notes xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+<p:cSld><p:spTree>
+<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+<p:sp>
+<p:nvSpPr><p:cNvPr id="2" name="Notes"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+<p:spPr/>
+<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" dirty="0"/><a:t>{n}</a:t></a:r></a:p></p:txBody>
+</p:sp>
+</p:spTree></p:cSld>
+<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
+</p:notes>"#
+    )
+}
+
+fn notes_slide_rels(n: usize) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="../slides/slide{n}.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesMaster" Target="../notesMasters/notesMaster1.xml"/>
+</Relationships>"#
+    )
+}
+
+const NOTES_MASTER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:notesMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+<p:cSld><p:bg><p:bgRef idx="1001"><a:schemeClr val="bg1"/></p:bgRef></p:bg>
+<p:spTree>
+<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+</p:spTree></p:cSld>
+<p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>
+<p:notesStyle>
+<a:lvl1pPr><a:defRPr sz="1200"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill><a:latin typeface="+mn-lt"/></a:defRPr></a:lvl1pPr>
+</p:notesStyle>
+</p:notesMaster>"#;
+
+const NOTES_MASTER_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/>
 </Relationships>"#;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -482,6 +636,7 @@ mod tests {
         let bytes = build_pptx_bytes(&[PptxSlide {
             title: "Hello".into(),
             bullets: vec!["world".into()],
+            ..Default::default()
         }])
         .unwrap();
         assert!(bytes.len() > 1000, "expected a non-trivial pptx, got {}", bytes.len());
@@ -490,8 +645,8 @@ mod tests {
     #[test]
     fn generated_pptx_is_valid_zip_with_expected_parts() {
         let bytes = build_pptx_bytes(&[
-            PptxSlide { title: "First".into(),  bullets: vec!["a".into(), "b".into()] },
-            PptxSlide { title: "Second".into(), bullets: vec![] },
+            PptxSlide { title: "First".into(),  bullets: vec!["a".into(), "b".into()], ..Default::default() },
+            PptxSlide { title: "Second".into(), bullets: vec![], ..Default::default() },
         ])
         .unwrap();
 
@@ -538,6 +693,7 @@ mod tests {
         let bytes = build_pptx_bytes(&[PptxSlide {
             title: "A < B & C > D".into(),
             bullets: vec!["\"quoted\" & 'apos'".into()],
+            ..Default::default()
         }])
         .unwrap();
         let cursor = std::io::Cursor::new(&bytes);
@@ -549,6 +705,61 @@ mod tests {
         assert!(s.contains("&quot;quoted&quot; &amp; &apos;apos&apos;"));
     }
 
+    #[test]
+    fn section_layout_emits_centered_title_no_body() {
+        let bytes = build_pptx_bytes(&[PptxSlide {
+            title: "Chapter 1".into(),
+            layout: SlideLayout::Section,
+            ..Default::default()
+        }])
+        .unwrap();
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut zip = ZipArchive::new(cursor).unwrap();
+        let mut s = String::new();
+        zip.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut s).unwrap();
+        // Section uses ctrTitle placeholder + algn="ctr".
+        assert!(s.contains("ctrTitle"),  "expected center-title placeholder, got: {s}");
+        assert!(s.contains("Chapter 1"), "title text missing");
+        // No content placeholder on a section slide.
+        assert!(!s.contains("name=\"Content\""), "section slide must not carry content shape");
+    }
+
+    #[test]
+    fn slides_with_notes_emit_notes_parts_and_relationships() {
+        let bytes = build_pptx_bytes(&[
+            PptxSlide {
+                title: "With notes".into(),
+                bullets: vec!["a".into()],
+                notes: "remember to talk slower here".into(),
+                ..Default::default()
+            },
+            PptxSlide { title: "No notes".into(), ..Default::default() },
+        ])
+        .unwrap();
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut zip = ZipArchive::new(cursor).unwrap();
+
+        // Slide 1 gets notesSlide1 + notesMaster.
+        assert!(zip.by_name("ppt/notesSlides/notesSlide1.xml").is_ok());
+        assert!(zip.by_name("ppt/notesMasters/notesMaster1.xml").is_ok());
+
+        // Slide 2 (no notes) MUST NOT spawn a stray notesSlide2.
+        assert!(zip.by_name("ppt/notesSlides/notesSlide2.xml").is_err());
+
+        // Notes content carried through.
+        let mut n = String::new();
+        zip.by_name("ppt/notesSlides/notesSlide1.xml").unwrap().read_to_string(&mut n).unwrap();
+        assert!(n.contains("remember to talk slower"), "notes text missing");
+
+        // Slide 1 rels reference the notesSlide; slide 2 rels do not.
+        let mut r1 = String::new();
+        zip.by_name("ppt/slides/_rels/slide1.xml.rels").unwrap().read_to_string(&mut r1).unwrap();
+        assert!(r1.contains("notesSlide"), "slide 1 should link to its notes");
+        let mut r2 = String::new();
+        zip.by_name("ppt/slides/_rels/slide2.xml.rels").unwrap().read_to_string(&mut r2).unwrap();
+        assert!(!r2.contains("notesSlide"), "slide 2 should NOT link to a notes file it doesn't have");
+    }
+
     /// Smoke: write a real .pptx to /tmp so a developer can open it
     /// in PowerPoint / Keynote / Google Slides to eyeball formatting.
     /// Ignored by default — run with `cargo test smoke_write -- --ignored`.
@@ -556,6 +767,12 @@ mod tests {
     #[ignore]
     fn smoke_write_to_tmp() {
         let bytes = build_pptx_bytes(&[
+            // Section divider — chapter cover (no body, big centered title).
+            PptxSlide {
+                title: "CodeFactory write_pptx v2".into(),
+                layout: SlideLayout::Section,
+                ..Default::default()
+            },
             PptxSlide {
                 title: "CodeFactory v1.2 — write_pptx 工具".into(),
                 bullets: vec![
@@ -563,6 +780,8 @@ mod tests {
                     "无 Python / 无 Node 依赖".into(),
                     "Office / Keynote / Google Slides 均可打开".into(),
                 ],
+                notes: "Talking points: 强调本地化、跨平台、无 runtime 依赖。".into(),
+                ..Default::default()
             },
             PptxSlide {
                 title: "用法".into(),
@@ -571,6 +790,7 @@ mod tests {
                     "AI 综合大纲".into(),
                     "调用 write_pptx 输出文件".into(),
                 ],
+                ..Default::default()
             },
         ])
         .unwrap();
@@ -582,7 +802,7 @@ mod tests {
     #[test]
     fn many_slides_generate_unique_slide_ids() {
         let slides: Vec<PptxSlide> = (0..10)
-            .map(|i| PptxSlide { title: format!("Slide {i}"), bullets: vec![] })
+            .map(|i| PptxSlide { title: format!("Slide {i}"), bullets: vec![], ..Default::default() })
             .collect();
         let bytes = build_pptx_bytes(&slides).unwrap();
         let cursor = std::io::Cursor::new(&bytes);

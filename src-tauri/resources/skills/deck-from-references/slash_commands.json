@@ -1,0 +1,17 @@
+[
+  {
+    "name": "deck",
+    "description": "从参考文档生成一份 PPT。{input} = 主题 + 受众 + 大概几页",
+    "template": "Make a .pptx presentation. Brief: {input}\n\nFollow the standard pipeline: confirm scope, locate sources (use kb_search if a knowledge library is registered, otherwise glob + read_file), draft outline, then write_pptx. Include section dividers between chapters and speaker notes per slide. Save as output/deck.pptx (or whatever path the user prefers)."
+  },
+  {
+    "name": "report",
+    "description": "从参考文档生成一份 Word 报告。{input} = 主题 + 角度 + 篇幅",
+    "template": "Make a .docx report. Brief: {input}\n\nFollow the standard pipeline: confirm scope, locate sources, draft outline (headings + key points), then write_docx with heading/paragraph/bullet/numbered blocks. Save as output/report.docx (or whatever path the user prefers)."
+  },
+  {
+    "name": "outline",
+    "description": "只综合大纲不出文件（先看再决定）。{input} = 主题",
+    "template": "Synthesize an outline for: {input}\n\nLocate sources (kb_search or glob+read), then propose a structured outline. For a deck: list slides with title + bullets + marked section dividers. For a report: list headings + 1-sentence summary each. Stop after the outline — wait for user approval before generating the actual file."
+  }
+]
