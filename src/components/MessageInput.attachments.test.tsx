@@ -67,7 +67,9 @@ describe("MessageInput attachments", () => {
       "save_chat_attachment",
       expect.objectContaining({ cwd: "/proj", filename: "screenshot.png" }),
     ));
-    expect(await screen.findByText("x.png")).toBeInTheDocument();
+    // The chip shows the ORIGINAL filename (the on-disk name is a uuid), so we
+    // assert the pasted file's name rather than save_chat_attachment's return.
+    expect(await screen.findByText("screenshot.png")).toBeInTheDocument();
   });
 
   it("paste with no cwd shows an error and does NOT invoke save", () => {
@@ -111,7 +113,7 @@ describe("MessageInput attachments", () => {
         ],
       },
     });
-    await waitFor(() => expect(screen.queryByText("y.png")).toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText("screenshot.png")).toBeInTheDocument());
 
     fireEvent.change(textarea, { target: { value: "look at this:" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
@@ -119,7 +121,8 @@ describe("MessageInput attachments", () => {
     expect(onSend).toHaveBeenCalledTimes(1);
     const arg: string = onSend.mock.calls[0][0];
     expect(arg).toContain("look at this:");
-    expect(arg).toMatch(/!\[y\.png\]\(file:\/\/\/proj\/\.codefactory\/attachments\/y\.png\)/);
+    // Label = original filename; the link still points at the saved on-disk path.
+    expect(arg).toMatch(/!\[screenshot\.png\]\(file:\/\/\/proj\/\.codefactory\/attachments\/y\.png\)/);
   });
 
   it("submit with ONLY an attachment (no text) still sends", async () => {
@@ -138,11 +141,11 @@ describe("MessageInput attachments", () => {
         ],
       },
     });
-    await waitFor(() => expect(screen.queryByText("z.png")).toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText("screenshot.png")).toBeInTheDocument());
 
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(onSend).toHaveBeenCalledTimes(1);
-    expect(onSend.mock.calls[0][0]).toMatch(/!\[z\.png\]\(file:\/\//);
+    expect(onSend.mock.calls[0][0]).toMatch(/!\[screenshot\.png\]\(file:\/\//);
   });
 
 });
