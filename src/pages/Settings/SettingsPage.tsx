@@ -2,18 +2,20 @@
 import React, { useEffect, useState } from "react";
 import {
   ArrowLeft, Plus, Trash2, Eye, EyeOff, Check, AlertCircle, ChevronDown,
+  RefreshCw, Download, Package,
 } from "lucide-react";
 import { invoke } from "../../lib/tauri";
 import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
+import { useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
 import type { Settings, Endpoint, ApiStyle, CustomModel, AddGitRemoteRequest, GitRemoteConfig, GitProvider } from "../../lib/tauri";
 
 interface Props {
   onBack: () => void;
 }
 
-type Tab = "endpoints" | "permissions" | "general" | "hooks" | "remotes" | "appearance";
+type Tab = "endpoints" | "permissions" | "general" | "hooks" | "remotes" | "appearance" | "about";
 
 // ── Hooks types ───────────────────────────────────────────────────────────────
 
@@ -575,6 +577,7 @@ export function SettingsPage({ onBack }: Props) {
     { id: "appearance", label: "外观" },
     { id: "hooks", label: "Hooks" },
     { id: "remotes", label: "Remotes" },
+    { id: "about", label: "关于" },
   ];
 
   return (
@@ -770,6 +773,9 @@ export function SettingsPage({ onBack }: Props) {
 
         {/* ── Remotes ── */}
         {tab === "remotes" && <RemotesTab />}
+
+        {/* ── About ── */}
+        {tab === "about" && <AboutTab />}
 
       </div>
     </div>
@@ -1233,6 +1239,173 @@ function AppearanceTab() {
         </p>
       </div>
 
+    </div>
+  );
+}
+
+// ── AboutTab — app version + in-app updater ──────────────────────────────────
+
+// Renders the single status line under "软件更新", driven by the shared
+// updater phase. Kept as its own component so the switch stays exhaustive and
+// the markup for each phase is easy to read.
+function UpdateStatusLine({
+  phase,
+  currentVersion,
+  onInstall,
+}: {
+  phase: UpdaterPhase;
+  currentVersion: string | null;
+  onInstall: () => void;
+}) {
+  switch (phase.kind) {
+    case "idle":
+      return (
+        <p className="text-xs text-gray-500">
+          点击「检查更新」以查看是否有新版本。
+        </p>
+      );
+    case "checking":
+      return (
+        <p className="flex items-center gap-1.5 text-xs text-gray-400">
+          <RefreshCw size={12} className="animate-spin" /> 正在检查最新版本…
+        </p>
+      );
+    case "up_to_date":
+      return (
+        <p className="flex flex-wrap items-center gap-1.5 text-xs text-emerald-700 dark:text-emerald-400">
+          <Check size={12} />
+          已是最新版本{currentVersion ? ` (v${currentVersion})` : ""}。
+          <span className="text-gray-600">
+            上次检查 {new Date(phase.checkedAt).toLocaleTimeString()}
+          </span>
+        </p>
+      );
+    case "available":
+      return (
+        <div className="space-y-2">
+          <p className="flex items-center gap-1.5 text-xs text-accent">
+            <Download size={12} /> 发现新版本{" "}
+            <span className="font-semibold">v{phase.update.version}</span>
+          </p>
+          {phase.update.body && (
+            <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap rounded bg-surface-3 p-2 text-[11px] leading-relaxed text-gray-400">
+              {phase.update.body}
+            </pre>
+          )}
+          <button
+            onClick={onInstall}
+            className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs text-white transition-colors hover:bg-accent-hover"
+          >
+            <Download size={12} /> 下载并安装
+          </button>
+          <p className="text-[11px] text-gray-600">安装完成后应用会自动重启。</p>
+        </div>
+      );
+    case "downloading": {
+      const pct = phase.total ? Math.round((phase.received / phase.total) * 100) : 0;
+      return (
+        <div className="space-y-1.5">
+          <p className="flex items-center gap-1.5 text-xs text-accent">
+            <RefreshCw size={12} className="animate-spin" />
+            正在下载…{" "}
+            {phase.total ? `${pct}%` : `${(phase.received / 1024 / 1024).toFixed(1)} MB`}
+          </p>
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface-3">
+            <div
+              className="h-full bg-accent transition-all"
+              style={{ width: phase.total ? `${pct}%` : "100%" }}
+            />
+          </div>
+        </div>
+      );
+    }
+    case "installing":
+      return (
+        <p className="flex items-center gap-1.5 text-xs text-emerald-700 dark:text-emerald-400">
+          <RefreshCw size={12} className="animate-spin" /> 正在安装…
+        </p>
+      );
+    case "ready":
+      return (
+        <p className="flex items-center gap-1.5 text-xs text-emerald-700 dark:text-emerald-400">
+          <Check size={12} /> 安装完成，即将重启…
+        </p>
+      );
+    case "error":
+      return (
+        <p className="flex items-start gap-1.5 text-xs text-rose-500">
+          <AlertCircle size={12} className="mt-0.5 shrink-0" />
+          检查更新失败：{phase.message}
+        </p>
+      );
+  }
+}
+
+function AboutTab() {
+  const phase = useUpdaterStore((s) => s.phase);
+  const currentVersion = useUpdaterStore((s) => s.currentVersion);
+  const checkNow = useUpdaterStore((s) => s.checkNow);
+  const install = useUpdaterStore((s) => s.install);
+  const initialize = useUpdaterStore((s) => s.initialize);
+
+  // Ensure the version is resolved even if the floating UpdaterBanner isn't
+  // mounted (e.g. Settings opened very early in the session). initialize() is
+  // idempotent — it guards its poll handle and re-reading the version is cheap.
+  useEffect(() => {
+    void initialize();
+  }, [initialize]);
+
+  // A check is in flight, or an install is mid-flight — don't let the user
+  // kick off a second check on top of either.
+  const busy =
+    phase.kind === "checking" ||
+    phase.kind === "downloading" ||
+    phase.kind === "installing" ||
+    phase.kind === "ready";
+
+  return (
+    <div className="max-w-md space-y-6">
+      {/* Identity */}
+      <div className="flex items-center gap-3">
+        <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-accent/15 text-accent">
+          <Package size={22} />
+        </div>
+        <div>
+          <h2 className="text-base font-semibold text-gray-100">CodeFactory</h2>
+          <p className="font-mono text-xs text-gray-500">
+            {currentVersion ? `v${currentVersion}` : "版本加载中…"}
+          </p>
+        </div>
+      </div>
+
+      {/* Update card */}
+      <div className="space-y-3 rounded-lg border border-border bg-surface-1 p-4">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">
+            软件更新
+          </span>
+          <button
+            onClick={() => void checkNow()}
+            disabled={busy}
+            className="flex items-center gap-1.5 rounded border border-border px-3 py-1 text-xs text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
+          >
+            <RefreshCw size={12} className={phase.kind === "checking" ? "animate-spin" : ""} />
+            {phase.kind === "checking" ? "检查中…" : "检查更新"}
+          </button>
+        </div>
+
+        <UpdateStatusLine
+          phase={phase}
+          currentVersion={currentVersion}
+          onInstall={() => void install()}
+        />
+      </div>
+
+      {/* Meta */}
+      <p className="text-[11px] leading-relaxed text-gray-600">
+        CodeFactory 是基于 Tauri 的本地 AI 编码工作台。更新通过 GitHub Releases
+        分发；点击「检查更新」会与最新发布版本比对，并在确认后下载安装。
+      </p>
     </div>
   );
 }
