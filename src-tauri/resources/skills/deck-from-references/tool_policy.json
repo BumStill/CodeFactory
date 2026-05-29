@@ -1,6 +1,6 @@
 {
   "full_access": false,
-  "allow": ["read_file", "glob", "grep", "list_dir", "kb_search", "kb_get_chunk", "write_pptx", "write_docx"],
+  "allow": ["read_file", "glob", "grep", "list_dir", "kb_search", "kb_get_chunk", "write_pptx", "read_pptx", "edit_pptx", "format_pptx", "write_docx"],
   "ask": [],
   "deny": ["bash"]
 }
