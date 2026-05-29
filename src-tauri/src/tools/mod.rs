@@ -8,6 +8,7 @@ pub mod grep;
 pub mod knowledge;
 pub mod path_sanity;
 pub mod pptx;
+pub mod pptx_edit;
 pub mod read;
 pub mod shell_policy;
 pub mod test_path;
@@ -81,6 +82,9 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         knowledge::get_chunk_definition(),
         bash::definition(),
         pptx::definition(),
+        pptx_edit::read_definition(),
+        pptx_edit::edit_definition(),
+        pptx_edit::format_definition(),
         docx::definition(),
     ]
 }
@@ -96,6 +100,9 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "kb_get_chunk" => knowledge::execute_get_chunk(args, ctx).await,
         "bash" => bash::execute(args, ctx).await,
         "write_pptx" => pptx::execute(args, ctx).await,
+        "read_pptx" => pptx_edit::execute_read(args, ctx).await,
+        "edit_pptx" => pptx_edit::execute_edit(args, ctx).await,
+        "format_pptx" => pptx_edit::execute_format(args, ctx).await,
         "write_docx" => docx::execute(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),
     }

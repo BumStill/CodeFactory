@@ -13,5 +13,20 @@
     "name": "outline",
     "description": "只综合大纲不出文件（先看再决定）。{input} = 主题",
     "template": "Synthesize an outline for: {input}\n\nLocate sources (kb_search or glob+read), then propose a structured outline. For a deck: list slides with title + bullets + marked section dividers. For a report: list headings + 1-sentence summary each. Stop after the outline — wait for user approval before generating the actual file."
+  },
+  {
+    "name": "enrich",
+    "description": "用知识库内容丰富你上传的 PPT，产出保留原样式的新版本。{input} = 想补充的方向（可留空）",
+    "template": "Enrich the uploaded .pptx into a richer new version, preserving its design. Focus: {input}\n\nFollow the enrich pipeline: read_pptx on the uploaded deck to get sN.F.P locators, kb_search topic-by-topic to find supporting content, plan the per-slide edits (which paragraphs to rewrite vs. where to add bullets), then edit_pptx writing to a new path (e.g. output/deck-enriched.pptx) so the original is untouched. Never delete slides or images — only rewrite and expand text. Verify with read_pptx and report the output path."
+  },
+  {
+    "name": "beautify",
+    "description": "统一并美化你上传的 PPT 排版（字体/字号/颜色/对齐/间距），保留原设计。{input} = 风格偏好（可留空）",
+    "template": "Beautify and unify the formatting of the uploaded .pptx, preserving its design. Style preference: {input}\n\nFollow the beautify pipeline: read_pptx with with_format:true to audit current fonts/sizes/colors/alignment and spot inconsistencies, decide one coherent scheme (a single body font — prefer a CJK-capable font for Chinese decks — plus title/body size tiers, a text color, and consistent spacing), then apply it as a few broad format_pptx rules (scope all/title/body) writing to a new path (e.g. output/deck-pretty.pptx). format_pptx only rewrites text formatting — it never moves or resizes shapes, so flag any layout/overflow issues instead of pretending to fix them. Verify with read_pptx with_format:true and report the output path."
+  },
+  {
+    "name": "summarize",
+    "description": "总结你上传的 PPT，或生成演讲稿。{input} = 想要的形式（要点 / 演讲稿 / 摘要，可留空）",
+    "template": "Summarize the uploaded .pptx. Desired form: {input}\n\nRead the deck text with read_file (or read_pptx if you need per-slide structure). If the user wants a short summary or talking points, answer directly in chat. If they want a full speech script (演讲稿), write_docx a standalone document (e.g. output/script.docx) with a heading per slide followed by the spoken paragraph(s). Do NOT write the script into the deck's speaker notes — keep it as a separate deliverable. Keep it in the speaker's voice, timed to the slides."
   }
 ]
