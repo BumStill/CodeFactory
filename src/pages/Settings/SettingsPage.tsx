@@ -1261,9 +1261,11 @@ const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 // (gpt-5-codex → gpt-5.3-codex, etc.), so ensureChatGptEndpoint refreshes an
 // existing endpoint's list whenever this changes.
 const CHATGPT_MODELS: CustomModel[] = [
-  { id: "gpt-5.5", name: "GPT-5.5" },
-  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
-  { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini" },
+  // 272K input window per codex's published model metadata — without this the
+  // context meter falls back to a wrong/conservative 128K for these models.
+  { id: "gpt-5.5", name: "GPT-5.5", context_length: 272000 },
+  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", context_length: 272000 },
+  { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini", context_length: 272000 },
 ];
 const CHATGPT_DEFAULT_MODEL = "gpt-5.5";
 
