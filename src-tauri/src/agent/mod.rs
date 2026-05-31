@@ -777,6 +777,10 @@ impl AgentLoop {
             })
             .collect();
 
+        // Reasoning effort: configurable default from settings (older configs
+        // and unset → Medium).
+        let effort = self.settings.read().await.reasoning_effort.as_str();
+
         let body = serde_json::json!({
             "model": self.model_id,
             "instructions": instructions,
@@ -786,7 +790,7 @@ impl AgentLoop {
             "parallel_tool_calls": false,
             "store": false,
             "stream": true,
-            "reasoning": { "effort": "medium", "summary": "auto" },
+            "reasoning": { "effort": effort, "summary": "auto" },
         });
 
         let mut request = self

@@ -77,6 +77,10 @@ pub struct Settings {
     /// overlay shows on first launch and never again.
     #[serde(default)]
     pub onboarded: bool,
+    /// Default reasoning effort for reasoning-capable models. Editable in
+    /// Settings and via the chat header quick-control.
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -90,6 +94,34 @@ pub enum Theme {
 impl Default for Theme {
     fn default() -> Self {
         Theme::Dark
+    }
+}
+
+/// Reasoning effort for reasoning-capable models (currently the ChatGPT/Codex
+/// Responses path). Maps directly to `reasoning.effort` in the request body.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl Default for ReasoningEffort {
+    fn default() -> Self {
+        ReasoningEffort::Medium
+    }
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
     }
 }
 
@@ -282,7 +314,44 @@ impl Default for Settings {
             font_family: default_font_family(),
             font_size: default_font_size(),
             onboarded: false,
+            reasoning_effort: ReasoningEffort::Medium,
         }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_medium() {
+        assert_eq!(ReasoningEffort::default(), ReasoningEffort::Medium);
+        assert_eq!(Settings::default().reasoning_effort, ReasoningEffort::Medium);
+    }
+
+    #[test]
+    fn serde_is_lowercase_roundtrip() {
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::Minimal).unwrap(),
+            "\"minimal\""
+        );
+        let parsed: ReasoningEffort = serde_json::from_str("\"high\"").unwrap();
+        assert_eq!(parsed, ReasoningEffort::High);
+        assert_eq!(ReasoningEffort::Low.as_str(), "low");
+    }
+
+    #[test]
+    fn old_settings_without_field_default_to_medium() {
+        // Configs that predate this field must still load.
+        let s: Settings = serde_json::from_value(serde_json::json!({
+            "endpoints": {},
+            "default_endpoint": "x",
+            "default_model": "y",
+            "permissions": {"allow": [], "ask": [], "deny": [], "full_access": false},
+            "shell": {"shell": "bash"}
+        }))
+        .expect("settings without reasoning_effort should deserialize");
+        assert_eq!(s.reasoning_effort, ReasoningEffort::Medium);
     }
 }
 
