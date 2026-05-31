@@ -2,14 +2,14 @@
 import React, { useEffect, useState } from "react";
 import {
   ArrowLeft, Plus, Trash2, Eye, EyeOff, Check, AlertCircle, ChevronDown,
-  RefreshCw, Download, Package,
+  RefreshCw, Download, Package, LogIn, LogOut, Sparkles,
 } from "lucide-react";
-import { invoke } from "../../lib/tauri";
+import { invoke, codexLogin, codexLogout, codexAccount } from "../../lib/tauri";
 import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
 import { useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
-import type { Settings, Endpoint, ApiStyle, CustomModel, AddGitRemoteRequest, GitRemoteConfig, GitProvider } from "../../lib/tauri";
+import type { Settings, Endpoint, ApiStyle, CustomModel, AddGitRemoteRequest, GitRemoteConfig, GitProvider, CodexAccount } from "../../lib/tauri";
 
 interface Props {
   onBack: () => void;
@@ -616,6 +616,8 @@ export function SettingsPage({ onBack }: Props) {
         {/* ── Endpoints ── */}
         {tab === "endpoints" && (
           <div className="max-w-xl space-y-3">
+            <ChatGptLoginCard />
+
             <div className="flex items-center justify-between mb-1">
               <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
                 API Endpoints
@@ -1239,6 +1241,107 @@ function AppearanceTab() {
         </p>
       </div>
 
+    </div>
+  );
+}
+
+// ── ChatGptLoginCard — "Sign in with ChatGPT" (Codex OAuth) ──────────────────
+// Stage-1/3 surface: runs the OAuth login and shows the signed-in account.
+// Wiring the signed-in session into model requests (subscription Responses API)
+// is handled separately by the request layer.
+function ChatGptLoginCard() {
+  // undefined = still checking; null = signed out; object = signed in.
+  const [account, setAccount] = useState<CodexAccount | null | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    codexAccount()
+      .then((a) => setAccount(a))
+      .catch(() => setAccount(null));
+  }, []);
+
+  const handleLogin = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setAccount(await codexLogin());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await codexLogout();
+      setAccount(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const loggedIn = account != null;
+
+  return (
+    <div className="space-y-2.5 rounded-lg border border-border bg-surface-1 p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent/15 text-accent">
+            <Sparkles size={16} />
+          </div>
+          <div className="min-w-0">
+            <p className="text-sm text-gray-200">使用 ChatGPT 登录</p>
+            {account === undefined ? (
+              <p className="text-[11px] text-gray-600">检查登录状态…</p>
+            ) : loggedIn ? (
+              <p className="truncate text-[11px] text-gray-500">
+                已登录{account.email ? `：${account.email}` : ""}
+                {account.plan ? ` · ${account.plan}` : ""}
+              </p>
+            ) : (
+              <p className="text-[11px] text-gray-600">
+                用 ChatGPT Plus/Pro 订阅，免去手动填 API Key
+              </p>
+            )}
+          </div>
+        </div>
+
+        {account === undefined ? null : loggedIn ? (
+          <button
+            onClick={handleLogout}
+            disabled={busy}
+            className="flex shrink-0 items-center gap-1.5 rounded border border-border px-2.5 py-1 text-xs text-gray-400 transition-colors hover:bg-surface-3 disabled:opacity-50"
+          >
+            <LogOut size={12} /> 退出登录
+          </button>
+        ) : (
+          <button
+            onClick={handleLogin}
+            disabled={busy}
+            className="flex shrink-0 items-center gap-1.5 rounded bg-accent px-2.5 py-1 text-xs text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
+          >
+            {busy ? <RefreshCw size={12} className="animate-spin" /> : <LogIn size={12} />}
+            {busy ? "等待浏览器授权…" : "登录"}
+          </button>
+        )}
+      </div>
+
+      {busy && !loggedIn && (
+        <p className="text-[11px] text-gray-500">
+          已在浏览器中打开 OpenAI 登录页，请完成授权后返回（5 分钟内有效）。
+        </p>
+      )}
+      {error && (
+        <p className="flex items-start gap-1.5 text-[11px] text-rose-500">
+          <AlertCircle size={12} className="mt-0.5 shrink-0" /> {error}
+        </p>
+      )}
     </div>
   );
 }

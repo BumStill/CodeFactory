@@ -86,6 +86,33 @@ export interface Endpoint {
   active_model?: string;
 }
 
+// ── ChatGPT (Codex) OAuth login ─────────────────────────────────────────────
+
+/** Public account info from a ChatGPT sign-in — never includes raw tokens. */
+export interface CodexAccount {
+  email?: string | null;
+  plan?: string | null;
+  account_id?: string | null;
+}
+
+/** Run the interactive ChatGPT OAuth login: opens the system browser, captures
+ *  the localhost:1455 callback, exchanges the code, and stores tokens in the OS
+ *  keychain. Resolves with the signed-in account, or rejects on error/timeout.
+ *  The `app` handle is injected by Tauri, so no JS arguments are passed. */
+export function codexLogin(): Promise<CodexAccount> {
+  return invoke<CodexAccount>("codex_login");
+}
+
+/** Sign out: remove the stored ChatGPT tokens from the OS keychain. */
+export function codexLogout(): Promise<void> {
+  return invoke<void>("codex_logout");
+}
+
+/** The currently signed-in ChatGPT account, or null if not signed in. */
+export function codexAccount(): Promise<CodexAccount | null> {
+  return invoke<CodexAccount | null>("codex_account");
+}
+
 // ── Checkpoints (git-backed rollback) ──────────────────────────────────────
 
 export interface CheckpointInfo {
