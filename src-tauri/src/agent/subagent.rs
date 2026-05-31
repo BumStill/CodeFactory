@@ -435,7 +435,13 @@ pub(crate) async fn run_acceptance_check(
             "max_tokens": 256,
             "messages": [{"role": "user", "content": prompt}]
         }),
-        ApiStyle::Openai => serde_json::json!({
+        // NOTE: ChatGPT endpoints would need the Responses API + OAuth token
+        // here. This one-shot acceptance check (autonomous-task mode only) does
+        // not yet support that — it falls through to the chat/completions shape,
+        // which the ChatGPT backend will reject. Interactive chat is unaffected
+        // (that path uses AgentLoop::call_chatgpt_model). TODO: route this
+        // through the Responses path for ChatGPT endpoints.
+        ApiStyle::Openai | ApiStyle::Chatgpt => serde_json::json!({
             "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 256,

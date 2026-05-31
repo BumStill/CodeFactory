@@ -172,7 +172,9 @@ pub async fn send_message(
         api_key.len(),
     );
 
-    if api_key.is_empty() {
+    // ChatGPT endpoints authenticate with the OAuth access token resolved
+    // inside the agent (codex_auth), so an empty API key is expected there.
+    if api_key.is_empty() && !matches!(api_style, crate::config::settings::ApiStyle::Chatgpt) {
         return Err(AppError::Other(format!(
             "API key not found for key_ref '{}'. Please configure it in Settings.",
             key_ref

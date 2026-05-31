@@ -67,7 +67,7 @@ export interface ModelInfo {
   is_custom?: boolean;
 }
 
-export type ApiStyle = "openai" | "anthropic";
+export type ApiStyle = "openai" | "anthropic" | "chatgpt";
 
 export interface CustomModel {
   id: string;

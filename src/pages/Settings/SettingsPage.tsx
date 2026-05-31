@@ -1249,6 +1249,49 @@ function AppearanceTab() {
 // Stage-1/3 surface: runs the OAuth login and shows the signed-in account.
 // Wiring the signed-in session into model requests (subscription Responses API)
 // is handled separately by the request layer.
+const CHATGPT_ENDPOINT_KEY = "chatgpt";
+const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const CHATGPT_MODELS: CustomModel[] = [
+  { id: "gpt-5-codex", name: "GPT-5 Codex" },
+  { id: "gpt-5", name: "GPT-5" },
+];
+
+// Create + activate the ChatGPT endpoint on sign-in so requests route to the
+// subscription Responses path (api_style "chatgpt"). Idempotent.
+async function ensureChatGptEndpoint() {
+  const { settings, save } = useSettingsStore.getState();
+  if (!settings || settings.endpoints[CHATGPT_ENDPOINT_KEY]) return;
+  await save({
+    ...settings,
+    endpoints: {
+      ...settings.endpoints,
+      [CHATGPT_ENDPOINT_KEY]: {
+        base_url: CHATGPT_BASE_URL,
+        api_style: "chatgpt",
+        custom_models: CHATGPT_MODELS,
+        active_model: "gpt-5-codex",
+      },
+    },
+    default_endpoint: CHATGPT_ENDPOINT_KEY,
+    default_model: "gpt-5-codex",
+  });
+}
+
+// Drop the ChatGPT endpoint on sign-out so it can't linger as a broken default.
+async function removeChatGptEndpoint() {
+  const { settings, save } = useSettingsStore.getState();
+  if (!settings || !settings.endpoints[CHATGPT_ENDPOINT_KEY]) return;
+  const { [CHATGPT_ENDPOINT_KEY]: _removed, ...rest } = settings.endpoints;
+  await save({
+    ...settings,
+    endpoints: rest,
+    default_endpoint:
+      settings.default_endpoint === CHATGPT_ENDPOINT_KEY
+        ? (Object.keys(rest)[0] ?? "")
+        : settings.default_endpoint,
+  });
+}
+
 function ChatGptLoginCard() {
   // undefined = still checking; null = signed out; object = signed in.
   const [account, setAccount] = useState<CodexAccount | null | undefined>(undefined);
@@ -1265,7 +1308,9 @@ function ChatGptLoginCard() {
     setBusy(true);
     setError(null);
     try {
-      setAccount(await codexLogin());
+      const acct = await codexLogin();
+      setAccount(acct);
+      await ensureChatGptEndpoint();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1279,6 +1324,7 @@ function ChatGptLoginCard() {
     try {
       await codexLogout();
       setAccount(null);
+      await removeChatGptEndpoint();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
