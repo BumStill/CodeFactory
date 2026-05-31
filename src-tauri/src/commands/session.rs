@@ -131,14 +131,18 @@ pub async fn update_session_reasoning_effort(
     session_id: String,
     effort: Option<String>,
     state: State<'_, AppState>,
-) -> Result<(), AppError> {
+) -> Result<Session, AppError> {
     let pool = state.db.read().await;
     sqlx::query("UPDATE sessions SET reasoning_effort = ? WHERE id = ?")
         .bind(&effort)
         .bind(&session_id)
         .execute(&*pool)
         .await?;
-    Ok(())
+    let session = sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = ?")
+        .bind(&session_id)
+        .fetch_one(&*pool)
+        .await?;
+    Ok(session)
 }
 
 #[tauri::command]

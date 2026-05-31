@@ -760,6 +760,30 @@ export function SettingsPage({ onBack }: Props) {
               </span>
             </label>
 
+            <div className="space-y-1">
+              <label className="text-xs text-gray-500">Default reasoning effort</label>
+              <p className="text-[11px] leading-5 text-gray-600">
+                Applies to reasoning models (ChatGPT / Codex). Each chat can
+                override it from the model row in the chat header.
+              </p>
+              <select
+                value={settings.reasoning_effort ?? "medium"}
+                onChange={(e) =>
+                  void save({
+                    ...settings,
+                    reasoning_effort: e.target.value as Settings["reasoning_effort"],
+                  })
+                }
+                className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+              >
+                {(["minimal", "low", "medium", "high"] as const).map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </select>
+            </div>
+
             <div className="flex justify-end">
               <button
                 onClick={handleSaveGeneral}

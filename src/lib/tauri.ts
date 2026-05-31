@@ -45,6 +45,8 @@ export interface Session {
    *  the single persistent ephemeral chat launched from Home's Quick Task.
    *  Optional for backward compat — old code paths default to "project". */
   kind?: "project" | "quick";
+  /** Per-session reasoning effort override; null/undefined → global default. */
+  reasoning_effort?: ReasoningEffort | null;
 }
 
 export interface Message {

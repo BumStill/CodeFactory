@@ -6,6 +6,7 @@
 // principle (show a control where it's relevant, hide it otherwise). Edits the
 // persisted global default in Settings.
 import { useSettingsStore } from "../stores/settings";
+import { useChatStore } from "../stores/chat";
 import type { Settings, ReasoningEffort } from "../lib/tauri";
 
 const EFFORTS: ReasoningEffort[] = ["minimal", "low", "medium", "high"];
@@ -26,16 +27,18 @@ export function reasoningPickerVisible(settings: Settings | null): boolean {
 
 export function ReasoningEffortPicker() {
   const settings = useSettingsStore((s) => s.settings);
-  const save = useSettingsStore((s) => s.save);
-  if (!settings || !reasoningPickerVisible(settings)) return null;
-  const effort: ReasoningEffort = settings.reasoning_effort ?? "medium";
+  const activeSession = useChatStore((s) => s.activeSession);
+  const setEffort = useChatStore((s) => s.updateActiveSessionReasoningEffort);
+  if (!settings || !reasoningPickerVisible(settings) || !activeSession) return null;
+  // Per-session override; falls back to the global default for display.
+  const globalDefault: ReasoningEffort = settings.reasoning_effort ?? "medium";
+  const effort: ReasoningEffort =
+    (activeSession.reasoning_effort as ReasoningEffort | null | undefined) ?? globalDefault;
   return (
     <select
       value={effort}
-      onChange={(e) =>
-        void save({ ...settings, reasoning_effort: e.target.value as ReasoningEffort })
-      }
-      title="思考强度 (reasoning effort) — 默认值，立即对后续请求生效"
+      onChange={(e) => void setEffort(e.target.value as ReasoningEffort)}
+      title="思考强度 (reasoning effort) — 仅作用于当前会话，立即对后续请求生效"
       className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300 transition-colors hover:bg-surface-3"
     >
       {EFFORTS.map((v) => (

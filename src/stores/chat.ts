@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "zustand";
 import { invoke, onStream, onSessionUpdated } from "../lib/tauri";
-import type { Message, Session, StreamEvent, ModelInfo } from "../lib/tauri";
+import type { Message, Session, StreamEvent, ModelInfo, ReasoningEffort } from "../lib/tauri";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   markPermissionResponse,
@@ -58,6 +58,7 @@ interface ChatStore {
   addLocalAssistantMessage: (content: string) => void;
   clearVisibleConversation: () => void;
   updateActiveSessionModel: (modelId: string) => Promise<void>;
+  updateActiveSessionReasoningEffort: (effort: ReasoningEffort | null) => Promise<void>;
 
   _unlisten?: UnlistenFn;
   _unlistenSessionUpdated?: UnlistenFn;
@@ -218,6 +219,21 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const session = await invoke<Session>("update_session_model", {
       sessionId: activeSession.id,
       modelId,
+    });
+    set((s) => ({
+      activeSession: session,
+      sessions: s.sessions.map((existing) =>
+        existing.id === session.id ? session : existing,
+      ),
+    }));
+  },
+
+  updateActiveSessionReasoningEffort: async (effort) => {
+    const activeSession = get().activeSession;
+    if (!activeSession) return;
+    const session = await invoke<Session>("update_session_reasoning_effort", {
+      sessionId: activeSession.id,
+      effort,
     });
     set((s) => ({
       activeSession: session,
