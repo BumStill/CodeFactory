@@ -630,18 +630,24 @@ export function SettingsPage({ onBack }: Props) {
               </button>
             </div>
 
-            {endpointDrafts.map((d) => (
-              <EndpointCard
-                key={d.key}
-                draft={d}
-                isDefault={settings.default_endpoint === d.key}
-                onSetDefault={() => handleSetDefault(d.key)}
-                onSave={handleSaveEndpoint}
-                onDelete={() => handleDeleteEndpoint(d.key)}
-              />
-            ))}
+            {/* The ChatGPT (OAuth) endpoint is managed by ChatGptLoginCard
+                above — hide it from the editable list so its base_url / API
+                key / API-style fields aren't shown (and so a card "Save" can't
+                clobber its api_style back to "openai"). */}
+            {endpointDrafts
+              .filter((d) => d.key !== CHATGPT_ENDPOINT_KEY)
+              .map((d) => (
+                <EndpointCard
+                  key={d.key}
+                  draft={d}
+                  isDefault={settings.default_endpoint === d.key}
+                  onSetDefault={() => handleSetDefault(d.key)}
+                  onSave={handleSaveEndpoint}
+                  onDelete={() => handleDeleteEndpoint(d.key)}
+                />
+              ))}
 
-            {endpointDrafts.length === 0 && (
+            {endpointDrafts.filter((d) => d.key !== CHATGPT_ENDPOINT_KEY).length === 0 && (
               <p className="text-xs text-gray-600">No endpoints configured.</p>
             )}
 
