@@ -3,8 +3,8 @@
 // Compact "reasoning effort" control for reasoning-capable models. Surfaces
 // ONLY when the active endpoint is the ChatGPT/Codex subscription — the only
 // path that honours `reasoning.effort` — in line with the state-driven layout
-// principle (show a control where it's relevant, hide it otherwise). Edits the
-// persisted global default in Settings.
+// principle (show a control where it's relevant, hide it otherwise). Sets the
+// ACTIVE SESSION's per-session override (the global default lives in Settings).
 import { useSettingsStore } from "../stores/settings";
 import { useChatStore } from "../stores/chat";
 import type { Settings, ReasoningEffort } from "../lib/tauri";

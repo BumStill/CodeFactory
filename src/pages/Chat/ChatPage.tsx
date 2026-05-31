@@ -304,8 +304,6 @@ export function ChatPage({ onOpenSpecs, onOpenSkills, onOpenSettings }: ChatPage
 
         {/* Input */}
         <MessageInput
-          key={activeSession?.id}
-          initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
           onSend={(t) => void sendOrQueue(t)}
           onCommand={handleSlashCommand}
           onCancel={cancelStream}

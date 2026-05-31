@@ -126,6 +126,9 @@ pub async fn list_quick_sessions(
 
 /// Set (or clear, with `None`) a session's per-session reasoning-effort
 /// override. The agent reads this and falls back to the global default.
+/// Intentionally does NOT bump `updated_at`: changing the effort is a settings
+/// tweak, not activity, so it shouldn't resurface the session to the top of the
+/// quick-session switcher (which orders by updated_at).
 #[tauri::command]
 pub async fn update_session_reasoning_effort(
     session_id: String,

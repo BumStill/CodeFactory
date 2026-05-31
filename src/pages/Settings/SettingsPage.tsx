@@ -427,6 +427,7 @@ export function SettingsPage({ onBack }: Props) {
     default_model: string;
     shell: string;
     auto_create_pr: boolean;
+    reasoning_effort: Settings["reasoning_effort"];
   } | null>(null);
   const [generalSaved, setGeneralSaved] = useState(false);
 
@@ -462,6 +463,7 @@ export function SettingsPage({ onBack }: Props) {
       default_model: settings.default_model,
       shell: settings.shell.shell,
       auto_create_pr: (settings as Settings & { auto_create_pr?: boolean }).auto_create_pr ?? false,
+      reasoning_effort: settings.reasoning_effort ?? "medium",
     });
   }, [settings]);
 
@@ -562,6 +564,7 @@ export function SettingsPage({ onBack }: Props) {
       ...settings,
       shell: { shell: generalDraft.shell },
       auto_create_pr: generalDraft.auto_create_pr,
+      reasoning_effort: generalDraft.reasoning_effort,
     } as Settings & { auto_create_pr: boolean });
 
     setGeneralSaved(true);
@@ -767,10 +770,10 @@ export function SettingsPage({ onBack }: Props) {
                 override it from the model row in the chat header.
               </p>
               <select
-                value={settings.reasoning_effort ?? "medium"}
+                value={generalDraft.reasoning_effort ?? "medium"}
                 onChange={(e) =>
-                  void save({
-                    ...settings,
+                  setGeneralDraft({
+                    ...generalDraft,
                     reasoning_effort: e.target.value as Settings["reasoning_effort"],
                   })
                 }
