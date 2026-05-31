@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useRef, useState, useEffect, ChangeEvent, KeyboardEvent, ClipboardEvent, DragEvent } from "react";
+import { recallHistory, pushHistory } from "./messageHistory";
 import { Send, Square, Paperclip, X, Loader2 } from "lucide-react";
 import {
   filterSlashCommandSuggestions,
@@ -64,6 +65,10 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
   const [dragOver, setDragOver] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Shell-style input history: sent messages this session + where we are in it.
+  const [history, setHistory] = useState<string[]>([]);
+  const [histPos, setHistPos] = useState(0);
+  const draftRef = useRef("");
 
   useEffect(() => {
     if (!pendingInsert) return;
@@ -177,6 +182,9 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
     // Allow submission with attachments but no text — the markdown links
     // appended below count as content for the model.
     if (!text && attachments.length === 0) return;
+    // Record the typed text for ↑/↓ recall, and leave history-navigation mode.
+    if (text) setHistory((h) => pushHistory(h, text));
+    setHistPos(0);
     const command = parseSlashCommand(text);
     // Slash commands run synchronously and are never queued — they would
     // be confusing as deferred work (`/cwd` two stream-finishes later).
@@ -215,10 +223,44 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
     onSend(outgoing);
   };
 
+  const moveCursorToEnd = () => {
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (el) {
+        el.selectionStart = el.selectionEnd = el.value.length;
+        autoResize();
+      }
+    });
+  };
+
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
+      return;
+    }
+    // Shell-style history recall. ↑ enters history only when the caret is at
+    // the very start (so multi-line editing isn't hijacked); once navigating,
+    // ↑/↓ step through it. ↓ walks back out to the live draft.
+    if (e.key === "ArrowUp" && history.length > 0) {
+      const el = ref.current;
+      const atStart = !!el && el.selectionStart === 0 && el.selectionEnd === 0;
+      if (histPos > 0 || atStart) {
+        e.preventDefault();
+        if (histPos === 0) draftRef.current = value;
+        const { value: v, pos } = recallHistory(history, histPos, "up", draftRef.current);
+        setValue(v);
+        setHistPos(pos);
+        moveCursorToEnd();
+      }
+      return;
+    }
+    if (e.key === "ArrowDown" && histPos > 0) {
+      e.preventDefault();
+      const { value: v, pos } = recallHistory(history, histPos, "down", draftRef.current);
+      setValue(v);
+      setHistPos(pos);
+      moveCursorToEnd();
     }
   };
 
@@ -314,7 +356,7 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
         <textarea
           ref={ref}
           value={value}
-          onChange={(e) => { setValue(e.target.value); autoResize(); }}
+          onChange={(e) => { setValue(e.target.value); setHistPos(0); autoResize(); }}
           onKeyDown={onKey}
           onPaste={onPaste}
           rows={1}
