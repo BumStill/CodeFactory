@@ -1251,16 +1251,31 @@ function AppearanceTab() {
 // is handled separately by the request layer.
 const CHATGPT_ENDPOINT_KEY = "chatgpt";
 const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
+// Codex model slugs the ChatGPT backend accepts. These get renamed over time
+// (gpt-5-codex → gpt-5.3-codex, etc.), so ensureChatGptEndpoint refreshes an
+// existing endpoint's list whenever this changes.
 const CHATGPT_MODELS: CustomModel[] = [
-  { id: "gpt-5-codex", name: "GPT-5 Codex" },
-  { id: "gpt-5", name: "GPT-5" },
+  { id: "gpt-5.5", name: "GPT-5.5" },
+  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
+  { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini" },
 ];
+const CHATGPT_DEFAULT_MODEL = "gpt-5.5";
 
-// Create + activate the ChatGPT endpoint on sign-in so requests route to the
-// subscription Responses path (api_style "chatgpt"). Idempotent.
+// Create the ChatGPT endpoint on sign-in (and keep its model list current) so
+// requests route to the subscription Responses path (api_style "chatgpt").
 async function ensureChatGptEndpoint() {
   const { settings, save } = useSettingsStore.getState();
-  if (!settings || settings.endpoints[CHATGPT_ENDPOINT_KEY]) return;
+  if (!settings) return;
+  const existing = settings.endpoints[CHATGPT_ENDPOINT_KEY];
+  // Up to date already? Nothing to do.
+  if (existing && JSON.stringify(existing.custom_models ?? []) === JSON.stringify(CHATGPT_MODELS)) {
+    return;
+  }
+  const validIds = CHATGPT_MODELS.map((m) => m.id);
+  const active =
+    existing?.active_model && validIds.includes(existing.active_model)
+      ? existing.active_model
+      : CHATGPT_DEFAULT_MODEL;
   await save({
     ...settings,
     endpoints: {
@@ -1269,11 +1284,12 @@ async function ensureChatGptEndpoint() {
         base_url: CHATGPT_BASE_URL,
         api_style: "chatgpt",
         custom_models: CHATGPT_MODELS,
-        active_model: "gpt-5-codex",
+        active_model: active,
       },
     },
-    default_endpoint: CHATGPT_ENDPOINT_KEY,
-    default_model: "gpt-5-codex",
+    // Only seize default/model on first creation; respect the user afterwards.
+    default_endpoint: existing ? settings.default_endpoint : CHATGPT_ENDPOINT_KEY,
+    default_model: existing ? settings.default_model : CHATGPT_DEFAULT_MODEL,
   });
 }
 
@@ -1300,7 +1316,12 @@ function ChatGptLoginCard() {
 
   useEffect(() => {
     codexAccount()
-      .then((a) => setAccount(a))
+      .then(async (a) => {
+        setAccount(a);
+        // Already signed in (e.g. from a prior session)? Make sure the ChatGPT
+        // endpoint exists so the account is actually usable. Idempotent.
+        if (a) await ensureChatGptEndpoint();
+      })
       .catch(() => setAccount(null));
   }, []);
 
