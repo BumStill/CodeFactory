@@ -23,6 +23,10 @@ pub struct Session {
     /// hidden from the Recent Projects list and reused across visits.
     #[serde(default = "default_session_kind")]
     pub kind: String,
+    /// Per-session reasoning effort override (minimal/low/medium/high).
+    /// None → fall back to the global Settings.reasoning_effort default.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 fn default_session_kind() -> String { "project".into() }

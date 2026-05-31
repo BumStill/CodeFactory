@@ -112,6 +112,15 @@ fn guess_context_from_name(model_id: &str) -> Option<u32> {
         return Some(65_536);
     }
 
+    // OpenAI GPT-5 / Codex subscription family (gpt-5.5, gpt-5.3-codex,
+    // gpt-5.1-codex-mini …) — 272K input window, per codex's published model
+    // metadata. Match the gpt-5 prefix only: a bare "codex" substring would
+    // wrongly catch the legacy small-window codex-* completion models. Must
+    // come before the gpt-4 branch.
+    if id.starts_with("gpt-5") {
+        return Some(272_000);
+    }
+
     // OpenAI family
     if id.starts_with("gpt-4") || id.contains("gpt-4o") || id.contains("o1") || id.contains("o3") {
         return Some(128_000);
@@ -249,5 +258,35 @@ pub fn compress_if_needed(
         compressed: elided_count > 0,
         elided_count,
         tokens_freed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guess_context_from_name as guess;
+
+    #[test]
+    fn gpt5_and_codex_families_resolve_to_real_window() {
+        // Regression: the ChatGPT-subscription models (gpt-5.x / *-codex) were
+        // falling through to the 128K fallback. Codex publishes 272K for the
+        // gpt-5 / codex family — that's what the context meter should show.
+        assert_eq!(guess("gpt-5.5"), Some(272_000));
+        assert_eq!(guess("gpt-5.3-codex"), Some(272_000));
+        assert_eq!(guess("gpt-5.1-codex-mini"), Some(272_000));
+        assert_eq!(guess("gpt-5"), Some(272_000));
+        assert_eq!(guess("gpt-5-codex"), Some(272_000));
+        // Narrowed to the gpt-5 prefix: a bare legacy "codex-*" id is NOT
+        // assumed to be 272K (those were small-window completion models).
+        assert_eq!(guess("codex-mini-latest"), None);
+    }
+
+    #[test]
+    fn known_families_unchanged() {
+        assert_eq!(guess("claude-3-5-sonnet"), Some(200_000));
+        assert_eq!(guess("gemini-2.5-pro"), Some(2_000_000));
+        assert_eq!(guess("deepseek-v4-pro"), Some(131_072));
+        assert_eq!(guess("gpt-4o"), Some(128_000));
+        assert_eq!(guess("gpt-3.5-turbo"), Some(16_385));
+        assert_eq!(guess("totally-unknown-model"), None);
     }
 }

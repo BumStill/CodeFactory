@@ -427,6 +427,7 @@ export function SettingsPage({ onBack }: Props) {
     default_model: string;
     shell: string;
     auto_create_pr: boolean;
+    reasoning_effort: Settings["reasoning_effort"];
   } | null>(null);
   const [generalSaved, setGeneralSaved] = useState(false);
 
@@ -462,6 +463,7 @@ export function SettingsPage({ onBack }: Props) {
       default_model: settings.default_model,
       shell: settings.shell.shell,
       auto_create_pr: (settings as Settings & { auto_create_pr?: boolean }).auto_create_pr ?? false,
+      reasoning_effort: settings.reasoning_effort ?? "medium",
     });
   }, [settings]);
 
@@ -562,6 +564,7 @@ export function SettingsPage({ onBack }: Props) {
       ...settings,
       shell: { shell: generalDraft.shell },
       auto_create_pr: generalDraft.auto_create_pr,
+      reasoning_effort: generalDraft.reasoning_effort,
     } as Settings & { auto_create_pr: boolean });
 
     setGeneralSaved(true);
@@ -759,6 +762,30 @@ export function SettingsPage({ onBack }: Props) {
                 </span>
               </span>
             </label>
+
+            <div className="space-y-1">
+              <label className="text-xs text-gray-500">Default reasoning effort</label>
+              <p className="text-[11px] leading-5 text-gray-600">
+                Applies to reasoning models (ChatGPT / Codex). Each chat can
+                override it from the model row in the chat header.
+              </p>
+              <select
+                value={generalDraft.reasoning_effort ?? "medium"}
+                onChange={(e) =>
+                  setGeneralDraft({
+                    ...generalDraft,
+                    reasoning_effort: e.target.value as Settings["reasoning_effort"],
+                  })
+                }
+                className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+              >
+                {(["minimal", "low", "medium", "high"] as const).map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </select>
+            </div>
 
             <div className="flex justify-end">
               <button
@@ -1261,9 +1288,11 @@ const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 // (gpt-5-codex → gpt-5.3-codex, etc.), so ensureChatGptEndpoint refreshes an
 // existing endpoint's list whenever this changes.
 const CHATGPT_MODELS: CustomModel[] = [
-  { id: "gpt-5.5", name: "GPT-5.5" },
-  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
-  { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini" },
+  // 272K input window per codex's published model metadata — without this the
+  // context meter falls back to a wrong/conservative 128K for these models.
+  { id: "gpt-5.5", name: "GPT-5.5", context_length: 272000 },
+  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", context_length: 272000 },
+  { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini", context_length: 272000 },
 ];
 const CHATGPT_DEFAULT_MODEL = "gpt-5.5";
 

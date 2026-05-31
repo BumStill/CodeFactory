@@ -45,6 +45,8 @@ export interface Session {
    *  the single persistent ephemeral chat launched from Home's Quick Task.
    *  Optional for backward compat — old code paths default to "project". */
   kind?: "project" | "quick";
+  /** Per-session reasoning effort override; null/undefined → global default. */
+  reasoning_effort?: ReasoningEffort | null;
 }
 
 export interface Message {
@@ -68,6 +70,8 @@ export interface ModelInfo {
 }
 
 export type ApiStyle = "openai" | "anthropic" | "chatgpt";
+
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high";
 
 export interface CustomModel {
   id: string;
@@ -158,6 +162,9 @@ export interface Settings {
   theme: Theme;
   font_family: string;
   font_size: number;
+  /** Default reasoning effort for reasoning-capable models (chatgpt/codex
+   *  Responses path). Optional for backward compat — missing → "medium". */
+  reasoning_effort?: ReasoningEffort;
   /** True once the user has completed (or skipped) first-run onboarding.
    *  Optional for backward compat — missing/false triggers the overlay. */
   onboarded?: boolean;

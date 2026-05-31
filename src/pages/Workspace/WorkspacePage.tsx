@@ -27,6 +27,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
 import { ModelPicker } from "../../components/ModelPicker";
+import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
 import { ExecutionStream } from "../../components/ExecutionStream";
@@ -115,6 +116,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: Workspa
           </div>
         </div>
         <ModelPicker />
+        <ReasoningEffortPicker />
 
         {/* Theme toggle */}
         <div className="flex items-center rounded border border-border overflow-hidden">
@@ -168,6 +170,8 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: Workspa
             <QueueBadge queue={queue} onRemove={removeFromQueue} />
           )}
           <MessageInput
+            key={activeSession?.id ?? sessionId}
+            initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
             onSend={(t) => void sendOrQueue(t)}
             onCancel={cancelStream}
             streaming={streaming}
