@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 mod agent;
+mod codex_auth;
 mod commands;
 mod config;
 mod errors;
@@ -141,6 +142,9 @@ pub fn run() {
             commands::settings::get_api_key,
             commands::settings::save_api_key,
             commands::settings::delete_api_key,
+            codex_auth::codex_login,
+            codex_auth::codex_logout,
+            codex_auth::codex_account,
             commands::backup::export_user_data,
             commands::backup::import_user_data,
             commands::backup::get_data_dir,
