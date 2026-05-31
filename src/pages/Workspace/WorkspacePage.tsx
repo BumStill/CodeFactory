@@ -170,6 +170,8 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: Workspa
             <QueueBadge queue={queue} onRemove={removeFromQueue} />
           )}
           <MessageInput
+            key={activeSession?.id ?? sessionId}
+            initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
             onSend={(t) => void sendOrQueue(t)}
             onCancel={cancelStream}
             streaming={streaming}

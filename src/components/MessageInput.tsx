@@ -55,9 +55,12 @@ interface Props {
    *  in the right project's .codefactory/attachments dir. Without it,
    *  paste/drop are silently ignored. */
   cwd?: string | null;
+  /** Seed ↑/↓ recall with this session's already-sent user messages (oldest
+   *  first). Combined with a per-session `key`, recall is scoped per session. */
+  initialHistory?: string[];
 }
 
-export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd }: Props) {
+export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd, initialHistory }: Props) {
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
   const [attachments, setAttachments] = useState<AttachmentChip[]>([]);
@@ -66,7 +69,9 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
   const [attachError, setAttachError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Shell-style input history: sent messages this session + where we are in it.
-  const [history, setHistory] = useState<string[]>([]);
+  // Seeded from the session's prior user messages (the component is keyed by
+  // session, so this re-seeds on switch).
+  const [history, setHistory] = useState<string[]>(() => initialHistory ?? []);
   const [histPos, setHistPos] = useState(0);
   const draftRef = useRef("");
 

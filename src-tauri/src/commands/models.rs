@@ -34,6 +34,13 @@ pub async fn list_models(
 
     let custom_ids: HashSet<String> = merged.iter().map(|m| m.id.clone()).collect();
 
+    // ChatGPT (OAuth) endpoints: /models needs the OAuth token, not an API key,
+    // and custom_models above already list the available codex models — so skip
+    // the remote fetch entirely (with the empty key it just 401s on every poll).
+    if endpoint.api_style == crate::config::settings::ApiStyle::Chatgpt {
+        return Ok(merged);
+    }
+
     // ── 2. Try to fetch remote /models — failures are non-fatal ──────────────
     let key_ref = endpoint
         .key_ref
