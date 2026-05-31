@@ -123,6 +123,18 @@ impl ReasoningEffort {
             ReasoningEffort::High => "high",
         }
     }
+
+    /// Parse a stored string (e.g. a per-session override) into an effort,
+    /// or None if it's not a recognised value.
+    pub fn parse(s: &str) -> Option<ReasoningEffort> {
+        match s {
+            "minimal" => Some(ReasoningEffort::Minimal),
+            "low" => Some(ReasoningEffort::Low),
+            "medium" => Some(ReasoningEffort::Medium),
+            "high" => Some(ReasoningEffort::High),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +350,9 @@ mod reasoning_effort_tests {
         let parsed: ReasoningEffort = serde_json::from_str("\"high\"").unwrap();
         assert_eq!(parsed, ReasoningEffort::High);
         assert_eq!(ReasoningEffort::Low.as_str(), "low");
+        assert_eq!(ReasoningEffort::parse("high"), Some(ReasoningEffort::High));
+        assert_eq!(ReasoningEffort::parse("minimal"), Some(ReasoningEffort::Minimal));
+        assert_eq!(ReasoningEffort::parse("bogus"), None);
     }
 
     #[test]

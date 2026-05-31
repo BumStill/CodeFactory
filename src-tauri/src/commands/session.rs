@@ -124,6 +124,23 @@ pub async fn list_quick_sessions(
     Ok(sessions)
 }
 
+/// Set (or clear, with `None`) a session's per-session reasoning-effort
+/// override. The agent reads this and falls back to the global default.
+#[tauri::command]
+pub async fn update_session_reasoning_effort(
+    session_id: String,
+    effort: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    let pool = state.db.read().await;
+    sqlx::query("UPDATE sessions SET reasoning_effort = ? WHERE id = ?")
+        .bind(&effort)
+        .bind(&session_id)
+        .execute(&*pool)
+        .await?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn create_session(
     title: String,

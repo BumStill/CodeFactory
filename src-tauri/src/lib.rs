@@ -174,6 +174,7 @@ pub fn run() {
             commands::session::get_or_create_quick_session,
             commands::session::create_quick_session,
             commands::session::list_quick_sessions,
+            commands::session::update_session_reasoning_effort,
             commands::session::get_session,
             commands::session::delete_session,
             commands::session::update_session_model,

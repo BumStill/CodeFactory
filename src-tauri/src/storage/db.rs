@@ -181,6 +181,8 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     // ephemeral one-off chats launched from the home page's Quick Task entry.
     // List-sessions excludes 'quick' from the Recent Projects card.
     ensure_column(pool, "sessions", "kind", "TEXT NOT NULL DEFAULT 'project'").await?;
+    // Per-session reasoning effort override (NULL → use the global default).
+    ensure_column(pool, "sessions", "reasoning_effort", "TEXT").await?;
 
     // task_runs.acceptance_criteria_json: JSON Vec<String> set by the
     // decompose commands at task creation time. The autonomous subagent

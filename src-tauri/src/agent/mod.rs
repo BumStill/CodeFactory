@@ -777,9 +777,23 @@ impl AgentLoop {
             })
             .collect();
 
-        // Reasoning effort: configurable default from settings (older configs
-        // and unset → Medium).
-        let effort = self.settings.read().await.reasoning_effort.as_str();
+        // Reasoning effort: a per-session override (sessions.reasoning_effort)
+        // wins; otherwise the global Settings default (which itself defaults to
+        // Medium for older configs).
+        let session_effort: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT reasoning_effort FROM sessions WHERE id = ?",
+        )
+        .bind(&self.session_id)
+        .fetch_one(&self.db)
+        .await
+        .ok()
+        .flatten();
+        let global = self.settings.read().await.reasoning_effort;
+        let effort = session_effort
+            .as_deref()
+            .and_then(crate::config::settings::ReasoningEffort::parse)
+            .unwrap_or(global)
+            .as_str();
 
         let body = serde_json::json!({
             "model": self.model_id,
