@@ -75,6 +75,55 @@ pub async fn get_or_create_quick_session(
     Ok(session)
 }
 
+/// Create a *fresh* Quick Task session. Multi-session: each gets its own
+/// scratch dir `~/.codefactory/quick/<id>`. Unlike get_or_create_quick_session
+/// this never reuses an existing one — it's the "new quick task" action.
+#[tauri::command]
+pub async fn create_quick_session(
+    model_id: String,
+    state: State<'_, AppState>,
+) -> Result<Session, AppError> {
+    let pool = state.db.read().await;
+    let id = Uuid::new_v4().to_string();
+    let home = dirs::home_dir()
+        .ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
+    let quick_dir = home.join(".codefactory").join("quick").join(&id);
+    std::fs::create_dir_all(&quick_dir)
+        .map_err(|e| AppError::Other(format!("create quick-task dir failed: {e}")))?;
+    let now = Utc::now().timestamp_millis();
+    sqlx::query(
+        "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at, kind) \
+         VALUES (?,?,?,?,?,?,'quick')",
+    )
+    .bind(&id)
+    .bind("快速任务")
+    .bind(quick_dir.to_string_lossy().to_string())
+    .bind(&model_id)
+    .bind(now)
+    .bind(now)
+    .execute(&*pool)
+    .await?;
+    let session = sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&*pool)
+        .await?;
+    Ok(session)
+}
+
+/// List Quick Task sessions (most-recent first) for the quick-session switcher.
+#[tauri::command]
+pub async fn list_quick_sessions(
+    state: State<'_, AppState>,
+) -> Result<Vec<Session>, AppError> {
+    let pool = state.db.read().await;
+    let sessions = sqlx::query_as::<_, Session>(
+        "SELECT * FROM sessions WHERE kind = 'quick' ORDER BY updated_at DESC LIMIT 50",
+    )
+    .fetch_all(&*pool)
+    .await?;
+    Ok(sessions)
+}
+
 #[tauri::command]
 pub async fn create_session(
     title: String,

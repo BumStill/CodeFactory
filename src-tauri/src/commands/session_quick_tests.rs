@@ -128,4 +128,32 @@ mod tests {
         .unwrap();
         assert_eq!(id.0, "new");
     }
+
+    #[tokio::test]
+    async fn list_quick_sessions_returns_all_quick_most_recent_first() {
+        // Multi-session: the switcher lists every quick session, newest first,
+        // and never surfaces project rows.
+        let pool = fresh_pool().await;
+        insert_session(&pool, "p1", "project", None).await;
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at, parent_session_id, kind) \
+             VALUES ('qa','q','/tmp','m',1,1,NULL,'quick'), \
+                    ('qb','q','/tmp','m',2,2,NULL,'quick'), \
+                    ('qc','q','/tmp','m',3,3,NULL,'quick')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ids: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM sessions WHERE kind = 'quick' ORDER BY updated_at DESC LIMIT 50",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ids.into_iter().map(|(s,)| s).collect::<Vec<_>>(),
+            vec!["qc", "qb", "qa"]
+        );
+    }
 }
