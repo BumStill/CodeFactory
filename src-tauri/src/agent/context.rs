@@ -112,10 +112,12 @@ fn guess_context_from_name(model_id: &str) -> Option<u32> {
         return Some(65_536);
     }
 
-    // OpenAI GPT-5 / Codex family (incl. ChatGPT-subscription models like
-    // gpt-5.5, gpt-5.3-codex, gpt-5.1-codex-mini) — 272K input window, per
-    // codex's published model metadata. Must come before the gpt-4 branch.
-    if id.starts_with("gpt-5") || id.contains("codex") {
+    // OpenAI GPT-5 / Codex subscription family (gpt-5.5, gpt-5.3-codex,
+    // gpt-5.1-codex-mini …) — 272K input window, per codex's published model
+    // metadata. Match the gpt-5 prefix only: a bare "codex" substring would
+    // wrongly catch the legacy small-window codex-* completion models. Must
+    // come before the gpt-4 branch.
+    if id.starts_with("gpt-5") {
         return Some(272_000);
     }
 
@@ -273,7 +275,9 @@ mod tests {
         assert_eq!(guess("gpt-5.1-codex-mini"), Some(272_000));
         assert_eq!(guess("gpt-5"), Some(272_000));
         assert_eq!(guess("gpt-5-codex"), Some(272_000));
-        assert_eq!(guess("codex-mini-latest"), Some(272_000));
+        // Narrowed to the gpt-5 prefix: a bare legacy "codex-*" id is NOT
+        // assumed to be 272K (those were small-window completion models).
+        assert_eq!(guess("codex-mini-latest"), None);
     }
 
     #[test]

@@ -73,6 +73,7 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
   useEffect(() => {
     if (!pendingInsert) return;
     setValue((prev) => (prev ? `${prev} ${pendingInsert}` : pendingInsert));
+    setHistPos(0); // an insert exits history-recall mode, like typing does
     onInsertConsumed?.();
     ref.current?.focus();
   }, [pendingInsert]);
@@ -182,9 +183,7 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
     // Allow submission with attachments but no text — the markdown links
     // appended below count as content for the model.
     if (!text && attachments.length === 0) return;
-    // Record the typed text for ↑/↓ recall, and leave history-navigation mode.
-    if (text) setHistory((h) => pushHistory(h, text));
-    setHistPos(0);
+    setHistPos(0); // leave history-navigation mode on any submit
     const command = parseSlashCommand(text);
     // Slash commands run synchronously and are never queued — they would
     // be confusing as deferred work (`/cwd` two stream-finishes later).
@@ -197,6 +196,9 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
       return;
     }
     if (disabled) return;
+    // Record real (non-command) sends for ↑/↓ recall — slash commands run
+    // locally and shouldn't pollute message history.
+    if (text) setHistory((h) => pushHistory(h, text));
     // Append attachments at send time so the user can freely remove chips
     // before send without text-editing the textarea. Images become vision
     // markdown links; documents become a labelled path the agent reads with
