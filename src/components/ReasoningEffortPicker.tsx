@@ -20,8 +20,8 @@ const LABELS: Record<ReasoningEffort, string> = {
 /** Whether the reasoning control is relevant for the current settings — only
  *  the ChatGPT/Codex endpoint honours reasoning.effort. Exported for testing. */
 export function reasoningPickerVisible(settings: Settings | null): boolean {
-  if (!settings) return false;
-  const ep = settings.endpoints[settings.default_endpoint];
+  // Defensive: settings (or endpoints) may be partial while loading.
+  const ep = settings?.endpoints?.[settings.default_endpoint];
   return ep?.api_style === "chatgpt";
 }
 

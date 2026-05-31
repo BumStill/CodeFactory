@@ -22,6 +22,11 @@ describe("reasoningPickerVisible", () => {
     expect(reasoningPickerVisible(null)).toBe(false);
   });
 
+  it("is hidden (not crashing) when settings are partial / endpoints missing", () => {
+    expect(reasoningPickerVisible({ default_endpoint: "x" } as unknown as Settings)).toBe(false);
+    expect(reasoningPickerVisible({} as unknown as Settings)).toBe(false);
+  });
+
   it("shows only for the active ChatGPT/Codex endpoint", () => {
     const chatgpt = settingsWith("chatgpt", {
       chatgpt: { base_url: "x", api_style: "chatgpt" },
