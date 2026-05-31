@@ -1319,6 +1319,10 @@ function ChatGptLoginCard() {
   const [account, setAccount] = useState<CodexAccount | null | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Is ChatGPT the endpoint requests currently route to? Shown explicitly so
+  // it's clear whether the subscription or one of the API endpoints is active.
+  const isDefault =
+    useSettingsStore((s) => s.settings?.default_endpoint) === CHATGPT_ENDPOINT_KEY;
 
   useEffect(() => {
     codexAccount()
@@ -1359,6 +1363,17 @@ function ChatGptLoginCard() {
     }
   };
 
+  const handleSetDefault = async () => {
+    const { settings, save } = useSettingsStore.getState();
+    if (!settings) return;
+    const ep = settings.endpoints[CHATGPT_ENDPOINT_KEY];
+    await save({
+      ...settings,
+      default_endpoint: CHATGPT_ENDPOINT_KEY,
+      default_model: ep?.active_model ?? CHATGPT_DEFAULT_MODEL,
+    });
+  };
+
   const loggedIn = account != null;
 
   return (
@@ -1386,13 +1401,32 @@ function ChatGptLoginCard() {
         </div>
 
         {account === undefined ? null : loggedIn ? (
-          <button
-            onClick={handleLogout}
-            disabled={busy}
-            className="flex shrink-0 items-center gap-1.5 rounded border border-border px-2.5 py-1 text-xs text-gray-400 transition-colors hover:bg-surface-3 disabled:opacity-50"
-          >
-            <LogOut size={12} /> 退出登录
-          </button>
+          <div className="flex shrink-0 items-center gap-2">
+            {isDefault ? (
+              <span
+                className="rounded-full bg-accent/15 px-2 py-0.5 text-[11px] text-accent"
+                title="当前模型请求走 ChatGPT 订阅"
+              >
+                默认
+              </span>
+            ) : (
+              <button
+                onClick={handleSetDefault}
+                disabled={busy}
+                className="rounded border border-border px-2.5 py-1 text-xs text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
+                title="把模型请求切到 ChatGPT 订阅"
+              >
+                设为默认
+              </button>
+            )}
+            <button
+              onClick={handleLogout}
+              disabled={busy}
+              className="flex items-center gap-1.5 rounded border border-border px-2.5 py-1 text-xs text-gray-400 transition-colors hover:bg-surface-3 disabled:opacity-50"
+            >
+              <LogOut size={12} /> 退出登录
+            </button>
+          </div>
         ) : (
           <button
             onClick={handleLogin}
