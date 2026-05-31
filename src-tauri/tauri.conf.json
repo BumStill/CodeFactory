@@ -58,6 +58,9 @@
       "digestAlgorithm": "sha256",
       "timestampUrl": ""
     },
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    },
     "createUpdaterArtifacts": true
   },
   "plugins": {

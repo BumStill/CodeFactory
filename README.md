@@ -48,9 +48,12 @@ API key.
 
 ## Install
 
-Download `CodeFactory_X.Y.Z_x64-setup.exe` from
-[Releases](https://github.com/BumStill/CodeFactory/releases/latest) and run it.
-No admin rights required.
+Grab the latest build from
+[Releases](https://github.com/BumStill/CodeFactory/releases/latest):
+
+- **Windows** — `CodeFactory_X.Y.Z_x64-setup.exe` (NSIS installer, no admin
+  rights required)
+- **macOS (Apple Silicon)** — `CodeFactory_X.Y.Z_aarch64.dmg` (macOS 11+)
 
 > **Windows SmartScreen warning is expected on first run.** CodeFactory
 > isn't currently signed with a paid Authenticode certificate (working on
@@ -73,19 +76,34 @@ No admin rights required.
 > the updater verifies the Tauri signature (`.sig`) against the embedded
 > public key — only the first manual install gets the warning.
 
+> **macOS Gatekeeper warning is expected on first launch.** CodeFactory isn't
+> notarized with an Apple Developer ID yet, so macOS refuses to open it
+> directly. To get past it:
+>
+> 1. Open the `.dmg` and drag **CodeFactory** to **Applications**
+> 2. In Applications, **right-click (or Control-click) CodeFactory → Open**
+> 3. Click **Open** in the dialog (only needed the first time)
+>
+> Alternatively, after the blocked first launch, allow it under **System
+> Settings → Privacy & Security → Open Anyway**. As on Windows, in-app updates
+> afterward are verified by the Tauri signature and don't prompt.
+
 On first launch you'll be prompted for an API key. Anything OpenAI-compatible
 works — OpenRouter is the easiest if you want access to multiple frontier
 models with one key.
 
 ### Code-signing status
 
-Authenticode signing is on the near-term roadmap. The plan:
+Both platforms currently ship **unsigned** binaries with Tauri-signed updates;
+the first-install OS warning is expected and one-time. The plan:
 
-- **Now**: unsigned NSIS installer + Tauri-signed updates (good enough for
-  technical users who can dismiss SmartScreen once)
-- **Next**: apply for [SignPath.io](https://signpath.io/) free OSS code
-  signing (eliminates the SmartScreen warning at no cost)
-- **Later**: full EV cert if download volume justifies the spend
+- **Now**: unsigned NSIS installer (Windows) and unsigned `.dmg` (macOS) +
+  Tauri-signed auto-updates — good enough for technical users who can dismiss
+  the SmartScreen / Gatekeeper prompt once
+- **Next**: apply for [SignPath.io](https://signpath.io/) free OSS code signing
+  on Windows (eliminates the SmartScreen warning at no cost)
+- **Later**: Apple Developer ID notarization for macOS, and a full EV cert on
+  Windows, if download volume justifies the spend
 
 ## Quick start
 
