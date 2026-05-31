@@ -12,17 +12,19 @@ body = """
 
 ### Install
 
-Download `CodeFactory_X.Y.Z_x64-setup.exe` below and run it.
+**Windows** — download `CodeFactory_X.Y.Z_x64-setup.exe` below and run it. A
+SmartScreen warning is expected on first install (the app isn't signed with a
+paid Authenticode certificate yet) — click **More info → Run anyway**.
 
-**Windows SmartScreen warning is expected on first install** — the app isn't
-signed with a paid Authenticode certificate yet. Click **More info → Run anyway**.
-After this first install, in-app auto-updates are verified via the Tauri
-signature (`.sig`) against an embedded public key and don't trigger the warning.
+**macOS (Apple Silicon)** — download `CodeFactory_X.Y.Z_aarch64.dmg` below, open
+it and drag CodeFactory to Applications. The app isn't notarized with an Apple
+Developer ID yet, so Gatekeeper blocks it on first launch: **right-click (or
+Control-click) the app → Open → Open**, or allow it under **System Settings →
+Privacy & Security**. Requires macOS 11 or later.
 
-For verification:
-```pwsh
-Get-FileHash CodeFactory_*_x64-setup.exe
-```
+After the first manual install on either platform, in-app auto-updates are
+verified via the Tauri signature (`.sig`) against an embedded public key and
+don't trigger these warnings.
 
 See the [README](https://github.com/BumStill/CodeFactory#install) for the
 code-signing roadmap.
