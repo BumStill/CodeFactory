@@ -2,14 +2,14 @@
 import React, { useEffect, useState } from "react";
 import {
   ArrowLeft, Plus, Trash2, Eye, EyeOff, Check, AlertCircle, ChevronDown,
-  RefreshCw, Download, Package,
+  RefreshCw, Download, Package, LogIn, LogOut, Sparkles,
 } from "lucide-react";
-import { invoke } from "../../lib/tauri";
+import { invoke, codexLogin, codexLogout, codexAccount } from "../../lib/tauri";
 import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
 import { useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
-import type { Settings, Endpoint, ApiStyle, CustomModel, AddGitRemoteRequest, GitRemoteConfig, GitProvider } from "../../lib/tauri";
+import type { Settings, Endpoint, ApiStyle, CustomModel, AddGitRemoteRequest, GitRemoteConfig, GitProvider, CodexAccount } from "../../lib/tauri";
 
 interface Props {
   onBack: () => void;
@@ -616,6 +616,8 @@ export function SettingsPage({ onBack }: Props) {
         {/* ── Endpoints ── */}
         {tab === "endpoints" && (
           <div className="max-w-xl space-y-3">
+            <ChatGptLoginCard />
+
             <div className="flex items-center justify-between mb-1">
               <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
                 API Endpoints
@@ -628,18 +630,24 @@ export function SettingsPage({ onBack }: Props) {
               </button>
             </div>
 
-            {endpointDrafts.map((d) => (
-              <EndpointCard
-                key={d.key}
-                draft={d}
-                isDefault={settings.default_endpoint === d.key}
-                onSetDefault={() => handleSetDefault(d.key)}
-                onSave={handleSaveEndpoint}
-                onDelete={() => handleDeleteEndpoint(d.key)}
-              />
-            ))}
+            {/* The ChatGPT (OAuth) endpoint is managed by ChatGptLoginCard
+                above — hide it from the editable list so its base_url / API
+                key / API-style fields aren't shown (and so a card "Save" can't
+                clobber its api_style back to "openai"). */}
+            {endpointDrafts
+              .filter((d) => d.key !== CHATGPT_ENDPOINT_KEY)
+              .map((d) => (
+                <EndpointCard
+                  key={d.key}
+                  draft={d}
+                  isDefault={settings.default_endpoint === d.key}
+                  onSetDefault={() => handleSetDefault(d.key)}
+                  onSave={handleSaveEndpoint}
+                  onDelete={() => handleDeleteEndpoint(d.key)}
+                />
+              ))}
 
-            {endpointDrafts.length === 0 && (
+            {endpointDrafts.filter((d) => d.key !== CHATGPT_ENDPOINT_KEY).length === 0 && (
               <p className="text-xs text-gray-600">No endpoints configured.</p>
             )}
 
@@ -1239,6 +1247,208 @@ function AppearanceTab() {
         </p>
       </div>
 
+    </div>
+  );
+}
+
+// ── ChatGptLoginCard — "Sign in with ChatGPT" (Codex OAuth) ──────────────────
+// Stage-1/3 surface: runs the OAuth login and shows the signed-in account.
+// Wiring the signed-in session into model requests (subscription Responses API)
+// is handled separately by the request layer.
+const CHATGPT_ENDPOINT_KEY = "chatgpt";
+const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
+// Codex model slugs the ChatGPT backend accepts. These get renamed over time
+// (gpt-5-codex → gpt-5.3-codex, etc.), so ensureChatGptEndpoint refreshes an
+// existing endpoint's list whenever this changes.
+const CHATGPT_MODELS: CustomModel[] = [
+  { id: "gpt-5.5", name: "GPT-5.5" },
+  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
+  { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini" },
+];
+const CHATGPT_DEFAULT_MODEL = "gpt-5.5";
+
+// Create the ChatGPT endpoint on sign-in (and keep its model list current) so
+// requests route to the subscription Responses path (api_style "chatgpt").
+async function ensureChatGptEndpoint() {
+  const { settings, save } = useSettingsStore.getState();
+  if (!settings) return;
+  const existing = settings.endpoints[CHATGPT_ENDPOINT_KEY];
+  // Up to date already? Nothing to do.
+  if (existing && JSON.stringify(existing.custom_models ?? []) === JSON.stringify(CHATGPT_MODELS)) {
+    return;
+  }
+  const validIds = CHATGPT_MODELS.map((m) => m.id);
+  const active =
+    existing?.active_model && validIds.includes(existing.active_model)
+      ? existing.active_model
+      : CHATGPT_DEFAULT_MODEL;
+  await save({
+    ...settings,
+    endpoints: {
+      ...settings.endpoints,
+      [CHATGPT_ENDPOINT_KEY]: {
+        base_url: CHATGPT_BASE_URL,
+        api_style: "chatgpt",
+        custom_models: CHATGPT_MODELS,
+        active_model: active,
+      },
+    },
+    // Only seize default/model on first creation; respect the user afterwards.
+    default_endpoint: existing ? settings.default_endpoint : CHATGPT_ENDPOINT_KEY,
+    default_model: existing ? settings.default_model : CHATGPT_DEFAULT_MODEL,
+  });
+}
+
+// Drop the ChatGPT endpoint on sign-out so it can't linger as a broken default.
+async function removeChatGptEndpoint() {
+  const { settings, save } = useSettingsStore.getState();
+  if (!settings || !settings.endpoints[CHATGPT_ENDPOINT_KEY]) return;
+  const { [CHATGPT_ENDPOINT_KEY]: _removed, ...rest } = settings.endpoints;
+  await save({
+    ...settings,
+    endpoints: rest,
+    default_endpoint:
+      settings.default_endpoint === CHATGPT_ENDPOINT_KEY
+        ? (Object.keys(rest)[0] ?? "")
+        : settings.default_endpoint,
+  });
+}
+
+function ChatGptLoginCard() {
+  // undefined = still checking; null = signed out; object = signed in.
+  const [account, setAccount] = useState<CodexAccount | null | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Is ChatGPT the endpoint requests currently route to? Shown explicitly so
+  // it's clear whether the subscription or one of the API endpoints is active.
+  const isDefault =
+    useSettingsStore((s) => s.settings?.default_endpoint) === CHATGPT_ENDPOINT_KEY;
+
+  useEffect(() => {
+    codexAccount()
+      .then(async (a) => {
+        setAccount(a);
+        // Already signed in (e.g. from a prior session)? Make sure the ChatGPT
+        // endpoint exists so the account is actually usable. Idempotent.
+        if (a) await ensureChatGptEndpoint();
+      })
+      .catch(() => setAccount(null));
+  }, []);
+
+  const handleLogin = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const acct = await codexLogin();
+      setAccount(acct);
+      await ensureChatGptEndpoint();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await codexLogout();
+      setAccount(null);
+      await removeChatGptEndpoint();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleSetDefault = async () => {
+    const { settings, save } = useSettingsStore.getState();
+    if (!settings) return;
+    const ep = settings.endpoints[CHATGPT_ENDPOINT_KEY];
+    await save({
+      ...settings,
+      default_endpoint: CHATGPT_ENDPOINT_KEY,
+      default_model: ep?.active_model ?? CHATGPT_DEFAULT_MODEL,
+    });
+  };
+
+  const loggedIn = account != null;
+
+  return (
+    <div className="space-y-2.5 rounded-lg border border-border bg-surface-1 p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent/15 text-accent">
+            <Sparkles size={16} />
+          </div>
+          <div className="min-w-0">
+            <p className="text-sm text-gray-200">使用 ChatGPT 登录</p>
+            {account === undefined ? (
+              <p className="text-[11px] text-gray-600">检查登录状态…</p>
+            ) : loggedIn ? (
+              <p className="truncate text-[11px] text-gray-500">
+                已登录{account.email ? `：${account.email}` : ""}
+                {account.plan ? ` · ${account.plan}` : ""}
+              </p>
+            ) : (
+              <p className="text-[11px] text-gray-600">
+                用 ChatGPT Plus/Pro 订阅，免去手动填 API Key
+              </p>
+            )}
+          </div>
+        </div>
+
+        {account === undefined ? null : loggedIn ? (
+          <div className="flex shrink-0 items-center gap-2">
+            {isDefault ? (
+              <span
+                className="rounded-full bg-accent/15 px-2 py-0.5 text-[11px] text-accent"
+                title="当前模型请求走 ChatGPT 订阅"
+              >
+                默认
+              </span>
+            ) : (
+              <button
+                onClick={handleSetDefault}
+                disabled={busy}
+                className="rounded border border-border px-2.5 py-1 text-xs text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
+                title="把模型请求切到 ChatGPT 订阅"
+              >
+                设为默认
+              </button>
+            )}
+            <button
+              onClick={handleLogout}
+              disabled={busy}
+              className="flex items-center gap-1.5 rounded border border-border px-2.5 py-1 text-xs text-gray-400 transition-colors hover:bg-surface-3 disabled:opacity-50"
+            >
+              <LogOut size={12} /> 退出登录
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={handleLogin}
+            disabled={busy}
+            className="flex shrink-0 items-center gap-1.5 rounded bg-accent px-2.5 py-1 text-xs text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
+          >
+            {busy ? <RefreshCw size={12} className="animate-spin" /> : <LogIn size={12} />}
+            {busy ? "等待浏览器授权…" : "登录"}
+          </button>
+        )}
+      </div>
+
+      {busy && !loggedIn && (
+        <p className="text-[11px] text-gray-500">
+          已在浏览器中打开 OpenAI 登录页，请完成授权后返回（5 分钟内有效）。
+        </p>
+      )}
+      {error && (
+        <p className="flex items-start gap-1.5 text-[11px] text-rose-500">
+          <AlertCircle size={12} className="mt-0.5 shrink-0" /> {error}
+        </p>
+      )}
     </div>
   );
 }

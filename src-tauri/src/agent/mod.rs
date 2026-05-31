@@ -324,7 +324,10 @@ impl AgentLoop {
         let api_style = self.api_style.clone();
 
         match api_style {
-            ApiStyle::Openai => {
+            // ChatGPT shares the OpenAI orchestration loop (same ChatMessage
+            // shape, tool loop, persistence, events). Only the per-round model
+            // call differs — run_openai picks call_chatgpt_model when needed.
+            ApiStyle::Openai | ApiStyle::Chatgpt => {
                 self.run_openai(history, &tool_defs, &event_name, &system_prompt)
                     .await
             }
@@ -383,7 +386,12 @@ impl AgentLoop {
                     .ok();
             }
 
-            let (text, tool_calls, usage, reasoning) = self.call_openai_model(&messages, tool_defs, event_name).await?;
+            let (text, tool_calls, usage, reasoning) = match self.api_style {
+                ApiStyle::Chatgpt => {
+                    self.call_chatgpt_model(&messages, tool_defs, event_name).await?
+                }
+                _ => self.call_openai_model(&messages, tool_defs, event_name).await?,
+            };
 
             // Emit real (provider-reported) context-usage right after each
             // round-trip so the UI bar tracks actual usage, not just our
@@ -676,6 +684,237 @@ impl AgentLoop {
                 false
             }
         }
+    }
+
+    /// Flatten a message body to plain text. Text passes through; Parts keep
+    /// their text fragments (image parts are dropped — the ChatGPT codex models
+    /// are text-first). Robust to ContentPart's exact shape via serde.
+    fn content_to_text(content: &MessageContent) -> String {
+        match content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::Parts(parts) => serde_json::to_value(parts)
+                .ok()
+                .and_then(|v| {
+                    v.as_array().map(|arr| {
+                        arr.iter()
+                            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Per-round model call against the ChatGPT backend **Responses API**
+    /// (subscription). Self-resolves the OAuth access token (refreshing as
+    /// needed) via `codex_auth`, so no API key is threaded through. Translates
+    /// the OpenAI-shaped ChatMessage history into Responses `instructions` +
+    /// `input` items, parses the Responses SSE stream, and returns the same
+    /// (text, tool_calls, usage, reasoning) contract as call_openai_model.
+    async fn call_chatgpt_model(
+        &self,
+        messages: &[ChatMessage],
+        tool_defs: &[ToolDefinition],
+        event_name: &str,
+    ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
+        use futures_util::StreamExt;
+
+        let (access_token, account_id) = crate::codex_auth::valid_access_token().await?;
+        // The ChatGPT backend URL is fixed — use the canonical constant rather
+        // than the endpoint's base_url so the request always lands correctly.
+        let url = format!("{}/responses", crate::codex_auth::CHATGPT_BASE_URL);
+
+        // ── ChatMessage history → Responses instructions + input items ──
+        let mut instructions = String::new();
+        let mut input: Vec<serde_json::Value> = Vec::new();
+        for m in messages {
+            match m.role.as_str() {
+                "system" => instructions = Self::content_to_text(&m.content),
+                "tool" => input.push(serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": m.tool_call_id.clone().unwrap_or_default(),
+                    "output": Self::content_to_text(&m.content),
+                })),
+                "assistant" => {
+                    let text = Self::content_to_text(&m.content);
+                    if !text.is_empty() {
+                        input.push(serde_json::json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        }));
+                    }
+                    if let Some(tcs) = &m.tool_calls {
+                        for tc in tcs {
+                            input.push(serde_json::json!({
+                                "type": "function_call",
+                                "call_id": tc.id,
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            }));
+                        }
+                    }
+                }
+                _ => input.push(serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": Self::content_to_text(&m.content)}],
+                })),
+            }
+        }
+
+        // Tools → Responses shape (function fields flattened, no "function" nest).
+        let tools: Vec<serde_json::Value> = tool_defs
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": t.function.name,
+                    "description": t.function.description,
+                    "parameters": t.function.parameters,
+                })
+            })
+            .collect();
+
+        let body = serde_json::json!({
+            "model": self.model_id,
+            "instructions": instructions,
+            "input": input,
+            "tools": tools,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "store": false,
+            "stream": true,
+            "reasoning": { "effort": "medium", "summary": "auto" },
+        });
+
+        let mut request = self
+            .http
+            .post(&url)
+            .bearer_auth(&access_token)
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", "codex_cli_rs")
+            .header("session_id", &self.session_id)
+            .header("Accept", "text/event-stream")
+            .json(&body);
+        if let Some(acct) = &account_id {
+            request = request.header("chatgpt-account-id", acct.as_str());
+        }
+
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(crate::errors::AppError::Other(format!(
+                "ChatGPT 后端请求失败（{status}）：{text}"
+            )));
+        }
+
+        // ── Parse the Responses SSE stream ──
+        let mut byte_stream = response.bytes_stream();
+        let mut text_buf = String::new();
+        let mut reasoning_buf = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut usage: Option<Usage> = None;
+        let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
+
+        while let Some(chunk) = byte_stream.next().await {
+            let bytes = chunk?;
+            byte_buffer.extend_from_slice(&bytes);
+            while let Some(nl) = byte_buffer.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = byte_buffer.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
+                let line = line.trim_end_matches('\r');
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                if data.trim() == "[DONE]" {
+                    byte_buffer.clear();
+                    break;
+                }
+                let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) else {
+                    continue;
+                };
+                match ev.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                    "response.output_text.delta" => {
+                        if let Some(d) = ev.get("delta").and_then(|v| v.as_str()) {
+                            if !d.is_empty() {
+                                self.app
+                                    .emit(event_name, StreamEvent::TextDelta { content: d.to_string() })
+                                    .ok();
+                                text_buf.push_str(d);
+                            }
+                        }
+                    }
+                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                        if let Some(d) = ev.get("delta").and_then(|v| v.as_str()) {
+                            reasoning_buf.push_str(d);
+                        }
+                    }
+                    "response.output_item.done" => {
+                        if let Some(item) = ev.get("item") {
+                            if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                                let call_id = item
+                                    .get("call_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let name = item
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let arguments = item
+                                    .get("arguments")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if !call_id.is_empty() && !name.is_empty() {
+                                    tool_calls.push(ToolCall {
+                                        id: call_id,
+                                        r#type: "function".into(),
+                                        function: FunctionCall { name, arguments },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    "response.completed" => {
+                        if let Some(u) = ev.get("response").and_then(|r| r.get("usage")) {
+                            let inp = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                            let out =
+                                u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                            usage = Some(Usage {
+                                prompt_tokens: inp,
+                                completion_tokens: out,
+                                total_tokens: inp + out,
+                            });
+                        }
+                    }
+                    "response.failed" => {
+                        let msg = ev
+                            .get("response")
+                            .and_then(|r| r.get("error"))
+                            .and_then(|e| e.get("message"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("response.failed")
+                            .to_string();
+                        return Err(crate::errors::AppError::Other(format!(
+                            "ChatGPT 后端返回错误：{msg}"
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let reasoning = if reasoning_buf.is_empty() {
+            None
+        } else {
+            Some(reasoning_buf)
+        };
+        Ok((text_buf, tool_calls, usage, reasoning))
     }
 
     async fn call_openai_model(

@@ -189,6 +189,10 @@ fn default_font_size() -> u8 {
 pub enum ApiStyle {
     Openai,
     Anthropic,
+    /// ChatGPT (Codex) subscription — requests go to the ChatGPT backend
+    /// Responses API using the OAuth access token from `codex_auth`, not an
+    /// API key. See AgentLoop::call_chatgpt_model.
+    Chatgpt,
 }
 
 impl Default for ApiStyle {
