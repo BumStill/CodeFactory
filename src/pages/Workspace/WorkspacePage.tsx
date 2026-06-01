@@ -35,6 +35,7 @@ import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
 import { SessionSidebar } from "../../components/SessionSidebar";
 import { SessionSwitcherPopover } from "../../components/SessionSwitcherPopover";
+import { SpecsPage } from "../Specs/SpecsPage";
 import { ModelPicker } from "../../components/ModelPicker";
 import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
@@ -101,6 +102,10 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
   const isAnonymous = activeSession?.kind === "anonymous";
   const { settings, setTheme } = useSettingsStore();
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
+  // Specs workbench, folded into the Workspace as a full-screen overlay: it's
+  // invoked in-context, scoped to this session's cwd, and its "开始实现" creates +
+  // runs tasks in THIS session (no navigation away — unified flow).
+  const [specsOpen, setSpecsOpen] = useState(false);
 
   // Collapsible session sidebar. Collapsed → the left rail hides (chat widens)
   // and the top-left icon opens a popover with the full quick-switcher, so
@@ -259,6 +264,13 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
         </div>
 
         <button
+          onClick={() => setSpecsOpen(true)}
+          className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+          title="规范工作台（在当前会话里写需求规范并就地实现）"
+        >
+          <BookOpen size={14} />
+        </button>
+        <button
           onClick={() => setConnectorsCollapsed((v) => !v)}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
           title={connectorsCollapsed ? "显示连接器（知识库 / 技能 / 记忆）" : "收起连接器面板"}
@@ -324,6 +336,19 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
           </aside>
         )}
       </div>
+
+      {/* ── Specs workbench, folded into the Workspace as a full-screen ───
+          overlay. SpecsPage reads the active session from the chat store, so
+          it auto-scopes to this session's cwd; its "开始实现" runs in this very
+          session. onOpenWorkspace just closes (we're already here). */}
+      {specsOpen && (
+        <div className="fixed inset-0 z-50">
+          <SpecsPage
+            onBack={() => setSpecsOpen(false)}
+            onOpenWorkspace={() => setSpecsOpen(false)}
+          />
+        </div>
+      )}
 
       {/* ── Permission dialog overlay ───────────────────────────────────── */}
       {pendingPermission && (
