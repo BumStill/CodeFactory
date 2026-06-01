@@ -27,6 +27,8 @@ import {
   EyeOff,
   PanelLeftClose,
   PanelLeft,
+  PanelRightClose,
+  PanelRight,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { MessageList } from "../../components/MessageList";
@@ -109,6 +111,22 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
   });
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const sidebarCtrlRef = useRef<HTMLDivElement>(null);
+  // Right "连接器" column (knowledge / skills / memory) — informational, so a
+  // plain collapse toggle (no popover). Persisted independently of the left.
+  const [connectorsCollapsed, setConnectorsCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("cf.workspace.connectorsCollapsed") === "1";
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("cf.workspace.connectorsCollapsed", connectorsCollapsed ? "1" : "0");
+    } catch {
+      /* persistence is best-effort */
+    }
+  }, [connectorsCollapsed]);
   useEffect(() => {
     try {
       localStorage.setItem("cf.workspace.sidebarCollapsed", sidebarCollapsed ? "1" : "0");
@@ -238,6 +256,13 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
         </div>
 
         <button
+          onClick={() => setConnectorsCollapsed((v) => !v)}
+          className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+          title={connectorsCollapsed ? "显示连接器（知识库 / 技能 / 记忆）" : "收起连接器面板"}
+        >
+          {connectorsCollapsed ? <PanelRight size={14} /> : <PanelRightClose size={14} />}
+        </button>
+        <button
           onClick={onOpenSettings}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
           title="设置"
@@ -289,10 +314,12 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
           />
         </main>
 
-        {/* ─── Right: Active skills + memory ─────────────────────────── */}
-        <aside className="w-60 shrink-0 border-l border-border bg-surface-1 flex flex-col">
-          <ConnectorsColumn cwd={activeSession?.cwd ?? null} />
-        </aside>
+        {/* ─── Right: connectors (collapsible — informational, not nav) ── */}
+        {!connectorsCollapsed && (
+          <aside className="w-60 shrink-0 border-l border-border bg-surface-1 flex flex-col">
+            <ConnectorsColumn cwd={activeSession?.cwd ?? null} />
+          </aside>
+        )}
       </div>
 
       {/* ── Permission dialog overlay ───────────────────────────────────── */}

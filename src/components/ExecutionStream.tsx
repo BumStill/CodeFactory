@@ -109,10 +109,15 @@ function InterjectionBar({ sessionId }: { sessionId: string }) {
   const justSent = sentAt > 0 && Date.now() - sentAt < 3000;
 
   return (
-    <div className="sticky bottom-0 z-10 border-t border-border bg-surface-2 px-3 py-2 flex items-center gap-2">
-      <MessageSquarePlus size={11} className="text-gray-500 shrink-0" />
+    <div
+      className="sticky bottom-0 z-10 border-t border-border bg-surface-2 px-3 py-2 flex items-center gap-2"
+      title="执行期间可随时在这里插话，引导 AI 的下一步（在下一个任务开始前生效）"
+    >
+      <MessageSquarePlus size={11} className="text-accent shrink-0" />
+      <span className="shrink-0 text-[10px] font-medium text-gray-400">引导下一步</span>
       <input
         type="text"
+        aria-label="引导下一步"
         value={text}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
@@ -121,7 +126,7 @@ function InterjectionBar({ sessionId }: { sessionId: string }) {
             void send();
           }
         }}
-        placeholder="插嘴：让 AI 在下一个任务前改变方向…"
+        placeholder="例如：先跳过登录，专注做 UI…"
         disabled={busy}
         className="flex-1 bg-surface-1 border border-border rounded px-2 py-1 text-[11px] text-gray-200 outline-none focus:border-accent disabled:opacity-50"
       />
@@ -321,12 +326,26 @@ function renderEvent(e: ExecutionEvent): {
         color: "text-amber-700 dark:text-amber-300",
         text: e.message ?? "重试",
       };
-    case "task_verification":
+    case "task_verification": {
+      // Live per-criterion summary: green when all pass, red otherwise.
+      const v = e.verification;
+      if (v && v.length > 0) {
+        const passed = v.filter((r) => r.passed).length;
+        return {
+          Icon: ShieldCheck,
+          color:
+            passed === v.length
+              ? "text-green-700 dark:text-green-400"
+              : "text-red-700 dark:text-red-400",
+          text: `验证 · ${passed}/${v.length} 通过`,
+        };
+      }
       return {
         Icon: ShieldCheck,
         color: "text-blue-700 dark:text-blue-300",
         text: e.message ?? "验证",
       };
+    }
   }
 }
 

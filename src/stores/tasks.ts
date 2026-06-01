@@ -8,6 +8,7 @@ import type {
   TaskEventPayload,
   TaskInput,
   TaskRun,
+  VerificationResult,
 } from "../lib/tauri";
 
 // ── Evidence pack notification store ─────────────────────────────────────────
@@ -59,6 +60,9 @@ export interface ExecutionEvent {
   /** Working dir of the task. Surfaced alongside filesChanged so the UI
    *  can call `git diff` in the right place when expanding the panel. */
   cwd?: string;
+  /** Per-criterion verification results — present on task_verification events
+   *  (the backend emits them; we capture them for a live pass/fail summary). */
+  verification?: VerificationResult[];
   at: number;
 }
 
@@ -187,6 +191,11 @@ export const useTasksStore = create<TasksState>((set, get) => ({
           ? (extra.files_changed as string[])
           : undefined;
         const cwd = typeof extra.cwd === "string" ? extra.cwd : undefined;
+        // task_verification carries structured per-criterion results on the
+        // wire (same Record cast as files_changed); capture them here.
+        const verification = Array.isArray(extra.results)
+          ? (extra.results as VerificationResult[])
+          : undefined;
 
         const entry: ExecutionEvent = {
           id: `${k}-${payload.task_id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -198,6 +207,7 @@ export const useTasksStore = create<TasksState>((set, get) => ({
           error: payload.error,
           filesChanged,
           cwd,
+          verification,
           at: Date.now(),
         };
         set((s) => {
