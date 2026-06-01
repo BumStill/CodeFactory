@@ -49,7 +49,7 @@ describe("ExecutionStream interjection bar", () => {
       },
     }));
     render(<ExecutionStream sessionId="s1" />);
-    expect(screen.queryByPlaceholderText(/插嘴/)).toBeNull();
+    expect(screen.queryByLabelText(/引导/)).toBeNull();
   });
 
   it("appears when running and submits via Enter", async () => {
@@ -58,7 +58,7 @@ describe("ExecutionStream interjection bar", () => {
 
     render(<ExecutionStream sessionId="s1" />);
 
-    const input = screen.getByPlaceholderText(/插嘴/) as HTMLInputElement;
+    const input = screen.getByLabelText(/引导/) as HTMLInputElement;
     expect(input).toBeInTheDocument();
 
     const user = userEvent.setup();

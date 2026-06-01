@@ -72,4 +72,21 @@ describe("ExecutionStream", () => {
     render(<ExecutionStream sessionId="s1" />);
     expect(screen.getByText("运行中")).toBeInTheDocument();
   });
+
+  it("renders a live per-criterion verification summary (passed/total)", () => {
+    pushEvents("s1", [
+      ev({ kind: "task_started", taskId: "t1", title: "Verify me" }),
+      ev({
+        kind: "task_verification",
+        taskId: "t1",
+        verification: [
+          { check: "cargo test", passed: true, output: "", duration_ms: 10 },
+          { check: "tsc", passed: true, output: "", duration_ms: 5 },
+          { check: "lint", passed: false, output: "oops", duration_ms: 3 },
+        ],
+      }),
+    ]);
+    render(<ExecutionStream sessionId="s1" />);
+    expect(screen.getByText("验证 · 2/3 通过")).toBeInTheDocument();
+  });
 });
