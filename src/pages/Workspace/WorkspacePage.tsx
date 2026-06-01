@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   BookOpen,
@@ -25,11 +25,14 @@ import {
   Square,
   Brain,
   EyeOff,
+  PanelLeftClose,
+  PanelLeft,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
 import { SessionSidebar } from "../../components/SessionSidebar";
+import { SessionSwitcherPopover } from "../../components/SessionSwitcherPopover";
 import { ModelPicker } from "../../components/ModelPicker";
 import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
@@ -92,6 +95,40 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
   const { settings, setTheme } = useSettingsStore();
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
 
+  // Collapsible session sidebar. Collapsed → the left rail hides (chat widens)
+  // and the top-left icon opens a popover with the full quick-switcher, so
+  // collapsing never buries navigation. Persisted so it sticks across launches.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("cf.workspace.sidebarCollapsed") === "1";
+    } catch {
+      return false; // localStorage unavailable (e.g. some test envs)
+    }
+  });
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+  const sidebarCtrlRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    try {
+      localStorage.setItem("cf.workspace.sidebarCollapsed", sidebarCollapsed ? "1" : "0");
+    } catch {
+      /* persistence is best-effort */
+    }
+    if (!sidebarCollapsed) setSwitcherOpen(false);
+  }, [sidebarCollapsed]);
+  // Dismiss the collapsed-state quick switcher on an outside click. The ref
+  // wraps BOTH the toggle button and the popover, so clicking the toggle
+  // itself doesn't count as "outside" (the button owns its own toggle).
+  useEffect(() => {
+    if (!switcherOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (sidebarCtrlRef.current && !sidebarCtrlRef.current.contains(e.target as Node)) {
+        setSwitcherOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [switcherOpen]);
+
   useEffect(() => {
     selectSession(sessionId);
   }, [sessionId]);
@@ -108,6 +145,32 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
         >
           <ChevronLeft size={14} />
         </button>
+        {/* Sidebar toggle: collapse the session rail, or (when collapsed) open
+            a quick-switcher popover so navigation is never buried. */}
+        <div className="relative" ref={sidebarCtrlRef}>
+          <button
+            onClick={() =>
+              sidebarCollapsed ? setSwitcherOpen((v) => !v) : setSidebarCollapsed(true)
+            }
+            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+            title={sidebarCollapsed ? "会话（点击快速切换 / 展开侧栏）" : "收起会话侧栏"}
+          >
+            {sidebarCollapsed ? <PanelLeft size={14} /> : <PanelLeftClose size={14} />}
+          </button>
+          {sidebarCollapsed && switcherOpen && (
+            <SessionSwitcherPopover
+              currentSessionId={sessionId}
+              onOpenSession={(id) => {
+                onOpenSession(id);
+                setSwitcherOpen(false);
+              }}
+              onExpand={() => {
+                setSidebarCollapsed(false);
+                setSwitcherOpen(false);
+              }}
+            />
+          )}
+        </div>
         <div className="flex-1 min-w-0">
           <div className="text-sm font-medium text-gray-200 truncate flex items-center gap-2">
             {activeSession?.title || "..."}
@@ -184,17 +247,19 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
       {/* ── Body: 3 columns ──────────────────────────────────────────────── */}
       <div className="flex-1 flex min-h-0">
 
-        {/* ─── Left: Session sidebar + adaptive task tree ─────────────── */}
-        <aside className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col min-h-0">
-          <SessionSidebar currentSessionId={sessionId} onOpenSession={onOpenSession} />
-          {/* Adaptive: the task tree only makes sense for project sessions.
-              Quick + anonymous chats have no tasks, so the panel is omitted. */}
-          {activeSession &&
-            activeSession.kind !== "quick" &&
-            activeSession.kind !== "anonymous" && (
-              <TasksColumn sessionId={sessionId} />
-            )}
-        </aside>
+        {/* ─── Left: Session sidebar + adaptive task tree (collapsible) ─── */}
+        {!sidebarCollapsed && (
+          <aside className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col min-h-0">
+            <SessionSidebar currentSessionId={sessionId} onOpenSession={onOpenSession} />
+            {/* Adaptive: the task tree only makes sense for project sessions.
+                Quick + anonymous chats have no tasks, so the panel is omitted. */}
+            {activeSession &&
+              activeSession.kind !== "quick" &&
+              activeSession.kind !== "anonymous" && (
+                <TasksColumn sessionId={sessionId} />
+              )}
+          </aside>
+        )}
 
         {/* ─── Center: Execution stream + input ──────────────────────── */}
         <main className="flex-1 flex flex-col min-w-0">
