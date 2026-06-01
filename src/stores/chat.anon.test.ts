@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Anonymous-chat store flow. Verifies the privacy contract at the store seam:
+// anonymous turns go to `send_message_anonymous` (NOT the persisted
+// `send_message`), the frontend replays its own history, exiting discards
+// everything, and re-selecting the ephemeral session never hits the DB.
+// The actual no-DB-write guarantee lives in the Rust agent guards.
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { useChatStore } from "./chat";
+
+const invokeMock = vi.hoisted(() => vi.fn());
+const sendAnonMock = vi.hoisted(() => vi.fn());
+vi.mock("../lib/tauri", () => ({
+  invoke: invokeMock,
+  onStream: vi.fn(async () => () => {}),
+  onSessionUpdated: vi.fn(async () => () => {}),
+  sendMessageAnonymous: sendAnonMock,
+}));
+
+beforeEach(() => {
+  invokeMock.mockReset();
+  invokeMock.mockResolvedValue(undefined);
+  sendAnonMock.mockReset();
+  sendAnonMock.mockResolvedValue(undefined);
+  useChatStore.setState({
+    sessions: [],
+    quickSessions: [],
+    activeSession: null,
+    messages: [],
+    streaming: false,
+    queue: [],
+    activeModel: "anthropic/claude-opus-4-7",
+    inputTokenTotal: 0,
+    outputTokenTotal: 0,
+    pendingPermission: null,
+  });
+});
+
+describe("anonymous chat store flow", () => {
+  it("startAnonymousSession creates a blank in-memory anonymous session", () => {
+    const s = useChatStore.getState().startAnonymousSession();
+    expect(s.kind).toBe("anonymous");
+    const st = useChatStore.getState();
+    expect(st.activeSession?.id).toBe(s.id);
+    expect(st.activeSession?.kind).toBe("anonymous");
+    expect(st.messages).toEqual([]);
+  });
+
+  it("routes anonymous turns to send_message_anonymous with replayed history", async () => {
+    const s = useChatStore.getState().startAnonymousSession();
+    useChatStore.setState({
+      messages: [
+        { id: "u1", role: "user", content: "hi", createdAt: 0 },
+        { id: "a1", role: "assistant", content: "hello", createdAt: 0 },
+      ] as never,
+    });
+
+    await useChatStore.getState().sendMessage("how are you");
+
+    expect(sendAnonMock).toHaveBeenCalledTimes(1);
+    const [sid, content, history, cwd, model] = sendAnonMock.mock.calls[0];
+    expect(sid).toBe(s.id);
+    expect(content).toBe("how are you");
+    expect(history).toEqual([
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ]);
+    expect(cwd).toBe(""); // backend resolves the scratch dir
+    expect(model).toBe("anthropic/claude-opus-4-7");
+    // The persisted path must never run for an anonymous session.
+    expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
+  });
+
+  it("non-anonymous sendMessage still uses the persisted send_message path", async () => {
+    useChatStore.setState({
+      activeSession: {
+        id: "p1", title: "t", cwd: "/proj", model_id: "m", created_at: 0,
+        updated_at: 0, total_input_tokens: 0, total_output_tokens: 0, kind: "project",
+      } as never,
+      messages: [],
+    });
+
+    await useChatStore.getState().sendMessage("hello");
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      "send_message",
+      expect.objectContaining({ content: "hello" }),
+    );
+    expect(sendAnonMock).not.toHaveBeenCalled();
+  });
+
+  it("exitAnonymous discards the in-memory session and its history", () => {
+    useChatStore.getState().startAnonymousSession();
+    useChatStore.setState({
+      messages: [{ id: "x", role: "user", content: "secret", createdAt: 0 }] as never,
+    });
+
+    useChatStore.getState().exitAnonymous();
+
+    const st = useChatStore.getState();
+    expect(st.activeSession).toBeNull();
+    expect(st.messages).toEqual([]);
+  });
+
+  it("selectSession never hits the DB for the active anonymous session", async () => {
+    const s = useChatStore.getState().startAnonymousSession();
+    await useChatStore.getState().selectSession(s.id);
+    expect(invokeMock).not.toHaveBeenCalledWith("get_session", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("get_messages", expect.anything());
+    expect(useChatStore.getState().activeSession?.id).toBe(s.id);
+  });
+});

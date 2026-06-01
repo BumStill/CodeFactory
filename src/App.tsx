@@ -90,6 +90,7 @@ export default function App() {
           sessionId={activeProject}
           onBackHome={backToHome}
           onOpenSettings={() => setView("settings")}
+          onOpenSession={openProject}
         />
       )}
 

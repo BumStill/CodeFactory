@@ -31,24 +31,37 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: mocks.openDialog,
 }));
 
+// Chat store mock supports BOTH call shapes: the no-arg destructure form
+// (WorkspacePage: `const {activeSession,...} = useChatStore()`) and the
+// selector form (SessionSidebar: `useChatStore(s => s.sessions)`).
+const fakeChatState = {
+  sessions: [] as unknown[],
+  quickSessions: [] as unknown[],
+  activeSession: { id: "s1", cwd: "/Users/x/proj", title: "proj" },
+  messages: [] as unknown[],
+  streaming: false,
+  queue: [] as unknown[],
+  activeModel: "anthropic/claude-opus-4-7",
+  selectSession: vi.fn(),
+  sendMessage: vi.fn(),
+  sendOrQueue: vi.fn(),
+  removeFromQueue: vi.fn(),
+  cancelStream: vi.fn(),
+  pendingPermission: null,
+  respondPermission: vi.fn(),
+  updateActiveSessionModel: vi.fn(),
+  createSession: vi.fn(),
+  loadSessions: vi.fn(),
+  loadQuickSessions: vi.fn(),
+  inputTokenTotal: 0,
+  outputTokenTotal: 0,
+};
 vi.mock("../../stores/chat", () => ({
-  useChatStore: () => ({
-    activeSession: { id: "s1", cwd: "/Users/x/proj", title: "proj" },
-    messages: [],
-    streaming: false,
-    queue: [],
-    activeModel: "anthropic/claude-opus-4-7",
-    selectSession: vi.fn(),
-    sendMessage: vi.fn(),
-    sendOrQueue: vi.fn(),
-    removeFromQueue: vi.fn(),
-    cancelStream: vi.fn(),
-    pendingPermission: null,
-    respondPermission: vi.fn(),
-    updateActiveSessionModel: vi.fn(),
-    inputTokenTotal: 0,
-    outputTokenTotal: 0,
-  }),
+  useChatStore: Object.assign(
+    <T,>(selector?: (s: typeof fakeChatState) => T): T | typeof fakeChatState =>
+      selector ? selector(fakeChatState) : fakeChatState,
+    { setState: vi.fn(), getState: () => fakeChatState },
+  ),
 }));
 // Stub ModelPicker — it pulls in a lot of provider state we don't care about
 vi.mock("../../components/ModelPicker", () => ({
@@ -160,7 +173,7 @@ describe("AI task decomposition flow", () => {
     });
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     // Open the modal via the empty-state CTA
@@ -234,7 +247,7 @@ describe("AI task decomposition flow", () => {
     });
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     await user.click(await screen.findByText(/点这里描述需求/));
@@ -279,7 +292,7 @@ describe("AI task decomposition flow", () => {
     });
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     const library = await screen.findByText("历史方案库");

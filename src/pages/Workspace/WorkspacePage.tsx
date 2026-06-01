@@ -4,6 +4,8 @@ import {
   AlertTriangle,
   BookOpen,
   ChevronLeft,
+  ChevronDown,
+  ChevronRight,
   Settings as SettingsIcon,
   Moon,
   Sun,
@@ -22,10 +24,12 @@ import {
   Play,
   Square,
   Brain,
+  EyeOff,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
+import { SessionSidebar } from "../../components/SessionSidebar";
 import { ModelPicker } from "../../components/ModelPicker";
 import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
@@ -64,22 +68,27 @@ interface WorkspacePageProps {
   sessionId: string;
   onBackHome: () => void;
   onOpenSettings: () => void;
+  /** Switch the workspace to another session in-place (from the sidebar). */
+  onOpenSession: (id: string) => void;
 }
 
 /**
- * Workspace — the new primary working surface (replaces ChatPage as default).
+ * Workspace — the primary working surface.
  *
  * Three-column layout:
- *   Left   — Task tree for this project (persistent unit)
+ *   Left   — Session sidebar (Codex-style: unified quick+project list, in-place
+ *            switching, "+ 新建" menu) PLUS an ADAPTIVE task tree shown only for
+ *            project sessions — quick chats get no meaningless task column.
  *   Center — Execution stream (AI work in progress + chat input)
  *   Right  — Active skills + memory increments (transparency surface)
  */
-export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: WorkspacePageProps) {
+export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSession }: WorkspacePageProps) {
   const {
     activeSession, messages, streaming, queue,
     selectSession, sendOrQueue, cancelStream, removeFromQueue,
-    pendingPermission, respondPermission,
+    pendingPermission, respondPermission, exitAnonymous,
   } = useChatStore();
+  const isAnonymous = activeSession?.kind === "anonymous";
   const { settings, setTheme } = useSettingsStore();
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
 
@@ -110,13 +119,37 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: Workspa
                 Quick
               </span>
             )}
+            {isAnonymous && (
+              <span
+                className="inline-flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400 font-normal"
+                title="匿名会话：不落库、不计费、不进记忆/画像。离开即丢弃。"
+              >
+                <EyeOff size={9} />
+                匿名
+              </span>
+            )}
           </div>
           <div className="text-[10px] text-gray-600 font-mono truncate">
-            {activeSession?.cwd}
+            {isAnonymous ? "无痕会话 · 不落库 · 不计费 · 不学习" : activeSession?.cwd}
           </div>
         </div>
+        {isAnonymous && (
+          <button
+            onClick={() => {
+              exitAnonymous();
+              onBackHome();
+            }}
+            className="flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-600 transition-colors hover:bg-amber-500/20 dark:text-amber-400"
+            title="退出匿名会话并丢弃其历史"
+          >
+            <EyeOff size={12} />
+            退出匿名
+          </button>
+        )}
         <ModelPicker />
-        <ReasoningEffortPicker />
+        {/* Per-session reasoning override needs a DB row; anonymous chats use
+            the global default, so the picker is hidden for them. */}
+        {!isAnonymous && <ReasoningEffortPicker />}
 
         {/* Theme toggle */}
         <div className="flex items-center rounded border border-border overflow-hidden">
@@ -151,9 +184,16 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings }: Workspa
       {/* ── Body: 3 columns ──────────────────────────────────────────────── */}
       <div className="flex-1 flex min-h-0">
 
-        {/* ─── Left: Task tree ────────────────────────────────────────── */}
-        <aside className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col">
-          <TasksColumn sessionId={sessionId} />
+        {/* ─── Left: Session sidebar + adaptive task tree ─────────────── */}
+        <aside className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col min-h-0">
+          <SessionSidebar currentSessionId={sessionId} onOpenSession={onOpenSession} />
+          {/* Adaptive: the task tree only makes sense for project sessions.
+              Quick + anonymous chats have no tasks, so the panel is omitted. */}
+          {activeSession &&
+            activeSession.kind !== "quick" &&
+            activeSession.kind !== "anonymous" && (
+              <TasksColumn sessionId={sessionId} />
+            )}
         </aside>
 
         {/* ─── Center: Execution stream + input ──────────────────────── */}
@@ -215,6 +255,7 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
   const pendingCount = sessionTasks.filter((t) => t.status === "pending").length;
   const [creatorOpen, setCreatorOpen] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState(false);
 
   useEffect(() => {
     loadTasks(sessionId);
@@ -266,9 +307,19 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
   };
 
   return (
-    <>
+    <div className={`flex shrink-0 flex-col border-t border-border ${collapsed ? "" : "max-h-[55%] min-h-0"}`}>
       <div className="flex items-center justify-between px-3 py-2 border-b border-border gap-2">
-        <h2 className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">任务</h2>
+        <button
+          onClick={() => setCollapsed((v) => !v)}
+          className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500 transition-colors hover:text-gray-300"
+          title={collapsed ? "展开任务" : "折叠任务"}
+        >
+          {collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+          任务
+          {sessionTasks.length > 0 && (
+            <span className="ml-0.5 text-gray-600">· {sessionTasks.length}</span>
+          )}
+        </button>
         <div className="flex items-center gap-1">
           {isRunning ? (
             <button
@@ -300,28 +351,32 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
           </button>
         </div>
       </div>
-      {startError && (
-        <div className="px-3 py-2 text-[10px] text-red-700 dark:text-red-300 bg-red-500/10 border-b border-red-500/20">
-          {startError}
-        </div>
+      {!collapsed && (
+        <>
+          {startError && (
+            <div className="px-3 py-2 text-[10px] text-red-700 dark:text-red-300 bg-red-500/10 border-b border-red-500/20">
+              {startError}
+            </div>
+          )}
+          <div className="flex-1 overflow-y-auto p-2">
+            {sessionTasks.length === 0 ? (
+              <button
+                onClick={() => setCreatorOpen(true)}
+                className="w-full text-[11px] text-gray-600 hover:text-gray-300 hover:bg-surface-2 rounded transition-colors py-8 leading-relaxed cursor-pointer"
+              >
+                还没有任务<br />
+                <span className="text-gray-700">点这里描述需求<br />AI 会自动拆解</span>
+              </button>
+            ) : (
+              <ul className="space-y-0.5">
+                {buildTaskTree(sessionTasks).map(({ task, depth }) => (
+                  <TaskRow key={task.id} task={task} depth={depth} />
+                ))}
+              </ul>
+            )}
+          </div>
+        </>
       )}
-      <div className="flex-1 overflow-y-auto p-2">
-        {sessionTasks.length === 0 ? (
-          <button
-            onClick={() => setCreatorOpen(true)}
-            className="w-full text-[11px] text-gray-600 hover:text-gray-300 hover:bg-surface-2 rounded transition-colors py-8 leading-relaxed cursor-pointer"
-          >
-            还没有任务<br />
-            <span className="text-gray-700">点这里描述需求<br />AI 会自动拆解</span>
-          </button>
-        ) : (
-          <ul className="space-y-0.5">
-            {buildTaskTree(sessionTasks).map(({ task, depth }) => (
-              <TaskRow key={task.id} task={task} depth={depth} />
-            ))}
-          </ul>
-        )}
-      </div>
       {creatorOpen && (
         <TaskCreatorModal
           cwd={activeSession?.cwd ?? null}
@@ -330,7 +385,7 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
           onConfirm={handleConfirm}
         />
       )}
-    </>
+    </div>
   );
 }
 

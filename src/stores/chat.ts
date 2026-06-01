@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "zustand";
-import { invoke, onStream, onSessionUpdated } from "../lib/tauri";
-import type { Message, Session, StreamEvent, ModelInfo, ReasoningEffort } from "../lib/tauri";
+import { invoke, onStream, onSessionUpdated, sendMessageAnonymous } from "../lib/tauri";
+import type { Message, Session, StreamEvent, ModelInfo, ReasoningEffort, AnonTurn } from "../lib/tauri";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   markPermissionResponse,
@@ -27,6 +27,10 @@ export const QUEUE_MAX = 5;
 
 interface ChatStore {
   sessions: Session[];
+  /** Quick-task sessions (kind='quick'), kept separate from `sessions` so
+   *  Home's "最近项目" stays project-only. The Workspace session sidebar
+   *  merges both for its unified list. */
+  quickSessions: Session[];
   activeSession: Session | null;
   messages: UIMessage[];
   streaming: boolean;
@@ -41,6 +45,7 @@ interface ChatStore {
   queue: QueuedMessage[];
 
   loadSessions: () => Promise<void>;
+  loadQuickSessions: () => Promise<void>;
   createSession: (cwd: string, model: string) => Promise<Session>;
   selectSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
@@ -59,6 +64,12 @@ interface ChatStore {
   clearVisibleConversation: () => void;
   updateActiveSessionModel: (modelId: string) => Promise<void>;
   updateActiveSessionReasoningEffort: (effort: ReasoningEffort | null) => Promise<void>;
+  /** Begin an in-memory ANONYMOUS chat — never persisted, not learned from,
+   *  API cost not counted. Returns the synthetic session so the caller can
+   *  navigate to it (it lives only in this store, never in the DB). */
+  startAnonymousSession: () => Session;
+  /** Tear down the active anonymous chat, discarding its in-memory history. */
+  exitAnonymous: () => void;
 
   _unlisten?: UnlistenFn;
   _unlistenSessionUpdated?: UnlistenFn;
@@ -67,6 +78,7 @@ interface ChatStore {
 
 export const useChatStore = create<ChatStore>((set, get) => ({
   sessions: [],
+  quickSessions: [],
   activeSession: null,
   messages: [],
   streaming: false,
@@ -84,6 +96,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     set({ sessions });
   },
 
+  loadQuickSessions: async () => {
+    const quickSessions = await invoke<Session[]>("list_quick_sessions");
+    set({ quickSessions });
+  },
+
   createSession: async (cwd, model) => {
     const title = cwd.split(/[/\\]/).pop() ?? "New Session";
     const session = await invoke<Session>("create_session", { title, cwd, modelId: model });
@@ -92,6 +109,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   selectSession: async (id) => {
+    // An active anonymous session lives only in memory (never in the DB), so
+    // re-selecting it must NOT hit get_session/get_messages — that would error
+    // (no row) and wipe its in-memory history. Keep it as-is.
+    const cur = get().activeSession;
+    if (cur?.id === id && cur.kind === "anonymous") return;
     const session = await invoke<Session>("get_session", { sessionId: id });
     const msgs = await invoke<Message[]>("get_messages", { sessionId: id });
     set({
@@ -118,20 +140,40 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const { activeSession, _unlisten, _unlistenSessionUpdated } = get();
     if (!activeSession || get().streaming) return;
 
+    const isAnon = activeSession.kind === "anonymous";
+
     // Cancel any previous listeners
     _unlisten?.();
     _unlistenSessionUpdated?.();
 
-    // Subscribe to session title update events before sending
-    const unlistenSessionUpdated = await onSessionUpdated(activeSession.id, (session) => {
-      set((s) => ({
-        activeSession: s.activeSession?.id === session.id ? session : s.activeSession,
-        sessions: s.sessions.map((existing) =>
-          existing.id === session.id ? session : existing
-        ),
-      }));
-    });
-    set({ _unlistenSessionUpdated: unlistenSessionUpdated });
+    // Anonymous sessions are never persisted, so there's no server-side title
+    // to subscribe to. Only normal sessions get the title-update listener.
+    if (!isAnon) {
+      const unlistenSessionUpdated = await onSessionUpdated(activeSession.id, (session) => {
+        set((s) => ({
+          activeSession: s.activeSession?.id === session.id ? session : s.activeSession,
+          sessions: s.sessions.map((existing) =>
+            existing.id === session.id ? session : existing
+          ),
+          // Quick sessions live in a separate array; mirror title/updated_at
+          // changes there too so the sidebar's unified list stays fresh.
+          quickSessions: s.quickSessions.map((existing) =>
+            existing.id === session.id ? session : existing
+          ),
+        }));
+      });
+      set({ _unlistenSessionUpdated: unlistenSessionUpdated });
+    }
+
+    // Anonymous: snapshot the prior conversation from memory BEFORE appending
+    // the new turn — the backend keeps no history, so the frontend replays it.
+    const anonHistory: AnonTurn[] = isAnon
+      ? get()
+          .messages.filter(
+            (m) => (m.role === "user" || m.role === "assistant") && m.content.trim().length > 0,
+          )
+          .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }))
+      : [];
 
     const userMsg: UIMessage = {
       id: crypto.randomUUID(),
@@ -160,10 +202,20 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     set({ _unlisten: unlisten });
 
     try {
-      await invoke("send_message", {
-        sessionId: activeSession.id,
-        content,
-      });
+      if (isAnon) {
+        await sendMessageAnonymous(
+          activeSession.id,
+          content,
+          anonHistory,
+          activeSession.cwd,
+          get().activeModel,
+        );
+      } else {
+        await invoke("send_message", {
+          sessionId: activeSession.id,
+          content,
+        });
+      }
     } catch (e) {
       set((s) => ({
         messages: s.messages.map((m) =>
@@ -215,6 +267,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const activeSession = get().activeSession;
     set({ activeModel: modelId });
     if (!activeSession) return;
+    if (activeSession.kind === "anonymous") {
+      // No DB row to persist to — reflect the choice on the in-memory session.
+      set({ activeSession: { ...activeSession, model_id: modelId } });
+      return;
+    }
 
     const session = await invoke<Session>("update_session_model", {
       sessionId: activeSession.id,
@@ -231,6 +288,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   updateActiveSessionReasoningEffort: async (effort) => {
     const activeSession = get().activeSession;
     if (!activeSession) return;
+    if (activeSession.kind === "anonymous") {
+      set({ activeSession: { ...activeSession, reasoning_effort: effort } });
+      return;
+    }
     const session = await invoke<Session>("update_session_reasoning_effort", {
       sessionId: activeSession.id,
       effort,
@@ -241,6 +302,59 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         existing.id === session.id ? session : existing,
       ),
     }));
+  },
+
+  startAnonymousSession: () => {
+    // A purely in-memory session: a client-generated id, kind "anonymous", and
+    // an empty cwd (the backend resolves a scratch dir). Never written to the
+    // DB. Replaces the visible conversation with a fresh, blank one.
+    const anon: Session = {
+      id: crypto.randomUUID(),
+      title: "匿名会话",
+      cwd: "",
+      model_id: get().activeModel,
+      created_at: Date.now(),
+      updated_at: Date.now(),
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      kind: "anonymous",
+    };
+    get()._unlisten?.();
+    get()._unlistenSessionUpdated?.();
+    set({
+      activeSession: anon,
+      messages: [],
+      streaming: false,
+      queue: [],
+      inputTokenTotal: 0,
+      outputTokenTotal: 0,
+      pendingPermission: null,
+      contextUsage: null,
+      compressionToast: null,
+      _unlisten: undefined,
+      _unlistenSessionUpdated: undefined,
+    });
+    return anon;
+  },
+
+  exitAnonymous: () => {
+    if (get().activeSession?.kind !== "anonymous") return;
+    get()._unlisten?.();
+    get()._unlistenSessionUpdated?.();
+    // Drop the in-memory session + its history entirely (no trace kept).
+    set({
+      activeSession: null,
+      messages: [],
+      streaming: false,
+      queue: [],
+      inputTokenTotal: 0,
+      outputTokenTotal: 0,
+      pendingPermission: null,
+      contextUsage: null,
+      compressionToast: null,
+      _unlisten: undefined,
+      _unlistenSessionUpdated: undefined,
+    });
   },
 
   cancelStream: () => {
@@ -317,9 +431,12 @@ function handleStreamEvent(
     //   - throttled per session to avoid burning tokens on rapid replies
     //   - skip too-short conversations (< 3 messages = noise)
     //   - skip 'error' terminations (the task path skips failures too)
+    //   - NEVER for anonymous chats — they must not feed the learning/profile
+    //     pipeline (no-trace = no learning).
     const session = get().activeSession;
     if (
       session &&
+      session.kind !== "anonymous" &&
       event.type === "done" &&
       get().messages.length >= POSTMORTEM_MIN_MESSAGES
     ) {
