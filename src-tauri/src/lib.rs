@@ -16,11 +16,18 @@ mod util;
 
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::{oneshot, Mutex, RwLock};
 
 pub type PendingPermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
+
+/// Per-chat-session cancel flags. Set by the `cancel_chat` command (the chat
+/// "stop" button) and polled cooperatively by the chat agent loop between
+/// rounds. Entirely separate from the task scheduler's cancel flags — stopping
+/// a chat turn never touches running tasks.
+pub type ChatCancelMap = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 
 /// Make a once-per-day copy of the SQLite DB so a botched schema migration
 /// or accidental delete isn't unrecoverable. Files named
@@ -66,6 +73,7 @@ pub struct AppState {
     pub db: Arc<RwLock<SqlitePool>>,
     pub settings: Arc<RwLock<config::Settings>>,
     pub pending_permissions: PendingPermissionMap,
+    pub chat_cancels: ChatCancelMap,
     pub interjections: commands::interjections::InterjectionQueue,
 }
 
@@ -124,6 +132,7 @@ pub fn run() {
                 db: Arc::new(RwLock::new(pool)),
                 settings: Arc::new(RwLock::new(settings)),
                 pending_permissions: Arc::new(Mutex::new(HashMap::new())),
+                chat_cancels: Arc::new(Mutex::new(HashMap::new())),
                 interjections: Arc::new(Mutex::new(HashMap::new())),
             });
             // Manage the Arc so all commands share the same McpManager instance.
@@ -185,6 +194,7 @@ pub fn run() {
             commands::chat::send_message,
             commands::chat::send_message_anonymous,
             commands::chat::respond_to_permission,
+            commands::chat::cancel_chat,
             commands::files::list_dir,
             commands::files::save_chat_attachment,
             commands::terminal::terminal_create,
