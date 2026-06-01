@@ -53,7 +53,9 @@ import type {
   TaskRun,
   TaskInput,
   TaskDep,
+  VerificationResult,
 } from "../../lib/tauri";
+import { parseVerification, verificationSummary } from "../../lib/verification";
 
 interface DecomposedTask {
   tmp_id: string;
@@ -694,35 +696,91 @@ function TaskRow({ task, depth }: { task: TaskRun; depth: number }) {
   const hasUnindexed = context.knowledge_libraries.some((library) =>
     !["ready", "completed", "completed_with_errors"].includes(library.scan_status),
   );
+  // Surface acceptance-criteria verification right here in the task tree — the
+  // "did it actually pass?" proof that previously only lived in evidence packs.
+  const verif = parseVerification(task.verification_results);
+  const summary = verificationSummary(task.verification_results);
+  const [verifOpen, setVerifOpen] = useState(false);
   return (
     <li
-      className="group flex items-start gap-2 px-1.5 py-1 rounded hover:bg-surface-3 transition-colors cursor-default"
+      className="rounded hover:bg-surface-3 transition-colors"
       style={{ paddingLeft: `${0.375 + depth * 0.875}rem` }}
     >
-      <Icon
-        size={11}
-        className={`mt-1 shrink-0 ${statusColor(task.status)} ${
-          task.status === "running" ? "animate-spin" : ""
-        }`}
-      />
-      <div className="min-w-0 flex-1">
-        <span className="block text-[11px] text-gray-300 leading-snug line-clamp-2">
-          {task.title}
-        </span>
-        {knowledgeCount > 0 && (
-          <div
-            className="mt-0.5 flex items-center gap-1 text-[9px] text-gray-600"
-            title={context.knowledge_libraries
-              .map((library) => `${library.name} · ${scanStatusText(library.scan_status)}`)
-              .join("\n")}
-          >
-            <BookOpen size={9} className="shrink-0 text-accent" />
-            <span>知识库 {knowledgeCount}</span>
-            {hasUnindexed && <span className="text-amber-700 dark:text-amber-300">待索引</span>}
+      <div className="group flex items-start gap-2 px-1.5 py-1">
+        <Icon
+          size={11}
+          className={`mt-1 shrink-0 ${statusColor(task.status)} ${
+            task.status === "running" ? "animate-spin" : ""
+          }`}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-start gap-1.5">
+            <span className="block flex-1 text-[11px] text-gray-300 leading-snug line-clamp-2">
+              {task.title}
+            </span>
+            {summary && (
+              <button
+                onClick={() => setVerifOpen((v) => !v)}
+                title={`验收验证：${summary.passed}/${summary.total} 通过（点击展开逐条）`}
+                className={`mt-0.5 inline-flex shrink-0 items-center gap-0.5 rounded px-1 text-[9px] transition-colors hover:bg-surface-2 ${
+                  summary.allPassed ? "text-green-500" : "text-red-500"
+                }`}
+              >
+                {summary.allPassed ? <CheckCircle2 size={10} /> : <XCircle size={10} />}
+                {summary.passed}/{summary.total}
+              </button>
+            )}
           </div>
-        )}
+          {knowledgeCount > 0 && (
+            <div
+              className="mt-0.5 flex items-center gap-1 text-[9px] text-gray-600"
+              title={context.knowledge_libraries
+                .map((library) => `${library.name} · ${scanStatusText(library.scan_status)}`)
+                .join("\n")}
+            >
+              <BookOpen size={9} className="shrink-0 text-accent" />
+              <span>知识库 {knowledgeCount}</span>
+              {hasUnindexed && <span className="text-amber-700 dark:text-amber-300">待索引</span>}
+            </div>
+          )}
+        </div>
       </div>
+      {verifOpen && verif && (
+        <div className="mb-1 ml-5 mr-1 space-y-0.5">
+          {verif.map((r, i) => (
+            <VerifCheckRow key={i} result={r} />
+          ))}
+        </div>
+      )}
     </li>
+  );
+}
+
+/** One acceptance-criterion check: ✓/✗ + name + duration, click to reveal the
+ *  captured output (only when there is any). */
+function VerifCheckRow({ result }: { result: VerificationResult }) {
+  const [showOutput, setShowOutput] = useState(false);
+  const hasOutput = result.output.trim().length > 0;
+  return (
+    <div className="rounded bg-surface-2">
+      <div
+        className={`flex items-center gap-1.5 px-1.5 py-0.5 ${hasOutput ? "cursor-pointer" : ""}`}
+        onClick={() => hasOutput && setShowOutput((v) => !v)}
+      >
+        {result.passed ? (
+          <CheckCircle2 size={10} className="shrink-0 text-green-500" />
+        ) : (
+          <XCircle size={10} className="shrink-0 text-red-500" />
+        )}
+        <span className="flex-1 truncate text-[10px] text-gray-400">{result.check}</span>
+        <span className="text-[9px] text-gray-600">{result.duration_ms}ms</span>
+      </div>
+      {showOutput && hasOutput && (
+        <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap px-1.5 pb-1 font-mono text-[9px] text-gray-500">
+          {result.output}
+        </pre>
+      )}
+    </div>
   );
 }
 
