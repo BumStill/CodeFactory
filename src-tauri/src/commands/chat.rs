@@ -192,6 +192,21 @@ pub async fn send_message(
         .await?
     };
 
+    // Framework-side plan/act dispatch (no user-facing mode toggle): if the
+    // previous assistant turn ended on a pending proposal and this message
+    // approves it, run THIS turn under the execute contract instead of
+    // plan-first — so the agent doesn't re-ask "Ready to proceed?" for work
+    // the user already greenlit. `history` already includes the just-inserted
+    // user message as its last element, so the most recent assistant message
+    // is the proposal we're checking.
+    let prev_assistant = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .map(|m| m.content.clone());
+    let mode = crate::agent::decide_chat_mode(prev_assistant.as_deref(), &content);
+    tracing::info!("send_message: dispatch mode = {:?}", mode);
+
     let db = state.db.read().await.clone();
     let settings_state = state.settings.clone();
     let pending_permissions = state.pending_permissions.clone();
@@ -202,7 +217,7 @@ pub async fn send_message(
     let event_name = format!("stream:{}", session_id);
     let session_id_clone = session_id.clone();
     tokio::spawn(async move {
-        let mut agent = AgentLoop::new(
+        let mut agent = AgentLoop::new_with_mode(
             app,
             db,
             session_id_clone,
@@ -215,6 +230,7 @@ pub async fn send_message(
             pending_permissions,
             mcp_manager,
             None,
+            mode,
         );
         if let Err(e) = agent.run(history).await {
             tracing::error!("Agent loop error: {e:#}");

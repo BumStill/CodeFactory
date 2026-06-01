@@ -3,12 +3,15 @@ pub mod anthropic_client;
 pub mod attachments;
 pub mod checkpoint;
 pub mod context;
+pub mod dispatch;
 pub mod hooks;
 pub mod scheduler;
 pub mod sse_buffer;
 pub mod subagent;
 pub mod user_context;
 pub mod verification;
+
+pub use dispatch::decide_chat_mode;
 
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -42,6 +45,12 @@ const MAX_ITERATIONS_INTERACTIVE: usize = 30;
 /// are tool round-trips, not LLM turns — they're cheap.
 const MAX_ITERATIONS_AUTONOMOUS: usize = 200;
 
+/// Iteration ceiling for EXECUTE turns — the chat surface right after the
+/// user approved a plan. Higher than interactive (the work was greenlit, so
+/// don't bounce back early) but well under autonomous (the user is still in
+/// the room and may interject between turns).
+const MAX_ITERATIONS_EXECUTE: usize = 80;
+
 /// How many distinct retry attempts the autonomous agent makes against
 /// the SAME failure signature before being forced to try a different
 /// approach. e.g. a `cargo test` that keeps failing the same way 5
@@ -64,6 +73,12 @@ const MAX_DISTINCT_APPROACHES: usize = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentMode {
     Interactive,
+    /// Chat surface, but the user just approved a pending proposal. Same
+    /// session and tool-permission safety net as Interactive, but the
+    /// "plan-first / ask to proceed" contract is replaced by "carry out the
+    /// approved work now, don't re-ask". Selected per-turn by the framework
+    /// (see [`dispatch::decide_chat_mode`]) — never exposed as a user toggle.
+    Execute,
     Autonomous,
 }
 
@@ -71,6 +86,7 @@ impl AgentMode {
     pub fn max_iterations(&self) -> usize {
         match self {
             AgentMode::Interactive => MAX_ITERATIONS_INTERACTIVE,
+            AgentMode::Execute     => MAX_ITERATIONS_EXECUTE,
             AgentMode::Autonomous  => MAX_ITERATIONS_AUTONOMOUS,
         }
     }
@@ -78,6 +94,7 @@ impl AgentMode {
     pub fn system_prompt(&self) -> &'static str {
         match self {
             AgentMode::Interactive => SYSTEM_PROMPT,
+            AgentMode::Execute     => SYSTEM_PROMPT_EXECUTE,
             AgentMode::Autonomous  => SYSTEM_PROMPT_AUTONOMOUS,
         }
     }
@@ -122,6 +139,14 @@ first with a plan in the format above (problem → approach → acceptance\n\
 → files), then end with \"Ready to proceed?\" and wait for the user's\n\
 go-ahead (\"yes\", \"ok\", \"做吧\", or a refinement). Skip this ceremony\n\
 for one-line bugfixes, typos, and pure read-only investigation.\n\
+\n\
+# Don't re-confirm an approved plan\n\
+If your previous message proposed a plan or suggestions and the user's\n\
+reply approves it (\"yes\", \"ok\", \"做吧\", \"同意\", \"就这样\", or names a\n\
+deliverable like \"output the PPT\"), do NOT reply with another plan and\n\
+do NOT ask \"Ready to proceed?\" again — begin executing immediately. The\n\
+user already greenlit it; re-confirming wastes their turn and breaks the\n\
+engineering contract.\n\
 \n\
 # TDD execution loop\n\
 Once the user approves the plan, execute in this exact order:\n\
@@ -221,6 +246,45 @@ catch it and respawn you with a 'previous attempt incomplete' brief.\n\
 \n\
 You can communicate as engineer-to-engineer in your reasoning, but\n\
 prose without verification is wasted tokens. Verify, then summarize.";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SYSTEM_PROMPT_EXECUTE — one chat turn right after the user approves a
+// pending proposal. Same chat session and tool-permission safety net as
+// interactive, but the plan-first/ask contract is replaced with "carry out
+// the approved work now". Selected per-turn by `dispatch::decide_chat_mode`;
+// never exposed as a user-facing mode.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SYSTEM_PROMPT_EXECUTE: &str = "\
+You are CodeFactory. In your previous message you proposed a plan or a set\n\
+of suggestions, and the user just APPROVED it. Carry it out NOW.\n\
+\n\
+**HARD RULES — non-negotiable:**\n\
+\n\
+1. **Do not re-plan and do not re-ask.** Do NOT restate the plan, do NOT\n\
+   reply with a fresh plan, and do NOT end with \"Ready to proceed?\" or any\n\
+   \"should I…?\" confirmation. Approval was already given — re-confirming is\n\
+   a contract violation. Your FIRST action this turn should be the tool call\n\
+   that starts the approved work, not prose.\n\
+\n\
+2. **Produce the deliverable, not a proposal for it.** If the approval named\n\
+   an output (\"output a PPT\", \"生成报告\", \"build the endpoint\"), produce that\n\
+   artifact. Describing how you *would* produce it is a failure.\n\
+\n\
+3. **Failure is not a stopping condition.** When a tool errors / a test\n\
+   fails / a build breaks: diagnose, fix, re-run. Iterate a few times before\n\
+   surfacing anything. Don't bounce back to the user on the first snag.\n\
+\n\
+4. **Keep going until done or truly blocked.** Stop only for a HARD blocker:\n\
+   a missing credential/file the user must provide, or a destructive,\n\
+   irreversible action that genuinely needs their explicit OK. A tool\n\
+   permission prompt is NOT a blocker — it's the normal safety check; let it\n\
+   surface and continue once answered.\n\
+\n\
+5. **Verify, then report.** Before declaring done, confirm the work actually\n\
+   happened (run it, read it back). Then summarize engineer-style: what you\n\
+   did, the outcome the user sees, and a short list of files/deliverables.\n\
+   Lead with the result, keep bookkeeping last.";
 
 pub struct AgentLoop {
     app: AppHandle,
@@ -341,8 +405,11 @@ impl AgentLoop {
         }
         let event_name = format!("stream:{}", self.session_id);
         let base_prompt = build_system_prompt_for(self.mode, &self.cwd);
-        let system_prompt =
+        let mut system_prompt =
             crate::commands::skills::get_active_system_prompt(&base_prompt, &self.app).await;
+        // Model-aware reinforcement for post-approval Execute turns (no-op for
+        // high-compliance models and all non-Execute turns).
+        system_prompt.push_str(compliance_booster(self.mode, &self.model_id));
         let api_style = self.api_style.clone();
 
         match api_style {
@@ -1710,6 +1777,35 @@ fn build_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
     }
 
     prompt
+}
+
+/// Extra, model-aware reinforcement of the [`AgentMode::Execute`] contract.
+///
+/// Instruction-following varies by model: stronger families infer "they said
+/// go, so act" from the Execute prompt alone, while smaller / unknown models
+/// keep latching onto plan-first habits and re-ask. Rather than expose a user
+/// knob, the framework restates the contract harder — appended at the very end
+/// of the system prompt, where weaker models weight it most — but only for
+/// those models. Returns "" for high-compliance families (keeps their prompt
+/// lean) and for any non-Execute turn.
+fn compliance_booster(mode: AgentMode, model_id: &str) -> &'static str {
+    if mode != AgentMode::Execute {
+        return "";
+    }
+    let m = model_id.to_lowercase();
+    let high = m.contains("opus")
+        || m.contains("sonnet")
+        || m.contains("gpt-5")
+        || m.contains("o3")
+        || m.contains("o1");
+    if high {
+        return "";
+    }
+    "\n\n# REMINDER — read before replying\n\
+     The user ALREADY approved. Do NOT output a plan and do NOT ask to\n\
+     confirm. Your first output this turn MUST be a tool call that starts the\n\
+     approved work. If you reply with a plan or a question instead of acting,\n\
+     you have failed this turn."
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
