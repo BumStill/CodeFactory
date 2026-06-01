@@ -299,6 +299,10 @@ export interface TaskRun {
   verification_results: string | null;
   /** JSON-encoded TaskConnectorContext; null when no connector scope is attached. */
   task_context_json: string | null;
+  /** The spec this task was decomposed from (set by a spec's 开始实现); null for
+   *  ad-hoc Workspace tasks. Surfaces the spec→task link in the task tree. */
+  spec_req_id?: string | null;
+  spec_title?: string | null;
 }
 
 export interface TaskInput {

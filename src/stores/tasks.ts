@@ -84,6 +84,8 @@ interface TasksState {
     tasks: TaskInput[],
     deps: TaskDep[],
     context?: TaskConnectorContext,
+    specReqId?: string,
+    specTitle?: string,
   ) => Promise<string[]>;
   start: (sessionId: string, specReqId?: string, specTitle?: string) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
@@ -122,12 +124,14 @@ export const useTasksStore = create<TasksState>((set, get) => ({
     }
   },
 
-  createTaskTree: async (sessionId, tasks, deps, context) => {
+  createTaskTree: async (sessionId, tasks, deps, context, specReqId, specTitle) => {
     const ids = await invoke<string[]>("create_task_tree", {
       sessionId,
       tasksIn: tasks,
       dependencies: deps,
       context: context ?? null,
+      specReqId: specReqId ?? null,
+      specTitle: specTitle ?? null,
     });
     await get().loadTasks(sessionId);
     return ids;

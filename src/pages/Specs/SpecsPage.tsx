@@ -578,7 +578,16 @@ function ImplementationModal({ meta, specContent, sessionId, cwd, onConfirm, onC
       const deps = tasks.flatMap(t =>
         t.dependencies.map(dep => ({ task_tmp_id: t.tmp_id, depends_on_tmp_id: dep }))
       );
-      await createTaskTree(sessionId, taskDefs, deps);
+      // Tag the created tasks with their source spec so the Workspace task tree
+      // can show "来自规范《X》" — closing the spec→task link.
+      await createTaskTree(
+        sessionId,
+        taskDefs,
+        deps,
+        undefined,
+        meta.req_id ?? undefined,
+        meta.title,
+      );
       await start(sessionId, meta.req_id ?? undefined, meta.title);
       onConfirm();
     } catch (e) {

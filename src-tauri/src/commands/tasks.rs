@@ -60,6 +60,8 @@ pub async fn create_task_tree(
     tasks_in: Vec<TaskInput>,
     dependencies: Vec<TaskDep>,
     context: Option<TaskConnectorContext>,
+    spec_req_id: Option<String>,
+    spec_title: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, AppError> {
     let pool = state.db.read().await;
@@ -97,6 +99,8 @@ pub async fn create_task_tree(
             verification_results: None,
             task_context_json: task_context_json.clone(),
             acceptance_criteria_json: acceptance_json,
+            spec_req_id: spec_req_id.clone(),
+            spec_title: spec_title.clone(),
         };
         tasks::insert_task(&pool, &row).await?;
         real_ids.push(id);
