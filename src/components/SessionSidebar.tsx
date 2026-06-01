@@ -10,7 +10,7 @@
 // Mental model: 快速任务 ≈ lightweight "cowork" chat, 项目 ≈ full "code"
 // project — both created and switched from this one rail.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, ChevronDown, Zap, Folder } from "lucide-react";
+import { Plus, ChevronDown, Zap, Folder, EyeOff } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../stores/chat";
 import { createQuickSession } from "../lib/tauri";
@@ -31,6 +31,7 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
   const createSession = useChatStore((s) => s.createSession);
   const loadSessions = useChatStore((s) => s.loadSessions);
   const loadQuickSessions = useChatStore((s) => s.loadQuickSessions);
+  const startAnonymousSession = useChatStore((s) => s.startAnonymousSession);
 
   const [menuOpen, setMenuOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -94,6 +95,14 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
     }
   };
 
+  const handleNewAnonymous = () => {
+    setMenuOpen(false);
+    if (busy) return;
+    // Purely in-memory — no backend call, nothing persisted. Navigate to it.
+    const s = startAnonymousSession();
+    onOpenSession(s.id);
+  };
+
   return (
     <div className="flex flex-col min-h-0 flex-1">
       {/* ── "+ 新建" menu ─────────────────────────────────────────────── */}
@@ -124,6 +133,14 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
               <Folder size={12} className="text-gray-400" />
               <span className="flex-1">新建项目</span>
               <span className="text-[9px] text-gray-600">完整工程</span>
+            </button>
+            <button
+              onClick={handleNewAnonymous}
+              className="flex w-full items-center gap-2 border-t border-border px-3 py-2 text-left text-xs text-gray-300 transition-colors hover:bg-surface-3"
+            >
+              <EyeOff size={12} className="text-gray-400" />
+              <span className="flex-1">新建匿名任务</span>
+              <span className="text-[9px] text-gray-600">无痕 · 不留存</span>
             </button>
           </div>
         )}

@@ -41,10 +41,11 @@ export interface Session {
   updated_at: number;
   total_input_tokens: number;
   total_output_tokens: number;
-  /** "project" (default) for full software-factory sessions, "quick" for
-   *  the single persistent ephemeral chat launched from Home's Quick Task.
+  /** "project" (default) for full software-factory sessions, "quick" for an
+   *  ephemeral chat launched from Quick Task, "anonymous" for a private/no-trace
+   *  chat that is NEVER persisted (frontend-memory only — see sendMessageAnonymous).
    *  Optional for backward compat — old code paths default to "project". */
-  kind?: "project" | "quick";
+  kind?: "project" | "quick" | "anonymous";
   /** Per-session reasoning effort override; null/undefined → global default. */
   reasoning_effort?: ReasoningEffort | null;
 }
@@ -134,6 +135,33 @@ export function createQuickSession(modelId: string): Promise<Session> {
 /** List Quick Task sessions, most-recent first (for the Home switcher). */
 export function listQuickSessions(): Promise<Session[]> {
   return invoke<Session[]>("list_quick_sessions");
+}
+
+/** One prior turn of an anonymous conversation (role + text). */
+export interface AnonTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/** Send a message in an ANONYMOUS / ephemeral session. Nothing is persisted
+ *  server-side: no messages, no cost, no checkpoints, no session row. The
+ *  frontend owns the whole history (`history`), which is replayed to the model
+ *  each turn. `sessionId` is a client-generated id used only to route stream
+ *  events; `cwd` may be "" to let the backend use the default scratch dir. */
+export function sendMessageAnonymous(
+  sessionId: string,
+  content: string,
+  history: AnonTurn[],
+  cwd: string,
+  modelId: string,
+): Promise<void> {
+  return invoke<void>("send_message_anonymous", {
+    sessionId,
+    content,
+    history,
+    cwd,
+    modelId,
+  });
 }
 
 // ── Checkpoints (git-backed rollback) ──────────────────────────────────────

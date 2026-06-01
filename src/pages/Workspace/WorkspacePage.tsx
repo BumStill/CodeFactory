@@ -24,6 +24,7 @@ import {
   Play,
   Square,
   Brain,
+  EyeOff,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { MessageList } from "../../components/MessageList";
@@ -85,8 +86,9 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
   const {
     activeSession, messages, streaming, queue,
     selectSession, sendOrQueue, cancelStream, removeFromQueue,
-    pendingPermission, respondPermission,
+    pendingPermission, respondPermission, exitAnonymous,
   } = useChatStore();
+  const isAnonymous = activeSession?.kind === "anonymous";
   const { settings, setTheme } = useSettingsStore();
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
 
@@ -117,13 +119,37 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
                 Quick
               </span>
             )}
+            {isAnonymous && (
+              <span
+                className="inline-flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400 font-normal"
+                title="匿名会话：不落库、不计费、不进记忆/画像。离开即丢弃。"
+              >
+                <EyeOff size={9} />
+                匿名
+              </span>
+            )}
           </div>
           <div className="text-[10px] text-gray-600 font-mono truncate">
-            {activeSession?.cwd}
+            {isAnonymous ? "无痕会话 · 不落库 · 不计费 · 不学习" : activeSession?.cwd}
           </div>
         </div>
+        {isAnonymous && (
+          <button
+            onClick={() => {
+              exitAnonymous();
+              onBackHome();
+            }}
+            className="flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-600 transition-colors hover:bg-amber-500/20 dark:text-amber-400"
+            title="退出匿名会话并丢弃其历史"
+          >
+            <EyeOff size={12} />
+            退出匿名
+          </button>
+        )}
         <ModelPicker />
-        <ReasoningEffortPicker />
+        {/* Per-session reasoning override needs a DB row; anonymous chats use
+            the global default, so the picker is hidden for them. */}
+        {!isAnonymous && <ReasoningEffortPicker />}
 
         {/* Theme toggle */}
         <div className="flex items-center rounded border border-border overflow-hidden">
@@ -162,10 +188,12 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
         <aside className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col min-h-0">
           <SessionSidebar currentSessionId={sessionId} onOpenSession={onOpenSession} />
           {/* Adaptive: the task tree only makes sense for project sessions.
-              Quick chats have no tasks, so the whole panel is omitted. */}
-          {activeSession && activeSession.kind !== "quick" && (
-            <TasksColumn sessionId={sessionId} />
-          )}
+              Quick + anonymous chats have no tasks, so the panel is omitted. */}
+          {activeSession &&
+            activeSession.kind !== "quick" &&
+            activeSession.kind !== "anonymous" && (
+              <TasksColumn sessionId={sessionId} />
+            )}
         </aside>
 
         {/* ─── Center: Execution stream + input ──────────────────────── */}

@@ -183,6 +183,7 @@ pub fn run() {
             commands::session::update_session_title,
             commands::session::get_messages,
             commands::chat::send_message,
+            commands::chat::send_message_anonymous,
             commands::chat::respond_to_permission,
             commands::files::list_dir,
             commands::files::save_chat_attachment,

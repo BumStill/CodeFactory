@@ -239,6 +239,11 @@ pub struct AgentLoop {
     /// Selects iteration ceiling and system prompt. Interactive for
     /// chat panel use, Autonomous for subagent / approved-task runs.
     mode: AgentMode,
+    /// Ephemeral "anonymous" run: when true, NOTHING is written to the DB
+    /// (no user/assistant/tool messages, no cost entries). The conversation
+    /// exists only in the frontend's memory and this run's model context, so
+    /// a private/sensitive chat leaves no trace. Set via `.anonymous()`.
+    anonymous: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -307,7 +312,16 @@ impl AgentLoop {
             mcp_manager,
             execution_context,
             mode,
+            anonymous: false,
         }
+    }
+
+    /// Mark this loop as an anonymous/ephemeral run: disables ALL DB
+    /// persistence (messages, cost entries). Chainable —
+    /// `AgentLoop::new(..).anonymous()`. Used by `send_message_anonymous`.
+    pub fn anonymous(mut self) -> Self {
+        self.anonymous = true;
+        self
     }
 
     pub async fn run(&mut self, history: Vec<Message>) -> Result<()> {
@@ -316,6 +330,14 @@ impl AgentLoop {
         let mcp_tools = self.mcp_manager.list_all_tools().await;
         for mcp_tool in &mcp_tools {
             tool_defs.push(mcp_tool_to_definition(mcp_tool));
+        }
+        // Anonymous runs must leave NO DB trace. The knowledge tools
+        // (kb_search / kb_get_chunk) write a `retrieval_events` audit row —
+        // including the user's query text — keyed on the session, so withhold
+        // them entirely from anonymous chats (KB access is off in no-trace mode).
+        if self.anonymous {
+            tool_defs
+                .retain(|d| d.function.name != "kb_search" && d.function.name != "kb_get_chunk");
         }
         let event_name = format!("stream:{}", self.session_id);
         let base_prompt = build_system_prompt_for(self.mode, &self.cwd);
@@ -425,8 +447,6 @@ impl AgentLoop {
             if tool_calls.is_empty() {
                 // Emit Done with accumulated usage if we have it
                 if let Some(u) = &usage {
-                    let inp = u.prompt_tokens as i64;
-                    let out = u.completion_tokens as i64;
                     self.app
                         .emit(
                             &event_name,
@@ -436,21 +456,26 @@ impl AgentLoop {
                             },
                         )
                         .ok();
-                    // Persist cost entry and notify frontend to refresh stats
-                    let settings = self.settings.read().await;
-                    let endpoint = settings.default_endpoint.clone();
-                    drop(settings);
-                    if let Err(e) = crate::commands::costs::record_cost_entry(
-                        &self.db,
-                        &self.session_id,
-                        &self.model_id,
-                        &endpoint,
-                        inp,
-                        out,
-                    ).await {
-                        tracing::warn!("Failed to record cost entry: {e}");
-                    } else {
-                        self.app.emit("token-usage-recorded", &self.session_id).ok();
+                    // Persist cost entry and notify frontend to refresh stats.
+                    // Anonymous runs are NEVER billed into today/month stats.
+                    if !self.anonymous {
+                        let inp = u.prompt_tokens as i64;
+                        let out = u.completion_tokens as i64;
+                        let settings = self.settings.read().await;
+                        let endpoint = settings.default_endpoint.clone();
+                        drop(settings);
+                        if let Err(e) = crate::commands::costs::record_cost_entry(
+                            &self.db,
+                            &self.session_id,
+                            &self.model_id,
+                            &endpoint,
+                            inp,
+                            out,
+                        ).await {
+                            tracing::warn!("Failed to record cost entry: {e}");
+                        } else {
+                            self.app.emit("token-usage-recorded", &self.session_id).ok();
+                        }
                     }
                 }
                 break;
@@ -610,24 +635,29 @@ impl AgentLoop {
                     )
                     .ok();
 
-                let now = Utc::now().timestamp_millis();
-                let msg_id = Uuid::new_v4().to_string();
-                let tool_content = serde_json::json!({
-                    "tool_call_id": tc.id,
-                    "content": output.content
-                })
-                .to_string();
+                // Persist the tool result — skipped entirely for anonymous runs.
+                // The in-memory `result_messages` push below still carries it
+                // through this turn so the model sees the tool output.
+                if !self.anonymous {
+                    let now = Utc::now().timestamp_millis();
+                    let msg_id = Uuid::new_v4().to_string();
+                    let tool_content = serde_json::json!({
+                        "tool_call_id": tc.id,
+                        "content": output.content
+                    })
+                    .to_string();
 
-                sqlx::query(
-                    "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-                )
-                .bind(&msg_id)
-                .bind(&self.session_id)
-                .bind("tool")
-                .bind(&tool_content)
-                .bind(now)
-                .execute(&self.db)
-                .await?;
+                    sqlx::query(
+                        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
+                    )
+                    .bind(&msg_id)
+                    .bind(&self.session_id)
+                    .bind("tool")
+                    .bind(&tool_content)
+                    .bind(now)
+                    .execute(&self.db)
+                    .await?;
+                }
 
                 result_messages.push(ChatMessage {
                     role: "tool".into(),
@@ -1084,6 +1114,11 @@ impl AgentLoop {
         tool_calls: Option<&[ToolCall]>,
         reasoning_content: Option<&str>,
     ) -> Result<()> {
+        // Anonymous runs never touch the DB — the assistant turn lives only in
+        // the in-memory `messages` vec for the rest of this run.
+        if self.anonymous {
+            return Ok(());
+        }
         let msg_id = Uuid::new_v4().to_string();
         let now = Utc::now().timestamp_millis();
         let input_tok = usage.map(|u| u.prompt_tokens as i64);
@@ -1335,21 +1370,24 @@ impl AgentLoop {
                         },
                     )
                     .ok();
-                // Persist cost entry
-                let settings = self.settings.read().await;
-                let endpoint = settings.default_endpoint.clone();
-                drop(settings);
-                if let Err(e) = crate::commands::costs::record_cost_entry(
-                    &self.db,
-                    &self.session_id,
-                    &self.model_id,
-                    &endpoint,
-                    inp,
-                    out,
-                ).await {
-                    tracing::warn!("Failed to record cost entry (anthropic): {e}");
-                } else {
-                    self.app.emit("token-usage-recorded", &self.session_id).ok();
+                // Persist cost entry — NEVER for anonymous runs (no billing,
+                // no usage-stats trace). Mirrors the OpenAI-path guard.
+                if !self.anonymous {
+                    let settings = self.settings.read().await;
+                    let endpoint = settings.default_endpoint.clone();
+                    drop(settings);
+                    if let Err(e) = crate::commands::costs::record_cost_entry(
+                        &self.db,
+                        &self.session_id,
+                        &self.model_id,
+                        &endpoint,
+                        inp,
+                        out,
+                    ).await {
+                        tracing::warn!("Failed to record cost entry (anthropic): {e}");
+                    } else {
+                        self.app.emit("token-usage-recorded", &self.session_id).ok();
+                    }
                 }
                 break;
             }
@@ -1511,24 +1549,28 @@ impl AgentLoop {
                     )
                     .ok();
 
-                // Persist tool result to DB
-                let now = Utc::now().timestamp_millis();
-                let msg_id = Uuid::new_v4().to_string();
-                let tool_content = serde_json::json!({
-                    "tool_call_id": tc.id,
-                    "content": output.content
-                })
-                .to_string();
-                sqlx::query(
-                    "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-                )
-                .bind(&msg_id)
-                .bind(&self.session_id)
-                .bind("tool")
-                .bind(&tool_content)
-                .bind(now)
-                .execute(&self.db)
-                .await?;
+                // Persist tool result to DB — skipped for anonymous runs; the
+                // in-memory `tool_result_blocks` below still feeds it back to
+                // the model this turn.
+                if !self.anonymous {
+                    let now = Utc::now().timestamp_millis();
+                    let msg_id = Uuid::new_v4().to_string();
+                    let tool_content = serde_json::json!({
+                        "tool_call_id": tc.id,
+                        "content": output.content
+                    })
+                    .to_string();
+                    sqlx::query(
+                        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
+                    )
+                    .bind(&msg_id)
+                    .bind(&self.session_id)
+                    .bind("tool")
+                    .bind(&tool_content)
+                    .bind(now)
+                    .execute(&self.db)
+                    .await?;
+                }
 
                 tool_result_blocks.push(serde_json::json!({
                     "type": "tool_result",
