@@ -171,6 +171,7 @@ function SessionRow({
     <li>
       <button
         onClick={onClick}
+        aria-current={active ? "page" : undefined}
         className={`group w-full rounded-md px-2 py-1.5 text-left transition-colors ${
           active
             ? "border border-accent/40 bg-accent/15"
