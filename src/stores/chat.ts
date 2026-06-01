@@ -371,8 +371,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   cancelStream: () => {
+    const id = get().activeSession?.id;
     get()._unlisten?.();
     set({ streaming: false, _unlisten: undefined, pendingPermission: null });
+    // Also tell the backend to stop the in-flight turn — otherwise the agent
+    // keeps looping (burning tokens) after the UI already says "stopped".
+    // Cooperative: it stops between rounds, never mid tool-call. Scoped to THIS
+    // chat session only; it never affects the task scheduler / long task runs.
+    if (id) void invoke("cancel_chat", { sessionId: id });
   },
 
   respondPermission: async (allow) => {

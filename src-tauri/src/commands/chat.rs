@@ -3,6 +3,7 @@ use chrono::Utc;
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::agent::AgentLoop;
@@ -26,6 +27,20 @@ pub async fn respond_to_permission(
     sender
         .send(allow)
         .map_err(|_| AppError::Other("Permission request receiver closed".into()))
+}
+
+/// Request cancellation of the in-flight chat turn for `session_id`. Flips the
+/// per-session cooperative flag that the agent loop polls between rounds, so the
+/// turn stops cleanly — it does NOT interrupt an in-flight tool call. No-ops if
+/// nothing is running for that session. Scoped to chat only: this never touches
+/// the task scheduler (that has its own `cancel_implementation`).
+#[tauri::command]
+pub async fn cancel_chat(session_id: String, state: State<'_, AppState>) -> Result<(), AppError> {
+    if let Some(flag) = state.chat_cancels.lock().await.get(&session_id) {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!("cancel_chat: requested stop for session {session_id}");
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -212,6 +227,16 @@ pub async fn send_message(
     let pending_permissions = state.pending_permissions.clone();
     let mcp_manager: Arc<McpManager> = Arc::clone(&mcp);
 
+    // Fresh per-turn cancel flag (false). The chat "stop" button flips it via
+    // `cancel_chat`; the agent loop polls it between rounds. Overwriting any
+    // prior entry guarantees a new turn never inherits a stale cancel.
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    state
+        .chat_cancels
+        .lock()
+        .await
+        .insert(session_id.clone(), cancel_flag.clone());
+
     // Spawn agent loop (non-blocking); emit Error event to frontend if it fails
     let app_clone = app.clone();
     let event_name = format!("stream:{}", session_id);
@@ -231,7 +256,8 @@ pub async fn send_message(
             mcp_manager,
             None,
             mode,
-        );
+        )
+        .with_cancel(cancel_flag);
         if let Err(e) = agent.run(history).await {
             tracing::error!("Agent loop error: {e:#}");
             app_clone
@@ -339,6 +365,15 @@ pub async fn send_message_anonymous(
     let pending_permissions = state.pending_permissions.clone();
     let mcp_manager: Arc<McpManager> = Arc::clone(&mcp);
 
+    // Same per-turn cancel wiring as send_message, so "stop" works for
+    // anonymous chats too. (Anonymous = no DB/cost; cancel just ends the turn.)
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    state
+        .chat_cancels
+        .lock()
+        .await
+        .insert(session_id.clone(), cancel_flag.clone());
+
     let app_clone = app.clone();
     let event_name = format!("stream:{}", session_id);
     let session_id_clone = session_id.clone();
@@ -358,7 +393,8 @@ pub async fn send_message_anonymous(
             mcp_manager,
             None,
         )
-        .anonymous();
+        .anonymous()
+        .with_cancel(cancel_flag);
         if let Err(e) = agent.run(full_history).await {
             tracing::error!("Anonymous agent loop error: {e:#}");
             app_clone

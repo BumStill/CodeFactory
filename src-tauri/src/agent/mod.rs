@@ -18,6 +18,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -308,6 +309,12 @@ pub struct AgentLoop {
     /// exists only in the frontend's memory and this run's model context, so
     /// a private/sensitive chat leaves no trace. Set via `.anonymous()`.
     anonymous: bool,
+    /// User-requested cancellation for THIS chat turn. `None` for every
+    /// non-chat construction (subagent / autonomous task runs), so those are
+    /// completely unaffected. When set (via `.with_cancel()`), the run loop
+    /// polls it between rounds and stops cleanly — it never interrupts an
+    /// in-flight tool call, and never touches the task scheduler.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -377,6 +384,7 @@ impl AgentLoop {
             execution_context,
             mode,
             anonymous: false,
+            cancel: None,
         }
     }
 
@@ -385,6 +393,15 @@ impl AgentLoop {
     /// `AgentLoop::new(..).anonymous()`. Used by `send_message_anonymous`.
     pub fn anonymous(mut self) -> Self {
         self.anonymous = true;
+        self
+    }
+
+    /// Attach a cooperative cancellation flag for this chat turn. The run loop
+    /// checks it at the top of each round and stops cleanly if set. Only the
+    /// interactive chat path wires this (via the `cancel_chat` command); every
+    /// other call site leaves it `None`, so their behavior is unchanged.
+    pub fn with_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(flag);
         self
     }
 
@@ -451,6 +468,23 @@ impl AgentLoop {
         // stream always closes even if the loop runs to its iteration ceiling.
         let mut emitted_terminal = false;
         for _ in 0..self.mode.max_iterations() {
+            // Cooperative cancellation: if the user hit "stop" for this chat
+            // turn, end the stream cleanly between rounds. Checked here (not
+            // mid tool-call) so in-flight work isn't hard-killed. No-op unless
+            // a cancel flag was attached (chat only) and has actually tripped.
+            if let Some(c) = &self.cancel {
+                if c.load(Ordering::SeqCst) {
+                    tracing::info!("chat turn cancelled by user (session {})", self.session_id);
+                    self.app
+                        .emit(
+                            &event_name,
+                            StreamEvent::Done { input_tokens: 0, output_tokens: 0 },
+                        )
+                        .ok();
+                    emitted_terminal = true;
+                    break;
+                }
+            }
             // ── Context-window management ────────────────────────────────────
             // Estimate prompt tokens before sending. If we're over 75% of the
             // model's window, elide oversized tool results from the older
@@ -1405,6 +1439,23 @@ impl AgentLoop {
         // stream always closes even if the loop runs to its iteration ceiling.
         let mut emitted_terminal = false;
         for _ in 0..self.mode.max_iterations() {
+            // Cooperative cancellation: if the user hit "stop" for this chat
+            // turn, end the stream cleanly between rounds. Checked here (not
+            // mid tool-call) so in-flight work isn't hard-killed. No-op unless
+            // a cancel flag was attached (chat only) and has actually tripped.
+            if let Some(c) = &self.cancel {
+                if c.load(Ordering::SeqCst) {
+                    tracing::info!("chat turn cancelled by user (session {})", self.session_id);
+                    self.app
+                        .emit(
+                            event_name,
+                            StreamEvent::Done { input_tokens: 0, output_tokens: 0 },
+                        )
+                        .ok();
+                    emitted_terminal = true;
+                    break;
+                }
+            }
             // We don't run elision compression on the Anthropic path because
             // its messages are serde_json::Value-shaped, not ChatMessage.
             // The OpenAI path is the primary one for now (OpenRouter,
