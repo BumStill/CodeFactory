@@ -786,6 +786,15 @@ function TaskRow({ task, depth }: { task: TaskRun; depth: number }) {
               </button>
             )}
           </div>
+          {task.spec_title && (
+            <div
+              className="mt-0.5 flex items-center gap-1 text-[9px] text-accent/80"
+              title={`来自规范《${task.spec_title}》`}
+            >
+              <BookOpen size={9} className="shrink-0" />
+              <span className="truncate">规范《{task.spec_title}》</span>
+            </div>
+          )}
           {knowledgeCount > 0 && (
             <div
               className="mt-0.5 flex items-center gap-1 text-[9px] text-gray-600"

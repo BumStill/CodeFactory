@@ -98,14 +98,21 @@ pub struct TaskRun {
     /// must verify before declaring done. Drives autonomous-mode
     /// completion check + scheduler-side respawn-on-incomplete loop.
     pub acceptance_criteria_json: Option<String>,
+    /// The spec this task was decomposed from (set when the tree is created
+    /// from a spec's "开始实现"). None for ad-hoc Workspace tasks. Lets the task
+    /// tree show "来自规范《X》" and close the spec→task→execution loop.
+    #[serde(default)]
+    pub spec_req_id: Option<String>,
+    #[serde(default)]
+    pub spec_title: Option<String>,
 }
 
 pub async fn insert_task(pool: &SqlitePool, task: &TaskRun) -> Result<()> {
     sqlx::query(
         "INSERT INTO task_runs (id, session_id, title, description, status, cwd, parent_task_id, \
          sub_session_id, created_at, started_at, completed_at, result, error, attempt_count, \
-         verification_results, task_context_json, acceptance_criteria_json) \
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         verification_results, task_context_json, acceptance_criteria_json, spec_req_id, spec_title) \
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&task.id)
     .bind(&task.session_id)
@@ -124,6 +131,8 @@ pub async fn insert_task(pool: &SqlitePool, task: &TaskRun) -> Result<()> {
     .bind(&task.verification_results)
     .bind(&task.task_context_json)
     .bind(&task.acceptance_criteria_json)
+    .bind(&task.spec_req_id)
+    .bind(&task.spec_title)
     .execute(pool)
     .await?;
     Ok(())

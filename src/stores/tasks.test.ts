@@ -64,6 +64,29 @@ describe("tasks store", () => {
       tasksIn: tasks,
       dependencies: [],
       context,
+      specReqId: null,
+      specTitle: null,
+    });
+  });
+
+  it("tags created tasks with their source spec when provided", async () => {
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "create_task_tree") return Promise.resolve(["task-1"]);
+      if (cmd === "list_tasks") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+
+    await useTasksStore
+      .getState()
+      .createTaskTree("s1", [], [], undefined, "REQ-7", "深色模式");
+
+    expect(mocks.invoke).toHaveBeenCalledWith("create_task_tree", {
+      sessionId: "s1",
+      tasksIn: [],
+      dependencies: [],
+      context: null,
+      specReqId: "REQ-7",
+      specTitle: "深色模式",
     });
   });
 });

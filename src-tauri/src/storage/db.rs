@@ -191,6 +191,11 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     // result. NULL on legacy rows = no-criteria back-compat.
     ensure_column(pool, "task_runs", "acceptance_criteria_json", "TEXT").await?;
 
+    // task_runs spec link: which spec this task was decomposed from, so the
+    // workspace task tree can show "来自规范《X》" and close the spec→task loop.
+    ensure_column(pool, "task_runs", "spec_req_id", "TEXT").await?;
+    ensure_column(pool, "task_runs", "spec_title", "TEXT").await?;
+
     // ── user_preferences: structured key→value the AI reads at
     //    decomposition / execution time. Scoped per cwd so different
     //    projects can have different defaults. `source` is one of:
