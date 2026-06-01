@@ -80,14 +80,14 @@ function TagList({
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && add()}
-          placeholder="Add tool name…"
+          placeholder="添加工具名称…"
           className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
         />
         <button
           onClick={add}
           className="px-2 py-1 rounded bg-surface-3 hover:bg-surface-4 text-xs text-gray-400 border border-border"
         >
-          Add
+          添加
         </button>
       </div>
     </div>
@@ -133,7 +133,7 @@ function CustomModelsEditor({
         className="flex w-full items-center justify-between text-[11px] text-gray-500 hover:text-gray-300"
       >
         <span>
-          Custom Models
+          自定义模型
           {models.length > 0 && (
             <span className="ml-1.5 text-[10px] text-gray-600">({models.length})</span>
           )}
@@ -148,8 +148,7 @@ function CustomModelsEditor({
         <div className="space-y-1.5">
           {models.length === 0 && (
             <div className="text-[11px] text-gray-600 italic">
-              No custom models yet. Useful for LMStudio / Ollama / private gateways
-              that don't expose <code>/models</code>.
+              暂无自定义模型。适用于不暴露 <code>/models</code> 的 LMStudio / Ollama / 私有网关。
             </div>
           )}
 
@@ -158,7 +157,7 @@ function CustomModelsEditor({
               <input
                 value={m.id}
                 onChange={(e) => updateAt(idx, { id: e.target.value })}
-                placeholder="model-id (e.g. llama3.1:8b)"
+                placeholder="模型 ID(例如 llama3.1:8b)"
                 className="flex-[2] bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
               />
               <input
@@ -166,13 +165,13 @@ function CustomModelsEditor({
                 onChange={(e) =>
                   updateAt(idx, { name: e.target.value || undefined })
                 }
-                placeholder="display name (optional)"
+                placeholder="显示名称(可选)"
                 className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
               />
               <button
                 onClick={() => removeAt(idx)}
                 className="p-1 text-gray-600 hover:text-red-400 transition-colors"
-                title="Remove"
+                title="移除"
               >
                 <Trash2 size={12} />
               </button>
@@ -184,7 +183,7 @@ function CustomModelsEditor({
             onClick={addNew}
             className="flex items-center gap-1 text-[11px] text-accent hover:text-accent-hover"
           >
-            <Plus size={11} /> Add model
+            <Plus size={11} /> 添加模型
           </button>
         </div>
       )}
@@ -235,14 +234,14 @@ function EndpointCard({
         <div className="flex items-center gap-2">
           {isDefault ? (
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent/20 text-accent">
-              default
+              默认
             </span>
           ) : (
             <button
               onClick={onSetDefault}
               className="text-[10px] px-1.5 py-0.5 rounded border border-border text-gray-500 hover:text-gray-300 hover:border-gray-500 transition-colors"
             >
-              set default
+              设为默认
             </button>
           )}
           <button
@@ -256,7 +255,7 @@ function EndpointCard({
 
       {/* Base URL */}
       <div className="space-y-1">
-        <label className="text-[11px] text-gray-500">Base URL</label>
+        <label className="text-[11px] text-gray-500">基础 URL</label>
         <input
           value={local.base_url}
           onChange={(e) => setLocal({ ...local, base_url: e.target.value })}
@@ -267,7 +266,7 @@ function EndpointCard({
 
       {/* API Key */}
       <div className="space-y-1">
-        <label className="text-[11px] text-gray-500">API Key</label>
+        <label className="text-[11px] text-gray-500">API 密钥</label>
         <div className="flex gap-1">
           <input
             type={showKey ? "text" : "password"}
@@ -287,7 +286,7 @@ function EndpointCard({
 
       {/* API Style */}
       <div className="space-y-1">
-        <label className="text-[11px] text-gray-500">API Style</label>
+        <label className="text-[11px] text-gray-500">API 风格</label>
         <div className="flex gap-3">
           {(["openai", "anthropic"] as ApiStyle[]).map((style) => (
             <label key={style} className="flex items-center gap-1.5 cursor-pointer">
@@ -298,7 +297,7 @@ function EndpointCard({
                 onChange={() => setLocal({ ...local, api_style: style })}
               />
               <span className="text-xs text-gray-300">
-                {style === "openai" ? "OpenAI-compatible" : "Anthropic Messages"}
+                {style === "openai" ? "OpenAI 兼容" : "Anthropic Messages"}
               </span>
             </label>
           ))}
@@ -318,7 +317,7 @@ function EndpointCard({
             disabled={saving}
             className="flex items-center gap-1 px-3 py-1 rounded bg-accent hover:bg-accent-hover text-xs text-white transition-colors disabled:opacity-50"
           >
-            {saved ? <><Check size={11} /> Saved</> : saving ? "Saving…" : "Save"}
+            {saved ? <><Check size={11} /> 已保存</> : saving ? "保存中…" : "保存"}
           </button>
         </div>
       )}
@@ -344,9 +343,9 @@ function AddEndpointModal({
 
   const handleAdd = () => {
     const k = key.trim().toLowerCase().replace(/\s+/g, "-");
-    if (!k) { setErr("Name required"); return; }
-    if (existing.includes(k)) { setErr(`"${k}" already exists`); return; }
-    if (!url.trim()) { setErr("Base URL required"); return; }
+    if (!k) { setErr("请填写名称"); return; }
+    if (existing.includes(k)) { setErr(`"${k}" 已存在`); return; }
+    if (!url.trim()) { setErr("请填写基础 URL"); return; }
     onAdd(k, { base_url: url.trim(), api_style: style, custom_models: [] });
     onClose();
   };
@@ -357,21 +356,21 @@ function AddEndpointModal({
         className="w-96 rounded-xl border border-border bg-surface-2 shadow-2xl p-4 space-y-3"
         onClick={(e) => e.stopPropagation()}
       >
-        <h3 className="text-sm font-semibold text-gray-200">Add Endpoint</h3>
+        <h3 className="text-sm font-semibold text-gray-200">添加端点</h3>
 
         <div className="space-y-1">
-          <label className="text-[11px] text-gray-500">Name (slug)</label>
+          <label className="text-[11px] text-gray-500">名称(slug)</label>
           <input
             autoFocus
             value={key}
             onChange={(e) => { setKey(e.target.value); setErr(""); }}
-            placeholder="my-endpoint"
+            placeholder="我的端点"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
           />
         </div>
 
         <div className="space-y-1">
-          <label className="text-[11px] text-gray-500">Base URL</label>
+          <label className="text-[11px] text-gray-500">基础 URL</label>
           <input
             value={url}
             onChange={(e) => { setUrl(e.target.value); setErr(""); }}
@@ -381,13 +380,13 @@ function AddEndpointModal({
         </div>
 
         <div className="space-y-1">
-          <label className="text-[11px] text-gray-500">API Style</label>
+          <label className="text-[11px] text-gray-500">API 风格</label>
           <div className="flex gap-3">
             {(["openai", "anthropic"] as ApiStyle[]).map((s) => (
               <label key={s} className="flex items-center gap-1.5 cursor-pointer">
                 <input type="radio" checked={style === s} onChange={() => setStyle(s)} />
                 <span className="text-xs text-gray-300">
-                  {s === "openai" ? "OpenAI-compatible" : "Anthropic Messages"}
+                  {s === "openai" ? "OpenAI 兼容" : "Anthropic Messages"}
                 </span>
               </label>
             ))}
@@ -402,10 +401,10 @@ function AddEndpointModal({
 
         <div className="flex justify-end gap-2 pt-1">
           <button onClick={onClose} className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300">
-            Cancel
+            取消
           </button>
           <button onClick={handleAdd} className="px-3 py-1.5 rounded bg-accent hover:bg-accent-hover text-xs text-white transition-colors">
-            Add
+            添加
           </button>
         </div>
       </div>
@@ -470,7 +469,7 @@ export function SettingsPage({ onBack }: Props) {
   if (!settings || !permDraft || !generalDraft) {
     return (
       <div className="flex h-full items-center justify-center text-xs text-gray-600">
-        Loading settings…
+        正在加载设置…
       </div>
     );
   }
@@ -574,12 +573,12 @@ export function SettingsPage({ onBack }: Props) {
   // ── Render ─────────────────────────────────────────────────────────────────
 
   const tabs: { id: Tab; label: string }[] = [
-    { id: "endpoints", label: "Endpoints" },
-    { id: "permissions", label: "Permissions" },
-    { id: "general", label: "General" },
+    { id: "endpoints", label: "端点" },
+    { id: "permissions", label: "权限" },
+    { id: "general", label: "通用" },
     { id: "appearance", label: "外观" },
-    { id: "hooks", label: "Hooks" },
-    { id: "remotes", label: "Remotes" },
+    { id: "hooks", label: "钩子" },
+    { id: "remotes", label: "远程仓库" },
     { id: "about", label: "关于" },
   ];
 
@@ -593,7 +592,7 @@ export function SettingsPage({ onBack }: Props) {
         >
           <ArrowLeft size={14} />
         </button>
-        <span className="text-sm font-semibold">Settings</span>
+        <span className="text-sm font-semibold">设置</span>
 
         {/* Tabs */}
         <div className="ml-4 flex gap-1">
@@ -623,13 +622,13 @@ export function SettingsPage({ onBack }: Props) {
 
             <div className="flex items-center justify-between mb-1">
               <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-                API Endpoints
+                API 端点
               </h2>
               <button
                 onClick={() => setShowAddEp(true)}
                 className="flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors border border-border"
               >
-                <Plus size={11} /> Add endpoint
+                <Plus size={11} /> 添加端点
               </button>
             </div>
 
@@ -651,7 +650,7 @@ export function SettingsPage({ onBack }: Props) {
               ))}
 
             {endpointDrafts.filter((d) => d.key !== CHATGPT_ENDPOINT_KEY).length === 0 && (
-              <p className="text-xs text-gray-600">No endpoints configured.</p>
+              <p className="text-xs text-gray-600">尚未配置端点。</p>
             )}
 
             {showAddEp && (
@@ -668,7 +667,7 @@ export function SettingsPage({ onBack }: Props) {
         {tab === "permissions" && (
           <div className="max-w-xl space-y-4">
             <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-              Tool Permissions
+              工具权限
             </h2>
 
             <label className="flex items-start gap-3 rounded-lg border border-border bg-surface-1 px-3 py-2.5 cursor-pointer">
@@ -681,26 +680,26 @@ export function SettingsPage({ onBack }: Props) {
                 className="mt-0.5"
               />
               <span>
-                <span className="block text-xs font-medium text-gray-200">Full access mode</span>
+                <span className="block text-xs font-medium text-gray-200">完全访问模式</span>
                 <span className="block text-xs leading-5 text-gray-500">
-                  Skip all permission prompts. Use only in fully trusted projects.
+                  跳过所有权限提示。仅在完全信任的项目中使用。
                 </span>
               </span>
             </label>
 
             <div className="space-y-3 rounded-lg border border-border bg-surface-1 p-3">
               <TagList
-                label="Allow (auto-approve)"
+                label="允许(自动批准)"
                 tags={permDraft.allow}
                 onChange={(t) => setPermDraft({ ...permDraft, allow: t })}
               />
               <TagList
-                label="Ask (prompt user)"
+                label="询问(提示用户)"
                 tags={permDraft.ask}
                 onChange={(t) => setPermDraft({ ...permDraft, ask: t })}
               />
               <TagList
-                label="Deny (always block)"
+                label="拒绝(始终阻止)"
                 tags={permDraft.deny}
                 onChange={(t) => setPermDraft({ ...permDraft, deny: t })}
               />
@@ -711,7 +710,7 @@ export function SettingsPage({ onBack }: Props) {
                 onClick={handleSavePerms}
                 className="flex items-center gap-1 px-4 py-1.5 rounded bg-accent hover:bg-accent-hover text-xs text-white transition-colors"
               >
-                {permSaved ? <><Check size={11} /> Saved</> : "Save permissions"}
+                {permSaved ? <><Check size={11} /> 已保存</> : "保存权限"}
               </button>
             </div>
           </div>
@@ -721,13 +720,13 @@ export function SettingsPage({ onBack }: Props) {
         {tab === "general" && (
           <div className="max-w-xl space-y-4">
             <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-              General
+              通用
             </h2>
 
             <div className="rounded-lg border border-border bg-surface-1 px-3 py-2.5 text-[11px] text-gray-500 leading-5">
-              <span className="text-gray-300 font-medium">Active model</span> is now per-endpoint.
-              Pick it from the model dropdown in the chat header — each endpoint
-              remembers its own choice. Manage endpoints in the <span className="text-gray-300">Endpoints</span> tab.
+              <span className="text-gray-300 font-medium">当前模型</span> 现在按端点设置。
+              在聊天顶栏的模型下拉菜单中选择——每个端点都会记住各自的选择。
+              在 <span className="text-gray-300">端点</span> 标签页中管理端点。
             </div>
 
             <div className="space-y-1">
@@ -756,18 +755,17 @@ export function SettingsPage({ onBack }: Props) {
                 className="mt-0.5"
               />
               <span>
-                <span className="block text-xs font-medium text-gray-200">Auto-create PR after implementation</span>
+                <span className="block text-xs font-medium text-gray-200">实现完成后自动创建 PR</span>
                 <span className="block text-xs leading-5 text-gray-500">
-                  Automatically opens a pull request when a spec implementation finishes successfully.
+                  当规格实现成功完成时自动创建一个拉取请求。
                 </span>
               </span>
             </label>
 
             <div className="space-y-1">
-              <label className="text-xs text-gray-500">Default reasoning effort</label>
+              <label className="text-xs text-gray-500">默认思考强度</label>
               <p className="text-[11px] leading-5 text-gray-600">
-                Applies to reasoning models (ChatGPT / Codex). Each chat can
-                override it from the model row in the chat header.
+                适用于推理模型(ChatGPT / Codex)。每个会话可在聊天顶栏的模型行中单独覆盖。
               </p>
               <select
                 value={generalDraft.reasoning_effort ?? "medium"}
@@ -779,9 +777,14 @@ export function SettingsPage({ onBack }: Props) {
                 }
                 className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
               >
-                {(["minimal", "low", "medium", "high"] as const).map((v) => (
+                {([
+                  ["minimal", "最低"],
+                  ["low", "低"],
+                  ["medium", "中"],
+                  ["high", "高"],
+                ] as const).map(([v, label]) => (
                   <option key={v} value={v}>
-                    {v}
+                    {label}
                   </option>
                 ))}
               </select>
@@ -792,7 +795,7 @@ export function SettingsPage({ onBack }: Props) {
                 onClick={handleSaveGeneral}
                 className="flex items-center gap-1 px-4 py-1.5 rounded bg-accent hover:bg-accent-hover text-xs text-white transition-colors"
               >
-                {generalSaved ? <><Check size={11} /> Saved</> : "Save"}
+                {generalSaved ? <><Check size={11} /> 已保存</> : "保存"}
               </button>
             </div>
 
@@ -825,10 +828,10 @@ const HOOK_EVENTS = [
 ];
 
 const HOOK_ACTIONS: { value: HookActionType; label: string; placeholder: string }[] = [
-  { value: "log_to_file",     label: "Log to file",             placeholder: "C:\\logs\\codefactory.jsonl" },
-  { value: "run_command",     label: "Run command",             placeholder: "echo hook fired" },
-  { value: "emit_event",      label: "Emit Tauri event",        placeholder: "my-hook-event" },
-  { value: "auto_git_commit", label: "Auto git commit (post_task)", placeholder: "chore: {task_title}" },
+  { value: "log_to_file",     label: "记录到文件",               placeholder: "C:\\logs\\codefactory.jsonl" },
+  { value: "run_command",     label: "运行命令",                 placeholder: "echo hook fired" },
+  { value: "emit_event",      label: "发送 Tauri 事件",          placeholder: "my-hook-event" },
+  { value: "auto_git_commit", label: "自动 git 提交(post_task)", placeholder: "chore: {task_title}" },
 ];
 
 function HooksTab() {
@@ -864,16 +867,16 @@ function HooksTab() {
   return (
     <div className="max-w-xl space-y-3">
       <div className="flex items-center justify-between">
-        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Hooks</h2>
+        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">钩子</h2>
         <button
           onClick={() => setAddOpen(true)}
           className="flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 border border-border transition-colors"
         >
-          <Plus size={11} /> Add hook
+          <Plus size={11} /> 添加钩子
         </button>
       </div>
 
-      {hooks.length === 0 && <p className="text-xs text-gray-600">No hooks configured.</p>}
+      {hooks.length === 0 && <p className="text-xs text-gray-600">尚未配置钩子。</p>}
 
       {hooks.map((hook) => (
         <div key={hook.id} className="rounded-lg border border-border bg-surface-1 px-3 py-2 space-y-1.5">
@@ -886,13 +889,13 @@ function HooksTab() {
                 hook.enabled ? "bg-accent/20 text-accent" : "bg-surface-3 text-gray-600"
               }`}
             >
-              {hook.enabled ? "on" : "off"}
+              {hook.enabled ? "开" : "关"}
             </button>
             <button
               onClick={() => handleTest(hook.id)}
               className="text-[10px] text-gray-600 hover:text-gray-300 px-1.5 py-0.5 rounded hover:bg-surface-3 transition-colors"
             >
-              test
+              测试
             </button>
             <button
               onClick={() => handleDelete(hook.id)}
@@ -938,7 +941,7 @@ function AddHookForm({ onAdded, onCancel }: { onAdded: () => void; onCancel: () 
   };
 
   const handleSave = async () => {
-    if (!name.trim() || !actionParam.trim()) { setErr("Name and action param required."); return; }
+    if (!name.trim() || !actionParam.trim()) { setErr("请填写名称和动作参数。"); return; }
     setSaving(true); setErr(null);
     try {
       await invoke("add_hook", {
@@ -960,34 +963,34 @@ function AddHookForm({ onAdded, onCancel }: { onAdded: () => void; onCancel: () 
 
   return (
     <div className="rounded-lg border border-accent/30 bg-surface-1 p-3 space-y-2.5">
-      <p className="text-xs font-medium text-gray-300">New Hook</p>
+      <p className="text-xs font-medium text-gray-300">新建钩子</p>
       <div className="grid grid-cols-2 gap-2">
         <div>
-          <label className="block text-[10px] text-gray-500 mb-0.5">Name</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="My Hook"
+          <label className="block text-[10px] text-gray-500 mb-0.5">名称</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="我的钩子"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
         <div>
-          <label className="block text-[10px] text-gray-500 mb-0.5">Event</label>
+          <label className="block text-[10px] text-gray-500 mb-0.5">事件</label>
           <select value={event} onChange={(e) => setEvent(e.target.value)}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none">
             {HOOK_EVENTS.map((ev) => <option key={ev} value={ev}>{ev}</option>)}
           </select>
         </div>
         <div>
-          <label className="block text-[10px] text-gray-500 mb-0.5">Action type</label>
+          <label className="block text-[10px] text-gray-500 mb-0.5">动作类型</label>
           <select value={actionType} onChange={(e) => setActionType(e.target.value as HookActionType)}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none">
             {HOOK_ACTIONS.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
           </select>
         </div>
         <div>
-          <label className="block text-[10px] text-gray-500 mb-0.5">Filter (optional)</label>
-          <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="e.g. bash"
+          <label className="block text-[10px] text-gray-500 mb-0.5">过滤器(可选)</label>
+          <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="例如 bash"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
         <div className="col-span-2">
-          <label className="block text-[10px] text-gray-500 mb-0.5">{currentAction?.label ?? "Param"}</label>
+          <label className="block text-[10px] text-gray-500 mb-0.5">{currentAction?.label ?? "参数"}</label>
           <input value={actionParam} onChange={(e) => setActionParam(e.target.value)}
             placeholder={currentAction?.placeholder ?? ""}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
@@ -995,10 +998,10 @@ function AddHookForm({ onAdded, onCancel }: { onAdded: () => void; onCancel: () 
       </div>
       {err && <p className="text-xs text-red-400">{err}</p>}
       <div className="flex justify-end gap-2">
-        <button onClick={onCancel} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300">Cancel</button>
+        <button onClick={onCancel} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300">取消</button>
         <button onClick={handleSave} disabled={saving}
           className="px-2 py-1 rounded bg-accent hover:bg-accent-hover text-xs text-white disabled:opacity-50 transition-colors">
-          {saving ? "Adding…" : "Add Hook"}
+          {saving ? "添加中…" : "添加钩子"}
         </button>
       </div>
     </div>
@@ -1031,17 +1034,17 @@ function RemotesTab() {
     <div className="max-w-xl space-y-3">
       <div className="flex items-center justify-between">
         <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-          Git Remotes (GitHub / GitLab)
+          Git 远程仓库(GitHub / GitLab)
         </h2>
         <button
           onClick={() => setAddOpen(true)}
           className="flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 border border-border transition-colors"
         >
-          <Plus size={11} /> Add remote
+          <Plus size={11} /> 添加远程仓库
         </button>
       </div>
 
-      {remotes.length === 0 && <p className="text-xs text-gray-600">No remotes configured.</p>}
+      {remotes.length === 0 && <p className="text-xs text-gray-600">尚未配置远程仓库。</p>}
 
       {remotes.map((remote: GitRemoteConfig) => (
         <div key={remote.id} className="rounded-lg border border-border bg-surface-1 px-3 py-2 space-y-1.5">
@@ -1062,7 +1065,7 @@ function RemotesTab() {
               disabled={testing === remote.id}
               className="text-[10px] text-gray-600 hover:text-gray-300 px-1.5 py-0.5 rounded hover:bg-surface-3 transition-colors disabled:opacity-50"
             >
-              {testing === remote.id ? "…" : "Test"}
+              {testing === remote.id ? "…" : "测试"}
             </button>
             <button
               onClick={() => deleteRemote(remote.id)}
@@ -1112,7 +1115,7 @@ function AddRemoteForm({
   };
 
   const handleSave = async () => {
-    if (!name.trim() || !token.trim()) { setErr("Name and token required."); return; }
+    if (!name.trim() || !token.trim()) { setErr("请填写名称和令牌。"); return; }
     setSaving(true); setErr(null);
     try {
       await addRemote({
@@ -1130,15 +1133,15 @@ function AddRemoteForm({
 
   return (
     <div className="rounded-lg border border-accent/30 bg-surface-1 p-3 space-y-2.5">
-      <p className="text-xs font-medium text-gray-300">New Remote</p>
+      <p className="text-xs font-medium text-gray-300">新建远程仓库</p>
       <div className="grid grid-cols-2 gap-2">
         <div>
-          <label className="block text-[10px] text-gray-500 mb-0.5">Name</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="My GitHub"
+          <label className="block text-[10px] text-gray-500 mb-0.5">名称</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="我的 GitHub"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
         <div>
-          <label className="block text-[10px] text-gray-500 mb-0.5">Provider</label>
+          <label className="block text-[10px] text-gray-500 mb-0.5">提供商</label>
           <select value={provider} onChange={(e) => handleProviderChange(e.target.value as GitProvider)}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none">
             <option value="github">GitHub</option>
@@ -1146,12 +1149,12 @@ function AddRemoteForm({
           </select>
         </div>
         <div className="col-span-2">
-          <label className="block text-[10px] text-gray-500 mb-0.5">Base URL</label>
+          <label className="block text-[10px] text-gray-500 mb-0.5">基础 URL</label>
           <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none focus:border-accent/40" />
         </div>
         <div className="col-span-2">
-          <label className="block text-[10px] text-gray-500 mb-0.5">Personal Access Token</label>
+          <label className="block text-[10px] text-gray-500 mb-0.5">个人访问令牌</label>
           <div className="flex gap-1">
             <input type={showToken ? "text" : "password"} value={token} onChange={(e) => setToken(e.target.value)}
               placeholder="ghp_…"
@@ -1163,17 +1166,17 @@ function AddRemoteForm({
           </div>
         </div>
         <div className="col-span-2">
-          <label className="block text-[10px] text-gray-500 mb-0.5">Default Repo (optional)</label>
+          <label className="block text-[10px] text-gray-500 mb-0.5">默认仓库(可选)</label>
           <input value={defaultRepo} onChange={(e) => setDefaultRepo(e.target.value)} placeholder="owner/repo"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
       </div>
       {err && <p className="text-xs text-red-400">{err}</p>}
       <div className="flex justify-end gap-2">
-        <button onClick={onCancel} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300">Cancel</button>
+        <button onClick={onCancel} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300">取消</button>
         <button onClick={handleSave} disabled={saving}
           className="px-2 py-1 rounded bg-accent hover:bg-accent-hover text-xs text-white disabled:opacity-50 transition-colors">
-          {saving ? "Adding…" : "Add Remote"}
+          {saving ? "添加中…" : "添加远程仓库"}
         </button>
       </div>
     </div>
@@ -1671,7 +1674,7 @@ function DataSection() {
   const handleExport = async () => {
     const path = await saveDialog({
       defaultPath: `codefactory-backup-${new Date().toISOString().slice(0, 10)}.cfbkp`,
-      filters: [{ name: "CodeFactory backup", extensions: ["cfbkp"] }],
+      filters: [{ name: "CodeFactory 备份", extensions: ["cfbkp"] }],
     });
     if (!path) return;
     setBusy("export");
@@ -1679,7 +1682,7 @@ function DataSection() {
       const r = await invoke<{ path: string; size_bytes: number }>("export_user_data", {
         targetPath: path,
       });
-      showMsg("ok", `Exported ${(r.size_bytes / 1024 / 1024).toFixed(2)} MB to ${r.path}`);
+      showMsg("ok", `已导出 ${(r.size_bytes / 1024 / 1024).toFixed(2)} MB 到 ${r.path}`);
     } catch (e) {
       showMsg("err", String(e));
     } finally {
@@ -1690,12 +1693,12 @@ function DataSection() {
   const handleImport = async () => {
     const path = await openDialog({
       multiple: false,
-      filters: [{ name: "CodeFactory backup", extensions: ["cfbkp"] }],
+      filters: [{ name: "CodeFactory 备份", extensions: ["cfbkp"] }],
     });
     if (!path || typeof path !== "string") return;
     if (
       !confirm(
-        "Restoring will overwrite your current settings and sessions. The old files will be saved with a .pre-restore-<timestamp> suffix in the data directory. Continue?",
+        "恢复将覆盖当前的设置和会话。旧文件会以 .pre-restore-<timestamp> 后缀保存在数据目录中。是否继续？",
       )
     ) {
       return;
@@ -1707,11 +1710,11 @@ function DataSection() {
         { sourcePath: path },
       );
       const parts: string[] = [];
-      if (r.restored_settings) parts.push("settings");
-      if (r.restored_db) parts.push("sessions");
+      if (r.restored_settings) parts.push("设置");
+      if (r.restored_db) parts.push("会话");
       showMsg(
         "ok",
-        `Restored ${parts.join(" + ")}. Restart the app to take effect.`,
+        `已恢复 ${parts.join(" + ")}。重启应用后生效。`,
       );
     } catch (e) {
       showMsg("err", String(e));
@@ -1722,17 +1725,17 @@ function DataSection() {
 
   return (
     <div className="pt-4 mt-4 border-t border-border space-y-3">
-      <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Data</h2>
+      <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">数据</h2>
 
       <div className="rounded-lg border border-border bg-surface-1 p-3 space-y-2">
-        <div className="text-[11px] text-gray-500">Storage location</div>
+        <div className="text-[11px] text-gray-500">存储位置</div>
         <div className="flex items-center gap-2 font-mono text-[11px] text-gray-300">
           <FolderOpen size={11} className="text-gray-600 shrink-0" />
-          <span className="truncate" title={dataDir}>{dataDir || "loading…"}</span>
+          <span className="truncate" title={dataDir}>{dataDir || "加载中…"}</span>
         </div>
         <p className="text-[11px] text-gray-600 leading-relaxed">
-          All sessions, messages, and settings live here. Survives uninstall and reinstall.
-          API keys are stored separately in Windows Credential Manager and are not part of backups.
+          所有会话、消息和设置都保存在这里。卸载并重装后依然保留。
+          API Key 单独存储在 Windows 凭据管理器中，不包含在备份内。
         </p>
       </div>
 
@@ -1743,7 +1746,7 @@ function DataSection() {
           className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded border border-border bg-surface-1 hover:bg-surface-3 text-xs text-gray-200 transition-colors disabled:opacity-50"
         >
           <DownloadIcon size={12} />
-          {busy === "export" ? "Exporting…" : "Export backup"}
+          {busy === "export" ? "导出中…" : "导出备份"}
         </button>
         <button
           onClick={handleImport}
@@ -1751,7 +1754,7 @@ function DataSection() {
           className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded border border-border bg-surface-1 hover:bg-surface-3 text-xs text-gray-200 transition-colors disabled:opacity-50"
         >
           <UploadIcon size={12} />
-          {busy === "import" ? "Restoring…" : "Restore from backup"}
+          {busy === "import" ? "恢复中…" : "从备份恢复"}
         </button>
       </div>
 

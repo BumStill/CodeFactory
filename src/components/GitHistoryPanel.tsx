@@ -40,18 +40,18 @@ export function GitHistoryPanel({ onClose }: Props) {
       {/* Header */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0">
         <History size={14} className="text-gray-400" />
-        <span className="text-xs font-semibold text-gray-200 flex-1">History</span>
+        <span className="text-xs font-semibold text-gray-200 flex-1">历史记录</span>
         <button
           onClick={handleRefresh}
           className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors"
-          title="Refresh"
+          title="刷新"
         >
           <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
         </button>
         <button
           onClick={onClose}
           className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors"
-          title="Close"
+          title="关闭"
         >
           <X size={14} />
         </button>
@@ -59,10 +59,10 @@ export function GitHistoryPanel({ onClose }: Props) {
 
       <div className="flex-1 overflow-y-auto">
         {commits.length === 0 && !loading && (
-          <div className="text-[11px] text-gray-700 text-center pt-8">No commits</div>
+          <div className="text-[11px] text-gray-700 text-center pt-8">无提交</div>
         )}
         {loading && commits.length === 0 && (
-          <div className="text-[11px] text-gray-600 text-center pt-8">Loading…</div>
+          <div className="text-[11px] text-gray-600 text-center pt-8">加载中…</div>
         )}
         {commits.map((c) => {
           const isExpanded = expanded.has(c.hash);
@@ -114,15 +114,15 @@ export function GitHistoryPanel({ onClose }: Props) {
 function formatRelative(ts: number): string {
   // ts is unix epoch in seconds
   const diff = Math.max(0, Date.now() / 1000 - ts);
-  if (diff < 60) return "just now";
+  if (diff < 60) return "刚刚";
   const min = Math.floor(diff / 60);
-  if (min < 60) return `${min}m ago`;
+  if (min < 60) return `${min} 分钟前`;
   const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
+  if (hr < 24) return `${hr} 小时前`;
   const day = Math.floor(hr / 24);
-  if (day < 30) return `${day}d ago`;
+  if (day < 30) return `${day} 天前`;
   const month = Math.floor(day / 30);
-  if (month < 12) return `${month}mo ago`;
+  if (month < 12) return `${month} 个月前`;
   const year = Math.floor(day / 365);
-  return `${year}y ago`;
+  return `${year} 年前`;
 }

@@ -65,7 +65,7 @@ export function CheckpointsPanel({ sessionId }: Props) {
         >
           {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
           <GitBranch size={11} />
-          <span>Checkpoints</span>
+          <span>检查点</span>
           {checkpoints.length > 0 && (
             <span className="ml-auto text-[10px] text-gray-600 tabular-nums">
               {checkpoints.length}
@@ -77,8 +77,7 @@ export function CheckpointsPanel({ sessionId }: Props) {
           <div className="px-1 pb-2 max-h-[28vh] overflow-y-auto">
             {checkpoints.length === 0 ? (
               <div className="px-3 py-2 text-[11px] text-gray-600 italic">
-                No checkpoints yet. One will appear after the next message
-                if this folder is a git repo.
+                暂无检查点。如果此文件夹是 git 仓库，发送下一条消息后会出现一个。
               </div>
             ) : (
               <ul className="space-y-0.5">
@@ -111,22 +110,22 @@ function CheckpointRow({ cp, onRequestRevert }: { cp: CheckpointInfo; onRequestR
         {cp.git_sha.slice(0, 7)}
       </span>
       <span className={`flex-1 min-w-0 truncate ${cp.reverted ? "text-gray-700 line-through" : "text-gray-400"}`} title={cp.label}>
-        {label || "(empty message)"}
+        {label || "(空消息)"}
       </span>
       <span className="text-[10px] text-gray-700 shrink-0" title={when.toLocaleString()}>
         {when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
       </span>
       {cp.reverted ? (
-        <span className="text-[10px] text-emerald-500 shrink-0 flex items-center gap-0.5" title="Already reverted">
-          <Check size={10} /> reverted
+        <span className="text-[10px] text-emerald-500 shrink-0 flex items-center gap-0.5" title="已恢复">
+          <Check size={10} /> 已恢复
         </span>
       ) : (
         <button
           onClick={() => onRequestRevert(cp)}
           className="opacity-0 group-hover:opacity-100 transition-opacity shrink-0 flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] text-gray-500 hover:text-amber-400 hover:bg-amber-500/10"
-          title="Revert working tree to this checkpoint"
+          title="将工作区恢复到此检查点"
         >
-          <RotateCcw size={10} /> revert
+          <RotateCcw size={10} /> 恢复
         </button>
       )}
     </li>
@@ -169,9 +168,9 @@ function RevertConfirmModal({ cp, onCancel, onDone }: {
       >
         <div className="flex items-start justify-between gap-3 px-4 py-3 border-b border-border">
           <div className="min-w-0">
-            <div className="text-sm font-semibold text-gray-100">Revert to checkpoint</div>
+            <div className="text-sm font-semibold text-gray-100">恢复到检查点</div>
             <div className="text-[11px] text-gray-500 mt-0.5 truncate" title={cp.label}>
-              {cp.git_sha.slice(0, 7)} · {cp.label || "(empty)"}
+              {cp.git_sha.slice(0, 7)} · {cp.label || "(空)"}
             </div>
           </div>
           <button onClick={onCancel} className="text-gray-600 hover:text-gray-300">
@@ -186,23 +185,22 @@ function RevertConfirmModal({ cp, onCancel, onDone }: {
               <span className="flex-1 break-words">{error}</span>
             </div>
           ) : changes === null ? (
-            <div className="text-xs text-gray-500">Computing diff…</div>
+            <div className="text-xs text-gray-500">正在计算差异…</div>
           ) : changes.length === 0 ? (
             <div className="text-xs text-gray-500 italic">
-              Working tree already matches this checkpoint — nothing would change.
+              工作区已与此检查点一致 — 不会有任何更改。
             </div>
           ) : (
             <>
               <div className="text-[11px] text-gray-500 mb-2">
-                These files will be restored to their state at the checkpoint
-                (your current edits to them will be overwritten):
+                这些文件将恢复到检查点时的状态（你对它们的当前修改会被覆盖）：
               </div>
               <ul className="space-y-0.5">
                 {changes.map((c) => (
                   <li key={c.path} className="flex items-center gap-2 text-[11px] font-mono">
                     <StatusIcon status={c.status} />
                     <span className="text-gray-300 truncate flex-1" title={c.path}>{c.path}</span>
-                    <span className="text-[10px] text-gray-600 uppercase tracking-wide">{c.status}</span>
+                    <span className="text-[10px] text-gray-600 uppercase tracking-wide">{statusLabel(c.status)}</span>
                   </li>
                 ))}
               </ul>
@@ -215,7 +213,7 @@ function RevertConfirmModal({ cp, onCancel, onDone }: {
             onClick={onCancel}
             className="px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 rounded hover:bg-surface-3 transition-colors"
           >
-            Cancel
+            取消
           </button>
           <button
             onClick={handleRevert}
@@ -223,7 +221,7 @@ function RevertConfirmModal({ cp, onCancel, onDone }: {
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-amber-500/20 text-amber-800 dark:text-amber-300 border border-amber-500/40 rounded hover:bg-amber-500/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
             <RotateCcw size={11} />
-            {busy ? "Reverting…" : "Revert"}
+            {busy ? "正在恢复…" : "恢复"}
           </button>
         </div>
       </div>
@@ -237,5 +235,14 @@ function StatusIcon({ status }: { status: CheckpointFileChange["status"] }) {
     case "deleted":  return <FileMinus size={11} className="text-rose-400 shrink-0" />;
     case "modified": return <FileEdit size={11} className="text-amber-400 shrink-0" />;
     default:         return <FileText size={11} className="text-gray-500 shrink-0" />;
+  }
+}
+
+function statusLabel(status: CheckpointFileChange["status"]): string {
+  switch (status) {
+    case "added":    return "新增";
+    case "deleted":  return "删除";
+    case "modified": return "修改";
+    default:         return status;
   }
 }

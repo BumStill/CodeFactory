@@ -371,8 +371,8 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
             dragOver
               ? "松开以附加文件"
               : disabled
-              ? "Message or /cwd <path>"
-              : "Message · 粘贴/拖拽/回形针附加文件（图片 · pptx · docx · pdf）"
+              ? "发送消息，或用 /cwd <path> 切换目录"
+              : "发送消息 · 粘贴/拖拽/回形针附加文件（图片 · pptx · docx · pdf）"
           }
           className="flex-1 resize-none bg-transparent text-sm text-gray-200 placeholder-gray-600 outline-none min-h-[24px] max-h-[200px] leading-6 disabled:opacity-40"
         />
@@ -394,7 +394,7 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
           disabled={!streaming && !submitReady}
           className="shrink-0 rounded-lg p-1.5 transition-colors disabled:opacity-30
             enabled:hover:bg-surface-4 text-accent disabled:text-gray-600"
-          title={streaming ? "Cancel stream" : "Send (Enter)"}
+          title={streaming ? "取消生成" : "发送(Enter)"}
         >
           {streaming ? <Square size={16} /> : <Send size={16} />}
         </button>

@@ -169,12 +169,12 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
           <button
             onClick={onBack}
             className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-            title="Back to Chat"
+            title="返回"
           >
             <ChevronLeft size={14} />
           </button>
           <span className="flex-1 text-xs font-semibold text-gray-400 uppercase tracking-wider">
-            Skills
+            技能
           </span>
         </div>
 
@@ -188,7 +188,7 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
                 : "text-gray-600 hover:text-gray-400"
             }`}
           >
-            Installed
+            已安装
           </button>
           <button
             onClick={() => setTab("marketplace")}
@@ -199,7 +199,7 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
             }`}
           >
             <Store size={10} />
-            Marketplace
+            市场
           </button>
         </div>
 
@@ -213,14 +213,14 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
                   value={installUrl}
                   onChange={(e) => setInstallUrl(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && handleInstall()}
-                  placeholder="Install from URL..."
+                  placeholder="从 URL 安装…"
                   className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-300 placeholder-gray-600 outline-none focus:border-accent/50"
                 />
                 <button
                   onClick={handleInstall}
                   disabled={installing || !installUrl.trim()}
                   className="p-1.5 rounded bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
-                  title="Install skill"
+                  title="安装技能"
                 >
                   <Plus size={12} />
                 </button>
@@ -235,10 +235,10 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
             {/* Installed skill list */}
             <ul className="flex-1 overflow-y-auto py-1">
               {loading && (
-                <li className="px-3 py-2 text-xs text-gray-700">Loading...</li>
+                <li className="px-3 py-2 text-xs text-gray-700">加载中…</li>
               )}
               {!loading && skills.length === 0 && (
-                <li className="px-3 py-2 text-xs text-gray-700">No skills installed</li>
+                <li className="px-3 py-2 text-xs text-gray-700">未安装任何技能</li>
               )}
               {skills.map((skill) => (
                 <li key={skill.id}>
@@ -258,7 +258,7 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
                         <span
                           className="opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded hover:bg-surface-4 text-gray-600 hover:text-red-400"
                           role="button"
-                          title="Delete"
+                          title="删除"
                           onClick={(e) => {
                             e.stopPropagation();
                             handleDelete(skill.id);
@@ -271,7 +271,7 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
                     <div className="flex items-center gap-1 flex-wrap">
                       {skill.enabled && (
                         <span className="px-1 py-0.5 rounded bg-accent/20 text-accent text-[10px]">
-                          enabled
+                          已启用
                         </span>
                       )}
                       <span className="text-[10px] text-gray-700">
@@ -291,7 +291,7 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
                 type="text"
                 value={marketSearch}
                 onChange={(e) => setMarketSearch(e.target.value)}
-                placeholder="Search skills..."
+                placeholder="搜索技能…"
                 className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-300 placeholder-gray-600 outline-none focus:border-accent/50"
               />
             </div>
@@ -299,13 +299,13 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
             {/* Marketplace list */}
             <ul className="flex-1 overflow-y-auto py-1">
               {marketLoading && (
-                <li className="px-3 py-2 text-xs text-gray-700">Loading catalog...</li>
+                <li className="px-3 py-2 text-xs text-gray-700">正在加载目录…</li>
               )}
               {!marketLoading && marketError && (
                 <li className="px-3 py-2 text-xs text-red-400">{marketError}</li>
               )}
               {!marketLoading && !marketError && filteredMarketSkills.length === 0 && (
-                <li className="px-3 py-2 text-xs text-gray-700">No skills found</li>
+                <li className="px-3 py-2 text-xs text-gray-700">未找到技能</li>
               )}
               {filteredMarketSkills.map((skill) => (
                 <li key={skill.id} className="px-3 py-2 border-b border-border/50">
@@ -317,7 +317,7 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
                         </span>
                         {skill.installed && (
                           <span className="px-1 py-0.5 rounded bg-accent/20 text-accent text-[10px] flex-shrink-0">
-                            installed
+                            已安装
                           </span>
                         )}
                       </div>
@@ -341,7 +341,7 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
                         onClick={() => handleInstallMarketplace(skill)}
                         disabled={installingId === skill.id}
                         className="flex-shrink-0 p-1 rounded bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
-                        title="Install"
+                        title="安装"
                       >
                         {installingId === skill.id ? (
                           <span className="text-[10px]">...</span>
@@ -358,7 +358,7 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
             {/* Local catalog notice */}
             {usingLocalCatalog && !marketLoading && (
               <div className="px-3 py-1.5 border-t border-border text-[10px] text-gray-700">
-                Using local catalog (offline)
+                正在使用本地目录（离线）
               </div>
             )}
           </>
@@ -371,11 +371,11 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
           <MarketplaceWelcome />
         ) : !selectedId ? (
           <div className="flex-1 flex items-center justify-center text-sm text-gray-700">
-            Select a skill to view details
+            选择一个技能查看详情
           </div>
         ) : detailLoading ? (
           <div className="flex-1 flex items-center justify-center text-sm text-gray-700">
-            Loading...
+            加载中…
           </div>
         ) : detail ? (
           <SkillDetailView
@@ -394,9 +394,9 @@ function MarketplaceWelcome() {
     <div className="flex-1 flex flex-col items-center justify-center gap-3 text-center px-8">
       <Store size={32} className="text-gray-700" />
       <div>
-        <h2 className="text-sm font-medium text-gray-400">Skill Marketplace</h2>
+        <h2 className="text-sm font-medium text-gray-400">技能市场</h2>
         <p className="text-xs text-gray-700 mt-1 max-w-xs">
-          Browse and install community skills. Click Install to add a skill to your library, then enable it in the Installed tab.
+          浏览并安装社区技能。点击“安装”将技能添加到你的技能库，然后在“已安装”标签页中启用它。
         </p>
       </div>
     </div>
@@ -422,7 +422,7 @@ function SkillDetailView({
           <h1 className="text-sm font-semibold text-gray-200">{manifest.name}</h1>
           <p className="text-xs text-gray-500 mt-0.5">{manifest.description}</p>
           <div className="flex items-center gap-2 mt-1 flex-wrap">
-            <span className="text-[10px] text-gray-700">v{manifest.version} by {manifest.author}</span>
+            <span className="text-[10px] text-gray-700">v{manifest.version} 作者 {manifest.author}</span>
             {manifest.tags.map((tag) => (
               <span
                 key={tag}
@@ -434,7 +434,7 @@ function SkillDetailView({
             ))}
             {has_tool_policy && (
               <span className="px-1.5 py-0.5 rounded bg-yellow-900/40 text-yellow-400 text-[10px]">
-                tool policy
+                工具策略
               </span>
             )}
           </div>
@@ -448,17 +448,17 @@ function SkillDetailView({
               : "bg-accent hover:bg-accent-hover text-white"
           }`}
         >
-          {toggling ? "..." : manifest.enabled ? "Disable" : "Enable"}
+          {toggling ? "…" : manifest.enabled ? "禁用" : "启用"}
         </button>
       </div>
 
       {/* System prompt */}
       <div>
         <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
-          System Prompt
+          系统提示词
         </h2>
         <pre className="text-xs text-gray-300 bg-surface-1 border border-border rounded p-3 whitespace-pre-wrap leading-relaxed font-mono">
-          {system_prompt || "(none)"}
+          {system_prompt || "（无）"}
         </pre>
       </div>
 
@@ -466,7 +466,7 @@ function SkillDetailView({
       {slash_commands.length > 0 && (
         <div>
           <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
-            Slash Commands
+            斜杠命令
           </h2>
           <div className="space-y-1.5">
             {slash_commands.map((cmd) => (

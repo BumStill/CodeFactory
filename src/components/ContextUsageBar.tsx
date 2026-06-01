@@ -105,20 +105,20 @@ export function ContextUsageBar({ sessionId }: Props) {
       {hasTokens && (
         <div className="flex items-center gap-3 text-gray-500 tabular-nums">
           {sessionTok > 0 && (
-            <span title="This session">
-              <span className="text-gray-600 mr-1">session</span>
+            <span title="当前会话">
+              <span className="text-gray-600 mr-1">会话</span>
               {fmtTokens(sessionTok)}
             </span>
           )}
           {todayTok > 0 && (
-            <span title="Today's total">
-              <span className="text-gray-600 mr-1">today</span>
+            <span title="今日合计">
+              <span className="text-gray-600 mr-1">今日</span>
               {fmtTokens(todayTok)}
             </span>
           )}
           {monthCost > 0.0001 && (
-            <span title="This month (estimated)">
-              <span className="text-gray-600 mr-1">month</span>
+            <span title="本月(估算)">
+              <span className="text-gray-600 mr-1">本月</span>
               ${monthCost.toFixed(4)}
             </span>
           )}
@@ -129,16 +129,16 @@ export function ContextUsageBar({ sessionId }: Props) {
       {showToast && toast && (
         <span
           className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-800 dark:text-amber-300 text-[10px]"
-          title={`Freed ~${fmtTokens(toast.tokensFreed)} tokens`}
+          title={`释放约 ${fmtTokens(toast.tokensFreed)} tokens`}
         >
-          compressed {toast.elidedCount} old result{toast.elidedCount === 1 ? "" : "s"}
+          已压缩 {toast.elidedCount} 条旧结果
         </span>
       )}
 
       {/* Context window usage — right-aligned */}
       {hasUsage && (
         <div className="flex items-center gap-2 ml-auto tabular-nums">
-          <span className="text-gray-600">context</span>
+          <span className="text-gray-600">上下文</span>
           <span className={toneText}>
             {fmtTokens(usage!.used)} / {fmtTokens(usage!.limit)}
           </span>

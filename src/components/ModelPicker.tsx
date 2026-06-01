@@ -67,7 +67,7 @@ export function ModelPicker() {
               autoFocus
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search models..."
+              placeholder="搜索模型…"
               className="w-full bg-surface-3 rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none"
             />
           </div>
@@ -103,7 +103,7 @@ export function ModelPicker() {
               </li>
             ))}
             {filtered.length === 0 && (
-              <li className="px-3 py-2 text-xs text-gray-600">No models found</li>
+              <li className="px-3 py-2 text-xs text-gray-600">未找到模型</li>
             )}
           </ul>
         </div>

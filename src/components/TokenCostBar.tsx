@@ -81,17 +81,17 @@ export function TokenCostBar({ sessionId }: Props) {
   return (
     <div className="flex items-center gap-4 px-4 py-1 border-t border-border text-[11px] text-gray-600 bg-surface-1 shrink-0 select-none">
       {sessionTok > 0 && (
-        <span title="This session">
+        <span title="当前会话">
           📊 {fmtTokens(sessionTok)} tok
         </span>
       )}
       {todayTok > 0 && (
-        <span title="Today's total">
-          📅 {fmtTokens(todayTok)} today
+        <span title="今日合计">
+          📅 {fmtTokens(todayTok)} 今日
         </span>
       )}
       {monthCost > 0.0001 && (
-        <span title="This month (estimated)">
+        <span title="本月(估算)">
           💰 ${monthCost.toFixed(4)}/mo
         </span>
       )}

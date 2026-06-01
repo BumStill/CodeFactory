@@ -192,11 +192,19 @@ const STATUS_COLORS: Record<string, string> = {
   done: "bg-gray-900 text-gray-400",
 };
 
+const STATUS_LABELS: Record<string, string> = {
+  draft: "草稿",
+  review: "审查中",
+  approved: "已批准",
+  implementing: "实现中",
+  done: "已完成",
+};
+
 function StatusChip({ status }: { status: string }) {
   const cls = STATUS_COLORS[status] ?? "bg-gray-700 text-gray-300";
   return (
-    <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium uppercase ${cls}`}>
-      {status}
+    <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${cls}`}>
+      {STATUS_LABELS[status] ?? status}
     </span>
   );
 }
@@ -277,7 +285,7 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
     <div className="w-80 flex-shrink-0 flex flex-col border-l border-border bg-surface-1">
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border">
         <Sparkles size={14} className="text-accent" />
-        <span className="flex-1 text-xs font-semibold text-gray-300">AI Co-drafting</span>
+        <span className="flex-1 text-xs font-semibold text-gray-300">AI 协作起草</span>
         <button onClick={onClose} className="p-1 rounded text-gray-600 hover:text-gray-300">
           <X size={12} />
         </button>
@@ -295,10 +303,10 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
                 : "bg-surface-3 text-gray-400 hover:text-gray-200"
             }`}
           >
-            {m === "generate" ? "Generate" :
-             m === "section" ? "Add Section" :
-             m === "decisions" ? "Decisions" :
-             m === "criteria" ? "Criteria" : "Review"}
+            {m === "generate" ? "生成" :
+             m === "section" ? "添加章节" :
+             m === "decisions" ? "决策点" :
+             m === "criteria" ? "验收标准" : "审查"}
           </button>
         ))}
       </div>
@@ -310,7 +318,7 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
             <textarea
               value={brief}
               onChange={(e) => setBrief(e.target.value)}
-              placeholder="One-line description of the feature..."
+              placeholder="功能的一句话描述…"
               className="w-full bg-surface-3 border border-border rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50 resize-none"
               rows={3}
             />
@@ -319,7 +327,7 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
               disabled={loading || !brief.trim()}
               className="w-full px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
             >
-              {loading ? "Generating..." : "Generate Spec"}
+              {loading ? "生成中…" : "生成规范"}
             </button>
           </>
         )}
@@ -328,7 +336,7 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
             <textarea
               value={instruction}
               onChange={(e) => setInstruction(e.target.value)}
-              placeholder="Describe the section you want to add..."
+              placeholder="描述你要添加的部分…"
               className="w-full bg-surface-3 border border-border rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50 resize-none"
               rows={3}
             />
@@ -337,7 +345,7 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
               disabled={loading || !instruction.trim()}
               className="w-full px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
             >
-              {loading ? "Drafting..." : "Draft Section"}
+              {loading ? "起草中…" : "起草章节"}
             </button>
           </>
         )}
@@ -347,7 +355,7 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
             disabled={loading}
             className="w-full px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
           >
-            {loading ? "Analyzing..." : "Identify Decision Points"}
+            {loading ? "分析中…" : "识别决策点"}
           </button>
         )}
         {mode === "criteria" && (
@@ -356,7 +364,7 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
             disabled={loading}
             className="w-full px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
           >
-            {loading ? "Extracting..." : "Generate Criteria"}
+            {loading ? "提取中…" : "生成验收标准"}
           </button>
         )}
         {mode === "review" && (
@@ -365,7 +373,7 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
             disabled={loading}
             className="w-full px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
           >
-            {loading ? "Reviewing..." : "Review for Completeness"}
+            {loading ? "审查中…" : "审查完整性"}
           </button>
         )}
       </div>
@@ -384,7 +392,7 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
                 onClick={() => onInsert(result)}
                 className="flex-1 px-2 py-1.5 rounded text-xs bg-green-700 hover:bg-green-600 text-white transition-colors"
               >
-                Insert (replace editor)
+                插入（替换编辑器内容）
               </button>
             )}
             {mode === "section" && (
@@ -392,7 +400,7 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
                 onClick={() => onInsert(result)}
                 className="flex-1 px-2 py-1.5 rounded text-xs bg-green-700 hover:bg-green-600 text-white transition-colors"
               >
-                Append to Spec
+                追加到规范
               </button>
             )}
             {mode === "decisions" && (
@@ -400,7 +408,7 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
                 onClick={() => onApplyDecisions(result)}
                 className="flex-1 px-2 py-1.5 rounded text-xs bg-yellow-700 hover:bg-yellow-600 text-white transition-colors"
               >
-                Apply Decisions
+                应用决策点
               </button>
             )}
             {mode === "criteria" && (
@@ -408,17 +416,17 @@ function AiSidebar({ specContent, onInsert, onApplyDecisions, onClose }: AiSideb
                 onClick={() => onApplyDecisions(result)}
                 className="flex-1 px-2 py-1.5 rounded text-xs bg-blue-700 hover:bg-blue-600 text-white transition-colors"
               >
-                Apply Criteria
+                应用验收标准
               </button>
             )}
             {mode === "review" && (
-              <span className="text-xs text-gray-500 italic">Review feedback (read-only)</span>
+              <span className="text-xs text-gray-500 italic">审查反馈（只读）</span>
             )}
             <button
               onClick={() => setResult("")}
               className="px-2 py-1.5 rounded text-xs bg-surface-3 text-gray-400 hover:text-gray-200 transition-colors"
             >
-              Clear
+              清除
             </button>
           </div>
         </div>
@@ -442,16 +450,16 @@ function FrontmatterPanel({ meta, onApprove, onStartImplementation }: Frontmatte
   return (
     <div className="w-56 flex-shrink-0 flex flex-col border-l border-border bg-surface-1 p-3 gap-3 overflow-y-auto">
       <div>
-        <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1">Req ID</div>
+        <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1">需求 ID</div>
         <div className="text-xs text-gray-300 font-mono">{meta.req_id ?? "—"}</div>
       </div>
       <div>
-        <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1">Status</div>
+        <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1">状态</div>
         <StatusChip status={meta.status} />
       </div>
       {meta.tags.length > 0 && (
         <div>
-          <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1">Tags</div>
+          <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1">标签</div>
           <div className="flex flex-wrap gap-1">
             {meta.tags.map((t) => (
               <span key={t} className="px-1.5 py-0.5 rounded bg-surface-3 text-gray-400 text-[10px]">
@@ -464,7 +472,7 @@ function FrontmatterPanel({ meta, onApprove, onStartImplementation }: Frontmatte
       {meta.acceptance_criteria.length > 0 && (
         <div>
           <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1">
-            Acceptance Criteria
+            验收标准
           </div>
           <ul className="space-y-1">
             {meta.acceptance_criteria.map((c, i) => (
@@ -483,7 +491,7 @@ function FrontmatterPanel({ meta, onApprove, onStartImplementation }: Frontmatte
           className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded text-xs bg-green-800 hover:bg-green-700 text-green-100 disabled:opacity-40 transition-colors"
         >
           <CheckCircle size={12} />
-          Approve Spec
+          批准规范
         </button>
         <button
           onClick={onStartImplementation}
@@ -491,7 +499,7 @@ function FrontmatterPanel({ meta, onApprove, onStartImplementation }: Frontmatte
           className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded text-xs bg-blue-800 hover:bg-blue-700 text-blue-100 disabled:opacity-40 transition-colors"
         >
           <Play size={12} />
-          Start Implementation
+          开始实现
         </button>
       </div>
     </div>
@@ -539,7 +547,7 @@ function ImplementationModal({ meta, specContent, sessionId, cwd, onConfirm, onC
         setTasks([{
           tmp_id: "t-0",
           title: meta.title,
-          description: `Implement spec ${meta.req_id ?? ""}: ${meta.title}`,
+          description: `实现规范 ${meta.req_id ?? ""}：${meta.title}`,
           dependencies: [],
         }]);
         setPhase("review");
@@ -582,17 +590,17 @@ function ImplementationModal({ meta, specContent, sessionId, cwd, onConfirm, onC
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div className="w-[520px] rounded-xl border border-border bg-surface-2 shadow-2xl p-5 space-y-4">
-        <h2 className="text-sm font-semibold text-gray-200">Start Implementation</h2>
+        <h2 className="text-sm font-semibold text-gray-200">开始实现</h2>
 
         {phase === "decomposing" ? (
           <div className="flex flex-col items-center justify-center py-8 gap-3 text-xs text-gray-400">
             <div className="w-5 h-5 border-2 border-gray-500 border-t-blue-400 rounded-full animate-spin" />
-            <span>🤖 AI is decomposing your spec into tasks...</span>
+            <span>🤖 AI 正在将你的规范拆解为任务…</span>
           </div>
         ) : (
           <>
             <p className="text-xs text-gray-400">
-              Review and edit the tasks below, then confirm to begin implementation.
+              查看并编辑下方的任务，然后确认以开始实现。
             </p>
             <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
               {tasks.map((task, idx) => (
@@ -606,7 +614,7 @@ function ImplementationModal({ meta, specContent, sessionId, cwd, onConfirm, onC
                     <button
                       onClick={() => deleteTask(idx)}
                       className="text-gray-600 hover:text-red-400 transition-colors flex-shrink-0"
-                      title="Remove task"
+                      title="移除任务"
                     >
                       <Trash2 size={12} />
                     </button>
@@ -621,7 +629,7 @@ function ImplementationModal({ meta, specContent, sessionId, cwd, onConfirm, onC
                     <div className="flex flex-wrap gap-1">
                       {task.dependencies.map(dep => (
                         <span key={dep} className="text-[10px] bg-surface-1 text-gray-500 border border-border rounded px-1.5 py-0.5">
-                          after {dep}
+                          在 {dep} 之后
                         </span>
                       ))}
                     </div>
@@ -635,14 +643,14 @@ function ImplementationModal({ meta, specContent, sessionId, cwd, onConfirm, onC
                 onClick={onCancel}
                 className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
               >
-                Cancel
+                取消
               </button>
               <button
                 onClick={handleConfirm}
                 disabled={busy || tasks.length === 0}
                 className="px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
               >
-                {busy ? "Starting..." : "Confirm & Start"}
+                {busy ? "启动中…" : "确认并开始"}
               </button>
             </div>
           </>
@@ -680,14 +688,14 @@ function NewSpecModal({ cwd, onCreated, onCancel }: {
         className="w-80 rounded-xl border border-border bg-surface-2 shadow-2xl p-5 space-y-4"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="text-sm font-semibold text-gray-200">New Spec</h2>
+        <h2 className="text-sm font-semibold text-gray-200">新建规范</h2>
         <input
           autoFocus
           type="text"
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && handleCreate()}
-          placeholder="Feature title..."
+          placeholder="功能标题…"
           className="w-full bg-surface-3 border border-border rounded px-3 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50"
         />
         <div className="flex justify-end gap-2">
@@ -695,14 +703,14 @@ function NewSpecModal({ cwd, onCreated, onCancel }: {
             onClick={onCancel}
             className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
           >
-            Cancel
+            取消
           </button>
           <button
             onClick={handleCreate}
             disabled={busy || !title.trim()}
             className="px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
           >
-            {busy ? "Creating..." : "Create"}
+            {busy ? "创建中…" : "创建"}
           </button>
         </div>
       </div>
@@ -740,7 +748,7 @@ function ImportFromIssueModal({ cwd, onImported, onCancel }: ImportFromIssueModa
     if (!remoteId || !repo.trim() || !issueNumber.trim()) return;
     const num = parseInt(issueNumber, 10);
     if (isNaN(num) || num <= 0) {
-      setError("Issue number must be a positive integer.");
+      setError("问题编号必须是正整数。");
       return;
     }
     setBusy(true);
@@ -759,11 +767,11 @@ function ImportFromIssueModal({ cwd, onImported, onCancel }: ImportFromIssueModa
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
         <div className="w-80 rounded-xl border border-border bg-surface-2 shadow-2xl p-5 space-y-4">
-          <h2 className="text-sm font-semibold text-gray-200">Import from Issue</h2>
-          <p className="text-xs text-gray-500">No remotes configured. Add a GitHub or GitLab remote in Settings first.</p>
+          <h2 className="text-sm font-semibold text-gray-200">从问题导入</h2>
+          <p className="text-xs text-gray-500">未配置远程仓库。请先在设置中添加 GitHub 或 GitLab 远程仓库。</p>
           <div className="flex justify-end">
             <button onClick={onCancel} className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors">
-              Close
+              关闭
             </button>
           </div>
         </div>
@@ -774,11 +782,11 @@ function ImportFromIssueModal({ cwd, onImported, onCancel }: ImportFromIssueModa
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div className="w-96 rounded-xl border border-border bg-surface-2 shadow-2xl p-5 space-y-4" onClick={(e) => e.stopPropagation()}>
-        <h2 className="text-sm font-semibold text-gray-200">Import from Issue</h2>
+        <h2 className="text-sm font-semibold text-gray-200">从问题导入</h2>
 
         <div className="space-y-3">
           <div>
-            <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">Remote</label>
+            <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">远程仓库</label>
             <select
               value={remoteId}
               onChange={(e) => {
@@ -794,7 +802,7 @@ function ImportFromIssueModal({ cwd, onImported, onCancel }: ImportFromIssueModa
             </select>
           </div>
           <div>
-            <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">Repository</label>
+            <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">仓库</label>
             <input
               type="text"
               value={repo}
@@ -804,7 +812,7 @@ function ImportFromIssueModal({ cwd, onImported, onCancel }: ImportFromIssueModa
             />
           </div>
           <div>
-            <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">Issue Number</label>
+            <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">问题编号</label>
             <input
               autoFocus
               type="number"
@@ -824,14 +832,14 @@ function ImportFromIssueModal({ cwd, onImported, onCancel }: ImportFromIssueModa
             onClick={onCancel}
             className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
           >
-            Cancel
+            取消
           </button>
           <button
             onClick={handleImport}
             disabled={busy || !repo.trim() || !issueNumber.trim()}
             className="px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
           >
-            {busy ? "Importing..." : "Import"}
+            {busy ? "导入中…" : "导入"}
           </button>
         </div>
       </div>
@@ -938,18 +946,18 @@ export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
           <button
             onClick={onBack}
             className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-            title="Back to Chat"
+            title="返回"
           >
             <ChevronLeft size={14} />
           </button>
           <span className="flex-1 text-xs font-semibold text-gray-400 uppercase tracking-wider">
-            Specs
+            规范
           </span>
           <button
             onClick={() => setImportIssueOpen(true)}
             disabled={noCwd}
             className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 disabled:opacity-40 transition-colors"
-            title="Import from Issue"
+            title="从问题导入"
           >
             <Download size={14} />
           </button>
@@ -957,7 +965,7 @@ export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
             onClick={() => setNewSpecOpen(true)}
             disabled={noCwd}
             className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 disabled:opacity-40 transition-colors"
-            title="New spec"
+            title="新建规范"
           >
             <Plus size={14} />
           </button>
@@ -969,7 +977,7 @@ export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
             type="text"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            placeholder="Filter specs..."
+            placeholder="筛选规范…"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-300 placeholder-gray-600 outline-none focus:border-accent/50"
           />
         </div>
@@ -977,13 +985,13 @@ export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
         {/* Spec list */}
         <ul className="flex-1 overflow-y-auto py-1">
           {noCwd && (
-            <li className="px-3 py-2 text-xs text-gray-700">Open a project first</li>
+            <li className="px-3 py-2 text-xs text-gray-700">请先打开一个项目</li>
           )}
           {!noCwd && loading && (
-            <li className="px-3 py-2 text-xs text-gray-700">Loading...</li>
+            <li className="px-3 py-2 text-xs text-gray-700">加载中…</li>
           )}
           {!noCwd && !loading && filteredSpecs.length === 0 && (
-            <li className="px-3 py-2 text-xs text-gray-700">No specs yet</li>
+            <li className="px-3 py-2 text-xs text-gray-700">暂无规范</li>
           )}
           {filteredSpecs.map((s) => (
             <li key={s.file_path}>
@@ -1005,7 +1013,7 @@ export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
                   <span
                     className="opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded hover:bg-surface-4 text-gray-600 hover:text-red-400"
                     role="button"
-                    title="Delete"
+                    title="删除"
                     onClick={(e) => {
                       e.stopPropagation();
                       deleteSpec(s.file_path);
@@ -1034,8 +1042,8 @@ export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
         {!activeSpec ? (
           <div className="flex-1 flex items-center justify-center text-sm text-gray-700">
             {noCwd
-              ? "Open a project session to manage specs."
-              : "Select a spec or create a new one."}
+              ? "打开一个项目会话以管理规范。"
+              : "选择一个规范或创建新规范。"}
           </div>
         ) : (
           <>
@@ -1053,7 +1061,7 @@ export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
                     }`}
                   >
                     {t === "evidence" && <Archive size={11} />}
-                    {t}
+                    {t === "edit" ? "编辑" : t === "preview" ? "预览" : "证据"}
                   </button>
                 ))}
               </div>
@@ -1067,7 +1075,7 @@ export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
                     ? "text-accent bg-surface-3"
                     : "text-gray-500 hover:text-gray-300 hover:bg-surface-3"
                 }`}
-                title="AI Co-drafting"
+                title="AI 协作起草"
               >
                 <Sparkles size={12} />
                 <span>AI</span>

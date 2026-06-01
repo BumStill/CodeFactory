@@ -118,19 +118,19 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
     <div className="fixed right-0 top-0 bottom-0 z-40 w-[640px] max-w-[80vw] bg-surface-1 border-l border-border shadow-2xl flex flex-col">
       {/* Header */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0">
-        <span className="text-xs font-semibold text-gray-200 flex-1">Tasks</span>
+        <span className="text-xs font-semibold text-gray-200 flex-1">任务</span>
         <button
           onClick={() => loadTasks(sessionId)}
           disabled={isLoading}
           className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors disabled:opacity-40"
-          title="Refresh"
+          title="刷新"
         >
           <RefreshCw size={12} className={isLoading ? "animate-spin" : ""} />
         </button>
         <button
           onClick={onClose}
           className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors"
-          title="Close"
+          title="关闭"
         >
           <X size={14} />
         </button>
@@ -142,15 +142,15 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
           onClick={handleAddDemo}
           disabled={creatingDemo}
           className="flex items-center gap-1 px-2 py-1 text-[11px] rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 transition-colors"
-          title="Insert a demo 5-task tree for testing"
+          title="插入一个用于测试的 5 任务示例树"
         >
           <Plus size={11} />
-          Add demo task tree
+          添加示例任务树
         </button>
         <span className="flex-1" />
         {total > 0 && (
           <span className="text-[11px] text-gray-500">
-            {settled}/{total} done{failed > 0 ? `  · ${failed} failed` : ""}
+            {settled}/{total} 已完成{failed > 0 ? `  · ${failed} 失败` : ""}
           </span>
         )}
         {hasActive && !isRunning && (
@@ -159,7 +159,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
             className="flex items-center gap-1 px-2 py-1 text-[11px] rounded bg-accent hover:bg-accent-hover text-white transition-colors"
           >
             <Play size={11} />
-            Start
+            开始
           </button>
         )}
         {isRunning && (
@@ -168,7 +168,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
             className="flex items-center gap-1 px-2 py-1 text-[11px] rounded bg-red-700/70 hover:bg-red-700 text-white transition-colors"
           >
             <Square size={11} />
-            Cancel
+            取消
           </button>
         )}
       </div>
@@ -193,7 +193,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
       <div className="flex-1 overflow-y-auto">
         {sessionTasks.length === 0 && !isLoading && (
           <div className="px-4 py-8 text-center text-[11px] text-gray-700">
-            No tasks yet. Click "Add demo task tree" to insert a 5-task example.
+            暂无任务。点击“添加示例任务树”可插入一个 5 任务示例。
           </div>
         )}
 
@@ -204,7 +204,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
             return (
               <div key={group}>
                 <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 bg-surface-2 sticky top-0 z-10">
-                  {group} ({items.length})
+                  {STATUS_LABELS[group]} ({items.length})
                 </div>
                 {items.map((t) => {
                   // Merge local verification cache so the UI reflects just-run results.
@@ -231,6 +231,14 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
     </div>
   );
 }
+
+const STATUS_LABELS: Record<TaskStatus, string> = {
+  running: "进行中",
+  pending: "等待中",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
 
 function groupTasks(tasks: TaskRun[]): Record<TaskStatus, TaskRun[]> {
   const out: Record<TaskStatus, TaskRun[]> = {
@@ -306,16 +314,16 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun }: Row
           <div className="flex items-center gap-1.5">
             <span className="text-[12px] text-gray-200 truncate">{task.title}</span>
             {verifBadge === "pass" && (
-              <span title="All verification checks passed"><CheckCircle2 size={11} className="text-green-400 shrink-0" /></span>
+              <span title="全部验证检查通过"><CheckCircle2 size={11} className="text-green-400 shrink-0" /></span>
             )}
             {verifBadge === "fail" && (
-              <span title="One or more verification checks failed"><XCircle size={11} className="text-red-400 shrink-0" /></span>
+              <span title="有验证检查未通过"><XCircle size={11} className="text-red-400 shrink-0" /></span>
             )}
           </div>
           <div className="flex items-center gap-2 text-[10px] text-gray-600">
             {dur && <span>{dur}</span>}
             {task.attempt_count > 1 && (
-              <span className="text-yellow-500">attempt #{task.attempt_count}</span>
+              <span className="text-yellow-500">第 {task.attempt_count} 次尝试</span>
             )}
             {task.status === "failed" && task.error && (
               <span className="text-red-400 truncate">{task.error}</span>
@@ -327,22 +335,22 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun }: Row
       {expanded && (
         <div className="px-3 pb-2 pt-1 bg-surface-1/50 text-[11px] space-y-2">
           <div>
-            <span className="text-gray-600">Description: </span>
+            <span className="text-gray-600">描述：</span>
             <span className="text-gray-300 whitespace-pre-wrap">{task.description}</span>
           </div>
           <div>
-            <span className="text-gray-600">cwd: </span>
+            <span className="text-gray-600">工作目录：</span>
             <code className="text-gray-400">{task.cwd}</code>
           </div>
           {task.sub_session_id && (
             <div>
-              <span className="text-gray-600">Sub-session: </span>
+              <span className="text-gray-600">子会话：</span>
               <code className="text-gray-500 truncate">{task.sub_session_id}</code>
             </div>
           )}
           {task.error && (
             <div className="text-red-400">
-              <span className="text-gray-600">Error: </span>
+              <span className="text-gray-600">错误：</span>
               <span className="whitespace-pre-wrap">{task.error}</span>
             </div>
           )}
@@ -350,7 +358,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun }: Row
             <div className="space-y-1">
               {result.summary && (
                 <div>
-                  <span className="text-gray-600">Summary:</span>
+                  <span className="text-gray-600">摘要：</span>
                   <div className="mt-1 p-2 rounded bg-surface-2 text-gray-300 whitespace-pre-wrap font-mono text-[10px] max-h-48 overflow-y-auto">
                     {result.summary}
                   </div>
@@ -358,7 +366,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun }: Row
               )}
               {result.files_changed && result.files_changed.length > 0 && (
                 <div>
-                  <span className="text-gray-600">Files changed:</span>
+                  <span className="text-gray-600">改动的文件：</span>
                   <ul className="mt-1 ml-3 list-disc text-gray-400">
                     {result.files_changed.map((f) => (
                       <li key={f}>
@@ -370,7 +378,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun }: Row
               )}
               {typeof result.tool_calls_count === "number" && (
                 <div className="text-gray-600">
-                  Tool calls: <span className="text-gray-400">{result.tool_calls_count}</span>
+                  工具调用：<span className="text-gray-400">{result.tool_calls_count}</span>
                 </div>
               )}
             </div>
@@ -381,19 +389,19 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun }: Row
             <div className="flex items-center gap-2 mb-1">
               <span className="text-gray-600 flex items-center gap-1">
                 <ShieldCheck size={11} />
-                Verification
+                验证
               </span>
               <button
                 onClick={handleRunVerif}
                 disabled={runningVerif}
                 className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded bg-surface-3 hover:bg-surface-4 text-gray-400 hover:text-gray-200 disabled:opacity-40 transition-colors"
-                title="Run verification checks now"
+                title="立即运行验证检查"
               >
                 {runningVerif
                   ? <Loader2 size={10} className="animate-spin" />
                   : <RefreshCw size={10} />
                 }
-                Run
+                运行
               </button>
             </div>
 
@@ -425,7 +433,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun }: Row
                 ))}
               </div>
             ) : (
-              <span className="text-gray-700 text-[10px]">Not run yet</span>
+              <span className="text-gray-700 text-[10px]">尚未运行</span>
             )}
           </div>
         </div>
@@ -497,37 +505,37 @@ function buildDemoTaskTree(cwd: string): { tasks: TaskInput[]; deps: TaskDep[] }
   const tasks: TaskInput[] = [
     {
       tmp_id: "T1",
-      title: "Read project structure",
+      title: "读取项目结构",
       description:
-        "Use the `glob` tool to list the top-level files in this repository. Briefly describe what kind of project it appears to be.",
+        "使用 `glob` 工具列出本仓库的顶层文件。简要描述这看起来是什么类型的项目。",
       cwd,
     },
     {
       tmp_id: "T2",
-      title: "Identify main entry points",
+      title: "识别主要入口点",
       description:
-        "Find the main entry point(s) for this project (e.g. main.rs, index.ts, App.tsx, lib.rs). Use `glob` and `read_file`. Report the paths and a one-line summary of each.",
+        "找出本项目的主要入口点（例如 main.rs、index.ts、App.tsx、lib.rs）。使用 `glob` 和 `read_file`。报告各自的路径并附一行简介。",
       cwd,
     },
     {
       tmp_id: "T3",
-      title: "Count lines of Rust code",
+      title: "统计 Rust 代码行数",
       description:
-        "Use `glob` to find all `**/*.rs` files (excluding `target/`), then read a few of them and estimate the total lines of Rust code in the project. Report your estimate and method.",
+        "使用 `glob` 找出所有 `**/*.rs` 文件（排除 `target/`），然后读取其中几个并估算项目中 Rust 代码的总行数。报告你的估算结果和方法。",
       cwd,
     },
     {
       tmp_id: "T4",
-      title: "List all TypeScript components",
+      title: "列出所有 TypeScript 组件",
       description:
-        "Use `glob` to find all `**/components/**/*.tsx` files. Report the file list and a one-line description of what each component appears to do (based on its filename).",
+        "使用 `glob` 找出所有 `**/components/**/*.tsx` 文件。报告文件列表，并根据文件名为每个组件附一行说明其用途。",
       cwd,
     },
     {
       tmp_id: "T5",
-      title: "Summarize findings",
+      title: "汇总发现",
       description:
-        "Based on a quick re-read of the project's top-level files (e.g. README, package.json, Cargo.toml), produce a short summary of the project: name, primary languages, purpose, and notable subsystems.",
+        "在快速重读项目顶层文件（例如 README、package.json、Cargo.toml）的基础上，生成一份简短的项目摘要：名称、主要语言、用途及值得关注的子系统。",
       cwd,
     },
   ];
