@@ -24,6 +24,10 @@ export interface UIMessage {
   inputTokens?: number;
   outputTokens?: number;
   createdAt: number;
+  /** Wall-clock the turn took, frozen when the stream reached a terminal
+   *  state (done/error). Absent while still streaming (the UI ticks live off
+   *  `createdAt` instead) and for plain user messages. */
+  durationMs?: number;
 }
 
 export interface ContextUsage {
@@ -119,24 +123,37 @@ export function reduceChatStreamEvent(
       };
     }
 
-    case "done":
+    case "done": {
+      const endedAt = Date.now();
       return {
         ...state,
         streaming: false,
         inputTokenTotal: state.inputTokenTotal + event.input_tokens,
         outputTokenTotal: state.outputTokenTotal + event.output_tokens,
+        messages: state.messages.map((m) =>
+          m.id === msgId && m.durationMs == null
+            ? { ...m, durationMs: Math.max(0, endedAt - m.createdAt) }
+            : m,
+        ),
       };
+    }
 
-    case "error":
+    case "error": {
+      const endedAt = Date.now();
       return {
         ...state,
         streaming: false,
         messages: state.messages.map((m) =>
           m.id === msgId
-            ? { ...m, content: m.content + `\n\nError: ${event.message}` }
+            ? {
+                ...m,
+                content: m.content + `\n\nError: ${event.message}`,
+                durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
+              }
             : m,
         ),
       };
+    }
 
     case "context_usage":
       return {

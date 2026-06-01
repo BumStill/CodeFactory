@@ -8,6 +8,7 @@ import { ToolCallCard } from "./ToolCallCard";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import { RememberButton } from "./RememberButton";
+import { formatDuration, useNowTick } from "../lib/duration";
 import type { UIMessage } from "../stores/chat";
 
 interface Props {
@@ -222,6 +223,10 @@ export function MessageList({ messages, streaming, cwd, onUsePrompt }: Props) {
 
 function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreamingTail: boolean; cwd: string | null }) {
   const isUser = msg.role === "user";
+  // Must run unconditionally (before the early return) to satisfy the rules
+  // of hooks. Only the live streaming tail arms the 1s ticker; for every
+  // other row `active` is false, so this is inert.
+  const nowMs = useNowTick(isStreamingTail);
 
   if (isUser) {
     return (
@@ -238,6 +243,14 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
   // message isn't worth saving as a fact.
   const showRemember = !!cwd && !isStreamingTail && !!msg.content;
 
+  // Per-turn duration: ticks live (off `createdAt`) while this is the
+  // streaming tail, then shows the frozen total once the turn settled.
+  const durationLabel = isStreamingTail
+    ? formatDuration(Math.max(0, nowMs - msg.createdAt))
+    : msg.durationMs != null
+      ? formatDuration(msg.durationMs)
+      : null;
+
   return (
     <div className="group text-sm text-gray-200 space-y-1.5">
       {msg.toolCalls?.map((tc) => (
@@ -252,6 +265,11 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
       {showThinkingHint && (
         <div className="text-xs text-gray-500 inline-flex items-center">
           Thinking <TypingDots />
+        </div>
+      )}
+      {durationLabel && (
+        <div className="text-[10px] text-gray-600 tabular-nums select-none">
+          {isStreamingTail ? `运行中 · ${durationLabel}` : `用时 ${durationLabel}`}
         </div>
       )}
       {showRemember && (
