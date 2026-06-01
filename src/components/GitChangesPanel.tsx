@@ -116,18 +116,18 @@ export function GitChangesPanel({ onClose }: Props) {
       {/* Header */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0">
         <FileText size={14} className="text-gray-400" />
-        <span className="text-xs font-semibold text-gray-200 flex-1">Changes</span>
+        <span className="text-xs font-semibold text-gray-200 flex-1">变更</span>
         <button
           onClick={() => refreshStatus()}
           className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors"
-          title="Refresh"
+          title="刷新"
         >
           <RefreshCw size={12} />
         </button>
         <button
           onClick={onClose}
           className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors"
-          title="Close"
+          title="关闭"
         >
           <X size={14} />
         </button>
@@ -140,14 +140,14 @@ export function GitChangesPanel({ onClose }: Props) {
           disabled={rows.length === 0}
           className="px-2 py-1 text-[11px] rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
         >
-          Stage all
+          暂存全部
         </button>
         <button
           onClick={handleStageSelected}
           disabled={selected.size === 0}
           className="px-2 py-1 text-[11px] rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
         >
-          Stage selected ({selected.size})
+          暂存选中 ({selected.size})
         </button>
         <span className="flex-1" />
         <button
@@ -156,7 +156,7 @@ export function GitChangesPanel({ onClose }: Props) {
           className="flex items-center gap-1 px-2 py-1 text-[11px] rounded bg-accent hover:bg-accent-hover text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
         >
           <GitCommitIcon size={11} />
-          Commit ({stagedCount})
+          提交 ({stagedCount})
         </button>
       </div>
 
@@ -172,11 +172,11 @@ export function GitChangesPanel({ onClose }: Props) {
         <div className="w-[260px] border-r border-border overflow-y-auto shrink-0">
           {rows.length === 0 && (
             <div className="px-3 py-4 text-[11px] text-gray-700 text-center">
-              No changes
+              无变更
             </div>
           )}
           <FileGroup
-            label="Staged"
+            label="已暂存"
             files={status?.staged ?? []}
             group="staged"
             selected={selected}
@@ -185,7 +185,7 @@ export function GitChangesPanel({ onClose }: Props) {
             onSelect={(path, staged) => setActiveFile({ path, staged })}
           />
           <FileGroup
-            label="Unstaged"
+            label="未暂存"
             files={status?.unstaged ?? []}
             group="unstaged"
             selected={selected}
@@ -196,7 +196,7 @@ export function GitChangesPanel({ onClose }: Props) {
           {status && status.untracked.length > 0 && (
             <div>
               <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 bg-surface-2 sticky top-0">
-                Untracked ({status.untracked.length})
+                未跟踪 ({status.untracked.length})
               </div>
               {status.untracked.map((p) => (
                 <FileRow
@@ -218,21 +218,21 @@ export function GitChangesPanel({ onClose }: Props) {
         <div className="flex-1 overflow-y-auto p-2 min-w-0">
           {!activeFile && (
             <div className="text-[11px] text-gray-700 text-center pt-8">
-              Select a file to view diff
+              选择文件以查看差异
             </div>
           )}
           {activeFile && diffLoading && (
-            <div className="text-[11px] text-gray-600 text-center pt-8">Loading…</div>
+            <div className="text-[11px] text-gray-600 text-center pt-8">加载中…</div>
           )}
           {activeFile && !diffLoading && (
             <>
               <div className="text-[11px] text-gray-500 mb-2 truncate">
                 {activeFile.path}{" "}
-                <span className="text-gray-700">({activeFile.staged ? "staged" : "unstaged"})</span>
+                <span className="text-gray-700">({activeFile.staged ? "已暂存" : "未暂存"})</span>
               </div>
               {diff.trim().length === 0 ? (
                 <div className="text-[11px] text-gray-700">
-                  No diff available (file may be binary or fully added).
+                  无可用差异（文件可能为二进制或完全新增）。
                 </div>
               ) : (
                 <DiffViewer output={diff} />
@@ -253,12 +253,12 @@ export function GitChangesPanel({ onClose }: Props) {
             onClick={(e) => e.stopPropagation()}
           >
             <h2 className="text-sm font-semibold text-gray-200 flex items-center gap-2">
-              <GitCommitIcon size={14} /> Commit {stagedCount} file{stagedCount === 1 ? "" : "s"}
+              <GitCommitIcon size={14} /> 提交 {stagedCount} 个文件
             </h2>
             <textarea
               value={commitMsg}
               onChange={(e) => setCommitMsg(e.target.value)}
-              placeholder="Commit message…"
+              placeholder="提交信息…"
               rows={5}
               className="w-full bg-surface-3 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50 resize-none font-mono"
               autoFocus
@@ -270,7 +270,7 @@ export function GitChangesPanel({ onClose }: Props) {
                 onClick={() => setShowCommitModal(false)}
                 className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors disabled:opacity-40"
               >
-                Cancel
+                取消
               </button>
               <button
                 disabled={committing || !commitMsg.trim()}
@@ -278,7 +278,7 @@ export function GitChangesPanel({ onClose }: Props) {
                 className="flex items-center gap-1 px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <Check size={12} />
-                {committing ? "Committing…" : "Commit"}
+                {committing ? "提交中…" : "提交"}
               </button>
             </div>
           </div>
@@ -348,7 +348,7 @@ function FileRow({ path, status, group, selected, active, onToggle, onClick }: R
           onChange={onToggle}
           onClick={(e) => e.stopPropagation()}
           className="shrink-0"
-          title="Select for staging"
+          title="选择暂存"
         />
       )}
       {group === "staged" && <Plus size={10} className="text-green-400 shrink-0" />}

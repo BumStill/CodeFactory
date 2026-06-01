@@ -28,7 +28,7 @@ async function openUrl(url: string) {
 // ── Markdown renderer (minimal, inline only) ──────────────────────────────────
 
 function renderBody(text: string): string {
-  if (!text) return "<em class='text-gray-600'>No description</em>";
+  if (!text) return "<em class='text-gray-600'>无描述</em>";
   // Basic inline transforms
   let out = text
     .replace(/&/g, "&amp;")
@@ -60,10 +60,10 @@ function IssueDetail({ issue, remoteId, repo, cwd, onBack }: IssueDetailProps) {
     setBusy(true);
     try {
       const path = await issueToSpec(remoteId, repo, issue.number, cwd);
-      setToast(`Spec created: ${path.split(/[\\/]/).pop()}`);
+      setToast(`规范已创建：${path.split(/[\\/]/).pop()}`);
       setTimeout(() => setToast(null), 4000);
     } catch (e) {
-      setToast(`Error: ${String(e)}`);
+      setToast(`错误：${String(e)}`);
       setTimeout(() => setToast(null), 5000);
     } finally {
       setBusy(false);
@@ -85,7 +85,7 @@ function IssueDetail({ issue, remoteId, repo, cwd, onBack }: IssueDetailProps) {
         <button
           onClick={() => openUrl(issue.url)}
           className="p-1 rounded text-gray-600 hover:text-gray-300 transition-colors"
-          title="Open in browser"
+          title="在浏览器中打开"
         >
           <ExternalLink size={12} />
         </button>
@@ -116,7 +116,7 @@ function IssueDetail({ issue, remoteId, repo, cwd, onBack }: IssueDetailProps) {
         </div>
 
         <div className="text-[10px] text-gray-600">
-          by <span className="text-gray-400">{issue.author}</span> ·{" "}
+          作者 <span className="text-gray-400">{issue.author}</span> ·{" "}
           {new Date(issue.created_at).toLocaleDateString()}
         </div>
 
@@ -138,7 +138,7 @@ function IssueDetail({ issue, remoteId, repo, cwd, onBack }: IssueDetailProps) {
           disabled={busy}
           className="flex-1 px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
         >
-          {busy ? "Creating..." : "Create as Spec"}
+          {busy ? "创建中…" : "创建为规范"}
         </button>
       </div>
     </div>
@@ -181,27 +181,27 @@ function NewIssueForm({ remoteId, repo, onCreated, onCancel }: NewIssueFormProps
         <button onClick={onCancel} className="p-1 rounded text-gray-600 hover:text-gray-300">
           <ChevronLeft size={14} />
         </button>
-        <span className="text-xs font-semibold text-gray-300">New Issue</span>
+        <span className="text-xs font-semibold text-gray-300">新建问题</span>
       </div>
 
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
         <div>
-          <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">Title</label>
+          <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">标题</label>
           <input
             autoFocus
             type="text"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            placeholder="Issue title..."
+            placeholder="问题标题…"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50"
           />
         </div>
         <div>
-          <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">Body</label>
+          <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">描述</label>
           <textarea
             value={body}
             onChange={(e) => setBody(e.target.value)}
-            placeholder="Describe the issue..."
+            placeholder="描述问题…"
             rows={8}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50 resize-none"
           />
@@ -214,14 +214,14 @@ function NewIssueForm({ remoteId, repo, onCreated, onCancel }: NewIssueFormProps
           onClick={onCancel}
           className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
         >
-          Cancel
+          取消
         </button>
         <button
           onClick={handleSubmit}
           disabled={busy || !title.trim()}
           className="flex-1 px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
         >
-          {busy ? "Creating..." : "Create Issue"}
+          {busy ? "创建中…" : "创建问题"}
         </button>
       </div>
     </div>
@@ -269,24 +269,24 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
         <button onClick={onCancel} className="p-1 rounded text-gray-600 hover:text-gray-300">
           <ChevronLeft size={14} />
         </button>
-        <span className="text-xs font-semibold text-gray-300">Create PR</span>
+        <span className="text-xs font-semibold text-gray-300">创建拉取请求</span>
       </div>
 
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
         <div>
-          <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">Title</label>
+          <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">标题</label>
           <input
             autoFocus
             type="text"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            placeholder="PR title..."
+            placeholder="拉取请求标题…"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50"
           />
         </div>
         <div className="flex gap-2">
           <div className="flex-1">
-            <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">Head branch</label>
+            <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">源分支</label>
             <input
               type="text"
               value={head}
@@ -295,7 +295,7 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
             />
           </div>
           <div className="flex-1">
-            <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">Base branch</label>
+            <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">目标分支</label>
             <input
               type="text"
               value={base}
@@ -305,11 +305,11 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
           </div>
         </div>
         <div>
-          <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">Body</label>
+          <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">描述</label>
           <textarea
             value={body}
             onChange={(e) => setBody(e.target.value)}
-            placeholder="Describe the changes..."
+            placeholder="描述变更…"
             rows={6}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50 resize-none"
           />
@@ -321,7 +321,7 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
             onChange={(e) => setDraft(e.target.checked)}
             className="accent-accent"
           />
-          Draft PR
+          草稿拉取请求
         </label>
         {error && <p className="text-xs text-red-400">{error}</p>}
       </div>
@@ -331,14 +331,14 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
           onClick={onCancel}
           className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
         >
-          Cancel
+          取消
         </button>
         <button
           onClick={handleSubmit}
           disabled={busy || !title.trim()}
           className="flex-1 px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
         >
-          {busy ? "Creating..." : "Create PR"}
+          {busy ? "创建中…" : "创建拉取请求"}
         </button>
       </div>
     </div>
@@ -432,9 +432,9 @@ function IssuesTab({ remotes, cwd }: IssuesTabProps) {
             onChange={(e) => setStateFilter(e.target.value)}
             className="bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-300 outline-none focus:border-accent/50"
           >
-            <option value="open">Open</option>
-            <option value="closed">Closed</option>
-            <option value="all">All</option>
+            <option value="open">开放</option>
+            <option value="closed">已关闭</option>
+            <option value="all">全部</option>
           </select>
         </div>
         <div className="flex gap-2">
@@ -449,7 +449,7 @@ function IssuesTab({ remotes, cwd }: IssuesTabProps) {
             onClick={handleLoad}
             disabled={!repo || loading}
             className="p-1.5 rounded bg-surface-3 text-gray-400 hover:text-gray-200 disabled:opacity-50 transition-colors"
-            title="Refresh"
+            title="刷新"
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -457,7 +457,7 @@ function IssuesTab({ remotes, cwd }: IssuesTabProps) {
             onClick={() => setNewIssueOpen(true)}
             disabled={!repo}
             className="p-1.5 rounded bg-surface-3 text-gray-400 hover:text-gray-200 disabled:opacity-50 transition-colors"
-            title="New Issue"
+            title="新建问题"
           >
             <Plus size={12} />
           </button>
@@ -471,7 +471,7 @@ function IssuesTab({ remotes, cwd }: IssuesTabProps) {
         )}
         {!loading && issues.length === 0 && (
           <div className="px-3 py-3 text-xs text-gray-600">
-            {repo ? "No issues found." : "Enter a repo to load issues."}
+            {repo ? "未找到问题。" : "输入仓库以加载问题。"}
           </div>
         )}
         {issues.map((issue) => (
@@ -582,9 +582,9 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
             onChange={(e) => setStateFilter(e.target.value)}
             className="bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-300 outline-none focus:border-accent/50"
           >
-            <option value="open">Open</option>
-            <option value="closed">Closed</option>
-            <option value="all">All</option>
+            <option value="open">开放</option>
+            <option value="closed">已关闭</option>
+            <option value="all">全部</option>
           </select>
         </div>
         <div className="flex gap-2">
@@ -599,7 +599,7 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
             onClick={handleLoad}
             disabled={!repo || loading}
             className="p-1.5 rounded bg-surface-3 text-gray-400 hover:text-gray-200 disabled:opacity-50 transition-colors"
-            title="Refresh"
+            title="刷新"
           >
             <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           </button>
@@ -607,7 +607,7 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
             onClick={() => setNewPROpen(true)}
             disabled={!repo}
             className="p-1.5 rounded bg-surface-3 text-gray-400 hover:text-gray-200 disabled:opacity-50 transition-colors"
-            title="Create PR"
+            title="创建拉取请求"
           >
             <Plus size={12} />
           </button>
@@ -621,7 +621,7 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
         )}
         {!loading && prs.length === 0 && (
           <div className="px-3 py-3 text-xs text-gray-600">
-            {repo ? "No pull requests found." : "Enter a repo to load PRs."}
+            {repo ? "未找到拉取请求。" : "输入仓库以加载拉取请求。"}
           </div>
         )}
         {prs.map((pr) => (
@@ -637,7 +637,7 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
                   <span className="text-[10px] text-gray-600 font-mono shrink-0">#{pr.number}</span>
                   <span className="text-xs text-gray-300 truncate">{pr.title}</span>
                   {pr.draft && (
-                    <span className="text-[9px] px-1 rounded bg-surface-3 text-gray-500 shrink-0">draft</span>
+                    <span className="text-[9px] px-1 rounded bg-surface-3 text-gray-500 shrink-0">草稿</span>
                   )}
                 </div>
                 <div className="text-[9px] text-gray-700 mt-0.5 font-mono">
@@ -682,7 +682,7 @@ export function RemoteGitPanel({ cwd, currentBranch, onClose }: RemoteGitPanelPr
       {/* Header */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0 bg-surface-2">
         <GitPullRequest size={14} className="text-accent" />
-        <span className="flex-1 text-xs font-semibold text-gray-300">Remote Git</span>
+        <span className="flex-1 text-xs font-semibold text-gray-300">远程仓库</span>
         <button
           onClick={onClose}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
@@ -704,7 +704,7 @@ export function RemoteGitPanel({ cwd, currentBranch, onClose }: RemoteGitPanelPr
             }`}
           >
             {t === "issues" ? <CircleDot size={11} /> : <GitPullRequest size={11} />}
-            {t === "prs" ? "Pull Requests" : "Issues"}
+            {t === "prs" ? "拉取请求" : "问题"}
           </button>
         ))}
       </div>
@@ -713,8 +713,8 @@ export function RemoteGitPanel({ cwd, currentBranch, onClose }: RemoteGitPanelPr
       {remotes.length === 0 ? (
         <div className="flex-1 flex items-center justify-center flex-col gap-2 p-6 text-center">
           <GitPullRequest size={32} className="text-gray-700" />
-          <p className="text-xs text-gray-600">No remotes configured.</p>
-          <p className="text-[10px] text-gray-700">Add a GitHub or GitLab remote in Settings.</p>
+          <p className="text-xs text-gray-600">未配置远程仓库。</p>
+          <p className="text-[10px] text-gray-700">在设置中添加 GitHub 或 GitLab 远程仓库。</p>
         </div>
       ) : (
         <div className="flex-1 min-h-0">

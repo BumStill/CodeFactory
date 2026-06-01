@@ -50,7 +50,7 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
     return (
       <div className="flex items-center gap-2 px-3 py-1 border-t border-border bg-surface-1 text-xs text-gray-700 select-none shrink-0">
         <GitBranchIcon size={11} />
-        <span>Not a git repository</span>
+        <span>不是 git 仓库</span>
       </div>
     );
   }
@@ -85,7 +85,7 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
         <button
           onClick={handleOpenBranchPicker}
           className="flex items-center gap-1 hover:text-gray-300 transition-colors"
-          title="Switch branch"
+          title="切换分支"
         >
           <GitBranchIcon size={11} />
           <span className="truncate max-w-[180px]">{status?.branch ?? "…"}</span>
@@ -98,7 +98,7 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
               </div>
             )}
             {branches.length === 0 && (
-              <div className="px-2 py-1 text-[11px] text-gray-600">No branches</div>
+              <div className="px-2 py-1 text-[11px] text-gray-600">无分支</div>
             )}
             {branches.map((b) => (
               <button
@@ -111,8 +111,8 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
               >
                 <GitBranchIcon size={10} />
                 <span className="flex-1 truncate">{b.name}</span>
-                {b.is_current && <span className="text-[10px]">current</span>}
-                {b.is_remote && !b.is_current && <span className="text-[10px]">remote</span>}
+                {b.is_current && <span className="text-[10px]">当前</span>}
+                {b.is_remote && !b.is_current && <span className="text-[10px]">远程</span>}
               </button>
             ))}
           </div>
@@ -121,7 +121,7 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
 
       {/* Ahead/behind */}
       {status && (status.ahead > 0 || status.behind > 0) && (
-        <span className="flex items-center gap-1 text-gray-500" title="Ahead / behind upstream">
+        <span className="flex items-center gap-1 text-gray-500" title="领先 / 落后于上游">
           {status.ahead > 0 && (
             <span className="flex items-center gap-0.5">
               <ArrowUp size={10} />
@@ -148,7 +148,7 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
       <button
         onClick={onOpenChanges}
         className="flex items-center gap-1 hover:text-gray-300 transition-colors"
-        title="Show changes"
+        title="显示变更"
       >
         {dirty > 0 ? (
           <>
@@ -158,7 +158,7 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
         ) : (
           <>
             <Circle size={8} className="text-gray-700" />
-            <span className="text-gray-700">clean</span>
+            <span className="text-gray-700">干净</span>
           </>
         )}
       </button>
@@ -167,7 +167,7 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
       <button
         onClick={onOpenHistory}
         className="flex items-center gap-1 hover:text-gray-300 transition-colors"
-        title="Show commit history"
+        title="显示提交历史"
       >
         <History size={11} />
       </button>
@@ -177,10 +177,10 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
         <button
           onClick={onOpenRemote}
           className="flex items-center gap-1 hover:text-gray-300 transition-colors"
-          title="Remote Git (Issues & PRs)"
+          title="远程仓库（问题与拉取请求）"
         >
           <GitPullRequest size={11} />
-          <span className="text-[10px]">Remote</span>
+          <span className="text-[10px]">远程仓库</span>
         </button>
       )}
 
@@ -200,10 +200,10 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
 function formatRelative(ts: number): string {
   const diff = Math.max(0, Date.now() - ts);
   const sec = Math.floor(diff / 1000);
-  if (sec < 5) return "just now";
-  if (sec < 60) return `${sec}s ago`;
+  if (sec < 5) return "刚刚";
+  if (sec < 60) return `${sec} 秒前`;
   const min = Math.floor(sec / 60);
-  if (min < 60) return `${min}m ago`;
+  if (min < 60) return `${min} 分钟前`;
   const hr = Math.floor(min / 60);
-  return `${hr}h ago`;
+  return `${hr} 小时前`;
 }

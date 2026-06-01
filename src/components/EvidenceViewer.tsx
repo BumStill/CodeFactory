@@ -119,9 +119,14 @@ function StatusBadge({ status }: { status: "passed" | "failed" | "partial" }) {
     failed: "bg-red-800 text-red-200",
     partial: "bg-yellow-800 text-yellow-200",
   };
+  const labels = {
+    passed: "通过",
+    failed: "失败",
+    partial: "部分通过",
+  };
   return (
     <span className={`px-2 py-0.5 rounded text-[10px] font-semibold uppercase ${map[status]}`}>
-      {status}
+      {labels[status]}
     </span>
   );
 }
@@ -147,14 +152,14 @@ function formatTs(ts: string): string {
 }
 
 function sourceFileName(path: string | undefined): string {
-  if (!path) return "unknown source";
+  if (!path) return "未知来源";
   const normalized = path.replace(/\\/g, "/");
   return normalized.split("/").filter(Boolean).pop() ?? path;
 }
 
 function sourceLocator(source: KnowledgeRefSource): string | null {
-  if (source.slide != null) return `slide ${source.slide}`;
-  if (source.page != null) return `page ${source.page}`;
+  if (source.slide != null) return `第 ${source.slide} 张幻灯片`;
+  if (source.page != null) return `第 ${source.page} 页`;
   return null;
 }
 
@@ -240,7 +245,7 @@ function ToolCallsTab({ toolCalls }: { toolCalls: ToolCallEntry[] }) {
           onChange={(e) => setFilter(e.target.value)}
           className="bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-300 outline-none"
         >
-          <option value="">All tools ({toolCalls.length})</option>
+          <option value="">所有工具 ({toolCalls.length})</option>
           {tools.map((t) => (
             <option key={t} value={t}>
               {t} ({toolCalls.filter((c) => c.tool_name === t).length})
@@ -252,10 +257,10 @@ function ToolCallsTab({ toolCalls }: { toolCalls: ToolCallEntry[] }) {
         <table className="w-full text-xs">
           <thead className="sticky top-0 bg-surface-2">
             <tr className="text-left text-gray-500 border-b border-border">
-              <th className="px-3 py-2 font-medium">Time</th>
-              <th className="px-3 py-2 font-medium">Tool</th>
-              <th className="px-3 py-2 font-medium">Args</th>
-              <th className="px-3 py-2 font-medium">Result</th>
+              <th className="px-3 py-2 font-medium">时间</th>
+              <th className="px-3 py-2 font-medium">工具</th>
+              <th className="px-3 py-2 font-medium">参数</th>
+              <th className="px-3 py-2 font-medium">结果</th>
             </tr>
           </thead>
           <tbody>
@@ -278,7 +283,7 @@ function ToolCallsTab({ toolCalls }: { toolCalls: ToolCallEntry[] }) {
           </tbody>
         </table>
         {filtered.length === 0 && (
-          <div className="text-center text-gray-600 text-xs py-8">No tool calls recorded</div>
+          <div className="text-center text-gray-600 text-xs py-8">未记录工具调用</div>
         )}
       </div>
     </div>
@@ -291,7 +296,7 @@ function FilesChangedTab({ files }: { files: FileChangedEntry[] }) {
   if (files.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center text-gray-600 text-xs">
-        No files changed recorded
+        未记录文件变更
       </div>
     );
   }
@@ -314,7 +319,7 @@ function FilesChangedTab({ files }: { files: FileChangedEntry[] }) {
             </div>
           )}
           {expanded === i && !f.diff && (
-            <div className="px-3 py-2 text-xs text-gray-600 italic">No diff available</div>
+            <div className="px-3 py-2 text-xs text-gray-600 italic">无可用差异</div>
           )}
         </div>
       ))}
@@ -326,7 +331,7 @@ function VerificationTab({ items }: { items: VerificationEntry[] }) {
   if (items.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center text-gray-600 text-xs">
-        No verification results recorded
+        未记录验证结果
       </div>
     );
   }
@@ -341,7 +346,7 @@ function VerificationTab({ items }: { items: VerificationEntry[] }) {
               : <XCircle size={12} className="text-red-400 shrink-0" />}
             <span className="text-xs font-medium text-gray-200">{v.check}</span>
             {v.task_title && (
-              <span className="text-[10px] text-gray-500 ml-auto">task: {v.task_title}</span>
+              <span className="text-[10px] text-gray-500 ml-auto">任务：{v.task_title}</span>
             )}
             <span className="text-[10px] text-gray-600">{v.duration_ms}ms</span>
           </div>
@@ -360,7 +365,7 @@ function GitHistoryTab({ commits }: { commits: GitCommitEntry[] }) {
   if (commits.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center text-gray-600 text-xs">
-        No commits recorded during this session
+        本次会话期间未记录提交
       </div>
     );
   }
@@ -391,7 +396,7 @@ function AiCollabTab({ data }: { data: AiCollaboration | null }) {
   if (!data) {
     return (
       <div className="flex-1 flex items-center justify-center text-gray-600 text-xs">
-        No AI collaboration data available
+        无可用的 AI 协作数据
       </div>
     );
   }
@@ -400,19 +405,19 @@ function AiCollabTab({ data }: { data: AiCollaboration | null }) {
     <div className="flex-1 overflow-y-auto p-4 space-y-4">
       <div className="grid grid-cols-2 gap-3">
         <div className="bg-surface-2 rounded p-3">
-          <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1">Model</div>
+          <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1">模型</div>
           <div className="text-xs text-gray-200 font-mono">{data.model}</div>
         </div>
         <div className="bg-surface-2 rounded p-3">
-          <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1">Total Tokens</div>
+          <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-1">总 Token 数</div>
           <div className="text-xs text-gray-200 font-mono">{formatTokens(data.total_tokens)}</div>
         </div>
       </div>
 
       <div>
-        <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-2">Assumptions Made</div>
+        <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-2">所做假设</div>
         {data.assumptions.length === 0 ? (
-          <div className="text-xs text-gray-600 italic">None recorded</div>
+          <div className="text-xs text-gray-600 italic">无记录</div>
         ) : (
           <ul className="space-y-1">
             {data.assumptions.map((a, i) => (
@@ -426,9 +431,9 @@ function AiCollabTab({ data }: { data: AiCollaboration | null }) {
       </div>
 
       <div>
-        <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-2">Review Points</div>
+        <div className="text-[10px] text-gray-600 uppercase tracking-wider mb-2">审查要点</div>
         {data.review_points.length === 0 ? (
-          <div className="text-xs text-gray-600 italic">None recorded</div>
+          <div className="text-xs text-gray-600 italic">无记录</div>
         ) : (
           <ul className="space-y-1">
             {data.review_points.map((r, i) => (
@@ -448,7 +453,7 @@ function SourcesTab({ refs }: { refs: KnowledgeRefEntry[] }) {
   if (refs.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center text-gray-600 text-xs">
-        No knowledge sources recorded
+        未记录知识来源
       </div>
     );
   }
@@ -465,7 +470,7 @@ function SourcesTab({ refs }: { refs: KnowledgeRefEntry[] }) {
                 <span className="text-[10px] text-gray-600 shrink-0">{ref.latency_ms}ms</span>
               </div>
               <div className="mt-1 text-[10px] text-gray-600">
-                {ref.result_refs.length} result{ref.result_refs.length === 1 ? "" : "s"}
+{ref.result_refs.length} 条结果
               </div>
             </div>
           </div>
@@ -481,7 +486,7 @@ function SourcesTab({ refs }: { refs: KnowledgeRefEntry[] }) {
                 <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-gray-500 font-mono">
                   {sourceLocator(source) && <span>{sourceLocator(source)}</span>}
                   {source.chunk_id && <span>{source.chunk_id}</span>}
-                  {source.document_id && <span>doc {source.document_id}</span>}
+                  {source.document_id && <span>文档 {source.document_id}</span>}
                 </div>
                 {source.path && (
                   <div className="mt-1 text-[10px] text-gray-600 font-mono truncate" title={source.path}>
@@ -526,11 +531,11 @@ export function EvidenceViewer({ packPath, onClose }: EvidenceViewerProps) {
   };
 
   const tabs: { key: TabKey; label: string; icon: React.ReactNode }[] = [
-    { key: "summary", label: "Summary", icon: <FileText size={12} /> },
-    { key: "tool_calls", label: `Tool Calls${pack ? ` (${pack.tool_calls.length})` : ""}`, icon: <Terminal size={12} /> },
-    { key: "sources", label: `Sources${pack ? ` (${pack.knowledge_refs?.length ?? 0})` : ""}`, icon: <BookOpen size={12} /> },
-    { key: "files", label: `Files${pack ? ` (${pack.files_changed.length})` : ""}`, icon: <FileText size={12} /> },
-    { key: "verification", label: "Verification", icon: <CheckCircle size={12} /> },
+    { key: "summary", label: "摘要", icon: <FileText size={12} /> },
+    { key: "tool_calls", label: `工具调用${pack ? ` (${pack.tool_calls.length})` : ""}`, icon: <Terminal size={12} /> },
+    { key: "sources", label: `来源${pack ? ` (${pack.knowledge_refs?.length ?? 0})` : ""}`, icon: <BookOpen size={12} /> },
+    { key: "files", label: `文件${pack ? ` (${pack.files_changed.length})` : ""}`, icon: <FileText size={12} /> },
+    { key: "verification", label: "验证", icon: <CheckCircle size={12} /> },
     { key: "git", label: `Git${pack ? ` (${pack.git_commits.length})` : ""}`, icon: <GitCommit size={12} /> },
     { key: "ai", label: "AI", icon: <Bot size={12} /> },
   ];
@@ -547,7 +552,7 @@ export function EvidenceViewer({ packPath, onClose }: EvidenceViewerProps) {
               <StatusBadge status={pack.manifest.status} />
             </div>
           ) : (
-            <span className="text-xs text-gray-500">Loading...</span>
+            <span className="text-xs text-gray-500">加载中…</span>
           )}
           {pack && (
             <div className="flex items-center gap-3 mt-1 text-[10px] text-gray-500">
@@ -557,19 +562,19 @@ export function EvidenceViewer({ packPath, onClose }: EvidenceViewerProps) {
               </span>
               <span className="flex items-center gap-1">
                 <Coins size={10} />
-                {formatTokens(pack.manifest.total_tokens)} tokens
+                {formatTokens(pack.manifest.total_tokens)} 个 Token
               </span>
-              <span>{pack.manifest.total_tasks} tasks · {pack.manifest.total_tool_calls} calls · {pack.manifest.files_changed} files</span>
+              <span>{pack.manifest.total_tasks} 个任务 · {pack.manifest.total_tool_calls} 次调用 · {pack.manifest.files_changed} 个文件</span>
             </div>
           )}
         </div>
         <button
           onClick={openFolder}
           className="flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors shrink-0"
-          title="Open in Explorer"
+          title="在文件管理器中打开"
         >
           <FolderOpen size={12} />
-          <span>Open Folder</span>
+          <span>打开文件夹</span>
         </button>
         <button
           onClick={onClose}
@@ -601,7 +606,7 @@ export function EvidenceViewer({ packPath, onClose }: EvidenceViewerProps) {
       <div className="flex flex-1 flex-col min-h-0">
         {loading && (
           <div className="flex-1 flex items-center justify-center text-gray-600 text-xs">
-            Loading evidence pack...
+            正在加载证据包…
           </div>
         )}
         {error && (
@@ -647,15 +652,15 @@ export function EvidencePackList({ specReqId, cwd }: EvidencePackListProps) {
   }, [cwd, specReqId]);
 
   if (loading) {
-    return <div className="text-xs text-gray-600 p-3">Loading evidence packs...</div>;
+    return <div className="text-xs text-gray-600 p-3">正在加载证据包…</div>;
   }
 
   if (packs.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-8 gap-2 text-gray-600">
         <FileText size={24} className="opacity-30" />
-        <div className="text-xs">No evidence packs yet for {specReqId}</div>
-        <div className="text-[10px] text-gray-700">Run "Start Implementation" to generate one</div>
+        <div className="text-xs">{specReqId} 暂无证据包</div>
+        <div className="text-[10px] text-gray-700">运行“开始实现”以生成</div>
       </div>
     );
   }
@@ -675,10 +680,10 @@ export function EvidencePackList({ specReqId, cwd }: EvidencePackListProps) {
                 <span className="text-xs text-gray-300">{new Date(p.created_at).toLocaleString()}</span>
               </div>
               <div className="flex items-center gap-3 mt-1 text-[10px] text-gray-500">
-                <span>{p.total_tasks} tasks</span>
-                <span>{p.total_tool_calls} tool calls</span>
+                <span>{p.total_tasks} 个任务</span>
+                <span>{p.total_tool_calls} 次工具调用</span>
                 <span>{formatDuration(p.duration_minutes)}</span>
-                <span>{formatTokens(p.total_tokens)} tokens</span>
+                <span>{formatTokens(p.total_tokens)} 个 Token</span>
               </div>
             </div>
             {p.verification_passed

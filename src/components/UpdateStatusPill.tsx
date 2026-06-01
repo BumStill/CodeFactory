@@ -21,10 +21,10 @@ export function UpdateStatusPill() {
       <button
         onClick={() => void install()}
         className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent/15 border border-accent/40 text-[11px] text-accent hover:bg-accent/25 transition-colors animate-pulse"
-        title={`Click to download and install v${phase.update.version}`}
+        title={`点击下载并安装 v${phase.update.version}`}
       >
         <Download size={11} />
-        Update to v{phase.update.version}
+        更新到 v{phase.update.version}
       </button>
     );
   }
@@ -34,7 +34,7 @@ export function UpdateStatusPill() {
     return (
       <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent/10 text-[11px] text-accent">
         <RefreshCw size={11} className="animate-spin" />
-        Downloading {pct}%
+        正在下载 {pct}%
       </span>
     );
   }
@@ -43,14 +43,14 @@ export function UpdateStatusPill() {
     return (
       <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-500/15 text-[11px] text-emerald-800 dark:text-emerald-300">
         <Check size={11} />
-        {phase.kind === "installing" ? "Installing…" : "Restarting…"}
+        {phase.kind === "installing" ? "安装中…" : "重启中…"}
       </span>
     );
   }
 
   // Idle / checking / up-to-date / error — small subdued pill showing version
   // and acting as a manual "check now" button.
-  const versionText = currentVersion ? `v${currentVersion}` : "checking…";
+  const versionText = currentVersion ? `v${currentVersion}` : "检查中…";
   const errored = phase.kind === "error";
 
   return (
@@ -63,12 +63,12 @@ export function UpdateStatusPill() {
       }`}
       title={
         errored
-          ? `Last check failed: ${phase.message}\nClick to retry.`
+          ? `上次检查失败：${phase.message}\n点击重试。`
           : phase.kind === "up_to_date"
-          ? `Up to date.\nLast checked ${new Date(phase.checkedAt).toLocaleTimeString()}.\nClick to check again.`
+          ? `已是最新版本。\n上次检查于 ${new Date(phase.checkedAt).toLocaleTimeString()}。\n点击再次检查。`
           : phase.kind === "checking"
-          ? "Checking for updates…"
-          : "Click to check for updates."
+          ? "正在检查更新…"
+          : "点击检查更新。"
       }
     >
       {errored && <AlertCircle size={10} />}

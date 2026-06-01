@@ -36,7 +36,7 @@ export function UpdaterBanner() {
             <Download size={14} className="text-accent shrink-0 mt-0.5" />
             <div className="flex-1 min-w-0">
               <div className="text-xs font-medium text-gray-200">
-                Update available: v{phase.update.version}
+                有可用更新：v{phase.update.version}
               </div>
               {phase.update.body && (
                 <div className="mt-1 text-[11px] text-gray-500 line-clamp-3 whitespace-pre-wrap">
@@ -47,7 +47,7 @@ export function UpdaterBanner() {
             <button
               onClick={dismiss}
               className="p-0.5 text-gray-600 hover:text-gray-300 transition-colors"
-              title="Dismiss this version"
+              title="忽略此版本"
             >
               <X size={12} />
             </button>
@@ -57,13 +57,13 @@ export function UpdaterBanner() {
               onClick={dismiss}
               className="flex-1 py-1.5 text-[11px] text-gray-500 hover:bg-surface-3 transition-colors"
             >
-              Later
+              稍后
             </button>
             <button
               onClick={() => void install()}
               className="flex-1 py-1.5 text-[11px] text-accent font-medium hover:bg-accent/10 transition-colors border-l border-border"
             >
-              Install now
+              立即安装
             </button>
           </div>
         </>
@@ -73,7 +73,7 @@ export function UpdaterBanner() {
         <div className="p-3 space-y-2">
           <div className="flex items-center gap-2 text-xs text-gray-300">
             <RefreshCw size={12} className="text-accent animate-spin" />
-            <span>Downloading update…</span>
+            <span>正在下载更新…</span>
           </div>
           <div className="h-1 bg-surface-3 rounded-full overflow-hidden">
             <div
@@ -95,14 +95,14 @@ export function UpdaterBanner() {
       {phase.kind === "installing" && (
         <div className="flex items-center gap-2 p-3 text-xs text-gray-300">
           <RefreshCw size={12} className="text-accent animate-spin" />
-          <span>Installing…</span>
+          <span>安装中…</span>
         </div>
       )}
 
       {phase.kind === "ready" && (
         <div className="flex items-center gap-2 p-3 text-xs text-green-400">
           <CheckCircle size={12} />
-          <span>Installed. Restarting…</span>
+          <span>已安装，正在重启…</span>
         </div>
       )}
 
@@ -112,7 +112,7 @@ export function UpdaterBanner() {
       {false && phase.kind === "error" && (
         <div className="p-3 flex items-start gap-2 text-xs text-red-400">
           <AlertCircle size={12} className="shrink-0 mt-0.5" />
-          <span className="flex-1 break-words">Update failed</span>
+          <span className="flex-1 break-words">更新失败</span>
         </div>
       )}
     </div>

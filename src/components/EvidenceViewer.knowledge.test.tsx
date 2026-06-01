@@ -77,11 +77,11 @@ describe("EvidenceViewer knowledge refs", () => {
     render(<EvidenceViewer packPath="/tmp/evidence" onClose={() => {}} />);
 
     await waitFor(() => expect(screen.getByText("CF-KB-R2")).toBeInTheDocument());
-    await userEvent.click(screen.getByRole("button", { name: /Sources/ }));
+    await userEvent.click(screen.getByRole("button", { name: /来源/ }));
 
     expect(screen.getByText("产品路线图")).toBeInTheDocument();
     expect(screen.getByText("roadmap.pptx")).toBeInTheDocument();
-    expect(screen.getByText("slide 4")).toBeInTheDocument();
+    expect(screen.getByText("第 4 张幻灯片")).toBeInTheDocument();
     expect(screen.getByText("chunk-1")).toBeInTheDocument();
     expect(screen.getByText("42ms")).toBeInTheDocument();
   });
