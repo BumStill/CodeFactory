@@ -27,6 +27,10 @@ export const QUEUE_MAX = 5;
 
 interface ChatStore {
   sessions: Session[];
+  /** Quick-task sessions (kind='quick'), kept separate from `sessions` so
+   *  Home's "最近项目" stays project-only. The Workspace session sidebar
+   *  merges both for its unified list. */
+  quickSessions: Session[];
   activeSession: Session | null;
   messages: UIMessage[];
   streaming: boolean;
@@ -41,6 +45,7 @@ interface ChatStore {
   queue: QueuedMessage[];
 
   loadSessions: () => Promise<void>;
+  loadQuickSessions: () => Promise<void>;
   createSession: (cwd: string, model: string) => Promise<Session>;
   selectSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
@@ -67,6 +72,7 @@ interface ChatStore {
 
 export const useChatStore = create<ChatStore>((set, get) => ({
   sessions: [],
+  quickSessions: [],
   activeSession: null,
   messages: [],
   streaming: false,
@@ -82,6 +88,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   loadSessions: async () => {
     const sessions = await invoke<Session[]>("list_sessions");
     set({ sessions });
+  },
+
+  loadQuickSessions: async () => {
+    const quickSessions = await invoke<Session[]>("list_quick_sessions");
+    set({ quickSessions });
   },
 
   createSession: async (cwd, model) => {
@@ -127,6 +138,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       set((s) => ({
         activeSession: s.activeSession?.id === session.id ? session : s.activeSession,
         sessions: s.sessions.map((existing) =>
+          existing.id === session.id ? session : existing
+        ),
+        // Quick sessions live in a separate array; mirror title/updated_at
+        // changes there too so the sidebar's unified list stays fresh.
+        quickSessions: s.quickSessions.map((existing) =>
           existing.id === session.id ? session : existing
         ),
       }));
