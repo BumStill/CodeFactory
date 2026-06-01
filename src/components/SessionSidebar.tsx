@@ -10,7 +10,7 @@
 // Mental model: 快速任务 ≈ lightweight "cowork" chat, 项目 ≈ full "code"
 // project — both created and switched from this one rail.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, ChevronDown, Zap, Folder, EyeOff } from "lucide-react";
+import { Plus, ChevronDown, Zap, Folder, EyeOff, Loader2 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../stores/chat";
 import { createQuickSession } from "../lib/tauri";
@@ -184,6 +184,9 @@ function SessionRow({
   onClick: () => void;
 }) {
   const isQuick = session.kind === "quick";
+  // Per-session streaming indicator: with concurrent sessions, any row may be
+  // mid-stream even when it's not the foreground one.
+  const streaming = useChatStore((s) => s.runtime?.[session.id]?.streaming ?? false);
   return (
     <li>
       <button
@@ -208,6 +211,9 @@ function SessionRow({
           >
             {session.title || (isQuick ? "快速任务" : "未命名项目")}
           </span>
+          {streaming && (
+            <Loader2 size={11} className="shrink-0 animate-spin text-accent" aria-label="运行中" />
+          )}
           <span
             className={`shrink-0 rounded px-1 py-0.5 text-[8px] ${
               isQuick ? "bg-accent/15 text-accent" : "bg-surface-3 text-gray-500"

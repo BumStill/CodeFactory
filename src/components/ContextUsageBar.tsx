@@ -27,8 +27,8 @@ interface Props {
 }
 
 export function ContextUsageBar({ sessionId }: Props) {
-  const usage = useChatStore((s) => s.contextUsage);
-  const toast = useChatStore((s) => s.compressionToast);
+  const usage = useChatStore((s) => (sessionId ? s.runtime?.[sessionId]?.contextUsage ?? null : null));
+  const toast = useChatStore((s) => (sessionId ? s.runtime?.[sessionId]?.compressionToast ?? null : null));
 
   const [session, setSession] = useState<CostSummary | null>(null);
   const [today, setToday] = useState<CostSummary | null>(null);

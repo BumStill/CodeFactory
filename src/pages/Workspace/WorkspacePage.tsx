@@ -39,7 +39,7 @@ import { PermissionDialog } from "../../components/PermissionDialog";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
 import { ExecutionStream } from "../../components/ExecutionStream";
 import { invoke } from "../../lib/tauri";
-import { useChatStore } from "../../stores/chat";
+import { useChatStore, activeRuntime } from "../../stores/chat";
 import { QueueBadge } from "../../components/QueueBadge";
 import { useSettingsStore } from "../../stores/settings";
 import { useTasksStore } from "../../stores/tasks";
@@ -89,10 +89,13 @@ interface WorkspacePageProps {
  */
 export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSession }: WorkspacePageProps) {
   const {
-    activeSession, messages, streaming, queue,
+    activeSession,
     selectSession, sendOrQueue, cancelStream, removeFromQueue,
-    pendingPermission, respondPermission, exitAnonymous,
+    respondPermission, exitAnonymous,
   } = useChatStore();
+  // Per-session chat state for the ACTIVE session. Background sessions keep
+  // streaming into their own buckets; here we render the active one's slice.
+  const { messages, streaming, queue, pendingPermission } = useChatStore(activeRuntime);
   const isAnonymous = activeSession?.kind === "anonymous";
   const { settings, setTheme } = useSettingsStore();
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
@@ -280,7 +283,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
             key={activeSession?.id ?? sessionId}
             initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
             onSend={(t) => void sendOrQueue(t)}
-            onCancel={cancelStream}
+            onCancel={() => cancelStream()}
             streaming={streaming}
             disabled={!activeSession}
             pendingInsert={pendingInsert}

@@ -4,10 +4,10 @@
 // anonymous turns go to `send_message_anonymous` (NOT the persisted
 // `send_message`), the frontend replays its own history, exiting discards
 // everything, and re-selecting the ephemeral session never hits the DB.
-// The actual no-DB-write guarantee lives in the Rust agent guards.
+// State now lives in per-session runtime buckets (keyed by session id).
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { useChatStore } from "./chat";
+import { useChatStore, activeRuntime, freshRuntime, type SessionRuntime } from "./chat";
 
 const invokeMock = vi.hoisted(() => vi.fn());
 const sendAnonMock = vi.hoisted(() => vi.fn());
@@ -18,6 +18,13 @@ vi.mock("../lib/tauri", () => ({
   sendMessageAnonymous: sendAnonMock,
 }));
 
+/** Merge a patch into a specific session's runtime bucket. */
+function seedRuntime(id: string, patch: Partial<SessionRuntime>) {
+  useChatStore.setState((s) => ({
+    runtime: { ...s.runtime, [id]: { ...(s.runtime[id] ?? freshRuntime()), ...patch } },
+  }));
+}
+
 beforeEach(() => {
   invokeMock.mockReset();
   invokeMock.mockResolvedValue(undefined);
@@ -27,13 +34,11 @@ beforeEach(() => {
     sessions: [],
     quickSessions: [],
     activeSession: null,
-    messages: [],
-    streaming: false,
-    queue: [],
+    runtime: {},
     activeModel: "anthropic/claude-opus-4-7",
-    inputTokenTotal: 0,
-    outputTokenTotal: 0,
-    pendingPermission: null,
+    _unlisten: {},
+    _unlistenSessionUpdated: {},
+    _streamingMsgId: {},
   });
 });
 
@@ -44,16 +49,16 @@ describe("anonymous chat store flow", () => {
     const st = useChatStore.getState();
     expect(st.activeSession?.id).toBe(s.id);
     expect(st.activeSession?.kind).toBe("anonymous");
-    expect(st.messages).toEqual([]);
+    expect(activeRuntime(st).messages).toEqual([]);
   });
 
   it("routes anonymous turns to send_message_anonymous with replayed history", async () => {
     const s = useChatStore.getState().startAnonymousSession();
-    useChatStore.setState({
+    seedRuntime(s.id, {
       messages: [
         { id: "u1", role: "user", content: "hi", createdAt: 0 },
         { id: "a1", role: "assistant", content: "hello", createdAt: 0 },
-      ] as never,
+      ],
     });
 
     await useChatStore.getState().sendMessage("how are you");
@@ -78,7 +83,7 @@ describe("anonymous chat store flow", () => {
         id: "p1", title: "t", cwd: "/proj", model_id: "m", created_at: 0,
         updated_at: 0, total_input_tokens: 0, total_output_tokens: 0, kind: "project",
       } as never,
-      messages: [],
+      runtime: { p1: freshRuntime() },
     });
 
     await useChatStore.getState().sendMessage("hello");
@@ -91,16 +96,17 @@ describe("anonymous chat store flow", () => {
   });
 
   it("exitAnonymous discards the in-memory session and its history", () => {
-    useChatStore.getState().startAnonymousSession();
-    useChatStore.setState({
-      messages: [{ id: "x", role: "user", content: "secret", createdAt: 0 }] as never,
+    const s = useChatStore.getState().startAnonymousSession();
+    seedRuntime(s.id, {
+      messages: [{ id: "x", role: "user", content: "secret", createdAt: 0 }],
     });
 
     useChatStore.getState().exitAnonymous();
 
     const st = useChatStore.getState();
     expect(st.activeSession).toBeNull();
-    expect(st.messages).toEqual([]);
+    expect(st.runtime[s.id]).toBeUndefined();
+    expect(activeRuntime(st).messages).toEqual([]);
   });
 
   it("selectSession never hits the DB for the active anonymous session", async () => {

@@ -6,6 +6,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   markPermissionResponse,
   reduceChatStreamEvent,
+  type ChatEventState,
   type PendingPermission,
   type ToolCallState,
   type UIMessage,
@@ -25,71 +26,109 @@ export interface QueuedMessage {
 
 export const QUEUE_MAX = 5;
 
-interface ChatStore {
-  sessions: Session[];
-  /** Quick-task sessions (kind='quick'), kept separate from `sessions` so
-   *  Home's "最近项目" stays project-only. The Workspace session sidebar
-   *  merges both for its unified list. */
-  quickSessions: Session[];
-  activeSession: Session | null;
-  messages: UIMessage[];
-  streaming: boolean;
-  models: ModelInfo[];
-  activeModel: string;
-  inputTokenTotal: number;
-  outputTokenTotal: number;
-  pendingPermission: PendingPermission | null;
-  contextUsage: { used: number; limit: number } | null;
-  compressionToast: { elidedCount: number; tokensFreed: number; id: number } | null;
-  /** Messages waiting to fire after the current stream finishes. */
+/** All ephemeral chat state for ONE session. Buckets are keyed by session id in
+ *  the store, so multiple sessions can stream concurrently without clobbering
+ *  each other — each has its own messages, streaming flag, queue, stats, and
+ *  (privately) its own stream listener. */
+export interface SessionRuntime extends ChatEventState {
+  /** Messages waiting to fire after THIS session's current stream finishes. */
   queue: QueuedMessage[];
-
-  loadSessions: () => Promise<void>;
-  loadQuickSessions: () => Promise<void>;
-  createSession: (cwd: string, model: string) => Promise<Session>;
-  selectSession: (id: string) => Promise<void>;
-  deleteSession: (id: string) => Promise<void>;
-  sendMessage: (content: string) => Promise<void>;
-  /** Send right now if idle, otherwise enqueue. Returns "sent" or "queued". */
-  sendOrQueue: (content: string) => Promise<"sent" | "queued" | "full">;
-  /** Remove a queued message before it fires. */
-  removeFromQueue: (id: string) => void;
-  /** Empty the queue without sending. */
-  clearQueue: () => void;
-  loadModels: (endpoint: string) => Promise<void>;
-  setModel: (modelId: string) => void;
-  cancelStream: () => void;
-  respondPermission: (allow: boolean) => Promise<void>;
-  addLocalAssistantMessage: (content: string) => void;
-  clearVisibleConversation: () => void;
-  updateActiveSessionModel: (modelId: string) => Promise<void>;
-  updateActiveSessionReasoningEffort: (effort: ReasoningEffort | null) => Promise<void>;
-  /** Begin an in-memory ANONYMOUS chat — never persisted, not learned from,
-   *  API cost not counted. Returns the synthetic session so the caller can
-   *  navigate to it (it lives only in this store, never in the DB). */
-  startAnonymousSession: () => Session;
-  /** Tear down the active anonymous chat, discarding its in-memory history. */
-  exitAnonymous: () => void;
-
-  _unlisten?: UnlistenFn;
-  _unlistenSessionUpdated?: UnlistenFn;
-  _streamingMsgId?: string;
 }
 
-export const useChatStore = create<ChatStore>((set, get) => ({
-  sessions: [],
-  quickSessions: [],
-  activeSession: null,
+/** Shared read-only default returned by the selector when a session has no
+ *  bucket yet (e.g. no active session). Never mutated. */
+const EMPTY_RUNTIME: SessionRuntime = {
   messages: [],
   streaming: false,
-  models: [],
-  activeModel: "anthropic/claude-opus-4-7",
   inputTokenTotal: 0,
   outputTokenTotal: 0,
   pendingPermission: null,
   contextUsage: null,
   compressionToast: null,
   queue: [],
+};
+
+/** A fresh, independent runtime bucket (its own arrays). */
+export function freshRuntime(messages: UIMessage[] = []): SessionRuntime {
+  return {
+    messages,
+    streaming: false,
+    inputTokenTotal: 0,
+    outputTokenTotal: 0,
+    pendingPermission: null,
+    contextUsage: null,
+    compressionToast: null,
+    queue: [],
+  };
+}
+
+interface ChatStore {
+  sessions: Session[];
+  quickSessions: Session[];
+  activeSession: Session | null;
+  /** Per-session ephemeral chat state, keyed by session id. Source of truth for
+   *  messages / streaming / queue / token + context stats. Multiple sessions
+   *  can be present and streaming at the same time. */
+  runtime: Record<string, SessionRuntime>;
+  models: ModelInfo[];
+  activeModel: string;
+
+  loadSessions: () => Promise<void>;
+  loadQuickSessions: () => Promise<void>;
+  createSession: (cwd: string, model: string) => Promise<Session>;
+  selectSession: (id: string) => Promise<void>;
+  deleteSession: (id: string) => Promise<void>;
+  /** Send to `sessionId` (default: the active session). Targeting lets the
+   *  queue-drain fire the next message into a background session too. */
+  sendMessage: (content: string, sessionId?: string) => Promise<void>;
+  /** Send right now if the active session is idle, otherwise enqueue. */
+  sendOrQueue: (content: string) => Promise<"sent" | "queued" | "full">;
+  /** Remove a queued message (active session) before it fires. */
+  removeFromQueue: (id: string) => void;
+  /** Empty the active session's queue without sending. */
+  clearQueue: () => void;
+  loadModels: (endpoint: string) => Promise<void>;
+  setModel: (modelId: string) => void;
+  /** Stop the in-flight turn for `sessionId` (default: the active session). */
+  cancelStream: (sessionId?: string) => void;
+  respondPermission: (allow: boolean) => Promise<void>;
+  addLocalAssistantMessage: (content: string) => void;
+  clearVisibleConversation: () => void;
+  updateActiveSessionModel: (modelId: string) => Promise<void>;
+  updateActiveSessionReasoningEffort: (effort: ReasoningEffort | null) => Promise<void>;
+  startAnonymousSession: () => Session;
+  exitAnonymous: () => void;
+
+  /** Per-session stream listeners — kept alive across session switches so a
+   *  background session keeps streaming into its own runtime bucket. */
+  _unlisten: Record<string, UnlistenFn | undefined>;
+  _unlistenSessionUpdated: Record<string, UnlistenFn | undefined>;
+  _streamingMsgId: Record<string, string | undefined>;
+}
+
+/** Selector: the active session's runtime slice (or the empty default). Use as
+ *  `useChatStore(activeRuntime)`. */
+export function activeRuntime(s: ChatStore): SessionRuntime {
+  const id = s.activeSession?.id;
+  return (id ? s.runtime[id] : undefined) ?? EMPTY_RUNTIME;
+}
+
+/** Resolve a session object by id across the active / project / quick lists. */
+function findSession(s: ChatStore, id: string): Session | undefined {
+  if (s.activeSession?.id === id) return s.activeSession;
+  return s.sessions.find((x) => x.id === id) ?? s.quickSessions.find((x) => x.id === id);
+}
+
+export const useChatStore = create<ChatStore>((set, get) => ({
+  sessions: [],
+  quickSessions: [],
+  activeSession: null,
+  runtime: {},
+  models: [],
+  activeModel: "anthropic/claude-opus-4-7",
+  _unlisten: {},
+  _unlistenSessionUpdated: {},
+  _streamingMsgId: {},
 
   loadSessions: async () => {
     const sessions = await invoke<Session[]>("list_sessions");
@@ -104,85 +143,95 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   createSession: async (cwd, model) => {
     const title = cwd.split(/[/\\]/).pop() ?? "New Session";
     const session = await invoke<Session>("create_session", { title, cwd, modelId: model });
-    set((s) => ({ sessions: [session, ...s.sessions], activeSession: session, messages: [] }));
+    set((s) => ({
+      sessions: [session, ...s.sessions],
+      activeSession: session,
+      runtime: { ...s.runtime, [session.id]: freshRuntime() },
+    }));
     return session;
   },
 
   selectSession: async (id) => {
-    // An active anonymous session lives only in memory (never in the DB), so
-    // re-selecting it must NOT hit get_session/get_messages — that would error
-    // (no row) and wipe its in-memory history. Keep it as-is.
+    // Re-selecting the active anonymous session: it lives only in memory, so
+    // never hit get_session/get_messages (that would error and wipe history).
     const cur = get().activeSession;
     if (cur?.id === id && cur.kind === "anonymous") return;
-    // Tear down the previous session's stream listeners so its events can't
-    // bleed into the newly-selected session, and clear the global `streaming`
-    // flag + queue. `streaming` is a single global flag, so a session left
-    // mid-stream — or one whose terminal event was missed — would otherwise
-    // keep every other session showing "running" and block all sends.
-    // Switching sessions is therefore also the manual recovery path.
-    get()._unlisten?.();
-    get()._unlistenSessionUpdated?.();
+
     const session = await invoke<Session>("get_session", { sessionId: id });
+
+    // If this session is mid-stream it already owns a live bucket + listener —
+    // foreground it WITHOUT reloading (a reload would clobber the in-flight
+    // buffer and drop the live tail).
+    if (get().runtime[id]?.streaming) {
+      set({ activeSession: session, activeModel: session.model_id });
+      return;
+    }
+
+    // Otherwise load a fresh snapshot and (re)seed this session's bucket.
     const msgs = await invoke<Message[]>("get_messages", { sessionId: id });
-    set({
+    set((s) => ({
       activeSession: session,
-      messages: msgs.map(dbToUI),
       activeModel: session.model_id,
-      streaming: false,
-      inputTokenTotal: 0,
-      outputTokenTotal: 0,
-      pendingPermission: null,
-      contextUsage: null,
-      compressionToast: null,
-      queue: [],
-      _unlisten: undefined,
-      _unlistenSessionUpdated: undefined,
-      _streamingMsgId: undefined,
-    });
+      runtime: { ...s.runtime, [id]: freshRuntime(msgs.map(dbToUI)) },
+    }));
   },
 
   deleteSession: async (id) => {
     await invoke("delete_session", { sessionId: id });
-    set((s) => ({
-      sessions: s.sessions.filter((x) => x.id !== id),
-      ...(s.activeSession?.id === id ? { activeSession: null, messages: [] } : {}),
-    }));
+    get()._unlisten[id]?.();
+    get()._unlistenSessionUpdated[id]?.();
+    set((s) => {
+      const runtime = { ...s.runtime };
+      delete runtime[id];
+      const _unlisten = { ...s._unlisten };
+      delete _unlisten[id];
+      const _unlistenSessionUpdated = { ...s._unlistenSessionUpdated };
+      delete _unlistenSessionUpdated[id];
+      const _streamingMsgId = { ...s._streamingMsgId };
+      delete _streamingMsgId[id];
+      return {
+        sessions: s.sessions.filter((x) => x.id !== id),
+        runtime,
+        _unlisten,
+        _unlistenSessionUpdated,
+        _streamingMsgId,
+        ...(s.activeSession?.id === id ? { activeSession: null } : {}),
+      };
+    });
   },
 
-  sendMessage: async (content) => {
-    const { activeSession, _unlisten, _unlistenSessionUpdated } = get();
-    if (!activeSession || get().streaming) return;
+  sendMessage: async (content, sessionId) => {
+    const target = sessionId ? findSession(get(), sessionId) : get().activeSession;
+    if (!target) return;
+    const id = target.id;
+    if (get().runtime[id]?.streaming) return;
 
-    const isAnon = activeSession.kind === "anonymous";
+    const isAnon = target.kind === "anonymous";
 
-    // Cancel any previous listeners
-    _unlisten?.();
-    _unlistenSessionUpdated?.();
+    // Re-subscribe THIS session's listeners (tear down any stale ones first).
+    get()._unlisten[id]?.();
+    get()._unlistenSessionUpdated[id]?.();
 
-    // Anonymous sessions are never persisted, so there's no server-side title
-    // to subscribe to. Only normal sessions get the title-update listener.
+    // Anonymous sessions are never persisted → no server-side title to track.
     if (!isAnon) {
-      const unlistenSessionUpdated = await onSessionUpdated(activeSession.id, (session) => {
+      const unlistenSessionUpdated = await onSessionUpdated(id, (session) => {
         set((s) => ({
           activeSession: s.activeSession?.id === session.id ? session : s.activeSession,
-          sessions: s.sessions.map((existing) =>
-            existing.id === session.id ? session : existing
-          ),
-          // Quick sessions live in a separate array; mirror title/updated_at
-          // changes there too so the sidebar's unified list stays fresh.
+          sessions: s.sessions.map((existing) => (existing.id === session.id ? session : existing)),
           quickSessions: s.quickSessions.map((existing) =>
-            existing.id === session.id ? session : existing
+            existing.id === session.id ? session : existing,
           ),
         }));
       });
-      set({ _unlistenSessionUpdated: unlistenSessionUpdated });
+      set((s) => ({
+        _unlistenSessionUpdated: { ...s._unlistenSessionUpdated, [id]: unlistenSessionUpdated },
+      }));
     }
 
-    // Anonymous: snapshot the prior conversation from memory BEFORE appending
-    // the new turn — the backend keeps no history, so the frontend replays it.
+    // Anonymous: replay this session's in-memory history (backend keeps none).
     const anonHistory: AnonTurn[] = isAnon
-      ? get()
-          .messages.filter(
+      ? (get().runtime[id]?.messages ?? [])
+          .filter(
             (m) => (m.role === "user" || m.role === "assistant") && m.content.trim().length > 0,
           )
           .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }))
@@ -203,67 +252,99 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       createdAt: Date.now(),
     };
 
-    set((s) => ({
-      messages: [...s.messages, userMsg, assistantMsg],
-      streaming: true,
-      _streamingMsgId: assistantMsgId,
-    }));
-
-    const unlisten = await onStream(activeSession.id, (event: StreamEvent) => {
-      handleStreamEvent(event, assistantMsgId, set, get);
+    set((s) => {
+      const prev = s.runtime[id] ?? freshRuntime();
+      return {
+        runtime: {
+          ...s.runtime,
+          [id]: { ...prev, messages: [...prev.messages, userMsg, assistantMsg], streaming: true },
+        },
+        _streamingMsgId: { ...s._streamingMsgId, [id]: assistantMsgId },
+      };
     });
-    set({ _unlisten: unlisten });
+
+    const unlisten = await onStream(id, (event: StreamEvent) => {
+      handleStreamEvent(event, id, assistantMsgId, set, get);
+    });
+    set((s) => ({ _unlisten: { ...s._unlisten, [id]: unlisten } }));
 
     try {
       if (isAnon) {
-        await sendMessageAnonymous(
-          activeSession.id,
-          content,
-          anonHistory,
-          activeSession.cwd,
-          get().activeModel,
-        );
+        await sendMessageAnonymous(id, content, anonHistory, target.cwd, target.model_id);
       } else {
-        await invoke("send_message", {
-          sessionId: activeSession.id,
-          content,
-        });
+        await invoke("send_message", { sessionId: id, content });
       }
     } catch (e) {
-      set((s) => ({
-        messages: s.messages.map((m) =>
-          m.id === assistantMsgId
-            ? { ...m, content: `Error: ${String(e)}` }
-            : m
-        ),
-        streaming: false,
-      }));
+      set((s) => {
+        const prev = s.runtime[id];
+        if (!prev) return {};
+        return {
+          runtime: {
+            ...s.runtime,
+            [id]: {
+              ...prev,
+              messages: prev.messages.map((m) =>
+                m.id === assistantMsgId ? { ...m, content: `Error: ${String(e)}` } : m,
+              ),
+              streaming: false,
+            },
+          },
+        };
+      });
     }
   },
 
   sendOrQueue: async (content) => {
     const text = content.trim();
     if (!text) return "sent";
-    const { streaming, queue, sendMessage } = get();
-    if (!streaming) {
-      await sendMessage(text);
+    const active = get().activeSession;
+    if (!active) return "sent";
+    const id = active.id;
+    const rt = get().runtime[id];
+    if (!rt || !rt.streaming) {
+      await get().sendMessage(text);
       return "sent";
     }
-    if (queue.length >= QUEUE_MAX) return "full";
-    set((s) => ({
-      queue: [
-        ...s.queue,
-        { id: crypto.randomUUID(), content: text, enqueuedAt: Date.now() },
-      ],
-    }));
+    if (rt.queue.length >= QUEUE_MAX) return "full";
+    set((s) => {
+      const prev = s.runtime[id] ?? freshRuntime();
+      return {
+        runtime: {
+          ...s.runtime,
+          [id]: {
+            ...prev,
+            queue: [
+              ...prev.queue,
+              { id: crypto.randomUUID(), content: text, enqueuedAt: Date.now() },
+            ],
+          },
+        },
+      };
+    });
     return "queued";
   },
 
-  removeFromQueue: (id) => {
-    set((s) => ({ queue: s.queue.filter((q) => q.id !== id) }));
+  removeFromQueue: (qid) => {
+    const id = get().activeSession?.id;
+    if (!id) return;
+    set((s) => {
+      const prev = s.runtime[id];
+      if (!prev) return {};
+      return {
+        runtime: { ...s.runtime, [id]: { ...prev, queue: prev.queue.filter((q) => q.id !== qid) } },
+      };
+    });
   },
 
-  clearQueue: () => set({ queue: [] }),
+  clearQueue: () => {
+    const id = get().activeSession?.id;
+    if (!id) return;
+    set((s) => {
+      const prev = s.runtime[id];
+      if (!prev) return {};
+      return { runtime: { ...s.runtime, [id]: { ...prev, queue: [] } } };
+    });
+  },
 
   loadModels: async (endpoint) => {
     try {
@@ -292,9 +373,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
     set((s) => ({
       activeSession: session,
-      sessions: s.sessions.map((existing) =>
-        existing.id === session.id ? session : existing,
-      ),
+      sessions: s.sessions.map((existing) => (existing.id === session.id ? session : existing)),
     }));
   },
 
@@ -311,16 +390,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
     set((s) => ({
       activeSession: session,
-      sessions: s.sessions.map((existing) =>
-        existing.id === session.id ? session : existing,
-      ),
+      sessions: s.sessions.map((existing) => (existing.id === session.id ? session : existing)),
     }));
   },
 
   startAnonymousSession: () => {
     // A purely in-memory session: a client-generated id, kind "anonymous", and
     // an empty cwd (the backend resolves a scratch dir). Never written to the
-    // DB. Replaces the visible conversation with a fresh, blank one.
+    // DB. Gets its own fresh runtime bucket like any other session.
     const anon: Session = {
       id: crypto.randomUUID(),
       title: "匿名会话",
@@ -332,83 +409,104 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       total_output_tokens: 0,
       kind: "anonymous",
     };
-    get()._unlisten?.();
-    get()._unlistenSessionUpdated?.();
-    set({
+    set((s) => ({
       activeSession: anon,
-      messages: [],
-      streaming: false,
-      queue: [],
-      inputTokenTotal: 0,
-      outputTokenTotal: 0,
-      pendingPermission: null,
-      contextUsage: null,
-      compressionToast: null,
-      _unlisten: undefined,
-      _unlistenSessionUpdated: undefined,
-    });
+      runtime: { ...s.runtime, [anon.id]: freshRuntime() },
+    }));
     return anon;
   },
 
   exitAnonymous: () => {
-    if (get().activeSession?.kind !== "anonymous") return;
-    get()._unlisten?.();
-    get()._unlistenSessionUpdated?.();
-    // Drop the in-memory session + its history entirely (no trace kept).
-    set({
-      activeSession: null,
-      messages: [],
-      streaming: false,
-      queue: [],
-      inputTokenTotal: 0,
-      outputTokenTotal: 0,
-      pendingPermission: null,
-      contextUsage: null,
-      compressionToast: null,
-      _unlisten: undefined,
-      _unlistenSessionUpdated: undefined,
+    const active = get().activeSession;
+    if (active?.kind !== "anonymous") return;
+    const id = active.id;
+    // Drop the in-memory session, its history, and its listeners entirely.
+    get()._unlisten[id]?.();
+    get()._unlistenSessionUpdated[id]?.();
+    set((s) => {
+      const runtime = { ...s.runtime };
+      delete runtime[id];
+      const _unlisten = { ...s._unlisten };
+      delete _unlisten[id];
+      const _unlistenSessionUpdated = { ...s._unlistenSessionUpdated };
+      delete _unlistenSessionUpdated[id];
+      const _streamingMsgId = { ...s._streamingMsgId };
+      delete _streamingMsgId[id];
+      return { activeSession: null, runtime, _unlisten, _unlistenSessionUpdated, _streamingMsgId };
     });
   },
 
-  cancelStream: () => {
-    const id = get().activeSession?.id;
-    get()._unlisten?.();
-    set({ streaming: false, _unlisten: undefined, pendingPermission: null });
-    // Also tell the backend to stop the in-flight turn — otherwise the agent
-    // keeps looping (burning tokens) after the UI already says "stopped".
-    // Cooperative: it stops between rounds, never mid tool-call. Scoped to THIS
-    // chat session only; it never affects the task scheduler / long task runs.
-    if (id) void invoke("cancel_chat", { sessionId: id });
+  cancelStream: (sessionId) => {
+    const id = sessionId ?? get().activeSession?.id;
+    if (!id) return;
+    get()._unlisten[id]?.();
+    set((s) => {
+      const prev = s.runtime[id];
+      const runtime = prev
+        ? { ...s.runtime, [id]: { ...prev, streaming: false, pendingPermission: null } }
+        : s.runtime;
+      return { runtime, _unlisten: { ...s._unlisten, [id]: undefined } };
+    });
+    // Tell the backend to stop the in-flight turn — otherwise the agent keeps
+    // looping (burning tokens) after the UI already says "stopped". Cooperative:
+    // it stops between rounds, never mid tool-call. Scoped to THIS chat session
+    // only; it never affects the task scheduler / long task runs.
+    void invoke("cancel_chat", { sessionId: id });
   },
 
   respondPermission: async (allow) => {
-    const pending = get().pendingPermission;
+    const id = get().activeSession?.id;
+    if (!id) return;
+    const pending = get().runtime[id]?.pendingPermission;
     if (!pending) return;
-    await invoke("respond_to_permission", {
-      toolCallId: pending.toolCallId,
-      allow,
+    await invoke("respond_to_permission", { toolCallId: pending.toolCallId, allow });
+    set((s) => {
+      const prev = s.runtime[id];
+      if (!prev) return {};
+      return {
+        runtime: {
+          ...s.runtime,
+          [id]: { ...prev, ...markPermissionResponse(prev, pending.toolCallId, allow) },
+        },
+      };
     });
-    set((s) => markPermissionResponse(s, pending.toolCallId, allow));
   },
 
   addLocalAssistantMessage: (content) => {
+    const id = get().activeSession?.id;
+    if (!id) return;
     const msg: UIMessage = {
       id: crypto.randomUUID(),
       role: "assistant",
       content,
       createdAt: Date.now(),
     };
-    set((s) => ({ messages: [...s.messages, msg] }));
+    set((s) => {
+      const prev = s.runtime[id] ?? freshRuntime();
+      return { runtime: { ...s.runtime, [id]: { ...prev, messages: [...prev.messages, msg] } } };
+    });
   },
 
   clearVisibleConversation: () => {
-    set({
-      messages: [],
-      inputTokenTotal: 0,
-      outputTokenTotal: 0,
-      pendingPermission: null,
-      contextUsage: null,
-      compressionToast: null,
+    const id = get().activeSession?.id;
+    if (!id) return;
+    set((s) => {
+      const prev = s.runtime[id];
+      if (!prev) return {};
+      return {
+        runtime: {
+          ...s.runtime,
+          [id]: {
+            ...prev,
+            messages: [],
+            inputTokenTotal: 0,
+            outputTokenTotal: 0,
+            pendingPermission: null,
+            contextUsage: null,
+            compressionToast: null,
+          },
+        },
+      };
     });
   },
 }));
@@ -423,41 +521,52 @@ const _lastPostmortemAt: Record<string, number> = {};
 
 function handleStreamEvent(
   event: StreamEvent,
+  sessionId: string,
   msgId: string,
   set: (fn: (s: ChatStore) => Partial<ChatStore>) => void,
-  get: () => ChatStore
+  get: () => ChatStore,
 ) {
-  const wasStreaming = get().streaming;
-  set((s) => reduceChatStreamEvent(s, event, msgId));
-  // Queue drain — fire the next queued message as soon as the previous
-  // stream lands in a terminal state (done OR error). We delay one tick
-  // so the just-completed sendMessage's React state has a chance to
-  // settle and we don't re-enter mid-reducer-update.
-  if (wasStreaming && !get().streaming) {
-    const next = get().queue[0];
+  const wasStreaming = get().runtime[sessionId]?.streaming ?? false;
+  set((s) => {
+    const prev = s.runtime[sessionId];
+    if (!prev) return {};
+    const reduced = reduceChatStreamEvent(prev, event, msgId);
+    return { runtime: { ...s.runtime, [sessionId]: { ...prev, ...reduced } } };
+  });
+
+  // Queue drain — fire this session's next queued message as soon as its
+  // stream lands in a terminal state (done OR error). We delay one tick so the
+  // just-completed send's React state settles before we re-enter.
+  const nowStreaming = get().runtime[sessionId]?.streaming ?? false;
+  if (wasStreaming && !nowStreaming) {
+    const next = get().runtime[sessionId]?.queue[0];
     if (next) {
-      get().removeFromQueue(next.id);
+      set((s) => {
+        const prev = s.runtime[sessionId];
+        if (!prev) return {};
+        return {
+          runtime: {
+            ...s.runtime,
+            [sessionId]: { ...prev, queue: prev.queue.filter((q) => q.id !== next.id) },
+          },
+        };
+      });
       setTimeout(() => {
-        void get().sendMessage(next.content);
+        void get().sendMessage(next.content, sessionId);
       }, 0);
       return; // more conversation coming — defer post-mortem
     }
 
-    // Chat-end post-mortem trigger. The Workspace already fires this
-    // after task trees settle (see stores/tasks.ts); here we cover
-    // free-form chat sessions too, since those produce just as many
-    // signals worth learning from. Guards:
-    //   - throttled per session to avoid burning tokens on rapid replies
-    //   - skip too-short conversations (< 3 messages = noise)
-    //   - skip 'error' terminations (the task path skips failures too)
-    //   - NEVER for anonymous chats — they must not feed the learning/profile
-    //     pipeline (no-trace = no learning).
-    const session = get().activeSession;
+    // Chat-end post-mortem trigger. Mirrors the task path (stores/tasks.ts).
+    // Guards: throttled per session, skip too-short conversations, skip
+    // 'error' terminations, and NEVER for anonymous chats (no-trace = no
+    // learning).
+    const session = findSession(get(), sessionId);
     if (
       session &&
       session.kind !== "anonymous" &&
       event.type === "done" &&
-      get().messages.length >= POSTMORTEM_MIN_MESSAGES
+      (get().runtime[sessionId]?.messages.length ?? 0) >= POSTMORTEM_MIN_MESSAGES
     ) {
       const last = _lastPostmortemAt[session.id] ?? 0;
       if (Date.now() - last >= POSTMORTEM_THROTTLE_MS) {

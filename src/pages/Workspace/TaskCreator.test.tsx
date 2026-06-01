@@ -56,12 +56,25 @@ const fakeChatState = {
   inputTokenTotal: 0,
   outputTokenTotal: 0,
 };
+// The active session's per-session runtime slice (what `activeRuntime` returns).
+const fakeChatRuntime = {
+  messages: fakeChatState.messages,
+  streaming: fakeChatState.streaming,
+  queue: fakeChatState.queue,
+  inputTokenTotal: fakeChatState.inputTokenTotal,
+  outputTokenTotal: fakeChatState.outputTokenTotal,
+  pendingPermission: fakeChatState.pendingPermission,
+  contextUsage: null,
+  compressionToast: null,
+};
 vi.mock("../../stores/chat", () => ({
   useChatStore: Object.assign(
     <T,>(selector?: (s: typeof fakeChatState) => T): T | typeof fakeChatState =>
       selector ? selector(fakeChatState) : fakeChatState,
     { setState: vi.fn(), getState: () => fakeChatState },
   ),
+  // WorkspacePage reads the active session's slice via `useChatStore(activeRuntime)`.
+  activeRuntime: () => fakeChatRuntime,
 }));
 // Stub ModelPicker — it pulls in a lot of provider state we don't care about
 vi.mock("../../components/ModelPicker", () => ({
