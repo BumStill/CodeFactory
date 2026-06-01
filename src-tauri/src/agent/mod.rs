@@ -447,6 +447,9 @@ impl AgentLoop {
             hooks::HookRunner::from_settings(&settings, self.app.clone())
         };
 
+        // Did we emit a terminal Done/Error this run? Used to guarantee the
+        // stream always closes even if the loop runs to its iteration ceiling.
+        let mut emitted_terminal = false;
         for _ in 0..self.mode.max_iterations() {
             // ── Context-window management ────────────────────────────────────
             // Estimate prompt tokens before sending. If we're over 75% of the
@@ -512,17 +515,26 @@ impl AgentLoop {
             }
 
             if tool_calls.is_empty() {
-                // Emit Done with accumulated usage if we have it
+                // Always emit a terminal Done so the frontend's `streaming`
+                // flag clears — even when the provider omitted usage on the
+                // final turn. Previously Done was gated behind `usage`, so a
+                // missing usage left the chat hung "running" forever.
+                let (done_in, done_out) = usage
+                    .as_ref()
+                    .map(|u| (u.prompt_tokens, u.completion_tokens))
+                    .unwrap_or((0, 0));
+                self.app
+                    .emit(
+                        &event_name,
+                        StreamEvent::Done {
+                            input_tokens: done_in,
+                            output_tokens: done_out,
+                        },
+                    )
+                    .ok();
+                emitted_terminal = true;
+                // Cost is only recorded when the provider reported usage.
                 if let Some(u) = &usage {
-                    self.app
-                        .emit(
-                            &event_name,
-                            StreamEvent::Done {
-                                input_tokens: u.prompt_tokens,
-                                output_tokens: u.completion_tokens,
-                            },
-                        )
-                        .ok();
                     // Persist cost entry and notify frontend to refresh stats.
                     // Anonymous runs are NEVER billed into today/month stats.
                     if !self.anonymous {
@@ -745,6 +757,27 @@ impl AgentLoop {
                 reasoning_content: reasoning,
             });
             messages.extend(result_messages);
+        }
+
+        // Safety net: the loop only emits a terminal Done when the model
+        // produces a tool-call-free turn. If it instead burns through the whole
+        // iteration budget (a tool call every round — far more likely on
+        // Execute turns), no terminal event was sent and the frontend would
+        // hang "running" forever. Emit one now so the stream always closes.
+        if !emitted_terminal {
+            tracing::warn!(
+                "agent loop hit the iteration ceiling ({}) without a terminal turn; emitting Done",
+                self.mode.max_iterations(),
+            );
+            self.app
+                .emit(
+                    &event_name,
+                    StreamEvent::Done {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    },
+                )
+                .ok();
         }
 
         Ok(())
@@ -1368,6 +1401,9 @@ impl AgentLoop {
             hooks::HookRunner::from_settings(&settings, self.app.clone())
         };
 
+        // Did we emit a terminal Done/Error this run? Used to guarantee the
+        // stream always closes even if the loop runs to its iteration ceiling.
+        let mut emitted_terminal = false;
         for _ in 0..self.mode.max_iterations() {
             // We don't run elision compression on the Anthropic path because
             // its messages are serde_json::Value-shaped, not ChatMessage.
@@ -1426,6 +1462,7 @@ impl AgentLoop {
             }
 
             if tool_calls.is_empty() {
+                emitted_terminal = true;
                 let inp = resp.input_tokens;
                 let out = resp.output_tokens;
                 self.app
@@ -1653,6 +1690,25 @@ impl AgentLoop {
                     "content": tool_result_blocks,
                 }));
             }
+        }
+
+        // Safety net: see run_openai — if the loop exhausted its iteration
+        // budget without a tool-call-free turn, no Done was emitted and the
+        // frontend would hang "running" forever. Emit one so the stream closes.
+        if !emitted_terminal {
+            tracing::warn!(
+                "agent loop hit the iteration ceiling ({}) without a terminal turn; emitting Done",
+                self.mode.max_iterations(),
+            );
+            self.app
+                .emit(
+                    event_name,
+                    StreamEvent::Done {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    },
+                )
+                .ok();
         }
 
         Ok(())

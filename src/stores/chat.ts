@@ -114,17 +114,30 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // (no row) and wipe its in-memory history. Keep it as-is.
     const cur = get().activeSession;
     if (cur?.id === id && cur.kind === "anonymous") return;
+    // Tear down the previous session's stream listeners so its events can't
+    // bleed into the newly-selected session, and clear the global `streaming`
+    // flag + queue. `streaming` is a single global flag, so a session left
+    // mid-stream — or one whose terminal event was missed — would otherwise
+    // keep every other session showing "running" and block all sends.
+    // Switching sessions is therefore also the manual recovery path.
+    get()._unlisten?.();
+    get()._unlistenSessionUpdated?.();
     const session = await invoke<Session>("get_session", { sessionId: id });
     const msgs = await invoke<Message[]>("get_messages", { sessionId: id });
     set({
       activeSession: session,
       messages: msgs.map(dbToUI),
       activeModel: session.model_id,
+      streaming: false,
       inputTokenTotal: 0,
       outputTokenTotal: 0,
       pendingPermission: null,
       contextUsage: null,
       compressionToast: null,
+      queue: [],
+      _unlisten: undefined,
+      _unlistenSessionUpdated: undefined,
+      _streamingMsgId: undefined,
     });
   },
 
