@@ -449,25 +449,13 @@ pub async fn spec_ai_assist(
         max_tokens: 2048,
     };
 
-    // GPT-5 / o-series need `max_completion_tokens` instead of `max_tokens` and
-    // reject a non-default `temperature`; no-op for every other model.
+    // Send as-is; post_chat_completions reactively switches to
+    // max_completion_tokens only if the server rejects max_tokens (GPT-5 /
+    // o-series), leaving endpoints that accept the legacy fields untouched.
     let mut body = serde_json::to_value(&request)
         .map_err(|e| format!("Failed to serialize request: {e}"))?;
-    crate::config::settings::adapt_chat_body_for_model(&mut body, &request.model);
-
     let client = Client::new();
-    let response = client
-        .post(&url)
-        .bearer_auth(&api_key)
-        .header("X-Title", "CodeFactory")
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
-    // Use check_status so the provider's actual error message surfaces in the
-    // UI (e.g. "model 'xxx' not found") instead of a generic "HTTP 400".
-    let response = crate::http_util::check_status(response)
+    let response = crate::http_util::post_chat_completions(&client, &url, &api_key, &mut body)
         .await
         .map_err(|e| e.to_string())?;
     let resp: AiResponse = response
@@ -578,25 +566,13 @@ Spec:\n\
         max_tokens: 1024,
     };
 
-    // GPT-5 / o-series need `max_completion_tokens` instead of `max_tokens` and
-    // reject a non-default `temperature`; no-op for every other model.
+    // Send as-is; post_chat_completions reactively switches to
+    // max_completion_tokens only if the server rejects max_tokens (GPT-5 /
+    // o-series), leaving endpoints that accept the legacy fields untouched.
     let mut body = serde_json::to_value(&request)
         .map_err(|e| format!("Failed to serialize request: {e}"))?;
-    crate::config::settings::adapt_chat_body_for_model(&mut body, &request.model);
-
     let client = Client::new();
-    let response = client
-        .post(&url)
-        .bearer_auth(&api_key)
-        .header("X-Title", "CodeFactory")
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
-    // Use check_status so the provider's actual error message surfaces in the
-    // UI (e.g. "model 'xxx' not found") instead of a generic "HTTP 400".
-    let response = crate::http_util::check_status(response)
+    let response = crate::http_util::post_chat_completions(&client, &url, &api_key, &mut body)
         .await
         .map_err(|e| e.to_string())?;
     let resp: AiResponse = response
@@ -754,23 +730,13 @@ User request:\n\
         max_tokens: 1024,
     };
 
-    // GPT-5 / o-series need `max_completion_tokens` instead of `max_tokens` and
-    // reject a non-default `temperature`; no-op for every other model.
+    // Send as-is; post_chat_completions reactively switches to
+    // max_completion_tokens only if the server rejects max_tokens (GPT-5 /
+    // o-series), leaving endpoints that accept the legacy fields untouched.
     let mut body = serde_json::to_value(&request_body)
         .map_err(|e| format!("Failed to serialize request: {e}"))?;
-    crate::config::settings::adapt_chat_body_for_model(&mut body, &request_body.model);
-
     let client = Client::new();
-    let response = client
-        .post(&url)
-        .bearer_auth(&api_key)
-        .header("X-Title", "CodeFactory")
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
-    let response = crate::http_util::check_status(response)
+    let response = crate::http_util::post_chat_completions(&client, &url, &api_key, &mut body)
         .await
         .map_err(|e| e.to_string())?;
     let resp: AiResponse = response
