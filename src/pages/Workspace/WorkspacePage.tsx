@@ -41,6 +41,11 @@ import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
 import { ExecutionStream } from "../../components/ExecutionStream";
+import { GitStatusBar } from "../../components/GitStatusBar";
+import { GitChangesPanel } from "../../components/GitChangesPanel";
+import { GitHistoryPanel } from "../../components/GitHistoryPanel";
+import { RemoteGitPanel } from "../../components/RemoteGitPanel";
+import { useGitStore } from "../../stores/git";
 import { invoke } from "../../lib/tauri";
 import { useChatStore, activeRuntime } from "../../stores/chat";
 import { QueueBadge } from "../../components/QueueBadge";
@@ -102,6 +107,10 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
   const isAnonymous = activeSession?.kind === "anonymous";
   const { settings, setTheme } = useSettingsStore();
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
+  // Git / environment panel — surface the (previously unwired) git UI in the
+  // right column: a branch/status bar + slide-out Changes / History / PR panels.
+  const [gitPanel, setGitPanel] = useState<"changes" | "history" | "remote" | null>(null);
+  const gitBranch = useGitStore((s) => s.status?.branch ?? "");
   // Specs workbench, folded into the Workspace as a full-screen overlay: it's
   // invoked in-context, scoped to this session's cwd, and its "开始实现" creates +
   // runs tasks in THIS session (no navigation away — unified flow).
@@ -332,6 +341,14 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
         {/* ─── Right: connectors (collapsible — informational, not nav) ── */}
         {!connectorsCollapsed && (
           <aside className="w-60 shrink-0 border-l border-border bg-surface-1 flex flex-col">
+            {/* 环境 — the git status bar (branch / ahead-behind / dirty count),
+                opening the Changes / History / PR panels. */}
+            <GitStatusBar
+              cwd={activeSession?.cwd ?? null}
+              onOpenChanges={() => setGitPanel("changes")}
+              onOpenHistory={() => setGitPanel("history")}
+              onOpenRemote={() => setGitPanel("remote")}
+            />
             <ConnectorsColumn cwd={activeSession?.cwd ?? null} />
           </aside>
         )}
@@ -348,6 +365,17 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
             onOpenWorkspace={() => setSpecsOpen(false)}
           />
         </div>
+      )}
+
+      {/* ── Git / environment slide-out panels (opened from the status bar) ─ */}
+      {gitPanel === "changes" && <GitChangesPanel onClose={() => setGitPanel(null)} />}
+      {gitPanel === "history" && <GitHistoryPanel onClose={() => setGitPanel(null)} />}
+      {gitPanel === "remote" && (
+        <RemoteGitPanel
+          cwd={activeSession?.cwd ?? null}
+          currentBranch={gitBranch}
+          onClose={() => setGitPanel(null)}
+        />
       )}
 
       {/* ── Permission dialog overlay ───────────────────────────────────── */}
