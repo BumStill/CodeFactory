@@ -1125,11 +1125,14 @@ impl AgentLoop {
             stream_options: Some(StreamOptions { include_usage: true }),
         };
 
-        // OpenAI's GPT-5 / o-series reject `max_tokens` (→ `max_completion_tokens`)
-        // and any non-default `temperature` on the Chat Completions API. Rewrite
-        // the serialized body for those models; a no-op for everything else.
+        // Send the request as-is — including `max_tokens` + `temperature`. We do
+        // NOT pre-rewrite by model name: providers and proxies routinely serve
+        // GPT-5-named models that accept the legacy fields just fine, and forcing
+        // `max_completion_tokens` (plus dropping `temperature`) on them breaks
+        // chat — the regression introduced by the name-based v1.19.2 attempt and
+        // reported as "1.15 worked, recent builds don't". We adapt REACTIVELY
+        // below, only when the server itself rejects `max_tokens`.
         let mut body = serde_json::to_value(&req)?;
-        crate::config::settings::adapt_chat_body_for_model(&mut body, &req.model);
 
         let mut response = self
             .http
