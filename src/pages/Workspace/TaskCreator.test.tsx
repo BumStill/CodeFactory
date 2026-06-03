@@ -168,6 +168,14 @@ describe("AI task decomposition flow", () => {
     });
     mocks.createTaskTree.mockClear();
     mocks.start.mockClear();
+    // Isolate the 自主 toggle between tests. localStorage persists in CI (Node's
+    // experimental localStorage) but throws in the local runner — guard it so the
+    // autonomous test can't leak its on-state into the reviewed-flow tests.
+    try {
+      localStorage.clear();
+    } catch {
+      /* localStorage unavailable in this env — nothing to isolate */
+    }
   });
 
   it("describes → decomposes → reviews → creates task tree end-to-end", async () => {
