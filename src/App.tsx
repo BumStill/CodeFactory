@@ -3,7 +3,6 @@ import { useEffect, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { HomePage } from "./pages/Home/HomePage";
 import { WorkspacePage } from "./pages/Workspace/WorkspacePage";
-import { SpecsPage } from "./pages/Specs/SpecsPage";
 import { SkillsPage } from "./pages/Skills/SkillsPage";
 import { SettingsPage } from "./pages/Settings/SettingsPage";
 import { ProfilePage } from "./pages/Profile/ProfilePage";
@@ -78,7 +77,6 @@ export default function App() {
       {view === "home" && (
         <HomePage
           onOpenProject={openProject}
-          onOpenSpecs={() => setView("specs")}
           onOpenSkills={() => setView("skills")}
           onOpenSettings={() => setView("settings")}
           onOpenProfile={() => setView("profile")}
@@ -94,7 +92,6 @@ export default function App() {
         />
       )}
 
-      {view === "specs"    && <SpecsPage    onBack={backToHome} onOpenWorkspace={openProject} />}
       {view === "skills"   && <SkillsPage   onBack={backToHome} />}
       {view === "profile"  && <ProfilePage  onBack={backToHome} />}
       {view === "settings" && <SettingsPage onBack={() => setView(activeProject ? "workspace" : "home")} />}
