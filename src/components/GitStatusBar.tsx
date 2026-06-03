@@ -79,7 +79,7 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
   };
 
   return (
-    <div className="flex items-center gap-3 px-3 py-1 border-t border-border bg-surface-1 text-xs text-gray-500 shrink-0 select-none relative">
+    <div className="flex items-center gap-2 px-2 py-1 border-t border-border bg-surface-1 text-xs text-gray-500 shrink-0 select-none relative">
       {/* Branch */}
       <div className="relative" ref={dropdownRef}>
         <button
@@ -88,7 +88,7 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
           title="切换分支"
         >
           <GitBranchIcon size={11} />
-          <span className="truncate max-w-[180px]">{status?.branch ?? "…"}</span>
+          <span className="truncate max-w-[100px]">{status?.branch ?? "…"}</span>
         </button>
         {branchPickerOpen && (
           <div className="absolute bottom-full mb-1 left-0 z-30 w-64 rounded border border-border bg-surface-2 shadow-2xl py-1 max-h-72 overflow-y-auto">
@@ -137,13 +137,6 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
         </span>
       )}
 
-      {/* Upstream */}
-      {status?.upstream && (
-        <span className="text-gray-700 truncate max-w-[160px]" title={status.upstream}>
-          {status.upstream}
-        </span>
-      )}
-
       {/* Dirty count */}
       <button
         onClick={onOpenChanges}
@@ -180,7 +173,6 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
           title="远程仓库（问题与拉取请求）"
         >
           <GitPullRequest size={11} />
-          <span className="text-[10px]">远程仓库</span>
         </button>
       )}
 
