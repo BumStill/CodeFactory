@@ -406,6 +406,26 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
   const [creatorOpen, setCreatorOpen] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
+  // 自主模式 (②-2): describe intent → auto-decompose → auto-create → auto-start,
+  // no modal, no manual review/start. Persisted so it survives reloads. When
+  // off, the reviewed modal flow (+ → describe → review → create → 开始) stays.
+  const [autonomous, setAutonomousState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("cf.workspace.autonomous") === "1";
+    } catch {
+      return false; // localStorage unavailable (e.g. some test envs)
+    }
+  });
+  const setAutonomous = (v: boolean) => {
+    setAutonomousState(v);
+    try {
+      localStorage.setItem("cf.workspace.autonomous", v ? "1" : "0");
+    } catch {
+      // localStorage unavailable — keep the toggle in-memory only.
+    }
+  };
+  const [autoIntent, setAutoIntent] = useState("");
+  const [autoBusy, setAutoBusy] = useState(false);
 
   useEffect(() => {
     loadTasks(sessionId);
@@ -414,7 +434,7 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
     return () => { unsub?.(); };
   }, [sessionId]);
 
-  const handleConfirm = async (decomposed: DecomposedTask[]) => {
+  const createFromDecomposed = async (decomposed: DecomposedTask[]) => {
     const cwd = activeSession?.cwd ?? "";
     const knowledgeLibraries = libraries.filter((library) => library.enabled);
     const inputs: TaskInput[] = decomposed.map((d) => ({
@@ -436,7 +456,38 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
       deps,
       buildTaskConnectorContext(knowledgeLibraries),
     );
+  };
+
+  const handleConfirm = async (decomposed: DecomposedTask[]) => {
+    await createFromDecomposed(decomposed);
     setCreatorOpen(false);
+  };
+
+  // 自主模式的一键闭环:意图 → AI 拆解 → 建任务树 → 开始执行,无模态框、无人工审核。
+  // start() 从数据库读 pending 任务执行,所以 createTaskTree → start 背靠背可行。
+  const runAutonomous = async () => {
+    const intent = autoIntent.trim();
+    if (!intent || autoBusy || isRunning) return;
+    setAutoBusy(true);
+    setStartError(null);
+    try {
+      const cwd = activeSession?.cwd ?? "";
+      const result = await invoke<DecomposedTask[]>("decompose_request_to_tasks", {
+        request: intent,
+        cwd,
+      });
+      if (result.length === 0) {
+        setStartError("AI 没有拆出可执行任务,换个说法再试。");
+        return;
+      }
+      await createFromDecomposed(result);
+      setAutoIntent("");
+      await start(sessionId);
+    } catch (e) {
+      setStartError(String(e));
+    } finally {
+      setAutoBusy(false);
+    }
   };
 
   const handleStart = async () => {
@@ -471,6 +522,22 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
           )}
         </button>
         <div className="flex items-center gap-1">
+          <button
+            onClick={() => setAutonomous(!autonomous)}
+            className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
+              autonomous
+                ? "text-accent bg-accent/10 hover:bg-accent/20"
+                : "text-gray-600 hover:text-gray-300 hover:bg-surface-3"
+            }`}
+            title={
+              autonomous
+                ? "自主模式已开:描述需求即自动拆解并执行(点此关闭,改用审核流)"
+                : "开启自主模式:描述需求即自动拆解并执行,免逐步确认"
+            }
+          >
+            <Sparkles size={10} className={autonomous ? "fill-accent/40" : ""} />
+            自主
+          </button>
           {isRunning ? (
             <button
               onClick={handleCancel}
@@ -492,13 +559,15 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
               </button>
             )
           )}
-          <button
-            onClick={() => setCreatorOpen(true)}
-            className="p-0.5 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-            title="AI 拆解需求为任务"
-          >
-            <Plus size={12} />
-          </button>
+          {!autonomous && (
+            <button
+              onClick={() => setCreatorOpen(true)}
+              className="p-0.5 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+              title="AI 拆解需求为任务"
+            >
+              <Plus size={12} />
+            </button>
+          )}
         </div>
       </div>
       {!collapsed && (
@@ -508,15 +577,60 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
               {startError}
             </div>
           )}
+          {autonomous && (
+            <div className="px-2 py-2 border-b border-border">
+              <textarea
+                value={autoIntent}
+                onChange={(e) => setAutoIntent(e.target.value)}
+                disabled={autoBusy || isRunning}
+                rows={2}
+                aria-label="自主任务描述"
+                placeholder={
+                  isRunning
+                    ? "执行中…用下方「引导下一步」插嘴"
+                    : "描述要做什么,回车自动拆解并执行…"
+                }
+                className="w-full bg-surface-2 border border-border rounded px-2 py-1.5 text-[12px] text-gray-200 outline-none focus:border-accent resize-none disabled:opacity-50"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void runAutonomous();
+                  }
+                }}
+              />
+              <div className="mt-1 flex items-center justify-between">
+                <span className="text-[10px] text-gray-600">回车执行 · Shift+Enter 换行</span>
+                <button
+                  onClick={() => void runAutonomous()}
+                  disabled={autoBusy || isRunning || !autoIntent.trim()}
+                  className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] text-white bg-accent hover:bg-accent-hover transition-colors disabled:opacity-40"
+                >
+                  {autoBusy ? (
+                    <Loader2 size={10} className="animate-spin" />
+                  ) : (
+                    <Sparkles size={10} />
+                  )}
+                  {autoBusy ? "拆解中…" : "自主执行"}
+                </button>
+              </div>
+            </div>
+          )}
           <div className="flex-1 overflow-y-auto p-2">
             {sessionTasks.length === 0 ? (
-              <button
-                onClick={() => setCreatorOpen(true)}
-                className="w-full text-[11px] text-gray-600 hover:text-gray-300 hover:bg-surface-2 rounded transition-colors py-8 leading-relaxed cursor-pointer"
-              >
-                还没有任务<br />
-                <span className="text-gray-700">点这里描述需求<br />AI 会自动拆解</span>
-              </button>
+              autonomous ? (
+                <p className="text-center text-[11px] text-gray-600 py-8 leading-relaxed">
+                  自主模式已开启<br />
+                  <span className="text-gray-700">在上方描述需求<br />AI 自动拆解并执行</span>
+                </p>
+              ) : (
+                <button
+                  onClick={() => setCreatorOpen(true)}
+                  className="w-full text-[11px] text-gray-600 hover:text-gray-300 hover:bg-surface-2 rounded transition-colors py-8 leading-relaxed cursor-pointer"
+                >
+                  还没有任务<br />
+                  <span className="text-gray-700">点这里描述需求<br />AI 会自动拆解</span>
+                </button>
+              )
             ) : (
               <ul className="space-y-0.5">
                 {buildTaskTree(sessionTasks).map(({ task, depth }) => (

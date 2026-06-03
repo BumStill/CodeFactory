@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   createTaskTree: vi.fn().mockResolvedValue(["id-0", "id-1"]),
   loadTasks: vi.fn(),
   subscribe: vi.fn().mockResolvedValue(() => {}),
+  start: vi.fn(),
 }));
 
 vi.mock("../../lib/tauri", async (orig) => {
@@ -108,7 +109,7 @@ const fakeState = {
   loadTasks: mocks.loadTasks,
   subscribe: mocks.subscribe,
   createTaskTree: mocks.createTaskTree,
-  start: vi.fn(),
+  start: mocks.start,
   cancel: vi.fn(),
 };
 vi.mock("../../stores/tasks", () => ({
@@ -166,6 +167,7 @@ describe("AI task decomposition flow", () => {
       return Promise.resolve(undefined);
     });
     mocks.createTaskTree.mockClear();
+    mocks.start.mockClear();
   });
 
   it("describes → decomposes → reviews → creates task tree end-to-end", async () => {
@@ -241,6 +243,52 @@ describe("AI task decomposition flow", () => {
         },
       ],
     });
+  });
+
+  it("autonomous mode: intent → decompose → create → start, no review modal", async () => {
+    const user = userEvent.setup();
+
+    mocks.invoke.mockImplementation((cmd: string, args: { request?: string }) => {
+      if (cmd === "list_knowledge_libraries") {
+        return Promise.resolve([sampleLibrary]);
+      }
+      if (cmd === "decompose_request_to_tasks") {
+        expect(args.request).toBe("加个深色模式");
+        return Promise.resolve([
+          { tmp_id: "t-0", title: "加深色模式开关", description: "theme toggle", dependencies: [], acceptance_criteria: ["切换即时生效"] },
+        ]);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+    );
+
+    // Flip the 自主 toggle on — the inline bar replaces the modal flow.
+    const toggle = await screen.findByRole("button", { name: /自主/ });
+    await user.click(toggle);
+
+    // Describe intent inline, then run.
+    const bar = await screen.findByLabelText("自主任务描述");
+    await user.type(bar, "加个深色模式");
+    await user.click(screen.getByRole("button", { name: /自主执行/ }));
+
+    // Full chain fires: decompose → createTaskTree → start — all automatic.
+    await waitFor(() => expect(mocks.createTaskTree).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(mocks.start).toHaveBeenCalledWith("s1"));
+
+    const [sessionId, tasks] = mocks.createTaskTree.mock.calls[0];
+    expect(sessionId).toBe("s1");
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]).toMatchObject({
+      tmp_id: "t-0",
+      title: "加深色模式开关",
+      cwd: "/Users/x/proj",
+    });
+
+    // The reviewed-flow modal never appeared.
+    expect(screen.queryByText(/审核并确认任务/)).not.toBeInTheDocument();
   });
 
   it("user can remove a decomposed task before confirming", async () => {
