@@ -1125,12 +1125,18 @@ impl AgentLoop {
             stream_options: Some(StreamOptions { include_usage: true }),
         };
 
+        // OpenAI's GPT-5 / o-series reject `max_tokens` (→ `max_completion_tokens`)
+        // and any non-default `temperature` on the Chat Completions API. Rewrite
+        // the serialized body for those models; a no-op for everything else.
+        let mut body = serde_json::to_value(&req)?;
+        crate::config::settings::adapt_chat_body_for_model(&mut body, &req.model);
+
         let response = self
             .http
             .post(&url)
             .bearer_auth(&self.api_key)
             .header("X-Title", "CodeFactory")
-            .json(&req)
+            .json(&body)
             .send()
             .await?;
         // Capture the response body on HTTP errors so the user sees the
