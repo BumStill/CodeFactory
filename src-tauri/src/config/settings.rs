@@ -617,9 +617,21 @@ pub fn is_openai_reasoning_model(model: &str) -> bool {
 ///   consumed entirely by reasoning and yield an empty completion.
 /// - `temperature` is dropped — these models only accept the default (1).
 pub fn adapt_chat_body_for_model(body: &mut serde_json::Value, model: &str) {
-    if !is_openai_reasoning_model(model) {
-        return;
+    if is_openai_reasoning_model(model) {
+        force_max_completion_tokens(body);
     }
+}
+
+/// Unconditionally rewrite a chat body to the GPT-5 / o-series shape
+/// (`max_tokens` → floored `max_completion_tokens`, drop `temperature`),
+/// independent of the model name.
+///
+/// [`adapt_chat_body_for_model`] calls this for models we recognize by name.
+/// It is also the reactive fallback: when a provider answers a request with
+/// HTTP 400 "use 'max_completion_tokens' instead" for a model whose name we
+/// did NOT flag (custom aliases, proxies, Azure deployment ids, `gpt5`…), the
+/// caller applies this and resends — so the fix never depends on guessing names.
+pub fn force_max_completion_tokens(body: &mut serde_json::Value) {
     if let Some(obj) = body.as_object_mut() {
         if let Some(cap) = obj.remove("max_tokens") {
             let floored = cap.as_u64().unwrap_or(8192).max(8192);
@@ -707,5 +719,17 @@ mod reasoning_model_adaptation_tests {
         let before = body.clone();
         adapt_chat_body_for_model(&mut body, "gpt-4o");
         assert_eq!(body, before, "non-reasoning body must be unchanged");
+    }
+
+    #[test]
+    fn force_converts_regardless_of_model_name() {
+        // The reactive fallback fires on the provider's 400 with no model in
+        // hand — it must convert unconditionally (here a name we would NOT flag).
+        let mut body = json!({ "model": "weird-alias-x", "temperature": 0.2, "max_tokens": 1024 });
+        force_max_completion_tokens(&mut body);
+        let obj = body.as_object().unwrap();
+        assert!(!obj.contains_key("max_tokens"));
+        assert!(!obj.contains_key("temperature"));
+        assert_eq!(obj["max_completion_tokens"], json!(8192)); // floored
     }
 }
