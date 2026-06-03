@@ -449,21 +449,12 @@ pub(crate) async fn run_acceptance_check(
         }),
     };
 
-    // GPT-5 / o-series reject `max_tokens` + non-default `temperature`; rewrite
-    // the Openai/Chatgpt body for them (a no-op for the Anthropic shape above,
-    // whose model id never matches the reasoning-family check).
-    crate::config::settings::adapt_chat_body_for_model(&mut body, model_id);
-
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let client = Client::new();
-    let response = match client
-        .post(&url)
-        .bearer_auth(api_key)
-        .header("X-Title", "CodeFactory")
-        .json(&body)
-        .send()
-        .await
-    {
+    // Send as-is; post_chat_completions reactively switches to
+    // max_completion_tokens only if the server rejects max_tokens (no-op for the
+    // Anthropic shape above, and for endpoints happy with the legacy fields).
+    let response = match crate::http_util::post_chat_completions(&client, &url, api_key, &mut body).await {
         Ok(r) => r,
         Err(e) => {
             return AcceptanceCheck {

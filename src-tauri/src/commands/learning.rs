@@ -321,8 +321,6 @@ Tasks from this session:\n{summary}"
         max_tokens: 500, // hard cap — see module-level doc on token economy
     };
 
-    // GPT-5 / o-series need `max_completion_tokens` instead of `max_tokens` and
-    // reject a non-default `temperature`; no-op for every other model.
     let mut body = match serde_json::to_value(&req) {
         Ok(b) => b,
         Err(e) => {
@@ -330,28 +328,15 @@ Tasks from this session:\n{summary}"
             return Ok(vec![]);
         }
     };
-    crate::config::settings::adapt_chat_body_for_model(&mut body, &req.model);
 
     let client = Client::new();
-    let response = match client
-        .post(&url)
-        .bearer_auth(&api_key)
-        .header("X-Title", "CodeFactory")
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
+    // Send as-is; post_chat_completions reactively switches to
+    // max_completion_tokens only if the server rejects max_tokens. Best-effort:
+    // any failure just yields no learnings.
+    let response = match crate::http_util::post_chat_completions(&client, &url, &api_key, &mut body).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("postmortem HTTP failed: {e}");
-            return Ok(vec![]);
-        }
-    };
-    let response = match crate::http_util::check_status(response).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("postmortem status failed: {e}");
+            tracing::warn!("postmortem request failed: {e}");
             return Ok(vec![]);
         }
     };

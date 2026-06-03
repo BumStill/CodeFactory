@@ -13,7 +13,8 @@
 //! or `error` (Anthropic), and surfaces the full text as `AppError::Other`.
 
 use crate::errors::{AppError, Result};
-use reqwest::Response;
+use reqwest::{Client, Response};
+use serde_json::Value;
 
 pub async fn check_status(response: Response) -> Result<Response> {
     let status = response.status();
@@ -65,4 +66,50 @@ pub async fn check_status(response: Response) -> Result<Response> {
         });
 
     Err(AppError::Other(format!("HTTP {status}: {detail}")))
+}
+
+/// POST a one-shot Chat Completions request, reactively switching `max_tokens`
+/// → `max_completion_tokens` only when the server actually rejects it.
+///
+/// Sends `body` exactly as built first — preserving `max_tokens` + `temperature`,
+/// which the overwhelming majority of endpoints (including proxies and
+/// aggregators that serve GPT-5-named models) accept. Only when the server
+/// itself answers 400 "use 'max_completion_tokens' instead" does it rewrite the
+/// body and resend once. This is the non-streaming twin of the interactive-chat
+/// path, so task decomposition, spec assist, post-mortems and acceptance checks
+/// get the same name-independent handling — without the name-based guessing that
+/// broke endpoints perfectly happy with the legacy fields.
+pub async fn post_chat_completions(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    body: &mut Value,
+) -> Result<Response> {
+    let mut resp = client
+        .post(url)
+        .bearer_auth(api_key)
+        .header("X-Title", "CodeFactory")
+        .header("Content-Type", "application/json")
+        .json(&*body)
+        .send()
+        .await?;
+
+    if resp.status().as_u16() == 400 && body.get("max_tokens").is_some() {
+        let err_text = resp.text().await.unwrap_or_default();
+        if err_text.contains("max_completion_tokens") {
+            crate::config::settings::force_max_completion_tokens(body);
+            resp = client
+                .post(url)
+                .bearer_auth(api_key)
+                .header("X-Title", "CodeFactory")
+                .header("Content-Type", "application/json")
+                .json(&*body)
+                .send()
+                .await?;
+        } else {
+            return Err(AppError::Other(format!("HTTP 400 Bad Request: {err_text}")));
+        }
+    }
+
+    check_status(resp).await
 }
