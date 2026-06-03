@@ -1131,7 +1131,7 @@ impl AgentLoop {
         let mut body = serde_json::to_value(&req)?;
         crate::config::settings::adapt_chat_body_for_model(&mut body, &req.model);
 
-        let response = self
+        let mut response = self
             .http
             .post(&url)
             .bearer_auth(&self.api_key)
@@ -1139,6 +1139,33 @@ impl AgentLoop {
             .json(&body)
             .send()
             .await?;
+
+        // Reactive safety net for the GPT-5 / o-series `max_tokens` rejection.
+        // The name-based adaptation above handles the common ids, but providers,
+        // proxies and Azure deployments expose these models under names we can't
+        // anticipate (`gpt5`, custom aliases, deployment ids). When the server
+        // itself answers 400 "use 'max_completion_tokens' instead", honor it
+        // once — regardless of model name — and resend. Makes the fix
+        // name-independent so it can't silently miss a model.
+        if response.status().as_u16() == 400 && body.get("max_tokens").is_some() {
+            let err_text = response.text().await.unwrap_or_default();
+            if err_text.contains("max_completion_tokens") {
+                crate::config::settings::force_max_completion_tokens(&mut body);
+                response = self
+                    .http
+                    .post(&url)
+                    .bearer_auth(&self.api_key)
+                    .header("X-Title", "CodeFactory")
+                    .json(&body)
+                    .send()
+                    .await?;
+            } else {
+                // A different 400 — surface the provider's real reason.
+                return Err(crate::errors::AppError::Other(format!(
+                    "HTTP 400 Bad Request: {err_text}"
+                )));
+            }
+        }
         // Capture the response body on HTTP errors so the user sees the
         // provider's actual rejection reason (bad model id, unsupported
         // field, etc.) rather than just "HTTP 400".
