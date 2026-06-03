@@ -6,7 +6,6 @@ import {
   User,
   Settings as SettingsIcon,
   Puzzle,
-  BookOpen,
   Moon,
   Sun,
   Monitor,
@@ -26,7 +25,6 @@ import type { Session, Theme } from "../../lib/tauri";
 
 interface HomePageProps {
   onOpenProject: (sessionId: string) => void;
-  onOpenSpecs: () => void;
   onOpenSkills: () => void;
   onOpenSettings: () => void;
   onOpenProfile: () => void;
@@ -59,7 +57,6 @@ function Brand() {
 
 export function HomePage({
   onOpenProject,
-  onOpenSpecs,
   onOpenSkills,
   onOpenSettings,
   onOpenProfile,
@@ -157,13 +154,6 @@ export function HomePage({
             title="技能库"
           >
             <Puzzle size={14} />
-          </button>
-          <button
-            onClick={onOpenSpecs}
-            className="p-2 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-            title="Spec Workbench"
-          >
-            <BookOpen size={14} />
           </button>
           <button
             onClick={onOpenSettings}
