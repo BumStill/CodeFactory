@@ -449,13 +449,19 @@ pub async fn spec_ai_assist(
         max_tokens: 2048,
     };
 
+    // GPT-5 / o-series need `max_completion_tokens` instead of `max_tokens` and
+    // reject a non-default `temperature`; no-op for every other model.
+    let mut body = serde_json::to_value(&request)
+        .map_err(|e| format!("Failed to serialize request: {e}"))?;
+    crate::config::settings::adapt_chat_body_for_model(&mut body, &request.model);
+
     let client = Client::new();
     let response = client
         .post(&url)
         .bearer_auth(&api_key)
         .header("X-Title", "CodeFactory")
         .header("Content-Type", "application/json")
-        .json(&request)
+        .json(&body)
         .send()
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;
@@ -572,13 +578,19 @@ Spec:\n\
         max_tokens: 1024,
     };
 
+    // GPT-5 / o-series need `max_completion_tokens` instead of `max_tokens` and
+    // reject a non-default `temperature`; no-op for every other model.
+    let mut body = serde_json::to_value(&request)
+        .map_err(|e| format!("Failed to serialize request: {e}"))?;
+    crate::config::settings::adapt_chat_body_for_model(&mut body, &request.model);
+
     let client = Client::new();
     let response = client
         .post(&url)
         .bearer_auth(&api_key)
         .header("X-Title", "CodeFactory")
         .header("Content-Type", "application/json")
-        .json(&request)
+        .json(&body)
         .send()
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;
@@ -742,13 +754,19 @@ User request:\n\
         max_tokens: 1024,
     };
 
+    // GPT-5 / o-series need `max_completion_tokens` instead of `max_tokens` and
+    // reject a non-default `temperature`; no-op for every other model.
+    let mut body = serde_json::to_value(&request_body)
+        .map_err(|e| format!("Failed to serialize request: {e}"))?;
+    crate::config::settings::adapt_chat_body_for_model(&mut body, &request_body.model);
+
     let client = Client::new();
     let response = client
         .post(&url)
         .bearer_auth(&api_key)
         .header("X-Title", "CodeFactory")
         .header("Content-Type", "application/json")
-        .json(&request_body)
+        .json(&body)
         .send()
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;

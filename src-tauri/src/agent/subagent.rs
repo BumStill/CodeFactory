@@ -429,7 +429,7 @@ pub(crate) async fn run_acceptance_check(
          Reply with JSON only (no markdown): {{ \"passed\": bool, \"reason\": string }}"
     );
 
-    let body = match api_style {
+    let mut body = match api_style {
         ApiStyle::Anthropic => serde_json::json!({
             "model": model_id,
             "max_tokens": 256,
@@ -448,6 +448,11 @@ pub(crate) async fn run_acceptance_check(
             "stream": false
         }),
     };
+
+    // GPT-5 / o-series reject `max_tokens` + non-default `temperature`; rewrite
+    // the Openai/Chatgpt body for them (a no-op for the Anthropic shape above,
+    // whose model id never matches the reasoning-family check).
+    crate::config::settings::adapt_chat_body_for_model(&mut body, model_id);
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let client = Client::new();

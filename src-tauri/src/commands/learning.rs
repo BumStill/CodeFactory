@@ -321,13 +321,24 @@ Tasks from this session:\n{summary}"
         max_tokens: 500, // hard cap — see module-level doc on token economy
     };
 
+    // GPT-5 / o-series need `max_completion_tokens` instead of `max_tokens` and
+    // reject a non-default `temperature`; no-op for every other model.
+    let mut body = match serde_json::to_value(&req) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("postmortem serialize failed: {e}");
+            return Ok(vec![]);
+        }
+    };
+    crate::config::settings::adapt_chat_body_for_model(&mut body, &req.model);
+
     let client = Client::new();
     let response = match client
         .post(&url)
         .bearer_auth(&api_key)
         .header("X-Title", "CodeFactory")
         .header("Content-Type", "application/json")
-        .json(&req)
+        .json(&body)
         .send()
         .await
     {
