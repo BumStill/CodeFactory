@@ -81,6 +81,11 @@ vi.mock("../../stores/chat", () => ({
 vi.mock("../../components/ModelPicker", () => ({
   ModelPicker: () => null,
 }));
+// Stub CheckpointsPanel — it calls Tauri listen() + list_checkpoints, neither
+// of which exists in jsdom; this flow doesn't exercise checkpoints.
+vi.mock("../../components/CheckpointsPanel", () => ({
+  CheckpointsPanel: () => null,
+}));
 vi.mock("../../components/MessageList", () => ({
   MessageList: () => null,
 }));

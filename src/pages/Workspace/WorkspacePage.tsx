@@ -42,6 +42,7 @@ import { PermissionDialog } from "../../components/PermissionDialog";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
 import { ExecutionStream } from "../../components/ExecutionStream";
 import { GitStatusBar } from "../../components/GitStatusBar";
+import { CheckpointsPanel } from "../../components/CheckpointsPanel";
 import { GitChangesPanel } from "../../components/GitChangesPanel";
 import { GitHistoryPanel } from "../../components/GitHistoryPanel";
 import { RemoteGitPanel } from "../../components/RemoteGitPanel";
@@ -351,6 +352,9 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
               onOpenRemote={() => setGitPanel("remote")}
             />
             <ConnectorsColumn cwd={activeSession?.cwd ?? null} />
+            {/* ②-4 审核面:每次自主执行(及每条消息)前的检查点都在这里,
+                点「恢复」先看文件级 diff 再决定撤销;不撤即采纳。 */}
+            <CheckpointsPanel sessionId={sessionId} />
           </aside>
         )}
       </div>
