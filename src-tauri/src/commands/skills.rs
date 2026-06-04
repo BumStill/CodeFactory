@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 // ── Data structures ───────────────────────────────────────────────────────────
@@ -268,6 +268,207 @@ pub async fn install_skill_from_url(url: String, _app: AppHandle) -> Result<Skil
 
     write_manifest(&manifest.path, &manifest)?;
     Ok(manifest)
+}
+
+// ── Local-directory import (SKILL.md / manifest.json) ─────────────────────────
+
+/// Frontmatter + body parsed out of a `SKILL.md` (the standard Claude skill
+/// format used by superpowers / openspec / etc.).
+struct ParsedSkillMd {
+    id: String,
+    name: String,
+    description: String,
+    tags: Vec<String>,
+    body: String,
+}
+
+/// Best-effort parse of a `SKILL.md`: a leading `--- … ---` frontmatter (we read
+/// name / description / id / tags) followed by the markdown body, which becomes
+/// the skill's system prompt. No YAML dependency — these manifests use simple
+/// `key: value` lines.
+fn parse_skill_md(content: &str) -> ParsedSkillMd {
+    let content = content.trim_start_matches('\u{feff}'); // strip BOM
+    let (frontmatter, body) = {
+        let t = content.trim_start();
+        match t
+            .strip_prefix("---")
+            .and_then(|after| after.find("\n---").map(|c| (after, c)))
+        {
+            Some((after, close)) => {
+                let fm = after[..close].to_string();
+                let rest = after[close + 4..].trim_start_matches('-');
+                (fm, rest.trim_start_matches(['\r', '\n']).to_string())
+            }
+            None => (String::new(), content.to_string()),
+        }
+    };
+
+    let mut id = String::new();
+    let mut name = String::new();
+    let mut description = String::new();
+    let mut tags: Vec<String> = Vec::new();
+    for line in frontmatter.lines() {
+        if let Some((k, v)) = line.trim().split_once(':') {
+            let val = v.trim().trim_matches(['"', '\'']).to_string();
+            match k.trim().to_ascii_lowercase().as_str() {
+                "name" => name = val,
+                "description" => description = val,
+                "id" | "slug" => id = val,
+                "tags" => {
+                    tags = val
+                        .trim_matches(['[', ']'])
+                        .split(',')
+                        .map(|s| s.trim().trim_matches(['"', '\'']).to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+    }
+    ParsedSkillMd { id, name, description, tags, body }
+}
+
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in s.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let s = out.trim_matches('-').to_string();
+    if s.is_empty() {
+        "imported-skill".to_string()
+    } else {
+        s
+    }
+}
+
+fn is_skill_dir(d: &Path) -> bool {
+    d.join("SKILL.md").exists() || d.join("manifest.json").exists()
+}
+
+/// Walk `dir` (bounded depth) collecting every skill directory — one holding a
+/// SKILL.md or manifest.json. A skill dir is a leaf (we don't descend into it),
+/// so a single skill, a `skills/<name>/` collection, or a whole repo all work.
+/// Hidden dirs (.git, …) are skipped.
+fn collect_skill_dirs(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
+    if is_skill_dir(dir) {
+        out.push(dir.to_path_buf());
+        return;
+    }
+    if depth == 0 {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let hidden = p
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with('.'))
+                .unwrap_or(false);
+            if p.is_dir() && !hidden {
+                collect_skill_dirs(&p, depth - 1, out);
+            }
+        }
+    }
+}
+
+/// Import one skill directory into the user skills folder. Returns its manifest.
+fn import_one_skill_dir(src: &Path) -> Result<SkillManifest, String> {
+    let (id_raw, name, description, version, author, tags, body): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Vec<String>,
+        Option<String>,
+    ) = if src.join("manifest.json").exists() {
+        let raw =
+            std::fs::read_to_string(src.join("manifest.json")).map_err(|e| e.to_string())?;
+        let mf: ManifestFile =
+            serde_json::from_str(&raw).map_err(|e| format!("manifest.json 解析失败: {e}"))?;
+        (mf.id, mf.name, mf.description, mf.version, mf.author, mf.tags, mf.system_prompt)
+    } else {
+        let raw = std::fs::read_to_string(src.join("SKILL.md")).map_err(|e| e.to_string())?;
+        let p = parse_skill_md(&raw);
+        (p.id, p.name, p.description, "1.0.0".into(), "imported".into(), p.tags, Some(p.body))
+    };
+
+    let dir_name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let id = if !id_raw.trim().is_empty() {
+        slugify(&id_raw)
+    } else if !name.trim().is_empty() {
+        slugify(&name)
+    } else {
+        slugify(&dir_name)
+    };
+
+    let dest = user_skills_dir().join(&id);
+    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+
+    let manifest = SkillManifest {
+        id: id.clone(),
+        name: if name.trim().is_empty() { id.clone() } else { name },
+        description,
+        version,
+        author,
+        tags,
+        enabled: true, // imported skills are active immediately
+        path: dest.to_string_lossy().to_string(),
+        source: "user".to_string(),
+    };
+    write_manifest(&manifest.path, &manifest)?;
+
+    // system_prompt.md: SKILL.md body wins; else copy an existing one if present.
+    if let Some(body) = body {
+        std::fs::write(dest.join("system_prompt.md"), body).map_err(|e| e.to_string())?;
+    } else if src.join("system_prompt.md").exists() {
+        let _ = std::fs::copy(src.join("system_prompt.md"), dest.join("system_prompt.md"));
+    }
+    // Carry across the optional extras CodeFactory understands.
+    for f in ["slash_commands.json", "tool_policy.json"] {
+        if src.join(f).exists() {
+            let _ = std::fs::copy(src.join(f), dest.join(f));
+        }
+    }
+    Ok(manifest)
+}
+
+/// Import skill(s) from a local directory — a single skill folder, a
+/// `skills/<name>/` collection, or a whole repo. Parses `SKILL.md` frontmatter
+/// (superpowers / openspec format) when there's no `manifest.json`.
+#[tauri::command]
+pub async fn install_skill_from_directory(dir_path: String) -> Result<Vec<SkillManifest>, String> {
+    let src = PathBuf::from(&dir_path);
+    if !src.is_dir() {
+        return Err("不是有效的目录".to_string());
+    }
+    let mut dirs = Vec::new();
+    collect_skill_dirs(&src, 3, &mut dirs);
+    if dirs.is_empty() {
+        return Err("目录里没找到 skill（需要含 SKILL.md 或 manifest.json 的文件夹）".to_string());
+    }
+    let mut imported = Vec::new();
+    for d in dirs {
+        match import_one_skill_dir(&d) {
+            Ok(m) => imported.push(m),
+            Err(e) => tracing::warn!("skill 导入跳过 {}: {e}", d.display()),
+        }
+    }
+    if imported.is_empty() {
+        return Err("找到了 skill 目录但全部导入失败".to_string());
+    }
+    Ok(imported)
 }
 
 #[tauri::command]

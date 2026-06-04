@@ -34,6 +34,7 @@ interface SkillsStore {
   enableSkill: (id: string) => Promise<void>;
   disableSkill: (id: string) => Promise<void>;
   installFromUrl: (url: string) => Promise<void>;
+  importFromDirectory: (dirPath: string) => Promise<number>;
   deleteSkill: (id: string) => Promise<void>;
   getSkillDetail: (id: string) => Promise<SkillDetail>;
 }
@@ -68,6 +69,13 @@ export const useSkillsStore = create<SkillsStore>((set) => ({
     await invoke("install_skill_from_url", { url });
     const skills = await invoke<SkillManifest[]>("list_skills");
     set({ skills });
+  },
+
+  importFromDirectory: async (dirPath) => {
+    const imported = await invoke<SkillManifest[]>("install_skill_from_directory", { dirPath });
+    const skills = await invoke<SkillManifest[]>("list_skills");
+    set({ skills });
+    return imported.length;
   },
 
   deleteSkill: async (id) => {

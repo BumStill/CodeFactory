@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect, useState } from "react";
-import { ChevronLeft, Plus, Trash2, Tag, Terminal, Download, Store } from "lucide-react";
+import { ChevronLeft, Plus, Trash2, Tag, Terminal, Download, Store, FolderOpen } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useSkillsStore, type SkillManifest, type SkillDetail } from "../../stores/skills";
 
 interface SkillsPageProps {
@@ -26,7 +27,7 @@ const REGISTRY_URL =
   "https://raw.githubusercontent.com/BumStill/codefactory-skills/main/registry.json";
 
 export function SkillsPage({ onBack }: SkillsPageProps) {
-  const { skills, loading, loadSkills, enableSkill, disableSkill, installFromUrl, deleteSkill, getSkillDetail } =
+  const { skills, loading, loadSkills, enableSkill, disableSkill, installFromUrl, importFromDirectory, deleteSkill, getSkillDetail } =
     useSkillsStore();
 
   const [tab, setTab] = useState<Tab>("installed");
@@ -55,6 +56,23 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
       loadMarketplace();
     }
   }, [tab]);
+
+  const handleImportDir = async () => {
+    setInstallError(null);
+    try {
+      const dir = await openDialog({
+        directory: true,
+        title: "选择 skill 目录（含 SKILL.md 或 manifest.json，可整个仓库）",
+      });
+      if (!dir || typeof dir !== "string") return;
+      setInstalling(true);
+      await importFromDirectory(dir);
+    } catch (e) {
+      setInstallError(String(e));
+    } finally {
+      setInstalling(false);
+    }
+  };
 
   const loadMarketplace = async () => {
     setMarketLoading(true);
@@ -220,9 +238,17 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
                   onClick={handleInstall}
                   disabled={installing || !installUrl.trim()}
                   className="p-1.5 rounded bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
-                  title="安装技能"
+                  title="从 URL 安装技能"
                 >
                   <Plus size={12} />
+                </button>
+                <button
+                  onClick={handleImportDir}
+                  disabled={installing}
+                  className="p-1.5 rounded bg-surface-3 hover:bg-surface-2 text-gray-300 border border-border disabled:opacity-50 transition-colors"
+                  title="从本地目录导入（支持 SKILL.md，如 superpowers / openspec，可整个仓库批量导入）"
+                >
+                  <FolderOpen size={12} />
                 </button>
               </div>
               {installError && (
