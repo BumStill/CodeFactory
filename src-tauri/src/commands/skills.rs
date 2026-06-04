@@ -471,6 +471,86 @@ pub async fn install_skill_from_directory(dir_path: String) -> Result<Vec<SkillM
     Ok(imported)
 }
 
+// ── Reusable, app-independent skill ops (shared by agent tools) ───────────────
+
+/// Create a new USER skill on disk. Only touches the user skills dir (no
+/// AppHandle needed), so the agent's skill tools can call it. Errors if the id
+/// already exists — use [`update_user_skill`] to change one.
+pub fn create_user_skill(
+    name: &str,
+    description: &str,
+    instructions: &str,
+    enabled: bool,
+) -> Result<SkillManifest, String> {
+    let id = slugify(name);
+    let dest = user_skills_dir().join(&id);
+    if dest.exists() {
+        return Err(format!("技能 '{id}' 已存在，请改用更新（skill_update）"));
+    }
+    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+    let manifest = SkillManifest {
+        id: id.clone(),
+        name: name.to_string(),
+        description: description.to_string(),
+        version: "1.0.0".to_string(),
+        author: "you".to_string(),
+        tags: vec![],
+        enabled,
+        path: dest.to_string_lossy().to_string(),
+        source: "user".to_string(),
+    };
+    write_manifest(&manifest.path, &manifest)?;
+    std::fs::write(dest.join("system_prompt.md"), instructions).map_err(|e| e.to_string())?;
+    Ok(manifest)
+}
+
+/// Update an existing USER skill's fields / instructions. Each `Some` is applied;
+/// `None` leaves that field as-is. The enabled state is preserved.
+pub fn update_user_skill(
+    id: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+    instructions: Option<&str>,
+) -> Result<SkillManifest, String> {
+    let dir = user_skills_dir().join(id);
+    if !dir.exists() {
+        return Err(format!("用户技能 '{id}' 不存在"));
+    }
+    let raw = std::fs::read_to_string(dir.join("manifest.json")).map_err(|e| e.to_string())?;
+    let mf: ManifestFile =
+        serde_json::from_str(&raw).map_err(|e| format!("manifest.json 解析失败: {e}"))?;
+    let manifest = SkillManifest {
+        id: id.to_string(),
+        name: name.map(String::from).unwrap_or(mf.name),
+        description: description.map(String::from).unwrap_or(mf.description),
+        version: mf.version,
+        author: mf.author,
+        tags: mf.tags,
+        enabled: mf.enabled,
+        path: dir.to_string_lossy().to_string(),
+        source: "user".to_string(),
+    };
+    write_manifest(&manifest.path, &manifest)?;
+    if let Some(instr) = instructions {
+        std::fs::write(dir.join("system_prompt.md"), instr).map_err(|e| e.to_string())?;
+    }
+    Ok(manifest)
+}
+
+/// List the USER skills (those under the user skills dir). App-independent.
+pub fn list_user_skills() -> Vec<SkillManifest> {
+    scan_skill_dir(&user_skills_dir(), "user")
+}
+
+/// Delete a USER skill by id. App-independent.
+pub fn delete_user_skill(id: &str) -> Result<(), String> {
+    let dir = user_skills_dir().join(id);
+    if !dir.exists() {
+        return Err(format!("用户技能 '{id}' 不存在"));
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn delete_skill(id: String, app: AppHandle) -> Result<(), String> {
     let skills = list_skills(app).await?;

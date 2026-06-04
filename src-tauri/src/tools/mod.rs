@@ -11,6 +11,7 @@ pub mod pptx;
 pub mod pptx_edit;
 pub mod read;
 pub mod shell_policy;
+pub mod skill_mgmt;
 pub mod test_path;
 pub mod workspace_path;
 pub mod write;
@@ -86,6 +87,10 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         pptx_edit::edit_definition(),
         pptx_edit::format_definition(),
         docx::definition(),
+        skill_mgmt::create_definition(),
+        skill_mgmt::update_definition(),
+        skill_mgmt::list_definition(),
+        skill_mgmt::delete_definition(),
     ]
 }
 
@@ -104,6 +109,10 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "edit_pptx" => pptx_edit::execute_edit(args, ctx).await,
         "format_pptx" => pptx_edit::execute_format(args, ctx).await,
         "write_docx" => docx::execute(args, ctx).await,
+        "skill_create" => skill_mgmt::execute_create(args, ctx).await,
+        "skill_update" => skill_mgmt::execute_update(args, ctx).await,
+        "skill_list" => skill_mgmt::execute_list(args, ctx).await,
+        "skill_delete" => skill_mgmt::execute_delete(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),
     }
 }
