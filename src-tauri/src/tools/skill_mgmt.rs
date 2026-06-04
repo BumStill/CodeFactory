@@ -173,3 +173,92 @@ pub async fn execute_delete(args: Value, _ctx: &ExecCtx) -> Result<ToolOutput> {
         Err(e) => Ok(ToolOutput::err(e)),
     }
 }
+
+pub fn search_definition() -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".into(),
+        function: FunctionDefinition {
+            name: "skill_search".into(),
+            description: "Search the skill registry for installable skills matching a query \
+                (by name / description / tags). Use this when the user wants you to find a skill \
+                for some capability. Then install one with skill_fetch <id>."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "What capability to look for, e.g. PDF 表格 / code review" }
+                },
+                "required": ["query"]
+            }),
+        },
+    }
+}
+
+pub async fn execute_search(args: Value, _ctx: &ExecCtx) -> Result<ToolOutput> {
+    #[derive(Deserialize)]
+    struct A {
+        query: String,
+    }
+    let a: A = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(ToolOutput::err(format!("skill_search 参数错误: {e}"))),
+    };
+    let results = crate::commands::skills::search_registry_skills(&a.query).await;
+    if results.is_empty() {
+        return Ok(ToolOutput::ok(format!(
+            "registry 里没找到和「{}」匹配的技能。你也可以给我一个 GitHub 仓库或 SKILL.md 链接,用 skill_fetch 直接装。",
+            a.query
+        )));
+    }
+    let mut out = String::from("找到这些可安装技能(用 skill_fetch <id> 安装):\n");
+    for s in results.iter().take(15) {
+        out.push_str(&format!("- {} (id: {}) — {}\n", s.name, s.id, s.description));
+    }
+    Ok(ToolOutput::ok(out))
+}
+
+pub fn fetch_definition() -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".into(),
+        function: FunctionDefinition {
+            name: "skill_fetch".into(),
+            description: "Install a skill from a source: a registry id (from skill_search), a git \
+                repo URL (github/gitlab — shallow-cloned, finds every SKILL.md), a manifest JSON \
+                URL, or a local directory path. Installs DISABLED — tell the user to review and \
+                enable it on the Skills page."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "registry id, git URL, JSON URL, or a local directory path" }
+                },
+                "required": ["source"]
+            }),
+        },
+    }
+}
+
+pub async fn execute_fetch(args: Value, _ctx: &ExecCtx) -> Result<ToolOutput> {
+    #[derive(Deserialize)]
+    struct A {
+        source: String,
+    }
+    let a: A = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return Ok(ToolOutput::err(format!("skill_fetch 参数错误: {e}"))),
+    };
+    match crate::commands::skills::fetch_skill_from_source(&a.source).await {
+        Ok(ms) => {
+            let names = ms
+                .iter()
+                .map(|m| format!("「{}」(id: {})", m.name, m.id))
+                .collect::<Vec<_>>()
+                .join("、");
+            Ok(ToolOutput::ok(format!(
+                "已获取 {} 个技能(均未启用):{names}。请到 Skills 页预览内容并启用后即生效。",
+                ms.len()
+            )))
+        }
+        Err(e) => Ok(ToolOutput::err(e)),
+    }
+}

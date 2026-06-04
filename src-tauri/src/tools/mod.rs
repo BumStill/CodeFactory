@@ -91,6 +91,8 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         skill_mgmt::update_definition(),
         skill_mgmt::list_definition(),
         skill_mgmt::delete_definition(),
+        skill_mgmt::search_definition(),
+        skill_mgmt::fetch_definition(),
     ]
 }
 
@@ -113,6 +115,8 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "skill_update" => skill_mgmt::execute_update(args, ctx).await,
         "skill_list" => skill_mgmt::execute_list(args, ctx).await,
         "skill_delete" => skill_mgmt::execute_delete(args, ctx).await,
+        "skill_search" => skill_mgmt::execute_search(args, ctx).await,
+        "skill_fetch" => skill_mgmt::execute_fetch(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),
     }
 }
