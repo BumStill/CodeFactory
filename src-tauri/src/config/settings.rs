@@ -309,9 +309,25 @@ impl Default for Settings {
             endpoints,
             default_endpoint: "openrouter".into(),
             default_model: "anthropic/claude-opus-4-7".into(),
+            // Action-biased default: non-destructive reads + writes (incl.
+            // document generation) auto-approve, so the agent produces
+            // deliverables without a confirmation prompt on every file write.
+            // Only `bash` (external commands) is gated — and its own shell
+            // policy still hard-denies the genuinely dangerous ones.
             permissions: PermissionPolicy {
-                allow: vec!["read_file".into(), "glob".into(), "grep".into()],
-                ask: vec!["write_file".into(), "edit_file".into(), "bash".into()],
+                allow: vec![
+                    "read_file".into(),
+                    "glob".into(),
+                    "grep".into(),
+                    "read_pptx".into(),
+                    "write_file".into(),
+                    "edit_file".into(),
+                    "write_pptx".into(),
+                    "edit_pptx".into(),
+                    "format_pptx".into(),
+                    "write_docx".into(),
+                ],
+                ask: vec!["bash".into()],
                 deny: vec![],
                 full_access: false,
             },
@@ -444,6 +460,26 @@ pub fn load() -> Settings {
     // For every other endpoint that has no active_model yet, leave it
     // None — the resolver will fall back to "first custom_model or
     // first remote model" when the user switches there.
+
+    // Permissions migration: the early default gated every write behind a
+    // confirmation prompt, which made the agent feel like it constantly asks.
+    // If the user never customized it (the policy still equals that exact old
+    // default), upgrade it to the action-biased default. A customized policy is
+    // left untouched.
+    {
+        let p = &settings.permissions;
+        let old_allow = ["read_file", "glob", "grep"];
+        let old_ask = ["write_file", "edit_file", "bash"];
+        let is_old_default = !p.full_access
+            && p.deny.is_empty()
+            && p.allow.len() == old_allow.len()
+            && p.allow.iter().zip(old_allow).all(|(a, b)| a == b)
+            && p.ask.len() == old_ask.len()
+            && p.ask.iter().zip(old_ask).all(|(a, b)| a == b);
+        if is_old_default {
+            settings.permissions = Settings::default().permissions;
+        }
+    }
 
     match persist_git_remote_inline_tokens(&mut settings) {
         Ok(true) => {
