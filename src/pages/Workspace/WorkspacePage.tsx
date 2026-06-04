@@ -51,6 +51,7 @@ import { useChatStore, activeRuntime } from "../../stores/chat";
 import { QueueBadge } from "../../components/QueueBadge";
 import { useSettingsStore } from "../../stores/settings";
 import { useTasksStore } from "../../stores/tasks";
+import { useSpecsStore } from "../../stores/specs";
 import { useSkillsStore } from "../../stores/skills";
 import { useLearningStore } from "../../stores/learning";
 import { useKnowledgeStore } from "../../stores/knowledge";
@@ -396,10 +397,32 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
 // TasksColumn
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Derive a short spec title from a free-form intent: first non-empty line,
+// trimmed and capped so it makes a sane filename slug + sidebar label.
+function deriveSpecTitle(intent: string): string {
+  const firstLine =
+    intent.split("\n").map((l) => l.trim()).find(Boolean) ?? intent.trim();
+  const capped = firstLine.length > 48 ? `${firstLine.slice(0, 48)}…` : firstLine;
+  return capped || "未命名需求";
+}
+
+// Prompt for spec_ai_assist "generate" — mirrors the Specs generator but injects
+// the real req_id/title create_spec already allocated, so the persisted spec and
+// the linked tasks agree on one identifier.
+function buildSpecPrompt(intent: string, reqId: string | null, title: string): string {
+  return (
+    `Generate a complete software specification document in markdown with YAML frontmatter for the following feature. ` +
+    `Include: frontmatter (req_id: ${reqId ?? "CF-001"}, title: ${title}, status: draft, created_at, updated_at, tags, acceptance_criteria), ` +
+    `then sections: Overview, Requirements table, Decision Points (with <!-- DECISION: ... --> comments for anything ambiguous), ` +
+    `and Testing Matrix. Feature description: ${intent}`
+  );
+}
+
 function TasksColumn({ sessionId }: { sessionId: string }) {
   const { tasks, running, loadTasks, subscribe, createTaskTree, start, cancel } = useTasksStore();
   const { activeSession } = useChatStore();
   const { libraries } = useKnowledgeStore();
+  const { createSpec, saveSpec } = useSpecsStore();
   const sessionTasks: TaskRun[] = tasks[sessionId] ?? [];
   const isRunning = running[sessionId] ?? false;
   const pendingCount = sessionTasks.filter((t) => t.status === "pending").length;
@@ -426,6 +449,26 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
   };
   const [autoIntent, setAutoIntent] = useState("");
   const [autoBusy, setAutoBusy] = useState(false);
+  // ②-3 自动写 spec: when on, a substantial intent is first formalized into a
+  // persisted spec (AI), then decomposed from that spec — folding the Specs
+  // "生成" capability into the autonomous flow. Off → intent decomposes directly.
+  const [specFirst, setSpecFirstState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("cf.workspace.specFirst") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const setSpecFirst = (v: boolean) => {
+    setSpecFirstState(v);
+    try {
+      localStorage.setItem("cf.workspace.specFirst", v ? "1" : "0");
+    } catch {
+      // localStorage unavailable — in-memory only.
+    }
+  };
+  // Short phase label shown while the autonomous chain runs ("起草规范…" etc.).
+  const [autoStatus, setAutoStatus] = useState("");
 
   useEffect(() => {
     loadTasks(sessionId);
@@ -463,30 +506,64 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
     setCreatorOpen(false);
   };
 
-  // 自主模式的一键闭环:意图 → AI 拆解 → 建任务树 → 开始执行,无模态框、无人工审核。
-  // start() 从数据库读 pending 任务执行,所以 createTaskTree → start 背靠背可行。
+  // 自主一键闭环:意图 →(可选先写 spec)→ 拆解 → 建任务树 → 开始执行,无模态框、
+  // 无人工审核。start() 从数据库读 pending 任务执行,故 createTaskTree → start 背靠背可行。
   const runAutonomous = async () => {
     const intent = autoIntent.trim();
     if (!intent || autoBusy || isRunning) return;
     setAutoBusy(true);
     setStartError(null);
+    setAutoStatus("");
+    const cwd = activeSession?.cwd ?? "";
     try {
-      const cwd = activeSession?.cwd ?? "";
-      const result = await invoke<DecomposedTask[]>("decompose_request_to_tasks", {
-        request: intent,
-        cwd,
-      });
+      let result: DecomposedTask[];
+      let specReqId: string | undefined;
+      let specTitle: string | undefined;
+      // ②-3: 大意图先 formalize 成一份持久化 spec,再从 spec 拆解。落盘需要项目
+      // 目录 —— 无 cwd(临时会话)时回退为直接拆解。
+      if (specFirst && cwd) {
+        setAutoStatus("起草规范…");
+        const specFile = await createSpec(cwd, deriveSpecTitle(intent));
+        specReqId = specFile.meta.req_id ?? undefined;
+        specTitle = specFile.meta.title;
+        let specMd = await invoke<string>("spec_ai_assist", {
+          specContent: "",
+          instruction: buildSpecPrompt(intent, specFile.meta.req_id, specFile.meta.title),
+        });
+        // Pin the persisted frontmatter req_id to the one create_spec allocated,
+        // so the saved spec and the linked tasks agree on one identifier even if
+        // the model drifts from the requested id.
+        if (specFile.meta.req_id) {
+          specMd = specMd.replace(/^(\s*req_id:\s*).*$/m, `$1${specFile.meta.req_id}`);
+        }
+        await saveSpec(specFile.meta.file_path, specMd);
+        setAutoStatus("拆解规范…");
+        result = await invoke<DecomposedTask[]>("decompose_spec_to_tasks", {
+          specContent: specMd,
+          cwd,
+        });
+      } else {
+        setAutoStatus("拆解需求…");
+        result = await invoke<DecomposedTask[]>("decompose_request_to_tasks", {
+          request: intent,
+          cwd,
+        });
+      }
       if (result.length === 0) {
         setStartError("AI 没有拆出可执行任务,换个说法再试。");
         return;
       }
       await createFromDecomposed(result);
       setAutoIntent("");
-      await start(sessionId);
+      setAutoStatus("");
+      // Spec linkage rides on start() (same contract SpecsPage uses); undefined
+      // for the direct path collapses to a plain start.
+      await start(sessionId, specReqId, specTitle);
     } catch (e) {
       setStartError(String(e));
     } finally {
       setAutoBusy(false);
+      setAutoStatus("");
     }
   };
 
@@ -588,6 +665,8 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
                 placeholder={
                   isRunning
                     ? "执行中…用下方「引导下一步」插嘴"
+                    : specFirst
+                    ? "描述大需求,回车先写规范、再拆解执行…"
                     : "描述要做什么,回车自动拆解并执行…"
                 }
                 className="w-full bg-surface-2 border border-border rounded px-2 py-1.5 text-[12px] text-gray-200 outline-none focus:border-accent resize-none disabled:opacity-50"
@@ -598,20 +677,47 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
                   }
                 }}
               />
-              <div className="mt-1 flex items-center justify-between">
-                <span className="text-[10px] text-gray-600">回车执行 · Shift+Enter 换行</span>
+              <div className="mt-1 flex items-center justify-between gap-2">
                 <button
-                  onClick={() => void runAutonomous()}
-                  disabled={autoBusy || isRunning || !autoIntent.trim()}
-                  className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] text-white bg-accent hover:bg-accent-hover transition-colors disabled:opacity-40"
+                  onClick={() => setSpecFirst(!specFirst)}
+                  disabled={autoBusy || isRunning}
+                  className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors disabled:opacity-40 ${
+                    specFirst
+                      ? "text-accent bg-accent/10 hover:bg-accent/20"
+                      : "text-gray-600 hover:text-gray-300 hover:bg-surface-3"
+                  }`}
+                  title={
+                    specFirst
+                      ? "先写规范:大意图先 formalize 成 spec、落盘后再拆解(点此关闭)"
+                      : "开启先写规范:大需求先让 AI 写一份 spec,落盘后再拆解执行"
+                  }
                 >
-                  {autoBusy ? (
-                    <Loader2 size={10} className="animate-spin" />
-                  ) : (
-                    <Sparkles size={10} />
-                  )}
-                  {autoBusy ? "拆解中…" : "自主执行"}
+                  <BookOpen size={10} />
+                  先写规范
                 </button>
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="truncate text-[10px] text-gray-600">
+                    {autoBusy && autoStatus ? (
+                      <span className="text-accent">{autoStatus}</span>
+                    ) : (
+                      "回车 · Shift+Enter 换行"
+                    )}
+                  </span>
+                  <button
+                    onClick={() => void runAutonomous()}
+                    disabled={autoBusy || isRunning || !autoIntent.trim()}
+                    className="flex shrink-0 items-center gap-1 px-2 py-0.5 rounded text-[10px] text-white bg-accent hover:bg-accent-hover transition-colors disabled:opacity-40"
+                  >
+                    {autoBusy ? (
+                      <Loader2 size={10} className="animate-spin" />
+                    ) : specFirst ? (
+                      <BookOpen size={10} />
+                    ) : (
+                      <Sparkles size={10} />
+                    )}
+                    {autoBusy ? "执行中…" : specFirst ? "写规范并执行" : "自主执行"}
+                  </button>
+                </div>
               </div>
             </div>
           )}

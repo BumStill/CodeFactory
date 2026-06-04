@@ -284,7 +284,8 @@ describe("AI task decomposition flow", () => {
 
     // Full chain fires: decompose → createTaskTree → start — all automatic.
     await waitFor(() => expect(mocks.createTaskTree).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(mocks.start).toHaveBeenCalledWith("s1"));
+    // Direct path passes the spec args as undefined (uniform start signature).
+    await waitFor(() => expect(mocks.start).toHaveBeenCalledWith("s1", undefined, undefined));
 
     const [sessionId, tasks] = mocks.createTaskTree.mock.calls[0];
     expect(sessionId).toBe("s1");
@@ -297,6 +298,70 @@ describe("AI task decomposition flow", () => {
 
     // The reviewed-flow modal never appeared.
     expect(screen.queryByText(/审核并确认任务/)).not.toBeInTheDocument();
+  });
+
+  it("autonomous + 先写规范: writes a spec, decomposes it, links tasks to the spec", async () => {
+    const user = userEvent.setup();
+
+    mocks.invoke.mockImplementation((cmd: string, args: Record<string, string>) => {
+      if (cmd === "list_knowledge_libraries") {
+        return Promise.resolve([sampleLibrary]);
+      }
+      if (cmd === "create_spec") {
+        expect(args.cwd).toBe("/Users/x/proj");
+        return Promise.resolve({
+          meta: {
+            req_id: "CF-007",
+            title: args.title,
+            file_path: "/Users/x/proj/.codefactory/specs/x.md",
+            rel_path: ".codefactory/specs/x.md",
+            status: "draft",
+          },
+          content: "",
+          body: "",
+        });
+      }
+      if (cmd === "spec_ai_assist") {
+        // The real allocated id is injected into the generate prompt.
+        expect(args.instruction).toContain("CF-007");
+        // Model emits the placeholder id; the chain pins it back to CF-007.
+        return Promise.resolve("---\nreq_id: CF-001\ntitle: 大需求\n---\n# Overview\n…");
+      }
+      if (cmd === "save_spec") {
+        expect(args.content).toContain("req_id: CF-007");
+        return Promise.resolve({ req_id: "CF-007", title: "做一个大功能", file_path: args.path });
+      }
+      if (cmd === "decompose_spec_to_tasks") {
+        expect(args.specContent).toContain("req_id: CF-007");
+        return Promise.resolve([
+          { tmp_id: "t-0", title: "实现 X", description: "…", dependencies: [], acceptance_criteria: ["X 通过"] },
+        ]);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "自主" }));
+    await user.click(screen.getByRole("button", { name: /先写规范/ }));
+    await user.type(await screen.findByLabelText("自主任务描述"), "做一个大功能");
+    await user.click(screen.getByRole("button", { name: /写规范并执行/ }));
+
+    // Full spec-first chain, then linked start.
+    await waitFor(() => expect(mocks.createTaskTree).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(mocks.start).toHaveBeenCalledWith("s1", "CF-007", "做一个大功能"),
+    );
+
+    const cmds = mocks.invoke.mock.calls.map((c: unknown[]) => c[0]);
+    expect(cmds).toContain("create_spec");
+    expect(cmds).toContain("spec_ai_assist");
+    expect(cmds).toContain("save_spec");
+    expect(cmds).toContain("decompose_spec_to_tasks");
+    // The direct path is bypassed when 先写规范 is on.
+    expect(cmds).not.toContain("decompose_request_to_tasks");
   });
 
   it("user can remove a decomposed task before confirming", async () => {
