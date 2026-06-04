@@ -554,6 +554,32 @@ pub fn delete_user_skill(id: &str) -> Result<(), String> {
     std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())
 }
 
+/// Create a skill from the UI form. User-authored → enabled immediately.
+#[tauri::command]
+pub async fn create_skill(
+    name: String,
+    description: String,
+    instructions: String,
+) -> Result<SkillManifest, String> {
+    create_user_skill(&name, &description, &instructions, true)
+}
+
+/// Update a USER skill from the UI form. Only the provided fields change.
+#[tauri::command]
+pub async fn update_skill(
+    id: String,
+    name: Option<String>,
+    description: Option<String>,
+    instructions: Option<String>,
+) -> Result<SkillManifest, String> {
+    update_user_skill(
+        &id,
+        name.as_deref(),
+        description.as_deref(),
+        instructions.as_deref(),
+    )
+}
+
 #[tauri::command]
 pub async fn delete_skill(id: String, app: AppHandle) -> Result<(), String> {
     let skills = list_skills(app).await?;

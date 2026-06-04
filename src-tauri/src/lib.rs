@@ -239,6 +239,8 @@ pub fn run() {
             commands::skills::disable_skill,
             commands::skills::install_skill_from_url,
             commands::skills::install_skill_from_directory,
+            commands::skills::create_skill,
+            commands::skills::update_skill,
             commands::skills::delete_skill,
             commands::skills::list_slash_commands,
             commands::skills::fetch_marketplace_skills,
