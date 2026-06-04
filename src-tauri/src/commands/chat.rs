@@ -219,7 +219,14 @@ pub async fn send_message(
         .rev()
         .find(|m| m.role == "assistant")
         .map(|m| m.content.clone());
-    let mode = crate::agent::decide_chat_mode(prev_assistant.as_deref(), &content);
+    // 信任模式(完全放手):when the user has opted into full access, skip
+    // plan-first entirely and run every turn under the execute contract — they
+    // asked the agent to act, not to ask.
+    let mode = if settings.permissions.full_access {
+        crate::agent::AgentMode::Execute
+    } else {
+        crate::agent::decide_chat_mode(prev_assistant.as_deref(), &content)
+    };
     tracing::info!("send_message: dispatch mode = {:?}", mode);
 
     let db = state.db.read().await.clone();

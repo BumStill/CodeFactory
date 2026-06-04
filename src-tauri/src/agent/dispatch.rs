@@ -44,6 +44,9 @@ const NEGATIONS_EN: &[&str] = &[
 const STRONG_CJK: &[&str] = &[
     "同意", "批准", "执行吧", "开始吧", "动手", "做吧", "搞吧", "去吧",
     "就这样", "就这么", "可以执行", "照这个", "按这个", "确认执行",
+    // Bare confirmations: after a draft the user types "确认/确定" to mean go.
+    // Promoted from the weak tier so they execute even without a trailing "?".
+    "确认", "确定",
 ];
 /// Strong approvals (English, whole multi-word phrases — substring is fine
 /// because the phrase itself is unambiguous).
@@ -53,11 +56,12 @@ const STRONG_EN_PHRASES: &[&str] = &[
 ];
 /// Strong approvals (English, single word — whole-token so "approve" never
 /// fires on "disapprove").
-const STRONG_EN_WORDS: &[&str] = &["approve", "approved", "proceed", "lgtm"];
+const STRONG_EN_WORDS: &[&str] =
+    &["approve", "approved", "proceed", "lgtm", "confirm", "confirmed"];
 
 /// Weak/standalone approvals — only count when the message is essentially
 /// *just* the approval. "好的，但是…" is a refinement, not a green light.
-const WEAK_CJK: &[&str] = &["好", "可以", "行", "嗯", "继续", "确认", "对", "是的", "可", "成"];
+const WEAK_CJK: &[&str] = &["好", "可以", "行", "嗯", "继续", "对", "是的", "可", "成"];
 const WEAK_EN: &[&str] = &[
     "ok", "okay", "k", "yes", "yeah", "yep", "yup", "sure", "fine", "go", "right",
 ];
@@ -82,37 +86,48 @@ pub fn is_pending_proposal(prev_assistant: &str) -> bool {
     t.ends_with('?') || t.ends_with('？')
 }
 
-/// Does the user's message read as a go-ahead to execute?
-///
-/// Order: negations veto first (conservative), then strong cues match
-/// anywhere, then weak cues match only in short messages.
-pub fn is_approval(user_msg: &str) -> bool {
+/// An unambiguous, imperative go-ahead ("做吧 / 执行吧 / 确认 / do it / proceed").
+/// Strong enough to act on even when our previous turn didn't end with a
+/// question — the user is plainly telling us to act, not answering one.
+/// Negations still veto.
+pub fn is_strong_approval(user_msg: &str) -> bool {
     let m = user_msg.trim().to_lowercase();
     if m.is_empty() {
         return false;
     }
     let toks = tokens(&m);
-
-    // 1. Negations veto.
     if NEGATIONS_CJK.iter().any(|n| m.contains(n)) {
         return false;
     }
     if toks.iter().any(|t| NEGATIONS_EN.contains(t)) {
         return false;
     }
-
-    // 2. Strong approvals — match anywhere in the message.
     if STRONG_CJK.iter().any(|s| m.contains(s)) {
         return true;
     }
     if STRONG_EN_PHRASES.iter().any(|s| m.contains(s)) {
         return true;
     }
-    if toks.iter().any(|t| STRONG_EN_WORDS.contains(t)) {
+    toks.iter().any(|t| STRONG_EN_WORDS.contains(t))
+}
+
+/// Does the user's message read as a go-ahead to execute?
+///
+/// A strong approval counts anywhere; weak approvals ("好 / ok") count only when
+/// the whole message is basically "yes" (so "好的，但是…" is a refinement).
+pub fn is_approval(user_msg: &str) -> bool {
+    if is_strong_approval(user_msg) {
         return true;
     }
-
-    // 3. Weak approvals — only when the whole message is basically "yes".
+    let m = user_msg.trim().to_lowercase();
+    let toks = tokens(&m);
+    if NEGATIONS_CJK.iter().any(|n| m.contains(n)) {
+        return false;
+    }
+    if toks.iter().any(|t| NEGATIONS_EN.contains(t)) {
+        return false;
+    }
+    // Weak approvals — only when the whole message is basically "yes".
     let short = m.chars().count() <= 12;
     if !short {
         return false;
@@ -128,6 +143,13 @@ pub fn is_approval(user_msg: &str) -> bool {
 /// `prev_assistant` is the most recent assistant message already in history
 /// (None on the first turn). `user_msg` is the message being sent now.
 pub fn decide_chat_mode(prev_assistant: Option<&str>, user_msg: &str) -> AgentMode {
+    // A clear, imperative go-ahead executes even if our previous turn didn't end
+    // with a question — models don't reliably emit "Ready to proceed?", so we
+    // don't make the contract hinge on it. (Trust mode bypasses this entirely
+    // and runs every turn as Execute; see send_message.)
+    if is_strong_approval(user_msg) {
+        return AgentMode::Execute;
+    }
     match prev_assistant {
         Some(p) if is_pending_proposal(p) && is_approval(user_msg) => AgentMode::Execute,
         _ => AgentMode::Interactive,
@@ -213,5 +235,29 @@ mod tests {
         );
         // First turn of a session.
         assert_eq!(decide_chat_mode(None, "帮我做个 ppt"), AgentMode::Interactive);
+    }
+
+    #[test]
+    fn strong_approval_executes_without_a_pending_question() {
+        // The motivating bug: the agent produced a draft that did NOT end with
+        // "?", and the user confirms — yet it stayed interactive and re-planned.
+        // "确认 / 做吧" now execute anyway.
+        assert!(is_strong_approval("确认"));
+        assert!(is_strong_approval("确定"));
+        assert!(!is_strong_approval("好的")); // weak — still needs a pending "?"
+        assert!(!is_strong_approval("先别确认")); // negation vetoes
+        assert_eq!(
+            decide_chat_mode(Some("这是 PPT 初稿，你看看。"), "确认"),
+            AgentMode::Execute
+        );
+        assert_eq!(
+            decide_chat_mode(Some("方案如下：第一步…第二步…"), "做吧"),
+            AgentMode::Execute
+        );
+        // A bare weak "好" after a no-question statement still stays interactive.
+        assert_eq!(
+            decide_chat_mode(Some("我已经重构了解析器。"), "好"),
+            AgentMode::Interactive
+        );
     }
 }
