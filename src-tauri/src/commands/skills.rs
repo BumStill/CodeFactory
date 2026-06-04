@@ -233,39 +233,42 @@ pub async fn disable_skill(id: String, app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn install_skill_from_url(url: String, _app: AppHandle) -> Result<SkillManifest, String> {
-    // Fetch the JSON manifest (with optional embedded system_prompt)
-    let response = reqwest::get(&url)
+    install_user_skill_from_url(&url, false).await
+}
+
+/// Fetch a JSON skill manifest from `url` and write it to the user skills dir.
+/// `enabled` controls whether it activates immediately. App-independent.
+pub async fn install_user_skill_from_url(url: &str, enabled: bool) -> Result<SkillManifest, String> {
+    let response = reqwest::get(url)
         .await
-        .map_err(|e| format!("Failed to fetch: {e}"))?;
+        .map_err(|e| format!("拉取失败: {e}"))?;
     let raw = response
         .text()
         .await
-        .map_err(|e| format!("Failed to read response: {e}"))?;
+        .map_err(|e| format!("读取响应失败: {e}"))?;
 
     let mf: ManifestFile =
-        serde_json::from_str(&raw).map_err(|e| format!("Invalid manifest JSON: {e}"))?;
+        serde_json::from_str(&raw).map_err(|e| format!("manifest JSON 无效: {e}"))?;
 
-    let user_dir = user_skills_dir();
-    let skill_dir = user_dir.join(&mf.id);
+    let skill_dir = user_skills_dir().join(&mf.id);
     std::fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
-
-    // Write system_prompt.md
-    let system_prompt = mf.system_prompt.clone().unwrap_or_default();
-    std::fs::write(skill_dir.join("system_prompt.md"), &system_prompt)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        skill_dir.join("system_prompt.md"),
+        mf.system_prompt.clone().unwrap_or_default(),
+    )
+    .map_err(|e| e.to_string())?;
 
     let manifest = SkillManifest {
-        id: mf.id.clone(),
-        name: mf.name.clone(),
-        description: mf.description.clone(),
-        version: mf.version.clone(),
-        author: mf.author.clone(),
-        tags: mf.tags.clone(),
-        enabled: false,
+        id: mf.id,
+        name: mf.name,
+        description: mf.description,
+        version: mf.version,
+        author: mf.author,
+        tags: mf.tags,
+        enabled,
         path: skill_dir.to_string_lossy().to_string(),
         source: "user".to_string(),
     };
-
     write_manifest(&manifest.path, &manifest)?;
     Ok(manifest)
 }
@@ -380,7 +383,7 @@ fn collect_skill_dirs(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
 }
 
 /// Import one skill directory into the user skills folder. Returns its manifest.
-fn import_one_skill_dir(src: &Path) -> Result<SkillManifest, String> {
+fn import_one_skill_dir(src: &Path, enabled: bool) -> Result<SkillManifest, String> {
     let (id_raw, name, description, version, author, tags, body): (
         String,
         String,
@@ -423,7 +426,7 @@ fn import_one_skill_dir(src: &Path) -> Result<SkillManifest, String> {
         version,
         author,
         tags,
-        enabled: true, // imported skills are active immediately
+        enabled,
         path: dest.to_string_lossy().to_string(),
         source: "user".to_string(),
     };
@@ -460,7 +463,7 @@ pub async fn install_skill_from_directory(dir_path: String) -> Result<Vec<SkillM
     }
     let mut imported = Vec::new();
     for d in dirs {
-        match import_one_skill_dir(&d) {
+        match import_one_skill_dir(&d, true) {
             Ok(m) => imported.push(m),
             Err(e) => tracing::warn!("skill 导入跳过 {}: {e}", d.display()),
         }
@@ -730,6 +733,114 @@ pub async fn install_marketplace_skill(
 
     write_manifest(&manifest.path, &manifest)?;
     Ok(manifest)
+}
+
+// ── Agent-facing discovery / fetch (search the registry, install from a source) ─
+
+/// The skill registry CodeFactory searches (same catalog as the Skills page).
+/// Remote; falls back to the embedded BUILTIN_REGISTRY on any error.
+const SKILL_REGISTRY_URL: &str =
+    "https://raw.githubusercontent.com/BumStill/codefactory-skills/main/registry.json";
+
+/// Search the registry for installable skills matching `query` (name /
+/// description / id / tags; empty query returns all). App-independent.
+pub async fn search_registry_skills(query: &str) -> Vec<MarketplaceSkill> {
+    let raw = match reqwest::get(SKILL_REGISTRY_URL).await {
+        Ok(r) => r.text().await.unwrap_or_else(|_| BUILTIN_REGISTRY.to_string()),
+        Err(_) => BUILTIN_REGISTRY.to_string(),
+    };
+    let all: Vec<MarketplaceSkill> = serde_json::from_str(&raw)
+        .or_else(|_| serde_json::from_str(BUILTIN_REGISTRY))
+        .unwrap_or_default();
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return all;
+    }
+    all.into_iter()
+        .filter(|s| {
+            s.name.to_lowercase().contains(&q)
+                || s.description.to_lowercase().contains(&q)
+                || s.id.to_lowercase().contains(&q)
+                || s.tags.iter().any(|t| t.to_lowercase().contains(&q))
+        })
+        .collect()
+}
+
+/// Install a registry skill by id (disabled). App-independent.
+async fn install_marketplace_skill_by_id(id: &str) -> Result<SkillManifest, String> {
+    let skill = search_registry_skills("")
+        .await
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| format!("registry 里没有 id 为 '{id}' 的技能（先用 skill_search 搜索）"))?;
+    install_marketplace_skill(skill).await
+}
+
+/// Fetch + install skill(s) from a source, landing them DISABLED (the user
+/// reviews + enables). Accepts, in order: an existing local directory, a git
+/// repo URL (github/gitlab/*.git, shallow-cloned), a manifest JSON URL, or a
+/// registry id. App-independent — backs the agent's `skill_fetch` tool.
+pub async fn fetch_skill_from_source(source: &str) -> Result<Vec<SkillManifest>, String> {
+    let s = source.trim();
+
+    // 1) Existing local directory.
+    let as_path = PathBuf::from(s);
+    if as_path.is_dir() {
+        let mut dirs = Vec::new();
+        collect_skill_dirs(&as_path, 3, &mut dirs);
+        let out: Vec<_> = dirs
+            .iter()
+            .filter_map(|d| import_one_skill_dir(d, false).ok())
+            .collect();
+        return if out.is_empty() {
+            Err("目录里没找到可导入的 skill".into())
+        } else {
+            Ok(out)
+        };
+    }
+
+    // 2) Git repo → shallow clone to a temp dir, import, clean up.
+    if s.starts_with("http")
+        && (s.contains("github.com") || s.contains("gitlab.com") || s.ends_with(".git"))
+    {
+        let tmp = std::env::temp_dir().join(format!("cf-skill-{}", slugify(s)));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let url = s.to_string();
+        let tmp_for_clone = tmp.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("git")
+                .args(["clone", "--depth", "1", &url])
+                .arg(&tmp_for_clone)
+                .status()
+        })
+        .await
+        .map_err(|e| format!("clone 任务失败: {e}"))?
+        .map_err(|e| format!("git 不可用: {e}"))?;
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err("git clone 失败（检查仓库地址是否正确、可访问）".into());
+        }
+        let mut dirs = Vec::new();
+        collect_skill_dirs(&tmp, 3, &mut dirs);
+        let out: Vec<_> = dirs
+            .iter()
+            .filter_map(|d| import_one_skill_dir(d, false).ok())
+            .collect();
+        let _ = std::fs::remove_dir_all(&tmp);
+        return if out.is_empty() {
+            Err("仓库里没找到 skill（需要 SKILL.md 或 manifest.json）".into())
+        } else {
+            Ok(out)
+        };
+    }
+
+    // 3) Plain http(s) URL → a JSON manifest.
+    if s.starts_with("http") {
+        return install_user_skill_from_url(s, false).await.map(|m| vec![m]);
+    }
+
+    // 4) Otherwise: treat as a registry id.
+    install_marketplace_skill_by_id(s).await.map(|m| vec![m])
 }
 
 /// Aggregate slash commands from all enabled skills.
