@@ -1963,6 +1963,12 @@ fn decide_permission(
     tool_name: &str,
     cmd: Option<&str>,
 ) -> PermissionDecision {
+    // Skill-management tools create *disabled* skills — nothing is injected into
+    // the system prompt until the user enables it on the Skills page, which is
+    // the real gate. So they never need a per-call permission prompt.
+    if tool_name.starts_with("skill_") {
+        return PermissionDecision::Allow;
+    }
     if tool_name == "bash" {
         if let Some(command) = cmd {
             match crate::tools::shell_policy::classify_command(command) {
