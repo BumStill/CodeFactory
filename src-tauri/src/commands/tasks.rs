@@ -182,6 +182,52 @@ pub async fn start_implementation(
     let pending_perms = state.pending_permissions.clone();
     let interjections = state.interjections.clone();
 
+    // ②-4: snapshot the working tree before the autonomous run so the user can
+    // review the whole run's diff and revert it with one click — same mechanism
+    // as the per-message chat checkpoint, surfaced in the CheckpointsPanel.
+    // Best-effort: a non-git cwd or a git hiccup just means no safety net this
+    // run, never a blocked start.
+    {
+        use std::path::Path;
+        let cwd: Option<String> = sqlx::query_scalar("SELECT cwd FROM sessions WHERE id = ?")
+            .bind(&session_id)
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+        if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
+            let label = match &spec_title {
+                Some(t) if !t.is_empty() => format!("自主执行：{t}"),
+                _ => "自主执行".to_string(),
+            };
+            match crate::agent::checkpoint::create(Path::new(&cwd), &label) {
+                Ok(Some(sha)) => {
+                    let cp_id = Uuid::new_v4().to_string();
+                    let now = Utc::now().to_rfc3339();
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO checkpoints (id, session_id, message_id, cwd, git_sha, label, created_at, reverted)
+                         VALUES (?, ?, NULL, ?, ?, ?, ?, 0)",
+                    )
+                    .bind(&cp_id)
+                    .bind(&session_id)
+                    .bind(&cwd)
+                    .bind(&sha)
+                    .bind(&label)
+                    .bind(&now)
+                    .execute(&pool)
+                    .await
+                    {
+                        tracing::warn!("autonomous checkpoint INSERT failed: {e}");
+                    } else {
+                        app.emit("checkpoint-created", &session_id).ok();
+                    }
+                }
+                Ok(None) => {} // cwd not a git repo — skip
+                Err(e) => tracing::warn!("autonomous checkpoint create failed: {e}"),
+            }
+        }
+    }
+
     let scheduler = Arc::new(TaskScheduler::new(pool.clone()));
     let cancel = scheduler.cancel_handle();
 
