@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect, useState } from "react";
-import { ChevronLeft, Plus, Trash2, Tag, Terminal, Download, Store, FolderOpen } from "lucide-react";
+import { ChevronLeft, Plus, Trash2, Tag, Terminal, Download, Store, FolderOpen, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useSkillsStore, type SkillManifest, type SkillDetail } from "../../stores/skills";
@@ -27,7 +27,7 @@ const REGISTRY_URL =
   "https://raw.githubusercontent.com/BumStill/codefactory-skills/main/registry.json";
 
 export function SkillsPage({ onBack }: SkillsPageProps) {
-  const { skills, loading, loadSkills, enableSkill, disableSkill, installFromUrl, importFromDirectory, deleteSkill, getSkillDetail } =
+  const { skills, loading, loadSkills, enableSkill, disableSkill, installFromUrl, importFromDirectory, createSkill, updateSkill, deleteSkill, getSkillDetail } =
     useSkillsStore();
 
   const [tab, setTab] = useState<Tab>("installed");
@@ -38,6 +38,42 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
+
+  // Create / edit skill form (P3). null = closed.
+  const [form, setForm] = useState<{
+    mode: "create" | "edit";
+    id?: string;
+    name: string;
+    description: string;
+    instructions: string;
+  } | null>(null);
+  const [savingForm, setSavingForm] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const handleSaveForm = async () => {
+    if (!form || !form.name.trim()) return;
+    setSavingForm(true);
+    setFormError(null);
+    try {
+      if (form.mode === "create") {
+        await createSkill(form.name.trim(), form.description.trim(), form.instructions);
+      } else if (form.id) {
+        await updateSkill(form.id, {
+          name: form.name.trim(),
+          description: form.description.trim(),
+          instructions: form.instructions,
+        });
+        if (selectedId === form.id) {
+          setDetail(await getSkillDetail(form.id));
+        }
+      }
+      setForm(null);
+    } catch (e) {
+      setFormError(String(e));
+    } finally {
+      setSavingForm(false);
+    }
+  };
 
   // Marketplace state
   const [marketSkills, setMarketSkills] = useState<MarketplaceSkill[]>([]);
@@ -251,6 +287,15 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
                   <FolderOpen size={12} />
                 </button>
               </div>
+              <button
+                onClick={() => {
+                  setFormError(null);
+                  setForm({ mode: "create", name: "", description: "", instructions: "" });
+                }}
+                className="w-full flex items-center justify-center gap-1 px-2 py-1 rounded bg-accent/15 hover:bg-accent/25 text-accent text-xs transition-colors"
+              >
+                <Plus size={11} /> 新建技能
+              </button>
               {installError && (
                 <p className="text-xs text-red-400 truncate" title={installError}>
                   {installError}
@@ -408,8 +453,108 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
             detail={detail}
             toggling={togglingId === detail.manifest.id}
             onToggle={() => handleToggle(detail.manifest)}
+            onEdit={() => {
+              setFormError(null);
+              setForm({
+                mode: "edit",
+                id: detail.manifest.id,
+                name: detail.manifest.name,
+                description: detail.manifest.description,
+                instructions: detail.system_prompt,
+              });
+            }}
           />
         ) : null}
+      </div>
+
+      {form && (
+        <SkillFormModal
+          form={form}
+          saving={savingForm}
+          error={formError}
+          onChange={setForm}
+          onCancel={() => setForm(null)}
+          onSave={handleSaveForm}
+        />
+      )}
+    </div>
+  );
+}
+
+function SkillFormModal({
+  form,
+  saving,
+  error,
+  onChange,
+  onCancel,
+  onSave,
+}: {
+  form: { mode: "create" | "edit"; id?: string; name: string; description: string; instructions: string };
+  saving: boolean;
+  error: string | null;
+  onChange: (f: { mode: "create" | "edit"; id?: string; name: string; description: string; instructions: string }) => void;
+  onCancel: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={onCancel}>
+      <div
+        className="w-full max-w-lg rounded-lg border border-border bg-surface-1 shadow-2xl flex flex-col max-h-[85vh]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="flex items-center justify-between px-4 py-3 border-b border-border">
+          <h2 className="text-sm font-semibold text-gray-200">
+            {form.mode === "create" ? "新建技能" : "编辑技能"}
+          </h2>
+          <button onClick={onCancel} className="p-1 rounded text-gray-500 hover:text-gray-200 hover:bg-surface-3">
+            <X size={14} />
+          </button>
+        </header>
+        <div className="flex-1 overflow-y-auto p-4 space-y-3">
+          <div>
+            <label className="block text-[11px] text-gray-500 mb-1">名称</label>
+            <input
+              type="text"
+              autoFocus
+              value={form.name}
+              onChange={(e) => onChange({ ...form, name: e.target.value })}
+              placeholder="例如 周报助手"
+              className="w-full bg-surface-2 border border-border rounded px-2 py-1.5 text-sm text-gray-200 outline-none focus:border-accent"
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] text-gray-500 mb-1">描述（何时使用）</label>
+            <input
+              type="text"
+              value={form.description}
+              onChange={(e) => onChange({ ...form, description: e.target.value })}
+              className="w-full bg-surface-2 border border-border rounded px-2 py-1.5 text-sm text-gray-200 outline-none focus:border-accent"
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] text-gray-500 mb-1">技能指令（启用后注入系统提示）</label>
+            <textarea
+              value={form.instructions}
+              onChange={(e) => onChange({ ...form, instructions: e.target.value })}
+              rows={10}
+              placeholder="用自然语言写下这个技能要让 AI 怎么做…"
+              className="w-full bg-surface-2 border border-border rounded px-2 py-1.5 text-[13px] text-gray-200 outline-none focus:border-accent resize-y font-mono leading-relaxed"
+            />
+          </div>
+          {error && <p className="text-xs text-red-400 break-words">{error}</p>}
+        </div>
+        <footer className="flex items-center justify-end gap-2 px-4 py-3 border-t border-border">
+          <button onClick={onCancel} className="px-3 py-1.5 rounded text-xs text-gray-400 hover:bg-surface-3">
+            取消
+          </button>
+          <button
+            onClick={onSave}
+            disabled={saving || !form.name.trim()}
+            className="px-3 py-1.5 rounded bg-accent hover:bg-accent-hover text-white text-xs disabled:opacity-40"
+          >
+            {saving ? "保存中…" : form.mode === "create" ? "创建" : "保存"}
+          </button>
+        </footer>
       </div>
     </div>
   );
@@ -433,10 +578,12 @@ function SkillDetailView({
   detail,
   toggling,
   onToggle,
+  onEdit,
 }: {
   detail: SkillDetail;
   toggling: boolean;
   onToggle: () => void;
+  onEdit: () => void;
 }) {
   const { manifest, system_prompt, slash_commands, has_tool_policy } = detail;
 
@@ -465,6 +612,14 @@ function SkillDetailView({
             )}
           </div>
         </div>
+        {manifest.source === "user" && (
+          <button
+            onClick={onEdit}
+            className="px-3 py-1.5 rounded text-xs font-medium bg-surface-3 text-gray-400 hover:text-gray-200 hover:bg-surface-4 transition-colors"
+          >
+            编辑
+          </button>
+        )}
         <button
           onClick={onToggle}
           disabled={toggling}
