@@ -620,53 +620,15 @@ pub fn normalize_model_id(model_id: &str, base_url: &str) -> String {
     model_id.to_string()
 }
 
-/// OpenAI's GPT-5 family and the o-series reasoning models (o1/o3/o4) reject two
-/// legacy Chat Completions fields: `max_tokens` (they require
-/// `max_completion_tokens` instead) and any non-default `temperature`. Detect
-/// them from the outbound model id so request builders can emit the modern
-/// shape.
-///
-/// Matches the bare model name after stripping an optional `vendor/` prefix
-/// (OpenRouter-style ids), case-insensitively. Non-reasoning ids like `gpt-4o`,
-/// `claude-*` or `deepseek-*` return false (they still accept `max_tokens`).
-pub fn is_openai_reasoning_model(model: &str) -> bool {
-    let bare = model
-        .rsplit('/')
-        .next()
-        .unwrap_or(model)
-        .to_ascii_lowercase();
-    bare.starts_with("gpt-5")
-        || bare.starts_with("o1")
-        || bare.starts_with("o3")
-        || bare.starts_with("o4")
-}
-
-/// Rewrite a `/chat/completions` request body in place so it satisfies OpenAI's
-/// GPT-5 / o-series models. No-op for every other model, so it is safe to call
-/// unconditionally on any chat body just before sending.
-///
-/// Two adjustments, each otherwise a hard HTTP 400 on those models:
-/// - `max_tokens` → `max_completion_tokens`. The moved cap is floored at 8192
-///   because reasoning models spend part of the budget on hidden reasoning
-///   tokens before any visible output; a small legacy cap (tuned for
-///   output-only models — e.g. 256/500/1024 on the auxiliary calls) can be
-///   consumed entirely by reasoning and yield an empty completion.
-/// - `temperature` is dropped — these models only accept the default (1).
-pub fn adapt_chat_body_for_model(body: &mut serde_json::Value, model: &str) {
-    if is_openai_reasoning_model(model) {
-        force_max_completion_tokens(body);
-    }
-}
-
-/// Unconditionally rewrite a chat body to the GPT-5 / o-series shape
+/// Rewrite a chat body to the GPT-5 / o-series shape
 /// (`max_tokens` → floored `max_completion_tokens`, drop `temperature`),
 /// independent of the model name.
 ///
-/// [`adapt_chat_body_for_model`] calls this for models we recognize by name.
-/// It is also the reactive fallback: when a provider answers a request with
-/// HTTP 400 "use 'max_completion_tokens' instead" for a model whose name we
-/// did NOT flag (custom aliases, proxies, Azure deployment ids, `gpt5`…), the
-/// caller applies this and resends — so the fix never depends on guessing names.
+/// The reactive fallback: when a provider answers a request with HTTP 400
+/// "use 'max_completion_tokens' instead" for any model — including names we
+/// would never flag (custom aliases, proxies, Azure deployment ids, `gpt5`…) —
+/// the caller applies this and resends, so the fix never depends on guessing
+/// model names.
 pub fn force_max_completion_tokens(body: &mut serde_json::Value) {
     if let Some(obj) = body.as_object_mut() {
         if let Some(cap) = obj.remove("max_tokens") {
@@ -689,73 +651,6 @@ pub fn save(settings: &Settings) -> crate::errors::Result<()> {
 mod reasoning_model_adaptation_tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn detects_gpt5_and_o_series_as_reasoning() {
-        for id in [
-            "gpt-5",
-            "gpt-5.4",
-            "gpt-5-mini",
-            "gpt-5-codex",
-            "openai/gpt-5",
-            "GPT-5",
-            "o1",
-            "o1-preview",
-            "o3",
-            "o3-mini",
-            "o4-mini",
-            "openai/o3-mini",
-        ] {
-            assert!(is_openai_reasoning_model(id), "{id} should be reasoning");
-        }
-    }
-
-    #[test]
-    fn non_reasoning_models_are_untouched() {
-        for id in [
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4.1",
-            "gpt-3.5-turbo",
-            "claude-opus-4",
-            "deepseek-chat",
-            "openai/gpt-4o",
-        ] {
-            assert!(!is_openai_reasoning_model(id), "{id} should NOT be reasoning");
-        }
-    }
-
-    #[test]
-    fn adapt_renames_max_tokens_and_drops_temperature_for_reasoning() {
-        let mut body = json!({
-            "model": "gpt-5.4",
-            "messages": [],
-            "temperature": 0.2,
-            "max_tokens": 256
-        });
-        adapt_chat_body_for_model(&mut body, "gpt-5.4");
-        let obj = body.as_object().unwrap();
-        assert!(!obj.contains_key("max_tokens"), "max_tokens must be removed");
-        assert!(!obj.contains_key("temperature"), "temperature must be dropped");
-        // 256 floored up to 8192 so hidden reasoning can't starve the output.
-        assert_eq!(obj["max_completion_tokens"], json!(8192));
-    }
-
-    #[test]
-    fn adapt_preserves_cap_above_the_floor() {
-        let mut body = json!({ "temperature": 0.2, "max_tokens": 16384 });
-        adapt_chat_body_for_model(&mut body, "o3-mini");
-        assert_eq!(body["max_completion_tokens"], json!(16384));
-        assert!(body.as_object().unwrap().get("max_tokens").is_none());
-    }
-
-    #[test]
-    fn adapt_is_noop_for_non_reasoning_models() {
-        let mut body = json!({ "temperature": 0.2, "max_tokens": 8192 });
-        let before = body.clone();
-        adapt_chat_body_for_model(&mut body, "gpt-4o");
-        assert_eq!(body, before, "non-reasoning body must be unchanged");
-    }
 
     #[test]
     fn force_converts_regardless_of_model_name() {
