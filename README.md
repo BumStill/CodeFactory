@@ -39,10 +39,12 @@ API key.
 |---|---|
 | 🔌 **Multi-provider** | OpenRouter, DeepSeek, Anthropic, OpenAI, LMStudio, Ollama. Per-endpoint custom models + auto vendor-prefix normalization (`deepseek/v4-pro` → `v4-pro` for direct providers). |
 | 🛠 **Real tool use** | `read_file`, `write_file`, `edit_file`, `bash` (PowerShell), `grep`, `glob`. Per-file locks + atomic writes + post-write byte-level integrity check. |
+| 📄 **Documents** | Generate and edit Office files from chat: PowerPoint (`read`/`edit`/`format`/`write_pptx`), Word (`write_docx`), Excel (`read_xlsx` / `edit_xlsx` — e.g. summarize a column into the next one row by row). Drop a `.pptx` / `.docx` / `.pdf` / `.xlsx` into the message box and the agent reads it. |
+| 🗂 **Sessions** | Lightweight quick chats and full project workspaces share one rail — rename or delete inline, and multiple sessions stream concurrently without blocking each other. |
 | 🧠 **Context-aware** | Live context-window meter, adaptive compression of oversized tool results when nearing the model's limit, `reasoning_content` propagation for DeepSeek reasoner / Claude thinking-mode models. |
 | 🛡 **Safe by default** | Configurable permission policy per-tool. Path-typo detection blocks hallucinated targets like `app/__iniy/` before they write. Daily DB backups with 7-day rolling retention. |
 | 🤖 **Subagents** | Spec → tasks → parallel subagent dispatch, shared brief, verification engine, evidence pack auto-collection. |
-| 🪝 **Hooks & Skills** | Run scripts on tool events (commit-on-edit, lint-on-write). Drop-in skill packs with system prompts and slash commands. |
+| 🪝 **Hooks & Skills** | Run scripts on tool events (commit-on-edit, lint-on-write). Create, edit, import, or let the agent search for skill packs (system prompts + slash commands) right from the chat box — pull in Superpowers / OpenSpec-style skills with a preview-then-enable step. |
 | 🌐 **MCP client** | Connect Model Context Protocol servers for arbitrary tool extension. |
 | 🔁 **Auto-update** | Signed updates over GitHub Releases. New version arrives → in-app banner → one-click install + relaunch. Your data stays. |
 
@@ -184,9 +186,12 @@ auto-generated release notes via [`cliff.toml`](cliff.toml).
 - [x] Auto-update over GitHub Releases
 - [x] DeepSeek `reasoning_content` round-tripping
 - [x] Path-typo detection harness
-- [ ] Export / import settings + DB
+- [x] Export / import settings + DB
+- [x] Office document generation (PowerPoint / Word / Excel)
+- [x] Skill management from chat (create / edit / import / search)
+- [x] macOS (Apple Silicon) build
 - [ ] Welcome page with template projects
-- [ ] macOS + Linux builds
+- [ ] Linux build
 
 ## License
 
