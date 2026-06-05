@@ -470,9 +470,11 @@ function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
   const subscribe = useLearningStore((s) => s.subscribe);
   const accept = useLearningStore((s) => s.accept);
   const reject = useLearningStore((s) => s.reject);
+  const mine = useLearningStore((s) => s.mine);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<"all" | "memory" | "preference">("all");
+  const [mining, setMining] = useState(false);
+  const [filter, setFilter] = useState<"all" | "memory" | "preference" | "pattern">("all");
 
   useEffect(() => {
     if (!selectedCwd) return;
@@ -508,6 +510,19 @@ function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
     }
   };
 
+  const handleMine = async () => {
+    if (!selectedCwd || mining) return;
+    setMining(true);
+    setError(null);
+    try {
+      await mine(selectedCwd);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setMining(false);
+    }
+  };
+
   const filtered = filter === "all" ? events : events.filter((e) => e.kind === filter);
   const pending = filtered.filter((e) => e.status === "pending");
   const decided = filtered.filter((e) => e.status !== "pending");
@@ -535,20 +550,35 @@ function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
             </span>
           )}
         </h2>
-        <div className="flex items-center rounded border border-border overflow-hidden text-[10px]">
-          {(["all", "memory", "preference"] as const).map((f) => (
-            <button
-              key={f}
-              onClick={() => setFilter(f)}
-              className={`px-2 py-0.5 transition-colors ${
-                filter === f
-                  ? "bg-surface-3 text-accent"
-                  : "text-gray-500 hover:text-gray-300 hover:bg-surface-3"
-              }`}
-            >
-              {f === "all" ? "全部" : f === "memory" ? "记忆" : "偏好"}
-            </button>
-          ))}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleMine}
+            disabled={!selectedCwd || mining}
+            title="跨会话分析：从多次会话的工具失败 / 重试 / 学习接受率里挖出反复出现的模式"
+            className="flex items-center gap-1 rounded border border-border px-2 py-0.5 text-[10px] text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
+          >
+            {mining ? (
+              <Loader2 size={11} className="animate-spin" />
+            ) : (
+              <Sparkles size={11} className="text-accent" />
+            )}
+            分析跨会话模式
+          </button>
+          <div className="flex items-center rounded border border-border overflow-hidden text-[10px]">
+            {(["all", "memory", "preference", "pattern"] as const).map((f) => (
+              <button
+                key={f}
+                onClick={() => setFilter(f)}
+                className={`px-2 py-0.5 transition-colors ${
+                  filter === f
+                    ? "bg-surface-3 text-accent"
+                    : "text-gray-500 hover:text-gray-300 hover:bg-surface-3"
+                }`}
+              >
+                {f === "all" ? "全部" : f === "memory" ? "记忆" : f === "preference" ? "偏好" : "模式"}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -562,7 +592,9 @@ function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
         <div className="rounded-lg border border-dashed border-border bg-surface-1 px-6 py-10 text-center">
           <Sparkles size={20} className="text-gray-600 mx-auto mb-3" />
           <p className="text-sm text-gray-400 font-medium mb-1">
-            {events.length === 0 ? "暂无学习记录" : `没有「${filter === "memory" ? "记忆" : "偏好"}」类型的记录`}
+            {events.length === 0
+              ? "暂无学习记录"
+              : `没有「${filter === "memory" ? "记忆" : filter === "preference" ? "偏好" : "模式"}」类型的记录`}
           </p>
           <p className="text-xs text-gray-500 max-w-md mx-auto leading-relaxed">
             每次任务 / 聊天 session 结束后，AI 自动总结观察到的事实，
@@ -647,6 +679,7 @@ function LearningEventCard({
   onReject: () => void;
 }) {
   const isPref = event.kind === "preference";
+  const isPattern = event.kind === "pattern";
   return (
     <div className="rounded-lg border border-accent/40 bg-accent/5 p-4">
       <div className="flex items-start gap-2 mb-2">
@@ -656,16 +689,24 @@ function LearningEventCard({
           className={`text-[9px] px-1.5 py-0.5 rounded shrink-0 ${
             isPref
               ? "bg-purple-500/15 text-purple-700 dark:text-purple-300"
-              : "bg-accent/15 text-accent"
+              : isPattern
+                ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+                : "bg-accent/15 text-accent"
           }`}
-          title={isPref ? "采纳后写入「个人偏好」表" : "采纳后追加到 memory.md"}
+          title={
+            isPref
+              ? "采纳后写入「个人偏好」表"
+              : isPattern
+                ? `跨会话挖掘的模式（${event.support_count} 次证据），采纳后追加到 memory.md`
+                : "采纳后追加到 memory.md"
+          }
         >
-          {isPref ? "偏好" : "记忆"}
+          {isPref ? "偏好" : isPattern ? `模式 · ${event.support_count}会话` : "记忆"}
         </span>
       </div>
       <div className="rounded bg-surface-2 border border-border px-3 py-2 mb-3">
         <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">
-          {isPref ? "建议更新偏好" : "建议写入记忆"}
+          {isPref ? "建议更新偏好" : isPattern ? "跨会话模式 → 写入记忆" : "建议写入记忆"}
         </div>
         <p className="text-[12px] text-gray-200 font-mono leading-relaxed">{event.suggestion}</p>
         {isPref && event.pref_key && (

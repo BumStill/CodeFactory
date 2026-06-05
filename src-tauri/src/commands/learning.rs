@@ -47,9 +47,17 @@ pub struct LearningEvent {
     /// Only populated when kind == 'preference'.
     #[serde(default)]
     pub pref_value: Option<String>,
+    /// Self-evolution P1: sessions of evidence behind a mined insight
+    /// (0 for per-session post-mortem rows). kind == 'pattern' rows set it.
+    #[serde(default)]
+    pub support_count: i64,
+    /// Raw metrics behind a mined insight, as JSON ("{}" for non-mined rows).
+    #[serde(default = "default_evidence")]
+    pub evidence_json: String,
 }
 
 fn default_kind() -> String { "memory".into() }
+fn default_evidence() -> String { "{}".into() }
 
 // ── Queries ───────────────────────────────────────────────────────────────────
 
@@ -59,20 +67,20 @@ pub async fn list_learning_events(
     state: State<'_, AppState>,
 ) -> Result<Vec<LearningEvent>, AppError> {
     let pool = state.db.read().await;
-    let rows = sqlx::query_as::<_, (String, String, String, String, String, String, String, Option<String>, String, Option<String>, Option<String>)>(
+    let rows = sqlx::query_as::<_, (String, String, String, String, String, String, String, Option<String>, String, Option<String>, Option<String>, i64, String)>(
         "SELECT id, session_id, cwd, observation, suggestion, status, created_at, decided_at, \
-                kind, pref_key, pref_value \
-         FROM learning_events WHERE cwd = ? ORDER BY created_at DESC LIMIT 50",
+                kind, pref_key, pref_value, support_count, evidence_json \
+         FROM learning_events WHERE cwd = ? ORDER BY support_count DESC, created_at DESC LIMIT 50",
     )
     .bind(&cwd)
     .fetch_all(&*pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, session_id, cwd, observation, suggestion, status, created_at, decided_at, kind, pref_key, pref_value)| {
+        .map(|(id, session_id, cwd, observation, suggestion, status, created_at, decided_at, kind, pref_key, pref_value, support_count, evidence_json)| {
             LearningEvent {
                 id, session_id, cwd, observation, suggestion, status,
-                created_at, decided_at, kind, pref_key, pref_value,
+                created_at, decided_at, kind, pref_key, pref_value, support_count, evidence_json,
             }
         })
         .collect())
@@ -477,6 +485,8 @@ Examples:\n\
             kind: kind.into(),
             pref_key,
             pref_value,
+            support_count: 0,
+            evidence_json: "{}".into(),
         });
     }
 
@@ -490,6 +500,295 @@ Examples:\n\
         }
     }
 
+    Ok(created)
+}
+
+// ── Self-evolution P1: cross-session pattern mining ───────────────────────────
+//
+// Per-session post-mortem reflects on ONE session. The miner aggregates the
+// outcome data the app already records across MANY sessions for a cwd and turns
+// recurring, evidence-backed patterns into kind='pattern' learnings that flow to
+// chat via the same A1–A3 pipeline once accepted.
+// See docs/self-evolution/P1-cross-session-pattern-mining.md.
+
+/// A mined pattern, before it becomes a learning_event row. Detectors are pure
+/// functions producing these, so they unit-test without a DB or model.
+#[derive(Debug, Clone)]
+pub struct PatternInsight {
+    pub observation: String,
+    pub suggestion: String,
+    pub support_count: i64,
+    pub evidence: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCallRow {
+    pub tool_name: String,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskRow {
+    pub status: String,
+    pub attempt_count: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LearningDecisionRow {
+    pub kind: String,
+    pub status: String,
+}
+
+fn pct(n: i64, d: i64) -> i64 {
+    if d == 0 { 0 } else { (n * 100) / d }
+}
+
+/// Tools whose recent failure rate is high enough to warn about.
+fn detect_tool_reliability(rows: &[ToolCallRow]) -> Vec<PatternInsight> {
+    use std::collections::HashMap;
+    let mut total: HashMap<&str, i64> = HashMap::new();
+    let mut errs: HashMap<&str, i64> = HashMap::new();
+    let mut sample: HashMap<&str, String> = HashMap::new();
+    for r in rows {
+        *total.entry(r.tool_name.as_str()).or_default() += 1;
+        if r.status == "error" {
+            *errs.entry(r.tool_name.as_str()).or_default() += 1;
+            if let Some(e) = &r.error {
+                sample
+                    .entry(r.tool_name.as_str())
+                    .or_insert_with(|| e.chars().take(80).collect());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (tool, &t) in &total {
+        let e = errs.get(tool).copied().unwrap_or(0);
+        let rate = pct(e, t);
+        if t >= 8 && rate >= 25 {
+            let ex = sample.get(tool).cloned().unwrap_or_default();
+            let tail = if ex.is_empty() { String::new() } else { format!("，最常见：{ex}") };
+            out.push(PatternInsight {
+                observation: format!("工具 `{tool}` 最近 {t} 次调用失败 {e} 次（{rate}%）{tail}。"),
+                suggestion: format!(
+                    "`{tool}` 近期失败率偏高（{e}/{t}，{rate}%）——调用前先核对前置条件，或考虑替代方案。"
+                ),
+                support_count: t,
+                evidence: serde_json::json!({"detector":"tool_reliability","tool":tool,"total":t,"errors":e,"rate":rate}),
+            });
+        }
+    }
+    out.sort_by(|a, b| b.support_count.cmp(&a.support_count));
+    out
+}
+
+/// A failure that keeps forcing retries across tasks.
+fn detect_retry_prone(rows: &[TaskRow]) -> Vec<PatternInsight> {
+    use std::collections::HashMap;
+    let mut by_err: HashMap<String, (i64, String)> = HashMap::new();
+    for r in rows {
+        if r.attempt_count < 2 {
+            continue;
+        }
+        let raw = r.error.clone().unwrap_or_default();
+        let key = norm_suggestion(&raw.chars().take(50).collect::<String>());
+        if key.is_empty() {
+            continue;
+        }
+        let entry = by_err
+            .entry(key)
+            .or_insert((0, raw.chars().take(60).collect()));
+        entry.0 += 1;
+    }
+    let mut out: Vec<PatternInsight> = by_err
+        .into_iter()
+        .filter(|(_, (count, _))| *count >= 3)
+        .map(|(_, (count, sample))| PatternInsight {
+            observation: format!("有 {count} 个任务因「{sample}」反复重试。"),
+            suggestion: format!("反复踩坑：「{sample}」导致多次重试——值得加一道前置检查或固定解法。"),
+            support_count: count,
+            evidence: serde_json::json!({"detector":"retry_prone","count":count,"sample":sample}),
+        })
+        .collect();
+    out.sort_by(|a, b| b.support_count.cmp(&a.support_count));
+    out
+}
+
+/// Calibrate the proposer from the user's accept/reject history.
+fn detect_learning_calibration(rows: &[LearningDecisionRow]) -> Vec<PatternInsight> {
+    use std::collections::HashMap;
+    let mut acc: HashMap<&str, i64> = HashMap::new();
+    let mut dec: HashMap<&str, i64> = HashMap::new();
+    for r in rows {
+        if r.status != "accepted" && r.status != "rejected" {
+            continue;
+        }
+        *dec.entry(r.kind.as_str()).or_default() += 1;
+        if r.status == "accepted" {
+            *acc.entry(r.kind.as_str()).or_default() += 1;
+        }
+    }
+    let mut out = Vec::new();
+    for (kind, &d) in &dec {
+        if d < 5 {
+            continue;
+        }
+        let a = acc.get(kind).copied().unwrap_or(0);
+        let rate = pct(a, d);
+        let (obs, sug) = if rate <= 20 {
+            (
+                format!("你几乎总是拒绝『{kind}』类学习建议（接受 {a}/{d}）。"),
+                format!("校准：少提『{kind}』类学习（接受率仅 {rate}%）——除非很有把握。"),
+            )
+        } else if rate >= 80 {
+            (
+                format!("你几乎总是接受『{kind}』类学习（接受 {a}/{d}）。"),
+                format!("校准：『{kind}』类学习接受率高（{rate}%）——可以多提。"),
+            )
+        } else {
+            continue;
+        };
+        out.push(PatternInsight {
+            observation: obs,
+            suggestion: sug,
+            support_count: d,
+            evidence: serde_json::json!({"detector":"learning_calibration","kind":kind,"decided":d,"accepted":a,"accept_rate":rate}),
+        });
+    }
+    out.sort_by(|a, b| b.support_count.cmp(&a.support_count));
+    out
+}
+
+/// Run every detector over the supplied rows. Pure; the command wires SQL +
+/// persistence around it.
+fn run_detectors(
+    tools: &[ToolCallRow],
+    tasks: &[TaskRow],
+    decisions: &[LearningDecisionRow],
+) -> Vec<PatternInsight> {
+    let mut out = Vec::new();
+    out.extend(detect_tool_reliability(tools));
+    out.extend(detect_retry_prone(tasks));
+    out.extend(detect_learning_calibration(decisions));
+    out
+}
+
+/// Cross-session pattern miner. Aggregates the cwd's recent outcome data, runs
+/// the detectors, dedups against existing learnings (A3's norm_suggestion), and
+/// inserts the survivors as kind='pattern' pending rows — which accept-route
+/// like memory, so an accepted insight reaches chat via A1's injection.
+#[command]
+pub async fn mine_cross_session_patterns(
+    cwd: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<LearningEvent>, AppError> {
+    let pool = state.db.read().await;
+
+    // Tool calls in this project (tool_calls → messages → sessions.cwd).
+    let tools: Vec<ToolCallRow> = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT tc.tool_name, tc.status, tc.error \
+         FROM tool_calls tc \
+         JOIN messages m ON tc.message_id = m.id \
+         JOIN sessions s ON m.session_id = s.id \
+         WHERE s.cwd = ? ORDER BY tc.created_at DESC LIMIT 4000",
+    )
+    .bind(&cwd)
+    .fetch_all(&*pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(tool_name, status, error)| ToolCallRow { tool_name, status, error })
+    .collect();
+
+    // Task runs in this project (task_runs → sessions.cwd).
+    let tasks: Vec<TaskRow> = sqlx::query_as::<_, (String, i64, Option<String>)>(
+        "SELECT t.status, t.attempt_count, t.error \
+         FROM task_runs t JOIN sessions s ON t.session_id = s.id \
+         WHERE s.cwd = ? ORDER BY t.created_at DESC LIMIT 2000",
+    )
+    .bind(&cwd)
+    .fetch_all(&*pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(status, attempt_count, error)| TaskRow { status, attempt_count, error })
+    .collect();
+
+    // Decided learnings (accept/reject calibration).
+    let decisions: Vec<LearningDecisionRow> = sqlx::query_as::<_, (String, String)>(
+        "SELECT kind, status FROM learning_events \
+         WHERE cwd = ? AND status IN ('accepted','rejected')",
+    )
+    .bind(&cwd)
+    .fetch_all(&*pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(kind, status)| LearningDecisionRow { kind, status })
+    .collect();
+
+    // Existing suggestions (accepted + pending) for dedup — same guard as A3.
+    let existing: Vec<(String,)> = sqlx::query_as(
+        "SELECT suggestion FROM learning_events WHERE cwd = ? AND status IN ('accepted','pending')",
+    )
+    .bind(&cwd)
+    .fetch_all(&*pool)
+    .await
+    .unwrap_or_default();
+    let mut seen: std::collections::HashSet<String> =
+        existing.iter().map(|(s,)| norm_suggestion(s)).collect();
+
+    let insights = run_detectors(&tools, &tasks, &decisions);
+
+    let now = Utc::now().to_rfc3339();
+    let mut created: Vec<LearningEvent> = Vec::new();
+    for ins in insights {
+        if !seen.insert(norm_suggestion(&ins.suggestion)) {
+            continue;
+        }
+        let id = Uuid::new_v4().to_string();
+        let evidence = ins.evidence.to_string();
+        sqlx::query(
+            "INSERT INTO learning_events \
+             (id, session_id, cwd, observation, suggestion, status, created_at, kind, \
+              support_count, evidence_json) \
+             VALUES (?, '', ?, ?, ?, 'pending', ?, 'pattern', ?, ?)",
+        )
+        .bind(&id)
+        .bind(&cwd)
+        .bind(&ins.observation)
+        .bind(&ins.suggestion)
+        .bind(&now)
+        .bind(ins.support_count)
+        .bind(&evidence)
+        .execute(&*pool)
+        .await?;
+        created.push(LearningEvent {
+            id,
+            session_id: String::new(),
+            cwd: cwd.clone(),
+            observation: ins.observation,
+            suggestion: ins.suggestion,
+            status: "pending".into(),
+            created_at: now.clone(),
+            decided_at: None,
+            kind: "pattern".into(),
+            pref_key: None,
+            pref_value: None,
+            support_count: ins.support_count,
+            evidence_json: evidence,
+        });
+    }
+    drop(pool);
+
+    if !created.is_empty() {
+        let event = format!("learning_events_updated:{}", cwd);
+        if let Err(e) = app.emit(&event, &created) {
+            tracing::warn!("emit {} failed: {}", event, e);
+        }
+    }
     Ok(created)
 }
 
@@ -520,6 +819,60 @@ mod tests {
         // A brand-new learning is accepted (and now itself guards repeats).
         assert!(seen.insert(norm_suggestion("This project deploys via GitHub Actions.")));
         assert!(!seen.insert(norm_suggestion("this project deploys via github actions.")));
+    }
+
+    fn tc(name: &str, status: &str, err: Option<&str>) -> ToolCallRow {
+        ToolCallRow { tool_name: name.into(), status: status.into(), error: err.map(Into::into) }
+    }
+
+    #[test]
+    fn tool_reliability_flags_only_high_volume_high_error_tools() {
+        let mut rows = Vec::new();
+        // flaky: 10 calls, 4 errors (40%) → flagged.
+        for i in 0..10 { rows.push(tc("bash", if i < 4 { "error" } else { "done" }, Some("pwsh not found"))); }
+        // reliable: 12 calls, 1 error (8%) → not flagged.
+        for i in 0..12 { rows.push(tc("read_file", if i < 1 { "error" } else { "done" }, None)); }
+        // flaky but low-volume: 5 calls, 3 errors → not flagged (< 8 calls).
+        for i in 0..5 { rows.push(tc("write_xlsx", if i < 3 { "error" } else { "done" }, None)); }
+
+        let out = detect_tool_reliability(&rows);
+        assert_eq!(out.len(), 1, "only the high-volume flaky tool is flagged");
+        assert!(out[0].suggestion.contains("bash"));
+        assert_eq!(out[0].support_count, 10);
+        assert!(out[0].evidence.get("rate").and_then(|v| v.as_i64()) == Some(40));
+    }
+
+    #[test]
+    fn retry_prone_groups_by_error_and_needs_three() {
+        let rows = vec![
+            // Same recurring failure (case/whitespace fold to one key) on retries.
+            TaskRow { status: "completed".into(), attempt_count: 3, error: Some("schannel: server closed abruptly".into()) },
+            TaskRow { status: "completed".into(), attempt_count: 2, error: Some("schannel: server closed abruptly".into()) },
+            TaskRow { status: "failed".into(), attempt_count: 4, error: Some("Schannel:  server  closed  abruptly".into()) },
+            // single-attempt → ignored even though same error.
+            TaskRow { status: "completed".into(), attempt_count: 1, error: Some("schannel: server closed abruptly".into()) },
+            // a different one-off retry error → its own group, below threshold.
+            TaskRow { status: "failed".into(), attempt_count: 2, error: Some("totally different".into()) },
+        ];
+        let out = detect_retry_prone(&rows);
+        assert_eq!(out.len(), 1, "only the 3x recurring retry error is surfaced");
+        assert_eq!(out[0].support_count, 3);
+    }
+
+    #[test]
+    fn learning_calibration_emits_at_extremes_only() {
+        let mut rows = Vec::new();
+        // memory: 6 decided, 5 accepted (83%) → "propose more".
+        for i in 0..6 { rows.push(LearningDecisionRow { kind: "memory".into(), status: if i < 5 { "accepted" } else { "rejected" }.into() }); }
+        // preference: 6 decided, 1 accepted (17%) → "propose less".
+        for i in 0..6 { rows.push(LearningDecisionRow { kind: "preference".into(), status: if i < 1 { "accepted" } else { "rejected" }.into() }); }
+        // pattern: only 4 decided → below threshold, no insight.
+        for _ in 0..4 { rows.push(LearningDecisionRow { kind: "pattern".into(), status: "accepted".into() }); }
+
+        let out = detect_learning_calibration(&rows);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|p| p.suggestion.contains("memory") && p.suggestion.contains("可以多提")));
+        assert!(out.iter().any(|p| p.suggestion.contains("preference") && p.suggestion.contains("少提")));
     }
 
     async fn fresh_pool() -> SqlitePool {

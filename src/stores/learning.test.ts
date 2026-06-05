@@ -35,6 +35,8 @@ const mkEvent = (id: string, status: LearningEvent["status"] = "pending"): Learn
   kind: "memory",
   pref_key: null,
   pref_value: null,
+  support_count: 0,
+  evidence_json: "{}",
 });
 
 describe("learning store", () => {
