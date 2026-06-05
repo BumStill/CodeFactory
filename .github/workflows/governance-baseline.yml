@@ -9,7 +9,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need history so the rules validator can diff vs base
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - run: pip install pyyaml
       - run: python tools/governance/validate_repo_governance_baseline.py
+      - name: Enforce governance rules manifest (docs/governance/rules.yml)
+        env:
+          GOVERNANCE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python tools/governance/check_governance_rules.py
