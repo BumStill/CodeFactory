@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+use crate::AppState;
 
 // ── Data structures ───────────────────────────────────────────────────────────
 
@@ -1013,6 +1015,203 @@ pub async fn list_slash_commands(app: AppHandle) -> Result<Vec<SlashCommand>, St
     Ok(commands)
 }
 
+// ── Self-evolution P2: skill auto-evolution ───────────────────────────────────
+//
+// Turn recurring TASK shapes into a skill the agent drafts for itself, stored
+// DISABLED for preview-then-enable. Clustering is pure + unit-tested; the draft
+// is deterministic for v1 (an LLM polish pass is a noted follow-up). A proposal
+// is just a normal user skill tagged "proposed" with the rationale in its
+// description — so list/enable/delete work unchanged and it can never act until
+// the human enables it. See docs/self-evolution/P2-skill-auto-evolution.md.
+
+const MIN_CLUSTER: usize = 4;
+const MAX_PROPOSALS_PER_RUN: usize = 3;
+
+#[derive(Debug, Clone)]
+pub struct TaskTitleRow {
+    pub title: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillProposalDraft {
+    pub key: String,
+    pub label: String,
+    pub support_count: usize,
+    pub examples: Vec<String>,
+}
+
+/// Normalize a task title into a cluster key: lowercase, drop punctuation /
+/// pure-number / single-char tokens (ids, paths), keep the first few keywords.
+fn norm_task_title(t: &str) -> String {
+    t.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|w| w.chars().count() > 1 && !w.chars().all(|c| c.is_numeric()))
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Cluster recurring task intents. A cluster with >= MIN_CLUSTER tasks is a
+/// candidate proposal. Pure.
+fn cluster_task_intents(rows: &[TaskTitleRow]) -> Vec<SkillProposalDraft> {
+    use std::collections::HashMap;
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    for r in rows {
+        let key = norm_task_title(&r.title);
+        if key.is_empty() {
+            continue;
+        }
+        groups.entry(key).or_default().push(r.title.trim().to_string());
+    }
+    let mut out: Vec<SkillProposalDraft> = groups
+        .into_iter()
+        .filter(|(_, v)| v.len() >= MIN_CLUSTER)
+        .map(|(key, mut examples)| {
+            examples.sort();
+            examples.dedup();
+            SkillProposalDraft {
+                label: key.clone(),
+                support_count: examples.len(),
+                examples: examples.into_iter().take(5).collect(),
+                key,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| b.support_count.cmp(&a.support_count));
+    out
+}
+
+/// Drop clusters already served by an existing skill (>= 2 keyword overlap with
+/// a skill name/tag) or previously rejected. Pure.
+fn filter_covered(
+    drafts: Vec<SkillProposalDraft>,
+    existing_skill_labels: &[String],
+    rejected_keys: &std::collections::HashSet<String>,
+) -> Vec<SkillProposalDraft> {
+    drafts
+        .into_iter()
+        .filter(|d| {
+            if rejected_keys.contains(&d.key) {
+                return false;
+            }
+            let words: Vec<&str> = d.key.split_whitespace().collect();
+            let covered = existing_skill_labels.iter().any(|s| {
+                let sl = s.to_lowercase();
+                words.iter().filter(|w| sl.contains(**w)).count() >= 2
+            });
+            !covered
+        })
+        .collect()
+}
+
+/// Write one cluster as a DISABLED "proposed" user skill (deterministic draft).
+fn write_proposal_skill(d: &SkillProposalDraft) -> Result<SkillManifest, String> {
+    let slug: String = d
+        .key
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let id = format!("proposed-{}", if slug.is_empty() { "task".into() } else { slug });
+    let skill_dir = user_skills_dir().join(&id);
+    std::fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
+
+    let examples = d
+        .examples
+        .iter()
+        .map(|e| format!("- {e}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system_prompt = format!(
+        "你是协助处理「{label}」类任务的助手。用户在本项目反复做这类事，例如：\n{examples}\n\n\
+处理这类请求时，沿用过往成功的做法、保持风格一致，并主动补齐这类任务常见但容易遗漏的步骤。",
+        label = d.label,
+        examples = examples,
+    );
+    std::fs::write(skill_dir.join("system_prompt.md"), &system_prompt).map_err(|e| e.to_string())?;
+
+    let cmd_name: String = d
+        .key
+        .split_whitespace()
+        .next()
+        .unwrap_or("task")
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    let slash = serde_json::json!([{
+        "name": if cmd_name.is_empty() { "task".to_string() } else { cmd_name },
+        "description": format!("处理「{}」类任务", d.label),
+        "template": format!("处理这个「{}」类任务：{{input}}", d.label),
+    }]);
+    std::fs::write(
+        skill_dir.join("slash_commands.json"),
+        serde_json::to_string_pretty(&slash).unwrap_or_default(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let manifest = SkillManifest {
+        id: id.clone(),
+        name: d.label.clone(),
+        description: format!(
+            "提议（{} 次证据）：你在本项目反复做「{}」类任务。预览后可编辑、启用。",
+            d.support_count, d.label
+        ),
+        version: "0.1.0".into(),
+        author: "CodeFactory (proposed)".into(),
+        tags: vec!["proposed".into()],
+        enabled: false,
+        path: skill_dir.to_string_lossy().to_string(),
+        source: "user".into(),
+    };
+    write_manifest(&manifest.path, &manifest)?;
+    Ok(manifest)
+}
+
+/// Propose skills from this project's recurring task patterns. Each proposal is
+/// written DISABLED; the user previews + enables (or deletes). Idempotent: a
+/// cluster already covered by an existing skill (including a prior proposal)
+/// is skipped, so re-running doesn't duplicate.
+#[tauri::command]
+pub async fn propose_skills_from_patterns(
+    cwd: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<SkillManifest>, String> {
+    let pool = state.db.read().await;
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT title FROM task_runs WHERE cwd = ? ORDER BY created_at DESC LIMIT 1000",
+    )
+    .bind(&cwd)
+    .fetch_all(&*pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    drop(pool);
+    let task_rows: Vec<TaskTitleRow> =
+        rows.into_iter().map(|(title,)| TaskTitleRow { title }).collect();
+
+    let existing = list_skills(app.clone()).await?;
+    let existing_labels: Vec<String> = existing
+        .iter()
+        .flat_map(|s| std::iter::once(s.name.clone()).chain(s.tags.iter().cloned()))
+        .collect();
+
+    let drafts = cluster_task_intents(&task_rows);
+    let drafts = filter_covered(drafts, &existing_labels, &std::collections::HashSet::new());
+
+    let mut created = Vec::new();
+    for d in drafts.into_iter().take(MAX_PROPOSALS_PER_RUN) {
+        created.push(write_proposal_skill(&d)?);
+    }
+    if !created.is_empty() {
+        let _ = app.emit("skill_proposals_updated", &created);
+    }
+    Ok(created)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,5 +1237,47 @@ mod tests {
             assert!(!s.name.trim().is_empty(), "{} has an empty name", s.id);
             assert!(!s.slash_commands.is_empty(), "{} has no slash commands", s.id);
         }
+    }
+
+    fn tr(title: &str) -> TaskTitleRow {
+        TaskTitleRow { title: title.into() }
+    }
+
+    #[test]
+    fn norm_task_title_keeps_keywords_drops_ids() {
+        assert_eq!(norm_task_title("Write Release PR #128 for /a/b"), "write release pr for");
+        assert_eq!(norm_task_title("  Add   Tauri command  "), "add tauri command");
+        assert_eq!(norm_task_title("123 / 456"), "");
+    }
+
+    #[test]
+    fn cluster_task_intents_needs_min_cluster() {
+        let rows = vec![
+            tr("Write release PR description and notes for v1"),
+            tr("write release pr description and notes for v2"),
+            tr("Write Release PR Description And Notes (v3)"),
+            tr("write release PR description and notes — v4"),
+            // unrelated one-offs → no cluster
+            tr("fix login bug"),
+            tr("fix a different thing"),
+        ];
+        let out = cluster_task_intents(&rows);
+        assert_eq!(out.len(), 1, "only the 4x recurring intent clusters");
+        assert_eq!(out[0].support_count, 4);
+        assert!(out[0].key.contains("release"));
+    }
+
+    #[test]
+    fn filter_covered_drops_existing_and_rejected() {
+        let drafts = vec![
+            SkillProposalDraft { key: "write release pr".into(), label: "write release pr".into(), support_count: 5, examples: vec![] },
+            SkillProposalDraft { key: "add tauri command".into(), label: "add tauri command".into(), support_count: 4, examples: vec![] },
+        ];
+        // An existing skill "Release PR helper" covers the first (overlap: release, pr).
+        let existing = vec!["Release PR helper".to_string()];
+        let mut rejected = std::collections::HashSet::new();
+        rejected.insert("add tauri command".to_string());
+        let out = filter_covered(drafts, &existing, &rejected);
+        assert!(out.is_empty(), "one covered, one rejected → both filtered");
     }
 }
