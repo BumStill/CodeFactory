@@ -26,10 +26,15 @@ export interface LearningEvent {
   created_at: string;
   decided_at: string | null;
   /** "memory" → suggestion appended to .codefactory/memory.md on accept.
-   *  "preference" → pref_key→pref_value upserted into user_preferences. */
-  kind: "memory" | "preference";
+   *  "preference" → pref_key→pref_value upserted into user_preferences.
+   *  "pattern" → a cross-session mined insight (P1); accept-routes like memory. */
+  kind: "memory" | "preference" | "pattern";
   pref_key: string | null;
   pref_value: string | null;
+  /** Sessions of evidence behind a mined insight (0 for per-session events). */
+  support_count: number;
+  /** Raw metrics behind a mined insight, as a JSON string ("{}" otherwise). */
+  evidence_json: string;
 }
 
 interface LearningStore {
@@ -45,6 +50,9 @@ interface LearningStore {
   subscribe: (cwd: string) => Promise<() => void>;
   accept: (id: string, cwd: string) => Promise<void>;
   reject: (id: string, cwd: string) => Promise<void>;
+  /** P1: run the cross-session pattern miner; new insights arrive via the
+   *  learning_events_updated event the subscriber already listens for. */
+  mine: (cwd: string) => Promise<number>;
 }
 
 export const useLearningStore = create<LearningStore>((set, get) => ({
@@ -121,5 +129,11 @@ export const useLearningStore = create<LearningStore>((set, get) => ({
         ),
       },
     }));
+  },
+
+  mine: async (cwd) => {
+    const created = await invoke<LearningEvent[]>("mine_cross_session_patterns", { cwd });
+    await get().load(cwd); // refresh (the backend also emits learning_events_updated)
+    return created.length;
   },
 }));

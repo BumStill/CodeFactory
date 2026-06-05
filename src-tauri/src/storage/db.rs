@@ -177,6 +177,11 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ensure_column(pool, "learning_events", "kind", "TEXT NOT NULL DEFAULT 'memory'").await?;
     ensure_column(pool, "learning_events", "pref_key", "TEXT").await?;
     ensure_column(pool, "learning_events", "pref_value", "TEXT").await?;
+    // ── Self-evolution P1: cross-session mined insights carry an evidence
+    //    count (how many sessions back the pattern) + the raw metrics.
+    //    Per-session post-mortem rows leave support_count = 0.
+    ensure_column(pool, "learning_events", "support_count", "INTEGER NOT NULL DEFAULT 0").await?;
+    ensure_column(pool, "learning_events", "evidence_json", "TEXT NOT NULL DEFAULT '{}'").await?;
     // 'project' (default) for full software-factory sessions, 'quick' for
     // ephemeral one-off chats launched from the home page's Quick Task entry.
     // List-sessions excludes 'quick' from the Recent Projects card.
