@@ -101,7 +101,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
   const {
     activeSession,
     selectSession, sendOrQueue, cancelStream, removeFromQueue,
-    respondPermission, exitAnonymous,
+    respondPermission, exitAnonymous, renameSession,
   } = useChatStore();
   // Per-session chat state for the ACTIVE session. Background sessions keep
   // streaming into their own buckets; here we render the active one's slice.
@@ -109,6 +109,19 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
   const isAnonymous = activeSession?.kind === "anonymous";
   const { settings, setTheme } = useSettingsStore();
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
+  // Double-click the session title (here or in the sidebar) to rename it inline.
+  const [titleEditing, setTitleEditing] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
+  const commitTitle = () => {
+    const t = titleDraft.trim();
+    setTitleEditing(false);
+    if (activeSession && t && t !== activeSession.title) renameSession(activeSession.id, t);
+  };
+  // Leave title-edit mode if the workspace switches to another session, so a
+  // pending edit can't blur-commit onto the wrong session.
+  useEffect(() => {
+    setTitleEditing(false);
+  }, [sessionId]);
   // Git / environment panel — surface the (previously unwired) git UI in the
   // right column: a branch/status bar + slide-out Changes / History / PR panels.
   const [gitPanel, setGitPanel] = useState<"changes" | "history" | "remote" | null>(null);
@@ -212,7 +225,32 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
         </div>
         <div className="flex-1 min-w-0">
           <div className="text-sm font-medium text-gray-200 truncate flex items-center gap-2">
-            {activeSession?.title || "..."}
+            {titleEditing && activeSession ? (
+              <input
+                autoFocus
+                value={titleDraft}
+                onChange={(e) => setTitleDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commitTitle();
+                  if (e.key === "Escape") setTitleEditing(false);
+                }}
+                onBlur={commitTitle}
+                className="min-w-0 flex-1 rounded border border-accent/50 bg-surface-3 px-1.5 py-0.5 text-sm text-gray-100 outline-none"
+              />
+            ) : (
+              <span
+                className="truncate"
+                title={isAnonymous ? undefined : "双击重命名"}
+                onDoubleClick={() => {
+                  if (!isAnonymous && activeSession) {
+                    setTitleDraft(activeSession.title || "");
+                    setTitleEditing(true);
+                  }
+                }}
+              >
+                {activeSession?.title || "..."}
+              </span>
+            )}
             {activeSession?.kind === "quick" && (
               <span
                 className="text-[9px] px-1.5 py-0.5 rounded bg-accent/15 text-accent font-normal"

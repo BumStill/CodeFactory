@@ -10,7 +10,7 @@
 // Mental model: 快速任务 ≈ lightweight "cowork" chat, 项目 ≈ full "code"
 // project — both created and switched from this one rail.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, ChevronDown, Zap, Folder, EyeOff, Loader2, Pencil, Trash2 } from "lucide-react";
+import { Plus, ChevronDown, Zap, Folder, EyeOff, Loader2, Pencil, Trash2, MoreHorizontal } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../stores/chat";
 import { createQuickSession } from "../lib/tauri";
@@ -198,9 +198,22 @@ function SessionRow({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [confirming, setConfirming] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Close the ⋯ menu on an outside click.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [menuOpen]);
 
   const startRename = () => {
     setConfirming(false);
+    setMenuOpen(false);
     setDraft(session.title || "");
     setEditing(true);
   };
@@ -250,6 +263,11 @@ function SessionRow({
             />
           ) : (
             <span
+              title="双击重命名"
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                startRename();
+              }}
               className={`flex-1 truncate text-[12px] ${
                 active ? "font-medium text-gray-100" : "text-gray-300"
               }`}
@@ -261,30 +279,49 @@ function SessionRow({
             <Loader2 size={11} className="shrink-0 animate-spin text-accent" aria-label="运行中" />
           )}
           {!editing && !confirming && (
-            <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+            <div className="relative shrink-0" ref={menuRef}>
               <span
                 role="button"
-                title="重命名"
+                title="更多操作"
+                aria-label="更多操作"
                 onClick={(e) => {
                   e.stopPropagation();
-                  startRename();
+                  setMenuOpen((v) => !v);
                 }}
-                className="rounded p-0.5 text-gray-600 hover:bg-surface-3 hover:text-gray-300"
+                className={`flex items-center rounded p-0.5 transition-opacity hover:bg-surface-3 hover:text-gray-200 ${
+                  menuOpen ? "text-gray-200 opacity-100" : "text-gray-500 opacity-70 group-hover:opacity-100"
+                }`}
               >
-                <Pencil size={10} />
+                <MoreHorizontal size={13} />
               </span>
-              <span
-                role="button"
-                title="删除会话"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setConfirming(true);
-                }}
-                className="rounded p-0.5 text-gray-600 hover:bg-surface-3 hover:text-red-400"
-              >
-                <Trash2 size={10} />
-              </span>
-            </span>
+              {menuOpen && (
+                <div className="absolute right-0 top-full z-50 mt-1 min-w-[100px] overflow-hidden rounded-md border border-border bg-surface-2 py-0.5 shadow-xl">
+                  <span
+                    role="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      startRename();
+                    }}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-gray-300 hover:bg-surface-3"
+                  >
+                    <Pencil size={11} />
+                    重命名
+                  </span>
+                  <span
+                    role="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setMenuOpen(false);
+                      setConfirming(true);
+                    }}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-red-400 hover:bg-red-500/15"
+                  >
+                    <Trash2 size={11} />
+                    删除
+                  </span>
+                </div>
+              )}
+            </div>
           )}
           {confirming && (
             <span className="flex shrink-0 items-center gap-1">
