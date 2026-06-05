@@ -130,4 +130,19 @@ describe("SessionSidebar", () => {
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(onOpen).not.toHaveBeenCalled();
   });
+
+  it("reveals a rename/delete menu from the always-visible ⋯ button", () => {
+    render(<SessionSidebar currentSessionId="p1" onOpenSession={() => {}} />);
+    // The menu is closed until the kebab is clicked.
+    expect(screen.queryByText("重命名")).not.toBeInTheDocument();
+    fireEvent.click(screen.getAllByLabelText("更多操作")[0]);
+    expect(screen.getByText("重命名")).toBeInTheDocument();
+    expect(screen.getByText("删除")).toBeInTheDocument();
+  });
+
+  it("double-clicking a session title opens an inline rename input", () => {
+    render(<SessionSidebar currentSessionId="p1" onOpenSession={() => {}} />);
+    fireEvent.doubleClick(screen.getByText("CodeFactory"));
+    expect(screen.getByDisplayValue("CodeFactory")).toBeInTheDocument();
+  });
 });

@@ -16,7 +16,6 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../../stores/chat";
 import { useSettingsStore } from "../../stores/settings";
 import {
-  getOrCreateQuickSession,
   createQuickSession,
   listQuickSessions,
 } from "../../lib/tauri";
@@ -86,14 +85,13 @@ export function HomePage({
   };
 
   const handleQuickTask = async () => {
-    // Continue-latest: the backend returns the most-recent "quick" session,
-    // creating the first one under ~/.codefactory/quick on demand. Routing
-    // into the same Workspace as a regular project keeps the
-    // chat/queue/attachments UX consistent — quick tasks are just sessions
-    // with a kind flag. Use the "最近快速任务" switcher below to open a
-    // specific one, or "+ 新建快速任务" to start a fresh parallel task.
+    // Always start a FRESH quick task. The primary "快速任务" card is an action,
+    // so it must not drop the user back into their last quick session — that
+    // was a continue-latest bug. Resuming a specific quick task is what the
+    // "最近快速任务" list below is for; entering an existing session should only
+    // ever happen by clicking it in a list.
     try {
-      const session = await getOrCreateQuickSession(activeModel);
+      const session = await createQuickSession(activeModel);
       onOpenProject(session.id);
     } catch (e) {
       // eslint-disable-next-line no-alert
