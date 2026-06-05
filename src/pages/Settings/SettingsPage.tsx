@@ -2,7 +2,7 @@
 import React, { useEffect, useState } from "react";
 import {
   ArrowLeft, Plus, Trash2, Eye, EyeOff, Check, AlertCircle, ChevronDown,
-  RefreshCw, Download, Package, LogIn, LogOut, Sparkles,
+  RefreshCw, Download, Package, LogIn, LogOut, Sparkles, Github, ExternalLink,
 } from "lucide-react";
 import { invoke, codexLogin, codexLogout, codexAccount } from "../../lib/tauri";
 import { useSettingsStore } from "../../stores/settings";
@@ -1583,6 +1583,8 @@ function UpdateStatusLine({
   }
 }
 
+const REPO_URL = "https://github.com/BumStill/CodeFactory";
+
 function AboutTab() {
   const phase = useUpdaterStore((s) => s.phase);
   const currentVersion = useUpdaterStore((s) => s.currentVersion);
@@ -1642,6 +1644,17 @@ function AboutTab() {
           onInstall={() => void install()}
         />
       </div>
+
+      {/* Project link — opens the repo in the system browser (never in-webview) */}
+      <button
+        onClick={() => void invoke("plugin:shell|open", { path: REPO_URL }).catch(() => {})}
+        className="flex w-full items-center gap-2 rounded-lg border border-border bg-surface-1 px-4 py-2.5 text-xs text-gray-300 transition-colors hover:bg-surface-3"
+      >
+        <Github size={14} className="text-gray-400" />
+        <span className="flex-1 text-left">GitHub 项目主页</span>
+        <span className="font-mono text-[10px] text-gray-500">BumStill/CodeFactory</span>
+        <ExternalLink size={11} className="text-gray-500" />
+      </button>
 
       {/* Meta */}
       <p className="text-[11px] leading-relaxed text-gray-600">
