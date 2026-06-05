@@ -239,6 +239,50 @@ fn norm_suggestion(s: &str) -> String {
         .join(" ")
 }
 
+/// P3 self-tuning: turn the user's accept/reject history per learning kind into
+/// an advisory line for the post-mortem prompt, so the proposer offers fewer of
+/// a kind they reliably reject (and leans into ones they accept). Pure. Empty
+/// unless a kind hits an extreme accept-rate with enough decisions. It only
+/// shapes what the proposer *suggests* — the user still reviews every one.
+fn calibration_hint(decisions: &[(String, String)]) -> String {
+    use std::collections::HashMap;
+    let mut by_kind: HashMap<&str, (i64, i64)> = HashMap::new(); // (accepted, total)
+    for (kind, status) in decisions {
+        let e = by_kind.entry(kind.as_str()).or_insert((0, 0));
+        e.1 += 1;
+        if status == "accepted" {
+            e.0 += 1;
+        }
+    }
+    let mut kinds: Vec<&str> = by_kind.keys().copied().collect();
+    kinds.sort(); // deterministic output
+    let mut lines: Vec<String> = Vec::new();
+    for k in kinds {
+        let (acc, tot) = by_kind[k];
+        if tot < 4 {
+            continue;
+        }
+        let rate = acc * 100 / tot;
+        if rate <= 25 {
+            lines.push(format!(
+                "- The user has rejected most \"{k}\" suggestions ({acc}/{tot} accepted) — only propose a \"{k}\" when highly confident."
+            ));
+        } else if rate >= 80 {
+            lines.push(format!(
+                "- The user accepts most \"{k}\" suggestions ({acc}/{tot}) — those are welcome."
+            ));
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Calibration from this user's past decisions:\n{}\n\n",
+            lines.join("\n")
+        )
+    }
+}
+
 /// Run a single post-mortem pass over a finished session. The model is given
 /// what's already known so it won't repeat it, exact-duplicate proposals are
 /// dropped on insert, and contradictions are flagged in the suggestion text.
@@ -269,6 +313,16 @@ pub async fn run_postmortem(
         "SELECT suggestion FROM learning_events \
          WHERE cwd = ? AND status IN ('accepted', 'pending') \
          ORDER BY decided_at DESC, created_at DESC LIMIT 40",
+    )
+    .bind(&cwd)
+    .fetch_all(&*pool)
+    .await
+    .unwrap_or_default();
+    // P3 self-tuning: the user's accept/reject history per kind, to calibrate
+    // what the proposer offers (fewer of a kind they reliably reject).
+    let decisions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT kind, status FROM learning_events \
+         WHERE cwd = ? AND status IN ('accepted', 'rejected')",
     )
     .bind(&cwd)
     .fetch_all(&*pool)
@@ -317,6 +371,7 @@ observation CONTRADICTS one, still report it but prefix its suggestion with \
                 .join("\n")
         )
     };
+    let calibration = calibration_hint(&decisions);
 
     // ── Build prompt
     let settings = state.settings.read().await.clone();
@@ -362,7 +417,7 @@ Examples:\n\
   {{\"observation\": \"This project uses pnpm not npm.\", \
 \"suggestion\": \"This project uses pnpm — never run npm commands here.\", \"kind\": \"memory\"}}\n\
 ]\n\n\
-{known_block}Tasks from this session:\n{summary}"
+{calibration}{known_block}Tasks from this session:\n{summary}"
     );
 
     let req = AiRequest {
@@ -819,6 +874,41 @@ mod tests {
         // A brand-new learning is accepted (and now itself guards repeats).
         assert!(seen.insert(norm_suggestion("This project deploys via GitHub Actions.")));
         assert!(!seen.insert(norm_suggestion("this project deploys via github actions.")));
+    }
+
+    fn decs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, s)| (k.to_string(), s.to_string())).collect()
+    }
+
+    #[test]
+    fn calibration_hint_fires_only_at_extremes() {
+        let d = decs(&[
+            // preference 1/5 = 20% → reject hint
+            ("preference", "rejected"), ("preference", "rejected"), ("preference", "rejected"),
+            ("preference", "rejected"), ("preference", "accepted"),
+            // memory 5/6 = 83% → welcome hint
+            ("memory", "accepted"), ("memory", "accepted"), ("memory", "accepted"),
+            ("memory", "accepted"), ("memory", "accepted"), ("memory", "rejected"),
+            // pattern 2/3 → below 4-decision threshold → silent
+            ("pattern", "accepted"), ("pattern", "accepted"), ("pattern", "rejected"),
+        ]);
+        let hint = calibration_hint(&d);
+        assert!(hint.contains("rejected most \"preference\""), "got: {hint}");
+        assert!(hint.contains("accepts most \"memory\""), "got: {hint}");
+        assert!(!hint.contains("pattern"), "below-threshold kind stays silent: {hint}");
+    }
+
+    #[test]
+    fn calibration_hint_empty_when_no_extreme_or_too_few() {
+        assert_eq!(calibration_hint(&decs(&[("memory", "accepted"), ("memory", "rejected")])), "");
+        // 50/50 with enough decisions is not an extreme → still empty.
+        assert_eq!(
+            calibration_hint(&decs(&[
+                ("memory", "accepted"), ("memory", "rejected"),
+                ("memory", "accepted"), ("memory", "rejected"),
+            ])),
+            ""
+        );
     }
 
     fn tc(name: &str, status: &str, err: Option<&str>) -> ToolCallRow {
