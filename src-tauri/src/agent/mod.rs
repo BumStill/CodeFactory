@@ -424,6 +424,18 @@ impl AgentLoop {
         let base_prompt = build_system_prompt_for(self.mode, &self.cwd);
         let mut system_prompt =
             crate::commands::skills::get_active_system_prompt(&base_prompt, &self.app).await;
+        // Wire the user's structured preferences + accepted learnings into the
+        // main agent loop. Without this, the post-mortem learning loop captured
+        // preferences/learnings that only ever reached spec decomposition — the
+        // chat the user actually talks to ignored them. memory.md is already in
+        // base_prompt, so we pull prefs + learnings only (no memory) to avoid
+        // duplicating it.
+        let user_ctx =
+            user_context::build_prefs_and_learnings(&self.db, &self.cwd.to_string_lossy()).await;
+        if !user_ctx.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&user_ctx);
+        }
         // Model-aware reinforcement for post-approval Execute turns (no-op for
         // high-compliance models and all non-Execute turns).
         system_prompt.push_str(compliance_booster(self.mode, &self.model_id));
