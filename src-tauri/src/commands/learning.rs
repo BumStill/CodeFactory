@@ -220,11 +220,22 @@ struct PostmortemEntry {
     pref_value: Option<String>,
 }
 
-/// Run a single post-mortem pass over a finished session. Idempotent on
-/// repeat call — if the AI returns the same observations they'll just
-/// appear as duplicates in the table (rare in practice; the UI dedups
-/// visually). Failure is logged but never propagated to the caller —
-/// post-mortem is best-effort and should never break a successful run.
+/// Normalize a suggestion for duplicate detection: trim, lowercase, and
+/// collapse internal whitespace. Cheap exact-ish matching — semantic dedup
+/// (catching reworded-but-equivalent facts) is a later vector-search concern.
+fn norm_suggestion(s: &str) -> String {
+    s.trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Run a single post-mortem pass over a finished session. The model is given
+/// what's already known so it won't repeat it, exact-duplicate proposals are
+/// dropped on insert, and contradictions are flagged in the suggestion text.
+/// Failure is logged but never propagated to the caller — post-mortem is
+/// best-effort and should never break a successful run.
 #[command]
 pub async fn run_postmortem(
     session_id: String,
@@ -243,6 +254,18 @@ pub async fn run_postmortem(
     .bind(&session_id)
     .fetch_all(&*pool)
     .await?;
+    // Existing learnings for this project — lets the model avoid repeating what
+    // it already knows (folded into the prompt below) and lets us drop exact
+    // duplicates defensively on insert.
+    let existing: Vec<(String,)> = sqlx::query_as(
+        "SELECT suggestion FROM learning_events \
+         WHERE cwd = ? AND status IN ('accepted', 'pending') \
+         ORDER BY decided_at DESC, created_at DESC LIMIT 40",
+    )
+    .bind(&cwd)
+    .fetch_all(&*pool)
+    .await
+    .unwrap_or_default();
     drop(pool);
 
     if rows.is_empty() {
@@ -262,6 +285,30 @@ pub async fn run_postmortem(
         })
         .collect::<Vec<_>>()
         .join("\n");
+
+    // What we already know — folded into the prompt (avoid repeats / flag
+    // contradictions) and into a dedup set that guards the insert below.
+    let known_suggestions: Vec<String> = existing
+        .iter()
+        .map(|(s,)| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut seen: std::collections::HashSet<String> =
+        known_suggestions.iter().map(|s| norm_suggestion(s)).collect();
+    let known_block = if known_suggestions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Already known about this user — do NOT repeat any of these. If a new \
+observation CONTRADICTS one, still report it but prefix its suggestion with \
+\"⚠️ 与现有冲突: <the conflicting fact>\":\n{}\n\n",
+            known_suggestions
+                .iter()
+                .map(|s| format!("- {s}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
 
     // ── Build prompt
     let settings = state.settings.read().await.clone();
@@ -307,7 +354,7 @@ Examples:\n\
   {{\"observation\": \"This project uses pnpm not npm.\", \
 \"suggestion\": \"This project uses pnpm — never run npm commands here.\", \"kind\": \"memory\"}}\n\
 ]\n\n\
-Tasks from this session:\n{summary}"
+{known_block}Tasks from this session:\n{summary}"
     );
 
     let req = AiRequest {
@@ -374,10 +421,17 @@ Tasks from this session:\n{summary}"
     let now = Utc::now().to_rfc3339();
     let mut created: Vec<LearningEvent> = Vec::new();
     for e in entries {
-        // Skip obvious junk: empty fields or duplicates of the most recent entry.
+        // Skip empty fields.
         let obs = e.observation.trim();
         let sug = e.suggestion.trim();
         if obs.is_empty() || sug.is_empty() {
+            continue;
+        }
+        // Drop exact duplicates — of an already-known learning OR one we just
+        // emitted this round. norm_suggestion folds case + whitespace so trivial
+        // rewordings of the same fact don't pile up now that learnings are
+        // injected into every chat.
+        if !seen.insert(norm_suggestion(sug)) {
             continue;
         }
         // Resolve kind defensively: only honour 'preference' when the
@@ -446,6 +500,27 @@ mod tests {
     // Storage-only tests; the post-mortem AI call needs a live endpoint.
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn norm_suggestion_folds_case_and_whitespace_for_dedup() {
+        // Trivial rewordings normalize to the same key…
+        assert_eq!(norm_suggestion("  Use  pnpm  "), norm_suggestion("use pnpm"));
+        assert_eq!(norm_suggestion("Use TDD by default."), "use tdd by default.");
+        // …but genuinely different facts do not collide.
+        assert_ne!(norm_suggestion("use pnpm"), norm_suggestion("use npm"));
+    }
+
+    #[test]
+    fn dedup_set_drops_repeats_keeps_new() {
+        let existing = ["Use pnpm not npm.", "Prefer TDD."];
+        let mut seen: std::collections::HashSet<String> =
+            existing.iter().map(|s| norm_suggestion(s)).collect();
+        // A reworded duplicate of an existing learning is rejected.
+        assert!(!seen.insert(norm_suggestion("use   pnpm not npm.")));
+        // A brand-new learning is accepted (and now itself guards repeats).
+        assert!(seen.insert(norm_suggestion("This project deploys via GitHub Actions.")));
+        assert!(!seen.insert(norm_suggestion("this project deploys via github actions.")));
+    }
 
     async fn fresh_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
