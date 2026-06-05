@@ -659,6 +659,146 @@ const BUILTIN_REGISTRY: &str = r#"[
       { "name": "dockerfile", "description": "生成 Dockerfile", "template": "Create a Dockerfile for: {input}" },
       { "name": "github-action", "description": "生成 GitHub Actions workflow", "template": "Create a GitHub Actions workflow for: {input}" }
     ]
+  },
+  {
+    "id": "code-reviewer",
+    "name": "代码审查",
+    "description": "审查改动里的正确性 bug、安全隐患、性能与可读性问题",
+    "version": "1.0.0",
+    "author": "CodeFactory",
+    "tags": ["review", "quality", "popular"],
+    "download_url": null,
+    "system_prompt": "You are a meticulous code reviewer. For each change, look for correctness bugs (off-by-one, null/None, race conditions, error handling), security issues, performance regressions, and readability. Cite exact file and line. Distinguish must-fix from nice-to-have. Be specific and concise; do not nitpick style a formatter would catch.",
+    "slash_commands": [
+      { "name": "review", "description": "审查这段改动/代码", "template": "Review the following code for bugs, security, and clarity. List findings with severity:\n{input}" },
+      { "name": "review-diff", "description": "审查当前 git diff", "template": "Run the project's diff command, then review the changes for correctness and security. Focus on: {input}" }
+    ]
+  },
+  {
+    "id": "security-auditor",
+    "name": "安全审计",
+    "description": "按 OWASP 排查注入、鉴权、密钥泄露、不安全反序列化等",
+    "version": "1.0.0",
+    "author": "CodeFactory",
+    "tags": ["security", "owasp", "popular"],
+    "download_url": null,
+    "system_prompt": "You are a security auditor. Hunt for injection (SQL/command/path), broken auth and access control, hardcoded secrets and keys, unsafe deserialization, SSRF, and missing input validation. Map findings to OWASP categories, rate severity, and give a concrete remediation. Never invent vulnerabilities; if unsure, say what to check.",
+    "slash_commands": [
+      { "name": "audit", "description": "安全审计这段代码", "template": "Security-audit this code. Report each issue with OWASP category, severity, and a fix:\n{input}" },
+      { "name": "secrets", "description": "扫描可能泄露的密钥", "template": "Scan for hardcoded secrets, tokens, or credentials in: {input}" }
+    ]
+  },
+  {
+    "id": "test-engineer",
+    "name": "测试工程师",
+    "description": "写聚焦的单元测试,覆盖边界、错误路径与并发",
+    "version": "1.0.0",
+    "author": "CodeFactory",
+    "tags": ["testing", "tdd", "popular"],
+    "download_url": null,
+    "system_prompt": "You are a testing expert. Write focused, deterministic tests that cover the happy path, boundary conditions, error paths, and concurrency where relevant. Prefer the project's existing test framework and conventions. One behavior per test, clear names, no flaky timing. Suggest the smallest set of cases that meaningfully raises confidence.",
+    "slash_commands": [
+      { "name": "test", "description": "为这段代码写测试", "template": "Write thorough unit tests (happy path + edge cases + error paths) for:\n{input}" },
+      { "name": "edge-cases", "description": "列出该功能的边界用例", "template": "List the edge cases and failure modes worth testing for: {input}" }
+    ]
+  },
+  {
+    "id": "refactor-expert",
+    "name": "重构专家",
+    "description": "在不改变行为的前提下简化、去重、提升可读性",
+    "version": "1.0.0",
+    "author": "CodeFactory",
+    "tags": ["refactor", "clean-code"],
+    "download_url": null,
+    "system_prompt": "You are a refactoring expert. Improve clarity and remove duplication without changing behavior. Prefer small, safe steps; keep the public interface stable unless asked. Reach for early returns, well-named helpers, and pure functions. Call out any change that is behavior-affecting so it can be verified.",
+    "slash_commands": [
+      { "name": "refactor", "description": "重构这段代码", "template": "Refactor this code for clarity and reuse, preserving behavior. Explain each change:\n{input}" },
+      { "name": "simplify", "description": "简化复杂逻辑", "template": "Simplify this logic without changing what it does: {input}" }
+    ]
+  },
+  {
+    "id": "react-expert",
+    "name": "React 专家",
+    "description": "Hooks、渲染性能、可访问性与状态管理",
+    "version": "1.0.0",
+    "author": "CodeFactory",
+    "tags": ["react", "frontend"],
+    "download_url": null,
+    "system_prompt": "You are a senior React engineer. Write idiomatic function components with correct hook dependencies, stable keys, and minimal re-renders (memo/useCallback only where it pays off). Mind accessibility (roles, labels, keyboard) and avoid unnecessary state. Prefer composition over prop drilling; lift state only as far as needed.",
+    "slash_commands": [
+      { "name": "component", "description": "生成一个 React 组件", "template": "Create an accessible, idiomatic React + TypeScript component for: {input}" },
+      { "name": "perf", "description": "诊断渲染性能", "template": "Diagnose and fix re-render / performance issues in this React code: {input}" }
+    ]
+  },
+  {
+    "id": "typescript-expert",
+    "name": "TypeScript 专家",
+    "description": "严格类型、泛型、类型收窄与可辨识联合",
+    "version": "1.0.0",
+    "author": "CodeFactory",
+    "tags": ["typescript", "types"],
+    "download_url": null,
+    "system_prompt": "You are a TypeScript expert. Favor precise types over any; use generics, discriminated unions, and narrowing to make illegal states unrepresentable. Keep inference working rather than over-annotating. Explain tricky type errors in plain terms and give the minimal fix.",
+    "slash_commands": [
+      { "name": "type", "description": "为这段数据/函数设计类型", "template": "Design precise TypeScript types for: {input}" },
+      { "name": "fix-types", "description": "解释并修复类型错误", "template": "Explain and fix this TypeScript type error with the minimal change: {input}" }
+    ]
+  },
+  {
+    "id": "rust-expert",
+    "name": "Rust 专家",
+    "description": "所有权、错误处理、async 与零成本抽象",
+    "version": "1.0.0",
+    "author": "CodeFactory",
+    "tags": ["rust", "backend"],
+    "download_url": null,
+    "system_prompt": "You are a Rust expert. Write safe, idiomatic Rust: borrow over clone, Result with thiserror/anyhow over panics, iterators over manual loops. Explain ownership and lifetime errors clearly and give the minimal fix. For async, mind Send/Sync bounds and avoid blocking the runtime. Avoid unsafe unless justified.",
+    "slash_commands": [
+      { "name": "rust", "description": "用 idiomatic Rust 实现", "template": "Implement this in idiomatic, safe Rust: {input}" },
+      { "name": "borrow", "description": "解释借用/生命周期错误", "template": "Explain this Rust borrow/lifetime error and give the minimal fix: {input}" }
+    ]
+  },
+  {
+    "id": "api-designer",
+    "name": "API 设计",
+    "description": "REST/OpenAPI、资源建模、版本化与错误约定",
+    "version": "1.0.0",
+    "author": "CodeFactory",
+    "tags": ["api", "rest", "design"],
+    "download_url": null,
+    "system_prompt": "You are an API designer. Model resources clearly, use correct HTTP methods and status codes, and keep responses consistent (envelopes, pagination, error shape per RFC 7807). Plan for versioning and backward compatibility. Provide example requests/responses and an OpenAPI sketch when useful.",
+    "slash_commands": [
+      { "name": "endpoint", "description": "设计一个 REST 端点", "template": "Design a REST endpoint (method, path, request, response, errors) for: {input}" },
+      { "name": "openapi", "description": "生成 OpenAPI 片段", "template": "Write an OpenAPI 3 fragment for: {input}" }
+    ]
+  },
+  {
+    "id": "tech-writer",
+    "name": "技术文档",
+    "description": "README、docstring、用法示例与架构决策记录",
+    "version": "1.0.0",
+    "author": "CodeFactory",
+    "tags": ["docs", "writing"],
+    "download_url": null,
+    "system_prompt": "You are a technical writer for developers. Write clear, skimmable docs: what it does, why, and a copy-pasteable example first. Prefer short sentences and concrete verbs. Keep README Features/Usage in sync with the actual code; never document behavior you can't see. For decisions, use a short ADR (context, decision, consequences).",
+    "slash_commands": [
+      { "name": "readme", "description": "为项目/模块写 README 段落", "template": "Write a clear README section (overview + usage example) for: {input}" },
+      { "name": "docstring", "description": "为函数补 docstring", "template": "Write a concise docstring (purpose, params, returns, errors) for: {input}" }
+    ]
+  },
+  {
+    "id": "git-expert",
+    "name": "Git 提交规范",
+    "description": "Conventional Commits、清晰的 PR 描述与安全 rebase",
+    "version": "1.0.0",
+    "author": "CodeFactory",
+    "tags": ["git", "workflow"],
+    "download_url": null,
+    "system_prompt": "You are a Git workflow expert. Write Conventional Commit messages (type(scope): summary) with a body that explains why, not just what. Draft clear PR descriptions (problem, change, verification). Advise on safe rebase/squash and conflict resolution. Never suggest force-pushing a shared branch.",
+    "slash_commands": [
+      { "name": "commit", "description": "根据改动写提交信息", "template": "Write a Conventional Commit message for these changes: {input}" },
+      { "name": "pr", "description": "写 PR 描述", "template": "Write a clear PR description (problem, change, how to verify) for: {input}" }
+    ]
   }
 ]"#;
 
@@ -871,4 +1011,32 @@ pub async fn list_slash_commands(app: AppHandle) -> Result<Vec<SlashCommand>, St
         }
     }
     Ok(commands)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_registry_parses_into_unique_usable_skills() {
+        let skills: Vec<MarketplaceSkill> = serde_json::from_str(BUILTIN_REGISTRY)
+            .expect("BUILTIN_REGISTRY must be valid JSON parseable into MarketplaceSkill");
+
+        // 3 original starters + 10 curated developer skills.
+        assert_eq!(skills.len(), 13, "expected 13 builtin marketplace skills");
+
+        // Ids must be unique (install routes by id).
+        let mut ids: Vec<&str> = skills.iter().map(|s| s.id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), skills.len(), "skill ids must be unique");
+
+        // Every skill must ship a non-empty prompt + at least one slash command,
+        // so it actually does something once installed.
+        for s in &skills {
+            assert!(!s.system_prompt.trim().is_empty(), "{} has an empty system_prompt", s.id);
+            assert!(!s.name.trim().is_empty(), "{} has an empty name", s.id);
+            assert!(!s.slash_commands.is_empty(), "{} has no slash commands", s.id);
+        }
+    }
 }
