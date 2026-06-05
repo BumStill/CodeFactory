@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect, useState } from "react";
-import { ChevronLeft, Plus, Trash2, Tag, Terminal, Download, Store, FolderOpen, X } from "lucide-react";
+import { ChevronLeft, Plus, Trash2, Tag, Terminal, Download, Store, FolderOpen, X, Sparkles, Loader2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useSkillsStore, type SkillManifest, type SkillDetail } from "../../stores/skills";
+import { useChatStore } from "../../stores/chat";
 
 interface SkillsPageProps {
   onBack: () => void;
@@ -38,6 +39,26 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
+  // P2: propose skills from the active project's recurring task patterns.
+  const proposeCwd = useChatStore((s) => s.activeSession?.cwd ?? null);
+  const [proposing, setProposing] = useState(false);
+
+  const handlePropose = async () => {
+    if (!proposeCwd || proposing) return;
+    setProposing(true);
+    setInstallError(null);
+    try {
+      const created = await invoke<SkillManifest[]>("propose_skills_from_patterns", { cwd: proposeCwd });
+      await loadSkills();
+      if (created.length === 0) {
+        setInstallError("没有发现足够反复的任务模式（需 ≥4 次相似任务）");
+      }
+    } catch (e) {
+      setInstallError(String(e));
+    } finally {
+      setProposing(false);
+    }
+  };
 
   // Create / edit skill form (P3). null = closed.
   const [form, setForm] = useState<{
@@ -295,6 +316,19 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
                 className="w-full flex items-center justify-center gap-1 px-2 py-1 rounded bg-accent/15 hover:bg-accent/25 text-accent text-xs transition-colors"
               >
                 <Plus size={11} /> 新建技能
+              </button>
+              <button
+                onClick={handlePropose}
+                disabled={!proposeCwd || proposing}
+                title={
+                  proposeCwd
+                    ? "从当前项目反复出现的任务模式里提议一个技能（生成禁用草稿，预览/编辑后再启用）"
+                    : "在某个项目会话里打开技能库时可用"
+                }
+                className="w-full flex items-center justify-center gap-1 px-2 py-1 rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-700 dark:text-emerald-300 text-xs transition-colors disabled:opacity-50"
+              >
+                {proposing ? <Loader2 size={11} className="animate-spin" /> : <Sparkles size={11} />}
+                从使用习惯提议技能
               </button>
               {installError && (
                 <p className="text-xs text-red-400 truncate" title={installError}>

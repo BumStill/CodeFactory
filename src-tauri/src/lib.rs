@@ -244,6 +244,7 @@ pub fn run() {
             commands::skills::update_skill,
             commands::skills::delete_skill,
             commands::skills::list_slash_commands,
+            commands::skills::propose_skills_from_patterns,
             commands::skills::fetch_marketplace_skills,
             commands::skills::install_marketplace_skill,
             commands::hooks::list_hooks,
