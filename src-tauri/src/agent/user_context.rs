@@ -22,21 +22,37 @@ use std::path::PathBuf;
 const MEMORY_CHAR_CAP: usize = 4000;
 const LEARNING_EVENTS_LIMIT: i64 = 20;
 
-/// Build the bundle as a single human-readable block. Empty string if
-/// nothing to inject (caller can skip the section entirely).
+/// Build the full bundle (preferences + learnings + memory.md) as a single
+/// human-readable block. Empty string if nothing to inject. Used by the spec
+/// workbench, which has no other channel for memory.md.
 pub async fn build(pool: &SqlitePool, cwd: &str) -> String {
-    let mut sections: Vec<String> = Vec::new();
+    let mut sections = collect_prefs_and_learnings(pool, cwd).await;
+    if let Some(memory) = build_memory_section(cwd) {
+        sections.push(memory);
+    }
+    wrap_sections(sections)
+}
 
+/// Preferences + accepted learnings only — for the main chat/agent loop, which
+/// already injects `.codefactory/memory.md` via `build_system_prompt_for`. We
+/// deliberately skip the memory section here so it isn't duplicated. Empty
+/// string if there's nothing to add.
+pub async fn build_prefs_and_learnings(pool: &SqlitePool, cwd: &str) -> String {
+    wrap_sections(collect_prefs_and_learnings(pool, cwd).await)
+}
+
+async fn collect_prefs_and_learnings(pool: &SqlitePool, cwd: &str) -> Vec<String> {
+    let mut sections: Vec<String> = Vec::new();
     if let Some(prefs) = build_preferences_section(pool, cwd).await {
         sections.push(prefs);
     }
     if let Some(learnings) = build_learnings_section(pool, cwd).await {
         sections.push(learnings);
     }
-    if let Some(memory) = build_memory_section(cwd) {
-        sections.push(memory);
-    }
+    sections
+}
 
+fn wrap_sections(sections: Vec<String>) -> String {
     if sections.is_empty() {
         String::new()
     } else {
@@ -242,5 +258,27 @@ mod tests {
         let s = build(&pool, "/proj").await;
         assert!(s.contains("always add empty-array test"));
         assert!(!s.contains("ignore me"));
+    }
+
+    #[tokio::test]
+    async fn prefs_and_learnings_emits_prefs_without_memory_section() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO user_preferences VALUES ('/proj','autonomy_level','high','user','2026-01-01')",
+        )
+        .execute(&pool).await.unwrap();
+        let s = build_prefs_and_learnings(&pool, "/proj").await;
+        assert!(s.contains("### Preferences"), "expected preferences, got: {s}");
+        assert!(s.contains("- autonomy_level: high"));
+        // The chat variant must never carry the memory section (it's injected
+        // separately by build_system_prompt_for and would otherwise duplicate).
+        assert!(!s.contains("Project memory"), "memory must be excluded, got: {s}");
+    }
+
+    #[tokio::test]
+    async fn prefs_and_learnings_empty_when_nothing_set() {
+        let pool = fresh_pool().await;
+        let s = build_prefs_and_learnings(&pool, "/nonexistent/proj").await;
+        assert_eq!(s, "");
     }
 }
