@@ -4,10 +4,12 @@ import {
   ChevronDown, ChevronRight,
   AlertCircle, CheckCircle, ShieldQuestion,
   FileText, Edit3, Save, TerminalSquare, Search, FolderTree,
-  Globe, Wrench, Bot, BookOpen,
+  Globe, Wrench, Bot, BookOpen, ExternalLink,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { useChatStore } from "../stores/chat";
 import type { ToolCallState } from "../stores/chat";
+import { invoke } from "../lib/tauri";
 import { DiffViewer, parseUnifiedDiffResult } from "./DiffViewer";
 
 interface Props {
@@ -147,6 +149,36 @@ function basename(path: string | undefined): string {
   return normalized.split("/").filter(Boolean).pop() ?? path;
 }
 
+// Tools whose `path` argument names a file the agent just produced — once the
+// call succeeds we offer to open it with the OS default app, so a generated
+// deck / doc / sheet isn't just a path string the user has to hunt down.
+const FILE_WRITE_TOOLS = new Set([
+  "write_file", "write", "edit_file", "edit",
+  "write_pptx", "edit_pptx", "format_pptx", "write_docx", "edit_xlsx",
+]);
+
+// A tool's `path` is usually relative to the session cwd; the OS opener needs
+// an absolute path. Resolve it, handling both unix and Windows separators.
+function resolveAgainstCwd(cwd: string | undefined, p: string): string {
+  const isAbsolute = /^(\/|\\\\|[A-Za-z]:[\\/])/.test(p);
+  if (isAbsolute || !cwd) return p;
+  const sep = cwd.includes("\\") ? "\\" : "/";
+  return `${cwd.replace(/[\\/]+$/, "")}${sep}${p.replace(/^[\\/]+/, "")}`;
+}
+
+// The file path to offer "open" for, or null if this isn't a successful
+// file-writing call.
+function generatedFilePath(tc: ToolCallState): string | null {
+  if (!FILE_WRITE_TOOLS.has(tc.name)) return null;
+  if (tc.status !== "done" || tc.isError) return null;
+  try {
+    const p = (JSON.parse(tc.args ?? "{}") as { path?: string }).path;
+    return typeof p === "string" && p.trim() ? p : null;
+  } catch {
+    return null;
+  }
+}
+
 function sourceDisplayName(source: KnowledgeSource): string {
   if (source.path) return basename(source.path);
   return source.title ?? source.document_id ?? source.chunk_id ?? "unknown source";
@@ -227,6 +259,8 @@ export function ToolCallCard({ tc }: Props) {
   const summary = summarizeArgs(tc.name, tc.args ?? "");
   const isTestMod = isTestPathFromArgs(tc.name, tc.args ?? "");
   const knowledgeSources = parseKnowledgeSources(tc.name, tc.result);
+  const cwd = useChatStore((s) => s.activeSession?.cwd);
+  const filePath = generatedFilePath(tc);
 
   const statusIcon =
     tc.status === "waiting_permission" ? (
@@ -264,6 +298,22 @@ export function ToolCallCard({ tc }: Props) {
         )}
         <span className="ml-auto shrink-0">{statusIcon}</span>
       </button>
+
+      {filePath && (
+        <button
+          onClick={() =>
+            void invoke("plugin:shell|open", {
+              path: resolveAgainstCwd(cwd, filePath),
+            }).catch(() => {})
+          }
+          title={`打开 ${filePath}`}
+          className="flex w-full items-center gap-1.5 border-t border-border px-3 py-1 text-left text-[11px] text-accent transition-colors hover:bg-surface-3"
+        >
+          <ExternalLink size={11} className="shrink-0" />
+          <span className="truncate font-mono">{basename(filePath)}</span>
+          <span className="ml-auto shrink-0 text-[10px] text-gray-500">打开文件</span>
+        </button>
+      )}
 
       {open && (
         <div className="border-t border-border px-3 py-2 space-y-2 font-mono">
