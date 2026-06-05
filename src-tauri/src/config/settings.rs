@@ -326,6 +326,8 @@ impl Default for Settings {
                     "edit_pptx".into(),
                     "format_pptx".into(),
                     "write_docx".into(),
+                    "read_xlsx".into(),
+                    "edit_xlsx".into(),
                 ],
                 ask: vec!["bash".into()],
                 deny: vec![],
@@ -478,6 +480,20 @@ pub fn load() -> Settings {
             && p.ask.iter().zip(old_ask).all(|(a, b)| a == b);
         if is_old_default {
             settings.permissions = Settings::default().permissions;
+        }
+    }
+
+    // Forward-add the xlsx tools to any policy that already auto-allows document
+    // writes (the action-biased default is marked by `write_docx` in allow).
+    // Idempotent via the read_xlsx guard; leaves a hand-narrowed policy that
+    // dropped write_docx untouched.
+    {
+        let p = &mut settings.permissions;
+        if p.allow.iter().any(|t| t == "write_docx")
+            && !p.allow.iter().any(|t| t == "read_xlsx")
+        {
+            p.allow.push("read_xlsx".into());
+            p.allow.push("edit_xlsx".into());
         }
     }
 

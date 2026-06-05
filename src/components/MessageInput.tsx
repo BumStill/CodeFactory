@@ -27,7 +27,7 @@ interface AttachmentChip {
 }
 
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp"];
-const DOC_EXTS = ["pptx", "docx", "pdf"];
+const DOC_EXTS = ["pptx", "docx", "pdf", "xlsx"];
 const ACCEPT_ATTR = [...IMAGE_EXTS, ...DOC_EXTS].map((e) => `.${e}`).join(",");
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
@@ -217,7 +217,7 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
       if (docs.length > 0) {
         const lines = docs.map((a) => `- ${a.name} — 本地路径: ${a.path}`).join("\n");
         blocks.push(
-          `已上传以下文件（.pptx 用 read_pptx 读结构后：edit_pptx 原地增强内容、format_pptx 统一美化排版；要总结/演讲稿就读取后在聊天框回答或 write_docx 生成。.docx/.pdf 用 read_file 提取文本）：\n${lines}`,
+          `已上传以下文件（.pptx 用 read_pptx 读结构后：edit_pptx 原地增强内容、format_pptx 统一美化排版；.xlsx 用 read_xlsx 读成表格、edit_xlsx 把结果写回单元格（如逐行总结到某列）；要总结/演讲稿就读取后在聊天框回答或 write_docx 生成。.docx/.pdf 用 read_file 提取文本）：\n${lines}`,
         );
       }
       const appendix = blocks.join("\n\n");
@@ -356,7 +356,7 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
           onClick={() => fileInputRef.current?.click()}
           disabled={!cwd || uploading}
           className="shrink-0 rounded-lg p-1.5 transition-colors enabled:hover:bg-surface-4 text-gray-500 disabled:opacity-30"
-          title={cwd ? "附加文件（图片 / pptx / docx / pdf）" : "打开项目后可附加文件"}
+          title={cwd ? "附加文件（图片 / pptx / docx / pdf / xlsx）" : "打开项目后可附加文件"}
         >
           <Paperclip size={16} />
         </button>
@@ -372,7 +372,7 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
               ? "松开以附加文件"
               : disabled
               ? "发送消息，或用 /cwd <path> 切换目录"
-              : "发送消息 · 粘贴/拖拽/回形针附加文件（图片 · pptx · docx · pdf）"
+              : "发送消息 · 粘贴/拖拽/回形针附加文件（图片 · pptx · docx · pdf · xlsx）"
           }
           className="flex-1 resize-none bg-transparent text-sm text-gray-200 placeholder-gray-600 outline-none min-h-[24px] max-h-[200px] leading-6 disabled:opacity-40"
         />
