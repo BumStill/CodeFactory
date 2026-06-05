@@ -78,6 +78,7 @@ interface ChatStore {
   createSession: (cwd: string, model: string) => Promise<Session>;
   selectSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
+  renameSession: (id: string, title: string) => Promise<void>;
   /** Send to `sessionId` (default: the active session). Targeting lets the
    *  queue-drain fire the next message into a background session too. */
   sendMessage: (content: string, sessionId?: string) => Promise<void>;
@@ -191,6 +192,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       delete _streamingMsgId[id];
       return {
         sessions: s.sessions.filter((x) => x.id !== id),
+        quickSessions: s.quickSessions.filter((x) => x.id !== id),
         runtime,
         _unlisten,
         _unlistenSessionUpdated,
@@ -198,6 +200,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         ...(s.activeSession?.id === id ? { activeSession: null } : {}),
       };
     });
+  },
+
+  renameSession: async (id, title) => {
+    await invoke("update_session_title", { sessionId: id, title });
+    set((s) => ({
+      sessions: s.sessions.map((x) => (x.id === id ? { ...x, title } : x)),
+      quickSessions: s.quickSessions.map((x) => (x.id === id ? { ...x, title } : x)),
+      ...(s.activeSession?.id === id
+        ? { activeSession: { ...s.activeSession, title } }
+        : {}),
+    }));
   },
 
   sendMessage: async (content, sessionId) => {

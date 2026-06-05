@@ -10,7 +10,7 @@
 // Mental model: 快速任务 ≈ lightweight "cowork" chat, 项目 ≈ full "code"
 // project — both created and switched from this one rail.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, ChevronDown, Zap, Folder, EyeOff, Loader2 } from "lucide-react";
+import { Plus, ChevronDown, Zap, Folder, EyeOff, Loader2, Pencil, Trash2 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../stores/chat";
 import { createQuickSession } from "../lib/tauri";
@@ -32,6 +32,8 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
   const loadSessions = useChatStore((s) => s.loadSessions);
   const loadQuickSessions = useChatStore((s) => s.loadQuickSessions);
   const startAnonymousSession = useChatStore((s) => s.startAnonymousSession);
+  const deleteSession = useChatStore((s) => s.deleteSession);
+  const renameSession = useChatStore((s) => s.renameSession);
 
   const [menuOpen, setMenuOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -165,6 +167,8 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
                 session={s}
                 active={s.id === currentSessionId}
                 onClick={() => onOpenSession(s.id)}
+                onDelete={() => deleteSession(s.id)}
+                onRename={(t) => renameSession(s.id, t)}
               />
             ))}
           </ul>
@@ -178,21 +182,47 @@ function SessionRow({
   session,
   active,
   onClick,
+  onDelete,
+  onRename,
 }: {
   session: Session;
   active: boolean;
   onClick: () => void;
+  onDelete: () => void;
+  onRename: (title: string) => void;
 }) {
   const isQuick = session.kind === "quick";
   // Per-session streaming indicator: with concurrent sessions, any row may be
   // mid-stream even when it's not the foreground one.
   const streaming = useChatStore((s) => s.runtime?.[session.id]?.streaming ?? false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [confirming, setConfirming] = useState(false);
+
+  const startRename = () => {
+    setConfirming(false);
+    setDraft(session.title || "");
+    setEditing(true);
+  };
+  const commitRename = () => {
+    const t = draft.trim();
+    setEditing(false);
+    if (t && t !== session.title) onRename(t);
+  };
+
   return (
     <li>
-      <button
-        onClick={onClick}
+      <div
+        role="button"
+        tabIndex={0}
         aria-current={active ? "page" : undefined}
-        className={`group w-full rounded-md px-2 py-1.5 text-left transition-colors ${
+        onClick={() => {
+          if (!editing) onClick();
+        }}
+        onKeyDown={(e) => {
+          if (!editing && e.key === "Enter") onClick();
+        }}
+        className={`group w-full cursor-pointer rounded-md px-2 py-1.5 text-left transition-colors ${
           active
             ? "border border-accent/40 bg-accent/15"
             : "border border-transparent hover:bg-surface-2"
@@ -204,28 +234,98 @@ function SessionRow({
           ) : (
             <Folder size={11} className="shrink-0 text-gray-500" />
           )}
-          <span
-            className={`flex-1 truncate text-[12px] ${
-              active ? "font-medium text-gray-100" : "text-gray-300"
-            }`}
-          >
-            {session.title || (isQuick ? "快速任务" : "未命名项目")}
-          </span>
+          {editing ? (
+            <input
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter") commitRename();
+                if (e.key === "Escape") setEditing(false);
+              }}
+              onBlur={commitRename}
+              className="min-w-0 flex-1 rounded border border-accent/50 bg-surface-3 px-1 text-[12px] text-gray-100 outline-none"
+            />
+          ) : (
+            <span
+              className={`flex-1 truncate text-[12px] ${
+                active ? "font-medium text-gray-100" : "text-gray-300"
+              }`}
+            >
+              {session.title || (isQuick ? "快速任务" : "未命名项目")}
+            </span>
+          )}
           {streaming && (
             <Loader2 size={11} className="shrink-0 animate-spin text-accent" aria-label="运行中" />
           )}
-          <span
-            className={`shrink-0 rounded px-1 py-0.5 text-[8px] ${
-              isQuick ? "bg-accent/15 text-accent" : "bg-surface-3 text-gray-500"
-            }`}
-          >
-            {isQuick ? "快速" : "项目"}
-          </span>
+          {!editing && !confirming && (
+            <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+              <span
+                role="button"
+                title="重命名"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  startRename();
+                }}
+                className="rounded p-0.5 text-gray-600 hover:bg-surface-3 hover:text-gray-300"
+              >
+                <Pencil size={10} />
+              </span>
+              <span
+                role="button"
+                title="删除会话"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setConfirming(true);
+                }}
+                className="rounded p-0.5 text-gray-600 hover:bg-surface-3 hover:text-red-400"
+              >
+                <Trash2 size={10} />
+              </span>
+            </span>
+          )}
+          {confirming && (
+            <span className="flex shrink-0 items-center gap-1">
+              <span
+                role="button"
+                title="确认删除"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDelete();
+                }}
+                className="rounded bg-red-500/15 px-1 py-0.5 text-[9px] text-red-400 hover:bg-red-500/25"
+              >
+                删除
+              </span>
+              <span
+                role="button"
+                title="取消"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setConfirming(false);
+                }}
+                className="rounded px-1 py-0.5 text-[9px] text-gray-500 hover:bg-surface-3"
+              >
+                取消
+              </span>
+            </span>
+          )}
+          {!editing && !confirming && (
+            <span
+              className={`shrink-0 rounded px-1 py-0.5 text-[8px] ${
+                isQuick ? "bg-accent/15 text-accent" : "bg-surface-3 text-gray-500"
+              }`}
+            >
+              {isQuick ? "快速" : "项目"}
+            </span>
+          )}
         </div>
         <div className="mt-0.5 pl-[18px] text-[9px] text-gray-600">
           {formatRelativeTime(session.updated_at)}
         </div>
-      </button>
+      </div>
     </li>
   );
 }
