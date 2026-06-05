@@ -76,8 +76,8 @@ describe("SessionSidebar", () => {
 
   it("marks the current session active via aria-current", () => {
     render(<SessionSidebar currentSessionId="q1" onOpenSession={() => {}} />);
-    expect(screen.getByText("改图脚本").closest("button")).toHaveAttribute("aria-current", "page");
-    expect(screen.getByText("CodeFactory").closest("button")).not.toHaveAttribute("aria-current");
+    expect(screen.getByText("改图脚本").closest('[role="button"]')).toHaveAttribute("aria-current", "page");
+    expect(screen.getByText("CodeFactory").closest('[role="button"]')).not.toHaveAttribute("aria-current");
   });
 
   it("switches session in place when a row is clicked", () => {
