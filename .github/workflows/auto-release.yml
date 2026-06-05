@@ -1,17 +1,25 @@
 name: Auto Release
 
-# Triggers after CI passes on main. Determines version slot from the
-# squash-merge commit message (conventional commits), bumps all three
-# version files, pushes a vX.Y.Z tag, and lets release.yml do the rest.
+# RELEASE CADENCE PRINCIPLE — merge continuously, release deliberately.
+# This does NOT run on every merge. A release is cut on demand
+# (workflow_dispatch) or once daily (schedule), batching everything merged
+# since the last tag into ONE versioned release — and only when there's a
+# user-facing change (feat/fix) to ship. See docs/principles/release-cadence.md.
 #
-# Infinite-loop guard: version-bump commits start with
-# "chore: bump version to" — this workflow skips them.
+# It then determines the version slot from ALL commits since the last tag,
+# bumps the three version files, pushes a vX.Y.Z tag, and lets release.yml
+# build + publish. Bump commits ("chore: bump version to …") are excluded so
+# they can never themselves cause a release.
 
 on:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Cut a release even with no feat/fix since the last tag"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 1 * * *" # daily 01:00 UTC — batches the day's merges into one release
 
 permissions:
   contents: write
@@ -19,11 +27,6 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    # Only proceed when CI actually passed, and skip version-bump commits
-    if: |
-      github.event.workflow_run.conclusion == 'success' &&
-      !startsWith(github.event.workflow_run.head_commit.message, 'chore: bump version to')
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,31 +41,62 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Determine version slot
-        id: slot
+      - name: Verify main CI is green
         env:
-          MSG: ${{ github.event.workflow_run.head_commit.message }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # feat!: or "BREAKING CHANGE" anywhere in message → major
-          if echo "$MSG" | grep -qE '^feat[^:]*!:|BREAKING[ -]CHANGE'; then
-            echo "slot=major" >> "$GITHUB_OUTPUT"
-          # feat: or feat(scope): → minor
-          elif echo "$MSG" | grep -qE '^feat(\([^)]+\))?:'; then
-            echo "slot=minor" >> "$GITHUB_OUTPUT"
-          # everything else (fix, chore, perf, docs, refactor, test…) → patch
-          else
-            echo "slot=patch" >> "$GITHUB_OUTPUT"
+          # Never cut a release on top of a red main. If a CI run exists for
+          # this exact HEAD it must be success; if none is found (timing), we
+          # proceed rather than block the cut.
+          HEAD_SHA=$(git rev-parse HEAD)
+          CONC=$(gh run list --workflow CI --branch main --limit 30 \
+                   --json headSha,conclusion \
+                   -q "[.[] | select(.headSha==\"$HEAD_SHA\")][0].conclusion" 2>/dev/null || echo "")
+          if [ -n "$CONC" ] && [ "$CONC" != "success" ]; then
+            echo "::error::main CI for $HEAD_SHA is '$CONC' — refusing to release on red."
+            exit 1
           fi
-          echo "Commit: $MSG"
-          echo "Slot  : $(cat $GITHUB_OUTPUT | grep slot | cut -d= -f2)"
+          echo "main CI for $HEAD_SHA: ${CONC:-not found, proceeding}"
+
+      - name: Determine version slot from commits since last tag
+        id: slot
+        run: |
+          # Batch the whole window since the last tag — NOT just one commit.
+          LAST=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          RANGE="${LAST:+$LAST..}HEAD"
+          # Conventional-commit subjects in the window, minus bump commits.
+          MSGS=$(git log --format=%s "$RANGE" | grep -v '^chore: bump version to' || true)
+          SLOT=none
+          while IFS= read -r m; do
+            [ -z "$m" ] && continue
+            if echo "$m" | grep -qE '^feat[^:]*!:|BREAKING[ -]CHANGE'; then SLOT=major; break; fi
+            if echo "$m" | grep -qE '^feat(\([^)]+\))?:'; then SLOT=minor; continue; fi
+            if [ "$SLOT" = none ] && echo "$m" | grep -qE '^fix(\([^)]+\))?:'; then SLOT=patch; fi
+          done <<< "$MSGS"
+          # Principle: only user-facing changes ship. No feat/fix → no release
+          # (chore/ci/docs/refactor/test ride the next feat/fix release), unless
+          # explicitly forced.
+          if [ "$SLOT" = none ]; then
+            if [ "${{ github.event.inputs.force }}" = "true" ]; then
+              echo "No feat/fix since ${LAST:-repo start}, but force=true → patch."
+              SLOT=patch
+            else
+              echo "Nothing to release: no feat/fix since ${LAST:-repo start}."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+          echo "Range: $RANGE  Slot: $SLOT"
 
       - name: Setup Node.js
+        if: steps.slot.outputs.skip != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Resolve next version
         id: ver
+        if: steps.slot.outputs.skip != 'true'
         run: |
           LAST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
           CURRENT="${LAST#v}"
@@ -78,6 +112,7 @@ jobs:
           echo "Last: $LAST  Slot: $SLOT  Next: v$NEW"
 
       - name: Bump version files
+        if: steps.slot.outputs.skip != 'true'
         env:
           NEW: ${{ steps.ver.outputs.version }}
         run: |
@@ -112,6 +147,7 @@ jobs:
           }
 
       - name: Commit, tag, push
+        if: steps.slot.outputs.skip != 'true'
         env:
           NEW: ${{ steps.ver.outputs.version }}
           TAG: ${{ steps.ver.outputs.tag }}
