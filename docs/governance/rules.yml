@@ -1,0 +1,43 @@
+# Governance rules — the single, executable source of truth.
+#
+# Every cross-cutting principle is declared here ONCE. Agent convention files
+# (AGENTS.md, CLAUDE.md) point at this file rather than re-stating rules, and
+# tools/governance/check_governance_rules.py enforces it on every PR/push — so
+# the harness binds regardless of which agent (or human) made the change.
+# See docs/governance/agent-conformance.md.
+#
+# Schema per rule:
+#   id          unique slug
+#   statement   one-line normative statement
+#   doc         canonical doc path (must exist)
+#   enforcement structural | check | review
+#   enforcer    artifact that makes/keeps the rule true (must exist)
+#   level       warn | error   (only for enforcement: check)
+
+version: "2026-06-05"
+
+rules:
+  - id: release-cadence
+    statement: "Merge continuously, release deliberately; releases are never triggered by a merge."
+    doc: docs/principles/release-cadence.md
+    enforcement: structural
+    enforcer: .github/workflows/auto-release.yml
+
+  - id: design-doc-for-major
+    statement: "Every major change lands a design doc in the tree (docs/specs|design|principles)."
+    doc: docs/principles/design-docs-for-major-changes.md
+    enforcement: check
+    enforcer: tools/governance/check_governance_rules.py
+    level: warn
+
+  - id: agent-conformance
+    statement: "Harness rules are enforced at the CI gate (agent-agnostic), not by agent goodwill."
+    doc: docs/governance/agent-conformance.md
+    enforcement: structural
+    enforcer: .github/workflows/governance-baseline.yml
+
+  - id: ux-verify-before-merge
+    statement: "User-facing behavior changes must be verified in the running app before they ship."
+    doc: AGENTS.md
+    enforcement: review
+    enforcer: AGENTS.md
