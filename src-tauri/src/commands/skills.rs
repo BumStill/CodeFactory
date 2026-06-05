@@ -595,36 +595,24 @@ pub async fn delete_skill(id: String, app: AppHandle) -> Result<(), String> {
     std::fs::remove_dir_all(&manifest.path).map_err(|e| e.to_string())
 }
 
-/// Returns the combined system prompt: base + all enabled skills.
-/// Used by the agent loop.
-pub async fn get_active_system_prompt(base: &str, app: &AppHandle) -> String {
+/// The trimmed `system_prompt.md` body of every enabled skill, in list order.
+/// The agent loop wraps each into a budgeted context block (see
+/// `agent::context_budget`) rather than concatenating them unbounded.
+pub async fn enabled_skill_prompts(app: &AppHandle) -> Vec<String> {
     let skills = match list_skills(app.clone()).await {
         Ok(s) => s,
-        Err(_) => return base.to_string(),
+        Err(_) => return Vec::new(),
     };
-
-    let enabled_prompts: Vec<String> = skills
+    skills
         .iter()
         .filter(|s| s.enabled)
         .filter_map(|s| {
             let path = PathBuf::from(&s.path).join("system_prompt.md");
             std::fs::read_to_string(path).ok()
         })
-        .collect();
-
-    if enabled_prompts.is_empty() {
-        return base.to_string();
-    }
-
-    let mut result = base.to_string();
-    for prompt in enabled_prompts {
-        let trimmed = prompt.trim();
-        if !trimmed.is_empty() {
-            result.push_str("\n\n---\n\n");
-            result.push_str(trimmed);
-        }
-    }
-    result
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 // ── Marketplace ───────────────────────────────────────────────────────────────

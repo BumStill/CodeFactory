@@ -3,6 +3,7 @@ pub mod anthropic_client;
 pub mod attachments;
 pub mod checkpoint;
 pub mod context;
+pub mod context_budget;
 pub mod dispatch;
 pub mod hooks;
 pub mod scheduler;
@@ -421,21 +422,29 @@ impl AgentLoop {
                 .retain(|d| d.function.name != "kb_search" && d.function.name != "kb_get_chunk");
         }
         let event_name = format!("stream:{}", self.session_id);
-        let base_prompt = build_system_prompt_for(self.mode, &self.cwd);
-        let mut system_prompt =
-            crate::commands::skills::get_active_system_prompt(&base_prompt, &self.app).await;
-        // Wire the user's structured preferences + accepted learnings into the
-        // main agent loop. Without this, the post-mortem learning loop captured
-        // preferences/learnings that only ever reached spec decomposition — the
-        // chat the user actually talks to ignored them. memory.md is already in
-        // base_prompt, so we pull prefs + learnings only (no memory) to avoid
-        // duplicating it.
-        let user_ctx =
-            user_context::build_prefs_and_learnings(&self.db, &self.cwd.to_string_lossy()).await;
-        if !user_ctx.is_empty() {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&user_ctx);
+        // Assemble the system prompt under ONE shared budget: the fixed base
+        // persona (always kept), then project knowledge (memory/README/config),
+        // enabled skills, and the user's preferences/learnings. Blocks render in
+        // this order, but the budget is allocated by priority — so when context
+        // is tight the least-important blocks (config, then README) yield first
+        // while preferences and memory survive. Wiring prefs/learnings here is
+        // what lets the chat the user actually talks to honor them (the
+        // post-mortem loop captured them but only spec decomposition read them).
+        // See `agent::context_budget`.
+        let cwd_str = self.cwd.to_string_lossy();
+        let mut blocks = project_knowledge_blocks(&self.cwd);
+        for body in crate::commands::skills::enabled_skill_prompts(&self.app).await {
+            blocks.push(context_budget::Block::new(format!("---\n\n{body}"), 2, 4000));
         }
+        let user_ctx = user_context::build_prefs_and_learnings(&self.db, &cwd_str).await;
+        if !user_ctx.is_empty() {
+            blocks.push(context_budget::Block::new(user_ctx, 0, 2500));
+        }
+        let mut system_prompt = context_budget::assemble(
+            self.mode.system_prompt().to_string(),
+            blocks,
+            SYSTEM_PROMPT_BUDGET,
+        );
         // Model-aware reinforcement for post-approval Execute turns (no-op for
         // high-compliance models and all non-Execute turns).
         system_prompt.push_str(compliance_booster(self.mode, &self.model_id));
@@ -1882,56 +1891,83 @@ fn build_system_prompt(cwd: &Path) -> String {
     build_system_prompt_for(AgentMode::Interactive, cwd)
 }
 
-/// Same as `build_system_prompt` but parameterized on the agent mode so
-/// subagent runs can switch to the autonomous contract without losing
-/// the project-memory / cwd appendices the interactive prompt builds.
-fn build_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
-    let mut prompt = mode.system_prompt().to_string();
+/// Char ceiling for project-only knowledge (memory / README / config) in the
+/// standalone prompt builder. The live loop uses a larger budget that also
+/// covers skills + user context (see [`SYSTEM_PROMPT_BUDGET`]).
+const PROJECT_CONTEXT_BUDGET: usize = 14_000;
 
-    // ── 1. Project memory ──────────────────────────────────────────────────
-    // Two locations supported:
-    //   - `.codefactory/memory.md`  (preferred, modern; matches the .cursorrules
-    //                                / .claude/ family of project-config dirs)
-    //   - `CODEFACTORY.md`          (legacy top-level file, kept for back-compat)
-    // The Remember button in the UI appends to `.codefactory/memory.md`.
-    let mut sources: Vec<(&str, std::path::PathBuf)> = vec![
+/// Char ceiling for ALL injected knowledge — project + enabled skills + user
+/// preferences/learnings — in the live agent loop. Roughly 6k tokens: a
+/// protective cap so a big README plus several large skills can't silently
+/// swallow the context window, not a limit the common case ever reaches.
+const SYSTEM_PROMPT_BUDGET: usize = 24_000;
+
+/// The project-derived knowledge blocks: memory (both supported files under one
+/// heading), README, and the primary config file — each rendered in its
+/// existing format. The caller fits them into a shared budget.
+fn project_knowledge_blocks(cwd: &Path) -> Vec<context_budget::Block> {
+    use context_budget::Block;
+    let mut blocks = Vec::new();
+
+    // Memory — `.codefactory/memory.md` (preferred, modern; matches the
+    // .cursorrules / .claude/ family) + legacy `CODEFACTORY.md`, combined under
+    // one heading. Each source keeps its prior 4000-char cap.
+    let sources: [(&str, std::path::PathBuf); 2] = [
         (".codefactory/memory.md", cwd.join(".codefactory").join("memory.md")),
         ("CODEFACTORY.md", cwd.join("CODEFACTORY.md")),
     ];
-    let mut injected_memory = false;
-    for (label, path) in sources.drain(..) {
-        if let Some(memory) = read_file_capped(&path, 4000) {
-            let memory = memory.trim();
-            if memory.is_empty() {
+    let mut mem = String::new();
+    for (label, path) in sources {
+        if let Some(content) = read_file_capped(&path, 4000) {
+            let content = content.trim();
+            if content.is_empty() {
                 continue;
             }
-            if !injected_memory {
-                prompt.push_str("\n\n# Project Memory");
-                injected_memory = true;
+            if mem.is_empty() {
+                mem.push_str("# Project Memory");
             }
-            prompt.push_str(&format!("\n\n## From `{label}`\n{memory}"));
+            mem.push_str(&format!("\n\n## From `{label}`\n{content}"));
         }
     }
+    if !mem.is_empty() {
+        blocks.push(Block::new(mem, 1, 8200));
+    }
 
-    // ── 2. README ────────────────────────────────────────────────────────────
+    // README — first of the candidates that exists.
     for readme in &["README.md", "README.txt", "readme.md"] {
         if let Some(content) = read_file_capped(&cwd.join(readme), 3000) {
-            prompt.push_str(&format!("\n\n# Project README ({readme})\n"));
-            prompt.push_str(&content);
-            break; // only first found
+            blocks.push(Block::new(
+                format!("# Project README ({readme})\n{content}"),
+                4,
+                3200,
+            ));
+            break;
         }
     }
 
-    // ── 3. Project config (Cargo.toml / package.json / etc.) ────────────────
+    // Project config (Cargo.toml / package.json / etc.).
     if let Some((label, config_path)) = detect_project_config(cwd) {
         if let Some(content) = read_file_capped(&config_path, 2000) {
-            prompt.push_str(&format!("\n\n# Project Config — {label}\n```\n"));
-            prompt.push_str(&content);
-            prompt.push_str("\n```");
+            blocks.push(Block::new(
+                format!("# Project Config — {label}\n```\n{content}\n```"),
+                5,
+                2200,
+            ));
         }
     }
 
-    prompt
+    blocks
+}
+
+/// Same as `build_system_prompt` but parameterized on the agent mode. Project
+/// knowledge only; the live loop ([`AgentLoop::run`]) assembles the full
+/// budgeted prompt (which also folds in skills + user context).
+fn build_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
+    context_budget::assemble(
+        mode.system_prompt().to_string(),
+        project_knowledge_blocks(cwd),
+        PROJECT_CONTEXT_BUDGET,
+    )
 }
 
 /// Extra, model-aware reinforcement of the [`AgentMode::Execute`] contract.
@@ -2166,6 +2202,32 @@ mod tests {
         assert!(prompt.starts_with(SYSTEM_PROMPT));
         assert!(prompt.contains("CODEFACTORY.md"));
         assert!(prompt.contains("Use the repo-local memory."));
+
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn project_knowledge_blocks_cover_memory_readme_config_with_priorities() {
+        let cwd = std::env::temp_dir().join(format!("codefactory-pkb-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(cwd.join(".codefactory")).unwrap();
+        std::fs::write(cwd.join(".codefactory").join("memory.md"), "remember pnpm not npm").unwrap();
+        std::fs::write(cwd.join("README.md"), "# MyProj\nhello world").unwrap();
+        std::fs::write(cwd.join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
+
+        let blocks = project_knowledge_blocks(&cwd);
+
+        // memory, README, config — in that render order, with eviction
+        // priorities memory(1) < README(4) < config(5).
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].priority, 1);
+        assert!(blocks[0].content.contains("# Project Memory"));
+        assert!(blocks[0].content.contains("remember pnpm not npm"));
+        assert_eq!(blocks[1].priority, 4);
+        assert!(blocks[1].content.contains("# Project README"));
+        assert!(blocks[1].content.contains("hello world"));
+        assert_eq!(blocks[2].priority, 5);
+        assert!(blocks[2].content.contains("# Project Config"));
+        assert!(blocks[2].content.contains("name = \"x\""));
 
         std::fs::remove_dir_all(cwd).unwrap();
     }
