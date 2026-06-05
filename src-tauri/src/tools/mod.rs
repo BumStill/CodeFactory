@@ -15,6 +15,7 @@ pub mod skill_mgmt;
 pub mod test_path;
 pub mod workspace_path;
 pub mod write;
+pub mod xlsx;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -93,6 +94,8 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         skill_mgmt::delete_definition(),
         skill_mgmt::search_definition(),
         skill_mgmt::fetch_definition(),
+        xlsx::read_definition(),
+        xlsx::edit_definition(),
     ]
 }
 
@@ -117,6 +120,8 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "skill_delete" => skill_mgmt::execute_delete(args, ctx).await,
         "skill_search" => skill_mgmt::execute_search(args, ctx).await,
         "skill_fetch" => skill_mgmt::execute_fetch(args, ctx).await,
+        "read_xlsx" => xlsx::execute_read(args, ctx).await,
+        "edit_xlsx" => xlsx::execute_edit(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),
     }
 }
