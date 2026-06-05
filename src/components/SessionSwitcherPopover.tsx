@@ -31,10 +31,11 @@ export function SessionSwitcherPopover({
         </span>
         <button
           onClick={onExpand}
-          title="固定展开侧栏"
-          className="rounded p-0.5 text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300"
+          title="把会话列表固定到左侧栏"
+          className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-accent transition-colors hover:bg-accent/10"
         >
-          <PanelLeftOpen size={13} />
+          <PanelLeftOpen size={12} />
+          固定到左侧
         </button>
       </div>
       <SessionSidebar currentSessionId={currentSessionId} onOpenSession={onOpenSession} />

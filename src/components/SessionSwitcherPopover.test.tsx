@@ -65,7 +65,7 @@ describe("SessionSwitcherPopover", () => {
     render(
       <SessionSwitcherPopover currentSessionId="p1" onOpenSession={() => {}} onExpand={onExpand} />,
     );
-    fireEvent.click(screen.getByTitle("固定展开侧栏"));
+    fireEvent.click(screen.getByText("固定到左侧"));
     expect(onExpand).toHaveBeenCalledTimes(1);
   });
 
