@@ -792,6 +792,87 @@ pub async fn mine_cross_session_patterns(
     Ok(created)
 }
 
+// ── Self-evolution P4: self-modification (SAFE foundation only) ────────────────
+//
+// P4 is "the factory improves its own code" — the boldest, highest-risk phase.
+// v1 ships ONLY the read-only foundation: aggregate friction globally and render
+// a PROPOSAL for the human. It writes no code, opens no PR, ships nothing. The
+// autonomous draft→branch→implement→verify→PR pipeline is deliberately gated and
+// NOT built here. See docs/self-evolution/P4-self-modification.md.
+
+/// Render a self-improvement proposal (markdown) from global friction insights.
+/// Pure. Its header makes the human-gate explicit: it changes nothing.
+fn build_improvement_proposal(
+    tool_insights: &[PatternInsight],
+    retry_insights: &[PatternInsight],
+) -> String {
+    let mut md = String::from(
+        "# CodeFactory 自我改进提案\n\n\
+> 本提案由系统从你的使用数据**只读聚合**生成。它**不修改任何代码、不开 PR、不发布任何版本**\
+——一切改动由你决定并经人工审批。\n\n",
+    );
+    if tool_insights.is_empty() && retry_insights.is_empty() {
+        md.push_str("暂未发现明显的反复摩擦点。继续用着，数据多了再来看。\n");
+        return md;
+    }
+    if !tool_insights.is_empty() {
+        md.push_str("## 工具可靠性\n");
+        for i in tool_insights.iter().take(5) {
+            md.push_str(&format!(
+                "- {}\n  - 可考虑：在该工具实现里加前置检查 / 更稳的错误处理。\n",
+                i.suggestion
+            ));
+        }
+        md.push('\n');
+    }
+    if !retry_insights.is_empty() {
+        md.push_str("## 反复重试的失败\n");
+        for i in retry_insights.iter().take(5) {
+            md.push_str(&format!(
+                "- {}\n  - 可考虑：为这个失败加一道前置检查或固定解法。\n",
+                i.suggestion
+            ));
+        }
+        md.push('\n');
+    }
+    md.push_str(
+        "---\n采纳方式：你（或在你审批下的 agent）据此开分支实现、verify、提 PR——系统不会自己动手。\n",
+    );
+    md
+}
+
+/// P4 v1: a read-only self-improvement proposal. Aggregates friction GLOBALLY
+/// (all projects) via P1's detectors and renders a markdown proposal for the
+/// human. Writes no code, opens no PR, ships nothing.
+#[command]
+pub async fn self_improvement_proposal(state: State<'_, AppState>) -> Result<String, AppError> {
+    let pool = state.db.read().await;
+    let tools: Vec<ToolCallRow> = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT tool_name, status, error FROM tool_calls ORDER BY created_at DESC LIMIT 8000",
+    )
+    .fetch_all(&*pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(tool_name, status, error)| ToolCallRow { tool_name, status, error })
+    .collect();
+    let tasks: Vec<TaskRow> = sqlx::query_as::<_, (String, i64, Option<String>)>(
+        "SELECT status, attempt_count, error FROM task_runs ORDER BY created_at DESC LIMIT 4000",
+    )
+    .fetch_all(&*pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(status, attempt_count, error)| TaskRow { status, attempt_count, error })
+    .collect();
+    drop(pool);
+
+    Ok(build_improvement_proposal(
+        &detect_tool_reliability(&tools),
+        &detect_retry_prone(&tasks),
+    ))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -799,6 +880,25 @@ mod tests {
     // Storage-only tests; the post-mortem AI call needs a live endpoint.
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn improvement_proposal_is_read_only_and_lists_friction() {
+        // Empty → states no friction, still carries the no-mutation header.
+        let empty = build_improvement_proposal(&[], &[]);
+        assert!(empty.contains("不修改任何代码"), "must state it changes nothing");
+        assert!(empty.contains("暂未发现"));
+        // With friction → lists it + keeps the human-gate footer.
+        let tool = PatternInsight {
+            observation: "o".into(),
+            suggestion: "工具 `bash` 失败率偏高".into(),
+            support_count: 10,
+            evidence: serde_json::json!({}),
+        };
+        let md = build_improvement_proposal(&[tool], &[]);
+        assert!(md.contains("## 工具可靠性"));
+        assert!(md.contains("工具 `bash` 失败率偏高"));
+        assert!(md.contains("系统不会自己动手"));
+    }
 
     #[test]
     fn norm_suggestion_folds_case_and_whitespace_for_dedup() {

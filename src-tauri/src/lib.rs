@@ -169,6 +169,7 @@ pub fn run() {
             commands::learning::reject_learning_event,
             commands::learning::run_postmortem,
             commands::learning::mine_cross_session_patterns,
+            commands::learning::self_improvement_proposal,
             commands::preferences::list_user_preferences,
             commands::preferences::upsert_user_preference,
             commands::preferences::delete_user_preference,
