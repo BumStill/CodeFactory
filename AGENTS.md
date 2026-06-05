@@ -1,5 +1,8 @@
 # CodeFactory 仓库协作规则（AGENTS）
 
+## 最高原则（适用本仓库与任何未来仓库）
+- **持续合并，刻意发版**：合并 ≠ 发版。发布管线**不由 push/merge 触发**；版本在需要时按需（`workflow_dispatch`）或每日（`schedule`）**成批**切出，把"自上个 tag 起的所有合并"汇成一个版本，且**仅当存在 `feat`/`fix` 时才发**（`chore`/`ci`/`docs`/`refactor`/`test` 搭下一次 feat/fix 一起发）。完整规则见 `docs/principles/release-cadence.md`，这是跨仓最高原则，可原样复制到任何仓库。
+
 ## 入口顺序
 - 日常任务先读 `docs/repo-quick-profile.md`、当前任务说明和 quick gate 结果。
 - 只有 quick gate 标记 release、compatibility、observation、payload、viewport 或 governance-change 风险时，才加载 `docs/repo-governance-profile.md` 和全局治理参考。
@@ -94,5 +97,6 @@ Tauri dev 二进制不在系统应用注册表里，`computer-use.request_access
 - `.github/workflows/governance-baseline.yml` 负责在 PR/push 上检查治理基线文件。
 - `.github/workflows/governed-delivery.yml` 是手动触发的治理交付入口。
 - 改 CI、发布配置、生产配置、schema、依赖或删除数据前必须先说明风险。
+- 发布节奏遵循 `docs/principles/release-cadence.md`（持续合并、刻意发版、非 feat/fix 不单独发版）；`auto-release.yml` 是其参考实现。
 
 Repository: `CodeFactory`
