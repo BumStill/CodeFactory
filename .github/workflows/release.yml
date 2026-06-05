@@ -127,6 +127,9 @@ jobs:
           # Disable incremental compilation — incompatible with sccache and
           # not useful in a fresh CI checkout anyway.
           CARGO_INCREMENTAL: "0"
+          # crates.io downloads occasionally drop mid-transfer on CI runners
+          # (schannel "server closed abruptly"); give cargo more retries.
+          CARGO_NET_RETRY: "10"
           # Override `release` profile to optimise for CI build time instead
           # of binary size. We can't use `tauri build --profile release-ci`
           # because tauri 2's CLI doesn't expose --profile at the top level
@@ -219,6 +222,7 @@ jobs:
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
           CARGO_INCREMENTAL: "0"
+          CARGO_NET_RETRY: "10"
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           CARGO_PROFILE_RELEASE_LTO: "false"
           # Same updater key as Windows — signs the .app.tar.gz so the macOS

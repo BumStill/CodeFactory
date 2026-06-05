@@ -119,5 +119,18 @@ jobs:
           git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/Cargo.lock
           git commit -m "chore: bump version to $NEW"
           git tag "$TAG"
-          git push origin main
-          git push origin "$TAG"
+          # GitHub's git backend occasionally 500s on push (transient, observed
+          # in practice). Retry each push with linear backoff instead of
+          # failing the whole release and leaving the bump unpushed.
+          for ref in main "$TAG"; do
+            n=0
+            until git push origin "$ref"; do
+              n=$((n + 1))
+              if [ "$n" -ge 5 ]; then
+                echo "::error::push of $ref failed after $n attempts"
+                exit 1
+              fi
+              echo "push of $ref failed (attempt $n); retrying in $((n * 10))s"
+              sleep $((n * 10))
+            done
+          done
