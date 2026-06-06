@@ -9,7 +9,9 @@ import {
   FolderOpen,
   Sparkles,
   Loader2,
+  Lightbulb,
 } from "lucide-react";
+import ReactMarkdown from "react-markdown";
 import { invoke } from "../../lib/tauri";
 import { useChatStore } from "../../stores/chat";
 import { useLearningStore, type LearningEvent } from "../../stores/learning";
@@ -80,6 +82,8 @@ export function ProfilePage({ onBack }: ProfilePageProps) {
           />
 
           <LearningLogSection selectedCwd={selectedCwd} />
+
+          <SelfImprovementSection />
 
           <CostDashboardSection />
 
@@ -662,6 +666,83 @@ function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
 
       {error && (
         <p className="mt-2 text-xs text-red-700 dark:text-red-300">{error}</p>
+      )}
+    </section>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SelfImprovementSection — read-only self-improvement proposal (self-evolution P4)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Surfaces the `self_improvement_proposal` command: a GLOBAL, read-only
+// aggregation of recurring friction (flaky tools, retry-prone failures) across
+// ALL projects, rendered as a markdown 改进提案 for the human. By contract it
+// writes no code, opens no PR, ships nothing — the system proposes, the human
+// disposes. This is the only user-facing surface of P4; the autonomous
+// implement→verify→PR loop stays human-gated (see docs/self-evolution/P4).
+
+export function SelfImprovementSection() {
+  const [proposal, setProposal] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const generate = async () => {
+    if (loading) return;
+    setLoading(true);
+    setError(null);
+    try {
+      // Global aggregation — no cwd; reuses P1's detectors across all projects.
+      const md = await invoke<string>("self_improvement_proposal");
+      setProposal(md);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+          自我改进提案
+        </h2>
+        <button
+          onClick={generate}
+          disabled={loading}
+          title="只读分析:跨所有项目聚合反复出现的摩擦(工具失败 / 反复重试),生成一份给你看的改进提案。不改任何代码、不开 PR、不发版。"
+          className="flex items-center gap-1 rounded border border-border px-2 py-0.5 text-[10px] text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
+        >
+          {loading ? (
+            <Loader2 size={11} className="animate-spin" />
+          ) : (
+            <Lightbulb size={11} className="text-accent" />
+          )}
+          {proposal === null ? "生成改进提案" : "重新生成"}
+        </button>
+      </div>
+
+      {error && (
+        <p className="mb-2 text-xs text-red-700 dark:text-red-300">{error}</p>
+      )}
+
+      {proposal === null ? (
+        <div className="rounded-lg border border-dashed border-border bg-surface-1 px-6 py-10 text-center">
+          <Lightbulb size={20} className="text-gray-600 mx-auto mb-3" />
+          <p className="text-sm text-gray-400 font-medium mb-1">还没有生成提案</p>
+          <p className="text-xs text-gray-500 max-w-md mx-auto leading-relaxed">
+            点「生成改进提案」,系统会<strong className="text-gray-400">只读</strong>聚合你跨所有项目的反复摩擦点
+            (常失败的工具、反复重试的步骤),给出一份改进建议。它只是
+            <strong className="text-gray-400">提议</strong> —— 改不改、怎么改都由你定,绝不自动动代码或发版。
+          </p>
+        </div>
+      ) : (
+        <div className="rounded-lg border border-border bg-surface-1 p-4">
+          <div className="prose dark:prose-invert prose-sm max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+            <ReactMarkdown>{proposal}</ReactMarkdown>
+          </div>
+        </div>
       )}
     </section>
   );
