@@ -41,13 +41,15 @@ accept most `memory` proposals, say those are welcome.
 This makes the proposer measurably better over time without any new surface:
 the more you curate learnings, the better its proposals fit you.
 
-## Later slices (designed, not yet built)
+## Later slices
 
 | Knob | Signal | Adaptation | Gate |
 |---|---|---|---|
 | Dispatch routing | re-ask / approval outcomes per model | bias plan-vs-execute | structural / internal |
-| Tool policy | P1 tool-reliability + denials | *suggest* gating a flaky tool | **human enables** (like P2) |
+| **Tool policy** ✅ | P1 tool-reliability | *suggest* gating a flaky tool (allow→ask) — **shipped**, see `P3-tool-policy.md` | **human enables** (like P2) |
 | Compliance booster | post-approval re-asks per model | strengthen/relax | internal |
+
+(Dispatch routing + compliance booster remain designed, not yet built.)
 
 Each later slice gets its own PR; security-relevant ones (tool policy) are
 proposal-only — the human applies them, never the system.

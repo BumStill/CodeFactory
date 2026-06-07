@@ -928,6 +928,101 @@ pub async fn self_improvement_proposal(state: State<'_, AppState>) -> Result<Str
     ))
 }
 
+// ── P3 tool-policy: flaky-tool gating proposals ───────────────────────────────
+//
+// P1 already mines which tools fail a lot. This turns that signal into a SAFE,
+// human-gated tweak to the permission policy: propose moving a flaky tool from
+// `allow` to `ask` so the agent confirms before running it. It rides the
+// existing `decide_permission` — no new enforcement. See
+// docs/self-evolution/P3-tool-policy.md.
+
+/// A proposal to gate a flaky tool behind a confirmation prompt. Surfaced
+/// read-only; applied only when the human clicks (`apply_tool_gate`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolGateProposal {
+    pub tool: String,
+    pub total: i64,
+    pub errors: i64,
+    pub rate: i64,
+    pub observation: String,
+}
+
+/// Pure: from flaky-tool insights + the current permission allow-list, propose
+/// gating the tools that are *currently auto-allowed* — so accepting actually
+/// changes behavior (auto-run → confirm). Tools already gated (absent from
+/// `allow`) or special-cased (`bash`, which already asks; `skill_*`, always
+/// allowed) are skipped. Order follows the detector's worst-first sort.
+fn tool_gate_proposals(insights: &[PatternInsight], allow: &[String]) -> Vec<ToolGateProposal> {
+    use std::collections::HashSet;
+    let allowed: HashSet<&str> = allow.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    for ins in insights {
+        // Only tool_reliability insights carry a tool name in evidence.
+        let Some(tool) = ins.evidence.get("tool").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if tool == "bash" || tool.starts_with("skill_") {
+            continue;
+        }
+        if !allowed.contains(tool) {
+            continue; // already gated — nothing to propose
+        }
+        let g = |k: &str| ins.evidence.get(k).and_then(serde_json::Value::as_i64).unwrap_or(0);
+        out.push(ToolGateProposal {
+            tool: tool.to_string(),
+            total: g("total"),
+            errors: g("errors"),
+            rate: g("rate"),
+            observation: ins.observation.clone(),
+        });
+    }
+    out
+}
+
+/// P3 tool-policy v1: read-only. Find flaky tools (P1 detector, global) that are
+/// currently auto-allowed and propose gating them. Mutates nothing.
+#[command]
+pub async fn propose_tool_gates(
+    state: State<'_, AppState>,
+) -> Result<Vec<ToolGateProposal>, AppError> {
+    let pool = state.db.read().await;
+    let tools: Vec<ToolCallRow> = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT tool_name, status, error FROM tool_calls ORDER BY created_at DESC LIMIT 8000",
+    )
+    .fetch_all(&*pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(tool_name, status, error)| ToolCallRow { tool_name, status, error })
+    .collect();
+    drop(pool);
+    let allow = state.settings.read().await.permissions.allow.clone();
+    Ok(tool_gate_proposals(&detect_tool_reliability(&tools), &allow))
+}
+
+/// P3 tool-policy v1: the human-gated enable. Moves `tool` from the permission
+/// `allow` list to `ask`, so the existing `decide_permission` now confirms
+/// before running it. Persists like `save_settings` (disk + in-memory). Only
+/// ever tightens (auto-run → confirm); never grants new access. Idempotent.
+#[command]
+pub async fn apply_tool_gate(tool: String, state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut s = state.settings.read().await.clone();
+    let before = s.permissions.allow.len();
+    s.permissions.allow.retain(|t| t != &tool);
+    let removed = s.permissions.allow.len() != before;
+    let added_ask = if s.permissions.ask.iter().any(|t| t == &tool) {
+        false
+    } else {
+        s.permissions.ask.push(tool.clone());
+        true
+    };
+    if removed || added_ask {
+        crate::config::settings::save(&s)?;
+        *state.settings.write().await = s;
+    }
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -953,6 +1048,42 @@ mod tests {
         assert!(md.contains("## 工具可靠性"));
         assert!(md.contains("工具 `bash` 失败率偏高"));
         assert!(md.contains("系统不会自己动手"));
+    }
+
+    #[test]
+    fn tool_gate_only_proposes_currently_allowed_flaky_tools() {
+        // edit_file: 10 calls, 4 errors (40%) → flaky; and it's in `allow`.
+        // flaky_gated: 9 calls, all errors → flaky, but NOT in `allow` (already gated).
+        // bash: 10 calls, all errors → flaky + "allowed", but special-cased (already asks).
+        let mut rows = Vec::new();
+        for _ in 0..6 {
+            rows.push(tc("edit_file", "ok", None));
+        }
+        for _ in 0..4 {
+            rows.push(tc("edit_file", "error", Some("boom")));
+        }
+        for _ in 0..9 {
+            rows.push(tc("flaky_gated", "error", Some("x")));
+        }
+        for _ in 0..10 {
+            rows.push(tc("bash", "error", Some("e")));
+        }
+        let insights = detect_tool_reliability(&rows);
+        let allow = vec!["edit_file".to_string(), "bash".to_string(), "read_file".to_string()];
+
+        let proposals = tool_gate_proposals(&insights, &allow);
+
+        // Only edit_file: flaky AND currently allowed AND not special-cased.
+        assert_eq!(proposals.len(), 1, "only currently-allowed, non-special flaky tools");
+        let p = &proposals[0];
+        assert_eq!(p.tool, "edit_file");
+        assert_eq!(p.total, 10);
+        assert_eq!(p.errors, 4);
+        assert_eq!(p.rate, 40);
+        // flaky_gated is flaky but already gated (absent from `allow`) → skipped.
+        assert!(proposals.iter().all(|q| q.tool != "flaky_gated"));
+        // bash is flaky + "allowed" but already asks → never proposed.
+        assert!(proposals.iter().all(|q| q.tool != "bash"));
     }
 
     #[test]
