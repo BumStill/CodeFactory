@@ -106,11 +106,17 @@ pub struct StreamChunk {
 pub struct StreamChoice {
     pub delta: Delta,
     pub finish_reason: Option<String>,
+    // Choice index from the wire (always 0 for our single-completion requests);
+    // deserialized for wire fidelity, not consumed.
+    #[allow(dead_code)]
     pub index: u32,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub struct Delta {
+    // Role marker ("assistant") sent on the first delta; we assume assistant, so
+    // it's deserialized but unused.
+    #[allow(dead_code)]
     pub role: Option<String>,
     pub content: Option<String>,
     pub tool_calls: Option<Vec<ToolCallDelta>>,
@@ -124,6 +130,8 @@ pub struct Delta {
 pub struct ToolCallDelta {
     pub index: u32,
     pub id: Option<String>,
+    // Always "function" on the wire; deserialized but unused.
+    #[allow(dead_code)]
     pub r#type: Option<String>,
     pub function: Option<FunctionDelta>,
 }
@@ -138,6 +146,9 @@ pub struct FunctionDelta {
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    // Provider's prompt+completion sum; we track the two components separately,
+    // so the total is deserialized but unused.
+    #[allow(dead_code)]
     pub total_tokens: u32,
 }
 

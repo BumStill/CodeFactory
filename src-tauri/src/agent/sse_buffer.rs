@@ -13,6 +13,12 @@
 //! OpenAI and Anthropic streaming parsers. It accepts bytes piecewise and
 //! yields complete lines on demand.
 
+// Scaffolding: the streaming chat path (openrouter::client::stream_chat) is not
+// yet wired into the live loop and still splits chunks inline, so this tested
+// fix-kernel currently has no production caller. Retained — see the module docs
+// above and the v0.3.5 regression tests below — for when streaming adopts it.
+#![allow(dead_code)]
+
 /// Streaming SSE line splitter. Bytes go in via [`feed`]; complete lines
 /// (with the trailing `\n` stripped, and any `\r` from CRLF dropped) come
 /// out via [`take_line`].

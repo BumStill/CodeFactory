@@ -36,6 +36,11 @@ impl OpenRouterClient {
 
     /// Stream a chat completion, emitting `StreamEvent`s on the Tauri event bus.
     /// `session_id` is used as the event channel name so the frontend can subscribe.
+    // Scaffolding: full streaming path, not yet wired into the live agent loop
+    // (which uses non-streaming completions). This `#[allow]` cascades to keep the
+    // trait/events it alone uses — `ArgsChunk` and the `ToolCallArgsDelta` /
+    // `ToolCallEnd` stream variants.
+    #[allow(dead_code)]
     pub async fn stream_chat(
         &self,
         app: AppHandle,

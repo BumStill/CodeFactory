@@ -68,6 +68,10 @@ impl TaskScheduler {
         }
     }
 
+    // Scaffolding: convenience in-process canceller. The live path hands out
+    // `cancel_handle()` and trips the flag itself, so this symmetric helper is
+    // unused for now — kept alongside `cancel_handle`.
+    #[allow(dead_code)]
     pub fn cancel(&self) {
         self.cancel_flag.store(true, Ordering::SeqCst);
     }

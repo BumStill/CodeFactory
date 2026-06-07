@@ -23,14 +23,6 @@ use std::path::PathBuf;
 
 use crate::errors::Result;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RiskLevel {
-    Low,
-    Medium,
-    High,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub content: String,

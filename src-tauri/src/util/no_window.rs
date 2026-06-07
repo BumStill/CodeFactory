@@ -10,6 +10,9 @@
 //! The trait is a no-op on non-Windows targets so call sites can use it
 //! unconditionally without `#[cfg(windows)]` boilerplate.
 
+// Consumed only by the `#[cfg(windows)]` impls below; on other targets the
+// trait is a no-op, so the constant is legitimately unused there.
+#[cfg_attr(not(windows), allow(dead_code))]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub trait NoWindow {
