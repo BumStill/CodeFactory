@@ -10,6 +10,7 @@ import {
   Sparkles,
   Loader2,
   Lightbulb,
+  ShieldAlert,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { invoke } from "../../lib/tauri";
@@ -84,6 +85,8 @@ export function ProfilePage({ onBack }: ProfilePageProps) {
           <LearningLogSection selectedCwd={selectedCwd} />
 
           <SelfImprovementSection />
+
+          <ToolGateSection />
 
           <CostDashboardSection />
 
@@ -742,6 +745,148 @@ export function SelfImprovementSection() {
           <div className="prose dark:prose-invert prose-sm max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
             <ReactMarkdown>{proposal}</ReactMarkdown>
           </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ToolGateSection — flaky-tool gating proposals (self-evolution P3 tool-policy)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// P1 mines which tools fail a lot; this proposes moving a flaky, currently
+// auto-allowed tool from `allow` to `ask` so the agent confirms before running
+// it. Read-only scan; the gate applies only when the human clicks 启用门控.
+// Rides the existing decide_permission — see docs/self-evolution/P3-tool-policy.md.
+
+interface ToolGateProposal {
+  tool: string;
+  total: number;
+  errors: number;
+  rate: number;
+  observation: string;
+}
+
+export function ToolGateSection() {
+  const [proposals, setProposals] = useState<ToolGateProposal[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [busyTool, setBusyTool] = useState<string | null>(null);
+  const [gated, setGated] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const scan = async () => {
+    if (loading) return;
+    setLoading(true);
+    setError(null);
+    try {
+      setProposals(await invoke<ToolGateProposal[]>("propose_tool_gates"));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const gate = async (tool: string) => {
+    setBusyTool(tool);
+    setError(null);
+    try {
+      // The human gate: only now does the policy change (allow → ask).
+      await invoke("apply_tool_gate", { tool });
+      setGated((g) => [...g, tool]);
+      setProposals((ps) => ps?.filter((p) => p.tool !== tool) ?? null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusyTool(null);
+    }
+  };
+
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+          工具门控建议
+        </h2>
+        <button
+          onClick={scan}
+          disabled={loading}
+          title="只读扫描:从跨会话调用记录里找出反复失败、却仍在自动放行的工具,建议改成「运行前先确认」。启用与否由你定,只会更谨慎、随时可在设置里改回。"
+          className="flex items-center gap-1 rounded border border-border px-2 py-0.5 text-[10px] text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
+        >
+          {loading ? (
+            <Loader2 size={11} className="animate-spin" />
+          ) : (
+            <ShieldAlert size={11} className="text-accent" />
+          )}
+          扫描易错工具
+        </button>
+      </div>
+
+      {error && (
+        <p className="mb-2 text-xs text-red-700 dark:text-red-300">{error}</p>
+      )}
+
+      {proposals === null ? (
+        <div className="rounded-lg border border-dashed border-border bg-surface-1 px-6 py-10 text-center">
+          <ShieldAlert size={20} className="text-gray-600 mx-auto mb-3" />
+          <p className="text-sm text-gray-400 font-medium mb-1">还没有扫描</p>
+          <p className="text-xs text-gray-500 max-w-md mx-auto leading-relaxed">
+            点「扫描易错工具」,系统会找出反复失败、却仍自动放行的工具,建议给它们加一道运行前确认。
+            纯<strong className="text-gray-400">建议</strong> —— 启用只会让工具更谨慎(自动→先问),随时可在设置里改回。
+          </p>
+        </div>
+      ) : proposals.length === 0 ? (
+        <div className="rounded-lg border border-border bg-surface-1 px-6 py-8 text-center">
+          <Check size={18} className="text-green-600 mx-auto mb-2" />
+          <p className="text-xs text-gray-400">
+            {gated.length > 0
+              ? `已门控:${gated.join("、")}——已写入设置的「询问」清单,随时可改回。`
+              : "没发现需要门控的工具——自动放行的工具最近都挺稳。"}
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {proposals.map((p) => (
+            <div
+              key={p.tool}
+              className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-4"
+            >
+              <div className="flex items-start gap-2">
+                <ShieldAlert size={12} className="text-amber-500 mt-0.5 shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs text-gray-300 leading-relaxed">
+                    <span className="font-mono text-amber-700 dark:text-amber-300">
+                      {p.tool}
+                    </span>{" "}
+                    最近 {p.total} 次调用失败 {p.errors} 次
+                    <span className="text-gray-500"> ({p.rate}%)</span>,但仍在自动放行。
+                  </p>
+                  <p className="text-[11px] text-gray-500 mt-1">
+                    建议改为「运行前先确认」——只影响这一个工具,随时可在设置里改回。
+                  </p>
+                </div>
+                <button
+                  onClick={() => gate(p.tool)}
+                  disabled={busyTool === p.tool}
+                  className="flex items-center gap-1 px-3 py-1 rounded bg-accent hover:bg-accent-hover text-white text-xs disabled:opacity-40 shrink-0"
+                >
+                  {busyTool === p.tool ? (
+                    <Loader2 size={11} className="animate-spin" />
+                  ) : (
+                    <ShieldAlert size={11} />
+                  )}
+                  启用门控
+                </button>
+              </div>
+            </div>
+          ))}
+          {gated.length > 0 && (
+            <p className="text-[11px] text-green-700 dark:text-green-400 flex items-center gap-1 pl-1">
+              <Check size={11} /> 已门控:{gated.join("、")}(已写入设置的「询问」清单)
+            </p>
+          )}
         </div>
       )}
     </section>

@@ -170,6 +170,8 @@ pub fn run() {
             commands::learning::run_postmortem,
             commands::learning::mine_cross_session_patterns,
             commands::learning::self_improvement_proposal,
+            commands::learning::propose_tool_gates,
+            commands::learning::apply_tool_gate,
             commands::preferences::list_user_preferences,
             commands::preferences::upsert_user_preference,
             commands::preferences::delete_user_preference,
