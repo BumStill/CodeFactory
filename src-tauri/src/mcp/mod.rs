@@ -59,6 +59,10 @@ impl McpManager {
             .collect()
     }
 
+    // Scaffolding: MCP server self-healing — respawns crashed stdio servers.
+    // Not wired into live tool dispatch yet; this `#[allow]` cascades to keep
+    // `McpClient::is_alive` and the `child` handle it inspects alive too.
+    #[allow(dead_code)]
     pub async fn restart_dead_servers(
         &self,
         configs: &[McpServerConfig],

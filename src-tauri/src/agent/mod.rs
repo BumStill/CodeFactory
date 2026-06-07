@@ -1887,6 +1887,13 @@ fn detect_project_config(cwd: &Path) -> Option<(&'static str, std::path::PathBuf
     None
 }
 
+// Scaffolding: standalone project-knowledge prompt builder, kept as the
+// test-covered reference path (and referenced by docs in commands/memory.rs and
+// agent/user_context.rs). The live loop (`AgentLoop::run`) currently inlines its
+// own budgeted assembly, so this entry point is exercised only by tests for now.
+// The `#[allow]` here also covers `build_system_prompt_for` + `PROJECT_CONTEXT_BUDGET`,
+// which are reachable only through it.
+#[allow(dead_code)]
 fn build_system_prompt(cwd: &Path) -> String {
     build_system_prompt_for(AgentMode::Interactive, cwd)
 }

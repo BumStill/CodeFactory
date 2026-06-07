@@ -167,6 +167,9 @@ pub async fn get_verification_results(
     Ok(row.and_then(|(v,)| v))
 }
 
+// Scaffolding: generic status setter. The live scheduler uses the specific
+// `mark_task_*` helpers below; this stays for arbitrary status transitions.
+#[allow(dead_code)]
 pub async fn update_task_status(
     pool: &SqlitePool,
     id: &str,
@@ -182,6 +185,8 @@ pub async fn update_task_status(
     Ok(())
 }
 
+// Scaffolding: generic result setter (mark_task_completed sets result inline).
+#[allow(dead_code)]
 pub async fn update_task_result(pool: &SqlitePool, id: &str, result: &str) -> Result<()> {
     sqlx::query("UPDATE task_runs SET result = ? WHERE id = ?")
         .bind(result)
@@ -244,6 +249,9 @@ pub async fn mark_task_cancelled(pool: &SqlitePool, id: &str) -> Result<()> {
     Ok(())
 }
 
+// Scaffolding: standalone attempt bump for retry flows; mark_task_started also
+// increments on (re)start, so this stays until retries call it directly.
+#[allow(dead_code)]
 pub async fn increment_attempt(pool: &SqlitePool, id: &str) -> Result<()> {
     sqlx::query("UPDATE task_runs SET attempt_count = attempt_count + 1 WHERE id = ?")
         .bind(id)

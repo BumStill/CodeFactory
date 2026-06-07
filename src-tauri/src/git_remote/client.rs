@@ -60,6 +60,9 @@ impl RemoteGitClient {
         serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {}", e))
     }
 
+    // Scaffolding: HTTP PATCH wrapper paired with get()/post(); reserved for
+    // git-remote API calls (e.g. editing PRs/issues) that aren't wired yet.
+    #[allow(dead_code)]
     pub async fn patch(&self, path: &str, body: Value) -> Result<Value, String> {
         let url = format!("{}{}", self.base_url, path);
         let req = self.apply_auth(self.inner.patch(&url)).json(&body);

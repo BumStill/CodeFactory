@@ -18,7 +18,10 @@ const TIMEOUT_SECS: u64 = 120;
 #[derive(Deserialize)]
 struct Args {
     command: String,
+    // Advertised in the tool schema (see definition() below) so the model sends a
+    // one-line summary; accepted but not surfaced yet.
     #[serde(default)]
+    #[allow(dead_code)]
     description: Option<String>,
 }
 

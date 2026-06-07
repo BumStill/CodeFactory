@@ -18,6 +18,7 @@
 use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sqlx::SqlitePool;
 use tauri::{command, AppHandle, Emitter, State};
 use uuid::Uuid;
@@ -585,6 +586,9 @@ pub struct ToolCallRow {
 
 #[derive(Debug, Clone)]
 pub struct TaskRow {
+    // Fetched by the task queries but not yet consumed by the retry/pattern
+    // detectors (which key off attempt_count + error); kept to match the row shape.
+    #[allow(dead_code)]
     pub status: String,
     pub attempt_count: i64,
     pub error: Option<String>,
