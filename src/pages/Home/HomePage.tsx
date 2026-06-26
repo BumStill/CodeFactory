@@ -11,6 +11,7 @@ import {
   Monitor,
   FolderOpen,
   Clock,
+  ShieldCheck,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../../stores/chat";
@@ -25,6 +26,7 @@ import type { Session, Theme } from "../../lib/tauri";
 interface HomePageProps {
   onOpenProject: (sessionId: string) => void;
   onOpenSkills: () => void;
+  onOpenControlPlane: () => void;
   onOpenSettings: () => void;
   onOpenProfile: () => void;
 }
@@ -57,6 +59,7 @@ function Brand() {
 export function HomePage({
   onOpenProject,
   onOpenSkills,
+  onOpenControlPlane,
   onOpenSettings,
   onOpenProfile,
 }: HomePageProps) {
@@ -146,6 +149,13 @@ export function HomePage({
               </button>
             ))}
           </div>
+          <button
+            onClick={onOpenControlPlane}
+            className="p-2 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+            title="AI Coding OS"
+          >
+            <ShieldCheck size={14} />
+          </button>
           <button
             onClick={onOpenSkills}
             className="p-2 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"

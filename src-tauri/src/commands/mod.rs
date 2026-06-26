@@ -2,6 +2,7 @@
 pub mod backup;
 pub mod chat;
 pub mod checkpoints;
+pub mod control_plane;
 pub mod costs;
 pub mod evidence;
 pub mod files;
