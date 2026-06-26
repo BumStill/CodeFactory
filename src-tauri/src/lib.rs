@@ -161,6 +161,7 @@ pub fn run() {
             commands::checkpoints::list_checkpoints,
             commands::checkpoints::checkpoint_changeset,
             commands::checkpoints::revert_checkpoint,
+            commands::control_plane::get_control_plane_snapshot,
             commands::memory::read_project_memory,
             commands::memory::write_project_memory,
             commands::memory::append_project_memory,

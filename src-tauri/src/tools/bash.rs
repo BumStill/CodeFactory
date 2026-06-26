@@ -144,6 +144,15 @@ mod tests {
 
     #[tokio::test]
     async fn successful_command_output_includes_shell_audit_metadata() {
+        if std::process::Command::new("powershell")
+            .args(["-NonInteractive", "-NoProfile", "-Command", "$PSVersionTable.PSVersion"])
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping powershell audit test: powershell executable not found");
+            return;
+        }
+
         let cwd = std::env::temp_dir().join(format!("codefactory-bash-audit-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&cwd).expect("create cwd");
 
