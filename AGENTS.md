@@ -41,6 +41,12 @@
 - 工具、文件、命令、OpenRouter、SQLite、安装包和发布路径的变更必须记录实际处理 route、字段级断言或主路径证据。
 - AI Collaboration 最小记录：context scope、assumptions、review point、validation result。
 
+## 并行分支同步门禁
+- 多分支或多 agent 并行开发时，动手前、提交前、push/开 PR 前都必须 `git fetch --prune origin main`，确认当前分支已包含最新 `origin/main`；没有包含时先 `git merge origin/main`，解决冲突并重新验证后再继续。
+- 本仓库使用版本化 pre-commit hook：`.githooks/pre-commit` 调用 `tools/git/ensure_branch_current.py`，会在提交前 fetch 默认分支并阻止未合并最新默认分支的提交。
+- 首次使用或 checkout 后运行：`git config core.hooksPath .githooks`。如果 hook 拦截，按提示 merge 最新默认分支，不要用重复 PR 或旧基线继续开发。
+- 只有用户明确批准紧急热修时才允许 `CODEFACTORY_SKIP_SYNC_GATE=1 git commit ...`，最终说明必须标记 `hotfix bypass` 并补回 PR+CI。
+
 ## 验证与测试
 - 行为或代码修改前必须先写独立测试或可执行验收，并先看到失败。
 - 修改后运行相关测试；若存在 lint、typecheck、build，应优先补齐并执行。
@@ -100,3 +106,29 @@ Tauri dev 二进制不在系统应用注册表里，`computer-use.request_access
 - 发布节奏遵循 `docs/principles/release-cadence.md`（持续合并、刻意发版、非 feat/fix 不单独发版）；`auto-release.yml` 是其参考实现。
 
 Repository: `CodeFactory`
+
+<!-- AI-CODING-OS:BEGIN project-codefactory-agents -->
+# AI Coding OS Project Profile - CodeFactory
+
+Generated preview. Promote edits through OpenClaw AI Coding OS proposals.
+
+## Project
+
+- id: `codefactory`
+- path: `/Users/leo/Projects/CodeFactory`
+- kind: `ai-coding-product`
+- primary executors: codex, claude-code
+
+## Durable Notes
+
+- Local assistant with reusable knowledge, office connectors, controlled delivery.
+- Keep dirty main checkout untouched; use sibling worktrees for risky slices.
+- Do not treat release/CI/health as complete until real artifact or app behavior is verified.
+
+## Required Behavior
+
+- Check current git/runtime/test state before relying on memory.
+- Keep user changes untouched unless explicitly asked to modify or revert them.
+- Record durable lessons as AI Coding OS proposals with evidence.
+- Separate business/product reasoning from implementation detail when reporting back.
+<!-- AI-CODING-OS:END project-codefactory-agents -->

@@ -18,7 +18,24 @@ git clone https://github.com/BumStill/CodeFactory
 cd CodeFactory
 pnpm install            # installs JS deps + Tauri CLI
 cargo fetch --manifest-path src-tauri/Cargo.toml   # warm Rust deps
+git config core.hooksPath .githooks                # enable local sync gates
 ```
+
+## Git sync gate
+
+CodeFactory often has multiple branches or agents moving at once. Before
+committing, the versioned pre-commit hook fetches the default branch and blocks
+the commit unless the current HEAD already contains latest `origin/main`.
+
+If it blocks, sync first:
+
+```pwsh
+git fetch --prune origin main
+git merge origin/main
+```
+
+Resolve conflicts, rerun the relevant tests, then commit. `CODEFACTORY_SKIP_SYNC_GATE=1`
+is reserved for explicitly approved `hotfix bypass` work.
 
 ## Run dev
 

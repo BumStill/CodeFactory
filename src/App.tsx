@@ -87,6 +87,7 @@ export default function App() {
         <WorkspacePage
           sessionId={activeProject}
           onBackHome={backToHome}
+          onOpenSkills={() => setView("skills")}
           onOpenSettings={() => setView("settings")}
           onOpenSession={openProject}
         />

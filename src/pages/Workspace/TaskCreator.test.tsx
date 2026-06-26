@@ -183,6 +183,24 @@ describe("AI task decomposition flow", () => {
     }
   });
 
+  it("opens the skills library from the workspace chrome", async () => {
+    const onOpenSkills = vi.fn();
+
+    render(
+      <WorkspacePage
+        sessionId="s1"
+        onBackHome={() => {}}
+        onOpenSettings={() => {}}
+        onOpenSession={() => {}}
+        onOpenSkills={onOpenSkills}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "技能库" }));
+
+    expect(onOpenSkills).toHaveBeenCalledTimes(1);
+  });
+
   it("describes → decomposes → reviews → creates task tree end-to-end", async () => {
     const user = userEvent.setup();
 
@@ -201,7 +219,7 @@ describe("AI task decomposition flow", () => {
     });
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     // Open the modal via the empty-state CTA
@@ -275,7 +293,7 @@ describe("AI task decomposition flow", () => {
     });
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     // Flip the 自主 toggle on — the inline bar replaces the modal flow.
@@ -346,7 +364,7 @@ describe("AI task decomposition flow", () => {
     });
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     await user.click(await screen.findByRole("button", { name: "自主" }));
@@ -386,7 +404,7 @@ describe("AI task decomposition flow", () => {
     });
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     await user.click(await screen.findByText(/点这里描述需求/));
@@ -431,7 +449,7 @@ describe("AI task decomposition flow", () => {
     });
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     const library = await screen.findByText("历史方案库");
