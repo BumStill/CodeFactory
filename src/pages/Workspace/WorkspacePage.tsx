@@ -82,6 +82,7 @@ interface DecomposedTask {
 interface WorkspacePageProps {
   sessionId: string;
   onBackHome: () => void;
+  onOpenSkills: () => void;
   onOpenSettings: () => void;
   /** Switch the workspace to another session in-place (from the sidebar). */
   onOpenSession: (id: string) => void;
@@ -97,7 +98,7 @@ interface WorkspacePageProps {
  *   Center — Execution stream (AI work in progress + chat input)
  *   Right  — Active skills + memory increments (transparency surface)
  */
-export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSession }: WorkspacePageProps) {
+export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSettings, onOpenSession }: WorkspacePageProps) {
   const {
     activeSession,
     selectSession, sendOrQueue, cancelStream, removeFromQueue,
@@ -320,6 +321,13 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
           <BookOpen size={14} />
         </button>
         <button
+          onClick={onOpenSkills}
+          className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+          title="技能库"
+        >
+          <Puzzle size={14} />
+        </button>
+        <button
           onClick={() => setConnectorsCollapsed((v) => !v)}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
           title={connectorsCollapsed ? "显示连接器（知识库 / 技能 / 记忆）" : "收起连接器面板"}
@@ -389,7 +397,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
               onOpenHistory={() => setGitPanel("history")}
               onOpenRemote={() => setGitPanel("remote")}
             />
-            <ConnectorsColumn cwd={activeSession?.cwd ?? null} />
+            <ConnectorsColumn cwd={activeSession?.cwd ?? null} onOpenSkills={onOpenSkills} />
             {/* ②-4 审核面:每次自主执行(及每条消息)前的检查点都在这里,
                 点「恢复」先看文件级 diff 再决定撤销;不撤即采纳。 */}
             <CheckpointsPanel sessionId={sessionId} />
@@ -1166,7 +1174,7 @@ const EMPTY_LEARNING: LearningEventForSelector[] = [];
 
 type LearningEventForSelector = ReturnType<typeof useLearningStore.getState>["events"][string][number];
 
-function ConnectorsColumn({ cwd }: { cwd: string | null }) {
+function ConnectorsColumn({ cwd, onOpenSkills }: { cwd: string | null; onOpenSkills: () => void }) {
   const { skills, loadSkills } = useSkillsStore();
   const learningEvents = useLearningStore(
     (s) => (cwd ? s.events[cwd] ?? EMPTY_LEARNING : EMPTY_LEARNING),
@@ -1336,10 +1344,13 @@ function ConnectorsColumn({ cwd }: { cwd: string | null }) {
             <span className="ml-auto text-[10px] text-gray-600">{enabled.length}</span>
           </div>
           {enabled.length === 0 ? (
-            <div className="text-[11px] text-gray-600 text-center py-5 leading-relaxed">
+            <button
+              onClick={onOpenSkills}
+              className="w-full rounded px-2 py-5 text-center text-[11px] leading-relaxed text-gray-600 transition-colors hover:bg-surface-2 hover:text-gray-300"
+            >
               没有激活的技能<br />
               <span className="text-gray-700">到「技能库」里启用</span>
-            </div>
+            </button>
           ) : (
             <ul className="space-y-1">
               {enabled.map((s) => (
