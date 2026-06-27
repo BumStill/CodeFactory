@@ -118,6 +118,92 @@ export function codexAccount(): Promise<CodexAccount | null> {
   return invoke<CodexAccount | null>("codex_account");
 }
 
+// ── Benchmarks ─────────────────────────────────────────────────────────────
+
+export interface BenchmarkProfile {
+  id: string;
+  dataset: string;
+  harness: string;
+  official_url: string;
+  leaderboard_url: string;
+  comparable_constraints: string[];
+  default_smoke_k: number;
+}
+
+export type BenchmarkProbeStatus = "ok" | "missing" | "warning";
+
+export interface BenchmarkProbeItem {
+  id: string;
+  label: string;
+  status: BenchmarkProbeStatus;
+  detail: string;
+}
+
+export interface BenchmarkEnvironmentProbe {
+  generated_at: string;
+  profile: BenchmarkProfile;
+  ready: boolean;
+  blockers: string[];
+  items: BenchmarkProbeItem[];
+  command_preview: string;
+}
+
+export interface BenchmarkRunRecord {
+  id: string;
+  benchmark_id: string;
+  dataset: string;
+  dataset_version?: string | null;
+  agent_name: string;
+  agent_version?: string | null;
+  model?: string | null;
+  codefactory_version?: string | null;
+  codefactory_git_sha?: string | null;
+  policy_preset: string;
+  harbor_version?: string | null;
+  command: string;
+  job_path: string;
+  status: string;
+  started_at: string;
+  finished_at?: string | null;
+  comparable: boolean;
+  comparable_reason?: string | null;
+  missing_files: string[];
+}
+
+export interface BenchmarkTrialRecord {
+  id: string;
+  run_id: string;
+  task_name: string;
+  category?: string | null;
+  difficulty?: string | null;
+  reward: number;
+  duration_ms?: number | null;
+  error_kind?: string | null;
+  failure_class?: string | null;
+  trajectory_path?: string | null;
+  verifier_stdout_path?: string | null;
+  verifier_stderr_path?: string | null;
+}
+
+export interface ImportedBenchmarkRun {
+  run: BenchmarkRunRecord;
+  trials: BenchmarkTrialRecord[];
+}
+
+export function listBenchmarkProfiles(): Promise<BenchmarkProfile[]> {
+  return invoke<BenchmarkProfile[]>("list_benchmark_profiles");
+}
+
+export function probeBenchmarkEnvironment(profileId: string): Promise<BenchmarkEnvironmentProbe> {
+  return invoke<BenchmarkEnvironmentProbe>("probe_benchmark_environment", { profileId });
+}
+
+export function importBenchmarkResults(jobPath: string): Promise<ImportedBenchmarkRun> {
+  return invoke<ImportedBenchmarkRun>("import_benchmark_results", {
+    request: { job_path: jobPath },
+  });
+}
+
 // ── Quick Task sessions (multi-session) ─────────────────────────────────────
 
 /** Resume the most-recent Quick Task session, creating the first one on

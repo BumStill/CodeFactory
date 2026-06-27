@@ -25,6 +25,36 @@
 
 P-TB-1: 用户打开 CodeFactory 的 `Benchmarks / Terminal-Bench 2.1` 页面。系统检查 Harbor、Docker 和 CodeFactory agent adapter 状态。用户启动 smoke run，系统展示不可修改的官方 dataset `terminal-bench/terminal-bench-2-1`、agent/model、policy preset、artifact path 和命令 preview。run 完成后，CodeFactory 导入 Harbor job 目录，展示 reward、trial 列表、verifier 输出、trajectory 和 failure class。用户选择失败类别，创建后续产品改进 slice，并能用同一 subset 在修复后回归对比。
 
+## 开发内嵌评估节奏
+
+Terminal-Bench 2.1 不是发版前偶尔运行的榜单检查，而是 CodeFactory 能力开发的反馈系统。所有面向 agent 能力的非平凡 PR 都必须声明它预计改善哪类 benchmark failure，并选择对应评估层级。
+
+| 阶段 | 何时运行 | 评估范围 | 必须回答的问题 | 产物 |
+| --- | --- | --- | --- | --- |
+| Baseline | Terminal-Bench 2.1 支持落地后、每个 release baseline 或重大 agent loop 改动前 | 当前 `main` 或 release build 的 smoke/subset | CodeFactory 现在主要输在哪类能力？ | baseline run、failure taxonomy、artifact refs |
+| PR planning | PR 开发前 | 不运行或导入已有失败集 | 这个 PR 预计改善 planning/context/tool-use/verification/policy/environment 中哪一类？ | PR 假设、目标 subset |
+| Inner loop smoke | adapter、runner、policy、importer、agent loop 改动中 | 1 到 5 个 task 或 fake Harbor fixture | Harbor -> CodeFactory -> verifier -> import 链路有没有断？ | smoke job、import result |
+| Targeted subset | 能力 PR 合并前 | 5 到 20 个历史失败同类 task | 原目标失败是否改善？是否转移成其他失败类型？ | baseline/head 对比 |
+| Regression subset | 触碰共享 agent loop、tool runtime、context builder、permission、verification 时 | 固定代表性 subset | 核心能力有没有退化？cost/latency 有没有恶化？ | regression report |
+| Main scheduled | `main` 定期运行，默认每日或每周 | 固定 subset + rotating subset | 多个 PR 叠加后的真实趋势是什么？ | trend snapshot、failure queue |
+| Release candidate | 发版候选或 leaderboard 相关准备 | 更大 subset，必要时接近完整 Terminal-Bench 2.1 | 相比上个 release 是否可接受？是否满足 comparable 约束？ | release evidence pack |
+
+合并标准不是“分数一定上涨”，而是必须解释变化：
+
+- reward delta、pass/fail delta、cost/duration delta。
+- 原失败 task 是否改善。
+- 是否新增 regression。
+- failure class 是否从一种产品问题转移成另一种。
+- 如果没跑对应 subset，PR 必须说明 blocker 和替代证据。
+
+PR 描述必须包含：
+
+- `Benchmark hypothesis`: 本 PR 预计改善的 failure class。
+- `Benchmark scope`: smoke、targeted subset、regression subset、full 或 not run。
+- `Baseline`: 对比基线 run id 或明确 `not available`。
+- `Result`: reward/failure/cost 变化和 artifact path。
+- `Interpretation`: 为什么可以合并，或为什么只能作为实验合并。
+
 ## Applicable Harnesses
 
 - Spec Harness: 本规格、Req ID、主路径、测试矩阵和证据要求必须存在。

@@ -11,9 +11,9 @@
 - Blocked means: Harbor/Docker/dataset/agent-adapter/runtime access prevents real smoke verification, with exact command, error, and next action recorded.
 
 ## Current State
-- Current phase: design
-- Current checkpoint: business, architecture, UX, and feature spec drafted for review.
-- Next owner: planning / system engineering
+- Current phase: implementation slice 1
+- Current checkpoint: benchmark profile, environment probe, fake Harbor job importer, SQLite ledger schema, and basic failure classification implemented behind backend commands.
+- Next owner: development / QA
 - Updated at: 2026-06-27
 
 ## Completed Items
@@ -21,10 +21,13 @@
 - Confirmed Terminal-Bench 2.1 uses Harbor dataset `terminal-bench/terminal-bench-2-1`.
 - Confirmed official leaderboard marks Terminal-Bench 2.1 live and notes submissions may not modify timeouts/resources.
 - Drafted business design, architecture design, UX design, and feature spec.
+- Added development-time benchmark cadence to the feature spec: baseline, PR planning, inner-loop smoke, targeted subset, regression subset, scheduled main run, and release-candidate run.
+- Implemented Terminal-Bench 2.1 benchmark profile and Harbor/Docker environment probe.
+- Implemented fake Harbor job import into benchmark run/trial SQLite tables.
+- Implemented basic reward/evidence-based failure classification for imported trials.
+- Exposed backend commands for listing benchmark profiles, probing the environment, and importing benchmark results.
 
 ## Remaining Items
-- Implement benchmark profile and environment probe.
-- Implement Harbor job importer with fake fixture coverage.
 - Implement CodeFactory headless agent adapter for Harbor.
 - Implement `benchmark-sandbox` policy preset with hard host/secret boundaries.
 - Add Benchmarks UI for run summary, trial details, failure triage, and capability profile.
@@ -34,18 +37,18 @@
 ## Blockers
 - No CodeFactory headless runner or Harbor adapter exists yet.
 - Real Terminal-Bench 2.1 smoke verification has not been run in this branch.
-- Official leaderboard submission process is separate from local evaluation and not covered by this design-only slice.
+- Official leaderboard submission process is separate from local evaluation and not covered by this first implementation slice.
 
 ## Evidence
-- Local evidence: design docs and feature spec added in this branch.
+- Local evidence: design docs, feature spec, benchmark backend commands, fake Harbor job importer tests, and governance validators.
 - Release evidence: not live.
-- Blocking evidence: current slice is docs-only; no Harbor smoke run or adapter implementation exists yet.
+- Blocking evidence: no Harbor adapter or headless CodeFactory runner exists yet, so no real Terminal-Bench 2.1 smoke run has been executed.
 
 ## AI Collaboration
 - context scope: CodeFactory repo docs, AGENTS rules, current official Terminal-Bench and Harbor docs.
 - assumptions: Terminal-Bench 2.1 should be treated as the primary external terminal-agent benchmark; CodeFactory must add headless execution rather than rely on desktop UI approval.
-- review point: user/product review of this design package before implementation.
-- validation result: governance and long-task validators should pass for this design package.
+- review point: first implementation slice should be reviewed before starting the Harbor adapter/headless runner slice.
+- validation result: `cargo test benchmark::tests --lib` passes after an intentional failing-test step.
 
 ## Stop Boundary
 - Do not stop after local-only validation.

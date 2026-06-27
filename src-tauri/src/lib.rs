@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 mod agent;
+mod benchmark;
 mod codex_auth;
 mod commands;
 mod config;
@@ -157,6 +158,9 @@ pub fn run() {
             commands::backup::export_user_data,
             commands::backup::import_user_data,
             commands::backup::get_data_dir,
+            commands::benchmark::list_benchmark_profiles,
+            commands::benchmark::probe_benchmark_environment,
+            commands::benchmark::import_benchmark_results,
             commands::checkpoints::create_checkpoint,
             commands::checkpoints::list_checkpoints,
             commands::checkpoints::checkpoint_changeset,
