@@ -6,6 +6,7 @@
 
 相关设计：
 
+- `docs/principles/systematic-agent-evaluation.md`
 - `docs/design/terminal-bench-21-business-design.md`
 - `docs/design/terminal-bench-21-architecture-design.md`
 - `docs/design/terminal-bench-21-ux-design.md`
@@ -20,6 +21,7 @@
 | CF-TB-R4 | 能被 Terminal-Bench 2.1 跑 | 提供 Harbor custom agent adapter、显式 env 驱动的 model-backed headless runner，以及从当前 CodeFactory provider 到 benchmark env 的显式授权桥接 | adapter + agent loop + backend command | Python adapter smoke + Harbor CodeFactory baseline run + fake model headless runner integration test + provider bridge unit test + real model smoke |
 | CF-TB-R5 | 改进后能回归 | 支持同一 subset 的 baseline/head run 对比 | backend + UI | compare run fixture test |
 | CF-TB-R6 | 保持可审计和安全 | benchmark policy 只在 Harbor sandbox 生效，不污染普通项目权限和长期 memory | permission + memory + audit | policy unit test + memory write guard |
+| CF-TB-R7 | 区分 agent 评估和模型评估 | 所有 run、PR、证据包和 UI 都必须声明 evaluation axis、evaluation subject、fixed variables、changed variables 和 result attribution | docs + backend + UI | spec review + fixture attribution test |
 
 ## Primary User Path
 
@@ -49,11 +51,33 @@ Terminal-Bench 2.1 不是发版前偶尔运行的榜单检查，而是 CodeFacto
 
 PR 描述必须包含：
 
+- `Evaluation axis`: `codefactory-agent-capability`、`model-backend-ablation`、`agent-scaffold-comparison` 或 `evaluation-infrastructure-smoke`。
+- `Evaluation subject`: 被评价对象；默认是 `codefactory-headless` 或具体 CodeFactory agent。
+- `Fixed variables`: 为了归因而固定的 benchmark subset、model backend、policy、runner、build 等变量。
+- `Changed variables`: 本 PR 或本次实验实际改变的 build、model、adapter、policy 或 runner。
+- `Result attribution`: 结论归属给 CodeFactory agent、model backend、agent scaffold 还是 evaluation infrastructure。
 - `Benchmark hypothesis`: 本 PR 预计改善的 failure class。
 - `Benchmark scope`: smoke、targeted subset、regression subset、full 或 not run。
 - `Baseline`: 对比基线 run id 或明确 `not available`。
 - `Result`: reward/failure/cost 变化和 artifact path。
 - `Interpretation`: 为什么可以合并，或为什么只能作为实验合并。
+
+## 系统化评估矩阵
+
+本规格继承 `docs/principles/systematic-agent-evaluation.md`。Terminal-Bench 结果默认是 agent 系统结果，不是单独的模型结果。
+
+| Evaluation axis | 固定什么 | 变化什么 | 允许结论 | 禁止结论 |
+| --- | --- | --- | --- | --- |
+| `codefactory-agent-capability` | Terminal-Bench subset、model backend、policy、runner | CodeFactory build、agent loop、context/tool/policy 实现 | CodeFactory agent 能力变化 | 某模型独立能力排名 |
+| `model-backend-ablation` | CodeFactory build、agent adapter、subset、policy、runner | provider/model | 模型作为 CodeFactory 组件的影响 | CodeFactory 产品能力整体提升 |
+| `agent-scaffold-comparison` | provider/model、subset、runner | CodeFactory adapter、simple baseline、oracle 或其他 scaffold | agent scaffold / 产品机制强弱 | provider/model 本身优劣 |
+| `evaluation-infrastructure-smoke` | oracle 或 no-model diagnostic、runner | Harbor、Docker、importer、schema、UI | 评测基础设施是否打通 | CodeFactory agent 已具备任务能力 |
+
+命名规则：
+
+- 正确：`CodeFactory agent using DeepSeek`、`agent=codefactory-headless model_backend=DeepSeek`。
+- 错误：`DeepSeek 跑出了 CodeFactory 的 Terminal-Bench 结果`。
+- 第一次有效 CodeFactory 能力结果必须满足 `evaluation_axis=codefactory-agent-capability` 且 `agent_name=codefactory-headless`。
 
 ## Applicable Harnesses
 
@@ -111,6 +135,7 @@ Model-backed 模式只能读取显式 `CODEFACTORY_BENCH_*` 配置，不读取 C
 每次 run 至少记录：
 
 - benchmark id、dataset、dataset version 或 resolved package id。
+- evaluation axis、evaluation subject、fixed variables、changed variables、result attribution。
 - agent name、agent version、model、provider。
 - CodeFactory app version、git sha、build time。
 - Harbor version、Docker/provider 类型。
@@ -139,6 +164,7 @@ Model-backed 模式只能读取显式 `CODEFACTORY_BENCH_*` 配置，不读取 C
 | Adapter | Model-backed headless loop | fake OpenAI-compatible server 返回 `run_shell` tool call，adapter 执行 Harbor environment command 并写 trajectory | Python integration test |
 | Adapter | Provider bridge preview | 当前 DeepSeek endpoint/model 生成 redacted env 和 Harbor command preview，不暴露 raw key | Rust unit test |
 | Adapter | Provider bridge authorization | 授权短语不匹配时不得 lookup secret；匹配后只把 key 放入 child env | Rust unit test |
+| Attribution | Evaluation axis contract | run/PR/evidence 区分 CodeFactory agent 能力、模型后端影响、agent scaffold 对比和评测基础设施 smoke | spec review + fixture test |
 | Policy | benchmark-sandbox policy in task container | workspace command/file edit 自动允许，host path/secret deny | policy unit test |
 | Policy | network/secret deny | fake model 请求 `curl` 或 credential path 时不调用 environment.exec | Python policy test |
 | Failure | 缺失 `result.json` | 标记 `partial_import`，列出缺失文件 | importer test |
@@ -165,6 +191,7 @@ Model-backed 模式只能读取显式 `CODEFACTORY_BENCH_*` 配置，不读取 C
 - 在至少一次真实 Harbor smoke run 成功导入前，不能声明 `evaluation path verified`。oracle smoke 只能证明 Harbor 环境和导入链路，不能证明 CodeFactory agent 能力。
 - `codefactory-headless-baseline` 成功运行后，可以声明 `CodeFactory-owned adapter path verified`，但在 model-backed headless runner 跑通前，不能声明 `CodeFactory agent capability evaluated`。
 - fake model 测试通过后，只能声明 `model-backed runner implementation verified locally`；在显式模型 env 下跑完真实 Terminal-Bench smoke 前，不能声明 `model-backed CodeFactory score available`。
-- provider bridge 测试通过后，只能声明 `current provider can be authorized for benchmark launch by backend contract`；在真实 Harbor run 完成并导入前，不能声明当前本机 DeepSeek 已产生 Terminal-Bench 分数。
+- provider bridge 测试通过后，只能声明 `current provider can be authorized for CodeFactory agent benchmark launch by backend contract`；在真实 Harbor run 完成并导入前，不能声明当前本机已产生 CodeFactory agent Terminal-Bench 分数。
+- 使用 DeepSeek/Claude/GPT 等模型后端完成的 run，结果仍归属 `CodeFactory agent using <model backend>`；不得写成模型本身的 Terminal-Bench 结果，除非 evaluation axis 明确是 `model-backend-ablation` 且 CodeFactory build/agent adapter/subset/policy/runner 已固定。
 - 在 packaged app 或 release artifact 中验证前，不能声明 `live`。
 - 官方 leaderboard submission 需要单独 release/QA gate；本规格首期只覆盖本地可复现能力评估。

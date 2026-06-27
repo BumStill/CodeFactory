@@ -39,6 +39,7 @@
 
 ## C8 Terminal-Bench 能力评估
 - 使用 Terminal-Bench 2.1 作为 terminal agent 能力外部标尺。
+- 遵循 `docs/principles/systematic-agent-evaluation.md`：评估主体默认是 CodeFactory agent，模型只是 backend/component attribution。
 - 通过 Harbor 运行或导入 benchmark job，保存 run、trial、reward、trajectory、verifier output 和 artifact evidence。
 - 生成按任务类别、难度、工具路径、失败类型、耗时和成本的能力画像。
 - 支持同一 subset 的 baseline/head 回归对比。

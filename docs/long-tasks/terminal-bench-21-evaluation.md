@@ -4,7 +4,7 @@
 - Task ID: CF-LT-TB21
 - Title: Terminal-Bench 2.1 ability evaluation system
 - Feature spec: `docs/specs/feature-specs/terminal-bench-21-evaluation.md`
-- Related Req IDs: CF-TB-R1, CF-TB-R2, CF-TB-R3, CF-TB-R4, CF-TB-R5, CF-TB-R6
+- Related Req IDs: CF-TB-R1, CF-TB-R2, CF-TB-R3, CF-TB-R4, CF-TB-R5, CF-TB-R6, CF-TB-R7
 
 ## Completion Standard
 - Done means: CodeFactory can run or import a Terminal-Bench 2.1 Harbor job, persist run/trial/artifact evidence, classify failures, show capability profile, and compare a regression subset across builds with real evidence.
@@ -12,7 +12,7 @@
 
 ## Current State
 - Current phase: implementation slice 2
-- Current checkpoint: model-backed `codefactory-headless` runner entry exists and is locally tested with a fake OpenAI-compatible server; backend provider bridge can now preview and explicitly authorize current CodeFactory endpoint/model for one benchmark launch without exposing raw API keys. Real model-backed Terminal-Bench smoke still needs to be triggered through that explicit product path.
+- Current checkpoint: model-backed `codefactory-headless` runner entry exists and is locally tested with a fake OpenAI-compatible server; backend provider bridge can now preview and explicitly authorize current CodeFactory endpoint/model for one benchmark launch without exposing raw API keys. Systematic evaluation attribution is now documented so results are assigned to CodeFactory agent, model backend, agent scaffold, or evaluation infrastructure explicitly.
 - Next owner: development / QA
 - Updated at: 2026-06-27
 
@@ -38,15 +38,17 @@
 - Added model-backed adapter tests using a fake OpenAI-compatible server and fake Harbor environment.
 - Implemented backend provider bridge commands: preview current endpoint/model with redacted env and authorization phrase, then start Harbor only after exact authorization while temporarily injecting the provider key into child process env.
 - Added Rust provider bridge tests for DeepSeek direct endpoint normalization, redacted preview, authorization-before-secret-lookup, and child-env-only secret injection.
+- Added `docs/principles/systematic-agent-evaluation.md` and wired Terminal-Bench docs to the evaluation matrix: CodeFactory agent capability, model-backend ablation, agent-scaffold comparison, and evaluation-infrastructure smoke.
 
 ## Remaining Items
 - Run real Harbor smoke evaluation with model-backed CodeFactory headless execution through the explicit provider bridge path.
+- Add persisted run fields/UI for evaluation axis, evaluation subject, fixed variables, changed variables, and result attribution.
 - Promote `benchmark-sandbox` from adapter-local command gate to shared CodeFactory policy preset with run/task/container binding.
 - Add Benchmarks UI for run summary, trial details, failure triage, and capability profile.
 - Compare at least one baseline/head subset after an implementation change.
 
 ## Blockers
-- Real local DeepSeek-backed Terminal-Bench scoring now requires running the product bridge command from a CodeFactory app/runtime context with explicit user authorization; Codex should not directly read the user's OS credential store or generic provider env.
+- A real CodeFactory agent Terminal-Bench score using the current model backend now requires running the product bridge command from a CodeFactory app/runtime context with explicit user authorization; Codex should not directly read the user's OS credential store or generic provider env.
 - Official leaderboard submission process is separate from local evaluation and not covered by this first implementation slice.
 
 ## Evidence
@@ -63,6 +65,7 @@
 - Post-upgrade no-model result: run id `19e42aa8-9e97-4f3b-8965-21993f081ae5`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, mode `baseline-no-model`, reward `0.0`, mean `0.000`, exceptions `0`, runtime `1m 0s`.
 - Post-upgrade no-model import evidence: `CODEFACTORY_BENCHMARK_JOB_PATH=.codefactory/benchmark-jobs/cf-tb21-codefactory-headless-nomodel-20260627-1205 cargo test benchmark::tests::import_harbor_job_from_env_path --lib -- --ignored --nocapture` imported 1 trial with `agent=codefactory-headless`, `comparable=true`, `failure_class=Some("verification")`.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`.
+- Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.
 - Release evidence: not live.
 - Blocking evidence: bridge contract is implemented, but no real model-backed run has been launched through the CodeFactory product path yet.
 

@@ -13,6 +13,7 @@ CodeFactory UI / CLI
       -> Run Ledger
       -> Result Ingestor
       -> Failure Classifier
+      -> Evaluation Attribution
       -> Capability Profile
 ```
 
@@ -28,6 +29,7 @@ CodeFactory UI / CLI
 | Run Ledger | 保存 run、trial、artifact、成本、版本和 policy | SQLite |
 | Result Ingestor | 解析 Harbor job 目录、trial reward、trajectory 和 verifier 输出 | `jobs/<job>` |
 | Failure Classifier | 将失败归类为可改进产品能力 | trajectory + verifier + tool audit |
+| Evaluation Attribution | 区分 agent 能力、模型后端影响、agent scaffold 对比和评测基础设施 smoke | run config + comparison plan |
 | Capability Profile | 生成按类别、工具、失败类型的能力画像 | run ledger + classifier |
 
 ## Agent 接入方式
@@ -86,6 +88,27 @@ benchmark-sandbox
 - 离开 sandbox 后立即失效。
 - 不允许把 benchmark task instruction、solution、hidden test 或 canary 写入长期 memory。
 
+## Evaluation Attribution
+
+Terminal-Bench 2.1 的首要评估主体是 CodeFactory agent system。模型后端是 agent 的一个组件，不能把 `CodeFactory agent using DeepSeek` 的结果写成 `DeepSeek 的结果`。
+
+归因类型：
+
+| `evaluation_axis` | 固定变量 | 变化变量 | 结论归属 |
+| --- | --- | --- | --- |
+| `codefactory-agent-capability` | task set、model backend、policy、runner | CodeFactory build、agent loop、context/tool/policy 实现 | CodeFactory agent |
+| `model-backend-ablation` | CodeFactory build、agent adapter、task set、policy、runner | provider/model | model backend 作为组件 |
+| `agent-scaffold-comparison` | provider/model、task set、runner | CodeFactory adapter、simple baseline、oracle 或其他 scaffold | agent scaffold / product mechanism |
+| `evaluation-infrastructure-smoke` | oracle 或 no-model diagnostic、runner | Harbor、Docker、importer、schema、UI | evaluation infrastructure |
+
+Run ledger 和 UI 必须能展示：
+
+- evaluation axis。
+- evaluation subject，例如 `codefactory-headless`。
+- fixed variables 和 changed variables。
+- allowed claim 和 forbidden claim。
+- model provider/model 作为 backend attribution，而不是默认评价主体。
+
 ## 数据模型
 
 ```rust
@@ -94,9 +117,15 @@ struct BenchmarkRun {
   benchmark_id: String,
   dataset: String,
   dataset_version: String,
+  evaluation_axis: String,
+  evaluation_subject: String,
+  fixed_variables_json: String,
+  changed_variables_json: String,
+  result_attribution: String,
   agent_name: String,
   agent_version: Option<String>,
   model: Option<String>,
+  model_provider: Option<String>,
   codefactory_version: String,
   codefactory_git_sha: Option<String>,
   policy_preset: String,

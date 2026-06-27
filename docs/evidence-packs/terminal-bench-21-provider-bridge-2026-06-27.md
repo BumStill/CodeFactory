@@ -46,5 +46,5 @@ test result: ok. 3 passed; 0 failed
 ## Current Boundary
 
 - This verifies the product/backend contract for using the current provider in a benchmark run.
-- It does not yet produce a real DeepSeek-backed Terminal-Bench score.
-- Real scoring still requires launching `start_benchmark_provider_run` from the CodeFactory app/runtime after explicit user authorization, then importing the Harbor job result.
+- It does not yet produce a real CodeFactory agent Terminal-Bench score using the current model backend.
+- Real scoring still requires launching `start_benchmark_provider_run` from the CodeFactory app/runtime after explicit user authorization, then importing the Harbor job result with `agent=codefactory-headless`.

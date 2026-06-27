@@ -46,6 +46,25 @@ CodeFactory 的定位需要从“本地 AI 编程工作台”升级为：
 3. **能力画像比榜单名次更重要。** 用户需要知道 CodeFactory 输在哪里：上下文、终端操作、文件编辑、测试判断、环境安装、长任务漂移还是权限策略。
 4. **官方约束不可绕开。** 不能修改 Terminal-Bench 2.1 的 timeouts/resources；不能把 benchmark canary 或任务内容纳入训练/记忆。
 5. **真实运行证据优先。** 本地单元测试、UI 页面或配置存在都不能替代 Harbor job artifact 和 verifier reward。
+6. **评估主体必须明确。** Terminal-Bench 评的是 agent system；`CodeFactory agent using DeepSeek` 是 CodeFactory agent 的一次运行配置，不是 DeepSeek 本身的 benchmark 结果。
+
+## 系统化评估矩阵
+
+本项目的通用评估原则固化在 `docs/principles/systematic-agent-evaluation.md`。Terminal-Bench 2.1 首期按以下矩阵落地：
+
+| 目的 | 固定什么 | 变化什么 | 结论归属 |
+| --- | --- | --- | --- |
+| 评 CodeFactory agent 能力 | Terminal-Bench subset、model backend、policy、runner | CodeFactory build、agent loop、context/tool/policy 实现 | CodeFactory agent |
+| 评模型后端影响 | CodeFactory build、agent adapter、subset、policy、runner | DeepSeek / Claude / GPT 等 provider/model | model backend 作为组件 |
+| 评 agent scaffold 强弱 | 同一个 model backend、subset、runner | CodeFactory adapter、simple baseline、oracle 或其他 scaffold | agent scaffold / product mechanism |
+| 评 benchmark 基础设施 | oracle 或 no-model diagnostic、runner | Harbor、Docker、importer、schema、UI | evaluation infrastructure |
+
+业务口径：
+
+- 第一次有效能力结果必须写成 `agent=codefactory-headless`，模型只写在 `model_backend` 或 `model` 字段。
+- Oracle smoke 只证明基础设施，不证明 CodeFactory agent 能力。
+- No-model smoke 只证明 adapter/import 链路，不证明 model-backed agent 能力。
+- Provider bridge test 只证明产品授权路径，不证明真实 benchmark 分数。
 
 ## v1 范围
 
