@@ -77,6 +77,16 @@ PR 描述必须包含：
 | `leaderboard_url` | `https://www.tbench.ai/leaderboard/terminal-bench/2.1` |
 | `comparable_constraints` | no timeout/resource changes, dataset fixed, agent/model/build recorded |
 
+### Harbor Command Semantics
+
+当前本地验证使用 Harbor 0.15.0。命令语义必须按实际 CLI 处理：
+
+- `-d` / `--dataset`: 选择数据集，例如 `terminal-bench/terminal-bench-2-1`。
+- `-l` / `--n-tasks`: 限制 task 数量，smoke run 默认用 1 到 5。
+- `-k` / `--n-attempts`: 每个 trial 的 attempts，不得误用为 task 数量。
+- `--agent-import-path`: 自定义 CodeFactory agent adapter 的 import path。
+- `-a oracle`: 只用于验证 Harbor/Docker/dataset/verifier/import 链路，不代表 CodeFactory agent 能力。
+
 ### Run Summary
 
 每次 run 至少记录：
@@ -128,6 +138,6 @@ PR 描述必须包含：
 ## 发布边界
 
 - 在 headless runner 和 Harbor adapter 真正可跑前，产品只能声明 `design ready`，不得声明 Terminal-Bench 2.1 已支持。
-- 在至少一次真实 Harbor smoke run 成功导入前，不能声明 `evaluation path verified`。
+- 在至少一次真实 Harbor smoke run 成功导入前，不能声明 `evaluation path verified`。oracle smoke 只能证明 Harbor 环境和导入链路，不能证明 CodeFactory agent 能力。
 - 在 packaged app 或 release artifact 中验证前，不能声明 `live`。
 - 官方 leaderboard submission 需要单独 release/QA gate；本规格首期只覆盖本地可复现能力评估。

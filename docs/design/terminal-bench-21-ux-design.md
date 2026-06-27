@@ -66,7 +66,7 @@ Benchmarks
 
 用户点击 `Run Smoke`：
 
-- 默认 `-k 5`，用于确认 Harbor、Docker、agent adapter 可跑。
+- 默认 `-l 5`，用于确认 Harbor、Docker、agent adapter 可跑。`-k` 保留为 attempts，不用于限制 task 数量。
 - run 前显示 command preview、policy preset、agent/model、artifact path。
 - run 中显示 stdout/stderr 摘要和 trial 进度。
 - run 后导入 result，展示 reward、失败摘要和 job path。

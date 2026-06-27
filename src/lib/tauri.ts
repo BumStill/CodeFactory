@@ -127,7 +127,7 @@ export interface BenchmarkProfile {
   official_url: string;
   leaderboard_url: string;
   comparable_constraints: string[];
-  default_smoke_k: number;
+  default_smoke_task_limit: number;
 }
 
 export type BenchmarkProbeStatus = "ok" | "missing" | "warning";

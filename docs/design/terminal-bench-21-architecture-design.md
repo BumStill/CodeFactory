@@ -174,6 +174,6 @@ Harbor job 目录至少需要导入：
 
 - Unit: benchmark profile parsing、command generation、result import、failure taxonomy。
 - Integration: fake Harbor job fixture 导入。
-- CLI smoke: `harbor run -d terminal-bench/terminal-bench-2-1 -a oracle -k 1` 或等价可用 smoke。
+- CLI smoke: `harbor run -d terminal-bench/terminal-bench-2-1 -a oracle -l 1` 或等价可用 smoke。注意 Harbor 0.15.0 中 `-l` 是 task 数量上限，`-k` 是每个 trial 的 attempts。
 - Product smoke: CodeFactory UI 导入 job，展示 run summary 和 trial failure。
 - Regression: 同一 subset 对比两个 CodeFactory builds 的 reward 和 failure delta。

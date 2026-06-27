@@ -24,7 +24,7 @@ pub struct BenchmarkProfile {
     pub official_url: String,
     pub leaderboard_url: String,
     pub comparable_constraints: Vec<String>,
-    pub default_smoke_k: u32,
+    pub default_smoke_task_limit: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,7 +157,7 @@ pub fn terminal_bench_21_profile() -> BenchmarkProfile {
             "agent, model, CodeFactory build, policy preset, and Harbor job path must be recorded"
                 .to_string(),
         ],
-        default_smoke_k: 5,
+        default_smoke_task_limit: 5,
     }
 }
 
@@ -228,8 +228,8 @@ pub fn probe_environment_from_command_results(
     });
 
     let command_preview = format!(
-        "harbor run -d {} -a {} -m <model> -k {}",
-        profile.dataset, CODEFACTORY_HARBOR_AGENT, profile.default_smoke_k
+        "harbor run -d {} --agent-import-path {} -m <model> -l {}",
+        profile.dataset, CODEFACTORY_HARBOR_AGENT, profile.default_smoke_task_limit
     );
 
     Ok(BenchmarkEnvironmentProbe {
@@ -347,15 +347,17 @@ pub async fn import_harbor_job(pool: &SqlitePool, job_path: &Path) -> Result<Imp
 
     let dataset = json_string(&config, &["dataset"])
         .or_else(|| json_string(&config, &["dataset_name"]))
+        .or_else(|| json_string(&config, &["datasets", "0", "name"]))
         .unwrap_or_else(|| profile.dataset.clone());
     let command = json_string(&config, &["command"]).unwrap_or_else(|| {
         format!(
-            "harbor run -d {} -a {} -m <model> -k {}",
-            profile.dataset, CODEFACTORY_HARBOR_AGENT, profile.default_smoke_k
+            "harbor run -d {} --agent-import-path {} -m <model> -l {}",
+            profile.dataset, CODEFACTORY_HARBOR_AGENT, profile.default_smoke_task_limit
         )
     });
     let agent_name = json_string(&config, &["agent"])
         .or_else(|| json_string(&config, &["agent_name"]))
+        .or_else(|| json_string(&config, &["agents", "0", "name"]))
         .unwrap_or_else(|| "unknown".to_string());
     let policy_preset = json_string(&config, &["metadata", "policy_preset"])
         .unwrap_or_else(|| "benchmark-sandbox".to_string());
@@ -382,10 +384,13 @@ pub async fn import_harbor_job(pool: &SqlitePool, job_path: &Path) -> Result<Imp
             .unwrap_or_else(|| Uuid::new_v4().to_string()),
         benchmark_id: profile.id,
         dataset,
-        dataset_version: json_string(&config, &["dataset_version"]),
+        dataset_version: json_string(&config, &["dataset_version"])
+            .or_else(|| json_string(&config, &["datasets", "0", "version"]))
+            .or_else(|| json_string(&config, &["datasets", "0", "ref"])),
         agent_name,
         agent_version: json_string(&config, &["agent_version"]),
-        model: json_string(&config, &["model"]),
+        model: json_string(&config, &["model"])
+            .or_else(|| json_string(&config, &["agents", "0", "model_name"])),
         codefactory_version: json_string(&config, &["metadata", "codefactory_version"]),
         codefactory_git_sha: json_string(&config, &["metadata", "codefactory_git_sha"]),
         policy_preset,
@@ -424,7 +429,11 @@ fn read_json_file(path: PathBuf, missing_files: &mut Vec<String>) -> Result<Valu
 }
 
 fn import_trials(run_id: &str, job_path: &Path) -> Result<Vec<BenchmarkTrialRecord>> {
-    let trials_dir = job_path.join("trials");
+    let trials_dir = if job_path.join("trials").is_dir() {
+        job_path.join("trials")
+    } else {
+        job_path.to_path_buf()
+    };
     if !trials_dir.is_dir() {
         return Ok(Vec::new());
     }
@@ -432,6 +441,7 @@ fn import_trials(run_id: &str, job_path: &Path) -> Result<Vec<BenchmarkTrialReco
     let mut entries: Vec<_> = fs::read_dir(&trials_dir)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().is_dir())
+        .filter(|entry| entry.path().join("result.json").exists())
         .collect();
     entries.sort_by_key(|entry| entry.file_name());
 
@@ -442,11 +452,14 @@ fn import_trials(run_id: &str, job_path: &Path) -> Result<Vec<BenchmarkTrialReco
         let mut missing = Vec::new();
         let config = read_json_file(trial_dir.join("config.json"), &mut missing)?;
         let result = read_json_file(trial_dir.join("result.json"), &mut missing)?;
-        let task_name = json_string(&config, &["task_name"])
+        let task_name = json_string(&result, &["task_name"])
+            .or_else(|| json_string(&config, &["task_name"]))
+            .or_else(|| json_string(&config, &["task", "name"]))
             .or_else(|| json_string(&config, &["name"]))
             .unwrap_or(fallback_task_name);
         let reward = json_f64(&result, &["reward"])
             .or_else(|| json_f64(&result, &["result", "reward"]))
+            .or_else(|| json_f64(&result, &["verifier_result", "rewards", "reward"]))
             .unwrap_or(0.0);
         let verifier_stdout_path = first_existing_path(
             &trial_dir,
@@ -479,12 +492,15 @@ fn import_trials(run_id: &str, job_path: &Path) -> Result<Vec<BenchmarkTrialReco
             id: Uuid::new_v4().to_string(),
             run_id: run_id.to_string(),
             task_name,
-            category: json_string(&config, &["category"]),
+            category: json_string(&config, &["category"])
+                .or_else(|| json_string(&result, &["source"])),
             difficulty: json_string(&config, &["difficulty"]),
             reward,
             duration_ms: json_i64(&result, &["duration_ms"])
-                .or_else(|| json_i64(&result, &["duration"])),
-            error_kind: json_string(&result, &["error_kind"]),
+                .or_else(|| json_i64(&result, &["duration"]))
+                .or_else(|| duration_ms_from_result(&result)),
+            error_kind: json_string(&result, &["error_kind"])
+                .or_else(|| json_string(&result, &["exception_info", "type"])),
             failure_class: classify_failure(reward, &evidence),
             trajectory_path: trajectory_path.map(|path| path.to_string_lossy().to_string()),
             verifier_stdout_path: verifier_stdout_path
@@ -553,7 +569,11 @@ fn read_optional_text(path: Option<&Path>) -> Result<String> {
 fn json_string(value: &Value, path: &[&str]) -> Option<String> {
     let mut current = value;
     for segment in path {
-        current = current.get(segment)?;
+        current = if let Ok(index) = segment.parse::<usize>() {
+            current.get(index)?
+        } else {
+            current.get(segment)?
+        };
     }
     current
         .as_str()
@@ -566,7 +586,11 @@ fn json_string(value: &Value, path: &[&str]) -> Option<String> {
 fn json_f64(value: &Value, path: &[&str]) -> Option<f64> {
     let mut current = value;
     for segment in path {
-        current = current.get(segment)?;
+        current = if let Ok(index) = segment.parse::<usize>() {
+            current.get(index)?
+        } else {
+            current.get(segment)?
+        };
     }
     current
         .as_f64()
@@ -576,9 +600,21 @@ fn json_f64(value: &Value, path: &[&str]) -> Option<f64> {
 fn json_i64(value: &Value, path: &[&str]) -> Option<i64> {
     let mut current = value;
     for segment in path {
-        current = current.get(segment)?;
+        current = if let Ok(index) = segment.parse::<usize>() {
+            current.get(index)?
+        } else {
+            current.get(segment)?
+        };
     }
     current.as_i64()
+}
+
+fn duration_ms_from_result(value: &Value) -> Option<i64> {
+    let started = json_string(value, &["started_at"])?;
+    let finished = json_string(value, &["finished_at"])?;
+    let started = chrono::DateTime::parse_from_rfc3339(&started).ok()?;
+    let finished = chrono::DateTime::parse_from_rfc3339(&finished).ok()?;
+    Some((finished - started).num_milliseconds())
 }
 
 fn has_official_constraint_override(value: &Value) -> bool {
@@ -752,7 +788,7 @@ mod tests {
         assert!(probe.blockers.iter().any(|item| item.contains("Docker")));
         assert_eq!(
             probe.command_preview,
-            "harbor run -d terminal-bench/terminal-bench-2-1 -a codefactory_bench.agent:CodeFactoryAgent -m <model> -k 5"
+            "harbor run -d terminal-bench/terminal-bench-2-1 --agent-import-path codefactory_bench.agent:CodeFactoryAgent -m <model> -l 5"
         );
 
         let ready_probe = probe_environment_from_command_results(
@@ -780,7 +816,7 @@ mod tests {
                 "dataset": "terminal-bench/terminal-bench-2-1",
                 "agent": "codefactory",
                 "model": "gpt-5",
-                "command": "harbor run -d terminal-bench/terminal-bench-2-1 -a codefactory_bench.agent:CodeFactoryAgent -m gpt-5 -k 2",
+                "command": "harbor run -d terminal-bench/terminal-bench-2-1 --agent-import-path codefactory_bench.agent:CodeFactoryAgent -m gpt-5 -l 2",
                 "metadata": {
                     "codefactory_version": "1.40.0",
                     "codefactory_git_sha": "abc123",
@@ -854,5 +890,147 @@ mod tests {
                 .await
                 .expect("count persisted trials");
         assert_eq!(persisted_trials, 2);
+    }
+
+    #[tokio::test]
+    async fn import_harbor_015_job_structure_without_trials_subdir() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        ensure_schema(&pool).await.expect("benchmark schema");
+
+        let job_dir = temp_job_dir();
+        fs::write(
+            job_dir.join("config.json"),
+            json!({
+                "job_name": "cf-tb21-oracle-smoke",
+                "n_concurrent_trials": 1,
+                "agents": [
+                    { "name": "oracle", "model_name": null }
+                ],
+                "datasets": [
+                    {
+                        "name": "terminal-bench/terminal-bench-2-1",
+                        "ref": "sha256:dataset-ref",
+                        "n_tasks": 1
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write job config");
+        fs::write(
+            job_dir.join("result.json"),
+            json!({
+                "id": "job-id",
+                "started_at": "2026-06-27T03:13:08.536198Z",
+                "finished_at": "2026-06-27T03:17:19.982607Z",
+                "stats": {
+                    "n_completed_trials": 1,
+                    "n_errored_trials": 0
+                }
+            })
+            .to_string(),
+        )
+        .expect("write job result");
+
+        let trial_dir = job_dir.join("write-compressor__abc123");
+        fs::create_dir_all(trial_dir.join("verifier")).expect("create trial");
+        fs::write(
+            trial_dir.join("config.json"),
+            json!({
+                "task": {
+                    "name": "terminal-bench/write-compressor",
+                    "source": "terminal-bench/terminal-bench-2-1"
+                },
+                "trial_name": "write-compressor__abc123",
+                "agent": { "name": "oracle" }
+            })
+            .to_string(),
+        )
+        .expect("write trial config");
+        fs::write(
+            trial_dir.join("result.json"),
+            json!({
+                "id": "trial-id",
+                "task_name": "terminal-bench/write-compressor",
+                "trial_name": "write-compressor__abc123",
+                "source": "terminal-bench/terminal-bench-2-1",
+                "verifier_result": {
+                    "rewards": { "reward": 1.0 }
+                },
+                "started_at": "2026-06-27T03:13:08.826518Z",
+                "finished_at": "2026-06-27T03:17:19.980929Z"
+            })
+            .to_string(),
+        )
+        .expect("write trial result");
+        fs::write(trial_dir.join("verifier").join("reward.txt"), "1.0").expect("write reward");
+        fs::write(trial_dir.join("verifier").join("test-stdout.txt"), "passed")
+            .expect("write stdout");
+
+        let imported = import_harbor_job(&pool, &job_dir)
+            .await
+            .expect("import real Harbor layout");
+
+        assert_eq!(imported.run.id, "job-id");
+        assert_eq!(imported.run.dataset, "terminal-bench/terminal-bench-2-1");
+        assert_eq!(imported.run.agent_name, "oracle");
+        assert_eq!(
+            imported.run.dataset_version.as_deref(),
+            Some("sha256:dataset-ref")
+        );
+        assert!(imported.run.comparable);
+        assert_eq!(imported.trials.len(), 1);
+        assert_eq!(
+            imported.trials[0].task_name,
+            "terminal-bench/write-compressor"
+        );
+        assert_eq!(imported.trials[0].reward, 1.0);
+        assert_eq!(imported.trials[0].failure_class, None);
+        assert!(
+            imported.trials[0].duration_ms.unwrap_or_default() > 0,
+            "duration should be derived from Harbor started_at/finished_at"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn import_harbor_job_from_env_path() {
+        let job_path = std::env::var("CODEFACTORY_BENCHMARK_JOB_PATH")
+            .expect("set CODEFACTORY_BENCHMARK_JOB_PATH to a Harbor job directory");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        ensure_schema(&pool).await.expect("benchmark schema");
+
+        let imported = import_harbor_job(&pool, std::path::Path::new(&job_path))
+            .await
+            .expect("import Harbor job from env path");
+
+        println!(
+            "imported run={} dataset={} agent={} comparable={} trials={}",
+            imported.run.id,
+            imported.run.dataset,
+            imported.run.agent_name,
+            imported.run.comparable,
+            imported.trials.len()
+        );
+        for trial in &imported.trials {
+            println!(
+                "trial={} reward={} failure_class={:?}",
+                trial.task_name, trial.reward, trial.failure_class
+            );
+        }
+
+        assert_eq!(imported.run.dataset, TERMINAL_BENCH_21_DATASET);
+        assert!(
+            !imported.trials.is_empty(),
+            "real Harbor job import must include trial rows"
+        );
     }
 }
