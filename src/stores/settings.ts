@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "zustand";
+import { setTheme as setNativeAppTheme } from "@tauri-apps/api/app";
 import { invoke } from "../lib/tauri";
 import type { Settings, Theme } from "../lib/tauri";
 
@@ -22,7 +23,9 @@ export const FONT_SIZE_MAX = 20;
 
 // ── Theme application ────────────────────────────────────────────────────────
 
+let _mediaQuery: MediaQueryList | null = null;
 let _mediaListener: (() => void) | null = null;
+let _themeApplyVersion = 0;
 
 function resolveTheme(theme: Theme): "dark" | "light" {
   if (theme === "system") {
@@ -33,14 +36,32 @@ function resolveTheme(theme: Theme): "dark" | "light" {
   return theme;
 }
 
+function isTauriRuntime(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function toNativeTheme(theme: Theme): "dark" | "light" | null {
+  return theme === "system" ? null : theme;
+}
+
+async function syncNativeTheme(theme: Theme): Promise<void> {
+  if (!isTauriRuntime()) return;
+
+  try {
+    await setNativeAppTheme(toNativeTheme(theme));
+  } catch (error) {
+    console.warn("Failed to sync native app theme", error);
+  }
+}
+
 export function applyTheme(settings: Settings) {
   const html = document.documentElement;
+  const applyVersion = ++_themeApplyVersion;
 
   // ── Remove previous media listener if any ───────────────────────────────
-  if (_mediaListener) {
-    window
-      .matchMedia("(prefers-color-scheme: dark)")
-      .removeEventListener("change", _mediaListener);
+  if (_mediaQuery && _mediaListener) {
+    _mediaQuery.removeEventListener("change", _mediaListener);
+    _mediaQuery = null;
     _mediaListener = null;
   }
 
@@ -50,12 +71,16 @@ export function applyTheme(settings: Settings) {
   };
 
   applyResolved();
+  void syncNativeTheme(settings.theme).then(() => {
+    if (settings.theme === "system" && applyVersion === _themeApplyVersion) {
+      applyResolved();
+    }
+  });
 
   if (settings.theme === "system") {
+    _mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
     _mediaListener = applyResolved;
-    window
-      .matchMedia("(prefers-color-scheme: dark)")
-      .addEventListener("change", _mediaListener);
+    _mediaQuery.addEventListener("change", _mediaListener);
   }
 
   // ── Apply font ──────────────────────────────────────────────────────────
