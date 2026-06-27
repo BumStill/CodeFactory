@@ -3,6 +3,7 @@ import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
@@ -201,6 +202,50 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_benchmark_policy_allows_heredoc_source_with_network_like_text(self) -> None:
+        agent = CodeFactoryAgent(logs_dir=Path("/tmp"))
+        command = """cat > /app/enc.c << 'EOF'
+#include <stdio.h>
+int main(void) {
+  int nc = 0;
+  const char *example = "curl appears as inert source text";
+  return nc;
+}
+EOF
+gcc -o /app/enc /app/enc.c
+"""
+
+        decision = agent._classify_shell_command(command)
+
+        self.assertEqual(decision["action"], "allow")
+
+    def test_benchmark_policy_still_denies_real_network_command(self) -> None:
+        agent = CodeFactoryAgent(logs_dir=Path("/tmp"))
+
+        decision = agent._classify_shell_command("printf before; curl http://example.com")
+
+        self.assertEqual(decision["action"], "deny")
+        self.assertEqual(decision["reason"], "network/exfiltration tool disabled")
+
+    def test_agent_extracts_output_artifact_hint_from_instruction(self) -> None:
+        hint = CodeFactoryAgent._artifact_hint_from_instruction(
+            "Write me data.comp that's compressed such that running cat data.comp works."
+        )
+
+        self.assertEqual(hint, "data.comp")
+
+    def test_agent_emits_budget_reminder_near_step_limit(self) -> None:
+        reminder = CodeFactoryAgent._remaining_budget_reminder(
+            step=17,
+            max_steps=20,
+            artifact_hint="data.comp",
+        )
+
+        assert reminder is not None
+        self.assertIn("only 3 tool-call rounds", reminder)
+        self.assertIn("data.comp", reminder)
+        self.assertIn("create it now", reminder)
 
 
 if __name__ == "__main__":

@@ -161,15 +161,82 @@ final_txt_bytes=0
 
 This funded rerun is the first valid CodeFactory agent Terminal-Bench 2.1 smoke result. It is a real capability failure with reward `0.0`, not a provider/account blocker.
 
+## Loop Fix Rerun Evidence
+
+After the first valid 0-score run, the headless loop was improved in three ways:
+
+- `benchmark-sandbox` now strips heredoc bodies before checking for network tools, so source text containing `nc`, `curl`, or similar strings is not misclassified as an exfiltration command.
+- Model-backed runs now write `trajectory.json` and `trajectory.jsonl` incrementally instead of only at normal completion.
+- The agent now gets an output-artifact hint, remaining-budget reminders, and an internal wall-clock timeout before Harbor's outer timeout.
+
+Local policy/loop tests:
+
+```text
+........
+----------------------------------------------------------------------
+Ran 8 tests in 1.030s
+
+OK
+```
+
+Post-loop-fix controlled smoke:
+
+```bash
+CODEFACTORY_RUN_REAL_PROVIDER_BRIDGE=1 \
+CODEFACTORY_BENCH_ENDPOINT=deepseek \
+CODEFACTORY_BENCH_TASK_LIMIT=1 \
+CODEFACTORY_BENCH_TRIAL_COUNT=1 \
+CODEFACTORY_BENCH_MODEL_TIMEOUT_SEC=90 \
+CODEFACTORY_BENCH_SHELL_TIMEOUT_SEC=90 \
+CODEFACTORY_BENCH_MAX_STEPS=20 \
+CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC=660 \
+cargo test benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_from_local_settings \
+  --lib -- --ignored --nocapture
+```
+
+Result:
+
+- Harbor job path: `/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260627-101843`
+- Run id: `20875a8a-cdec-47a3-ac00-da77dceaebbb`
+- Agent: `codefactory-headless`
+- Model: `deepseek-v4-pro`
+- Trial count: 1
+- Task: `terminal-bench/write-compressor`
+- Mean reward: `0.000`
+- Harbor stats: `n_completed_trials=1`, `n_errored_trials=0`
+- Failure class after import: `verification`
+- Trajectory: incrementally written during run
+
+Verifier status improved from "missing artifact" to "invalid artifact":
+
+```text
+test_compressed_file_exists: passed
+test_compression_size: passed
+test_decompression_produces_original: failed
+error: Segmentation fault (core dumped)
+```
+
+Longer controlled smoke:
+
+- Harbor job path: `/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260627-103150`
+- Run id: `d3927cd4-340c-4436-9f62-1e3a1c673d97`
+- Mean reward: `0.000`
+- Harbor stats: `n_completed_trials=1`, `n_errored_trials=0`
+- The generated `data.comp` reached `2476` bytes in the trajectory, under the `2500` byte limit, but decompression still failed.
+
+Current failure boundary: CodeFactory now produces a bounded-size artifact and preserves trajectory evidence, but the generated compressed stream is not semantically valid for `/app/decomp2`.
+
 ## Product Findings
 
 - The default shell environment did not include `~/.local/bin`, so `harbor` was initially not discoverable even though uv tool had installed it.
 - CodeFactory now resolves Harbor from `PATH`, `~/.local/bin/harbor`, or `~/.local/share/uv/tools/harbor/bin/harbor`.
 - Provider/API errors are now included in trial evidence and classified as `model-provider` instead of falling through to `planning`.
+- The adapter-local network policy must parse shell command structure, not raw heredoc body text.
+- Long-running model-backed benchmark runs need incremental trajectory writes; normal-completion-only logging loses evidence on timeout.
 
 ## Next Run
 
-Use this valid failing smoke to drive the next implementation slice, then rerun the same ignored test:
+Use the current semantic verifier failure to drive the next implementation slice, then rerun the same ignored test:
 
 ```bash
 CODEFACTORY_RUN_REAL_PROVIDER_BRIDGE=1 \

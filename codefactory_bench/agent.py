@@ -4,6 +4,7 @@ import hashlib
 import os
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -138,9 +139,12 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         model = self._model_name()
         assert model is not None
 
-        max_steps = self._int_env("CODEFACTORY_BENCH_MAX_STEPS", 12)
+        max_steps = self._int_env("CODEFACTORY_BENCH_MAX_STEPS", 20)
         shell_timeout = self._int_env("CODEFACTORY_BENCH_SHELL_TIMEOUT_SEC", 120)
+        wall_timeout = self._int_env("CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC", 780)
+        deadline = time.monotonic() + max(30, wall_timeout)
         trajectory: list[dict[str, Any]] = []
+        artifact_hint = self._artifact_hint_from_instruction(instruction)
 
         messages: list[dict[str, Any]] = [
             {
@@ -151,15 +155,54 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     "run_shell tool. Do not ask for confirmation. Stay inside the "
                     "task workspace. Do not access Harbor solution, verifier, host, "
                     "credential, or network-exfiltration paths. Run a relevant "
-                    "verification command before you finish when feasible."
+                    "verification command before you finish when feasible. If a "
+                    "tool call is denied, choose a safe equivalent command instead "
+                    "of repeating the denied command. Before finishing, check that "
+                    "the task's expected output artifacts exist."
                 ),
             },
             {"role": "user", "content": instruction},
         ]
+        if artifact_hint:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Output artifact hint: the instruction appears to require "
+                        f"creating `{artifact_hint}`. Make sure that exact artifact "
+                        "exists in the task workspace before you finish."
+                    ),
+                }
+            )
 
         final_text = ""
         total_tool_calls = 0
         for step in range(max_steps):
+            if deadline - time.monotonic() <= 15:
+                final_text = final_text or "Stopped before the benchmark agent timeout."
+                trajectory.append(
+                    {
+                        "step": step,
+                        "role": "system-reminder",
+                        "content": (
+                            "Stopping now to leave time for Harbor cleanup and verifier execution."
+                        ),
+                    }
+                )
+                self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
+                break
+
+            reminder = self._remaining_budget_reminder(step, max_steps, artifact_hint)
+            if reminder:
+                messages.append({"role": "user", "content": reminder})
+                trajectory.append(
+                    {
+                        "step": step,
+                        "role": "system-reminder",
+                        "content": reminder,
+                    }
+                )
+                self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
             assistant_message = self._chat_completion(messages, model)
             tool_calls = assistant_message.get("tool_calls") or []
             content = assistant_message.get("content") or ""
@@ -179,16 +222,35 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     "tool_calls": self._redact_tool_calls(tool_calls),
                 }
             )
+            self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
 
             if not tool_calls:
                 break
 
             for tool_call in tool_calls:
+                remaining_sec = deadline - time.monotonic()
+                if remaining_sec <= 15:
+                    final_text = final_text or "Stopped before the benchmark agent timeout."
+                    trajectory.append(
+                        {
+                            "step": step,
+                            "role": "system-reminder",
+                            "content": (
+                                "Skipping remaining tool calls to leave time for Harbor cleanup "
+                                "and verifier execution."
+                            ),
+                        }
+                    )
+                    self._write_model_backed_logs(
+                        trajectory, final_text, model, instruction_hash
+                    )
+                    break
+
                 total_tool_calls += 1
                 tool_result = await self._handle_tool_call(
                     tool_call,
                     environment,
-                    shell_timeout,
+                    min(shell_timeout, max(5, int(remaining_sec) - 5)),
                 )
                 messages.append(
                     {
@@ -198,7 +260,28 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     }
                 )
                 trajectory.append(tool_result["trajectory"])
+                self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
 
+        self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
+
+        context.metadata = {
+            **(context.metadata or {}),
+            "agent": self.name(),
+            "mode": "model-backed",
+            "model": model,
+            "instruction_sha256": instruction_hash,
+            "tool_calls": total_tool_calls,
+            "max_steps": max_steps,
+        }
+
+    def _write_model_backed_logs(
+        self,
+        trajectory: list[dict[str, Any]],
+        final_text: str,
+        model: str,
+        instruction_hash: str,
+    ) -> None:
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
         (self.logs_dir / "final.txt").write_text(final_text)
         (self.logs_dir / "trajectory.json").write_text(
             json.dumps(
@@ -216,16 +299,6 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         (self.logs_dir / "trajectory.jsonl").write_text(
             "\n".join(json.dumps(item, sort_keys=True) for item in trajectory) + "\n"
         )
-
-        context.metadata = {
-            **(context.metadata or {}),
-            "agent": self.name(),
-            "mode": "model-backed",
-            "model": model,
-            "instruction_sha256": instruction_hash,
-            "tool_calls": total_tool_calls,
-            "max_steps": max_steps,
-        }
 
     async def _handle_tool_call(
         self,
@@ -393,25 +466,77 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             if needle in normalized:
                 return {"action": "deny", "reason": reason}
 
-        network_tools = [
-            "curl ",
-            "wget ",
-            "nc ",
-            "ncat ",
-            "netcat ",
-            "socat ",
-            "ssh ",
-            "scp ",
-            "sftp ",
-            "ftp ",
-            "rsync ",
-        ]
         if not self._bool_env("CODEFACTORY_BENCH_ALLOW_NETWORK"):
-            for needle in network_tools:
-                if needle in f"{normalized} ":
-                    return {"action": "deny", "reason": "network/exfiltration tool disabled"}
+            if self._contains_network_tool_invocation(command):
+                return {"action": "deny", "reason": "network/exfiltration tool disabled"}
 
         return {"action": "allow", "reason": "benchmark task container command"}
+
+    @staticmethod
+    def _artifact_hint_from_instruction(instruction: str) -> str | None:
+        patterns = [
+            r"\b(?:write|create|generate|produce|save)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+)?"
+            r"(?:file\s+)?(?:at\s+|to\s+|as\s+|named\s+)?"
+            r"(`?/?[A-Za-z0-9_.\-/]+\.[A-Za-z0-9_.-]+`?)",
+            r"\b(`/[A-Za-z0-9_.\-/]+\.[A-Za-z0-9_.-]+`?)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, instruction, re.IGNORECASE)
+            if match:
+                return match.group(1).strip("`.,;:")
+        return None
+
+    @staticmethod
+    def _remaining_budget_reminder(
+        step: int, max_steps: int, artifact_hint: str | None
+    ) -> str | None:
+        remaining = max_steps - step
+        if remaining not in {3, 1}:
+            return None
+
+        artifact = (
+            f" The expected artifact appears to be `{artifact_hint}`;"
+            if artifact_hint
+            else " If the task names an expected output artifact,"
+        )
+        urgency = "last tool-call round" if remaining == 1 else f"only {remaining} tool-call rounds"
+        return (
+            f"You have {urgency} remaining before the benchmark agent stops."
+            f"{artifact} create it now, run the quickest feasible verification, "
+            "and then return a concise final answer. Do not spend remaining calls "
+            "on broad exploration."
+        )
+
+    @staticmethod
+    def _contains_network_tool_invocation(command: str) -> bool:
+        command_text = CodeFactoryAgent._strip_heredoc_bodies(command).lower()
+        network_tool_pattern = (
+            r"(?:^|[;&|()]\s*|\b(?:then|do|else)\s+)"
+            r"(?:sudo\s+|command\s+|env\s+)*"
+            r"(curl|wget|nc|ncat|netcat|socat|ssh|scp|sftp|ftp|rsync)"
+            r"(?:\s|$)"
+        )
+        return re.search(network_tool_pattern, command_text, re.MULTILINE) is not None
+
+    @staticmethod
+    def _strip_heredoc_bodies(command: str) -> str:
+        lines = command.splitlines()
+        stripped: list[str] = []
+        delimiter: str | None = None
+        heredoc_pattern = re.compile(r"<<-?\s*['\"]?([A-Za-z0-9_./-]+)['\"]?")
+
+        for line in lines:
+            if delimiter is not None:
+                if line.strip() == delimiter:
+                    delimiter = None
+                continue
+
+            stripped.append(line)
+            match = heredoc_pattern.search(line)
+            if match:
+                delimiter = match.group(1)
+
+        return "\n".join(stripped)
 
     def _has_model_config(self) -> bool:
         return bool(self._bench_env("CODEFACTORY_BENCH_API_KEY") and self._model_name())
