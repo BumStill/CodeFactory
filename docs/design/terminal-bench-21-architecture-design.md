@@ -36,7 +36,7 @@ CodeFactory UI / CLI
 
 优先实现 Harbor `BaseAgent` adapter。它通过 Harbor `BaseEnvironment.exec` 与任务容器交互，调用 CodeFactory headless runner 决策下一步命令和文件操作。
 
-当前第一步落地的是 `codefactory_bench.agent:CodeFactoryAgent` baseline adapter：Harbor 能 import 并运行 CodeFactory-owned agent class，CodeFactory 能导入 reward 和 agent identity；它不加载模型，不代表完整产品 agent 能力。下一步必须把该 adapter 接到 model-backed headless runner。
+当前 adapter 是 `codefactory_bench.agent:CodeFactoryAgent`。历史第一步跑通的是 no-model baseline；当前实现已增加 model-backed headless loop：仅从显式 `CODEFACTORY_BENCH_*` 读取模型配置，通过 OpenAI-compatible chat-completions 生成 `run_shell` tool call，经 `benchmark-sandbox` command gate 后用 Harbor `BaseEnvironment.exec` 在 task container 内执行，并写出 trajectory。
 
 优点：
 
@@ -46,8 +46,8 @@ CodeFactory UI / CLI
 
 限制：
 
-- 必须实现 headless runner；不能依赖 React UI 和人工审批。
-- 需要明确 sandbox policy，避免把 benchmark run 的自动授权带回普通用户项目。
+- 真实 model-backed 分数需要显式 benchmark model env；不能隐式读取用户桌面设置、keychain 或通用 provider env。
+- 需要把 adapter-local `benchmark-sandbox` command gate 后续沉淀为共享 policy preset，避免把 benchmark run 的自动授权带回普通用户项目。
 
 ### v2: Installed Agent Adapter
 
