@@ -28,13 +28,13 @@ cargo test benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_from
 
 The ignored Rust test loads local CodeFactory settings, previews the provider bridge, uses the generated authorization phrase, reads the endpoint key through the product bridge path, launches Harbor, and imports the job into the benchmark schema. Raw provider keys are not printed.
 
-## Preview Evidence
+## Initial Preview Evidence
 
 ```text
 provider_bridge_preview endpoint=deepseek base_url=https://api.deepseek.com model=deepseek-v4-pro key_ref=codefactory.endpoint.deepseek agent=codefactory_bench.agent:CodeFactoryAgent task_limit=1 trial_count=1 job_path=/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260627-083120
 ```
 
-## Result
+## Initial Depleted-Provider Result
 
 - Harbor job path: `/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260627-083120`
 - Run id: `01801dd1-b725-45d8-844d-c0cc6b608803`
@@ -86,6 +86,81 @@ RuntimeError: model request failed: HTTP 402: {"error":{"message":"Insufficient 
 
 This is a `model-provider` blocker result. It proves the CodeFactory product bridge, Harbor launch, adapter identity, and import path work with a real configured endpoint, but it is not a meaningful CodeFactory task-solving capability score until the endpoint has usable balance or another configured provider is selected.
 
+## Funded Rerun Result
+
+After DeepSeek funding was restored, the same CodeFactory provider bridge command was rerun.
+
+Preview evidence:
+
+```text
+provider_bridge_preview endpoint=deepseek base_url=https://api.deepseek.com model=deepseek-v4-pro key_ref=codefactory.endpoint.deepseek agent=codefactory_bench.agent:CodeFactoryAgent task_limit=1 trial_count=1 job_path=/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260627-085326
+```
+
+Result:
+
+- Harbor job path: `/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260627-085326`
+- Run id: `b700c436-4836-44c3-a6f4-c3c83b4dd4cc`
+- Trial id: `f97f2a59-8302-4250-addc-71c18afd4db1`
+- Dataset: `terminal-bench/terminal-bench-2-1`
+- Dataset ref: `sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a`
+- Agent: `codefactory-headless`
+- Agent version: `1.40.1`
+- Model: `deepseek-v4-pro`
+- Trial count: 1
+- Task: `terminal-bench/write-compressor`
+- Mean reward: `0.000`
+- Trial reward: `0.0`
+- Comparable import: `true`
+- Harbor stats: `n_completed_trials=1`, `n_errored_trials=0`
+- Exception stats: `{}`
+- Failure class after import: `verification`
+- End-to-end test runtime: `818.87s`
+
+Observed test output:
+
+```text
+provider_bridge_result status=completed exit_code=Some(0) job_path=/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260627-085326
+provider_bridge_imported run=b700c436-4836-44c3-a6f4-c3c83b4dd4cc dataset=terminal-bench/terminal-bench-2-1 agent=codefactory-headless model=Some("deepseek-v4-pro") comparable=true trials=1 mean_reward=0.000
+provider_bridge_trial task=terminal-bench/write-compressor reward=0 failure_class=Some("verification")
+test benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_from_local_settings ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 164 filtered out; finished in 818.87s
+```
+
+Re-import command:
+
+```bash
+CODEFACTORY_BENCHMARK_JOB_PATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260627-085326 \
+cargo test benchmark::tests::import_harbor_job_from_env_path --lib -- --ignored --nocapture
+```
+
+Re-import evidence:
+
+```text
+imported run=b700c436-4836-44c3-a6f4-c3c83b4dd4cc dataset=terminal-bench/terminal-bench-2-1 agent=codefactory-headless comparable=true trials=1
+trial=terminal-bench/write-compressor reward=0 failure_class=Some("verification")
+test benchmark::tests::import_harbor_job_from_env_path ... ok
+```
+
+Verifier evidence:
+
+```text
+reward.txt: 0
+```
+
+The verifier failed because the expected compressed artifact was not created at `/app/data.comp`. Agent metadata confirms model-backed mode:
+
+```text
+agent=codefactory-headless
+mode=model-backed
+model=deepseek-v4-pro
+trajectory_jsonl_lines=27
+run_shell_entries=15
+final_txt_bytes=0
+```
+
+This funded rerun is the first valid CodeFactory agent Terminal-Bench 2.1 smoke result. It is a real capability failure with reward `0.0`, not a provider/account blocker.
+
 ## Product Findings
 
 - The default shell environment did not include `~/.local/bin`, so `harbor` was initially not discoverable even though uv tool had installed it.
@@ -94,7 +169,7 @@ This is a `model-provider` blocker result. It proves the CodeFactory product bri
 
 ## Next Run
 
-Rerun the same ignored test after funding the DeepSeek endpoint or selecting another configured OpenAI-compatible endpoint:
+Use this valid failing smoke to drive the next implementation slice, then rerun the same ignored test:
 
 ```bash
 CODEFACTORY_RUN_REAL_PROVIDER_BRIDGE=1 \

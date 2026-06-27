@@ -47,8 +47,9 @@ test result: ok. 3 passed; 0 failed; 1 ignored
 ## Real Launch Evidence
 
 - `start_benchmark_provider_run` has now launched a real Harbor job using local CodeFactory endpoint `deepseek` and model `deepseek-v4-pro`.
-- Imported run: `01801dd1-b725-45d8-844d-c0cc6b608803`.
+- Initial imported run: `01801dd1-b725-45d8-844d-c0cc6b608803`, blocked by DeepSeek `HTTP 402 Insufficient Balance`.
+- Funded rerun: `b700c436-4836-44c3-a6f4-c3c83b4dd4cc`, no provider exception.
 - Evaluation subject: `agent=codefactory-headless`.
-- Import result: `comparable=true`, 1 trial, mean reward `0.000`.
-- Boundary: DeepSeek returned `HTTP 402 Insufficient Balance`, so this is a product bridge / provider availability evidence point, not a meaningful agent capability score.
+- Import result: `comparable=true`, 1 trial, mean reward `0.000`, `failure_class=verification`.
+- Boundary: the provider bridge is verified; the current score is a real CodeFactory agent capability failure, not a provider/account blocker.
 - Detailed evidence: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
