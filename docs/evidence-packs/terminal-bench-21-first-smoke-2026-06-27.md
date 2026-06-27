@@ -55,4 +55,4 @@ trial=terminal-bench/write-compressor reward=1 failure_class=None
 
 ## Boundary
 
-The first real smoke is complete for the evaluation infrastructure. The next missing step is CodeFactory-as-agent evaluation: implement the Harbor custom agent adapter, headless runner, and `benchmark-sandbox` policy, then rerun a smoke job with the CodeFactory adapter instead of `oracle`.
+The first real smoke is complete for the evaluation infrastructure. It is now complemented by `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, which verifies the CodeFactory-owned baseline adapter path. The remaining gap is a model-backed CodeFactory headless runner plus `benchmark-sandbox` policy.

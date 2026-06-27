@@ -36,6 +36,8 @@ CodeFactory UI / CLI
 
 优先实现 Harbor `BaseAgent` adapter。它通过 Harbor `BaseEnvironment.exec` 与任务容器交互，调用 CodeFactory headless runner 决策下一步命令和文件操作。
 
+当前第一步落地的是 `codefactory_bench.agent:CodeFactoryAgent` baseline adapter：Harbor 能 import 并运行 CodeFactory-owned agent class，CodeFactory 能导入 reward 和 agent identity；它不加载模型，不代表完整产品 agent 能力。下一步必须把该 adapter 接到 model-backed headless runner。
+
 优点：
 
 - 不需要把完整桌面 app 安装到每个 task container。

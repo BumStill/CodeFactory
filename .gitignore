@@ -6,6 +6,10 @@ target/
 node_modules/
 dist/
 
+# Python
+__pycache__/
+*.pyc
+
 # Tauri dev
 src-tauri/WixTools/
 .codex/run-logs/

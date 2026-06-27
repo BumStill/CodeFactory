@@ -12,7 +12,7 @@
 
 ## Current State
 - Current phase: implementation slice 2
-- Current checkpoint: first real Terminal-Bench 2.1 Harbor oracle smoke completed and imported through the CodeFactory Rust benchmark importer.
+- Current checkpoint: first real Terminal-Bench 2.1 CodeFactory-owned baseline adapter smoke completed and imported through the CodeFactory Rust benchmark importer.
 - Next owner: development / QA
 - Updated at: 2026-06-27
 
@@ -30,17 +30,21 @@
 - Ran Terminal-Bench 2.1 oracle smoke against dataset `terminal-bench/terminal-bench-2-1` with `-l 1`.
 - Imported the real Harbor job artifact through the CodeFactory Rust benchmark importer.
 - Corrected Harbor command semantics in docs and code: `-l` is task limit, `-k` is attempts.
+- Implemented minimal Harbor custom agent adapter `codefactory_bench.agent:CodeFactoryAgent`.
+- Added Python adapter smoke test using Harbor's Python environment.
+- Ran Terminal-Bench 2.1 CodeFactory-owned baseline adapter smoke against dataset `terminal-bench/terminal-bench-2-1` with `-l 1`.
+- Fixed Harbor custom-agent import so run-level agent identity falls back to trial `agent_info`.
 
 ## Remaining Items
-- Implement CodeFactory headless agent adapter for Harbor.
+- Upgrade the baseline adapter into a model-backed CodeFactory headless runner.
 - Implement `benchmark-sandbox` policy preset with hard host/secret boundaries.
 - Add Benchmarks UI for run summary, trial details, failure triage, and capability profile.
-- Run real Harbor smoke evaluation with the CodeFactory agent adapter after it exists.
+- Run real Harbor smoke evaluation with model-backed CodeFactory headless execution.
 - Compare at least one baseline/head subset after an implementation change.
 
 ## Blockers
-- No CodeFactory headless runner or Harbor adapter exists yet.
-- Real Terminal-Bench 2.1 oracle smoke verification has been run, but CodeFactory itself has not yet been evaluated as the agent.
+- No model-backed CodeFactory headless runner exists yet.
+- Current evaluation environment does not expose model API credentials to the Harbor adapter; the first CodeFactory-owned run is therefore a no-model baseline, not a product capability score.
 - Official leaderboard submission process is separate from local evaluation and not covered by this first implementation slice.
 
 ## Evidence
@@ -48,15 +52,18 @@
 - First real smoke: `harbor run -d terminal-bench/terminal-bench-2-1 -a oracle -l 1 -n 1 -o .codefactory/benchmark-jobs --job-name cf-tb21-oracle-smoke-20260627-1116 -y`.
 - First real smoke result: run id `1e7185f0-68b1-4c74-b45b-bfbc3373010b`, task `terminal-bench/write-compressor`, reward `1.0`, mean `1.000`, exceptions `0`, runtime `4m 11s`.
 - First real import evidence: `CODEFACTORY_BENCHMARK_JOB_PATH=.codefactory/benchmark-jobs/cf-tb21-oracle-smoke-20260627-1116 cargo test benchmark::tests::import_harbor_job_from_env_path --lib -- --ignored --nocapture` imported 1 trial with `comparable=true`.
-- Evidence pack: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`.
+- First CodeFactory-owned baseline run: `harbor run -d terminal-bench/terminal-bench-2-1 --agent-import-path codefactory_bench.agent:CodeFactoryAgent -l 1 -n 1 -o .codefactory/benchmark-jobs --job-name cf-tb21-codefactory-baseline-20260627-1145 -y`.
+- First CodeFactory-owned baseline result: run id `3bcbc381-e510-4317-8947-fbb5a1e64bcd`, task `terminal-bench/write-compressor`, agent `codefactory-headless-baseline`, reward `0.0`, mean `0.000`, exceptions `0`, runtime `1m 4s`.
+- First CodeFactory-owned import evidence: `CODEFACTORY_BENCHMARK_JOB_PATH=.codefactory/benchmark-jobs/cf-tb21-codefactory-baseline-20260627-1145 cargo test benchmark::tests::import_harbor_job_from_env_path --lib -- --ignored --nocapture` imported 1 trial with `agent=codefactory-headless-baseline`, `comparable=true`, `failure_class=Some("verification")`.
+- Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`.
 - Release evidence: not live.
-- Blocking evidence: no Harbor adapter or headless CodeFactory runner exists yet, so the first completed smoke is an oracle environment/import baseline rather than a CodeFactory-agent evaluation.
+- Blocking evidence: no model-backed headless CodeFactory runner exists yet, so the first CodeFactory-owned score is a baseline adapter score rather than full product agent capability.
 
 ## AI Collaboration
 - context scope: CodeFactory repo docs, AGENTS rules, current official Terminal-Bench and Harbor docs.
 - assumptions: Terminal-Bench 2.1 should be treated as the primary external terminal-agent benchmark; CodeFactory must add headless execution rather than rely on desktop UI approval.
 - review point: first implementation slice should be reviewed before starting the Harbor adapter/headless runner slice.
-- validation result: `cargo test benchmark::tests --lib` and the ignored real-job import test both pass after an intentional failing-test step.
+- validation result: Python adapter smoke, Rust custom-agent import regression, and the ignored real-job import test pass after intentional failing-test steps.
 
 ## Stop Boundary
 - Do not stop after local-only validation.

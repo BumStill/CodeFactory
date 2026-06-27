@@ -17,7 +17,7 @@
 | CF-TB-R1 | 瞄准 Terminal-Bench 2.1 评估能力 | 仓库内有 Terminal-Bench 2.1 业务、架构、UX 和规格文档，明确官方约束和产品目标 | docs | 文档审查 + governance baseline | planning |
 | CF-TB-R2 | 评估我们的能力 | CodeFactory 能保存 benchmark run、trial、reward、artifact 和 build 信息 | backend + sqlite + UI | fake Harbor job 导入测试 + UI summary |
 | CF-TB-R3 | 不能只看总分 | 系统生成 capability profile 和 failure taxonomy | backend + UI | fixture run 分类断言 |
-| CF-TB-R4 | 能被 Terminal-Bench 2.1 跑 | 提供 Harbor custom agent adapter 设计和 headless runner 接口 | adapter + agent loop | Harbor smoke run 或 adapter integration test |
+| CF-TB-R4 | 能被 Terminal-Bench 2.1 跑 | 提供 Harbor custom agent adapter，并继续补齐 model-backed headless runner | adapter + agent loop | Python adapter smoke + Harbor CodeFactory baseline run + headless runner integration test |
 | CF-TB-R5 | 改进后能回归 | 支持同一 subset 的 baseline/head run 对比 | backend + UI | compare run fixture test |
 | CF-TB-R6 | 保持可审计和安全 | benchmark policy 只在 Harbor sandbox 生效，不污染普通项目权限和长期 memory | permission + memory + audit | policy unit test + memory write guard |
 
@@ -87,6 +87,8 @@ PR 描述必须包含：
 - `--agent-import-path`: 自定义 CodeFactory agent adapter 的 import path。
 - `-a oracle`: 只用于验证 Harbor/Docker/dataset/verifier/import 链路，不代表 CodeFactory agent 能力。
 
+当前已验证的 CodeFactory import path 是 `codefactory_bench.agent:CodeFactoryAgent`。它的首个模式是 `codefactory-headless-baseline` / `baseline-no-model`，只证明 Harbor 能运行 CodeFactory-owned adapter 并把结果导回 CodeFactory；不得把该 0 分 baseline 声明为完整 CodeFactory agent 能力。
+
 ### Run Summary
 
 每次 run 至少记录：
@@ -116,6 +118,7 @@ PR 描述必须包含：
 | Primary | 页面展示 latest run | reward、task count、artifact path、failure classes 可见 | UI test |
 | Primary | 同一 subset 对比两个 run | reward delta、regression task、improved task 可见 | compare test |
 | Adapter | custom agent adapter command 生成 | 使用 `terminal-bench/terminal-bench-2-1` 和 import path | command assertion |
+| Adapter | CodeFactory baseline adapter smoke | Harbor 能 import `codefactory_bench.agent:CodeFactoryAgent`，trial 无 exception，CodeFactory importer 读回 agent identity 和 reward | Harbor job + ignored real import test |
 | Policy | benchmark-sandbox policy in task container | workspace command/file edit 自动允许，host path/secret deny | policy unit test |
 | Failure | 缺失 `result.json` | 标记 `partial_import`，列出缺失文件 | importer test |
 | Failure | Harbor 不存在 | UI 显示 blocker，不影响其他页面 | environment probe test |
@@ -139,5 +142,6 @@ PR 描述必须包含：
 
 - 在 headless runner 和 Harbor adapter 真正可跑前，产品只能声明 `design ready`，不得声明 Terminal-Bench 2.1 已支持。
 - 在至少一次真实 Harbor smoke run 成功导入前，不能声明 `evaluation path verified`。oracle smoke 只能证明 Harbor 环境和导入链路，不能证明 CodeFactory agent 能力。
+- `codefactory-headless-baseline` 成功运行后，可以声明 `CodeFactory-owned adapter path verified`，但在 model-backed headless runner 跑通前，不能声明 `CodeFactory agent capability evaluated`。
 - 在 packaged app 或 release artifact 中验证前，不能声明 `live`。
 - 官方 leaderboard submission 需要单独 release/QA gate；本规格首期只覆盖本地可复现能力评估。

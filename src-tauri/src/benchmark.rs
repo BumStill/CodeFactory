@@ -343,6 +343,7 @@ pub async fn import_harbor_job(pool: &SqlitePool, job_path: &Path) -> Result<Imp
     let mut missing_files = Vec::new();
     let config = read_json_file(job_path.join("config.json"), &mut missing_files)?;
     let result = read_json_file(job_path.join("result.json"), &mut missing_files)?;
+    let trial_agent_info = first_trial_agent_info(job_path)?;
     let now = Utc::now().to_rfc3339();
 
     let dataset = json_string(&config, &["dataset"])
@@ -358,6 +359,7 @@ pub async fn import_harbor_job(pool: &SqlitePool, job_path: &Path) -> Result<Imp
     let agent_name = json_string(&config, &["agent"])
         .or_else(|| json_string(&config, &["agent_name"]))
         .or_else(|| json_string(&config, &["agents", "0", "name"]))
+        .or_else(|| trial_agent_info.name.clone())
         .unwrap_or_else(|| "unknown".to_string());
     let policy_preset = json_string(&config, &["metadata", "policy_preset"])
         .unwrap_or_else(|| "benchmark-sandbox".to_string());
@@ -388,9 +390,10 @@ pub async fn import_harbor_job(pool: &SqlitePool, job_path: &Path) -> Result<Imp
             .or_else(|| json_string(&config, &["datasets", "0", "version"]))
             .or_else(|| json_string(&config, &["datasets", "0", "ref"])),
         agent_name,
-        agent_version: json_string(&config, &["agent_version"]),
+        agent_version: json_string(&config, &["agent_version"]).or(trial_agent_info.version),
         model: json_string(&config, &["model"])
-            .or_else(|| json_string(&config, &["agents", "0", "model_name"])),
+            .or_else(|| json_string(&config, &["agents", "0", "model_name"]))
+            .or(trial_agent_info.model),
         codefactory_version: json_string(&config, &["metadata", "codefactory_version"]),
         codefactory_git_sha: json_string(&config, &["metadata", "codefactory_git_sha"]),
         policy_preset,
@@ -429,26 +432,12 @@ fn read_json_file(path: PathBuf, missing_files: &mut Vec<String>) -> Result<Valu
 }
 
 fn import_trials(run_id: &str, job_path: &Path) -> Result<Vec<BenchmarkTrialRecord>> {
-    let trials_dir = if job_path.join("trials").is_dir() {
-        job_path.join("trials")
-    } else {
-        job_path.to_path_buf()
-    };
-    if !trials_dir.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let mut entries: Vec<_> = fs::read_dir(&trials_dir)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_dir())
-        .filter(|entry| entry.path().join("result.json").exists())
-        .collect();
-    entries.sort_by_key(|entry| entry.file_name());
-
     let mut trials = Vec::new();
-    for entry in entries {
-        let trial_dir = entry.path();
-        let fallback_task_name = entry.file_name().to_string_lossy().to_string();
+    for trial_dir in harbor_trial_dirs(job_path)? {
+        let fallback_task_name = trial_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| trial_dir.to_string_lossy().to_string());
         let mut missing = Vec::new();
         let config = read_json_file(trial_dir.join("config.json"), &mut missing)?;
         let result = read_json_file(trial_dir.join("result.json"), &mut missing)?;
@@ -511,6 +500,52 @@ fn import_trials(run_id: &str, job_path: &Path) -> Result<Vec<BenchmarkTrialReco
     }
 
     Ok(trials)
+}
+
+#[derive(Default)]
+struct TrialAgentInfo {
+    name: Option<String>,
+    version: Option<String>,
+    model: Option<String>,
+}
+
+fn first_trial_agent_info(job_path: &Path) -> Result<TrialAgentInfo> {
+    for trial_dir in harbor_trial_dirs(job_path)? {
+        let result_path = trial_dir.join("result.json");
+        if !result_path.exists() {
+            continue;
+        }
+        let result: Value = serde_json::from_str(&fs::read_to_string(result_path)?)?;
+        let info = TrialAgentInfo {
+            name: json_string(&result, &["agent_info", "name"]),
+            version: json_string(&result, &["agent_info", "version"]),
+            model: json_string(&result, &["agent_info", "model_info", "name"]),
+        };
+        if info.name.is_some() || info.version.is_some() || info.model.is_some() {
+            return Ok(info);
+        }
+    }
+    Ok(TrialAgentInfo::default())
+}
+
+fn harbor_trial_dirs(job_path: &Path) -> Result<Vec<PathBuf>> {
+    let trials_dir = if job_path.join("trials").is_dir() {
+        job_path.join("trials")
+    } else {
+        job_path.to_path_buf()
+    };
+    if !trials_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries: Vec<_> = fs::read_dir(&trials_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .filter(|entry| entry.path().join("result.json").exists())
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name());
+
+    Ok(entries.into_iter().map(|entry| entry.path()).collect())
 }
 
 fn classify_failure(reward: f64, evidence: &str) -> Option<String> {
@@ -994,6 +1029,99 @@ mod tests {
             imported.trials[0].duration_ms.unwrap_or_default() > 0,
             "duration should be derived from Harbor started_at/finished_at"
         );
+    }
+
+    #[tokio::test]
+    async fn import_harbor_custom_agent_identity_from_trial_agent_info() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        ensure_schema(&pool).await.expect("benchmark schema");
+
+        let job_dir = temp_job_dir();
+        fs::write(
+            job_dir.join("config.json"),
+            json!({
+                "job_name": "cf-tb21-codefactory-baseline",
+                "agents": [
+                    {
+                        "name": null,
+                        "import_path": "codefactory_bench.agent:CodeFactoryAgent",
+                        "model_name": null
+                    }
+                ],
+                "datasets": [
+                    {
+                        "name": "terminal-bench/terminal-bench-2-1",
+                        "ref": "sha256:dataset-ref",
+                        "n_tasks": 1
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write job config");
+        fs::write(
+            job_dir.join("result.json"),
+            json!({
+                "id": "job-id",
+                "started_at": "2026-06-27T03:42:47.040459Z",
+                "finished_at": "2026-06-27T03:43:51.386251Z"
+            })
+            .to_string(),
+        )
+        .expect("write job result");
+
+        let trial_dir = job_dir.join("write-compressor__abc123");
+        fs::create_dir_all(trial_dir.join("verifier")).expect("create trial");
+        fs::write(
+            trial_dir.join("config.json"),
+            json!({
+                "task": {
+                    "name": "terminal-bench/write-compressor",
+                    "source": "terminal-bench/terminal-bench-2-1"
+                },
+                "trial_name": "write-compressor__abc123",
+                "agent": {
+                    "name": null,
+                    "import_path": "codefactory_bench.agent:CodeFactoryAgent"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write trial config");
+        fs::write(
+            trial_dir.join("result.json"),
+            json!({
+                "id": "trial-id",
+                "task_name": "terminal-bench/write-compressor",
+                "source": "terminal-bench/terminal-bench-2-1",
+                "agent_info": {
+                    "name": "codefactory-headless-baseline",
+                    "version": "1.40.0",
+                    "model_info": null
+                },
+                "verifier_result": {
+                    "rewards": { "reward": 0.0 }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write trial result");
+        fs::write(trial_dir.join("verifier").join("reward.txt"), "0").expect("write reward");
+        fs::write(trial_dir.join("verifier").join("test-stdout.txt"), "failed")
+            .expect("write stdout");
+
+        let imported = import_harbor_job(&pool, &job_dir)
+            .await
+            .expect("import custom Harbor agent layout");
+
+        assert_eq!(imported.run.agent_name, "codefactory-headless-baseline");
+        assert_eq!(imported.run.agent_version.as_deref(), Some("1.40.0"));
+        assert_eq!(imported.trials.len(), 1);
+        assert_eq!(imported.trials[0].reward, 0.0);
     }
 
     #[tokio::test]
