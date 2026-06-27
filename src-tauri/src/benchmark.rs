@@ -478,8 +478,9 @@ fn profile_by_id(profile_id: &str) -> Result<BenchmarkProfile> {
 }
 
 pub fn probe_environment(profile_id: &str) -> Result<BenchmarkEnvironmentProbe> {
-    let harbor = probe_command("harbor", &["--help"]);
-    let docker = probe_command("docker", &["info"]);
+    let harbor_binary = resolve_harbor_binary();
+    let harbor = probe_command(&harbor_binary, &["--help"]);
+    let docker = probe_command(Path::new("docker"), &["info"]);
     probe_environment_from_command_results(profile_id, harbor, docker)
 }
 
@@ -547,20 +548,21 @@ pub fn probe_environment_from_command_results(
     })
 }
 
-fn probe_command(binary: &str, args: &[&str]) -> ProbeCommandResult {
+fn probe_command(binary: &Path, args: &[&str]) -> ProbeCommandResult {
+    let binary_label = binary.to_string_lossy();
     match Command::new(binary).no_window().args(args).output() {
         Ok(output) if output.status.success() => ProbeCommandResult {
-            binary: binary.to_string(),
+            binary: binary_label.to_string(),
             available: true,
             stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            detail: format!("{binary} is available"),
+            detail: format!("{binary_label} is available"),
         },
         Ok(output) => ProbeCommandResult::warning(
-            binary,
+            &binary_label,
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
         ),
-        Err(_) => ProbeCommandResult::missing(binary),
+        Err(_) => ProbeCommandResult::missing(&binary_label),
     }
 }
 
@@ -576,7 +578,7 @@ fn execute_provider_launch(
         )));
     }
 
-    let mut command = Command::new("harbor").no_window();
+    let mut command = Command::new(resolve_harbor_binary()).no_window();
     command.args(&launch.args).current_dir(&adapter_root);
     for (key, value) in &launch.env {
         command.env(key, value);
@@ -589,6 +591,30 @@ fn execute_provider_launch(
         stdout: tail_text(&String::from_utf8_lossy(&output.stdout), 12000),
         stderr: tail_text(&String::from_utf8_lossy(&output.stderr), 12000),
     })
+}
+
+fn resolve_harbor_binary() -> PathBuf {
+    if let Some(path) = find_binary_on_path("harbor") {
+        return path;
+    }
+    if let Some(home) = dirs::home_dir() {
+        for candidate in [
+            home.join(".local/bin/harbor"),
+            home.join(".local/share/uv/tools/harbor/bin/harbor"),
+        ] {
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("harbor")
+}
+
+fn find_binary_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 fn pythonpath_with_adapter_root(adapter_root: &Path) -> Result<OsString> {
@@ -923,6 +949,9 @@ fn import_trials(run_id: &str, job_path: &Path) -> Result<Vec<BenchmarkTrialReco
             read_optional_text(verifier_stdout_path.as_deref())?,
             read_optional_text(verifier_stderr_path.as_deref())?,
             json_string(&result, &["error"]).unwrap_or_default(),
+            json_string(&result, &["exception_info", "exception_type"]).unwrap_or_default(),
+            json_string(&result, &["exception_info", "exception_message"]).unwrap_or_default(),
+            read_optional_text(first_existing_path(&trial_dir, &["exception.txt"]).as_deref())?,
         ]
         .join("\n");
 
@@ -938,7 +967,8 @@ fn import_trials(run_id: &str, job_path: &Path) -> Result<Vec<BenchmarkTrialReco
                 .or_else(|| json_i64(&result, &["duration"]))
                 .or_else(|| duration_ms_from_result(&result)),
             error_kind: json_string(&result, &["error_kind"])
-                .or_else(|| json_string(&result, &["exception_info", "type"])),
+                .or_else(|| json_string(&result, &["exception_info", "type"]))
+                .or_else(|| json_string(&result, &["exception_info", "exception_type"])),
             failure_class: classify_failure(reward, &evidence),
             trajectory_path: trajectory_path.map(|path| path.to_string_lossy().to_string()),
             verifier_stdout_path: verifier_stdout_path
@@ -1008,6 +1038,19 @@ fn classify_failure(reward: f64, evidence: &str) -> Option<String> {
         || text.contains("outside workspace")
     {
         "policy"
+    } else if text.contains("model request failed")
+        || text.contains("chat/completions")
+        || text.contains("insufficient balance")
+        || text.contains("payment required")
+        || text.contains("rate limit")
+        || text.contains("too many requests")
+        || text.contains("invalid_api_key")
+        || text.contains("http 401")
+        || text.contains("http 402")
+        || text.contains("http 403")
+        || text.contains("http 429")
+    {
+        "model-provider"
     } else if text.contains("command not found")
         || text.contains("no such file")
         || text.contains("exit status 127")
@@ -1574,6 +1617,16 @@ mod tests {
     }
 
     #[test]
+    fn failure_classifier_separates_model_provider_errors_from_agent_planning() {
+        let failure = classify_failure(
+            0.0,
+            r#"RuntimeError: model request failed: HTTP 402: {"error":{"message":"Insufficient Balance"}}"#,
+        );
+
+        assert_eq!(failure.as_deref(), Some("model-provider"));
+    }
+
+    #[test]
     fn provider_bridge_preview_uses_current_deepseek_without_exposing_secret() {
         let settings = settings_with_deepseek_endpoint();
         let preview = preview_provider_bridge(
@@ -1703,6 +1756,148 @@ mod tests {
             default_model: "deepseek/deepseek-v4-flash".to_string(),
             ..crate::config::settings::Settings::default()
         }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn provider_bridge_runs_real_codefactory_endpoint_from_local_settings() {
+        assert_eq!(
+            std::env::var("CODEFACTORY_RUN_REAL_PROVIDER_BRIDGE").as_deref(),
+            Ok("1"),
+            "set CODEFACTORY_RUN_REAL_PROVIDER_BRIDGE=1 to run a real provider-backed Terminal-Bench smoke"
+        );
+
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root")
+            .to_path_buf();
+        let endpoint_name =
+            std::env::var("CODEFACTORY_BENCH_ENDPOINT").unwrap_or_else(|_| "deepseek".to_string());
+        let model = std::env::var("CODEFACTORY_BENCH_MODEL_OVERRIDE").ok();
+        let task_limit = env_u32("CODEFACTORY_BENCH_TASK_LIMIT", 1);
+        let trial_count = env_u32("CODEFACTORY_BENCH_TRIAL_COUNT", 1);
+        let job_root = std::env::var("CODEFACTORY_BENCH_JOB_ROOT").unwrap_or_else(|_| {
+            repo_root
+                .join(".codefactory/benchmark-jobs")
+                .to_string_lossy()
+                .to_string()
+        });
+        let job_name = format!(
+            "cf-tb21-codefactory-provider-{}-{}",
+            endpoint_name,
+            Utc::now().format("%Y%m%d-%H%M%S")
+        );
+        let bridge = BenchmarkProviderBridgeRequest {
+            profile_id: TERMINAL_BENCH_21_PROFILE_ID.to_string(),
+            endpoint_name: Some(endpoint_name),
+            model,
+            task_limit: Some(task_limit),
+            trial_count: Some(trial_count),
+            job_root: Some(job_root),
+            job_name: Some(job_name),
+            adapter_root: Some(repo_root.to_string_lossy().to_string()),
+        };
+        let settings = crate::config::settings::load();
+        let preview = preview_provider_bridge(&settings, &bridge).expect("preview provider bridge");
+        println!(
+            "provider_bridge_preview endpoint={} base_url={} model={} key_ref={} agent={} task_limit={} trial_count={} job_path={}",
+            preview.endpoint_name,
+            preview.base_url,
+            preview.model,
+            preview.key_ref,
+            preview.agent_import_path,
+            preview.task_limit,
+            preview.trial_count,
+            preview.job_path
+        );
+        assert!(
+            preview.ready,
+            "provider bridge preview must be ready: {:?}",
+            preview.blockers
+        );
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        ensure_schema(&pool).await.expect("benchmark schema");
+
+        let result = start_provider_benchmark_run(
+            &pool,
+            &settings,
+            StartBenchmarkProviderRunRequest {
+                bridge,
+                authorization_phrase: preview.authorization_phrase.clone(),
+            },
+        )
+        .await
+        .expect("start provider benchmark run");
+
+        println!(
+            "provider_bridge_result status={} exit_code={:?} job_path={}",
+            result.status, result.exit_code, result.preview.job_path
+        );
+        if result.status != "completed" {
+            println!(
+                "provider_bridge_stdout_tail:\n{}",
+                redacted_log_tail(&result.stdout)
+            );
+            println!(
+                "provider_bridge_stderr_tail:\n{}",
+                redacted_log_tail(&result.stderr)
+            );
+        }
+        assert_eq!(result.status, "completed", "Harbor provider run failed");
+
+        let imported = result.imported.expect("completed run should be imported");
+        let total_reward: f64 = imported.trials.iter().map(|trial| trial.reward).sum();
+        let mean_reward = total_reward / imported.trials.len().max(1) as f64;
+        println!(
+            "provider_bridge_imported run={} dataset={} agent={} model={:?} comparable={} trials={} mean_reward={:.3}",
+            imported.run.id,
+            imported.run.dataset,
+            imported.run.agent_name,
+            imported.run.model,
+            imported.run.comparable,
+            imported.trials.len(),
+            mean_reward
+        );
+        for trial in &imported.trials {
+            println!(
+                "provider_bridge_trial task={} reward={} failure_class={:?}",
+                trial.task_name, trial.reward, trial.failure_class
+            );
+        }
+
+        assert_eq!(imported.run.dataset, TERMINAL_BENCH_21_DATASET);
+        assert_eq!(imported.run.agent_name, "codefactory-headless");
+        assert!(
+            !imported.trials.is_empty(),
+            "real provider-backed Harbor job must include trial rows"
+        );
+    }
+
+    fn env_u32(name: &str, default: u32) -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(default)
+    }
+
+    fn redacted_log_tail(text: &str) -> String {
+        let filtered = text
+            .lines()
+            .filter(|line| {
+                let lower = line.to_ascii_lowercase();
+                !(lower.contains("authorization")
+                    || lower.contains("api_key")
+                    || lower.contains("bearer ")
+                    || lower.contains("codefactory_bench_api_key"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        tail_text(&filtered, 4000)
     }
 
     #[tokio::test]

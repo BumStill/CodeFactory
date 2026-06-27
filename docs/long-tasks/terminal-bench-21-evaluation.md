@@ -11,8 +11,8 @@
 - Blocked means: Harbor/Docker/dataset/agent-adapter/runtime access prevents real smoke verification, with exact command, error, and next action recorded.
 
 ## Current State
-- Current phase: implementation slice 2
-- Current checkpoint: model-backed `codefactory-headless` runner entry exists and is locally tested with a fake OpenAI-compatible server; backend provider bridge can now preview and explicitly authorize current CodeFactory endpoint/model for one benchmark launch without exposing raw API keys. Systematic evaluation attribution is now documented so results are assigned to CodeFactory agent, model backend, agent scaffold, or evaluation infrastructure explicitly.
+- Current phase: implementation slice 3
+- Current checkpoint: first real provider-backed Terminal-Bench 2.1 smoke has run through the CodeFactory provider bridge with `agent=codefactory-headless` and model backend `deepseek-v4-pro`. The run path is verified, but the current DeepSeek provider returned `HTTP 402 Insufficient Balance`, so the first model-backed result is a `model-provider` blocker result rather than an agent capability score.
 - Next owner: development / QA
 - Updated at: 2026-06-27
 
@@ -39,16 +39,20 @@
 - Implemented backend provider bridge commands: preview current endpoint/model with redacted env and authorization phrase, then start Harbor only after exact authorization while temporarily injecting the provider key into child process env.
 - Added Rust provider bridge tests for DeepSeek direct endpoint normalization, redacted preview, authorization-before-secret-lookup, and child-env-only secret injection.
 - Added `docs/principles/systematic-agent-evaluation.md` and wired Terminal-Bench docs to the evaluation matrix: CodeFactory agent capability, model-backend ablation, agent-scaffold comparison, and evaluation-infrastructure smoke.
+- Added Harbor binary discovery fallback for product/runtime environments where `harbor` is installed by uv tool but `~/.local/bin` is not on `PATH`.
+- Added an ignored Rust real-smoke test that loads local CodeFactory settings, uses the provider bridge authorization phrase, starts Harbor, and imports the resulting job without printing raw provider keys.
+- Ran the first real CodeFactory provider-backed Terminal-Bench 2.1 smoke with `endpoint=deepseek`, `model=deepseek-v4-pro`, `agent=codefactory-headless`, `task_limit=1`, and `trial_count=1`.
+- Updated failure classification so provider/API errors such as `HTTP 402 Insufficient Balance` are recorded as `model-provider` instead of generic `planning`.
 
 ## Remaining Items
-- Run real Harbor smoke evaluation with model-backed CodeFactory headless execution through the explicit provider bridge path.
+- Rerun the real Harbor smoke after funding the DeepSeek endpoint or selecting another usable CodeFactory provider endpoint, so the run measures CodeFactory agent behavior rather than provider availability.
 - Add persisted run fields/UI for evaluation axis, evaluation subject, fixed variables, changed variables, and result attribution.
 - Promote `benchmark-sandbox` from adapter-local command gate to shared CodeFactory policy preset with run/task/container binding.
 - Add Benchmarks UI for run summary, trial details, failure triage, and capability profile.
 - Compare at least one baseline/head subset after an implementation change.
 
 ## Blockers
-- A real CodeFactory agent Terminal-Bench score using the current model backend now requires running the product bridge command from a CodeFactory app/runtime context with explicit user authorization; Codex should not directly read the user's OS credential store or generic provider env.
+- Current DeepSeek provider run is blocked by provider account state: `HTTP 402 Insufficient Balance`. This is not a CodeFactory planning/tool-use failure; rerun after funding the endpoint or switching to another configured OpenAI-compatible endpoint.
 - Official leaderboard submission process is separate from local evaluation and not covered by this first implementation slice.
 
 ## Evidence
@@ -64,16 +68,19 @@
 - Post-upgrade no-model Harbor smoke: `harbor run -d terminal-bench/terminal-bench-2-1 --agent-import-path codefactory_bench.agent:CodeFactoryAgent -l 1 -n 1 -o .codefactory/benchmark-jobs --job-name cf-tb21-codefactory-headless-nomodel-20260627-1205 -y`.
 - Post-upgrade no-model result: run id `19e42aa8-9e97-4f3b-8965-21993f081ae5`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, mode `baseline-no-model`, reward `0.0`, mean `0.000`, exceptions `0`, runtime `1m 0s`.
 - Post-upgrade no-model import evidence: `CODEFACTORY_BENCHMARK_JOB_PATH=.codefactory/benchmark-jobs/cf-tb21-codefactory-headless-nomodel-20260627-1205 cargo test benchmark::tests::import_harbor_job_from_env_path --lib -- --ignored --nocapture` imported 1 trial with `agent=codefactory-headless`, `comparable=true`, `failure_class=Some("verification")`.
-- Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`.
+- First provider-backed CodeFactory run command: `CODEFACTORY_RUN_REAL_PROVIDER_BRIDGE=1 CODEFACTORY_BENCH_ENDPOINT=deepseek CODEFACTORY_BENCH_TASK_LIMIT=1 CODEFACTORY_BENCH_TRIAL_COUNT=1 CODEFACTORY_BENCH_MODEL_TIMEOUT_SEC=120 CODEFACTORY_BENCH_SHELL_TIMEOUT_SEC=120 cargo test benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_from_local_settings --lib -- --ignored --nocapture`.
+- First provider-backed CodeFactory result: run id `01801dd1-b725-45d8-844d-c0cc6b608803`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, model `deepseek-v4-pro`, mean `0.000`, `n_errored_trials=1`, exception `RuntimeError`, cause `HTTP 402 Insufficient Balance`.
+- First provider-backed import evidence: `CODEFACTORY_BENCHMARK_JOB_PATH=.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260627-083120 cargo test benchmark::tests::import_harbor_job_from_env_path --lib -- --ignored --nocapture` imported 1 trial with `agent=codefactory-headless`, `comparable=true`, `failure_class=Some("model-provider")`.
+- Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.
 - Release evidence: not live.
-- Blocking evidence: bridge contract is implemented, but no real model-backed run has been launched through the CodeFactory product path yet.
+- Blocking evidence: CodeFactory product bridge launched a real Harbor job and imported it, but DeepSeek returned `HTTP 402 Insufficient Balance`.
 
 ## AI Collaboration
 - context scope: CodeFactory repo docs, AGENTS rules, current official Terminal-Bench and Harbor docs.
 - assumptions: Terminal-Bench 2.1 should be treated as the primary external terminal-agent benchmark; CodeFactory must add headless execution rather than rely on desktop UI approval.
 - review point: first implementation slice should be reviewed before starting the Harbor adapter/headless runner slice.
-- validation result: Python adapter smoke/model-backed tests, Rust custom-agent import regression, Rust provider bridge tests, and the ignored real-job import test pass after intentional failing-test steps.
+- validation result: Python adapter smoke/model-backed tests, Rust custom-agent import regression, Rust provider bridge tests, ignored real-job import test, and ignored real provider-bridge smoke pass after intentional failing-test steps; first provider-backed run is blocked by provider account balance.
 
 ## Stop Boundary
 - Do not stop after local-only validation.

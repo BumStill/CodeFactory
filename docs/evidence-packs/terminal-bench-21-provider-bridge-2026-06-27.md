@@ -28,12 +28,13 @@ cargo test provider_bridge --lib
 Result:
 
 ```text
-running 3 tests
+running 4 tests
+test benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_from_local_settings ... ignored
 test benchmark::tests::provider_bridge_preview_uses_current_deepseek_without_exposing_secret ... ok
 test benchmark::tests::provider_bridge_requires_authorization_before_secret_lookup ... ok
 test benchmark::tests::provider_bridge_authorized_launch_injects_secret_only_into_child_env ... ok
 
-test result: ok. 3 passed; 0 failed
+test result: ok. 3 passed; 0 failed; 1 ignored
 ```
 
 ## Security Assertions
@@ -43,8 +44,11 @@ test result: ok. 3 passed; 0 failed
 - The raw key appears only in the in-memory child process env vector used to spawn Harbor.
 - The frontend receives only redacted env values.
 
-## Current Boundary
+## Real Launch Evidence
 
-- This verifies the product/backend contract for using the current provider in a benchmark run.
-- It does not yet produce a real CodeFactory agent Terminal-Bench score using the current model backend.
-- Real scoring still requires launching `start_benchmark_provider_run` from the CodeFactory app/runtime after explicit user authorization, then importing the Harbor job result with `agent=codefactory-headless`.
+- `start_benchmark_provider_run` has now launched a real Harbor job using local CodeFactory endpoint `deepseek` and model `deepseek-v4-pro`.
+- Imported run: `01801dd1-b725-45d8-844d-c0cc6b608803`.
+- Evaluation subject: `agent=codefactory-headless`.
+- Import result: `comparable=true`, 1 trial, mean reward `0.000`.
+- Boundary: DeepSeek returned `HTTP 402 Insufficient Balance`, so this is a product bridge / provider availability evidence point, not a meaningful agent capability score.
+- Detailed evidence: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.

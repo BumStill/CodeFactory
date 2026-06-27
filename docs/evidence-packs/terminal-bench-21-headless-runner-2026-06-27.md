@@ -4,7 +4,7 @@
 
 This evidence pack records the first model-backed CodeFactory headless runner implementation for the Harbor adapter.
 
-It does not include a real model-backed Terminal-Bench score yet. The local environment has no explicit benchmark model credentials configured, so the runnable Harbor path currently falls back to no-model mode unless `CODEFACTORY_BENCH_*` variables are supplied.
+The first real provider-backed launch now exists in `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`. That launch reached the configured DeepSeek endpoint through the CodeFactory provider bridge, but the endpoint returned `HTTP 402 Insufficient Balance`; therefore it is a provider-availability result, not a meaningful task-solving score.
 
 ## Adapter Contract
 
@@ -92,10 +92,10 @@ trial=terminal-bench/write-compressor reward=0 failure_class=Some("verification"
 
 ## Current Blocker For Real Model-Backed Score
 
-The following explicit benchmark env vars are currently missing locally:
+The explicit benchmark env vars can now be supplied through the CodeFactory provider bridge without printing raw keys. The current blocker is provider account state:
 
-- `CODEFACTORY_BENCH_API_KEY`
-- `CODEFACTORY_BENCH_MODEL`
-- `CODEFACTORY_BENCH_BASE_URL`
+- Endpoint: `deepseek`
+- Model: `deepseek-v4-pro`
+- Error: `HTTP 402 Insufficient Balance`
 
-Without them, a real Harbor run can verify adapter/container/import behavior, but cannot produce a model-backed CodeFactory capability score.
+Rerun after funding the endpoint or selecting another configured OpenAI-compatible endpoint.
