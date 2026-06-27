@@ -17,13 +17,13 @@
 | CF-TB-R1 | 瞄准 Terminal-Bench 2.1 评估能力 | 仓库内有 Terminal-Bench 2.1 业务、架构、UX 和规格文档，明确官方约束和产品目标 | docs | 文档审查 + governance baseline | planning |
 | CF-TB-R2 | 评估我们的能力 | CodeFactory 能保存 benchmark run、trial、reward、artifact 和 build 信息 | backend + sqlite + UI | fake Harbor job 导入测试 + UI summary |
 | CF-TB-R3 | 不能只看总分 | 系统生成 capability profile 和 failure taxonomy | backend + UI | fixture run 分类断言 |
-| CF-TB-R4 | 能被 Terminal-Bench 2.1 跑 | 提供 Harbor custom agent adapter 和显式 env 驱动的 model-backed headless runner | adapter + agent loop | Python adapter smoke + Harbor CodeFactory baseline run + fake model headless runner integration test + real model smoke |
+| CF-TB-R4 | 能被 Terminal-Bench 2.1 跑 | 提供 Harbor custom agent adapter、显式 env 驱动的 model-backed headless runner，以及从当前 CodeFactory provider 到 benchmark env 的显式授权桥接 | adapter + agent loop + backend command | Python adapter smoke + Harbor CodeFactory baseline run + fake model headless runner integration test + provider bridge unit test + real model smoke |
 | CF-TB-R5 | 改进后能回归 | 支持同一 subset 的 baseline/head run 对比 | backend + UI | compare run fixture test |
 | CF-TB-R6 | 保持可审计和安全 | benchmark policy 只在 Harbor sandbox 生效，不污染普通项目权限和长期 memory | permission + memory + audit | policy unit test + memory write guard |
 
 ## Primary User Path
 
-P-TB-1: 用户打开 CodeFactory 的 `Benchmarks / Terminal-Bench 2.1` 页面。系统检查 Harbor、Docker 和 CodeFactory agent adapter 状态。用户启动 smoke run，系统展示不可修改的官方 dataset `terminal-bench/terminal-bench-2-1`、agent/model、policy preset、artifact path 和命令 preview。run 完成后，CodeFactory 导入 Harbor job 目录，展示 reward、trial 列表、verifier 输出、trajectory 和 failure class。用户选择失败类别，创建后续产品改进 slice，并能用同一 subset 在修复后回归对比。
+P-TB-1: 用户打开 CodeFactory 的 `Benchmarks / Terminal-Bench 2.1` 页面。系统检查 Harbor、Docker 和 CodeFactory agent adapter 状态。用户启动 smoke run 前，系统基于当前 endpoint/model 生成 provider bridge preview，展示不可修改的官方 dataset `terminal-bench/terminal-bench-2-1`、agent/model、policy preset、artifact path、redacted env 和命令 preview。用户必须确认授权短语后，后端才从 OS credential store 读取当前 endpoint key，并只把它临时注入本次 Harbor child process env。run 完成后，CodeFactory 导入 Harbor job 目录，展示 reward、trial 列表、verifier 输出、trajectory 和 failure class。用户选择失败类别，创建后续产品改进 slice，并能用同一 subset 在修复后回归对比。
 
 ## 开发内嵌评估节奏
 
@@ -96,6 +96,16 @@ PR 描述必须包含：
 
 Model-backed 模式只能读取显式 `CODEFACTORY_BENCH_*` 配置，不读取 CodeFactory desktop settings、macOS keychain、通用 provider env 或用户凭据。
 
+### Provider Bridge
+
+产品侧允许用户把当前 CodeFactory endpoint/model 用于一次 benchmark run，但必须经过显式授权桥接：
+
+- `preview_benchmark_provider_bridge(request)` 只读取 settings 中的 endpoint/model/key_ref，返回 redacted env、command preview、job path 和授权短语；不得读取或返回 raw API key。
+- `start_benchmark_provider_run(request)` 只有在授权短语完全匹配时才读取 OS credential store，并把 key 作为 `CODEFACTORY_BENCH_API_KEY` 注入 Harbor child process env。
+- raw key 不写入 command preview、frontend state、SQLite run record、Harbor args、日志或 evidence pack。
+- 当前 bridge 只支持 OpenAI-compatible `chat/completions` endpoint；DeepSeek 这类 direct provider 需要用 `normalize_model_id` 去掉 OpenRouter vendor 前缀。
+- ChatGPT OAuth、Anthropic 原生 Messages API、需要浏览器会话或非 API key 的 provider 暂不支持 benchmark bridge。
+
 ### Run Summary
 
 每次 run 至少记录：
@@ -127,6 +137,8 @@ Model-backed 模式只能读取显式 `CODEFACTORY_BENCH_*` 配置，不读取 C
 | Adapter | custom agent adapter command 生成 | 使用 `terminal-bench/terminal-bench-2-1` 和 import path | command assertion |
 | Adapter | CodeFactory baseline adapter smoke | Harbor 能 import `codefactory_bench.agent:CodeFactoryAgent`，trial 无 exception，CodeFactory importer 读回 agent identity 和 reward | Harbor job + ignored real import test |
 | Adapter | Model-backed headless loop | fake OpenAI-compatible server 返回 `run_shell` tool call，adapter 执行 Harbor environment command 并写 trajectory | Python integration test |
+| Adapter | Provider bridge preview | 当前 DeepSeek endpoint/model 生成 redacted env 和 Harbor command preview，不暴露 raw key | Rust unit test |
+| Adapter | Provider bridge authorization | 授权短语不匹配时不得 lookup secret；匹配后只把 key 放入 child env | Rust unit test |
 | Policy | benchmark-sandbox policy in task container | workspace command/file edit 自动允许，host path/secret deny | policy unit test |
 | Policy | network/secret deny | fake model 请求 `curl` 或 credential path 时不调用 environment.exec | Python policy test |
 | Failure | 缺失 `result.json` | 标记 `partial_import`，列出缺失文件 | importer test |
@@ -153,5 +165,6 @@ Model-backed 模式只能读取显式 `CODEFACTORY_BENCH_*` 配置，不读取 C
 - 在至少一次真实 Harbor smoke run 成功导入前，不能声明 `evaluation path verified`。oracle smoke 只能证明 Harbor 环境和导入链路，不能证明 CodeFactory agent 能力。
 - `codefactory-headless-baseline` 成功运行后，可以声明 `CodeFactory-owned adapter path verified`，但在 model-backed headless runner 跑通前，不能声明 `CodeFactory agent capability evaluated`。
 - fake model 测试通过后，只能声明 `model-backed runner implementation verified locally`；在显式模型 env 下跑完真实 Terminal-Bench smoke 前，不能声明 `model-backed CodeFactory score available`。
+- provider bridge 测试通过后，只能声明 `current provider can be authorized for benchmark launch by backend contract`；在真实 Harbor run 完成并导入前，不能声明当前本机 DeepSeek 已产生 Terminal-Bench 分数。
 - 在 packaged app 或 release artifact 中验证前，不能声明 `live`。
 - 官方 leaderboard submission 需要单独 release/QA gate；本规格首期只覆盖本地可复现能力评估。

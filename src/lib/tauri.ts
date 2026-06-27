@@ -148,6 +148,45 @@ export interface BenchmarkEnvironmentProbe {
   command_preview: string;
 }
 
+export interface BenchmarkEnvVarPreview {
+  name: string;
+  value: string;
+  secret: boolean;
+}
+
+export interface BenchmarkProviderBridgeRequest {
+  profile_id: string;
+  endpoint_name?: string | null;
+  model?: string | null;
+  task_limit?: number | null;
+  trial_count?: number | null;
+  job_root?: string | null;
+  job_name?: string | null;
+  adapter_root?: string | null;
+}
+
+export interface BenchmarkProviderBridgePreview {
+  generated_at: string;
+  profile: BenchmarkProfile;
+  endpoint_name: string;
+  base_url: string;
+  api_style: string;
+  model: string;
+  key_ref: string;
+  agent_import_path: string;
+  task_limit: number;
+  trial_count: number;
+  job_root: string;
+  job_name: string;
+  job_path: string;
+  adapter_root: string;
+  env_preview: BenchmarkEnvVarPreview[];
+  command_preview: string;
+  authorization_phrase: string;
+  ready: boolean;
+  blockers: string[];
+}
+
 export interface BenchmarkRunRecord {
   id: string;
   benchmark_id: string;
@@ -190,12 +229,36 @@ export interface ImportedBenchmarkRun {
   trials: BenchmarkTrialRecord[];
 }
 
+export interface BenchmarkProviderRunResult {
+  preview: BenchmarkProviderBridgePreview;
+  status: string;
+  exit_code?: number | null;
+  stdout: string;
+  stderr: string;
+  imported?: ImportedBenchmarkRun | null;
+}
+
 export function listBenchmarkProfiles(): Promise<BenchmarkProfile[]> {
   return invoke<BenchmarkProfile[]>("list_benchmark_profiles");
 }
 
 export function probeBenchmarkEnvironment(profileId: string): Promise<BenchmarkEnvironmentProbe> {
   return invoke<BenchmarkEnvironmentProbe>("probe_benchmark_environment", { profileId });
+}
+
+export function previewBenchmarkProviderBridge(
+  request: BenchmarkProviderBridgeRequest,
+): Promise<BenchmarkProviderBridgePreview> {
+  return invoke<BenchmarkProviderBridgePreview>("preview_benchmark_provider_bridge", { request });
+}
+
+export function startBenchmarkProviderRun(
+  bridge: BenchmarkProviderBridgeRequest,
+  authorizationPhrase: string,
+): Promise<BenchmarkProviderRunResult> {
+  return invoke<BenchmarkProviderRunResult>("start_benchmark_provider_run", {
+    request: { bridge, authorization_phrase: authorizationPhrase },
+  });
 }
 
 export function importBenchmarkResults(jobPath: string): Promise<ImportedBenchmarkRun> {

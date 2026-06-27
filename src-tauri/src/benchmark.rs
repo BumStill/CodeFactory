@@ -4,11 +4,13 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
+use crate::config::settings::{normalize_model_id, ApiStyle, Settings};
 use crate::errors::{AppError, Result};
 use crate::util::no_window::NoWindow;
 
@@ -144,6 +146,87 @@ pub struct ImportedBenchmarkRun {
     pub trials: Vec<BenchmarkTrialRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BenchmarkEnvVarPreview {
+    pub name: String,
+    pub value: String,
+    pub secret: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BenchmarkProviderBridgeRequest {
+    pub profile_id: String,
+    pub endpoint_name: Option<String>,
+    pub model: Option<String>,
+    pub task_limit: Option<u32>,
+    pub trial_count: Option<u32>,
+    pub job_root: Option<String>,
+    pub job_name: Option<String>,
+    pub adapter_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BenchmarkProviderBridgePreview {
+    pub generated_at: String,
+    pub profile: BenchmarkProfile,
+    pub endpoint_name: String,
+    pub base_url: String,
+    pub api_style: String,
+    pub model: String,
+    pub key_ref: String,
+    pub agent_import_path: String,
+    pub task_limit: u32,
+    pub trial_count: u32,
+    pub job_root: String,
+    pub job_name: String,
+    pub job_path: String,
+    pub adapter_root: String,
+    pub env_preview: Vec<BenchmarkEnvVarPreview>,
+    pub command_preview: String,
+    pub authorization_phrase: String,
+    pub ready: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartBenchmarkProviderRunRequest {
+    pub bridge: BenchmarkProviderBridgeRequest,
+    pub authorization_phrase: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkProviderRunResult {
+    pub preview: BenchmarkProviderBridgePreview,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub imported: Option<ImportedBenchmarkRun>,
+}
+
+#[derive(Debug, Clone)]
+struct AuthorizedBenchmarkProviderLaunch {
+    preview: BenchmarkProviderBridgePreview,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+impl AuthorizedBenchmarkProviderLaunch {
+    #[cfg(test)]
+    fn env_value(&self, name: &str) -> Option<&str> {
+        self.env
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+struct BenchmarkProviderCommandOutput {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
 pub fn terminal_bench_21_profile() -> BenchmarkProfile {
     BenchmarkProfile {
         id: TERMINAL_BENCH_21_PROFILE_ID.to_string(),
@@ -163,6 +246,228 @@ pub fn terminal_bench_21_profile() -> BenchmarkProfile {
 
 pub fn list_profiles() -> Vec<BenchmarkProfile> {
     vec![terminal_bench_21_profile()]
+}
+
+pub fn preview_provider_bridge(
+    settings: &Settings,
+    request: &BenchmarkProviderBridgeRequest,
+) -> Result<BenchmarkProviderBridgePreview> {
+    let profile = profile_by_id(&request.profile_id)?;
+    let endpoint_name = request
+        .endpoint_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&settings.default_endpoint)
+        .to_string();
+    let endpoint = settings
+        .endpoints
+        .get(&endpoint_name)
+        .ok_or_else(|| AppError::Other(format!("Unknown endpoint: {endpoint_name}")))?;
+    let base_url = endpoint.base_url.trim_end_matches('/').to_string();
+    let requested_model = request
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| settings.active_model_for(&endpoint_name));
+    let model = normalize_model_id(requested_model.trim(), &base_url);
+    let key_ref = endpoint
+        .key_ref
+        .clone()
+        .unwrap_or_else(|| format!("codefactory.endpoint.{endpoint_name}"));
+    let task_limit = request
+        .task_limit
+        .unwrap_or(profile.default_smoke_task_limit)
+        .max(1);
+    let trial_count = request.trial_count.unwrap_or(1).max(1);
+    let job_root = request
+        .job_root
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_benchmark_job_root().to_string_lossy().to_string());
+    let job_name = request
+        .job_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map(sanitize_job_name)
+        .unwrap_or_else(default_benchmark_job_name);
+    let job_path = Path::new(&job_root)
+        .join(&job_name)
+        .to_string_lossy()
+        .to_string();
+    let adapter_root = request
+        .adapter_root
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .to_string_lossy()
+                .to_string()
+        });
+    let mut blockers = Vec::new();
+    if !matches!(endpoint.api_style, ApiStyle::Openai) {
+        blockers.push(format!(
+            "Benchmark provider bridge currently supports OpenAI-compatible chat/completions endpoints only; endpoint '{endpoint_name}' uses {}",
+            api_style_label(&endpoint.api_style)
+        ));
+    }
+    if model.trim().is_empty() {
+        blockers.push(format!(
+            "Endpoint '{endpoint_name}' has no active model for Terminal-Bench"
+        ));
+    }
+
+    let env_preview = vec![
+        BenchmarkEnvVarPreview {
+            name: "CODEFACTORY_BENCH_API_KEY".to_string(),
+            value: format!("<redacted:{key_ref}>"),
+            secret: true,
+        },
+        BenchmarkEnvVarPreview {
+            name: "CODEFACTORY_BENCH_BASE_URL".to_string(),
+            value: base_url.clone(),
+            secret: false,
+        },
+        BenchmarkEnvVarPreview {
+            name: "CODEFACTORY_BENCH_MODEL".to_string(),
+            value: model.clone(),
+            secret: false,
+        },
+        BenchmarkEnvVarPreview {
+            name: "CODEFACTORY_BENCH_REQUIRE_MODEL".to_string(),
+            value: "1".to_string(),
+            secret: false,
+        },
+    ];
+    let args = harbor_run_args(
+        &profile,
+        &model,
+        task_limit,
+        trial_count,
+        &job_root,
+        &job_name,
+    );
+    let authorization_phrase = format!(
+        "Run {} with endpoint {} model {}",
+        profile.id, endpoint_name, model
+    );
+    let command_preview = command_preview(&env_preview, &args);
+
+    Ok(BenchmarkProviderBridgePreview {
+        generated_at: Utc::now().to_rfc3339(),
+        profile,
+        endpoint_name,
+        base_url,
+        api_style: api_style_label(&endpoint.api_style).to_string(),
+        model,
+        key_ref,
+        agent_import_path: CODEFACTORY_HARBOR_AGENT.to_string(),
+        task_limit,
+        trial_count,
+        job_root,
+        job_name,
+        job_path,
+        adapter_root,
+        env_preview,
+        command_preview,
+        authorization_phrase,
+        ready: blockers.is_empty(),
+        blockers,
+    })
+}
+
+pub async fn start_provider_benchmark_run(
+    pool: &SqlitePool,
+    settings: &Settings,
+    request: StartBenchmarkProviderRunRequest,
+) -> Result<BenchmarkProviderRunResult> {
+    let launch = resolve_authorized_provider_launch(settings, &request, crate::secrets::get_key)?;
+    let preview = launch.preview.clone();
+    let job_path = preview.job_path.clone();
+    let output = tokio::task::spawn_blocking(move || execute_provider_launch(launch))
+        .await
+        .map_err(|err| AppError::Other(format!("Benchmark Harbor worker failed: {err}")))??;
+    let imported = if output.exit_code == Some(0) && Path::new(&job_path).is_dir() {
+        Some(import_harbor_job(pool, Path::new(&job_path)).await?)
+    } else {
+        None
+    };
+    let status = if output.exit_code == Some(0) {
+        "completed"
+    } else {
+        "failed"
+    }
+    .to_string();
+
+    Ok(BenchmarkProviderRunResult {
+        preview,
+        status,
+        exit_code: output.exit_code,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        imported,
+    })
+}
+
+fn resolve_authorized_provider_launch<F>(
+    settings: &Settings,
+    request: &StartBenchmarkProviderRunRequest,
+    mut secret_lookup: F,
+) -> Result<AuthorizedBenchmarkProviderLaunch>
+where
+    F: FnMut(&str) -> Result<Option<String>>,
+{
+    let preview = preview_provider_bridge(settings, &request.bridge)?;
+    if !preview.ready {
+        return Err(AppError::Other(format!(
+            "Benchmark provider bridge is not ready: {}",
+            preview.blockers.join("; ")
+        )));
+    }
+    if request.authorization_phrase.trim() != preview.authorization_phrase {
+        return Err(AppError::Other(
+            "Benchmark provider authorization phrase did not match".to_string(),
+        ));
+    }
+    let api_key = secret_lookup(&preview.key_ref)?.ok_or_else(|| {
+        AppError::Other(format!(
+            "API key not found for benchmark provider key_ref '{}'",
+            preview.key_ref
+        ))
+    })?;
+    if api_key.trim().is_empty() {
+        return Err(AppError::Other(format!(
+            "API key is empty for benchmark provider key_ref '{}'",
+            preview.key_ref
+        )));
+    }
+
+    Ok(AuthorizedBenchmarkProviderLaunch {
+        args: harbor_run_args(
+            &preview.profile,
+            &preview.model,
+            preview.task_limit,
+            preview.trial_count,
+            &preview.job_root,
+            &preview.job_name,
+        ),
+        env: vec![
+            ("CODEFACTORY_BENCH_API_KEY".to_string(), api_key),
+            (
+                "CODEFACTORY_BENCH_BASE_URL".to_string(),
+                preview.base_url.clone(),
+            ),
+            ("CODEFACTORY_BENCH_MODEL".to_string(), preview.model.clone()),
+            (
+                "CODEFACTORY_BENCH_REQUIRE_MODEL".to_string(),
+                "1".to_string(),
+            ),
+        ],
+        preview,
+    })
 }
 
 fn profile_by_id(profile_id: &str) -> Result<BenchmarkProfile> {
@@ -257,6 +562,150 @@ fn probe_command(binary: &str, args: &[&str]) -> ProbeCommandResult {
         ),
         Err(_) => ProbeCommandResult::missing(binary),
     }
+}
+
+fn execute_provider_launch(
+    launch: AuthorizedBenchmarkProviderLaunch,
+) -> Result<BenchmarkProviderCommandOutput> {
+    fs::create_dir_all(&launch.preview.job_root)?;
+    let adapter_root = PathBuf::from(&launch.preview.adapter_root);
+    if !adapter_root.is_dir() {
+        return Err(AppError::Other(format!(
+            "Benchmark adapter root is not a directory: {}",
+            adapter_root.display()
+        )));
+    }
+
+    let mut command = Command::new("harbor").no_window();
+    command.args(&launch.args).current_dir(&adapter_root);
+    for (key, value) in &launch.env {
+        command.env(key, value);
+    }
+    command.env("PYTHONPATH", pythonpath_with_adapter_root(&adapter_root)?);
+
+    let output = command.output()?;
+    Ok(BenchmarkProviderCommandOutput {
+        exit_code: output.status.code(),
+        stdout: tail_text(&String::from_utf8_lossy(&output.stdout), 12000),
+        stderr: tail_text(&String::from_utf8_lossy(&output.stderr), 12000),
+    })
+}
+
+fn pythonpath_with_adapter_root(adapter_root: &Path) -> Result<OsString> {
+    let mut paths = vec![adapter_root.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PYTHONPATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths)
+        .map_err(|err| AppError::Other(format!("Could not build PYTHONPATH: {err}")))
+}
+
+fn harbor_run_args(
+    profile: &BenchmarkProfile,
+    model: &str,
+    task_limit: u32,
+    trial_count: u32,
+    job_root: &str,
+    job_name: &str,
+) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "-d".to_string(),
+        profile.dataset.clone(),
+        "--agent-import-path".to_string(),
+        CODEFACTORY_HARBOR_AGENT.to_string(),
+        "-m".to_string(),
+        model.to_string(),
+        "-l".to_string(),
+        task_limit.to_string(),
+        "-n".to_string(),
+        trial_count.to_string(),
+        "-o".to_string(),
+        job_root.to_string(),
+        "--job-name".to_string(),
+        job_name.to_string(),
+        "-y".to_string(),
+    ]
+}
+
+fn command_preview(env_preview: &[BenchmarkEnvVarPreview], args: &[String]) -> String {
+    let env = env_preview
+        .iter()
+        .map(|item| format!("{}={}", item.name, shell_quote(&item.value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let command = std::iter::once("harbor".to_string())
+        .chain(args.iter().cloned())
+        .map(|part| shell_quote(&part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{env} {command}")
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '='))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn sanitize_job_name(name: &str) -> String {
+    let sanitized = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if sanitized.is_empty() {
+        default_benchmark_job_name()
+    } else {
+        sanitized
+    }
+}
+
+fn default_benchmark_job_name() -> String {
+    format!(
+        "cf-tb21-codefactory-headless-{}",
+        Utc::now().format("%Y%m%d-%H%M%S")
+    )
+}
+
+fn default_benchmark_job_root() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("CodeFactory")
+        .join("benchmark-jobs")
+}
+
+fn api_style_label(style: &ApiStyle) -> &'static str {
+    match style {
+        ApiStyle::Openai => "openai",
+        ApiStyle::Anthropic => "anthropic",
+        ApiStyle::Chatgpt => "chatgpt",
+    }
+}
+
+fn tail_text(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    let tail = text
+        .chars()
+        .skip(total.saturating_sub(max_chars))
+        .collect::<String>();
+    format!("[truncated to last {max_chars} chars]\n{tail}")
 }
 
 fn truncate_probe_detail(result: &ProbeCommandResult) -> String {
@@ -1122,6 +1571,138 @@ mod tests {
         assert_eq!(imported.run.agent_version.as_deref(), Some("1.40.0"));
         assert_eq!(imported.trials.len(), 1);
         assert_eq!(imported.trials[0].reward, 0.0);
+    }
+
+    #[test]
+    fn provider_bridge_preview_uses_current_deepseek_without_exposing_secret() {
+        let settings = settings_with_deepseek_endpoint();
+        let preview = preview_provider_bridge(
+            &settings,
+            &BenchmarkProviderBridgeRequest {
+                profile_id: TERMINAL_BENCH_21_PROFILE_ID.to_string(),
+                endpoint_name: None,
+                model: None,
+                task_limit: Some(1),
+                trial_count: Some(1),
+                job_root: Some("/tmp/cf-bench".to_string()),
+                job_name: Some("deepseek-smoke".to_string()),
+                adapter_root: Some("/repo".to_string()),
+            },
+        )
+        .expect("preview");
+
+        assert_eq!(preview.endpoint_name, "deepseek");
+        assert_eq!(preview.base_url, "https://api.deepseek.com");
+        assert_eq!(preview.model, "deepseek-v4-flash");
+        assert_eq!(preview.key_ref, "codefactory.endpoint.deepseek");
+        assert!(preview.ready);
+        assert!(preview
+            .env_preview
+            .iter()
+            .any(|item| item.name == "CODEFACTORY_BENCH_API_KEY"
+                && item.secret
+                && item.value == "<redacted:codefactory.endpoint.deepseek>"));
+        assert!(!preview.command_preview.contains("test-secret"));
+        assert!(preview
+            .command_preview
+            .contains("CODEFACTORY_BENCH_API_KEY='<redacted:codefactory.endpoint.deepseek>'"));
+        assert!(preview.command_preview.contains("-m deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn provider_bridge_requires_authorization_before_secret_lookup() {
+        let settings = settings_with_deepseek_endpoint();
+        let request = StartBenchmarkProviderRunRequest {
+            bridge: BenchmarkProviderBridgeRequest {
+                profile_id: TERMINAL_BENCH_21_PROFILE_ID.to_string(),
+                endpoint_name: None,
+                model: None,
+                task_limit: Some(1),
+                trial_count: Some(1),
+                job_root: Some("/tmp/cf-bench".to_string()),
+                job_name: Some("deepseek-smoke".to_string()),
+                adapter_root: Some("/repo".to_string()),
+            },
+            authorization_phrase: "wrong".to_string(),
+        };
+        let err = resolve_authorized_provider_launch(&settings, &request, |_key_ref| {
+            panic!("secret lookup must not run before authorization is valid");
+        })
+        .expect_err("invalid authorization should fail");
+
+        assert!(err
+            .to_string()
+            .contains("Benchmark provider authorization phrase did not match"));
+    }
+
+    #[test]
+    fn provider_bridge_authorized_launch_injects_secret_only_into_child_env() {
+        let settings = settings_with_deepseek_endpoint();
+        let bridge = BenchmarkProviderBridgeRequest {
+            profile_id: TERMINAL_BENCH_21_PROFILE_ID.to_string(),
+            endpoint_name: None,
+            model: None,
+            task_limit: Some(1),
+            trial_count: Some(1),
+            job_root: Some("/tmp/cf-bench".to_string()),
+            job_name: Some("deepseek-smoke".to_string()),
+            adapter_root: Some("/repo".to_string()),
+        };
+        let preview = preview_provider_bridge(&settings, &bridge).expect("preview");
+        let launch = resolve_authorized_provider_launch(
+            &settings,
+            &StartBenchmarkProviderRunRequest {
+                bridge,
+                authorization_phrase: preview.authorization_phrase.clone(),
+            },
+            |key_ref| {
+                assert_eq!(key_ref, "codefactory.endpoint.deepseek");
+                Ok(Some("test-secret".to_string()))
+            },
+        )
+        .expect("authorized launch");
+
+        assert_eq!(
+            launch.env_value("CODEFACTORY_BENCH_API_KEY"),
+            Some("test-secret")
+        );
+        assert_eq!(
+            launch.env_value("CODEFACTORY_BENCH_BASE_URL"),
+            Some("https://api.deepseek.com")
+        );
+        assert_eq!(
+            launch.env_value("CODEFACTORY_BENCH_MODEL"),
+            Some("deepseek-v4-flash")
+        );
+        assert!(!launch.preview.command_preview.contains("test-secret"));
+        assert!(!launch
+            .preview
+            .env_preview
+            .iter()
+            .any(|item| item.value.contains("test-secret")));
+    }
+
+    fn settings_with_deepseek_endpoint() -> crate::config::settings::Settings {
+        use std::collections::HashMap;
+
+        let mut endpoints = HashMap::new();
+        endpoints.insert(
+            "deepseek".to_string(),
+            crate::config::settings::Endpoint {
+                base_url: "https://api.deepseek.com".to_string(),
+                key_ref: Some("codefactory.endpoint.deepseek".to_string()),
+                api_style: crate::config::settings::ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek/deepseek-v4-flash".to_string()),
+            },
+        );
+
+        crate::config::settings::Settings {
+            endpoints,
+            default_endpoint: "deepseek".to_string(),
+            default_model: "deepseek/deepseek-v4-flash".to_string(),
+            ..crate::config::settings::Settings::default()
+        }
     }
 
     #[tokio::test]

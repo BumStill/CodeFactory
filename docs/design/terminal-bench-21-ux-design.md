@@ -66,6 +66,9 @@ Benchmarks
 
 用户点击 `Run Smoke`：
 
+- 系统先显示 provider bridge preview：endpoint、base URL、model、key_ref、redacted env、job path 和 Harbor command preview。
+- 用户必须确认授权短语，明确允许“仅本次 Terminal-Bench run 使用当前 provider key”。
+- 未确认时 run 按钮不可执行；确认后 raw key 只进入后端启动的 Harbor child process env，不显示在页面、日志或 evidence pack。
 - 默认 `-l 5`，用于确认 Harbor、Docker、agent adapter 可跑。`-k` 保留为 attempts，不用于限制 task 数量。
 - run 前显示 command preview、policy preset、agent/model、artifact path。
 - run 中显示 stdout/stderr 摘要和 trial 进度。
@@ -96,6 +99,9 @@ Benchmarks
 | Docker stopped | 显示 Docker blocker，保留 import job 功能 |
 | Dataset unavailable | 显示 registry/dataset blocker，允许导入已有 job |
 | No agent adapter | 显示 adapter blocker，提供设计文档链接 |
+| Provider authorization required | 显示 redacted env 和授权短语，不读取 key，不显示 run 中状态 |
+| Provider unsupported | ChatGPT OAuth、Anthropic 原生或非 OpenAI-compatible endpoint 显示 blocker |
+| Provider key missing | 授权后后端发现 key_ref 无 key，显示设置入口，不回显 key_ref 以外的 secret |
 | Running | 禁用 mutating controls，显示 cancel/stop 但解释可能只停止本地 orchestrator |
 | Partial import | 展示已导入字段和缺失 artifacts |
 | Failed verifier | 显示 verifier stdout/stderr，不把失败等同于系统崩溃 |

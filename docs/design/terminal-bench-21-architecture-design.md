@@ -38,6 +38,13 @@ CodeFactory UI / CLI
 
 当前 adapter 是 `codefactory_bench.agent:CodeFactoryAgent`。历史第一步跑通的是 no-model baseline；当前实现已增加 model-backed headless loop：仅从显式 `CODEFACTORY_BENCH_*` 读取模型配置，通过 OpenAI-compatible chat-completions 生成 `run_shell` tool call，经 `benchmark-sandbox` command gate 后用 Harbor `BaseEnvironment.exec` 在 task container 内执行，并写出 trajectory。
 
+产品侧新增 provider bridge，解决“本地 CodeFactory 已配置 DeepSeek，但 benchmark adapter 不能隐式读取桌面设置”的边界：
+
+- `preview_benchmark_provider_bridge` 从 settings 解析当前 endpoint、active model、key_ref、job path 和 Harbor 命令，返回 redacted env 与授权短语。
+- `start_benchmark_provider_run` 只有在授权短语完全匹配后才读取 OS credential store，把 key 临时注入本次 Harbor child process 的 `CODEFACTORY_BENCH_API_KEY`。
+- raw key 不返回前端、不进入 command preview、不进 Harbor args、不写 SQLite run record。
+- direct provider 会复用 `normalize_model_id`，例如 DeepSeek direct API 下把 `deepseek/deepseek-v4-flash` 规范化为 `deepseek-v4-flash`。
+
 优点：
 
 - 不需要把完整桌面 app 安装到每个 task container。
@@ -46,7 +53,7 @@ CodeFactory UI / CLI
 
 限制：
 
-- 真实 model-backed 分数需要显式 benchmark model env；不能隐式读取用户桌面设置、keychain 或通用 provider env。
+- adapter 仍只接受显式 `CODEFACTORY_BENCH_*` env；读取当前 CodeFactory provider 只能发生在产品后端的显式授权 bridge 中。
 - 需要把 adapter-local `benchmark-sandbox` command gate 后续沉淀为共享 policy preset，避免把 benchmark run 的自动授权带回普通用户项目。
 
 ### v2: Installed Agent Adapter
@@ -123,6 +130,8 @@ struct BenchmarkTrial {
 | --- | --- |
 | `list_benchmark_profiles()` | 返回支持的 benchmark profile，首期包含 Terminal-Bench 2.1 |
 | `probe_benchmark_environment(profile_id)` | 检查 Harbor、Docker、provider、磁盘和网络 |
+| `preview_benchmark_provider_bridge(request)` | 基于当前或指定 endpoint/model 生成 redacted env、授权短语和 Harbor command preview，不读取 raw key |
+| `start_benchmark_provider_run(request)` | 授权短语匹配后临时注入 provider key，启动 Harbor run，完成后导入 job |
 | `create_benchmark_run(profile_id, run_config)` | 创建 run record 和 job config |
 | `start_benchmark_run(run_id)` | 启动 Harbor run，流式记录输出 |
 | `import_benchmark_results(job_path)` | 导入已有 Harbor job |
