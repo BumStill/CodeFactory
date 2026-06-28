@@ -162,6 +162,8 @@ Model-backed 模式只能读取显式 `CODEFACTORY_BENCH_*` 配置，不读取 C
 | Adapter | custom agent adapter command 生成 | 使用 `terminal-bench/terminal-bench-2-1` 和 import path | command assertion |
 | Adapter | CodeFactory baseline adapter smoke | Harbor 能 import `codefactory_bench.agent:CodeFactoryAgent`，trial 无 exception，CodeFactory importer 读回 agent identity 和 reward | Harbor job + ignored real import test |
 | Adapter | Model-backed headless loop | fake OpenAI-compatible server 返回 `run_shell` tool call，adapter 执行 Harbor environment command 并写 trajectory | Python integration test |
+| Adapter | Artifact enforcement loop | 初始 inspection 后，重复读文件、复合只读命令和无关实现命令会被压回 artifact 生成；有目标产物前空回复会恢复为 tool-call 要求 | Python loop tests + real provider smoke trajectory |
+| Adapter | Provider tool-choice compatibility | provider 拒绝 forced `tool_choice` 时自动降级为 `auto` 重试，不把兼容性错误误记为 agent 能力结果 | Python provider fallback test |
 | Adapter | Provider bridge preview | 当前 DeepSeek endpoint/model 生成 redacted env 和 Harbor command preview，不暴露 raw key | Rust unit test |
 | Adapter | Provider bridge authorization | 授权短语不匹配时不得 lookup secret；匹配后只把 key 放入 child env | Rust unit test |
 | Attribution | Evaluation axis contract | run/PR/evidence 区分 CodeFactory agent 能力、模型后端影响、agent scaffold 对比和评测基础设施 smoke | spec review + fixture test |

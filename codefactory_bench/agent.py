@@ -144,6 +144,8 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         max_steps = self._int_env("CODEFACTORY_BENCH_MAX_STEPS", 20)
         shell_timeout = self._int_env("CODEFACTORY_BENCH_SHELL_TIMEOUT_SEC", 120)
         wall_timeout = self._int_env("CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC", 780)
+        model_timeout_retries = self._int_env("CODEFACTORY_BENCH_MODEL_TIMEOUT_RETRIES", 1)
+        no_action_retries = self._int_env("CODEFACTORY_BENCH_NO_ACTION_RETRIES", 4)
         deadline = time.monotonic() + max(30, wall_timeout)
         trajectory: list[dict[str, Any]] = []
         artifact_hint = self._artifact_hint_from_instruction(instruction)
@@ -187,7 +189,13 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
 
         final_text = ""
         total_tool_calls = 0
+        no_action_recoveries = 0
         command_counts: dict[str, int] = {}
+        loop_state: dict[str, Any] = {
+            "implementation_started": False,
+            "artifact_started": False,
+            "implementation_required_count": 0,
+        }
         for step in range(max_steps):
             if deadline - time.monotonic() <= 15:
                 final_text = final_text or "Stopped before the benchmark agent timeout."
@@ -217,22 +225,53 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     }
                 )
                 self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
-            try:
-                assistant_message = self._chat_completion(
-                    self._chat_messages_for_model(messages, trajectory),
-                    model,
-                    self._bounded_model_timeout(deadline - time.monotonic() - 10),
-                )
-            except TimeoutError as exc:
-                final_text = final_text or "Stopped after the model request timed out."
-                trajectory.append(
-                    {
-                        "step": step,
-                        "role": "model-error",
-                        "content": f"model request timed out: {exc}",
-                    }
-                )
-                self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
+            assistant_message: dict[str, Any] | None = None
+            for request_attempt in range(model_timeout_retries + 1):
+                try:
+                    assistant_message = self._chat_completion(
+                        self._chat_messages_for_model(messages, trajectory),
+                        model,
+                        self._bounded_model_timeout(deadline - time.monotonic() - 10),
+                        force_tool=bool(artifact_hint)
+                        and not self._candidate_artifact_started(
+                            loop_state, artifact_hint
+                        ),
+                    )
+                    break
+                except TimeoutError as exc:
+                    trajectory.append(
+                        {
+                            "step": step,
+                            "role": "model-error",
+                            "content": f"model request timed out: {exc}",
+                        }
+                    )
+                    if (
+                        request_attempt < model_timeout_retries
+                        and deadline - time.monotonic() > 45
+                    ):
+                        retry_prompt = self._timeout_recovery_prompt(
+                            loop_state, artifact_hint
+                        )
+                        messages.append({"role": "user", "content": retry_prompt})
+                        trajectory.append(
+                            {
+                                "step": step,
+                                "role": "system-reminder",
+                                "content": retry_prompt,
+                            }
+                        )
+                        self._write_model_backed_logs(
+                            trajectory, final_text, model, instruction_hash
+                        )
+                        continue
+
+                    final_text = final_text or "Stopped after the model request timed out."
+                    self._write_model_backed_logs(
+                        trajectory, final_text, model, instruction_hash
+                    )
+                    break
+            if assistant_message is None:
                 break
             tool_calls = assistant_message.get("tool_calls") or []
             content = assistant_message.get("content") or ""
@@ -255,6 +294,25 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
 
             if not tool_calls:
+                if self._requires_no_action_recovery(
+                    loop_state, artifact_hint, no_action_recoveries, no_action_retries
+                ):
+                    no_action_recoveries += 1
+                    recovery_prompt = self._no_action_recovery_prompt(
+                        loop_state, artifact_hint
+                    )
+                    messages.append({"role": "user", "content": recovery_prompt})
+                    trajectory.append(
+                        {
+                            "step": step,
+                            "role": "system-reminder",
+                            "content": recovery_prompt,
+                        }
+                    )
+                    self._write_model_backed_logs(
+                        trajectory, final_text, model, instruction_hash
+                    )
+                    continue
                 break
 
             for tool_call in tool_calls:
@@ -282,6 +340,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     environment,
                     min(shell_timeout, max(5, int(remaining_sec) - 5)),
                     command_counts,
+                    loop_state,
+                    step,
+                    artifact_hint,
                 )
                 messages.append(
                     {
@@ -359,7 +420,14 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             if role != "user":
                 continue
             if kept_user_messages < 2 or content.startswith(
-                ("Inspection phase", "Repair focus:", "Verification hint:", "You have ")
+                (
+                    "Inspection phase",
+                    "No-action recovery:",
+                    "Repair focus:",
+                    "Timeout recovery:",
+                    "Verification hint:",
+                    "You have ",
+                )
             ):
                 compacted.append({"role": "user", "content": content})
                 kept_user_messages += 1
@@ -375,8 +443,8 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
 
         lines = [
             "Execution summary from previous tool calls. Continue from the latest "
-            "failure; inspect files again if needed instead of relying on omitted "
-            "large command bodies."
+            "failure. Do not repeat commands that were suppressed; when artifact "
+            "generation is required, produce the artifact before further inspection."
         ]
         for item in trajectory[-8:]:
             role = item.get("role")
@@ -404,6 +472,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         environment: BaseEnvironment,
         timeout_sec: int,
         command_counts: dict[str, int],
+        loop_state: dict[str, Any],
+        step: int,
+        artifact_hint: str | None,
     ) -> dict[str, Any]:
         call_id = tool_call.get("id", "unknown")
         function = tool_call.get("function") or {}
@@ -454,6 +525,61 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 },
             }
 
+        if self._requires_artifact_command(command, loop_state, artifact_hint):
+            loop_state["implementation_required_count"] = (
+                int(loop_state.get("implementation_required_count") or 0) + 1
+            )
+            artifact = f" `{artifact_hint}`" if artifact_hint else " the expected artifact"
+            content = (
+                "ARTIFACT COMMAND REQUIRED: prior inspection commands were blocked and "
+                f"{artifact} still has not been produced. The next accepted command must "
+                f"directly create, write, copy, move, or run a generator that produces{artifact}."
+            )
+            return {
+                "content": content,
+                "trajectory": {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "tool": name,
+                    "command": command,
+                    "policy": {
+                        "action": "suppress",
+                        "reason": "artifact command required",
+                    },
+                    "status": "artifact-required",
+                    "content": content,
+                },
+            }
+
+        if self._requires_implementation_before_inspection(
+            command, loop_state, step, artifact_hint
+        ):
+            loop_state["implementation_required_count"] = (
+                int(loop_state.get("implementation_required_count") or 0) + 1
+            )
+            artifact = f" `{artifact_hint}`" if artifact_hint else " the expected artifact"
+            content = (
+                "IMPLEMENTATION REQUIRED: the inspection budget is exhausted and no "
+                "candidate artifact has been produced yet. Do not inspect more files now. "
+                f"Create or compile a generator, write{artifact}, or run a command "
+                "that produces a candidate artifact before requesting more inspection."
+            )
+            return {
+                "content": content,
+                "trajectory": {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "tool": name,
+                    "command": command,
+                    "policy": {
+                        "action": "suppress",
+                        "reason": "implementation required before more inspection",
+                    },
+                    "status": "implementation-required",
+                    "content": content,
+                },
+            }
+
         command_key = self._repeat_command_key(command)
         command_counts[command_key] = command_counts.get(command_key, 0) + 1
         repeat_limit = self._int_env("CODEFACTORY_BENCH_REPEAT_COMMAND_LIMIT", 2)
@@ -491,6 +617,11 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             },
             timeout_sec=timeout_sec,
         )
+        if self._is_implementation_attempt(command):
+            loop_state["implementation_started"] = True
+        if self._is_artifact_attempt(command, artifact_hint):
+            loop_state["artifact_started"] = True
+            loop_state["implementation_required_count"] = 0
         content = self._format_exec_result(
             result.return_code,
             result.stdout,
@@ -518,6 +649,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         messages: list[dict[str, Any]],
         model: str,
         timeout_sec: int | None = None,
+        force_tool: bool = False,
     ) -> dict[str, Any]:
         api_key = self._bench_env("CODEFACTORY_BENCH_API_KEY")
         if not api_key:
@@ -530,6 +662,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             "model": model,
             "messages": messages,
             "temperature": 0,
+            "max_tokens": self._int_env("CODEFACTORY_BENCH_MAX_OUTPUT_TOKENS", 4096),
             "tools": [
                 {
                     "type": "function",
@@ -550,23 +683,46 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     },
                 }
             ],
-            "tool_choice": "auto",
+            "tool_choice": (
+                {"type": "function", "function": {"name": "run_shell"}}
+                if force_tool
+                else "auto"
+            ),
         }
-        req = request.Request(
-            f"{base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
+        def send_request() -> dict[str, Any]:
+            req = request.Request(
+                f"{base_url}/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
             with request.urlopen(req, timeout=timeout_sec) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                return json.loads(response.read().decode("utf-8"))
+
+        try:
+            data = send_request()
         except error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"model request failed: HTTP {exc.code}: {body[:1000]}") from exc
+            if (
+                force_tool
+                and exc.code == 400
+                and "tool_choice" in body.lower()
+            ):
+                payload["tool_choice"] = "auto"
+                try:
+                    data = send_request()
+                except error.HTTPError as retry_exc:
+                    retry_body = retry_exc.read().decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"model request failed: HTTP {retry_exc.code}: {retry_body[:1000]}"
+                    ) from retry_exc
+            else:
+                raise RuntimeError(
+                    f"model request failed: HTTP {exc.code}: {body[:1000]}"
+                ) from exc
         except (TimeoutError, http_client.IncompleteRead, http_client.RemoteDisconnected) as exc:
             raise TimeoutError(f"model request did not complete: {exc}") from exc
 
@@ -671,6 +827,56 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         )
 
     @staticmethod
+    def _timeout_recovery_prompt(
+        loop_state: dict[str, Any], artifact_hint: str | None
+    ) -> str:
+        artifact = f" `{artifact_hint}`" if artifact_hint else " the expected artifact"
+        if not CodeFactoryAgent._candidate_artifact_started(loop_state, artifact_hint):
+            return (
+                "Timeout recovery: the previous model response did not complete. "
+                "Return exactly one `run_shell` tool call and no prose. That command "
+                "must create or compile a candidate generator, write"
+                f"{artifact}, or otherwise produce a candidate artifact now."
+            )
+
+        return (
+            "Timeout recovery: the previous model response did not complete. Return "
+            "exactly one `run_shell` tool call and no prose. That command must run the "
+            "quickest verification or repair step for the current candidate artifact."
+        )
+
+    @staticmethod
+    def _requires_no_action_recovery(
+        loop_state: dict[str, Any],
+        artifact_hint: str | None,
+        recoveries: int,
+        max_recoveries: int,
+    ) -> bool:
+        return (
+            recoveries < max_recoveries
+            and bool(artifact_hint)
+            and not loop_state.get("artifact_started", False)
+        )
+
+    @staticmethod
+    def _no_action_recovery_prompt(
+        loop_state: dict[str, Any], artifact_hint: str | None
+    ) -> str:
+        artifact = f" `{artifact_hint}`" if artifact_hint else " the expected artifact"
+        if not CodeFactoryAgent._candidate_artifact_started(loop_state, artifact_hint):
+            return (
+                "No-action recovery: the previous assistant response had no tool call, "
+                "but the required artifact has not been produced. Return exactly one "
+                "`run_shell` tool call and no prose. That command must create or compile "
+                f"a generator, write{artifact}, or otherwise produce a candidate artifact now."
+            )
+
+        return (
+            "No-action recovery: the previous assistant response had no tool call. Return "
+            "exactly one `run_shell` tool call that verifies or repairs the current candidate."
+        )
+
+    @staticmethod
     def _remaining_budget_reminder(
         step: int, max_steps: int, artifact_hint: str | None
     ) -> str | None:
@@ -698,6 +904,13 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         content = str(tool_result.get("content") or "")
         normalized = content.lower()
         artifact = f" `{artifact_hint}`" if artifact_hint else " the expected artifact"
+
+        if "implementation required" in normalized or "artifact command required" in normalized:
+            return (
+                "Repair focus: more inspection is currently blocked because the "
+                f"candidate artifact has not been produced. The next command must write"
+                f"{artifact} or run a generator that creates it; do not read task files again."
+            )
 
         if "segmentation fault" in normalized or "core dumped" in normalized:
             return (
@@ -732,6 +945,113 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
 
         return None
 
+    def _requires_implementation_before_inspection(
+        self,
+        command: str,
+        loop_state: dict[str, Any],
+        step: int,
+        artifact_hint: str | None,
+    ) -> bool:
+        inspection_rounds = self._int_env("CODEFACTORY_BENCH_INSPECTION_ROUNDS", 2)
+        return (
+            step >= inspection_rounds
+            and not self._candidate_artifact_started(loop_state, artifact_hint)
+            and self._is_inspection_only_command(command)
+        )
+
+    @staticmethod
+    def _candidate_artifact_started(
+        loop_state: dict[str, Any], artifact_hint: str | None
+    ) -> bool:
+        if artifact_hint:
+            return loop_state.get("artifact_started", False)
+        return loop_state.get("implementation_started", False)
+
+    def _requires_artifact_command(
+        self,
+        command: str,
+        loop_state: dict[str, Any],
+        artifact_hint: str | None,
+    ) -> bool:
+        threshold = self._int_env("CODEFACTORY_BENCH_ARTIFACT_COMMAND_AFTER_BLOCKS", 2)
+        return (
+            bool(artifact_hint)
+            and not loop_state.get("artifact_started", False)
+            and int(loop_state.get("implementation_required_count") or 0) >= threshold
+            and not self._is_artifact_attempt(command, artifact_hint)
+        )
+
+    @staticmethod
+    def _is_inspection_only_command(command: str) -> bool:
+        return CodeFactoryAgent._inspection_target_key(command) is not None
+
+    @staticmethod
+    def _is_implementation_attempt(command: str) -> bool:
+        command_text = CodeFactoryAgent._strip_heredoc_bodies(command).strip()
+        if not command_text or CodeFactoryAgent._is_inspection_only_command(command_text):
+            return False
+        if any(token in command_text for token in [">", ">>", "<<"]):
+            return True
+        try:
+            parts = shlex.split(command_text)
+        except ValueError:
+            parts = command_text.split()
+        if not parts:
+            return False
+        first = parts[0].split("/")[-1]
+        if first in {
+            "bash",
+            "cc",
+            "clang",
+            "cp",
+            "gcc",
+            "make",
+            "mv",
+            "node",
+            "perl",
+            "python",
+            "python3",
+            "rustc",
+            "sh",
+            "touch",
+        }:
+            return True
+        return first.startswith("./") or command_text.startswith("./")
+
+    @staticmethod
+    def _is_artifact_attempt(command: str, artifact_hint: str | None) -> bool:
+        if not artifact_hint:
+            return CodeFactoryAgent._is_implementation_attempt(command)
+        if CodeFactoryAgent._is_inspection_only_command(command):
+            return False
+
+        normalized = command.lower()
+        artifact = artifact_hint.lower()
+        if artifact not in normalized:
+            return False
+
+        if any(token in normalized for token in [">", ">>", "<<"]):
+            return True
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            parts = command.split()
+        if not parts:
+            return False
+        executable = parts[0].split("/")[-1]
+        return executable in {
+            "bash",
+            "cp",
+            "mv",
+            "node",
+            "perl",
+            "python",
+            "python3",
+            "sh",
+            "tee",
+            "touch",
+        }
+
     @staticmethod
     def _repeat_command_key(command: str) -> str:
         inspection_key = CodeFactoryAgent._inspection_target_key(command)
@@ -744,8 +1064,22 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         command_text = CodeFactoryAgent._strip_heredoc_bodies(command).strip()
         if not command_text:
             return None
-        if any(token in command_text for token in [">", ">>", "&&", ";", "$("]):
+        if any(token in command_text for token in [">", ">>", "$("]):
             return None
+
+        compound_parts = CodeFactoryAgent._compound_command_parts(command_text)
+        if len(compound_parts) > 1:
+            keys: list[str] = []
+            for part in compound_parts:
+                if CodeFactoryAgent._is_context_only_command(part):
+                    continue
+                key = CodeFactoryAgent._inspection_target_key(part)
+                if not key:
+                    return None
+                keys.append(key)
+            if not keys:
+                return None
+            return "compound-read:" + "|".join(keys)
 
         pipeline = [part.strip() for part in command_text.split("|")]
         first_key = CodeFactoryAgent._simple_inspection_target_key(pipeline[0])
@@ -761,6 +1095,48 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             if filter_parts[0].split("/")[-1] not in {"grep", "head", "od", "sed", "tail", "wc"}:
                 return None
         return first_key
+
+    @staticmethod
+    def _compound_command_parts(command_text: str) -> list[str]:
+        parts: list[str] = []
+        current: list[str] = []
+        quote: str | None = None
+        index = 0
+        while index < len(command_text):
+            char = command_text[index]
+            if quote:
+                current.append(char)
+                if char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                current.append(char)
+                index += 1
+                continue
+            if command_text.startswith("&&", index) or char == ";":
+                part = "".join(current).strip()
+                if part:
+                    parts.append(part)
+                current = []
+                index += 2 if command_text.startswith("&&", index) else 1
+                continue
+            current.append(char)
+            index += 1
+
+        part = "".join(current).strip()
+        if part:
+            parts.append(part)
+        return parts or [command_text.strip()]
+
+    @staticmethod
+    def _is_context_only_command(command_text: str) -> bool:
+        try:
+            parts = shlex.split(command_text)
+        except ValueError:
+            return False
+        return bool(parts) and parts[0] == "cd"
 
     @staticmethod
     def _simple_inspection_target_key(command_text: str) -> str | None:

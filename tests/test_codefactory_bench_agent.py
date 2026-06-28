@@ -45,8 +45,9 @@ def start_fake_chat_server(responses: list[dict[str, object]]):
             length = int(self.headers.get("content-length", "0"))
             requests.append(json.loads(self.rfile.read(length).decode("utf-8")))
             response = responses.pop(0)
+            status = int(response.pop("_status", 200))
             body = json.dumps(response).encode("utf-8")
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
             self.end_headers()
@@ -86,6 +87,17 @@ def assistant_tool_call(command: str) -> dict[str, object]:
 
 def assistant_final(content: str) -> dict[str, object]:
     return {"choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
+def provider_error(status: int, message: str) -> dict[str, object]:
+    return {
+        "_status": status,
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+        },
+    }
 
 
 class CodeFactoryBenchAgentTest(unittest.TestCase):
@@ -147,12 +159,15 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                             f"http://127.0.0.1:{server.server_port}/v1"
                         ),
                         "CODEFACTORY_BENCH_MODEL": "fake-model",
+                        "CODEFACTORY_BENCH_INSPECTION_ROUNDS": "99",
+                        "CODEFACTORY_BENCH_MAX_OUTPUT_TOKENS": "1234",
                     },
                 )
 
                 asyncio.run(agent.run("fake Terminal-Bench instruction", env, context))
 
                 self.assertEqual(len(requests), 2)
+                self.assertEqual(requests[0]["max_tokens"], 1234)
                 self.assertEqual(env.calls[0]["command"], "printf ok")
                 assert context.metadata is not None
                 self.assertEqual(context.metadata["mode"], "model-backed")
@@ -185,6 +200,7 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                             f"http://127.0.0.1:{server.server_port}/v1"
                         ),
                         "CODEFACTORY_BENCH_MODEL": "fake-model",
+                        "CODEFACTORY_BENCH_INSPECTION_ROUNDS": "99",
                     },
                 )
 
@@ -230,6 +246,7 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                             f"http://127.0.0.1:{server.server_port}/v1"
                         ),
                         "CODEFACTORY_BENCH_MODEL": "fake-model",
+                        "CODEFACTORY_BENCH_INSPECTION_ROUNDS": "99",
                     },
                 )
 
@@ -243,6 +260,236 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                 ]
                 self.assertEqual(len(suppressed_steps), 1)
                 self.assertIn("REPEATED COMMAND SUPPRESSED", suppressed_steps[0]["content"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_codefactory_agent_requires_implementation_after_inspection_budget(self) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                assistant_tool_call("cat /app/decomp.c"),
+                assistant_tool_call("wc -c /app/data.txt"),
+                assistant_tool_call("head -20 /app/decomp.c"),
+                assistant_final("done"),
+            ]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironment()
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                        "CODEFACTORY_BENCH_INSPECTION_ROUNDS": "2",
+                        "CODEFACTORY_BENCH_NO_ACTION_RETRIES": "0",
+                    },
+                )
+
+                asyncio.run(agent.run("write data.comp", env, context))
+
+                self.assertEqual(len(requests), 4)
+                self.assertEqual(len(env.calls), 2)
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                implementation_required = [
+                    step
+                    for step in trajectory["steps"]
+                    if step.get("status") == "implementation-required"
+                ]
+                self.assertEqual(len(implementation_required), 1)
+                self.assertIn("IMPLEMENTATION REQUIRED", implementation_required[0]["content"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_codefactory_agent_retries_model_timeout_with_implementation_prompt(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env = FakeEnvironment()
+            context = AgentContext()
+            agent = CodeFactoryAgent(
+                logs_dir=tmp_path,
+                model_name=None,
+                extra_env={
+                    "CODEFACTORY_BENCH_API_KEY": "test-key",
+                    "CODEFACTORY_BENCH_MODEL": "fake-model",
+                    "CODEFACTORY_BENCH_MODEL_TIMEOUT_RETRIES": "1",
+                },
+            )
+            calls: list[list[dict[str, object]]] = []
+
+            def fake_chat_completion(
+                messages: list[dict[str, object]],
+                model: str,
+                timeout_sec: int | None = None,
+                force_tool: bool = False,
+            ) -> dict[str, object]:
+                calls.append(messages)
+                if len(calls) == 1:
+                    raise TimeoutError("fake timeout")
+                if len(calls) == 2:
+                    return assistant_tool_call(
+                        "cat > /app/data.comp <<'EOF'\nplaceholder\nEOF"
+                    )["choices"][0]["message"]
+                return assistant_final("done")["choices"][0]["message"]
+
+            agent._chat_completion = fake_chat_completion  # type: ignore[method-assign]
+
+            asyncio.run(agent.run("write data.comp", env, context))
+
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(len(env.calls), 1)
+            self.assertIn("data.comp", env.calls[0]["command"])
+            trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+            self.assertTrue(any(step.get("role") == "model-error" for step in trajectory["steps"]))
+            self.assertTrue(
+                any(
+                    "Timeout recovery:" in step.get("content", "")
+                    for step in trajectory["steps"]
+                    if step.get("role") == "system-reminder"
+                )
+            )
+
+    def test_chat_completion_falls_back_when_provider_rejects_forced_tool_choice(
+        self,
+    ) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                provider_error(400, "Thinking mode does not support this tool_choice"),
+                assistant_tool_call("cat /app/decomp.c"),
+            ]
+        )
+        try:
+            agent = CodeFactoryAgent(
+                logs_dir=Path("/tmp"),
+                model_name=None,
+                extra_env={
+                    "CODEFACTORY_BENCH_API_KEY": "test-key",
+                    "CODEFACTORY_BENCH_BASE_URL": (
+                        f"http://127.0.0.1:{server.server_port}/v1"
+                    ),
+                },
+            )
+
+            message = agent._chat_completion(
+                [{"role": "user", "content": "write data.comp"}],
+                "fake-model",
+                timeout_sec=5,
+                force_tool=True,
+            )
+
+            self.assertEqual(message["tool_calls"][0]["function"]["name"], "run_shell")
+            self.assertEqual(
+                requests[0]["tool_choice"],
+                {"type": "function", "function": {"name": "run_shell"}},
+            )
+            self.assertEqual(requests[1]["tool_choice"], "auto")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_codefactory_agent_recovers_empty_response_before_artifact_exists(self) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                assistant_final(""),
+                assistant_tool_call("cat > /app/data.comp <<'EOF'\nplaceholder\nEOF"),
+                assistant_final("done"),
+            ]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironment()
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                        "CODEFACTORY_BENCH_NO_ACTION_RETRIES": "1",
+                    },
+                )
+
+                asyncio.run(agent.run("write data.comp", env, context))
+
+                self.assertEqual(len(requests), 3)
+                self.assertEqual(
+                    requests[0]["tool_choice"],
+                    {"type": "function", "function": {"name": "run_shell"}},
+                )
+                self.assertEqual(len(env.calls), 1)
+                self.assertIn("data.comp", env.calls[0]["command"])
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                self.assertTrue(
+                    any(
+                        "No-action recovery:" in step.get("content", "")
+                        for step in trajectory["steps"]
+                        if step.get("role") == "system-reminder"
+                    )
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_codefactory_agent_recovers_empty_response_after_auxiliary_compile(self) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                assistant_tool_call("cd /app && gcc -o decomp decomp.c 2>&1"),
+                assistant_final(""),
+                assistant_tool_call("cat > /app/data.comp <<'EOF'\nplaceholder\nEOF"),
+                assistant_final("done"),
+            ]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironment()
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                        "CODEFACTORY_BENCH_NO_ACTION_RETRIES": "1",
+                    },
+                )
+
+                asyncio.run(agent.run("write data.comp", env, context))
+
+                self.assertEqual(len(requests), 4)
+                self.assertEqual(len(env.calls), 2)
+                self.assertIn("gcc -o decomp", env.calls[0]["command"])
+                self.assertIn("data.comp", env.calls[1]["command"])
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                self.assertTrue(
+                    any(
+                        "No-action recovery:" in step.get("content", "")
+                        for step in trajectory["steps"]
+                        if step.get("role") == "system-reminder"
+                    )
+                )
         finally:
             server.shutdown()
             server.server_close()
@@ -372,6 +619,14 @@ gcc -o /app/enc /app/enc.c
                 "content": "Inspection phase should be over. Create `data.comp` now.",
             },
             {
+                "role": "user",
+                "content": "Timeout recovery: return one implementation tool call.",
+            },
+            {
+                "role": "user",
+                "content": "No-action recovery: return one implementation tool call.",
+            },
+            {
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
@@ -409,6 +664,8 @@ gcc -o /app/enc /app/enc.c
         self.assertIn("Segmentation fault", serialized)
         self.assertIn("Verification hint", serialized)
         self.assertIn("Inspection phase should be over", serialized)
+        self.assertIn("Timeout recovery", serialized)
+        self.assertIn("No-action recovery", serialized)
 
     def test_repair_hint_focuses_semantic_self_check_failures(self) -> None:
         hint = CodeFactoryAgent._repair_hint_from_tool_result(
@@ -430,11 +687,32 @@ gcc -o /app/enc /app/enc.c
         self.assertIn("missing tool", hint)
         self.assertIn("Do not retry", hint)
 
+    def test_repair_hint_escalates_implementation_required(self) -> None:
+        hint = CodeFactoryAgent._repair_hint_from_tool_result(
+            {"content": "IMPLEMENTATION REQUIRED: create the artifact now."},
+            "data.comp",
+        )
+
+        assert hint is not None
+        self.assertIn("Repair focus", hint)
+        self.assertIn("data.comp", hint)
+        self.assertIn("do not read task files again", hint)
+
     def test_repeat_suppression_only_targets_simple_inspection_commands(self) -> None:
         self.assertTrue(CodeFactoryAgent._is_repeat_suppression_candidate("cat /app/decomp.c"))
         self.assertFalse(CodeFactoryAgent._is_repeat_suppression_candidate("gcc -o enc enc.c"))
         self.assertTrue(
             CodeFactoryAgent._is_repeat_suppression_candidate("cat /app/decomp.c | head")
+        )
+        self.assertTrue(
+            CodeFactoryAgent._is_repeat_suppression_candidate(
+                "wc -c /app/data.txt && head -c 500 /app/data.txt"
+            )
+        )
+        self.assertFalse(
+            CodeFactoryAgent._is_repeat_suppression_candidate(
+                "cd /app && gcc -o decomp decomp.c 2>&1"
+            )
         )
 
     def test_repeat_suppression_groups_file_read_inspections(self) -> None:
@@ -449,6 +727,96 @@ gcc -o /app/enc /app/enc.c
         self.assertNotEqual(
             CodeFactoryAgent._repeat_command_key("cat /app/decomp.c"),
             CodeFactoryAgent._repeat_command_key("cat /app/data.txt"),
+        )
+
+    def test_implementation_gate_allows_generation_commands(self) -> None:
+        agent = CodeFactoryAgent(
+            logs_dir=Path("/tmp"),
+            extra_env={"CODEFACTORY_BENCH_INSPECTION_ROUNDS": "2"},
+        )
+
+        self.assertTrue(
+            agent._requires_implementation_before_inspection(
+                "head -20 /app/decomp.c",
+                {"implementation_started": False, "artifact_started": False},
+                step=2,
+                artifact_hint="data.comp",
+            )
+        )
+        self.assertFalse(
+            agent._requires_implementation_before_inspection(
+                "cat > /app/enc.c <<'EOF'\nint main(void){return 0;}\nEOF",
+                {"implementation_started": False, "artifact_started": False},
+                step=2,
+                artifact_hint="data.comp",
+            )
+        )
+        self.assertTrue(
+            agent._requires_implementation_before_inspection(
+                "wc -c /app/data.txt && head -c 500 /app/data.txt",
+                {"implementation_started": False, "artifact_started": False},
+                step=2,
+                artifact_hint="data.comp",
+            )
+        )
+        self.assertFalse(
+            agent._requires_implementation_before_inspection(
+                "cd /app && gcc -o decomp decomp.c 2>&1",
+                {"implementation_started": False, "artifact_started": False},
+                step=2,
+                artifact_hint="data.comp",
+            )
+        )
+        self.assertTrue(CodeFactoryAgent._is_implementation_attempt("gcc -o /app/enc /app/enc.c"))
+        self.assertFalse(
+            CodeFactoryAgent._is_artifact_attempt(
+                "gcc -o /app/decomp /app/decomp.c",
+                "data.comp",
+            )
+        )
+        self.assertTrue(
+            CodeFactoryAgent._is_artifact_attempt(
+                "cat > /app/data.comp <<'EOF'\nplaceholder\nEOF",
+                "data.comp",
+            )
+        )
+        self.assertTrue(
+            CodeFactoryAgent._is_artifact_attempt(
+                "python3 - <<'PY'\nopen('/app/data.comp','wb').write(b'x')\nPY",
+                "data.comp",
+            )
+        )
+
+    def test_artifact_command_gate_blocks_non_artifact_commands_after_repeated_blocks(
+        self,
+    ) -> None:
+        agent = CodeFactoryAgent(logs_dir=Path("/tmp"))
+        state = {
+            "implementation_started": False,
+            "artifact_started": False,
+            "implementation_required_count": 2,
+        }
+
+        self.assertTrue(
+            agent._requires_artifact_command(
+                "cat /app/decomp.c",
+                state,
+                "data.comp",
+            )
+        )
+        self.assertTrue(
+            agent._requires_artifact_command(
+                "cd /app && gcc -o decomp decomp.c 2>&1",
+                state,
+                "data.comp",
+            )
+        )
+        self.assertFalse(
+            agent._requires_artifact_command(
+                "python3 - <<'PY'\nopen('/app/data.comp','wb').write(b'x')\nPY",
+                state,
+                "data.comp",
+            )
         )
 
 

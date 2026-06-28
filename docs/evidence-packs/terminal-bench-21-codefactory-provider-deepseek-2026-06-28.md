@@ -28,9 +28,9 @@ Implemented and verified in the headless adapter:
 Local validation:
 
 ```text
-...................
+...........................
 ----------------------------------------------------------------------
-Ran 19 tests in 1.539s
+Ran 27 tests in 3.593s
 
 OK
 ```
@@ -149,12 +149,72 @@ test_decompression_produces_original: failed because /app/data.comp does not exi
 test_compression_size: failed because /app/data.comp does not exist
 ```
 
+## Artifact Enforcement Run
+
+Command:
+
+```bash
+CODEFACTORY_RUN_REAL_PROVIDER_BRIDGE=1 \
+CODEFACTORY_BENCH_ENDPOINT=deepseek \
+CODEFACTORY_BENCH_TASK_LIMIT=1 \
+CODEFACTORY_BENCH_TRIAL_COUNT=1 \
+CODEFACTORY_BENCH_MODEL_TIMEOUT_SEC=60 \
+CODEFACTORY_BENCH_MODEL_TIMEOUT_RETRIES=1 \
+CODEFACTORY_BENCH_NO_ACTION_RETRIES=4 \
+CODEFACTORY_BENCH_ARTIFACT_COMMAND_AFTER_BLOCKS=2 \
+CODEFACTORY_BENCH_SHELL_TIMEOUT_SEC=45 \
+CODEFACTORY_BENCH_MAX_STEPS=28 \
+CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC=720 \
+CODEFACTORY_BENCH_TOOL_OUTPUT_LIMIT=20000 \
+CODEFACTORY_BENCH_MAX_OUTPUT_TOKENS=4096 \
+cargo test benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_from_local_settings \
+  --lib -- --ignored --nocapture
+```
+
+Result:
+
+- Harbor job path: `/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260628-061554`
+- Run id: `4639ab7f-42d3-4a18-b371-718e7fc71507`
+- Task: `terminal-bench/write-compressor`
+- Agent: `codefactory-headless`
+- Model: `deepseek-v4-pro`
+- Mean reward: `0.000`
+- Harbor stats: `n_completed_trials=1`, `n_errored_trials=0`
+- Failure class after import: `verification`
+- End-to-end test runtime: `257.03s`
+- Evidence: repeated inspection was blocked by `implementation-required` and then `artifact-required`; the model created `/app/data.comp` and ran a self-check, which failed with `Segmentation fault (core dumped)`.
+
+Observed output:
+
+```text
+provider_bridge_imported run=4639ab7f-42d3-4a18-b371-718e7fc71507 dataset=terminal-bench/terminal-bench-2-1 agent=codefactory-headless model=Some("deepseek-v4-pro") comparable=true trials=1 mean_reward=0.000
+provider_bridge_trial task=terminal-bench/write-compressor reward=0 failure_class=Some("verification")
+test benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_from_local_settings ... ok
+```
+
+Verifier evidence:
+
+```text
+reward.txt: 0
+test_compressed_file_exists: passed
+test_decompression_produces_original: failed because decompression exited 139 with Segmentation fault (core dumped)
+test_compression_size: failed because /app/data.comp was 4868 bytes and exceeded the 2500 byte limit
+```
+
+Provider compatibility boundary fixed during this slice:
+
+- Intermediate run id `da378cae-448c-402b-a5cb-ec917eb58a15` failed with `model-provider` because DeepSeek thinking mode returned HTTP 400 for forced `tool_choice`.
+- The adapter now retries with `tool_choice=auto` when a provider rejects forced tool choice, preserving the evaluation as an agent capability run instead of a provider compatibility failure.
+
 ## Product Finding
 
-The first CodeFactory-owned DeepSeek evaluation path is now operational and produces comparable imported results. The current score is still `0.000`; this is not a provider-balance issue. The dominant capability gap is the CodeFactory headless agent loop: natural-language reminders now reach the model, but they are not enough. The next slice should enforce implementation state mechanically so the agent starts producing/verifying the required artifact before the model transport timeout boundary.
+The first CodeFactory-owned DeepSeek evaluation path is operational and produces comparable imported results. The current score is still `0.000`; this is not a provider-balance issue and no longer a runner/import issue.
+
+The dominant capability gap has moved from "the agent does not create the required artifact" to "the agent creates a candidate artifact but does not repair the compression protocol after verifier/self-check failure." The next slice should focus on semantic artifact repair: after a failed self-check, preserve the concrete verifier failure and force targeted generator/protocol repair instead of falling back to broad file inspection.
 
 ## Next Slice
 
-- Add a stronger implementation-first loop state after initial inspection.
+- Improve semantic repair after candidate artifact failure, especially verifier crashes and size-limit failures.
+- Keep artifact-command enforcement and provider `tool_choice` fallback as regression coverage.
 - Consider provider/model ablation only as an attributed comparison: CodeFactory scaffold fixed, backend model varied.
 - Persist evaluation axis and fixed/changed variables in the run schema/UI so these runs are not confused with raw model leaderboard scores.

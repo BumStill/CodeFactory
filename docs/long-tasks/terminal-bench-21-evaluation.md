@@ -12,7 +12,7 @@
 
 ## Current State
 - Current phase: implementation slice 4
-- Current checkpoint: provider-backed Terminal-Bench 2.1 smoke runs through CodeFactory and imports comparable results. Latest verified DeepSeek-backed CodeFactory run is run id `5d9246fe-4662-4e93-996d-5f3597d9e56e`, mean reward `0.000`, failure class `verification`; the trial completed without Harbor/provider exception after model-read failures were converted into controlled `model-error` trajectory entries. Current capability boundary is agent-loop quality: early implementation reminders now reach the model, but natural-language reminders alone are insufficient because the model can still time out before creating `/app/data.comp`.
+- Current checkpoint: provider-backed Terminal-Bench 2.1 smoke runs through CodeFactory and imports comparable results. Latest verified DeepSeek-backed CodeFactory run is run id `4639ab7f-42d3-4a18-b371-718e7fc71507`, mean reward `0.000`, failure class `verification`; the trial completed without Harbor/provider exception, mechanically forced the model out of repeated inspection, created `/app/data.comp`, and failed verifier on decompression segfault plus size limit. Current capability boundary is semantic artifact repair after a bad candidate, not provider balance, runner import, or missing-artifact execution.
 - Next owner: development / QA
 - Updated at: 2026-06-28
 
@@ -50,10 +50,12 @@
 - Hardened the model-backed loop with compact chat payloads, repeated inspection suppression, semantic repair hints for crashes/missing tools/missing artifacts, exact-stdout verification hints extracted from task text, and phase reminders that push the model from inspection into implementation.
 - Converted provider `IncompleteRead` / remote disconnect failures into controlled model request timeouts so Harbor does not misclassify transient model transport failures as environment failures.
 - Reran real CodeFactory provider-backed smoke after loop hardening; latest completed trial has no Harbor exception and imports as a comparable verification failure with reward `0.0`.
+- Added mechanical artifact-state enforcement in the model-backed loop: no-action recovery, model-timeout retry prompt, implementation-required gate, artifact-command-required gate after repeated blocked inspection, compound read-only command detection, and provider `tool_choice` compatibility fallback.
+- Reran real CodeFactory provider-backed smoke after artifact enforcement; latest completed trial creates `/app/data.comp`, passes artifact existence, fails decompression with `Segmentation fault (core dumped)`, and fails the 2500 byte size limit.
 
 ## Remaining Items
-- Improve the headless agent's transition from inspection to implementation: current runs still often inspect task files, hit model read timeouts, and finish without creating the required artifact.
-- Improve the headless agent's debugging/completion loop for semantic verifier failures: when the artifact exists but verifier self-check fails, feed the exact failure back into more targeted repair without burning the run on broad exploration.
+- Improve the headless agent's debugging/completion loop for semantic verifier failures: when the artifact exists but verifier self-check fails, feed the exact failure back into targeted generator/protocol repair without falling back to broad file inspection.
+- Add a post-candidate repair mode that distinguishes `artifact exists but bad protocol`, `artifact too large`, `decompressor crash`, and `stdout mismatch`.
 - Add persisted run fields/UI for evaluation axis, evaluation subject, fixed variables, changed variables, and result attribution.
 - Promote `benchmark-sandbox` from adapter-local command gate to shared CodeFactory policy preset with run/task/container binding.
 - Add Benchmarks UI for run summary, trial details, failure triage, and capability profile.
@@ -89,6 +91,8 @@
 - Latest controlled long run: run id `d3927cd4-340c-4436-9f62-1e3a1c673d97`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, model `deepseek-v4-pro`, mean `0.000`, no provider exception, no Harbor timeout; trajectory shows `data.comp` creation, size under limit, and invalid decompression.
 - 2026-06-28 controlled timeout run: run id `5e08d50b-ca8e-4efa-94ab-68bc18918814`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, model `deepseek-v4-pro`, mean `0.000`, `n_completed_trials=1`, `n_errored_trials=0`; model read timeout was recorded in trajectory and imported as `verification`.
 - 2026-06-28 latest post-hardening run: run id `5d9246fe-4662-4e93-996d-5f3597d9e56e`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, model `deepseek-v4-pro`, mean `0.000`, `n_completed_trials=1`, `n_errored_trials=0`, failure class `verification`; verifier failed because `/app/data.comp` was not created before the controlled model-error stop.
+- 2026-06-28 artifact-enforcement run: run id `4639ab7f-42d3-4a18-b371-718e7fc71507`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, model `deepseek-v4-pro`, mean `0.000`, `n_completed_trials=1`, `n_errored_trials=0`, failure class `verification`; trajectory shows `implementation-required` and `artifact-required` gates, then candidate `/app/data.comp` creation, self-check segfault, and verifier failure on decompression plus size.
+- 2026-06-28 provider compatibility boundary: intermediate run id `da378cae-448c-402b-a5cb-ec917eb58a15` failed as `model-provider` because DeepSeek thinking mode rejected forced `tool_choice`; the adapter now retries with `tool_choice=auto` on that provider error.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.
@@ -99,7 +103,7 @@
 - context scope: CodeFactory repo docs, AGENTS rules, current official Terminal-Bench and Harbor docs.
 - assumptions: Terminal-Bench 2.1 should be treated as the primary external terminal-agent benchmark; CodeFactory must add headless execution rather than rely on desktop UI approval.
 - review point: first implementation slice should be reviewed before starting the Harbor adapter/headless runner slice.
-- validation result: Python adapter smoke/model-backed tests, Rust custom-agent import regression, Rust provider bridge tests, ignored real-job import test, and ignored real provider-bridge smoke pass after intentional failing-test steps; current provider-backed run is valid and fails verification with reward 0 because the agent stopped after controlled model transport failure before creating the artifact. Early implementation reminders were observed in the trajectory, so the next slice should enforce implementation state mechanically instead of relying only on prompt text.
+- validation result: Python adapter smoke/model-backed tests, Rust custom-agent import regression, Rust provider bridge tests, ignored real-job import test, and ignored real provider-bridge smoke pass after intentional failing-test steps; current provider-backed run is valid and fails verification with reward 0 after creating a bad candidate artifact. Mechanical artifact enforcement works; the next slice should improve semantic repair after verifier/self-check failure.
 
 ## Stop Boundary
 - Do not stop after local-only validation.
