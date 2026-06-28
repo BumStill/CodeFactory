@@ -196,6 +196,8 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             "implementation_started": False,
             "artifact_started": False,
             "implementation_required_count": 0,
+            "exec_errors": 0,
+            "command_timeouts": 0,
         }
 
         def write_logs() -> None:
@@ -379,24 +381,28 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     loop_state["auto_protocol_repairs"] = (
                         int(loop_state.get("auto_protocol_repairs") or 0) + 1
                     )
-                    auto_result = await environment.exec(
-                        auto_repair_command,
-                        env={
-                            "CODEFACTORY_BENCHMARK_POLICY": "benchmark-sandbox",
-                            "CODEFACTORY_AGENT_MODE": "model-backed",
-                            "CODEFACTORY_AGENT_AUTO_REPAIR": "1",
-                        },
-                        timeout_sec=min(shell_timeout, max(10, int(deadline - time.monotonic()) - 5)),
-                    )
-                    auto_content = self._format_exec_result(
-                        auto_result.return_code,
-                        auto_result.stdout,
-                        auto_result.stderr,
-                        self._int_env("CODEFACTORY_BENCH_TOOL_OUTPUT_LIMIT", 20000),
+                    auto_timeout_sec = min(
+                        shell_timeout,
+                        max(10, int(deadline - time.monotonic()) - 5),
                     )
                     loop_state["artifact_started"] = True
-                    trajectory.append(
-                        {
+                    try:
+                        auto_result = await environment.exec(
+                            auto_repair_command,
+                            env={
+                                "CODEFACTORY_BENCHMARK_POLICY": "benchmark-sandbox",
+                                "CODEFACTORY_AGENT_MODE": "model-backed",
+                                "CODEFACTORY_AGENT_AUTO_REPAIR": "1",
+                            },
+                            timeout_sec=auto_timeout_sec,
+                        )
+                        auto_content = self._format_exec_result(
+                            auto_result.return_code,
+                            auto_result.stdout,
+                            auto_result.stderr,
+                            self._int_env("CODEFACTORY_BENCH_TOOL_OUTPUT_LIMIT", 20000),
+                        )
+                        auto_trajectory = {
                             "role": "tool",
                             "tool_call_id": (
                                 f"auto_repair_{loop_state['auto_protocol_repairs']}"
@@ -417,6 +423,33 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                             "stderr_bytes": len(auto_result.stderr or ""),
                             "content": auto_content,
                         }
+                    except Exception as exc:
+                        error_type = self._exec_exception_type(exc)
+                        loop_state["exec_errors"] = int(loop_state.get("exec_errors") or 0) + 1
+                        if error_type == "command-timeout":
+                            loop_state["command_timeouts"] = (
+                                int(loop_state.get("command_timeouts") or 0) + 1
+                            )
+                        auto_trajectory = {
+                            "role": "tool",
+                            "tool_call_id": (
+                                f"auto_repair_{loop_state['auto_protocol_repairs']}"
+                            ),
+                            "tool": "run_shell",
+                            "command": auto_repair_command,
+                            "policy": {
+                                "action": "allow",
+                                "reason": "benchmark auto repair command",
+                            },
+                            "status": "exec-error",
+                            "error_type": error_type,
+                            "timeout_sec": auto_timeout_sec,
+                            "content": self._format_exec_exception(
+                                exc, auto_repair_command, auto_timeout_sec
+                            ),
+                        }
+                    trajectory.append(
+                        auto_trajectory
                     )
                     auto_summary = (
                         "Repair focus: an automatic protocol repair command was run "
@@ -444,6 +477,8 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             "tool_calls": total_tool_calls,
             "max_steps": max_steps,
             "usage": total_usage,
+            "exec_errors": int(loop_state.get("exec_errors") or 0),
+            "command_timeouts": int(loop_state.get("command_timeouts") or 0),
         }
 
     def _write_model_backed_logs(
@@ -682,19 +717,42 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 },
             }
 
-        result = await environment.exec(
-            command,
-            env={
-                "CODEFACTORY_BENCHMARK_POLICY": "benchmark-sandbox",
-                "CODEFACTORY_AGENT_MODE": "model-backed",
-            },
-            timeout_sec=timeout_sec,
-        )
         if self._is_implementation_attempt(command):
             loop_state["implementation_started"] = True
         if self._is_artifact_attempt(command, artifact_hint):
             loop_state["artifact_started"] = True
             loop_state["implementation_required_count"] = 0
+        try:
+            result = await environment.exec(
+                command,
+                env={
+                    "CODEFACTORY_BENCHMARK_POLICY": "benchmark-sandbox",
+                    "CODEFACTORY_AGENT_MODE": "model-backed",
+                },
+                timeout_sec=timeout_sec,
+            )
+        except Exception as exc:
+            error_type = self._exec_exception_type(exc)
+            loop_state["exec_errors"] = int(loop_state.get("exec_errors") or 0) + 1
+            if error_type == "command-timeout":
+                loop_state["command_timeouts"] = (
+                    int(loop_state.get("command_timeouts") or 0) + 1
+                )
+            content = self._format_exec_exception(exc, command, timeout_sec)
+            return {
+                "content": content,
+                "trajectory": {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "tool": name,
+                    "command": command,
+                    "policy": decision,
+                    "status": "exec-error",
+                    "error_type": error_type,
+                    "timeout_sec": timeout_sec,
+                    "content": content,
+                },
+            }
         content = self._format_exec_result(
             result.return_code,
             result.stdout,
@@ -1016,11 +1074,30 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 "helper program and continue from the known failure."
             )
 
+        if (
+            "assertionerror" in normalized
+            or "traceback (most recent call last)" in normalized
+            or "=================================== failures" in normalized
+            or re.search(r"\b\d+\s+failed\b", normalized)
+        ):
+            return (
+                "Repair focus: the latest self-check failed. Do not finish yet. "
+                "Use the failing assertion or traceback to patch the implementation, "
+                "then rerun the smallest failing check before giving a final answer."
+            )
+
         if "return_code=124" in normalized or "timed out" in normalized:
             return (
                 "Repair focus: the latest command timed out. Replace broad exploration "
                 "or long-running checks with a smaller deterministic check and continue "
                 "from the known failure."
+            )
+
+        if tool_result.get("status") == "exec-error":
+            return (
+                "Repair focus: the latest command failed before returning an exit code. "
+                "Do not repeat it unchanged; run a smaller command, inspect partial "
+                "files if useful, or switch to a simpler implementation path."
             )
 
         return None
@@ -1553,6 +1630,29 @@ fi"""
             f"return_code={return_code}\n"
             f"stdout:\n{CodeFactoryAgent._truncate(stdout or '', output_limit)}\n"
             f"stderr:\n{CodeFactoryAgent._truncate(stderr or '', output_limit)}"
+        )
+
+    @staticmethod
+    def _exec_exception_type(exc: Exception) -> str:
+        message = str(exc).lower()
+        if isinstance(exc, TimeoutError) or "timed out" in message or "timeout" in message:
+            return "command-timeout"
+        if "docker" in message or "container" in message or "harbor" in message:
+            return "environment-exec-error"
+        return "exec-runtime-error"
+
+    @staticmethod
+    def _format_exec_exception(exc: Exception, command: str, timeout_sec: int) -> str:
+        command_line = CodeFactoryAgent._single_line(
+            CodeFactoryAgent._strip_heredoc_bodies(command)
+        )
+        return (
+            f"EXECUTION ERROR ({CodeFactoryAgent._exec_exception_type(exc)})\n"
+            f"timeout_sec={timeout_sec}\n"
+            f"command={command_line}\n"
+            f"error={type(exc).__name__}: {exc}\n"
+            "The command did not produce a normal exit code. Continue by running a "
+            "smaller diagnostic, checking partial files, or choosing a simpler command."
         )
 
     @staticmethod

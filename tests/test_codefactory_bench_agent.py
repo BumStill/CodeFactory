@@ -64,6 +64,31 @@ class FakeEnvironmentWithResults(FakeEnvironment):
         return ExecResult(stdout="fake stdout", stderr="", return_code=0)
 
 
+class FakeEnvironmentRaises(FakeEnvironment):
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self.exc = exc
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        self.calls.append(
+            {
+                "command": command,
+                "cwd": cwd,
+                "env": env,
+                "timeout_sec": timeout_sec,
+                "user": user,
+            }
+        )
+        raise self.exc
+
+
 def start_fake_chat_server(responses: list[dict[str, object]]):
     requests: list[dict[str, object]] = []
 
@@ -416,6 +441,103 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                     if step.get("role") == "system-reminder"
                 )
             )
+
+    def test_codefactory_agent_records_shell_timeout_without_aborting(self) -> None:
+        server, requests = start_fake_chat_server(
+            [assistant_tool_call("sleep 999"), assistant_final("done")]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironmentRaises(
+                    RuntimeError("Command timed out after 5 seconds")
+                )
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                    },
+                )
+
+                asyncio.run(agent.run("fake Terminal-Bench instruction", env, context))
+
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(len(env.calls), 1)
+                assert context.metadata is not None
+                self.assertEqual(context.metadata["exec_errors"], 1)
+                self.assertEqual(context.metadata["command_timeouts"], 1)
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                exec_errors = [
+                    step
+                    for step in trajectory["steps"]
+                    if step.get("status") == "exec-error"
+                ]
+                self.assertEqual(len(exec_errors), 1)
+                self.assertEqual(exec_errors[0]["error_type"], "command-timeout")
+                self.assertIn("Command timed out", exec_errors[0]["content"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_codefactory_agent_prompts_repair_after_failed_self_check(self) -> None:
+        server, requests = start_fake_chat_server(
+            [assistant_tool_call("pytest -q"), assistant_final("done")]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironmentWithResults(
+                    [
+                        ExecResult(
+                            stdout=(
+                                "F\n"
+                                "=================================== FAILURES ===================================\n"
+                                "AssertionError: expected optimized query plan\n"
+                                "1 failed in 0.12s\n"
+                            ),
+                            stderr="",
+                            return_code=1,
+                        )
+                    ]
+                )
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                    },
+                )
+
+                asyncio.run(agent.run("fix the implementation", env, context))
+
+                self.assertEqual(len(requests), 2)
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                reminders = [
+                    step.get("content", "")
+                    for step in trajectory["steps"]
+                    if step.get("role") == "system-reminder"
+                ]
+                self.assertTrue(
+                    any("latest self-check failed" in reminder for reminder in reminders)
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_chat_completion_falls_back_when_provider_rejects_forced_tool_choice(
         self,

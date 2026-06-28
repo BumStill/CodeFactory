@@ -11,7 +11,7 @@
 - Blocked means: Harbor/Docker/dataset/agent-adapter/runtime access prevents real smoke verification, with exact command, error, and next action recorded.
 
 ## Current State
-- Current phase: implementation slice 5
+- Current phase: implementation slice 6
 - Current checkpoint: full Terminal-Bench 2.1 CodeFactory agent capability run completed and imported. Latest full run is run id `7ff6ef13-4488-4e0f-afd0-a1f9bd16d561`, agent `codefactory-headless`, model backend `deepseek-v4-pro`, dataset `terminal-bench/terminal-bench-2-1`, `89 / 89` trials completed, mean reward `0.06741573033707865`, pass count `6 / 89`, failed count `83 / 89`, exceptions `63`. This is the first full CodeFactory-run score and it is a low capability baseline, not an acceptable product level.
 - Next owner: development / QA
 - Updated at: 2026-06-28
@@ -60,12 +60,14 @@
 - Added provider usage capture in the headless adapter: future model-backed runs write `usage.json`, include aggregate usage in `trajectory.json`, and attach usage to context metadata when the provider reports it.
 - Added fine-grained `failure_reason` import/persistence and Docker CPU resource preflight so environment/resource failures are separated from agent execution failures before scoring product changes.
 - Added fixed regression subset `docs/benchmark-subsets/terminal-bench-21-regression-subset-v1.json` and provider bridge `task_names` support using Harbor `--include-task-name`.
+- Added first long-horizon resilience improvement: model-backed `environment.exec` exceptions are recorded as `exec-error` trajectory entries with `command-timeout` / environment / runtime detail and metadata counters, then returned to the model for recovery instead of aborting the whole Harbor trial.
+- Added first verifier-repair improvement: pytest/assertion/traceback style failed self-check output now produces a concrete repair reminder requiring implementation changes and a rerun of the smallest failing check before final answer.
 
 ## Remaining Items
 - Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
 - Add cost calculation once provider pricing metadata is available; current adapter captures provider-reported token usage but does not price it.
-- Improve long-horizon execution with better step budgeting, background process supervision, service readiness checks, long command timeout policy, and resumable artifact verification.
-- Improve verification repair so verifier stdout becomes concrete patch goals and expected artifacts remain first-class state.
+- Continue long-horizon execution work: better step budgeting, background process supervision, service readiness checks, long command timeout policy, and resumable artifact verification.
+- Continue verifier-driven repair work: use verifier/self-check stdout as concrete patch goals across more failure shapes and keep expected artifacts first-class state through repair attempts.
 - Generalize post-candidate repair so task-specific protocol repair becomes reusable capability, not only a `write-compressor` special case.
 - Add persisted run fields/UI for evaluation axis, evaluation subject, fixed variables, changed variables, and result attribution.
 - Promote `benchmark-sandbox` from adapter-local command gate to shared CodeFactory policy preset with run/task/container binding.
@@ -113,6 +115,7 @@
 - Full-run import evidence: `CODEFACTORY_BENCHMARK_JOB_PATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260628-085422 cargo test benchmark::tests::import_harbor_job_from_env_path --lib -- --ignored --nocapture` passed and imported `89` trials.
 - Infrastructure follow-up evidence: `PYTHONPATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design /Users/leo/.local/share/uv/tools/harbor/bin/python tests/test_codefactory_bench_agent.py` passes with provider usage aggregation coverage; `cargo test benchmark::tests --lib` passes with `failure_reason`, Docker CPU preflight, task-name filtering, and provider bridge coverage.
 - Regression subset evidence: `docs/benchmark-subsets/terminal-bench-21-regression-subset-v1.json` contains 18 tasks selected from the full-run failure mix and is runnable through provider bridge `task_names` / Harbor `--include-task-name`.
+- Long-horizon / verifier-repair local evidence: `PYTHONPATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design /Users/leo/.local/share/uv/tools/harbor/bin/python tests/test_codefactory_bench_agent.py` passes 31 tests, including command-timeout `exec-error` recovery and failed self-check repair reminder coverage.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.

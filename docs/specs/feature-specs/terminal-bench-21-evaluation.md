@@ -120,6 +120,16 @@ PR 描述必须包含：
 
 Model-backed 模式只能读取显式 `CODEFACTORY_BENCH_*` 配置，不读取 CodeFactory desktop settings、macOS keychain、通用 provider env 或用户凭据。
 
+Model-backed loop 必须把 task container 内的 `environment.exec` 异常记录成 trajectory 中的 `exec-error` tool result，而不是让整个 trial 直接变成 Harbor agent exception。至少记录：
+
+- `status=exec-error`
+- `error_type`: `command-timeout`、`environment-exec-error` 或 `exec-runtime-error`
+- `timeout_sec`
+- 原始 command 的单行摘要
+- `context.metadata.exec_errors` 和 `context.metadata.command_timeouts`
+
+对于自检命令返回非零且 stdout/stderr 包含 pytest failure、traceback 或 assertion 失败时，adapter 必须追加 verifier-repair 提示，要求模型基于失败断言修改实现并重跑最小失败检查后再结束。
+
 ### Provider Bridge
 
 产品侧允许用户把当前 CodeFactory endpoint/model 用于一次 benchmark run，但必须经过显式授权桥接：
@@ -180,6 +190,8 @@ Model-backed 模式只能读取显式 `CODEFACTORY_BENCH_*` 配置，不读取 C
 | Adapter | Model-backed headless loop | fake OpenAI-compatible server 返回 `run_shell` tool call，adapter 执行 Harbor environment command 并写 trajectory | Python integration test |
 | Adapter | Artifact enforcement loop | 初始 inspection 后，重复读文件、复合只读命令和无关实现命令会被压回 artifact 生成；有目标产物前空回复会恢复为 tool-call 要求 | Python loop tests + real provider smoke trajectory |
 | Adapter | Protocol auto-repair | candidate artifact 自检出现 decompressor crash、size limit 或协议失败时，adapter 能记录自动修复轨迹并产出可验证 artifact；修复不得依赖 task container 中不存在的 Python runtime | Python loop test + real provider smoke reward |
+| Adapter | Exec timeout recovery | `environment.exec` 抛出 command timeout 时，adapter 写入 `exec-error/command-timeout`、更新 metadata，并继续给模型修复机会，不直接 Harbor exception | Python loop test |
+| Adapter | Failed self-check repair | pytest/assertion/traceback 类自检失败会生成具体 repair reminder，要求修改实现并重跑最小失败检查 | Python loop test |
 | Adapter | Provider tool-choice compatibility | provider 拒绝 forced `tool_choice` 时自动降级为 `auto` 重试，不把兼容性错误误记为 agent 能力结果 | Python provider fallback test |
 | Adapter | Provider bridge preview | 当前 DeepSeek endpoint/model 生成 redacted env 和 Harbor command preview，不暴露 raw key | Rust unit test |
 | Adapter | Provider bridge authorization | 授权短语不匹配时不得 lookup secret；匹配后只把 key 放入 child env | Rust unit test |
