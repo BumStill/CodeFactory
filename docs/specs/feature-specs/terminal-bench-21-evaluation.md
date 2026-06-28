@@ -160,6 +160,8 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 
 后续 agent-loop、tool runtime、verification repair、resource/preflight 改动默认至少跑该 subset 或说明 blocker。
 
+固定 subset 的标准执行入口是 `tools/benchmark/run_terminal_bench_21_regression_subset.py`。该脚本从 subset JSON 读取任务列表，生成 provider bridge 环境变量，调用真实 Harbor provider-backed ignored test，并在成功或阻塞时写入 `docs/evidence-packs/terminal-bench-21-regression-subset-*.md`。脚本不得打印 raw provider key；无显式 `CODEFACTORY_BENCH_API_KEY` 且 OS credential store 不可用时，必须生成 credential blocker evidence。
+
 ### Run Summary
 
 每次 run 至少记录：
@@ -201,6 +203,7 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 | Adapter | Provider bridge preview | 当前 DeepSeek endpoint/model 生成 redacted env 和 Harbor command preview，不暴露 raw key | Rust unit test |
 | Adapter | Provider bridge authorization | 授权短语不匹配时不得 lookup secret；匹配后只把 key 放入 child env | Rust unit test |
 | Attribution | Evaluation axis contract | run/PR/evidence 区分 CodeFactory agent 能力、模型后端影响、agent scaffold 对比和评测基础设施 smoke | spec review + fixture test |
+| Regression | Fixed subset runner | 从固定 subset JSON 生成 18 题 provider-backed run；credential 不可用时生成 blocker evidence，不伪造 agent score | runner dry-run + blocker evidence |
 | Policy | benchmark-sandbox policy in task container | workspace command/file edit 自动允许，host path/secret deny | policy unit test |
 | Policy | network/secret deny | fake model 请求 `curl` 或 credential path 时不调用 environment.exec | Python policy test |
 | Failure | 缺失 `result.json` | 标记 `partial_import`，列出缺失文件 | importer test |

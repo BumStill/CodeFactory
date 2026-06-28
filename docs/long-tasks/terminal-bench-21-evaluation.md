@@ -65,6 +65,7 @@
 - Added first verifier-repair improvement: pytest/assertion/traceback style failed self-check output now produces a concrete repair reminder requiring implementation changes and a rerun of the smallest failing check before final answer.
 - Added provider credential-access timeout for benchmark bridge: macOS keychain reads now use a bounded, killable `security` subprocess for benchmark launch, so keychain authorization hangs become explicit infrastructure blockers instead of indefinite waits.
 - Added explicit benchmark secret override support: if the launching process already provides `CODEFACTORY_BENCH_API_KEY`, provider bridge uses that in-memory value for the Harbor child process and skips OS credential lookup; the key is still not printed, previewed, persisted, or put into Harbor args.
+- Added fixed subset runner/report script `tools/benchmark/run_terminal_bench_21_regression_subset.py`; it reads the 18-task subset JSON, runs the provider bridge path, and writes success or blocker evidence packs without printing raw keys.
 
 ## Remaining Items
 - Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
@@ -123,6 +124,7 @@
 - Long-horizon / verifier-repair local evidence: `PYTHONPATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design /Users/leo/.local/share/uv/tools/harbor/bin/python tests/test_codefactory_bench_agent.py` passes 32 tests, including command-timeout `exec-error` recovery, foreground service supervision guard, and failed self-check repair reminder coverage.
 - Provider credential blocker evidence: `CODEFACTORY_BENCH_SECRET_TIMEOUT_SEC=5 CODEFACTORY_RUN_REAL_PROVIDER_BRIDGE=1 ... cargo test benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_from_local_settings --lib -- --ignored --nocapture` now fails fast with the explicit keychain timeout message instead of hanging before Harbor job creation.
 - Explicit-env override evidence: `cargo test provider_bridge --lib` passes with coverage that an explicit benchmark API key skips OS credential lookup and that blank env values fall back to stored secrets.
+- Fixed subset runner evidence: `python3 tools/benchmark/run_terminal_bench_21_regression_subset.py --dry-run` prints the 18-task plan without raw secrets; `python3 tools/benchmark/run_terminal_bench_21_regression_subset.py --secret-timeout-sec 5` generates credential blocker report `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-28T15-31-31Z.md`.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.
