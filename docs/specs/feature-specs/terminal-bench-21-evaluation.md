@@ -162,6 +162,8 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 
 固定 subset 的标准执行入口是 `tools/benchmark/run_terminal_bench_21_regression_subset.py`。该脚本从 subset JSON 读取任务列表，生成 provider bridge 环境变量，调用真实 Harbor provider-backed ignored test，并在成功或阻塞时写入 `docs/evidence-packs/terminal-bench-21-regression-subset-*.md`。脚本不得打印 raw provider key；无显式 `CODEFACTORY_BENCH_API_KEY` 且 OS credential store 不可用时，必须生成 credential blocker evidence。
 
+固定 subset 的离线基线入口是 `tools/benchmark/summarize_terminal_bench_21_subset_baseline.py`。该脚本只读取已完成 full Harbor job 和 subset JSON，不调用 provider、不读取 secret，用于在 credential 或 provider 暂不可用时仍能生成同口径的 subset baseline evidence。该报告必须明确标注 `offline subset projection`，不能冒充新的 provider-backed rerun。
+
 ### Run Summary
 
 每次 run 至少记录：

@@ -16,6 +16,17 @@
 
 这个分数说明 CodeFactory 现在已经具备可跑、可导入、可归因的评估链路，但 agent 能力还处在低基线阶段。主要问题不是单个模型回答质量，而是 agent 系统没有稳定地把长任务拆解、执行、验证和修复闭环跑完。
 
+固定 18 题 regression subset 的离线映射基线是：
+
+- source: 完整 run `7ff6ef13-4488-4e0f-afd0-a1f9bd16d561`
+- subset: `terminal-bench-21-regression-subset-v1`
+- report: `docs/evidence-packs/terminal-bench-21-regression-subset-baseline-2026-06-28T15-41-50Z.md`
+- pass: `4 / 18`
+- mean reward: `0.222222`
+- level: `early scaffold baseline`
+
+这个 subset 分数是从完整 run 离线投影出来的，不是新的 provider-backed rerun。它比完整 89 题总分高，是因为 subset 刻意包含 4 个已通过任务作为回归哨兵；它的用途是比较后续 agent-loop 改动是否真实改善失败桶，而不是替代完整总分。
+
 ## 问题分层
 
 ### 1. 评测基础设施还不够产品化
