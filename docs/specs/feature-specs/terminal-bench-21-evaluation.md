@@ -140,6 +140,7 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 - `start_benchmark_provider_run(request)` 只有在授权短语完全匹配时才读取 OS credential store，并把 key 作为 `CODEFACTORY_BENCH_API_KEY` 注入 Harbor child process env。
 - raw key 不写入 command preview、frontend state、SQLite run record、Harbor args、日志或 evidence pack。
 - provider key lookup 必须有有界超时；如果 OS credential store 需要交互授权或挂起，run 必须返回明确 blocker，不得无限等待或误报为 agent 失败。
+- 如果调用进程已经显式提供 `CODEFACTORY_BENCH_API_KEY`，provider bridge 可以把它作为本次 benchmark launch 的授权 secret 来源并跳过 OS credential lookup；该值仍然不得进入 preview、日志、SQLite、Harbor args 或 evidence pack。
 - 当前 bridge 只支持 OpenAI-compatible `chat/completions` endpoint；DeepSeek 这类 direct provider 需要用 `normalize_model_id` 去掉 OpenRouter vendor 前缀。
 - ChatGPT OAuth、Anthropic 原生 Messages API、需要浏览器会话或非 API key 的 provider 暂不支持 benchmark bridge。
 - `concurrency` 是 Harbor `-n` / `--n-concurrent`，不是 trial count；`trial_count` 只作为旧客户端兼容 alias。

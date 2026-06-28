@@ -443,15 +443,19 @@ async fn resolve_authorized_provider_launch_with_timeout(
 ) -> Result<AuthorizedBenchmarkProviderLaunch> {
     let preview = authorized_provider_preview(settings, request)?;
     let key_ref = preview.key_ref.clone();
-    let timeout = provider_secret_lookup_timeout();
-    let api_key = lookup_provider_secret_for_benchmark(key_ref.clone(), timeout)
-        .await?
-        .ok_or_else(|| {
-            AppError::Other(format!(
-                "API key not found for benchmark provider key_ref '{}'",
-                key_ref
-            ))
-        })?;
+    let api_key = if let Some(api_key) = nonempty_secret(explicit_benchmark_api_key_from_env()) {
+        api_key
+    } else {
+        let timeout = provider_secret_lookup_timeout();
+        lookup_provider_secret_for_benchmark(key_ref.clone(), timeout)
+            .await?
+            .ok_or_else(|| {
+                AppError::Other(format!(
+                    "API key not found for benchmark provider key_ref '{}'",
+                    key_ref
+                ))
+            })?
+    };
     build_authorized_provider_launch(preview, api_key)
 }
 
@@ -464,18 +468,11 @@ where
     F: FnMut(&str) -> Result<Option<String>>,
 {
     let preview = authorized_provider_preview(settings, request)?;
-    let api_key = secret_lookup(&preview.key_ref)?.ok_or_else(|| {
-        AppError::Other(format!(
-            "API key not found for benchmark provider key_ref '{}'",
-            preview.key_ref
-        ))
-    })?;
-    if api_key.trim().is_empty() {
-        return Err(AppError::Other(format!(
-            "API key is empty for benchmark provider key_ref '{}'",
-            preview.key_ref
-        )));
-    }
+    let api_key = provider_api_key_from_explicit_env_or_lookup(
+        explicit_benchmark_api_key_from_env(),
+        &preview.key_ref,
+        &mut secret_lookup,
+    )?;
 
     build_authorized_provider_launch(preview, api_key)
 }
@@ -526,6 +523,45 @@ fn build_authorized_provider_launch(
             ),
         ],
         preview,
+    })
+}
+
+fn provider_api_key_from_explicit_env_or_lookup<F>(
+    explicit_env_api_key: Option<String>,
+    key_ref: &str,
+    mut secret_lookup: F,
+) -> Result<String>
+where
+    F: FnMut(&str) -> Result<Option<String>>,
+{
+    if let Some(api_key) = nonempty_secret(explicit_env_api_key) {
+        return Ok(api_key);
+    }
+    let api_key = secret_lookup(key_ref)?.ok_or_else(|| {
+        AppError::Other(format!(
+            "API key not found for benchmark provider key_ref '{}'",
+            key_ref
+        ))
+    })?;
+    nonempty_secret(Some(api_key)).ok_or_else(|| {
+        AppError::Other(format!(
+            "API key is empty for benchmark provider key_ref '{}'",
+            key_ref
+        ))
+    })
+}
+
+fn explicit_benchmark_api_key_from_env() -> Option<String> {
+    std::env::var("CODEFACTORY_BENCH_API_KEY").ok()
+}
+
+fn nonempty_secret(value: Option<String>) -> Option<String> {
+    value.and_then(|secret| {
+        if secret.trim().is_empty() {
+            None
+        } else {
+            Some(secret)
+        }
     })
 }
 
@@ -2063,6 +2099,32 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Benchmark provider secret lookup timed out"));
+    }
+
+    #[test]
+    fn provider_bridge_explicit_env_secret_skips_secret_lookup() {
+        let secret = provider_api_key_from_explicit_env_or_lookup(
+            Some("env-secret".to_string()),
+            "codefactory.endpoint.deepseek",
+            |_key_ref| {
+                panic!("explicit benchmark API key should skip OS credential lookup");
+            },
+        )
+        .expect("explicit env secret should be accepted");
+
+        assert_eq!(secret, "env-secret");
+    }
+
+    #[test]
+    fn provider_bridge_blank_explicit_env_secret_falls_back_to_secret_lookup() {
+        let secret = provider_api_key_from_explicit_env_or_lookup(
+            Some("   ".to_string()),
+            "codefactory.endpoint.deepseek",
+            |_key_ref| Ok(Some("stored-secret".to_string())),
+        )
+        .expect("blank env secret should fall back to stored secret");
+
+        assert_eq!(secret, "stored-secret");
     }
 
     #[test]
