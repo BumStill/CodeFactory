@@ -539,6 +539,48 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_codefactory_agent_requires_supervision_for_foreground_service(self) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                assistant_tool_call("python -m http.server 8000"),
+                assistant_final("done"),
+            ]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironment()
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                    },
+                )
+
+                asyncio.run(agent.run("start and test the web service", env, context))
+
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(env.calls, [])
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                supervision_required = [
+                    step
+                    for step in trajectory["steps"]
+                    if step.get("status") == "service-supervision-required"
+                ]
+                self.assertEqual(len(supervision_required), 1)
+                self.assertIn("readiness check", supervision_required[0]["content"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_chat_completion_falls_back_when_provider_rejects_forced_tool_choice(
         self,
     ) -> None:

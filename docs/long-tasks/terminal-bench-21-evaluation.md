@@ -61,12 +61,13 @@
 - Added fine-grained `failure_reason` import/persistence and Docker CPU resource preflight so environment/resource failures are separated from agent execution failures before scoring product changes.
 - Added fixed regression subset `docs/benchmark-subsets/terminal-bench-21-regression-subset-v1.json` and provider bridge `task_names` support using Harbor `--include-task-name`.
 - Added first long-horizon resilience improvement: model-backed `environment.exec` exceptions are recorded as `exec-error` trajectory entries with `command-timeout` / environment / runtime detail and metadata counters, then returned to the model for recovery instead of aborting the whole Harbor trial.
+- Added foreground service supervision guard: obvious long-running service commands are suppressed unless they are backgrounded/supervised, with a repair prompt requiring log redirection, pid capture, and bounded readiness checks.
 - Added first verifier-repair improvement: pytest/assertion/traceback style failed self-check output now produces a concrete repair reminder requiring implementation changes and a rerun of the smallest failing check before final answer.
 
 ## Remaining Items
 - Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
 - Add cost calculation once provider pricing metadata is available; current adapter captures provider-reported token usage but does not price it.
-- Continue long-horizon execution work: better step budgeting, background process supervision, service readiness checks, long command timeout policy, and resumable artifact verification.
+- Continue long-horizon execution work: better step budgeting, richer background process lifecycle supervision, broader service readiness templates, long command timeout policy, and resumable artifact verification.
 - Continue verifier-driven repair work: use verifier/self-check stdout as concrete patch goals across more failure shapes and keep expected artifacts first-class state through repair attempts.
 - Generalize post-candidate repair so task-specific protocol repair becomes reusable capability, not only a `write-compressor` special case.
 - Add persisted run fields/UI for evaluation axis, evaluation subject, fixed variables, changed variables, and result attribution.
@@ -115,7 +116,7 @@
 - Full-run import evidence: `CODEFACTORY_BENCHMARK_JOB_PATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260628-085422 cargo test benchmark::tests::import_harbor_job_from_env_path --lib -- --ignored --nocapture` passed and imported `89` trials.
 - Infrastructure follow-up evidence: `PYTHONPATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design /Users/leo/.local/share/uv/tools/harbor/bin/python tests/test_codefactory_bench_agent.py` passes with provider usage aggregation coverage; `cargo test benchmark::tests --lib` passes with `failure_reason`, Docker CPU preflight, task-name filtering, and provider bridge coverage.
 - Regression subset evidence: `docs/benchmark-subsets/terminal-bench-21-regression-subset-v1.json` contains 18 tasks selected from the full-run failure mix and is runnable through provider bridge `task_names` / Harbor `--include-task-name`.
-- Long-horizon / verifier-repair local evidence: `PYTHONPATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design /Users/leo/.local/share/uv/tools/harbor/bin/python tests/test_codefactory_bench_agent.py` passes 31 tests, including command-timeout `exec-error` recovery and failed self-check repair reminder coverage.
+- Long-horizon / verifier-repair local evidence: `PYTHONPATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design /Users/leo/.local/share/uv/tools/harbor/bin/python tests/test_codefactory_bench_agent.py` passes 32 tests, including command-timeout `exec-error` recovery, foreground service supervision guard, and failed self-check repair reminder coverage.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.

@@ -198,6 +198,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             "implementation_required_count": 0,
             "exec_errors": 0,
             "command_timeouts": 0,
+            "service_supervision_blocks": 0,
         }
 
         def write_logs() -> None:
@@ -479,6 +480,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             "usage": total_usage,
             "exec_errors": int(loop_state.get("exec_errors") or 0),
             "command_timeouts": int(loop_state.get("command_timeouts") or 0),
+            "service_supervision_blocks": int(
+                loop_state.get("service_supervision_blocks") or 0
+            ),
         }
 
     def _write_model_backed_logs(
@@ -684,6 +688,33 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                         "reason": "implementation required before more inspection",
                     },
                     "status": "implementation-required",
+                    "content": content,
+                },
+            }
+
+        if self._requires_service_supervision(command):
+            loop_state["service_supervision_blocks"] = (
+                int(loop_state.get("service_supervision_blocks") or 0) + 1
+            )
+            content = (
+                "SERVICE SUPERVISION REQUIRED: this looks like a foreground service "
+                "command that may run until the tool timeout. Start it in the "
+                "background, redirect stdout/stderr to a log file, record its pid, "
+                "run a bounded readiness check, then run the client/test command. "
+                "Do not retry the foreground service command unchanged."
+            )
+            return {
+                "content": content,
+                "trajectory": {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "tool": name,
+                    "command": command,
+                    "policy": {
+                        "action": "suppress",
+                        "reason": "foreground service requires supervision",
+                    },
+                    "status": "service-supervision-required",
                     "content": content,
                 },
             }
@@ -1050,6 +1081,14 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 f"{artifact} or run a generator that creates it; do not read task files again."
             )
 
+        if "service supervision required" in normalized:
+            return (
+                "Repair focus: the previous command tried to start a foreground service. "
+                "Start the service in the background with stdout/stderr redirected to a "
+                "log, save its pid, run a bounded readiness check, and then run the "
+                "client or verifier command."
+            )
+
         if "segmentation fault" in normalized or "core dumped" in normalized:
             return (
                 "Repair focus: the latest self-check crashed with a segmentation fault. "
@@ -1359,6 +1398,31 @@ fi"""
             and int(loop_state.get("implementation_required_count") or 0) >= threshold
             and not self._is_artifact_attempt(command, artifact_hint)
         )
+
+    @staticmethod
+    def _requires_service_supervision(command: str) -> bool:
+        command_text = CodeFactoryAgent._strip_heredoc_bodies(command).strip().lower()
+        if not command_text:
+            return False
+        if any(token in command_text for token in [" &", "nohup ", "setsid ", "timeout "]):
+            return False
+        if "docker run -d" in command_text or "daemon on" in command_text:
+            return False
+
+        service_patterns = [
+            r"\bpython3?\s+-m\s+http\.server\b",
+            r"\buvicorn\b",
+            r"\bgunicorn\b",
+            r"\bflask\s+run\b",
+            r"\bnpm\s+(run\s+)?(dev|start)\b",
+            r"\byarn\s+(dev|start)\b",
+            r"\bpnpm\s+(dev|start)\b",
+            r"\bnginx\s+-g\s+['\"]daemon off;",
+            r"\bredis-server\b",
+            r"\bpostgres\b",
+            r"\bmysqld\b",
+        ]
+        return any(re.search(pattern, command_text) for pattern in service_patterns)
 
     @staticmethod
     def _is_inspection_only_command(command: str) -> bool:

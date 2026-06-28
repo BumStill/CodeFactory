@@ -130,6 +130,8 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 
 对于自检命令返回非零且 stdout/stderr 包含 pytest failure、traceback 或 assertion 失败时，adapter 必须追加 verifier-repair 提示，要求模型基于失败断言修改实现并重跑最小失败检查后再结束。
 
+对于明显的前台服务启动命令，例如 `python -m http.server`、`uvicorn`、`flask run`、`npm start`、`redis-server` 等，adapter 必须要求后台启动、日志重定向、pid 记录和 bounded readiness check；不得直接执行会常驻到 tool timeout 的前台服务命令。已显式后台化、`nohup`、`setsid`、`timeout` 或 daemon 模式的命令不在该拦截范围内。
+
 ### Provider Bridge
 
 产品侧允许用户把当前 CodeFactory endpoint/model 用于一次 benchmark run，但必须经过显式授权桥接：
@@ -192,6 +194,7 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 | Adapter | Protocol auto-repair | candidate artifact 自检出现 decompressor crash、size limit 或协议失败时，adapter 能记录自动修复轨迹并产出可验证 artifact；修复不得依赖 task container 中不存在的 Python runtime | Python loop test + real provider smoke reward |
 | Adapter | Exec timeout recovery | `environment.exec` 抛出 command timeout 时，adapter 写入 `exec-error/command-timeout`、更新 metadata，并继续给模型修复机会，不直接 Harbor exception | Python loop test |
 | Adapter | Failed self-check repair | pytest/assertion/traceback 类自检失败会生成具体 repair reminder，要求修改实现并重跑最小失败检查 | Python loop test |
+| Adapter | Foreground service supervision | 前台服务启动命令被 suppress，并提示后台启动、日志、pid 和 readiness check，不消耗完整 tool timeout | Python loop test |
 | Adapter | Provider tool-choice compatibility | provider 拒绝 forced `tool_choice` 时自动降级为 `auto` 重试，不把兼容性错误误记为 agent 能力结果 | Python provider fallback test |
 | Adapter | Provider bridge preview | 当前 DeepSeek endpoint/model 生成 redacted env 和 Harbor command preview，不暴露 raw key | Rust unit test |
 | Adapter | Provider bridge authorization | 授权短语不匹配时不得 lookup secret；匹配后只把 key 放入 child env | Rust unit test |
