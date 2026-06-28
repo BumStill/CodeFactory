@@ -116,6 +116,21 @@ def assistant_final(content: str) -> dict[str, object]:
     return {"choices": [{"message": {"role": "assistant", "content": content}}]}
 
 
+def assistant_final_with_usage(
+    content: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> dict[str, object]:
+    return {
+        "choices": [{"message": {"role": "assistant", "content": content}}],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
+
 def provider_error(status: int, message: str) -> dict[str, object]:
     return {
         "_status": status,
@@ -167,7 +182,10 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
 
     def test_codefactory_agent_model_backed_loop_runs_shell_tool(self) -> None:
         server, requests = start_fake_chat_server(
-            [assistant_tool_call("printf ok"), assistant_final("done")]
+            [
+                assistant_tool_call("printf ok"),
+                assistant_final_with_usage("done", 17, 5),
+            ]
         )
         try:
             import tempfile
@@ -199,9 +217,21 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                 assert context.metadata is not None
                 self.assertEqual(context.metadata["mode"], "model-backed")
                 self.assertEqual(context.metadata["tool_calls"], 1)
+                self.assertEqual(
+                    context.metadata["usage"],
+                    {"prompt_tokens": 17, "completion_tokens": 5, "total_tokens": 22},
+                )
                 trajectory = json.loads((tmp_path / "trajectory.json").read_text())
                 self.assertEqual(trajectory["mode"], "model-backed")
                 self.assertEqual(trajectory["model"], "fake-model")
+                self.assertEqual(
+                    trajectory["usage"],
+                    {"prompt_tokens": 17, "completion_tokens": 5, "total_tokens": 22},
+                )
+                self.assertEqual(
+                    json.loads((tmp_path / "usage.json").read_text()),
+                    {"prompt_tokens": 17, "completion_tokens": 5, "total_tokens": 22},
+                )
         finally:
             server.shutdown()
             server.server_close()

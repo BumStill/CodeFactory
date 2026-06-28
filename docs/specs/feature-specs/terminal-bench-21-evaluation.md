@@ -129,6 +129,22 @@ Model-backed 模式只能读取显式 `CODEFACTORY_BENCH_*` 配置，不读取 C
 - raw key 不写入 command preview、frontend state、SQLite run record、Harbor args、日志或 evidence pack。
 - 当前 bridge 只支持 OpenAI-compatible `chat/completions` endpoint；DeepSeek 这类 direct provider 需要用 `normalize_model_id` 去掉 OpenRouter vendor 前缀。
 - ChatGPT OAuth、Anthropic 原生 Messages API、需要浏览器会话或非 API key 的 provider 暂不支持 benchmark bridge。
+- `concurrency` 是 Harbor `-n` / `--n-concurrent`，不是 trial count；`trial_count` 只作为旧客户端兼容 alias。
+- `task_names` 使用 Harbor `--include-task-name` 过滤固定 subset；当提供 `task_names` 且未显式提供 `task_limit` 时，默认 `task_limit=task_names.length`，避免固定 subset 被默认 smoke limit 截断。
+
+### Regression Subset
+
+首个固定回归子集为 `docs/benchmark-subsets/terminal-bench-21-regression-subset-v1.json`。
+
+该子集来自第一次完整 CodeFactory Terminal-Bench 2.1 run `7ff6ef13-4488-4e0f-afd0-a1f9bd16d561`，包含 18 个任务，覆盖：
+
+- passed smoke: `write-compressor`, `extract-elf`, `filter-js-from-html`, `nginx-request-logging`
+- verifier-zero: `circuit-fibsqrt`, `configure-git-webserver`, `mteb-retrieve`, `sanitize-git-repo`, `query-optimize`
+- tool-use: `count-dataset-tokens`, `install-windows-3.11`, `protein-assembly`
+- command-timeout: `build-cython-ext`, `kv-store-grpc`, `sparql-university`, `torch-tensor-parallelism`
+- environment/resource: `caffe-cifar-10`, `qemu-startup`
+
+后续 agent-loop、tool runtime、verification repair、resource/preflight 改动默认至少跑该 subset 或说明 blocker。
 
 ### Run Summary
 

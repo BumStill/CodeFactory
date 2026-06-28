@@ -189,6 +189,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
 
         final_text = ""
         total_tool_calls = 0
+        total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         no_action_recoveries = 0
         command_counts: dict[str, int] = {}
         loop_state: dict[str, Any] = {
@@ -196,6 +197,16 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             "artifact_started": False,
             "implementation_required_count": 0,
         }
+
+        def write_logs() -> None:
+            self._write_model_backed_logs(
+                trajectory,
+                final_text,
+                model,
+                instruction_hash,
+                total_usage,
+            )
+
         for step in range(max_steps):
             if deadline - time.monotonic() <= 15:
                 final_text = final_text or "Stopped before the benchmark agent timeout."
@@ -208,7 +219,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                         ),
                     }
                 )
-                self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
+                write_logs()
                 break
 
             reminders = [
@@ -224,7 +235,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                         "content": reminder,
                     }
                 )
-                self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
+                write_logs()
             assistant_message: dict[str, Any] | None = None
             for request_attempt in range(model_timeout_retries + 1):
                 try:
@@ -261,20 +272,20 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                                 "content": retry_prompt,
                             }
                         )
-                        self._write_model_backed_logs(
-                            trajectory, final_text, model, instruction_hash
-                        )
+                        write_logs()
                         continue
 
                     final_text = final_text or "Stopped after the model request timed out."
-                    self._write_model_backed_logs(
-                        trajectory, final_text, model, instruction_hash
-                    )
+                    write_logs()
                     break
             if assistant_message is None:
                 break
             tool_calls = assistant_message.get("tool_calls") or []
             content = assistant_message.get("content") or ""
+            usage = assistant_message.get("_codefactory_usage") or {}
+            if usage:
+                for key in total_usage:
+                    total_usage[key] += int(usage.get(key) or 0)
             final_text = content or final_text
             messages.append(
                 {
@@ -289,9 +300,10 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     "role": "assistant",
                     "content": content,
                     "tool_calls": self._redact_tool_calls(tool_calls),
+                    **({"usage": usage} if usage else {}),
                 }
             )
-            self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
+            write_logs()
 
             if not tool_calls:
                 if self._requires_no_action_recovery(
@@ -309,9 +321,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                             "content": recovery_prompt,
                         }
                     )
-                    self._write_model_backed_logs(
-                        trajectory, final_text, model, instruction_hash
-                    )
+                    write_logs()
                     continue
                 break
 
@@ -329,9 +339,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                             ),
                         }
                     )
-                    self._write_model_backed_logs(
-                        trajectory, final_text, model, instruction_hash
-                    )
+                    write_logs()
                     break
 
                 total_tool_calls += 1
@@ -423,9 +431,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                             "content": auto_summary,
                         }
                     )
-                self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
+                write_logs()
 
-        self._write_model_backed_logs(trajectory, final_text, model, instruction_hash)
+        write_logs()
 
         context.metadata = {
             **(context.metadata or {}),
@@ -435,6 +443,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             "instruction_sha256": instruction_hash,
             "tool_calls": total_tool_calls,
             "max_steps": max_steps,
+            "usage": total_usage,
         }
 
     def _write_model_backed_logs(
@@ -443,6 +452,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         final_text: str,
         model: str,
         instruction_hash: str,
+        usage: dict[str, int] | None = None,
     ) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         (self.logs_dir / "final.txt").write_text(final_text)
@@ -453,6 +463,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     "mode": "model-backed",
                     "model": model,
                     "instruction_sha256": instruction_hash,
+                    "usage": usage or {},
                     "steps": trajectory,
                 },
                 indent=2,
@@ -461,6 +472,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         )
         (self.logs_dir / "trajectory.jsonl").write_text(
             "\n".join(json.dumps(item, sort_keys=True) for item in trajectory) + "\n"
+        )
+        (self.logs_dir / "usage.json").write_text(
+            json.dumps(usage or {}, indent=2, sort_keys=True)
         )
 
     def _chat_messages_for_model(
@@ -791,6 +805,13 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         message = choices[0].get("message") or {}
         if not isinstance(message, dict):
             raise RuntimeError("model response message was not an object")
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            message["_codefactory_usage"] = {
+                "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage.get("completion_tokens") or 0),
+                "total_tokens": int(usage.get("total_tokens") or 0),
+            }
         return message
 
     def _bounded_model_timeout(self, remaining_sec: float) -> int:

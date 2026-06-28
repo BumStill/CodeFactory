@@ -135,6 +135,7 @@ pub struct BenchmarkTrialRecord {
     pub duration_ms: Option<i64>,
     pub error_kind: Option<String>,
     pub failure_class: Option<String>,
+    pub failure_reason: Option<String>,
     pub trajectory_path: Option<String>,
     pub verifier_stdout_path: Option<String>,
     pub verifier_stderr_path: Option<String>,
@@ -159,6 +160,7 @@ pub struct BenchmarkProviderBridgeRequest {
     pub endpoint_name: Option<String>,
     pub model: Option<String>,
     pub task_limit: Option<u32>,
+    pub task_names: Option<Vec<String>>,
     pub concurrency: Option<u32>,
     // Backwards-compatible alias for older clients. Harbor uses `-n` as
     // concurrency, not repeated trial count.
@@ -179,6 +181,7 @@ pub struct BenchmarkProviderBridgePreview {
     pub key_ref: String,
     pub agent_import_path: String,
     pub task_limit: u32,
+    pub task_names: Vec<String>,
     pub concurrency: u32,
     pub trial_count: u32,
     pub job_root: String,
@@ -279,11 +282,22 @@ pub fn preview_provider_bridge(
         .key_ref
         .clone()
         .unwrap_or_else(|| format!("codefactory.endpoint.{endpoint_name}"));
+    let task_names = normalize_task_names(request.task_names.as_deref());
     let task_limit = request
         .task_limit
-        .unwrap_or(profile.default_smoke_task_limit)
+        .unwrap_or_else(|| {
+            if task_names.is_empty() {
+                profile.default_smoke_task_limit
+            } else {
+                task_names.len() as u32
+            }
+        })
         .max(1);
-    let concurrency = request.concurrency.or(request.trial_count).unwrap_or(4).max(1);
+    let concurrency = request
+        .concurrency
+        .or(request.trial_count)
+        .unwrap_or(4)
+        .max(1);
     let trial_count = 1;
     let job_root = request
         .job_root
@@ -351,6 +365,7 @@ pub fn preview_provider_bridge(
         &profile,
         &model,
         task_limit,
+        &task_names,
         concurrency,
         &job_root,
         &job_name,
@@ -371,6 +386,7 @@ pub fn preview_provider_bridge(
         key_ref,
         agent_import_path: CODEFACTORY_HARBOR_AGENT.to_string(),
         task_limit,
+        task_names,
         concurrency,
         trial_count,
         job_root,
@@ -456,6 +472,7 @@ where
             &preview.profile,
             &preview.model,
             preview.task_limit,
+            &preview.task_names,
             preview.concurrency,
             &preview.job_root,
             &preview.job_name,
@@ -526,6 +543,16 @@ pub fn probe_environment_from_command_results(
         detail: truncate_probe_detail(&docker),
     });
 
+    if docker.available {
+        let (status, detail) = docker_resource_probe_detail(&docker.stdout);
+        items.push(BenchmarkProbeItem {
+            id: "docker-resources".to_string(),
+            label: "Docker resources".to_string(),
+            status,
+            detail,
+        });
+    }
+
     items.push(BenchmarkProbeItem {
         id: "dataset".to_string(),
         label: "Dataset".to_string(),
@@ -570,6 +597,39 @@ fn probe_command(binary: &Path, args: &[&str]) -> ProbeCommandResult {
         ),
         Err(_) => ProbeCommandResult::missing(&binary_label),
     }
+}
+
+fn docker_resource_probe_detail(docker_info_stdout: &str) -> (ProbeStatus, String) {
+    match parse_docker_cpus(docker_info_stdout) {
+        Some(cpus) if cpus < 4.0 => (
+            ProbeStatus::Warning,
+            format!(
+                "Docker reports {cpus:.2} CPUs; Terminal-Bench 2.1 tasks can request more resources, and prior full runs saw CPU-limit environment failures."
+            ),
+        ),
+        Some(cpus) => (
+            ProbeStatus::Ok,
+            format!("Docker reports {cpus:.2} CPUs."),
+        ),
+        None => (
+            ProbeStatus::Warning,
+            "Could not parse Docker CPU count from `docker info`; resource-related failures may be misattributed.".to_string(),
+        ),
+    }
+}
+
+fn parse_docker_cpus(docker_info_stdout: &str) -> Option<f64> {
+    for line in docker_info_stdout.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("cpus:") || lower.starts_with("ncpu:") {
+            let value = trimmed.split_once(':')?.1.trim();
+            if let Ok(parsed) = value.parse::<f64>() {
+                return Some(parsed);
+            }
+        }
+    }
+    None
 }
 
 fn execute_provider_launch(
@@ -636,11 +696,12 @@ fn harbor_run_args(
     profile: &BenchmarkProfile,
     model: &str,
     task_limit: u32,
+    task_names: &[String],
     concurrency: u32,
     job_root: &str,
     job_name: &str,
 ) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "run".to_string(),
         "-d".to_string(),
         profile.dataset.clone(),
@@ -648,6 +709,12 @@ fn harbor_run_args(
         CODEFACTORY_HARBOR_AGENT.to_string(),
         "-m".to_string(),
         model.to_string(),
+    ];
+    for task_name in task_names {
+        args.push("-i".to_string());
+        args.push(task_name.to_string());
+    }
+    args.extend([
         "-l".to_string(),
         task_limit.to_string(),
         "-n".to_string(),
@@ -657,7 +724,18 @@ fn harbor_run_args(
         "--job-name".to_string(),
         job_name.to_string(),
         "-y".to_string(),
-    ]
+    ]);
+    args
+}
+
+fn normalize_task_names(task_names: Option<&[String]>) -> Vec<String> {
+    task_names
+        .unwrap_or(&[])
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn command_preview(env_preview: &[BenchmarkEnvVarPreview], args: &[String]) -> String {
@@ -789,6 +867,7 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
             duration_ms           INTEGER,
             error_kind            TEXT,
             failure_class         TEXT,
+            failure_reason        TEXT,
             trajectory_path       TEXT,
             verifier_stdout_path  TEXT,
             verifier_stderr_path  TEXT,
@@ -798,14 +877,35 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    ensure_column(pool, "benchmark_trials", "failure_reason", "TEXT").await?;
 
     for index in [
         "CREATE INDEX IF NOT EXISTS idx_benchmark_runs_benchmark ON benchmark_runs(benchmark_id)",
         "CREATE INDEX IF NOT EXISTS idx_benchmark_runs_created ON benchmark_runs(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_benchmark_trials_run ON benchmark_trials(run_id)",
         "CREATE INDEX IF NOT EXISTS idx_benchmark_trials_failure ON benchmark_trials(failure_class)",
+        "CREATE INDEX IF NOT EXISTS idx_benchmark_trials_failure_reason ON benchmark_trials(failure_reason)",
     ] {
         sqlx::query(index).execute(pool).await?;
+    }
+    Ok(())
+}
+
+async fn ensure_column(pool: &SqlitePool, table: &str, column: &str, col_type: &str) -> Result<()> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await?;
+    let exists = rows.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .map(|name| name == column)
+            .unwrap_or(false)
+    });
+    if !exists {
+        sqlx::query(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {col_type}"
+        ))
+        .execute(pool)
+        .await?;
     }
     Ok(())
 }
@@ -961,6 +1061,7 @@ fn import_trials(run_id: &str, job_path: &Path) -> Result<Vec<BenchmarkTrialReco
         ]
         .join("\n");
 
+        let failure = classify_failure_detail(reward, &evidence);
         trials.push(BenchmarkTrialRecord {
             id: Uuid::new_v4().to_string(),
             run_id: run_id.to_string(),
@@ -975,7 +1076,8 @@ fn import_trials(run_id: &str, job_path: &Path) -> Result<Vec<BenchmarkTrialReco
             error_kind: json_string(&result, &["error_kind"])
                 .or_else(|| json_string(&result, &["exception_info", "type"]))
                 .or_else(|| json_string(&result, &["exception_info", "exception_type"])),
-            failure_class: classify_failure(reward, &evidence),
+            failure_class: failure.failure_class,
+            failure_reason: failure.failure_reason,
             trajectory_path: trajectory_path.map(|path| path.to_string_lossy().to_string()),
             verifier_stdout_path: verifier_stdout_path
                 .map(|path| path.to_string_lossy().to_string()),
@@ -1034,16 +1136,29 @@ fn harbor_trial_dirs(job_path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn classify_failure(reward: f64, evidence: &str) -> Option<String> {
+    classify_failure_detail(reward, evidence).failure_class
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailureDetail {
+    failure_class: Option<String>,
+    failure_reason: Option<String>,
+}
+
+fn classify_failure_detail(reward: f64, evidence: &str) -> FailureDetail {
     if reward >= 1.0 {
-        return None;
+        return FailureDetail {
+            failure_class: None,
+            failure_reason: None,
+        };
     }
     let text = evidence.to_lowercase();
-    let class = if text.contains("permission")
+    let (class, reason) = if text.contains("permission")
         || text.contains("denied")
         || text.contains("not allowed")
         || text.contains("outside workspace")
     {
-        "policy"
+        ("policy", "policy-denied-command")
     } else if text.contains("model request failed")
         || text.contains("chat/completions")
         || text.contains("insufficient balance")
@@ -1056,33 +1171,48 @@ fn classify_failure(reward: f64, evidence: &str) -> Option<String> {
         || text.contains("http 403")
         || text.contains("http 429")
     {
-        "model-provider"
+        ("model-provider", "provider-api-error")
+    } else if text.contains("failed to add tests directory") || text.contains("addtestsdirerror") {
+        ("environment", "harbor-tests-upload-failed")
+    } else if text.contains("range of cpus is from") || text.contains("as there are only") {
+        ("environment", "docker-cpu-limit")
+    } else if text.contains("verifiertimeouterror") {
+        ("verification", "verifier-timeout")
+    } else if text.contains("agenttimeouterror") {
+        ("long-horizon", "agent-timeout")
+    } else if text.contains("command timed out after")
+        || text.contains("runtimeerror: command timed out")
+    {
+        ("long-horizon", "command-timeout")
     } else if text.contains("command not found")
         || text.contains("no such file")
         || text.contains("exit status 127")
         || text.contains("syntax error")
     {
-        "tool-use"
+        ("tool-use", "bad-command-or-missing-file")
     } else if text.contains("assert")
         || text.contains("expected")
         || text.contains("pytest")
         || text.contains("test failed")
     {
-        "verification"
+        ("verification", "verifier-assertion-failed")
     } else if text.contains("timeout") || text.contains("timed out") {
-        "long-horizon"
+        ("long-horizon", "timeout")
     } else if text.contains("docker")
         || text.contains("network")
         || text.contains("dependency")
         || text.contains("package")
     {
-        "environment"
+        ("environment", "environment-runtime")
     } else if text.contains("context") || text.contains("instruction") || text.contains("readme") {
-        "context"
+        ("context", "context-or-instruction")
     } else {
-        "planning"
+        ("planning", "unclassified-agent-failure")
     };
-    Some(class.to_string())
+    FailureDetail {
+        failure_class: Some(class.to_string()),
+        failure_reason: Some(reason.to_string()),
+    }
 }
 
 fn first_existing_path(base: &Path, candidates: &[&str]) -> Option<PathBuf> {
@@ -1207,8 +1337,9 @@ async fn persist_trial(pool: &SqlitePool, trial: &BenchmarkTrialRecord) -> Resul
     sqlx::query(
         "INSERT INTO benchmark_trials (
             id, run_id, task_name, category, difficulty, reward, duration_ms, error_kind,
-            failure_class, trajectory_path, verifier_stdout_path, verifier_stderr_path, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            failure_class, failure_reason, trajectory_path, verifier_stdout_path,
+            verifier_stderr_path, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&trial.id)
     .bind(&trial.run_id)
@@ -1219,6 +1350,7 @@ async fn persist_trial(pool: &SqlitePool, trial: &BenchmarkTrialRecord) -> Resul
     .bind(trial.duration_ms)
     .bind(&trial.error_kind)
     .bind(&trial.failure_class)
+    .bind(&trial.failure_reason)
     .bind(&trial.trajectory_path)
     .bind(&trial.verifier_stdout_path)
     .bind(&trial.verifier_stderr_path)
@@ -1327,10 +1459,27 @@ mod tests {
         let ready_probe = probe_environment_from_command_results(
             "terminal-bench-2.1",
             ProbeCommandResult::ok("harbor", "harbor help"),
-            ProbeCommandResult::ok("docker", "Docker running"),
+            ProbeCommandResult::ok("docker", "Docker running\nCPUs: 2\n"),
         )
         .expect("ready probe");
         assert!(ready_probe.ready);
+        let docker_resources = ready_probe
+            .items
+            .iter()
+            .find(|item| item.id == "docker-resources")
+            .expect("docker resource probe item");
+        assert_eq!(docker_resources.status, ProbeStatus::Warning);
+        assert!(docker_resources.detail.contains("2.00 CPUs"));
+    }
+
+    #[test]
+    fn docker_resource_probe_parses_cpu_count() {
+        assert_eq!(parse_docker_cpus("Server:\n CPUs: 8\n"), Some(8.0));
+
+        let (status, detail) = docker_resource_probe_detail("Server:\n CPUs: 2\n");
+
+        assert_eq!(status, ProbeStatus::Warning);
+        assert!(detail.contains("2.00 CPUs"));
     }
 
     #[tokio::test]
@@ -1415,6 +1564,10 @@ mod tests {
             .expect("failed trial imported");
         assert_eq!(failed.reward, 0.0);
         assert_eq!(failed.failure_class.as_deref(), Some("policy"));
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("policy-denied-command")
+        );
 
         let persisted_trials: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM benchmark_trials WHERE run_id = ?")
@@ -1423,6 +1576,13 @@ mod tests {
                 .await
                 .expect("count persisted trials");
         assert_eq!(persisted_trials, 2);
+        let persisted_reason: String = sqlx::query_scalar(
+            "SELECT failure_reason FROM benchmark_trials WHERE task_name = 'task-fail'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read failure reason");
+        assert_eq!(persisted_reason, "policy-denied-command");
     }
 
     #[tokio::test]
@@ -1633,6 +1793,31 @@ mod tests {
     }
 
     #[test]
+    fn failure_classifier_records_specific_infra_reasons() {
+        let cpu = classify_failure_detail(
+            0.0,
+            "Error response from daemon: range of CPUs is from 0.01 to 2.00, as there are only 2 CPUs available",
+        );
+        assert_eq!(cpu.failure_class.as_deref(), Some("environment"));
+        assert_eq!(cpu.failure_reason.as_deref(), Some("docker-cpu-limit"));
+
+        let upload = classify_failure_detail(
+            0.0,
+            "harbor.verifier.verifier.AddTestsDirError: Failed to add tests directory to environment.",
+        );
+        assert_eq!(upload.failure_class.as_deref(), Some("environment"));
+        assert_eq!(
+            upload.failure_reason.as_deref(),
+            Some("harbor-tests-upload-failed")
+        );
+
+        let timeout =
+            classify_failure_detail(0.0, "RuntimeError: Command timed out after 60 seconds");
+        assert_eq!(timeout.failure_class.as_deref(), Some("long-horizon"));
+        assert_eq!(timeout.failure_reason.as_deref(), Some("command-timeout"));
+    }
+
+    #[test]
     fn provider_bridge_preview_uses_current_deepseek_without_exposing_secret() {
         let settings = settings_with_deepseek_endpoint();
         let preview = preview_provider_bridge(
@@ -1642,6 +1827,10 @@ mod tests {
                 endpoint_name: None,
                 model: None,
                 task_limit: Some(1),
+                task_names: Some(vec![
+                    "write-compressor".to_string(),
+                    "extract-elf".to_string(),
+                ]),
                 concurrency: Some(3),
                 trial_count: Some(1),
                 job_root: Some("/tmp/cf-bench".to_string()),
@@ -1655,6 +1844,10 @@ mod tests {
         assert_eq!(preview.base_url, "https://api.deepseek.com");
         assert_eq!(preview.model, "deepseek-v4-flash");
         assert_eq!(preview.key_ref, "codefactory.endpoint.deepseek");
+        assert_eq!(
+            preview.task_names,
+            vec!["write-compressor".to_string(), "extract-elf".to_string()]
+        );
         assert_eq!(preview.concurrency, 3);
         assert_eq!(preview.trial_count, 1);
         assert!(preview.ready);
@@ -1669,6 +1862,8 @@ mod tests {
             .command_preview
             .contains("CODEFACTORY_BENCH_API_KEY='<redacted:codefactory.endpoint.deepseek>'"));
         assert!(preview.command_preview.contains("-m deepseek-v4-flash"));
+        assert!(preview.command_preview.contains("-i write-compressor"));
+        assert!(preview.command_preview.contains("-i extract-elf"));
         assert!(preview.command_preview.contains("-n 3"));
     }
 
@@ -1681,6 +1876,7 @@ mod tests {
                 endpoint_name: None,
                 model: None,
                 task_limit: Some(1),
+                task_names: None,
                 concurrency: None,
                 trial_count: Some(1),
                 job_root: Some("/tmp/cf-bench".to_string()),
@@ -1707,6 +1903,7 @@ mod tests {
             endpoint_name: None,
             model: None,
             task_limit: Some(1),
+            task_names: None,
             concurrency: None,
             trial_count: Some(1),
             job_root: Some("/tmp/cf-bench".to_string()),
@@ -1791,6 +1988,16 @@ mod tests {
             "CODEFACTORY_BENCH_CONCURRENCY",
             env_u32("CODEFACTORY_BENCH_TRIAL_COUNT", 4),
         );
+        let task_names = std::env::var("CODEFACTORY_BENCH_TASK_NAMES")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|names| !names.is_empty());
         let job_root = std::env::var("CODEFACTORY_BENCH_JOB_ROOT").unwrap_or_else(|_| {
             repo_root
                 .join(".codefactory/benchmark-jobs")
@@ -1807,6 +2014,7 @@ mod tests {
             endpoint_name: Some(endpoint_name),
             model,
             task_limit: Some(task_limit),
+            task_names,
             concurrency: Some(concurrency),
             trial_count: None,
             job_root: Some(job_root),

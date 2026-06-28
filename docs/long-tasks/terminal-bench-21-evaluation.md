@@ -57,10 +57,13 @@
 - Ran the first full Terminal-Bench 2.1 CodeFactory provider-backed evaluation using `codefactory-headless` with DeepSeek backend over all 89 tasks.
 - Imported the full Harbor job with CodeFactory's importer; importer reported `comparable=true`, `trials=89`, and preserved per-trial failure classes.
 - Corrected provider bridge semantics so Harbor concurrency is exposed as `concurrency`; the old `trial_count` field remains only as a backward-compatible alias because Harbor `-n` is concurrency, not repeated trial count.
+- Added provider usage capture in the headless adapter: future model-backed runs write `usage.json`, include aggregate usage in `trajectory.json`, and attach usage to context metadata when the provider reports it.
+- Added fine-grained `failure_reason` import/persistence and Docker CPU resource preflight so environment/resource failures are separated from agent execution failures before scoring product changes.
+- Added fixed regression subset `docs/benchmark-subsets/terminal-bench-21-regression-subset-v1.json` and provider bridge `task_names` support using Harbor `--include-task-name`.
 
 ## Remaining Items
-- Build a fixed regression subset from the full-run failure mix: passing smoke tasks, verifier-zero tasks, command-timeout tasks, Docker/resource failures, and AddTestsDir failures.
-- Fix evaluation infrastructure gaps found by the full run: explicit concurrency UI/API, Docker resource preflight, token/cost capture, and clearer separation of environment failures from agent failures.
+- Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
+- Add cost calculation once provider pricing metadata is available; current adapter captures provider-reported token usage but does not price it.
 - Improve long-horizon execution with better step budgeting, background process supervision, service readiness checks, long command timeout policy, and resumable artifact verification.
 - Improve verification repair so verifier stdout becomes concrete patch goals and expected artifacts remain first-class state.
 - Generalize post-candidate repair so task-specific protocol repair becomes reusable capability, not only a `write-compressor` special case.
@@ -108,6 +111,8 @@
 - Full-run exception summary from Harbor: `RuntimeError=58`, `AddTestsDirError=3`, `AgentTimeoutError=1`, `VerifierTimeoutError=1`.
 - Full-run cost/token evidence: `cost_usd=null`, `n_input_tokens=null`, `n_output_tokens=null`; current custom-agent import does not capture provider token usage or cost.
 - Full-run import evidence: `CODEFACTORY_BENCHMARK_JOB_PATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260628-085422 cargo test benchmark::tests::import_harbor_job_from_env_path --lib -- --ignored --nocapture` passed and imported `89` trials.
+- Infrastructure follow-up evidence: `PYTHONPATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design /Users/leo/.local/share/uv/tools/harbor/bin/python tests/test_codefactory_bench_agent.py` passes with provider usage aggregation coverage; `cargo test benchmark::tests --lib` passes with `failure_reason`, Docker CPU preflight, task-name filtering, and provider bridge coverage.
+- Regression subset evidence: `docs/benchmark-subsets/terminal-bench-21-regression-subset-v1.json` contains 18 tasks selected from the full-run failure mix and is runnable through provider bridge `task_names` / Harbor `--include-task-name`.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.

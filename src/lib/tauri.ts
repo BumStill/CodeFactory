@@ -159,6 +159,7 @@ export interface BenchmarkProviderBridgeRequest {
   endpoint_name?: string | null;
   model?: string | null;
   task_limit?: number | null;
+  task_names?: string[] | null;
   concurrency?: number | null;
   /** Deprecated compatibility alias; Harbor `-n` means concurrency. */
   trial_count?: number | null;
@@ -177,6 +178,7 @@ export interface BenchmarkProviderBridgePreview {
   key_ref: string;
   agent_import_path: string;
   task_limit: number;
+  task_names: string[];
   concurrency: number;
   trial_count: number;
   job_root: string;
@@ -222,6 +224,7 @@ export interface BenchmarkTrialRecord {
   duration_ms?: number | null;
   error_kind?: string | null;
   failure_class?: string | null;
+  failure_reason?: string | null;
   trajectory_path?: string | null;
   verifier_stdout_path?: string | null;
   verifier_stderr_path?: string | null;

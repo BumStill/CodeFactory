@@ -1,0 +1,146 @@
+{
+  "id": "terminal-bench-21-regression-subset-v1",
+  "dataset": "terminal-bench/terminal-bench-2-1",
+  "dataset_ref": "sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a",
+  "source_run_id": "7ff6ef13-4488-4e0f-afd0-a1f9bd16d561",
+  "source_job_path": "/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260628-085422",
+  "evaluation_axis": "codefactory-agent-capability",
+  "evaluation_subject": "codefactory-headless",
+  "model_backend": "deepseek-v4-pro",
+  "created_at": "2026-06-28",
+  "selection_policy": "Representative 18-task subset from the first full CodeFactory Terminal-Bench 2.1 run. Covers passing smoke tasks, verifier-zero tasks, tool-use failures, long-horizon command timeouts, Docker resource failures, and Harbor tests-upload failures.",
+  "harbor_cli": {
+    "task_filter_flag": "--include-task-name",
+    "concurrency": 4,
+    "task_limit": 18,
+    "command_template": "CODEFACTORY_BENCH_TASK_NAMES='<comma-separated task names>' CODEFACTORY_BENCH_TASK_LIMIT=18 CODEFACTORY_BENCH_CONCURRENCY=4 cargo test benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_from_local_settings --lib -- --ignored --nocapture"
+  },
+  "tasks": [
+    {
+      "name": "write-compressor",
+      "baseline_reward": 1,
+      "baseline_failure_class": null,
+      "bucket": "passed-smoke",
+      "reason": "Artifact creation plus protocol auto-repair regression guard."
+    },
+    {
+      "name": "extract-elf",
+      "baseline_reward": 1,
+      "baseline_failure_class": null,
+      "bucket": "passed-smoke",
+      "reason": "Binary inspection and extraction success case."
+    },
+    {
+      "name": "filter-js-from-html",
+      "baseline_reward": 1,
+      "baseline_failure_class": null,
+      "bucket": "passed-smoke",
+      "reason": "Text transformation success case."
+    },
+    {
+      "name": "nginx-request-logging",
+      "baseline_reward": 1,
+      "baseline_failure_class": null,
+      "bucket": "passed-smoke",
+      "reason": "Service configuration success case."
+    },
+    {
+      "name": "circuit-fibsqrt",
+      "baseline_reward": 0,
+      "baseline_failure_class": "verification",
+      "bucket": "verifier-zero",
+      "reason": "Expected artifact exists but verifier remains unsatisfied."
+    },
+    {
+      "name": "configure-git-webserver",
+      "baseline_reward": 0,
+      "baseline_failure_class": "verification",
+      "bucket": "verifier-zero",
+      "reason": "Service/config verifier failure without Harbor exception."
+    },
+    {
+      "name": "mteb-retrieve",
+      "baseline_reward": 0,
+      "baseline_failure_class": "verification",
+      "bucket": "verifier-zero",
+      "reason": "Data retrieval/output correctness failure."
+    },
+    {
+      "name": "sanitize-git-repo",
+      "baseline_reward": 0,
+      "baseline_failure_class": "verification",
+      "bucket": "verifier-zero",
+      "reason": "Git artifact correctness failure."
+    },
+    {
+      "name": "query-optimize",
+      "baseline_reward": 0,
+      "baseline_failure_class": "verification",
+      "bucket": "verifier-timeout",
+      "reason": "VerifierTimeoutError case from the full run."
+    },
+    {
+      "name": "count-dataset-tokens",
+      "baseline_reward": 0,
+      "baseline_failure_class": "tool-use",
+      "bucket": "tool-use",
+      "reason": "Artifact/output task where the agent produced a final answer but failed verifier."
+    },
+    {
+      "name": "install-windows-3.11",
+      "baseline_reward": 0,
+      "baseline_failure_class": "tool-use",
+      "bucket": "tool-use",
+      "reason": "Long interactive setup pressure plus tool discipline."
+    },
+    {
+      "name": "protein-assembly",
+      "baseline_reward": 0,
+      "baseline_failure_class": "tool-use",
+      "bucket": "tool-use",
+      "reason": "Repeated inspection and external-data temptation case."
+    },
+    {
+      "name": "build-cython-ext",
+      "baseline_reward": 0,
+      "baseline_failure_class": "long-horizon",
+      "bucket": "command-timeout",
+      "reason": "Command timed out after 60 seconds."
+    },
+    {
+      "name": "kv-store-grpc",
+      "baseline_reward": 0,
+      "baseline_failure_class": "long-horizon",
+      "bucket": "command-timeout",
+      "reason": "Service/build command timeout."
+    },
+    {
+      "name": "sparql-university",
+      "baseline_reward": 0,
+      "baseline_failure_class": "long-horizon",
+      "bucket": "command-timeout",
+      "reason": "Repeated inspection plus command timeout."
+    },
+    {
+      "name": "torch-tensor-parallelism",
+      "baseline_reward": 0,
+      "baseline_failure_class": "long-horizon",
+      "bucket": "command-timeout",
+      "reason": "ML/runtime command timeout."
+    },
+    {
+      "name": "caffe-cifar-10",
+      "baseline_reward": 0,
+      "baseline_failure_class": "environment",
+      "bucket": "docker-resource",
+      "reason": "Docker CPU availability failure on the first full run."
+    },
+    {
+      "name": "qemu-startup",
+      "baseline_reward": 0,
+      "baseline_failure_class": "environment",
+      "bucket": "harbor-tests-upload",
+      "reason": "AddTestsDirError / failed tests-directory upload."
+    }
+  ]
+}
