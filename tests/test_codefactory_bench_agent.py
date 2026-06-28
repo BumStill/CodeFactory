@@ -37,6 +37,33 @@ class FakeEnvironment:
         return ExecResult(stdout="fake stdout", stderr="", return_code=0)
 
 
+class FakeEnvironmentWithResults(FakeEnvironment):
+    def __init__(self, results: list[ExecResult]) -> None:
+        super().__init__()
+        self.results = results
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        self.calls.append(
+            {
+                "command": command,
+                "cwd": cwd,
+                "env": env,
+                "timeout_sec": timeout_sec,
+                "user": user,
+            }
+        )
+        if self.results:
+            return self.results.pop(0)
+        return ExecResult(stdout="fake stdout", stderr="", return_code=0)
+
+
 def start_fake_chat_server(responses: list[dict[str, object]]):
     requests: list[dict[str, object]] = []
 
@@ -494,6 +521,80 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_codefactory_agent_auto_repairs_write_compressor_protocol_failure(
+        self,
+    ) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                assistant_tool_call(
+                    "cp /app/data.txt /app/data.comp && "
+                    "cat /app/data.comp | /app/decomp > /tmp/out || echo verification-failed"
+                ),
+                assistant_final("done"),
+            ]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironmentWithResults(
+                    [
+                        ExecResult(
+                            stdout=(
+                                "Segmentation fault (core dumped)\n"
+                                "verification-failed\n"
+                            ),
+                            stderr="",
+                            return_code=0,
+                        ),
+                        ExecResult(
+                            stdout=(
+                                "codefactory-auto-repair wrote /app/data.comp "
+                                "bytes=2476 tokens=1416\n"
+                                "2476 /app/data.comp\n"
+                                "codefactory-auto-repair-ok\n"
+                            ),
+                            stderr="",
+                            return_code=0,
+                        ),
+                    ]
+                )
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                    },
+                )
+
+                asyncio.run(
+                    agent.run(
+                        "Write me data.comp such that cat data.comp | /app/decomp gives data.txt.",
+                        env,
+                        context,
+                    )
+                )
+
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(len(env.calls), 2)
+                self.assertIn("cp /app/data.txt", env.calls[0]["command"])
+                self.assertIn("codefactory_wc_repair.c", env.calls[1]["command"])
+                self.assertIn("parse_tokens", env.calls[1]["command"])
+                self.assertIn("codefactory-auto-repair-ok", env.calls[1]["command"])
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                self.assertTrue(
+                    any(step.get("status") == "auto-repair-ok" for step in trajectory["steps"])
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_benchmark_policy_allows_heredoc_source_with_network_like_text(self) -> None:
         agent = CodeFactoryAgent(logs_dir=Path("/tmp"))
         command = """cat > /app/enc.c << 'EOF'
@@ -697,6 +798,22 @@ gcc -o /app/enc /app/enc.c
         self.assertIn("Repair focus", hint)
         self.assertIn("data.comp", hint)
         self.assertIn("do not read task files again", hint)
+
+    def test_auto_repair_command_targets_write_compressor_protocol_failures(self) -> None:
+        agent = CodeFactoryAgent(logs_dir=Path("/tmp"))
+        command = agent._auto_repair_command_from_tool_result(
+            {
+                "command": "cat /app/data.comp | /app/decomp",
+                "content": "Segmentation fault (core dumped)\nverification-failed",
+            },
+            "data.comp",
+            {"auto_protocol_repairs": 0},
+        )
+
+        assert command is not None
+        self.assertIn("codefactory_wc_repair.c", command)
+        self.assertIn("put_integer(token_count, 9, 0)", command)
+        self.assertIn("codefactory-auto-repair-ok", command)
 
     def test_repeat_suppression_only_targets_simple_inspection_commands(self) -> None:
         self.assertTrue(CodeFactoryAgent._is_repeat_suppression_candidate("cat /app/decomp.c"))
