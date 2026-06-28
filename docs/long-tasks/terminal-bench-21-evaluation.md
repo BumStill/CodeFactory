@@ -63,6 +63,7 @@
 - Added first long-horizon resilience improvement: model-backed `environment.exec` exceptions are recorded as `exec-error` trajectory entries with `command-timeout` / environment / runtime detail and metadata counters, then returned to the model for recovery instead of aborting the whole Harbor trial.
 - Added foreground service supervision guard: obvious long-running service commands are suppressed unless they are backgrounded/supervised, with a repair prompt requiring log redirection, pid capture, and bounded readiness checks.
 - Added first verifier-repair improvement: pytest/assertion/traceback style failed self-check output now produces a concrete repair reminder requiring implementation changes and a rerun of the smallest failing check before final answer.
+- Added provider credential-access timeout for benchmark bridge: macOS keychain reads now use a bounded, killable `security` subprocess for benchmark launch, so keychain authorization hangs become explicit infrastructure blockers instead of indefinite waits.
 
 ## Remaining Items
 - Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
@@ -76,7 +77,8 @@
 - Compare at least one baseline/head subset after an implementation change.
 
 ## Blockers
-- No current blocker for local full-run evaluation. The current full-run result is a valid CodeFactory agent capability baseline, not a provider/account blocker.
+- No current blocker for the already completed local full-run evaluation. The current full-run result is a valid CodeFactory agent capability baseline, not a provider/account blocker.
+- Current regression-subset rerun blocker in this Codex session: macOS keychain read for `com.codefactory.app` / `codefactory.endpoint.deepseek` requires authorization and blocked before Harbor spawn. Evidence before the fix: the real provider bridge printed preview for job `cf-tb21-codefactory-provider-deepseek-20260628-150115`, but no Harbor job directory was created; direct `security find-generic-password -s com.codefactory.app -a codefactory.endpoint.deepseek -w >/dev/null` also hung until interrupted. After the fix, the same real bridge path with `CODEFACTORY_BENCH_SECRET_TIMEOUT_SEC=5` exits in about 5 seconds with `Benchmark provider secret lookup timed out after 5s; unlock or authorize the OS credential store and retry`. This is infrastructure/credential-access blocking evidence, not an agent score.
 - Official leaderboard submission process is separate from local evaluation and not covered by this first implementation slice.
 
 ## Evidence
@@ -117,6 +119,7 @@
 - Infrastructure follow-up evidence: `PYTHONPATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design /Users/leo/.local/share/uv/tools/harbor/bin/python tests/test_codefactory_bench_agent.py` passes with provider usage aggregation coverage; `cargo test benchmark::tests --lib` passes with `failure_reason`, Docker CPU preflight, task-name filtering, and provider bridge coverage.
 - Regression subset evidence: `docs/benchmark-subsets/terminal-bench-21-regression-subset-v1.json` contains 18 tasks selected from the full-run failure mix and is runnable through provider bridge `task_names` / Harbor `--include-task-name`.
 - Long-horizon / verifier-repair local evidence: `PYTHONPATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design /Users/leo/.local/share/uv/tools/harbor/bin/python tests/test_codefactory_bench_agent.py` passes 32 tests, including command-timeout `exec-error` recovery, foreground service supervision guard, and failed self-check repair reminder coverage.
+- Provider credential blocker evidence: `CODEFACTORY_BENCH_SECRET_TIMEOUT_SEC=5 CODEFACTORY_RUN_REAL_PROVIDER_BRIDGE=1 ... cargo test benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_from_local_settings --lib -- --ignored --nocapture` now fails fast with the explicit keychain timeout message instead of hanging before Harbor job creation.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.

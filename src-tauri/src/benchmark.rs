@@ -7,7 +7,8 @@ use sqlx::{Row, SqlitePool};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::config::settings::{normalize_model_id, ApiStyle, Settings};
@@ -17,6 +18,8 @@ use crate::util::no_window::NoWindow;
 const TERMINAL_BENCH_21_PROFILE_ID: &str = "terminal-bench-2.1";
 const TERMINAL_BENCH_21_DATASET: &str = "terminal-bench/terminal-bench-2-1";
 const CODEFACTORY_HARBOR_AGENT: &str = "codefactory_bench.agent:CodeFactoryAgent";
+const CODEFACTORY_KEYRING_SERVICE: &str = "com.codefactory.app";
+const DEFAULT_PROVIDER_SECRET_LOOKUP_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BenchmarkProfile {
@@ -406,7 +409,7 @@ pub async fn start_provider_benchmark_run(
     settings: &Settings,
     request: StartBenchmarkProviderRunRequest,
 ) -> Result<BenchmarkProviderRunResult> {
-    let launch = resolve_authorized_provider_launch(settings, &request, crate::secrets::get_key)?;
+    let launch = resolve_authorized_provider_launch_with_timeout(settings, &request).await?;
     let preview = launch.preview.clone();
     let job_path = preview.job_path.clone();
     let output = tokio::task::spawn_blocking(move || execute_provider_launch(launch))
@@ -434,6 +437,24 @@ pub async fn start_provider_benchmark_run(
     })
 }
 
+async fn resolve_authorized_provider_launch_with_timeout(
+    settings: &Settings,
+    request: &StartBenchmarkProviderRunRequest,
+) -> Result<AuthorizedBenchmarkProviderLaunch> {
+    let preview = authorized_provider_preview(settings, request)?;
+    let key_ref = preview.key_ref.clone();
+    let timeout = provider_secret_lookup_timeout();
+    let api_key = lookup_provider_secret_for_benchmark(key_ref.clone(), timeout)
+        .await?
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "API key not found for benchmark provider key_ref '{}'",
+                key_ref
+            ))
+        })?;
+    build_authorized_provider_launch(preview, api_key)
+}
+
 fn resolve_authorized_provider_launch<F>(
     settings: &Settings,
     request: &StartBenchmarkProviderRunRequest,
@@ -442,18 +463,7 @@ fn resolve_authorized_provider_launch<F>(
 where
     F: FnMut(&str) -> Result<Option<String>>,
 {
-    let preview = preview_provider_bridge(settings, &request.bridge)?;
-    if !preview.ready {
-        return Err(AppError::Other(format!(
-            "Benchmark provider bridge is not ready: {}",
-            preview.blockers.join("; ")
-        )));
-    }
-    if request.authorization_phrase.trim() != preview.authorization_phrase {
-        return Err(AppError::Other(
-            "Benchmark provider authorization phrase did not match".to_string(),
-        ));
-    }
+    let preview = authorized_provider_preview(settings, request)?;
     let api_key = secret_lookup(&preview.key_ref)?.ok_or_else(|| {
         AppError::Other(format!(
             "API key not found for benchmark provider key_ref '{}'",
@@ -467,6 +477,32 @@ where
         )));
     }
 
+    build_authorized_provider_launch(preview, api_key)
+}
+
+fn authorized_provider_preview(
+    settings: &Settings,
+    request: &StartBenchmarkProviderRunRequest,
+) -> Result<BenchmarkProviderBridgePreview> {
+    let preview = preview_provider_bridge(settings, &request.bridge)?;
+    if !preview.ready {
+        return Err(AppError::Other(format!(
+            "Benchmark provider bridge is not ready: {}",
+            preview.blockers.join("; ")
+        )));
+    }
+    if request.authorization_phrase.trim() != preview.authorization_phrase {
+        return Err(AppError::Other(
+            "Benchmark provider authorization phrase did not match".to_string(),
+        ));
+    }
+    Ok(preview)
+}
+
+fn build_authorized_provider_launch(
+    preview: BenchmarkProviderBridgePreview,
+    api_key: String,
+) -> Result<AuthorizedBenchmarkProviderLaunch> {
     Ok(AuthorizedBenchmarkProviderLaunch {
         args: harbor_run_args(
             &preview.profile,
@@ -491,6 +527,122 @@ where
         ],
         preview,
     })
+}
+
+async fn lookup_provider_secret_for_benchmark(
+    key_ref: String,
+    timeout: Duration,
+) -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        tokio::task::spawn_blocking(move || macos_security_keychain_secret(&key_ref, timeout))
+            .await
+            .map_err(|err| {
+                AppError::Other(format!("Benchmark provider secret worker failed: {err}"))
+            })?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        lookup_provider_secret_with_timeout(key_ref, timeout, |key_ref| {
+            crate::secrets::get_key(&key_ref)
+        })
+        .await
+    }
+}
+
+async fn lookup_provider_secret_with_timeout<F>(
+    key_ref: String,
+    timeout: Duration,
+    lookup: F,
+) -> Result<Option<String>>
+where
+    F: FnOnce(String) -> Result<Option<String>> + Send + 'static,
+{
+    let timeout_secs = timeout.as_secs();
+    tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || lookup(key_ref)))
+        .await
+        .map_err(|_| {
+            AppError::Other(format!(
+                "Benchmark provider secret lookup timed out after {timeout_secs}s; unlock or authorize the OS credential store and retry"
+            ))
+        })?
+        .map_err(|err| AppError::Other(format!("Benchmark provider secret worker failed: {err}")))?
+}
+
+fn provider_secret_lookup_timeout() -> Duration {
+    let seconds = std::env::var("CODEFACTORY_BENCH_SECRET_TIMEOUT_SEC")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PROVIDER_SECRET_LOOKUP_TIMEOUT_SECS);
+    Duration::from_secs(seconds)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_security_keychain_secret(account: &str, timeout: Duration) -> Result<Option<String>> {
+    let mut child = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            CODEFACTORY_KEYRING_SERVICE,
+            "-a",
+            account,
+            "-w",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            AppError::Other(format!(
+                "Could not start macOS keychain lookup for benchmark provider key_ref '{}': {}",
+                account, err
+            ))
+        })?;
+    let started = std::time::Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .map_err(|err| {
+                AppError::Other(format!(
+                    "Could not poll macOS keychain lookup for benchmark provider key_ref '{}': {}",
+                    account, err
+                ))
+            })?
+            .is_some()
+        {
+            let output = child.wait_with_output().map_err(|err| {
+                AppError::Other(format!(
+                    "Could not read macOS keychain lookup output for benchmark provider key_ref '{}': {}",
+                    account, err
+                ))
+            })?;
+            if output.status.success() {
+                let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                return if secret.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(secret))
+                };
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+            if stderr.contains("could not be found") || stderr.contains("no such keychain item") {
+                return Ok(None);
+            }
+            return Err(AppError::Other(format!(
+                "macOS keychain lookup failed for benchmark provider key_ref '{}'",
+                account
+            )));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::Other(format!(
+                "Benchmark provider secret lookup timed out after {}s; unlock or authorize the OS credential store and retry",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn profile_by_id(profile_id: &str) -> Result<BenchmarkProfile> {
@@ -1893,6 +2045,24 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Benchmark provider authorization phrase did not match"));
+    }
+
+    #[tokio::test]
+    async fn provider_bridge_secret_lookup_times_out() {
+        let err = lookup_provider_secret_with_timeout(
+            "codefactory.endpoint.deepseek".to_string(),
+            Duration::from_millis(10),
+            |_key_ref| {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(Some("test-secret".to_string()))
+            },
+        )
+        .await
+        .expect_err("slow secret lookup should time out");
+
+        assert!(err
+            .to_string()
+            .contains("Benchmark provider secret lookup timed out"));
     }
 
     #[test]
