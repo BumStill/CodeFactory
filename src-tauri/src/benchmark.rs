@@ -159,6 +159,9 @@ pub struct BenchmarkProviderBridgeRequest {
     pub endpoint_name: Option<String>,
     pub model: Option<String>,
     pub task_limit: Option<u32>,
+    pub concurrency: Option<u32>,
+    // Backwards-compatible alias for older clients. Harbor uses `-n` as
+    // concurrency, not repeated trial count.
     pub trial_count: Option<u32>,
     pub job_root: Option<String>,
     pub job_name: Option<String>,
@@ -176,6 +179,7 @@ pub struct BenchmarkProviderBridgePreview {
     pub key_ref: String,
     pub agent_import_path: String,
     pub task_limit: u32,
+    pub concurrency: u32,
     pub trial_count: u32,
     pub job_root: String,
     pub job_name: String,
@@ -279,7 +283,8 @@ pub fn preview_provider_bridge(
         .task_limit
         .unwrap_or(profile.default_smoke_task_limit)
         .max(1);
-    let trial_count = request.trial_count.unwrap_or(1).max(1);
+    let concurrency = request.concurrency.or(request.trial_count).unwrap_or(4).max(1);
+    let trial_count = 1;
     let job_root = request
         .job_root
         .as_deref()
@@ -346,7 +351,7 @@ pub fn preview_provider_bridge(
         &profile,
         &model,
         task_limit,
-        trial_count,
+        concurrency,
         &job_root,
         &job_name,
     );
@@ -366,6 +371,7 @@ pub fn preview_provider_bridge(
         key_ref,
         agent_import_path: CODEFACTORY_HARBOR_AGENT.to_string(),
         task_limit,
+        concurrency,
         trial_count,
         job_root,
         job_name,
@@ -450,7 +456,7 @@ where
             &preview.profile,
             &preview.model,
             preview.task_limit,
-            preview.trial_count,
+            preview.concurrency,
             &preview.job_root,
             &preview.job_name,
         ),
@@ -630,7 +636,7 @@ fn harbor_run_args(
     profile: &BenchmarkProfile,
     model: &str,
     task_limit: u32,
-    trial_count: u32,
+    concurrency: u32,
     job_root: &str,
     job_name: &str,
 ) -> Vec<String> {
@@ -645,7 +651,7 @@ fn harbor_run_args(
         "-l".to_string(),
         task_limit.to_string(),
         "-n".to_string(),
-        trial_count.to_string(),
+        concurrency.to_string(),
         "-o".to_string(),
         job_root.to_string(),
         "--job-name".to_string(),
@@ -1636,6 +1642,7 @@ mod tests {
                 endpoint_name: None,
                 model: None,
                 task_limit: Some(1),
+                concurrency: Some(3),
                 trial_count: Some(1),
                 job_root: Some("/tmp/cf-bench".to_string()),
                 job_name: Some("deepseek-smoke".to_string()),
@@ -1648,6 +1655,8 @@ mod tests {
         assert_eq!(preview.base_url, "https://api.deepseek.com");
         assert_eq!(preview.model, "deepseek-v4-flash");
         assert_eq!(preview.key_ref, "codefactory.endpoint.deepseek");
+        assert_eq!(preview.concurrency, 3);
+        assert_eq!(preview.trial_count, 1);
         assert!(preview.ready);
         assert!(preview
             .env_preview
@@ -1660,6 +1669,7 @@ mod tests {
             .command_preview
             .contains("CODEFACTORY_BENCH_API_KEY='<redacted:codefactory.endpoint.deepseek>'"));
         assert!(preview.command_preview.contains("-m deepseek-v4-flash"));
+        assert!(preview.command_preview.contains("-n 3"));
     }
 
     #[test]
@@ -1671,6 +1681,7 @@ mod tests {
                 endpoint_name: None,
                 model: None,
                 task_limit: Some(1),
+                concurrency: None,
                 trial_count: Some(1),
                 job_root: Some("/tmp/cf-bench".to_string()),
                 job_name: Some("deepseek-smoke".to_string()),
@@ -1696,6 +1707,7 @@ mod tests {
             endpoint_name: None,
             model: None,
             task_limit: Some(1),
+            concurrency: None,
             trial_count: Some(1),
             job_root: Some("/tmp/cf-bench".to_string()),
             job_name: Some("deepseek-smoke".to_string()),
@@ -1775,7 +1787,10 @@ mod tests {
             std::env::var("CODEFACTORY_BENCH_ENDPOINT").unwrap_or_else(|_| "deepseek".to_string());
         let model = std::env::var("CODEFACTORY_BENCH_MODEL_OVERRIDE").ok();
         let task_limit = env_u32("CODEFACTORY_BENCH_TASK_LIMIT", 1);
-        let trial_count = env_u32("CODEFACTORY_BENCH_TRIAL_COUNT", 1);
+        let concurrency = env_u32(
+            "CODEFACTORY_BENCH_CONCURRENCY",
+            env_u32("CODEFACTORY_BENCH_TRIAL_COUNT", 4),
+        );
         let job_root = std::env::var("CODEFACTORY_BENCH_JOB_ROOT").unwrap_or_else(|_| {
             repo_root
                 .join(".codefactory/benchmark-jobs")
@@ -1792,7 +1807,8 @@ mod tests {
             endpoint_name: Some(endpoint_name),
             model,
             task_limit: Some(task_limit),
-            trial_count: Some(trial_count),
+            concurrency: Some(concurrency),
+            trial_count: None,
             job_root: Some(job_root),
             job_name: Some(job_name),
             adapter_root: Some(repo_root.to_string_lossy().to_string()),
@@ -1800,13 +1816,14 @@ mod tests {
         let settings = crate::config::settings::load();
         let preview = preview_provider_bridge(&settings, &bridge).expect("preview provider bridge");
         println!(
-            "provider_bridge_preview endpoint={} base_url={} model={} key_ref={} agent={} task_limit={} trial_count={} job_path={}",
+            "provider_bridge_preview endpoint={} base_url={} model={} key_ref={} agent={} task_limit={} concurrency={} trial_count={} job_path={}",
             preview.endpoint_name,
             preview.base_url,
             preview.model,
             preview.key_ref,
             preview.agent_import_path,
             preview.task_limit,
+            preview.concurrency,
             preview.trial_count,
             preview.job_path
         );

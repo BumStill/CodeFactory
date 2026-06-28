@@ -11,8 +11,8 @@
 - Blocked means: Harbor/Docker/dataset/agent-adapter/runtime access prevents real smoke verification, with exact command, error, and next action recorded.
 
 ## Current State
-- Current phase: implementation slice 4
-- Current checkpoint: provider-backed Terminal-Bench 2.1 smoke runs through CodeFactory and imports comparable results. Latest verified DeepSeek-backed CodeFactory run is run id `86a0f061-857a-4a0f-a005-b71e99d62452`, mean reward `1.000`, failure class `None`; the trial completed without Harbor/provider exception, mechanically forced the model out of repeated inspection, repaired `/app/data.comp` with a C-based protocol auto-repair helper, and passed all verifier checks. Current capability boundary is broader-subset generalization, not provider balance, runner import, missing-artifact execution, or the first `write-compressor` score.
+- Current phase: implementation slice 5
+- Current checkpoint: full Terminal-Bench 2.1 CodeFactory agent capability run completed and imported. Latest full run is run id `7ff6ef13-4488-4e0f-afd0-a1f9bd16d561`, agent `codefactory-headless`, model backend `deepseek-v4-pro`, dataset `terminal-bench/terminal-bench-2-1`, `89 / 89` trials completed, mean reward `0.06741573033707865`, pass count `6 / 89`, failed count `83 / 89`, exceptions `63`. This is the first full CodeFactory-run score and it is a low capability baseline, not an acceptable product level.
 - Next owner: development / QA
 - Updated at: 2026-06-28
 
@@ -54,9 +54,15 @@
 - Reran real CodeFactory provider-backed smoke after artifact enforcement; latest completed trial creates `/app/data.comp`, passes artifact existence, fails decompression with `Segmentation fault (core dumped)`, and fails the 2500 byte size limit.
 - Added C-based protocol auto-repair for the `write-compressor` failure family after bad candidate/self-check failure, avoiding Python runtime assumptions inside the task container.
 - Reran real CodeFactory provider-backed smoke after protocol auto-repair; latest completed trial gets reward `1.0` on `terminal-bench/write-compressor`.
+- Ran the first full Terminal-Bench 2.1 CodeFactory provider-backed evaluation using `codefactory-headless` with DeepSeek backend over all 89 tasks.
+- Imported the full Harbor job with CodeFactory's importer; importer reported `comparable=true`, `trials=89`, and preserved per-trial failure classes.
+- Corrected provider bridge semantics so Harbor concurrency is exposed as `concurrency`; the old `trial_count` field remains only as a backward-compatible alias because Harbor `-n` is concurrency, not repeated trial count.
 
 ## Remaining Items
-- Run a broader Terminal-Bench 2.1 subset to discover the next failure family beyond `write-compressor`.
+- Build a fixed regression subset from the full-run failure mix: passing smoke tasks, verifier-zero tasks, command-timeout tasks, Docker/resource failures, and AddTestsDir failures.
+- Fix evaluation infrastructure gaps found by the full run: explicit concurrency UI/API, Docker resource preflight, token/cost capture, and clearer separation of environment failures from agent failures.
+- Improve long-horizon execution with better step budgeting, background process supervision, service readiness checks, long command timeout policy, and resumable artifact verification.
+- Improve verification repair so verifier stdout becomes concrete patch goals and expected artifacts remain first-class state.
 - Generalize post-candidate repair so task-specific protocol repair becomes reusable capability, not only a `write-compressor` special case.
 - Add persisted run fields/UI for evaluation axis, evaluation subject, fixed variables, changed variables, and result attribution.
 - Promote `benchmark-sandbox` from adapter-local command gate to shared CodeFactory policy preset with run/task/container binding.
@@ -64,7 +70,7 @@
 - Compare at least one baseline/head subset after an implementation change.
 
 ## Blockers
-- No current blocker for local provider-backed smoke. The current result is a valid CodeFactory agent capability failure, not a provider/account blocker.
+- No current blocker for local full-run evaluation. The current full-run result is a valid CodeFactory agent capability baseline, not a provider/account blocker.
 - Official leaderboard submission process is separate from local evaluation and not covered by this first implementation slice.
 
 ## Evidence
@@ -96,17 +102,23 @@
 - 2026-06-28 artifact-enforcement run: run id `4639ab7f-42d3-4a18-b371-718e7fc71507`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, model `deepseek-v4-pro`, mean `0.000`, `n_completed_trials=1`, `n_errored_trials=0`, failure class `verification`; trajectory shows `implementation-required` and `artifact-required` gates, then candidate `/app/data.comp` creation, self-check segfault, and verifier failure on decompression plus size.
 - 2026-06-28 provider compatibility boundary: intermediate run id `da378cae-448c-402b-a5cb-ec917eb58a15` failed as `model-provider` because DeepSeek thinking mode rejected forced `tool_choice`; the adapter now retries with `tool_choice=auto` on that provider error.
 - 2026-06-28 protocol auto-repair passing run: run id `86a0f061-857a-4a0f-a005-b71e99d62452`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, model `deepseek-v4-pro`, mean `1.000`, `n_completed_trials=1`, `n_errored_trials=0`, failure class `None`; trajectory shows C auto-repair wrote `/app/data.comp` at `2476` bytes, self-check printed `verification-ok`, verifier reward is `1`, and all three verifier tests passed.
+- 2026-06-28 full CodeFactory run: Harbor job path `/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260628-085422`, run id `7ff6ef13-4488-4e0f-afd0-a1f9bd16d561`, task limit `89`, concurrency `4`, agent `codefactory-headless`, model backend `deepseek-v4-pro`, mean reward `0.06741573033707865`, pass count `6 / 89`, verifier reward-zero count `21`, exception count `63`, runtime about `2h17m15s`.
+- Full-run passing tasks: `write-compressor`, `vulnerable-secret`, `openssl-selfsigned-cert`, `nginx-request-logging`, `filter-js-from-html`, `extract-elf`.
+- Full-run failure class summary from CodeFactory importer: `environment=38`, `long-horizon=23`, `verification=13`, `tool-use=9`, `None=6`.
+- Full-run exception summary from Harbor: `RuntimeError=58`, `AddTestsDirError=3`, `AgentTimeoutError=1`, `VerifierTimeoutError=1`.
+- Full-run cost/token evidence: `cost_usd=null`, `n_input_tokens=null`, `n_output_tokens=null`; current custom-agent import does not capture provider token usage or cost.
+- Full-run import evidence: `CODEFACTORY_BENCHMARK_JOB_PATH=/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260628-085422 cargo test benchmark::tests::import_harbor_job_from_env_path --lib -- --ignored --nocapture` passed and imported `89` trials.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.
 - Release evidence: not live.
-- Blocking evidence: none for local provider-backed smoke; current valid run is a comparable 0.000 reward result.
+- Blocking evidence: none for local full-run evaluation; current valid run is a low-score baseline and not a release/leaderboard claim.
 
 ## AI Collaboration
 - context scope: CodeFactory repo docs, AGENTS rules, current official Terminal-Bench and Harbor docs.
 - assumptions: Terminal-Bench 2.1 should be treated as the primary external terminal-agent benchmark; CodeFactory must add headless execution rather than rely on desktop UI approval.
 - review point: first implementation slice should be reviewed before starting the Harbor adapter/headless runner slice.
-- validation result: Python adapter smoke/model-backed tests, Rust custom-agent import regression, Rust provider bridge tests, ignored real-job import test, and ignored real provider-bridge smoke pass after intentional failing-test steps; current provider-backed run is valid and scores reward 1.0 on `write-compressor`. Mechanical artifact enforcement and protocol auto-repair work for the first task; the next slice should broaden the subset and generalize repair.
+- validation result: Python adapter smoke/model-backed tests, Rust custom-agent import regression, Rust provider bridge tests, ignored real-job import test, ignored real provider-bridge smoke pass, and a full 89-task provider-backed run. Mechanical artifact enforcement and protocol auto-repair work for several tasks, but the full-run score is only `6 / 89`; the next slice should stabilize infrastructure, build a fixed regression subset, and improve long-horizon execution plus verifier-driven repair.
 
 ## Stop Boundary
 - Do not stop after local-only validation.

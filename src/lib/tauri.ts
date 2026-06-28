@@ -159,6 +159,8 @@ export interface BenchmarkProviderBridgeRequest {
   endpoint_name?: string | null;
   model?: string | null;
   task_limit?: number | null;
+  concurrency?: number | null;
+  /** Deprecated compatibility alias; Harbor `-n` means concurrency. */
   trial_count?: number | null;
   job_root?: string | null;
   job_name?: string | null;
@@ -175,6 +177,7 @@ export interface BenchmarkProviderBridgePreview {
   key_ref: string;
   agent_import_path: string;
   task_limit: number;
+  concurrency: number;
   trial_count: number;
   job_root: string;
   job_name: string;
