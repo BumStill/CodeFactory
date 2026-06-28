@@ -72,6 +72,7 @@
 - Continue long-horizon execution work: better step budgeting, richer background process lifecycle supervision, broader service readiness templates, long command timeout policy, and resumable artifact verification.
 - Continue verifier-driven repair work: use verifier/self-check stdout as concrete patch goals across more failure shapes and keep expected artifacts first-class state through repair attempts.
 - Generalize post-candidate repair so task-specific protocol repair becomes reusable capability, not only a `write-compressor` special case.
+- Use `docs/plans/terminal-bench-21-system-improvement-plan.md` as the first score-driven improvement roadmap after the fixed subset rerun produces a comparable delta.
 - Add persisted run fields/UI for evaluation axis, evaluation subject, fixed variables, changed variables, and result attribution.
 - Promote `benchmark-sandbox` from adapter-local command gate to shared CodeFactory policy preset with run/task/container binding.
 - Add Benchmarks UI for run summary, trial details, failure triage, and capability profile.
@@ -125,6 +126,7 @@
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.
+- Score-driven improvement roadmap: `docs/plans/terminal-bench-21-system-improvement-plan.md`.
 - Release evidence: not live.
 - Blocking evidence: none for local full-run evaluation; current valid run is a low-score baseline and not a release/leaderboard claim.
 
