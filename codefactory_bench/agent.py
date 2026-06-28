@@ -163,7 +163,10 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     "of repeating the denied command. Before finishing, check that "
                     "the task's expected output artifacts exist. Avoid installing "
                     "packages unless the task cannot be solved with existing tools; "
-                    "package installation consumes benchmark time."
+                    "package installation consumes benchmark time. For artifact "
+                    "generation tasks, use at most two inspection rounds before "
+                    "creating a candidate artifact; a wrong candidate plus a fast "
+                    "self-check is better than extended inspection."
                 ),
             },
             {"role": "user", "content": instruction},
@@ -656,7 +659,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
     def _phase_progress_reminder(
         step: int, max_steps: int, artifact_hint: str | None
     ) -> str | None:
-        checkpoints = {5, max_steps // 2}
+        checkpoints = {2, 5, max_steps // 2}
         if step not in checkpoints:
             return None
 
@@ -741,8 +744,26 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         command_text = CodeFactoryAgent._strip_heredoc_bodies(command).strip()
         if not command_text:
             return None
-        if any(token in command_text for token in [">", ">>", "|", "&&", ";", "$("]):
+        if any(token in command_text for token in [">", ">>", "&&", ";", "$("]):
             return None
+
+        pipeline = [part.strip() for part in command_text.split("|")]
+        first_key = CodeFactoryAgent._simple_inspection_target_key(pipeline[0])
+        if not first_key:
+            return None
+        for filter_command in pipeline[1:]:
+            try:
+                filter_parts = shlex.split(filter_command)
+            except ValueError:
+                return None
+            if not filter_parts:
+                return None
+            if filter_parts[0].split("/")[-1] not in {"grep", "head", "od", "sed", "tail", "wc"}:
+                return None
+        return first_key
+
+    @staticmethod
+    def _simple_inspection_target_key(command_text: str) -> str | None:
         try:
             parts = shlex.split(command_text)
         except ValueError:
@@ -765,6 +786,8 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         command_text = CodeFactoryAgent._strip_heredoc_bodies(command).strip()
         if not command_text:
             return False
+        if CodeFactoryAgent._inspection_target_key(command):
+            return True
         if any(token in command_text for token in [">", ">>", "|", "&&", ";", "$("]):
             return False
         first = command_text.split(None, 1)[0].split("/")[-1]

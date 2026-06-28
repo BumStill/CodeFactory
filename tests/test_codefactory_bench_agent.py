@@ -290,7 +290,7 @@ gcc -o /app/enc /app/enc.c
 
     def test_agent_emits_phase_progress_reminder_after_inspection(self) -> None:
         reminder = CodeFactoryAgent._phase_progress_reminder(
-            step=5,
+            step=2,
             max_steps=20,
             artifact_hint="data.comp",
         )
@@ -433,7 +433,7 @@ gcc -o /app/enc /app/enc.c
     def test_repeat_suppression_only_targets_simple_inspection_commands(self) -> None:
         self.assertTrue(CodeFactoryAgent._is_repeat_suppression_candidate("cat /app/decomp.c"))
         self.assertFalse(CodeFactoryAgent._is_repeat_suppression_candidate("gcc -o enc enc.c"))
-        self.assertFalse(
+        self.assertTrue(
             CodeFactoryAgent._is_repeat_suppression_candidate("cat /app/decomp.c | head")
         )
 
@@ -441,6 +441,10 @@ gcc -o /app/enc /app/enc.c
         self.assertEqual(
             CodeFactoryAgent._repeat_command_key("cat /app/decomp.c"),
             CodeFactoryAgent._repeat_command_key("head -200 /app/decomp.c"),
+        )
+        self.assertEqual(
+            CodeFactoryAgent._repeat_command_key("cat /app/decomp.c"),
+            CodeFactoryAgent._repeat_command_key("tail -n +1 /app/decomp.c | head -120"),
         )
         self.assertNotEqual(
             CodeFactoryAgent._repeat_command_key("cat /app/decomp.c"),

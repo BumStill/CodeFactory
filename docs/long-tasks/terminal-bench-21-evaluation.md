@@ -12,7 +12,7 @@
 
 ## Current State
 - Current phase: implementation slice 4
-- Current checkpoint: provider-backed Terminal-Bench 2.1 smoke runs through CodeFactory and imports comparable results. Latest verified DeepSeek-backed CodeFactory run is run id `358b068b-1a83-45ff-a37e-156f5ea089d4`, mean reward `0.000`, failure class `verification`; the trial completed without Harbor/provider exception after model-read failures were converted into controlled `model-error` trajectory entries. Current capability boundary is agent-loop quality: the model still spends too much of the run on inspection and can time out before creating `/app/data.comp`.
+- Current checkpoint: provider-backed Terminal-Bench 2.1 smoke runs through CodeFactory and imports comparable results. Latest verified DeepSeek-backed CodeFactory run is run id `5d9246fe-4662-4e93-996d-5f3597d9e56e`, mean reward `0.000`, failure class `verification`; the trial completed without Harbor/provider exception after model-read failures were converted into controlled `model-error` trajectory entries. Current capability boundary is agent-loop quality: early implementation reminders now reach the model, but natural-language reminders alone are insufficient because the model can still time out before creating `/app/data.comp`.
 - Next owner: development / QA
 - Updated at: 2026-06-28
 
@@ -88,7 +88,7 @@
 - Post-loop-fix verifier evidence: `/app/data.comp` existed and satisfied the <=2500 byte size check, but decompression failed with `Segmentation fault (core dumped)`.
 - Latest controlled long run: run id `d3927cd4-340c-4436-9f62-1e3a1c673d97`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, model `deepseek-v4-pro`, mean `0.000`, no provider exception, no Harbor timeout; trajectory shows `data.comp` creation, size under limit, and invalid decompression.
 - 2026-06-28 controlled timeout run: run id `5e08d50b-ca8e-4efa-94ab-68bc18918814`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, model `deepseek-v4-pro`, mean `0.000`, `n_completed_trials=1`, `n_errored_trials=0`; model read timeout was recorded in trajectory and imported as `verification`.
-- 2026-06-28 latest post-hardening run: run id `358b068b-1a83-45ff-a37e-156f5ea089d4`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, model `deepseek-v4-pro`, mean `0.000`, `n_completed_trials=1`, `n_errored_trials=0`, failure class `verification`; verifier failed because `/app/data.comp` was not created before the controlled model-error stop.
+- 2026-06-28 latest post-hardening run: run id `5d9246fe-4662-4e93-996d-5f3597d9e56e`, task `terminal-bench/write-compressor`, agent `codefactory-headless`, model `deepseek-v4-pro`, mean `0.000`, `n_completed_trials=1`, `n_errored_trials=0`, failure class `verification`; verifier failed because `/app/data.comp` was not created before the controlled model-error stop.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.
@@ -99,7 +99,7 @@
 - context scope: CodeFactory repo docs, AGENTS rules, current official Terminal-Bench and Harbor docs.
 - assumptions: Terminal-Bench 2.1 should be treated as the primary external terminal-agent benchmark; CodeFactory must add headless execution rather than rely on desktop UI approval.
 - review point: first implementation slice should be reviewed before starting the Harbor adapter/headless runner slice.
-- validation result: Python adapter smoke/model-backed tests, Rust custom-agent import regression, Rust provider bridge tests, ignored real-job import test, and ignored real provider-bridge smoke pass after intentional failing-test steps; current provider-backed run is valid and fails verification with reward 0 because the agent stopped after controlled model transport failure before creating the artifact.
+- validation result: Python adapter smoke/model-backed tests, Rust custom-agent import regression, Rust provider bridge tests, ignored real-job import test, and ignored real provider-bridge smoke pass after intentional failing-test steps; current provider-backed run is valid and fails verification with reward 0 because the agent stopped after controlled model transport failure before creating the artifact. Early implementation reminders were observed in the trajectory, so the next slice should enforce implementation state mechanically instead of relying only on prompt text.
 
 ## Stop Boundary
 - Do not stop after local-only validation.

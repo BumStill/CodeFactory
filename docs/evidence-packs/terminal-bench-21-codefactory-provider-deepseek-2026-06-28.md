@@ -118,26 +118,26 @@ Command: same provider bridge command with `CODEFACTORY_BENCH_MODEL_TIMEOUT_SEC=
 
 Result:
 
-- Harbor job path: `/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260628-051718`
-- Run id: `358b068b-1a83-45ff-a37e-156f5ea089d4`
+- Harbor job path: `/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260628-053114`
+- Run id: `5d9246fe-4662-4e93-996d-5f3597d9e56e`
 - Task: `terminal-bench/write-compressor`
 - Agent: `codefactory-headless`
 - Model: `deepseek-v4-pro`
 - Mean reward: `0.000`
 - Harbor stats: `n_completed_trials=1`, `n_errored_trials=0`
 - Failure class after import: `verification`
-- End-to-end test runtime: `173.38s`
-- Evidence: missing-tool repair hint was appended after `file: command not found`; repeated read suppression remained active; model transport timeout was converted into a controlled `model-error`; Harbor still completed and CodeFactory imported the run.
+- End-to-end test runtime: `181.39s`
+- Evidence: missing-tool repair hint and early implementation reminder were appended before the next model request; model transport timeout was converted into a controlled `model-error`; Harbor still completed and CodeFactory imported the run.
 
 Observed output:
 
 ```text
-provider_bridge_result status=completed exit_code=Some(0) job_path=/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260628-051718
-provider_bridge_imported run=358b068b-1a83-45ff-a37e-156f5ea089d4 dataset=terminal-bench/terminal-bench-2-1 agent=codefactory-headless model=Some("deepseek-v4-pro") comparable=true trials=1 mean_reward=0.000
+provider_bridge_result status=completed exit_code=Some(0) job_path=/Users/leo/Projects/CodeFactory-terminal-bench-21-design/.codefactory/benchmark-jobs/cf-tb21-codefactory-provider-deepseek-20260628-053114
+provider_bridge_imported run=5d9246fe-4662-4e93-996d-5f3597d9e56e dataset=terminal-bench/terminal-bench-2-1 agent=codefactory-headless model=Some("deepseek-v4-pro") comparable=true trials=1 mean_reward=0.000
 provider_bridge_trial task=terminal-bench/write-compressor reward=0 failure_class=Some("verification")
 test benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_from_local_settings ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 164 filtered out; finished in 173.38s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 164 filtered out; finished in 181.39s
 ```
 
 Verifier evidence:
@@ -151,7 +151,7 @@ test_compression_size: failed because /app/data.comp does not exist
 
 ## Product Finding
 
-The first CodeFactory-owned DeepSeek evaluation path is now operational and produces comparable imported results. The current score is still `0.000`; this is not a provider-balance issue. The dominant capability gap is the CodeFactory headless agent loop: it needs stronger planning/implementation scaffolding so the model stops inspecting and starts producing/verifying the required artifact before the model transport timeout boundary.
+The first CodeFactory-owned DeepSeek evaluation path is now operational and produces comparable imported results. The current score is still `0.000`; this is not a provider-balance issue. The dominant capability gap is the CodeFactory headless agent loop: natural-language reminders now reach the model, but they are not enough. The next slice should enforce implementation state mechanically so the agent starts producing/verifying the required artifact before the model transport timeout boundary.
 
 ## Next Slice
 
