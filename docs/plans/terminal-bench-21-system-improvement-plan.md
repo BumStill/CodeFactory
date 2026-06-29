@@ -107,6 +107,22 @@
 - failure class: `None`
 - conclusion: this is the first confirmed targeted score improvement in the iteration loop. It is not an aggregate 18-task or 89-task score movement; the next gate must rerun the fixed 18-task regression subset.
 
+2026-06-29 resource-preflighted 18-task regression 结果：
+
+- run: `159041ce-5682-4835-843a-fbed9088aa9d`
+- report: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T15-28-16Z.md`
+- iteration report: `docs/evidence-packs/terminal-bench-21-iteration-2026-06-29T15-28-16Z.md`
+- scope: `terminal-bench-21-regression-subset-v1`
+- comparable: `true`
+- trials: `18`
+- pass: `4 / 18`
+- mean reward: `0.222`
+- Harbor exceptions: `0`
+- result attribution: aggregate recovered from the earlier real provider-backed `0 / 18` run, but it has not exceeded the old offline projection baseline `4 / 18`.
+- infrastructure movement: local Colima was raised from `2 CPU / 4GB / 30GB overlay` to `4 CPU / 8GB / 99GB overlay`, and the runner now blocks provider-backed runs unless Docker CPU, memory, root free space, and apt bootstrap smoke pass.
+- current failure mix: `pass=4`, `verification=8`, `tool-use=3`, `policy=2`, `long-horizon=1` in the raw evidence. After classifier fix, verifier dependency network timeouts such as the observed MTEB `UV_HTTP_TIMEOUT` failure should route to `environment/verifier-dependency-resource`.
+- conclusion: the modification loop is now real at the infrastructure/aggregate level (`0 / 18` -> `4 / 18`, exceptions eliminated), but the next product target is score movement beyond `4 / 18`.
+
 ## 问题分层
 
 ### 1. 评测基础设施还不够产品化
@@ -126,6 +142,8 @@
 - `failure_reason`。
 - Docker CPU preflight。
 - Docker storage/rootfs failure has now been proven as a real verifier blocker; storage/apt-smoke preflight must join CPU preflight before future score runs.
+- fixed subset runner hard preflight: Docker CPU, memory, root free space, and apt bootstrap smoke must pass before Harbor/provider starts; otherwise the run exits with blocker evidence instead of consuming provider tokens.
+- verifier dependency network timeout classifier: `Failed to download distribution due to network timeout` / `UV_HTTP_TIMEOUT` now maps to `environment/verifier-dependency-resource`.
 - `task_names` 固定 subset 支持。
 - provider secret lookup timeout。
 - 显式 `CODEFACTORY_BENCH_API_KEY` override。
@@ -240,9 +258,9 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 
 当前下一轮 P0：
 
-1. 把 Docker overlay/storage、apt bootstrap smoke、Harbor cache footprint 加入 benchmark preflight；失败时直接生成 `environment` blocker report，不启动 provider-backed scoring run。
-2. 在当前 PR 合并前后跑一次固定 18 题 regression subset，建立 canary 改动后的 aggregate score；没有这个 same-scope 结果，不得声称总体能力提升。
-3. 针对 passing MTEB 轨迹里的剩余低效，产品化三条 agent-loop 规则：保留任务族实现 hint、减少重复 artifact inspection、final 前只允许 bounded verification 或明确 blocker。
+1. 稳定 `mteb-retrieve` 在 aggregate 下的 verifier dependency path：单题能过，但 18 题并发下 verifier `uv` 下载大依赖时触发 `UV_HTTP_TIMEOUT`。下一轮要么降低默认 regression concurrency，要么把 verifier dependency/network timeout 做成环境队列，不把它归为 agent 长任务失败。
+2. 修 `query-optimize`：agent 写出的 SQL 没有先跑 `EXPLAIN QUERY PLAN` / bounded subset，自检命令和 verifier 都长时间 CPU 跑。下一轮需要 SQL task recipe：先 index/EXPLAIN，再 bounded timing，再写最终 SQL。
+3. 修 tool-call JSON overflow：`protein-assembly` 多次生成超长 heredoc tool arguments，导致 `Tool arguments were not valid JSON`。需要 adapter 侧检测超长/非法 JSON 工具参数，并要求分块写文件或使用短脚本生成。
 
 首轮 canary 的具体调整：
 
@@ -263,6 +281,7 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 - subset runner 一键命令：`tools/benchmark/run_terminal_bench_21_regression_subset.py` 读取固定 18 题 subset 并生成 success/blocker evidence。
 - result import 后展示 failure reason：Rust importer 持久化 `failure_reason`，前端 Benchmark 页面按 failure reason 聚合并展示 trial 列表。
 - storage/bootstrap preflight：在 Harbor/provider 启动前执行 Docker rootfs free-space、apt update smoke、Harbor job-root footprint 检查；否则当前 MTEB 这类环境问题会伪装成 agent 低分。
+- concurrency/resource policy：根据 Docker CPU/memory 和 subset task mix 给出默认 concurrency 或 hard block；当前 `4 CPU + concurrency=4` 可以完成，但 MTEB verifier dependency download 在并发下仍不稳定。
 
 ### P1: 把 exception 变成可修复失败
 
@@ -292,7 +311,7 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 
 建议 gate：
 
-- 当前 targeted canary gate 已经达到 `mteb-retrieve` `1 / 1`、mean reward `1.000`；下一步必须跑 18 题 fixed subset，不能继续用单题结果代表系统能力。
+- 当前 targeted canary gate 已经达到 `mteb-retrieve` `1 / 1`、mean reward `1.000`；resource-preflighted 18 题 fixed subset 已完成 `4 / 18`、mean reward `0.222`、`0` Harbor exceptions。
 - 18 题 subset pass 从当前 full-run映射的约 `4 / 18` 附近提升到 `7 / 18` 以上，再跑完整 89 题。
 - 完整 89 题 pass 从 `6 / 89` 提升到 `15 / 89`，才算第一阶段 agent loop 改进有效。
 - 同时记录 cost 和 duration，避免靠无限重试换分数。

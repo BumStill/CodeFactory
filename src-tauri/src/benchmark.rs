@@ -1424,6 +1424,9 @@ fn classify_failure_detail(reward: f64, evidence: &str) -> FailureDetail {
         || text.contains("not enough free space in /var/cache/apt/archives")
         || text.contains("failed to fetch http://archive.ubuntu.com")
         || text.contains("at least one invalid signature was encountered")
+        || text.contains("failed to download distribution due to network timeout")
+        || text.contains("failed to download `")
+        || text.contains("uv_http_timeout")
         || text.contains("uvx: command not found")
         || text.contains("/root/.local/bin/env: no such file or directory")
     {
@@ -2120,6 +2123,23 @@ E: You don't have enough free space in /var/cache/apt/archives/.
         );
         assert_eq!(
             verifier_dependency.failure_reason.as_deref(),
+            Some("verifier-dependency-resource")
+        );
+
+        let verifier_network_timeout = classify_failure_detail(
+            0.0,
+            r#"
+  × Failed to download `nvidia-cudnn-cu13==9.20.0.48`
+  ╰─▶ Failed to download distribution due to network timeout. Try increasing
+      UV_HTTP_TIMEOUT (current value: 30s).
+"#,
+        );
+        assert_eq!(
+            verifier_network_timeout.failure_class.as_deref(),
+            Some("environment")
+        );
+        assert_eq!(
+            verifier_network_timeout.failure_reason.as_deref(),
             Some("verifier-dependency-resource")
         );
     }
