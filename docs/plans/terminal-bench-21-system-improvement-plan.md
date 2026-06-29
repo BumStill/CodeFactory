@@ -27,6 +27,18 @@
 
 这个 subset 分数是从完整 run 离线投影出来的，不是新的 provider-backed rerun。它比完整 89 题总分高，是因为 subset 刻意包含 4 个已通过任务作为回归哨兵；它的用途是比较后续 agent-loop 改动是否真实改善失败桶，而不是替代完整总分。
 
+2026-06-29 已完成第一次真实 fixed subset provider-backed rerun：
+
+- run: `e7d97f76-b1d1-4b08-beb7-08181a1f5a1e`
+- report: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T03-36-45Z.md`
+- agent: `codefactory-headless`
+- model backend: `deepseek-v4-pro`
+- pass: `0 / 18`
+- mean reward: `0.000`
+- result attribution: `codefactory-agent-capability`
+
+这个结果说明固定 subset 的真实 provider-backed 当前状态低于离线投影基线。它不是 DeepSeek 单独能力结论，而是 CodeFactory headless agent loop、tool policy、验证修复和环境 preflight 的系统性能力结论。后续不再把“跑通一次”作为目标，必须进入“hypothesis -> canary/subset -> delta -> improvement queue”的迭代闭环。
+
 ## 问题分层
 
 ### 1. 评测基础设施还不够产品化
@@ -129,6 +141,21 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 - Improvement Queue：从失败聚合生成工程任务，例如 `long-horizon/service-readiness`、`verifier-repair/assertion-parser`。
 - Regression Gate：agent loop / tool runtime / verifier repair 改动必须跑固定 subset。
 - Release Evidence：发版只报告经过 subset 或 full run 验证的趋势，不用单题 smoke 代表整体能力。
+
+当前落地的迭代入口：
+
+- `tools/benchmark/terminal_bench_21_iteration_loop.py`
+- 默认 canary：`docs/benchmark-subsets/terminal-bench-21-canary-subset-v1.json`
+- 输出：`docs/evidence-packs/terminal-bench-21-iteration-*.md`
+- 每轮必须声明：`hypothesis`、`target_failure_class`、`scope`、baseline/head evidence、delta 和 next improvement queue。
+
+推荐循环：
+
+1. 选一个目标 failure class，例如 `tool-use`。
+2. 写最小产品能力改动，例如减少重复 inspection 或强化 artifact-first 执行。
+3. 先跑 canary iteration。
+4. canary 有正向行为 delta 后再跑 18 题 regression subset。
+5. 根据 iteration report 更新下一轮 improvement queue。
 
 ## 优先级路线
 

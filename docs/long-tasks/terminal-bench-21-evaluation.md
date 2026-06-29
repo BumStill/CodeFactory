@@ -69,9 +69,12 @@
 - Completed P0 evaluation reliability slice: provider credential/keychain failures now return typed `status=blocked`, `failure_kind=credential` results for the Benchmark UI instead of being conflated with Harbor/agent failure; Home now exposes `能力评测`, and the Terminal-Bench page shows probe, provider preview, run blocker, import summary, failure reason counts, and trial-level failure reason.
 - Completed P1 exception-to-repair slice: the headless runner now suppresses unbounded long commands, records background service lifecycle signals, and keeps service supervision / command-timeout outcomes in trajectory metadata instead of letting them disappear into Harbor exceptions.
 - Completed P2 verifier-repair slice: failed self-checks now produce structured `repair-goal` trajectory entries with kind/failure/next action/smallest rerun, and final answers are gated until a candidate artifact has a bounded verification attempt.
+- Completed first real fixed-subset provider-backed rerun after task-name normalization: run `e7d97f76-b1d1-4b08-beb7-08181a1f5a1e`, subset `terminal-bench-21-regression-subset-v1`, agent `codefactory-headless`, model backend `deepseek-v4-pro`, `0 / 18` pass, mean reward `0.000`, evidence `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T03-36-45Z.md`.
+- Added the score-driven iteration entrypoint `tools/benchmark/terminal_bench_21_iteration_loop.py`, which records hypothesis, target failure class, canary/regression scope, baseline/head delta, and next improvement queue in `docs/evidence-packs/terminal-bench-21-iteration-*.md`.
 
 ## Remaining Items
 - Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
+- Use `tools/benchmark/terminal_bench_21_iteration_loop.py --scope canary --hypothesis <...>` as the default first gate for each agent-loop improvement before spending a full 18-task run.
 - Add cost calculation once provider pricing metadata is available; current adapter captures provider-reported token usage but does not price it.
 - Continue long-horizon execution work beyond P1: broaden service readiness templates and use real subset deltas to tune the long command policy.
 - Continue verifier-driven repair work beyond P2: add task-family specific parsers only after the generic `repair-goal` mechanism shows which failure shapes remain frequent.
@@ -84,7 +87,7 @@
 
 ## Blockers
 - No current blocker for the already completed local full-run evaluation. The current full-run result is a valid CodeFactory agent capability baseline, not a provider/account blocker.
-- Current regression-subset rerun blocker in this Codex session: macOS keychain read for `com.codefactory.app` / `codefactory.endpoint.deepseek` requires authorization and blocked before Harbor spawn. Evidence before the fix: the real provider bridge printed preview for job `cf-tb21-codefactory-provider-deepseek-20260628-150115`, but no Harbor job directory was created; direct `security find-generic-password -s com.codefactory.app -a codefactory.endpoint.deepseek -w >/dev/null` also hung until interrupted. After the fix, the same real bridge path with `CODEFACTORY_BENCH_SECRET_TIMEOUT_SEC=5` exits in about 5 seconds with `Benchmark provider secret lookup timed out after 5s; unlock or authorize the OS credential store and retry`. The current Codex shell does not have `CODEFACTORY_BENCH_API_KEY` set, so the new explicit-env override path cannot run the subset until the user/app injects a key or the keychain is authorized. This is infrastructure/credential-access blocking evidence, not an agent score.
+- No current blocker for local fixed-subset evaluation: the 2026-06-29 provider-backed 18-task run completed and imported. The score is a valid low CodeFactory agent capability result, not a credential/provider blocker.
 - Official leaderboard submission process is separate from local evaluation and not covered by this first implementation slice.
 
 ## Evidence
@@ -129,6 +132,8 @@
 - Explicit-env override evidence: `cargo test provider_bridge --lib` passes with coverage that an explicit benchmark API key skips OS credential lookup and that blank env values fall back to stored secrets.
 - Fixed subset runner evidence: `python3 tools/benchmark/run_terminal_bench_21_regression_subset.py --dry-run` prints the 18-task plan without raw secrets; `python3 tools/benchmark/run_terminal_bench_21_regression_subset.py --secret-timeout-sec 5` generates credential blocker report `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-28T15-31-31Z.md`.
 - Fixed subset offline baseline evidence: `python3 tools/benchmark/summarize_terminal_bench_21_subset_baseline.py` generated `docs/evidence-packs/terminal-bench-21-regression-subset-baseline-2026-06-28T15-41-50Z.md`, mapping the completed full run to the 18-task subset with `4 / 18` pass and mean reward `0.222222`. This is an offline projection from the full job, not a fresh provider-backed rerun.
+- Fixed subset provider-backed evidence: `python3 tools/benchmark/run_terminal_bench_21_regression_subset.py --secret-timeout-sec 20` generated `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T03-36-45Z.md`, importing run `e7d97f76-b1d1-4b08-beb7-08181a1f5a1e` with `0 / 18` pass and mean reward `0.000`.
+- Iteration loop evidence: `tools/benchmark/terminal_bench_21_iteration_loop.py` is the standard score-driven loop entrypoint for the next agent capability PR; it generates `terminal-bench-21-iteration-*.md` reports with baseline/head/delta/next queue.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.

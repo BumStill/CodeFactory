@@ -22,6 +22,7 @@
 | CF-TB-R5 | 改进后能回归 | 支持同一 subset 的 baseline/head run 对比 | backend + UI | compare run fixture test |
 | CF-TB-R6 | 保持可审计和安全 | benchmark policy 只在 Harbor sandbox 生效，不污染普通项目权限和长期 memory | permission + memory + audit | policy unit test + memory write guard |
 | CF-TB-R7 | 区分 agent 评估和模型评估 | 所有 run、PR、证据包和 UI 都必须声明 evaluation axis、evaluation subject、fixed variables、changed variables 和 result attribution | docs + backend + UI | spec review + fixture attribution test |
+| CF-TB-R8 | 形成产品能力迭代 loop | 每轮 agent 能力改动必须声明 hypothesis、target failure class、评估 scope，并生成 baseline/head/delta/next queue 的 iteration report | benchmark runner + docs + PR evidence | iteration loop dry-run test + real subset evidence |
 
 ## Primary User Path
 
@@ -164,6 +165,18 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 
 固定 subset 的离线基线入口是 `tools/benchmark/summarize_terminal_bench_21_subset_baseline.py`。该脚本只读取已完成 full Harbor job 和 subset JSON，不调用 provider、不读取 secret，用于在 credential 或 provider 暂不可用时仍能生成同口径的 subset baseline evidence。该报告必须明确标注 `offline subset projection`，不能冒充新的 provider-backed rerun。
 
+### Iteration Loop
+
+标准产品能力迭代入口是 `tools/benchmark/terminal_bench_21_iteration_loop.py`。它把单次评测变成可重复的开发闭环：
+
+1. 输入本轮 `hypothesis` 和 `target_failure_class`。
+2. 选择 `canary` 或 `regression` scope。
+3. 可选执行 provider-backed run；不执行时仍生成 dry-run iteration report。
+4. 读取 baseline/head evidence，生成 pass、mean reward 和 failure class delta。
+5. 写入 `docs/evidence-packs/terminal-bench-21-iteration-*.md`，其中必须包含下一步 improvement queue。
+
+默认 canary 文件为 `docs/benchmark-subsets/terminal-bench-21-canary-subset-v1.json`，任务为 `write-compressor`、`filter-js-from-html`、`mteb-retrieve`、`count-dataset-tokens`，用于在完整 18 题 regression 前快速验证 agent loop 是否真正改善。canary 只用于开发内循环，不能替代 regression subset 或 full run 作为 release 结论。
+
 ### Run Summary
 
 每次 run 至少记录：
@@ -210,6 +223,7 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 | UI | Benchmark credential blocker | provider keychain/credential failure 返回 `status=blocked`、`failure_kind=credential`，Benchmark 页面展示 blocker，不记为 agent failure | Rust unit test + frontend build |
 | Attribution | Evaluation axis contract | run/PR/evidence 区分 CodeFactory agent 能力、模型后端影响、agent scaffold 对比和评测基础设施 smoke | spec review + fixture test |
 | Regression | Fixed subset runner | 从固定 subset JSON 生成 18 题 provider-backed run；credential 不可用时生成 blocker evidence，不伪造 agent score | runner dry-run + blocker evidence |
+| Regression | Iteration loop runner | 声明 hypothesis/target failure class 后生成 baseline/head/delta/next queue report；可 dry-run 或执行 canary/regression | Python iteration loop test + evidence report |
 | Policy | benchmark-sandbox policy in task container | workspace command/file edit 自动允许，host path/secret deny | policy unit test |
 | Policy | network/secret deny | fake model 请求 `curl` 或 credential path 时不调用 environment.exec | Python policy test |
 | Failure | 缺失 `result.json` | 标记 `partial_import`，列出缺失文件 | importer test |
