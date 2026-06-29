@@ -373,6 +373,7 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                         "CODEFACTORY_BENCH_MODEL": "fake-model",
                         "CODEFACTORY_BENCH_INSPECTION_ROUNDS": "2",
                         "CODEFACTORY_BENCH_NO_ACTION_RETRIES": "0",
+                        "CODEFACTORY_BENCH_ENABLE_CONSTRAINED_IMPLEMENTATION": "0",
                     },
                 )
 
@@ -538,6 +539,76 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                 self.assertIn("missing-tool", preflight_blocks[0]["content"])
                 assert context.metadata is not None
                 self.assertEqual(context.metadata["preflight_blocks"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_codefactory_agent_runs_constrained_scaffold_after_artifact_blocks(
+        self,
+    ) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                assistant_tool_call("cat /app/decomp.c"),
+                assistant_tool_call("cat /app/decomp.c"),
+                assistant_final("done"),
+            ]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironmentWithResults(
+                    [
+                        ExecResult(stdout="int main(void){return 0;}\n", stderr="", return_code=0),
+                        ExecResult(
+                            stdout=(
+                                "codefactory-auto-repair wrote /app/data.comp "
+                                "bytes=2476 tokens=1416\n"
+                                "2476 /app/data.comp\n"
+                                "codefactory-auto-repair-ok\n"
+                            ),
+                            stderr="",
+                            return_code=0,
+                        ),
+                    ]
+                )
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                        "CODEFACTORY_BENCH_INSPECTION_ROUNDS": "1",
+                        "CODEFACTORY_BENCH_CONSTRAINED_IMPL_BLOCKS": "1",
+                    },
+                )
+
+                asyncio.run(
+                    agent.run(
+                        "Write me data.comp such that cat data.comp | /app/decomp gives data.txt.",
+                        env,
+                        context,
+                    )
+                )
+
+                self.assertEqual(len(requests), 3)
+                self.assertEqual(len(env.calls), 2)
+                self.assertEqual(env.calls[0]["command"], "cat /app/decomp.c")
+                self.assertIn("codefactory_wc_repair.c", env.calls[1]["command"])
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                self.assertTrue(
+                    any(
+                        step.get("status") == "constrained-implementation-ok"
+                        for step in trajectory["steps"]
+                    )
+                )
+                assert context.metadata is not None
+                self.assertEqual(context.metadata["constrained_implementation_repairs"], 1)
         finally:
             server.shutdown()
             server.server_close()

@@ -66,6 +66,19 @@
 - observed behavior: `write-compressor` 真实触发 `3` 个 forced-implementation prompt，并触发 `auto-repair-ok` 写出 `/app/data.comp` `2476` bytes，但 verifier dependency setup 因 apt cache 空间不足、`curl` 缺失和 `uvx` 缺失失败，reward 为 `0.0`
 - conclusion: prompt-only forced transition 已经被证明不足；下一步必须做 constrained implementation mode 或 deterministic scaffold，而不是继续叠自然语言提醒。同时 verifier dependency/resource failure 必须从 agent tool-use failure 中分离。
 
+2026-06-29 constrained implementation single-task 结果：
+
+- before report: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T12-03-31Z.md`
+- after report: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T12-07-06Z.md`
+- comparison: `docs/evidence-packs/terminal-bench-21-constrained-scaffold-2026-06-29T12-07-06Z.md`
+- task: `terminal-bench/write-compressor`
+- before runtime: `228.60s`
+- after runtime: `112.72s`
+- delta: `-115.88s`, about `50.7%` faster
+- failure class: stable `environment`
+- score: unchanged at `0.000`
+- conclusion: constrained implementation mode closed one modification loop: it reduced wasted model/probe time and reached artifact-producing scaffold faster. The next blocker is verifier environment/resource readiness, not this task's artifact generation path.
+
 ## 问题分层
 
 ### 1. 评测基础设施还不够产品化
@@ -152,10 +165,11 @@
 - command-not-found preflight。
 - `return_code=0` 但输出包含 `ERROR` / traceback / no-space-left 等语义失败时，记录 `semantic-failure` 并生成 repair goal。
 - forced implementation transition prompt：当 `implementation-required` / `artifact-required` 触发后，把模型切到“下一条命令必须产生产物”的结构化提示，并记录 `forced-implementation` 轨迹节点。
+- constrained implementation mode：在 `write-compressor` family 中，当 artifact/implementation block 或 no-action recovery 已经具备 decompressor context 时，系统直接运行 deterministic C scaffold，不再继续消耗模型轮次等待自觉转向。
 
 下一步要做：
 
-- 将 `implementation-required` / `artifact-required` 从“自然语言强制提示”升级为“constrained implementation mode”：注入当前 workspace inventory、expected artifact、已失败命令、最小自检命令，并拒绝后续 probe-only 命令；如果模型仍然 probe，则执行确定性的安全 scaffold 或 task-family recipe。
+- 将 constrained implementation mode 从 `write-compressor` family 扩展到更多有明确 artifact recipe 的任务；没有安全 recipe 的任务先只拒绝 probe-only 命令并生成结构化 implementation plan。
 - 增加 max-blocks escape hatch：同一任务多次被 artifact gate 拦截后，不再继续把控制权交给自由探索，而是进入 constrained implementation prompt 或自动生成最小 scaffold。
 - 扩展 verifier/resource preflight：`write-compressor` 这次 `/app/data.comp` 已写出且小于 byte limit，但 verifier 因 apt/cache/dependency bootstrap 失败给 `0.0`；这类结果不能算 agent artifact repair 失败。
 - tool planner 在执行前做静态风险/收益检查：路径、命令是否存在、是否会常驻、是否需要 cwd、是否会修改 host。

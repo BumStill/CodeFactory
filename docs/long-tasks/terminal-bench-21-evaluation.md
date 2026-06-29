@@ -77,6 +77,8 @@
 - Added forced implementation transition prompts after `implementation-required` / `artifact-required` blocks, with trajectory and metadata coverage.
 - Reran the canary with forced transition enabled; the runner returned explicit `124` after `360s`, with partial Harbor state `1 / 4` completed and completed reward `0 / 1`. `write-compressor` recorded `3` forced-implementation prompts and an `auto-repair-ok` that wrote `/app/data.comp` at `2476` bytes, but verifier reward remained `0.0` because verifier dependency setup hit apt cache free-space / missing `curl` / missing `uvx` errors.
 - Added failure-classifier coverage for verifier dependency/resource failures so apt cache exhaustion and missing verifier dependency bootstrap tools are attributed to `environment/verifier-dependency-resource` before generic `tool-use` missing-command rules.
+- Added constrained implementation mode for `write-compressor`: after artifact/implementation blocks or no-action recovery with decompressor context, CodeFactory runs the existing C scaffold directly instead of waiting for more model probing.
+- Reran single-task `write-compressor` canary after constrained no-action support: run `5b1c540d-56ab-4be2-afcb-ee3521b013d6`, `0 / 1` pass, failure class `environment`, runtime `112.72s`. Compared with the immediately previous single-task run `234859fc-085f-4492-9083-c883a4a39d13` at `228.60s`, this is a `115.88s` / about `50.7%` runtime reduction with stable environment attribution.
 
 ## Remaining Items
 - Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
@@ -92,6 +94,7 @@
 - Compare at least one baseline/head subset after an implementation change.
 - Next agent-loop slice must turn blocked `implementation-required` / `artifact-required` states into a concrete forced implementation plan; adding more blockers without strategy transition did not improve the canary score.
 - Natural-language forced transition alone is insufficient. Next slice should add constrained implementation mode or deterministic scaffold execution after repeated artifact blocks, while keeping verifier dependency/resource failures separate from agent capability failures.
+- Constrained implementation mode has now produced a measurable loop improvement on `write-compressor` runtime, but not a reward improvement because the remaining failure is verifier environment/resource readiness. Next score-facing slice should either preflight/fix verifier dependency resources or use a canary task whose verifier is not resource-blocked.
 
 ## Blockers
 - No current blocker for the already completed local full-run evaluation. The current full-run result is a valid CodeFactory agent capability baseline, not a provider/account blocker.
@@ -145,6 +148,7 @@
 - First score-driven canary evidence: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T06-58-36Z.md` records `0 / 4` pass for the canary after the first tool-use P0 iteration.
 - Bounded canary timeout evidence: `docs/evidence-packs/terminal-bench-21-canary-timeout-2026-06-29T07-15-12Z.md` records the `360s` timeout, partial `2 / 4` completion, and product conclusion that enforcement improved but strategy transition remains missing.
 - Forced transition canary evidence: `docs/evidence-packs/terminal-bench-21-forced-transition-timeout-2026-06-29T08-01-36Z.md` records the `360s` timeout, partial `1 / 4` completion, real forced-prompt trajectory nodes, and the conclusion that prompt-only transition is still not enough.
+- Constrained scaffold evidence: `docs/evidence-packs/terminal-bench-21-constrained-scaffold-2026-06-29T12-07-06Z.md` records the single-task `write-compressor` before/after runtime improvement from `228.60s` to `112.72s` while preserving environment failure attribution.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.
