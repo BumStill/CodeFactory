@@ -961,7 +961,13 @@ fn normalize_task_names(task_names: Option<&[String]>) -> Vec<String> {
         .iter()
         .map(|name| name.trim())
         .filter(|name| !name.is_empty())
-        .map(str::to_string)
+        .map(|name| {
+            if name.contains('/') {
+                name.to_string()
+            } else {
+                format!("terminal-bench/{name}")
+            }
+        })
         .collect()
 }
 
@@ -2073,7 +2079,10 @@ mod tests {
         assert_eq!(preview.key_ref, "codefactory.endpoint.deepseek");
         assert_eq!(
             preview.task_names,
-            vec!["write-compressor".to_string(), "extract-elf".to_string()]
+            vec![
+                "terminal-bench/write-compressor".to_string(),
+                "terminal-bench/extract-elf".to_string()
+            ]
         );
         assert_eq!(preview.concurrency, 3);
         assert_eq!(preview.trial_count, 1);
@@ -2089,9 +2098,30 @@ mod tests {
             .command_preview
             .contains("CODEFACTORY_BENCH_API_KEY='<redacted:codefactory.endpoint.deepseek>'"));
         assert!(preview.command_preview.contains("-m deepseek-v4-flash"));
-        assert!(preview.command_preview.contains("-i write-compressor"));
-        assert!(preview.command_preview.contains("-i extract-elf"));
+        assert!(preview
+            .command_preview
+            .contains("-i terminal-bench/write-compressor"));
+        assert!(preview
+            .command_preview
+            .contains("-i terminal-bench/extract-elf"));
         assert!(preview.command_preview.contains("-n 3"));
+    }
+
+    #[test]
+    fn provider_bridge_normalizes_terminal_bench_subset_task_names() {
+        let names = normalize_task_names(Some(&[
+            "write-compressor".to_string(),
+            "terminal-bench/extract-elf".to_string(),
+            " ".to_string(),
+        ]));
+
+        assert_eq!(
+            names,
+            vec![
+                "terminal-bench/write-compressor".to_string(),
+                "terminal-bench/extract-elf".to_string(),
+            ]
+        );
     }
 
     #[test]
