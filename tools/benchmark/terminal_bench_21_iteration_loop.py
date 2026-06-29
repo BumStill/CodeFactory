@@ -240,6 +240,14 @@ def delta_line(label: str, before: int | float | None, after: int | float | None
     return f"- {label}: `{before}` -> `{after}` (`{sign}{delta}`)"
 
 
+def comparable_delta(baseline: EvidenceSummary | None, head: EvidenceSummary | None) -> bool:
+    if baseline is None or head is None:
+        return False
+    if baseline.trials is None or head.trials is None:
+        return False
+    return baseline.trials == head.trials
+
+
 def format_failure_counts(summary: EvidenceSummary | None) -> list[str]:
     if summary is None or not summary.failure_counts:
         return ["- no trial failure table available"]
@@ -278,6 +286,28 @@ def write_iteration_report(
     ]
     if exit_code is not None:
         lines.append(f"- exit_code: `{exit_code}`")
+    is_comparable = comparable_delta(baseline, head)
+    if is_comparable:
+        delta_lines = [
+            delta_line(
+                "pass_count",
+                baseline.pass_count if baseline else None,
+                head.pass_count if head else None,
+            ),
+            delta_line(
+                "mean_reward",
+                baseline.mean_reward if baseline else None,
+                head.mean_reward if head else None,
+            ),
+        ]
+    else:
+        delta_lines = [
+            "- comparable_delta: `no`",
+            (
+                "- reason: baseline and head have different trial counts; use this "
+                "report as targeted canary evidence, not an aggregate score delta."
+            ),
+        ]
     lines.extend(
         [
             "",
@@ -299,16 +329,7 @@ def write_iteration_report(
             "",
             "## Delta",
             "",
-            delta_line(
-                "pass_count",
-                baseline.pass_count if baseline else None,
-                head.pass_count if head else None,
-            ),
-            delta_line(
-                "mean_reward",
-                baseline.mean_reward if baseline else None,
-                head.mean_reward if head else None,
-            ),
+            *delta_lines,
             "",
             "## Failure Class Counts",
             "",

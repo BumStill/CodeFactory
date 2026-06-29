@@ -79,6 +79,19 @@
 - score: unchanged at `0.000`
 - conclusion: constrained implementation mode closed one modification loop: it reduced wasted model/probe time and reached artifact-producing scaffold faster. The next blocker is verifier environment/resource readiness, not this task's artifact generation path.
 
+2026-06-29 `mteb-retrieve` environment/agent-loop canary 结果：
+
+- comparison report: `docs/evidence-packs/terminal-bench-21-mteb-cache-artifact-gate-2026-06-29T12-41-55Z.md`
+- latest run: `addff8cf-2249-4e6c-8463-cc919a1eed93`
+- latest report: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T12-41-55Z.md`
+- task: `terminal-bench/mteb-retrieve`
+- runtime: `227.18s` -> `57.17s`
+- latest tool calls: `5`
+- score: unchanged at `0.000`
+- behavior: `/app/result.txt` is now extracted as the artifact target, the agent writes the expected line, and `Artifact completion gate` stops further tool use.
+- remaining blocker: verifier bootstrap still fails with missing `curl`, `/root/.local/bin/env`, and `uvx`.
+- conclusion: this is a verified agent-loop improvement but not a scoring improvement. The next score-facing step must repair or preflight verifier bootstrap dependencies before running broader regression.
+
 ## 问题分层
 
 ### 1. 评测基础设施还不够产品化
@@ -93,6 +106,7 @@
 当前已落地：
 
 - provider usage capture。
+- canary iteration reports now mark mismatched trial-count comparisons as `comparable_delta: no`, preventing single-task canaries from being reported as aggregate 18-task score deltas.
 - `failure_reason`。
 - Docker CPU preflight。
 - `task_names` 固定 subset 支持。
@@ -206,6 +220,12 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 3. 先跑 canary iteration。
 4. canary 有正向行为 delta 后再跑 18 题 regression subset。
 5. 根据 iteration report 更新下一轮 improvement queue。
+
+当前下一轮 P0：
+
+1. 修复或前置检查 verifier bootstrap：`curl`、`/root/.local/bin/env`、`uvx`。
+2. 用同一个 `mteb-retrieve` canary 验证 reward/failure_class 是否从 `environment` 迁移。
+3. 只有单题 canary 解除 verifier blocker 后，才跑 18 题 regression subset，避免继续消耗 provider token 但只得到同一个基础设施失败。
 
 首轮 canary 的具体调整：
 

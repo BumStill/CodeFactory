@@ -239,6 +239,16 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                 self.assertEqual(len(requests), 2)
                 self.assertEqual(requests[0]["max_tokens"], 1234)
                 self.assertEqual(env.calls[0]["command"], "printf ok")
+                tool_env = env.calls[0]["env"]
+                assert isinstance(tool_env, dict)
+                self.assertEqual(
+                    tool_env["CODEFACTORY_BENCHMARK_POLICY"], "benchmark-sandbox"
+                )
+                self.assertEqual(tool_env["HF_HOME"], "/logs/agent/.cache/huggingface")
+                self.assertEqual(tool_env["PIP_USER"], "1")
+                self.assertEqual(
+                    tool_env["PYTHONUSERBASE"], "/logs/agent/python-userbase"
+                )
                 assert context.metadata is not None
                 self.assertEqual(context.metadata["mode"], "model-backed")
                 self.assertEqual(context.metadata["tool_calls"], 1)
@@ -260,6 +270,28 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_artifact_completion_gate_stops_after_confirmed_write(self) -> None:
+        self.assertTrue(
+            CodeFactoryAgent._should_stop_after_artifact_confirmation(
+                {
+                    "status": "ok",
+                    "command": "python3 solve.py > /app/result.txt",
+                    "content": "return_code=0\nstdout:\nDone writing /app/result.txt\n",
+                },
+                "/app/result.txt",
+            )
+        )
+        self.assertFalse(
+            CodeFactoryAgent._should_stop_after_artifact_confirmation(
+                {
+                    "status": "ok",
+                    "command": "cat /app/result.txt",
+                    "content": "return_code=0\nstdout:\nmaybe a result\n",
+                },
+                "/app/result.txt",
+            )
+        )
 
     def test_codefactory_agent_model_backed_policy_denies_network_tool(self) -> None:
         server, requests = start_fake_chat_server(
@@ -1194,6 +1226,14 @@ gcc -o /app/enc /app/enc.c
 
         self.assertEqual(hint, "data.comp")
 
+    def test_agent_extracts_artifact_hint_from_result_line_instruction(self) -> None:
+        hint = CodeFactoryAgent._artifact_hint_from_instruction(
+            'Given the query "terminal-bench" retrieve the document and write the '
+            "resulting line to /app/result.txt."
+        )
+
+        self.assertEqual(hint, "/app/result.txt")
+
     def test_agent_extracts_exact_stdout_verification_hint(self) -> None:
         hint = CodeFactoryAgent._verification_hint_from_instruction(
             "running cat data.comp | /app/decomp gives exactly data.txt."
@@ -1365,6 +1405,22 @@ gcc -o /app/enc /app/enc.c
         self.assertIn("Repair focus", hint)
         self.assertIn("data.comp", hint)
         self.assertIn("do not read task files again", hint)
+
+    def test_repair_hint_handles_mteb_task_name_requirement(self) -> None:
+        hint = CodeFactoryAgent._repair_hint_from_tool_result(
+            {
+                "content": (
+                    "TypeError: SentenceTransformerWrapper.encode() missing 1 "
+                    "required keyword-only argument: 'task_name'"
+                )
+            },
+            "/app/result.txt",
+        )
+
+        assert hint is not None
+        self.assertIn("MTEB 1.36", hint)
+        self.assertIn('task_name="T2Retrieval"', hint)
+        self.assertIn("/app/result.txt", hint)
 
     def test_auto_repair_command_targets_write_compressor_protocol_failures(self) -> None:
         agent = CodeFactoryAgent(logs_dir=Path("/tmp"))

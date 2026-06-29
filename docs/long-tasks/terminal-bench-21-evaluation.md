@@ -11,10 +11,10 @@
 - Blocked means: Harbor/Docker/dataset/agent-adapter/runtime access prevents real smoke verification, with exact command, error, and next action recorded.
 
 ## Current State
-- Current phase: implementation slice 6
-- Current checkpoint: full Terminal-Bench 2.1 CodeFactory agent capability run completed and imported. Latest full run is run id `7ff6ef13-4488-4e0f-afd0-a1f9bd16d561`, agent `codefactory-headless`, model backend `deepseek-v4-pro`, dataset `terminal-bench/terminal-bench-2-1`, `89 / 89` trials completed, mean reward `0.06741573033707865`, pass count `6 / 89`, failed count `83 / 89`, exceptions `63`. This is the first full CodeFactory-run score and it is a low capability baseline, not an acceptable product level. The first score-driven tool-use canary iteration completed one full canary at `0 / 4`, then exposed a runner hang during the next bounded canary; the runner now has a wall-time timeout and the partial evidence is recorded as a product/infrastructure finding.
+- Current phase: implementation slice 7
+- Current checkpoint: full Terminal-Bench 2.1 CodeFactory agent capability run completed and imported. Latest full run is run id `7ff6ef13-4488-4e0f-afd0-a1f9bd16d561`, agent `codefactory-headless`, model backend `deepseek-v4-pro`, dataset `terminal-bench/terminal-bench-2-1`, `89 / 89` trials completed, mean reward `0.06741573033707865`, pass count `6 / 89`, failed count `83 / 89`, exceptions `63`. This is the first full CodeFactory-run score and it is a low capability baseline, not an acceptable product level. The latest score-driven canary on `mteb-retrieve` verified an agent-loop behavior improvement from `227.18s` to `57.17s` and `5` tool calls with `/app/result.txt` artifact completion gating, but reward remains `0.0` because the verifier bootstrap environment still lacks `curl`, `/root/.local/bin/env`, and `uvx`.
 - Next owner: development / QA
-- Updated at: 2026-06-28
+- Updated at: 2026-06-29
 
 ## Completed Items
 - Verified current external Terminal-Bench 2.1 run surface from official sources.
@@ -79,6 +79,10 @@
 - Added failure-classifier coverage for verifier dependency/resource failures so apt cache exhaustion and missing verifier dependency bootstrap tools are attributed to `environment/verifier-dependency-resource` before generic `tool-use` missing-command rules.
 - Added constrained implementation mode for `write-compressor`: after artifact/implementation blocks or no-action recovery with decompressor context, CodeFactory runs the existing C scaffold directly instead of waiting for more model probing.
 - Reran single-task `write-compressor` canary after constrained no-action support: run `5b1c540d-56ab-4be2-afcb-ee3521b013d6`, `0 / 1` pass, failure class `environment`, runtime `112.72s`. Compared with the immediately previous single-task run `234859fc-085f-4492-9083-c883a4a39d13` at `228.60s`, this is a `115.88s` / about `50.7%` runtime reduction with stable environment attribution.
+- Routed model-backed tool execution caches, pip user installs, HuggingFace cache, sentence-transformer cache, and temp files to `/logs/agent` to avoid task-container overlay exhaustion during model/dataset tasks.
+- Fixed canary iteration reporting so single-task canaries are marked `comparable_delta: no` against the 18-task baseline instead of presenting a misleading aggregate score delta.
+- Added MTEB 1.36 repair guidance for `SentenceTransformerWrapper.encode()` requiring `task_name`, artifact hint extraction for `/app/result.txt`, and artifact completion gating after successful expected-artifact writes.
+- Reran `mteb-retrieve` canaries after the environment and artifact-loop fixes. Latest run `addff8cf-2249-4e6c-8463-cc919a1eed93` completed in `57.17s`, used `5` tool calls, wrote `/app/result.txt`, and triggered `Artifact completion gate`; reward stayed `0.0` with failure class `environment` because verifier bootstrap still reports missing `curl`, `/root/.local/bin/env`, and `uvx`. Evidence: `docs/evidence-packs/terminal-bench-21-mteb-cache-artifact-gate-2026-06-29T12-41-55Z.md`.
 
 ## Remaining Items
 - Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
@@ -91,10 +95,9 @@
 - Add persisted run fields/UI for evaluation axis, evaluation subject, fixed variables, changed variables, and result attribution.
 - Promote `benchmark-sandbox` from adapter-local command gate to shared CodeFactory policy preset with run/task/container binding.
 - Expand Benchmarks UI beyond P0: add historical run comparison, capability profile trends, and direct evidence-pack export.
-- Compare at least one baseline/head subset after an implementation change.
-- Next agent-loop slice must turn blocked `implementation-required` / `artifact-required` states into a concrete forced implementation plan; adding more blockers without strategy transition did not improve the canary score.
-- Natural-language forced transition alone is insufficient. Next slice should add constrained implementation mode or deterministic scaffold execution after repeated artifact blocks, while keeping verifier dependency/resource failures separate from agent capability failures.
-- Constrained implementation mode has now produced a measurable loop improvement on `write-compressor` runtime, but not a reward improvement because the remaining failure is verifier environment/resource readiness. Next score-facing slice should either preflight/fix verifier dependency resources or use a canary task whose verifier is not resource-blocked.
+- Compare at least one same-scope baseline/head subset after a score-facing implementation change.
+- Fix or preflight verifier bootstrap dependencies for tasks that require `curl`, `/root/.local/bin/env`, and `uvx`; current agent-loop canaries can produce correct artifacts but still score `0.0` when verifier dependency setup fails.
+- After verifier bootstrap is fixed, rerun the same `mteb-retrieve` single-task canary first, then the 18-task regression subset only if the canary reward or failure class improves.
 
 ## Blockers
 - No current blocker for the already completed local full-run evaluation. The current full-run result is a valid CodeFactory agent capability baseline, not a provider/account blocker.

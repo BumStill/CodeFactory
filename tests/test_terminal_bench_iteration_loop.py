@@ -134,6 +134,46 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
             self.assertIn("reduce repeated inspection", text)
             self.assertIn("artifact implementation earlier", text)
 
+    def test_write_iteration_report_marks_mismatched_trial_counts_not_comparable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            baseline_path = tmp_path / "baseline.md"
+            head_path = tmp_path / "head.md"
+            baseline_path.write_text(
+                "- run: `baseline`\n- trials: `18`\n- pass_count: `4`\n"
+                "- mean_reward: `0.222222`\n"
+            )
+            head_path.write_text(
+                "- run: `head`\n- trials: `1`\n- pass_count: `0`\n"
+                "- mean_reward: `0.0`\n"
+            )
+            baseline = loop.parse_evidence(baseline_path)
+            head = loop.parse_evidence(head_path)
+
+            with mock.patch.object(loop, "EVIDENCE_DIR", tmp_path):
+                report = loop.write_iteration_report(
+                    args=mock.Mock(
+                        endpoint="deepseek",
+                        model=None,
+                        hypothesis="target one task",
+                        target_failure_class="environment",
+                    ),
+                    scope="canary",
+                    subset_path=tmp_path / "subset.json",
+                    baseline=baseline,
+                    head=head,
+                    exit_code=0,
+                    ran_command=True,
+                    output="",
+                )
+
+            text = report.read_text()
+            self.assertIn("- comparable_delta: `no`", text)
+            self.assertIn("different trial counts", text)
+            self.assertNotIn("- pass_count: `4` -> `0`", text)
+
     def test_run_subset_times_out_and_returns_reportable_output(self) -> None:
         class TimeoutProcess:
             pid = 12345
