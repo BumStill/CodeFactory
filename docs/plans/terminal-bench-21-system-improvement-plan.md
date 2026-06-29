@@ -39,6 +39,24 @@
 
 这个结果说明固定 subset 的真实 provider-backed 当前状态低于离线投影基线。它不是 DeepSeek 单独能力结论，而是 CodeFactory headless agent loop、tool policy、验证修复和环境 preflight 的系统性能力结论。后续不再把“跑通一次”作为目标，必须进入“hypothesis -> canary/subset -> delta -> improvement queue”的迭代闭环。
 
+2026-06-29 首轮 score-driven tool-use canary 结果：
+
+- 完整 canary run: `77e98d56-2638-4b0c-a941-a84b542d51ff`
+- report: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T06-58-36Z.md`
+- scope: `terminal-bench-21-canary-subset-v1`
+- pass: `0 / 4`
+- mean reward: `0.000`
+- failure class: `tool-use` for all four tasks
+- result attribution: `codefactory-agent-capability`
+
+首轮改动后的 bounded canary 进一步暴露了评测 runner 和 agent 策略问题：
+
+- report: `docs/evidence-packs/terminal-bench-21-canary-timeout-2026-06-29T07-15-12Z.md`
+- runner exit: `124`
+- timeout: `360s`
+- partial Harbor state: `2 / 4` completed, completed reward `0 / 2`
+- conclusion: repeated-inspection suppression、artifact gate、semantic failure detection 能改变轨迹并提升可观测性，但还没有把被拦截状态转成有效实现策略，因此没有分数提升。
+
 ## 问题分层
 
 ### 1. 评测基础设施还不够产品化
@@ -59,6 +77,8 @@
 - provider secret lookup timeout。
 - 显式 `CODEFACTORY_BENCH_API_KEY` override。
 - 18 题固定 regression subset。
+- score-driven iteration runner。
+- iteration runner wall-time timeout：评测卡住时返回 `124` 并写 report，而不是无限等待。
 
 下一步标准：
 
@@ -119,9 +139,13 @@
 - repeated inspection suppression。
 - artifact-required / implementation-required gate。
 - foreground service supervision guard。
+- command-not-found preflight。
+- `return_code=0` 但输出包含 `ERROR` / traceback / no-space-left 等语义失败时，记录 `semantic-failure` 并生成 repair goal。
 
 下一步要做：
 
+- 将 `implementation-required` / `artifact-required` 从“拦截消息”升级为“强制实现状态”：注入当前 workspace inventory、expected artifact、已失败命令、最小自检命令，然后要求模型直接写候选实现。
+- 增加 max-blocks escape hatch：同一任务多次被 artifact gate 拦截后，不再继续把控制权交给自由探索，而是进入 constrained implementation prompt 或自动生成最小 scaffold。
 - tool planner 在执行前做静态风险/收益检查：路径、命令是否存在、是否会常驻、是否需要 cwd、是否会修改 host。
 - 对 `command not found`、`no such file`、`permission denied` 自动生成替代动作建议。
 - 建立 task workspace inventory：文件、可执行、端口、语言生态、测试入口。
@@ -156,6 +180,12 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 3. 先跑 canary iteration。
 4. canary 有正向行为 delta 后再跑 18 题 regression subset。
 5. 根据 iteration report 更新下一轮 improvement queue。
+
+首轮 canary 的具体调整：
+
+1. 不再继续单纯加 blocker。已有 blocker 能证明坏行为，但不能自动产生好实现。
+2. 下一轮优先做 `forced implementation transition`：当 inspection budget 或 artifact gate 触发后，把模型从自由工具调用切到结构化实现 prompt。
+3. canary gate 保持 4 题，但 runner 必须带 `--run-timeout-sec`，timeout 也要进入 evidence。
 
 ## 优先级路线
 

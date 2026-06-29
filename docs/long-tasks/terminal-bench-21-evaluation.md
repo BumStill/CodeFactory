@@ -12,7 +12,7 @@
 
 ## Current State
 - Current phase: implementation slice 6
-- Current checkpoint: full Terminal-Bench 2.1 CodeFactory agent capability run completed and imported. Latest full run is run id `7ff6ef13-4488-4e0f-afd0-a1f9bd16d561`, agent `codefactory-headless`, model backend `deepseek-v4-pro`, dataset `terminal-bench/terminal-bench-2-1`, `89 / 89` trials completed, mean reward `0.06741573033707865`, pass count `6 / 89`, failed count `83 / 89`, exceptions `63`. This is the first full CodeFactory-run score and it is a low capability baseline, not an acceptable product level.
+- Current checkpoint: full Terminal-Bench 2.1 CodeFactory agent capability run completed and imported. Latest full run is run id `7ff6ef13-4488-4e0f-afd0-a1f9bd16d561`, agent `codefactory-headless`, model backend `deepseek-v4-pro`, dataset `terminal-bench/terminal-bench-2-1`, `89 / 89` trials completed, mean reward `0.06741573033707865`, pass count `6 / 89`, failed count `83 / 89`, exceptions `63`. This is the first full CodeFactory-run score and it is a low capability baseline, not an acceptable product level. The first score-driven tool-use canary iteration completed one full canary at `0 / 4`, then exposed a runner hang during the next bounded canary; the runner now has a wall-time timeout and the partial evidence is recorded as a product/infrastructure finding.
 - Next owner: development / QA
 - Updated at: 2026-06-28
 
@@ -71,6 +71,9 @@
 - Completed P2 verifier-repair slice: failed self-checks now produce structured `repair-goal` trajectory entries with kind/failure/next action/smallest rerun, and final answers are gated until a candidate artifact has a bounded verification attempt.
 - Completed first real fixed-subset provider-backed rerun after task-name normalization: run `e7d97f76-b1d1-4b08-beb7-08181a1f5a1e`, subset `terminal-bench-21-regression-subset-v1`, agent `codefactory-headless`, model backend `deepseek-v4-pro`, `0 / 18` pass, mean reward `0.000`, evidence `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T03-36-45Z.md`.
 - Added the score-driven iteration entrypoint `tools/benchmark/terminal_bench_21_iteration_loop.py`, which records hypothesis, target failure class, canary/regression scope, baseline/head delta, and next improvement queue in `docs/evidence-packs/terminal-bench-21-iteration-*.md`.
+- Ran the first score-driven tool-use P0 canary iteration after repeated-inspection and preflight changes: run `77e98d56-2638-4b0c-a941-a84b542d51ff`, `0 / 4` pass, mean reward `0.000`, failure class `tool-use` for all canary tasks.
+- Added harder artifact-command gating, semantic failure detection for `return_code=0` pipelines with failure text, and bounded iteration-runner timeout support.
+- Reran the canary with bounded timeout; the runner returned explicit `124` after `360s` instead of hanging, with partial Harbor state `2 / 4` completed and `0 / 2` pass. Evidence shows the new gates changed trajectory behavior but did not improve score.
 
 ## Remaining Items
 - Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
@@ -84,6 +87,7 @@
 - Promote `benchmark-sandbox` from adapter-local command gate to shared CodeFactory policy preset with run/task/container binding.
 - Expand Benchmarks UI beyond P0: add historical run comparison, capability profile trends, and direct evidence-pack export.
 - Compare at least one baseline/head subset after an implementation change.
+- Next agent-loop slice must turn blocked `implementation-required` / `artifact-required` states into a concrete forced implementation plan; adding more blockers without strategy transition did not improve the canary score.
 
 ## Blockers
 - No current blocker for the already completed local full-run evaluation. The current full-run result is a valid CodeFactory agent capability baseline, not a provider/account blocker.
@@ -134,6 +138,8 @@
 - Fixed subset offline baseline evidence: `python3 tools/benchmark/summarize_terminal_bench_21_subset_baseline.py` generated `docs/evidence-packs/terminal-bench-21-regression-subset-baseline-2026-06-28T15-41-50Z.md`, mapping the completed full run to the 18-task subset with `4 / 18` pass and mean reward `0.222222`. This is an offline projection from the full job, not a fresh provider-backed rerun.
 - Fixed subset provider-backed evidence: `python3 tools/benchmark/run_terminal_bench_21_regression_subset.py --secret-timeout-sec 20` generated `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T03-36-45Z.md`, importing run `e7d97f76-b1d1-4b08-beb7-08181a1f5a1e` with `0 / 18` pass and mean reward `0.000`.
 - Iteration loop evidence: `tools/benchmark/terminal_bench_21_iteration_loop.py` is the standard score-driven loop entrypoint for the next agent capability PR; it generates `terminal-bench-21-iteration-*.md` reports with baseline/head/delta/next queue.
+- First score-driven canary evidence: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T06-58-36Z.md` records `0 / 4` pass for the canary after the first tool-use P0 iteration.
+- Bounded canary timeout evidence: `docs/evidence-packs/terminal-bench-21-canary-timeout-2026-06-29T07-15-12Z.md` records the `360s` timeout, partial `2 / 4` completion, and product conclusion that enforcement improved but strategy transition remains missing.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.

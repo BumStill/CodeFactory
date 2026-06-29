@@ -134,6 +134,39 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
             self.assertIn("reduce repeated inspection", text)
             self.assertIn("artifact implementation earlier", text)
 
+    def test_run_subset_times_out_and_returns_reportable_output(self) -> None:
+        class TimeoutProcess:
+            pid = 12345
+            returncode = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def communicate(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise loop.subprocess.TimeoutExpired(cmd=["runner"], timeout=timeout)
+                return "partial output\n", None
+
+        process = TimeoutProcess()
+        with (
+            mock.patch.object(loop.subprocess, "Popen", return_value=process),
+            mock.patch.object(loop.os, "killpg") as killpg,
+        ):
+            exit_code, output = loop.run_subset(
+                Path("/tmp/subset.json"),
+                endpoint="deepseek",
+                model=None,
+                concurrency=2,
+                secret_timeout_sec=20,
+                run_timeout_sec=1,
+            )
+
+        self.assertEqual(exit_code, 124)
+        self.assertIn("partial output", output)
+        self.assertIn("BENCHMARK_RUN_TIMEOUT: exceeded 1 seconds", output)
+        killpg.assert_called_once_with(12345, loop.signal.SIGTERM)
+
 
 if __name__ == "__main__":
     unittest.main()

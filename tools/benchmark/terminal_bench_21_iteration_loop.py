@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -171,6 +173,7 @@ def run_subset(
     model: str | None,
     concurrency: int,
     secret_timeout_sec: int,
+    run_timeout_sec: int,
 ) -> tuple[int, str]:
     command = [
         sys.executable,
@@ -192,14 +195,34 @@ def run_subset(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        bufsize=1,
+        start_new_session=True,
     )
-    output: list[str] = []
-    assert process.stdout is not None
-    for line in process.stdout:
-        output.append(line)
-        print(line, end="")
-    return process.wait(), "".join(output)
+    try:
+        output, _ = process.communicate(timeout=run_timeout_sec)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            output, _ = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            output, _ = process.communicate()
+        output = (
+            (output or "")
+            + "\n"
+            + f"BENCHMARK_RUN_TIMEOUT: exceeded {run_timeout_sec} seconds\n"
+        )
+        print(output, end="")
+        return 124, output
+
+    output = output or ""
+    print(output, end="")
+    return process.returncode or 0, output
 
 
 def extract_evidence_path(output: str) -> Path | None:
@@ -357,6 +380,7 @@ def main() -> int:
     parser.add_argument("--model")
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--secret-timeout-sec", type=int, default=20)
+    parser.add_argument("--run-timeout-sec", type=int, default=1800)
     parser.add_argument("--target-failure-class", default="tool-use")
     parser.add_argument("--hypothesis", required=True)
     parser.add_argument(
@@ -399,6 +423,7 @@ def main() -> int:
             model=args.model,
             concurrency=args.concurrency,
             secret_timeout_sec=args.secret_timeout_sec,
+            run_timeout_sec=args.run_timeout_sec,
         )
         head_path = extract_evidence_path(output)
     elif head_path is None:

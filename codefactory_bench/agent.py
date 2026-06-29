@@ -202,8 +202,11 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             "command_timeouts": 0,
             "service_supervision_blocks": 0,
             "long_command_blocks": 0,
+            "implementation_required_blocks": 0,
+            "preflight_blocks": 0,
             "background_processes": [],
             "repair_goals": [],
+            "missing_commands": {},
         }
 
         def write_logs() -> None:
@@ -526,6 +529,10 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 loop_state.get("service_supervision_blocks") or 0
             ),
             "long_command_blocks": int(loop_state.get("long_command_blocks") or 0),
+            "implementation_required_blocks": int(
+                loop_state.get("implementation_required_blocks") or 0
+            ),
+            "preflight_blocks": int(loop_state.get("preflight_blocks") or 0),
             "repair_goal_count": len(loop_state.get("repair_goals") or []),
             "background_process_count": len(loop_state.get("background_processes") or []),
         }
@@ -668,6 +675,25 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             }
 
         command = str(arguments.get("command") or "").strip()
+        preflight = self._preflight_shell_command(command, loop_state)
+        if preflight:
+            loop_state["preflight_blocks"] = int(loop_state.get("preflight_blocks") or 0) + 1
+            return {
+                "content": preflight["content"],
+                "trajectory": {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "tool": name,
+                    "command": command,
+                    "policy": {
+                        "action": "suppress",
+                        "reason": preflight["reason"],
+                    },
+                    "status": "preflight-blocked",
+                    "content": preflight["content"],
+                },
+            }
+
         decision = self._classify_shell_command(command)
         if decision["action"] == "deny":
             content = f"DENIED by benchmark-sandbox: {decision['reason']}"
@@ -684,13 +710,16 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 },
             }
 
-        if self._requires_artifact_command(command, loop_state, artifact_hint):
+        if self._requires_artifact_command(command, loop_state, step, artifact_hint):
             loop_state["implementation_required_count"] = (
                 int(loop_state.get("implementation_required_count") or 0) + 1
             )
+            loop_state["implementation_required_blocks"] = (
+                int(loop_state.get("implementation_required_blocks") or 0) + 1
+            )
             artifact = f" `{artifact_hint}`" if artifact_hint else " the expected artifact"
             content = (
-                "ARTIFACT COMMAND REQUIRED: prior inspection commands were blocked and "
+                "ARTIFACT COMMAND REQUIRED: implementation budget is exhausted and "
                 f"{artifact} still has not been produced. The next accepted command must "
                 f"directly create, write, copy, move, or run a generator that produces{artifact}."
             )
@@ -713,6 +742,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         if self._requires_implementation_before_inspection(
             command, loop_state, step, artifact_hint
         ):
+            loop_state["implementation_required_blocks"] = (
+                int(loop_state.get("implementation_required_blocks") or 0) + 1
+            )
             loop_state["implementation_required_count"] = (
                 int(loop_state.get("implementation_required_count") or 0) + 1
             )
@@ -796,7 +828,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
 
         command_key = self._repeat_command_key(command)
         command_counts[command_key] = command_counts.get(command_key, 0) + 1
-        repeat_limit = self._int_env("CODEFACTORY_BENCH_REPEAT_COMMAND_LIMIT", 2)
+        repeat_limit = self._int_env("CODEFACTORY_BENCH_REPEAT_COMMAND_LIMIT", 1)
         if (
             command_counts[command_key] > repeat_limit
             and self._is_repeat_suppression_candidate(command)
@@ -870,6 +902,8 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             result.stderr,
             self._int_env("CODEFACTORY_BENCH_TOOL_OUTPUT_LIMIT", 20000),
         )
+        self._record_tool_outcome(command, result.return_code, result.stdout, result.stderr, loop_state)
+        semantic_failure = self._semantic_failure_reason(content)
         return {
             "content": content,
             "trajectory": {
@@ -878,8 +912,13 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 "tool": name,
                 "command": command,
                 "policy": decision,
-                "status": "ok" if result.return_code == 0 else "nonzero",
+                "status": (
+                    "semantic-failure"
+                    if semantic_failure
+                    else "ok" if result.return_code == 0 else "nonzero"
+                ),
                 "return_code": result.return_code,
+                **({"semantic_failure": semantic_failure} if semantic_failure else {}),
                 "stdout_bytes": len(result.stdout or ""),
                 "stderr_bytes": len(result.stderr or ""),
                 "content": content,
@@ -1255,6 +1294,14 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 "from the known failure."
             )
 
+        if tool_result.get("status") == "semantic-failure":
+            return (
+                "Repair focus: the latest command reported failure text even though the "
+                "shell pipeline returned success. Do not trust the pipeline exit code; "
+                "rerun with `set -o pipefail` or a smaller direct command, then repair "
+                "from the actual error."
+            )
+
         if tool_result.get("status") == "exec-error":
             return (
                 "Repair focus: the latest command failed before returning an exit code. "
@@ -1297,6 +1344,21 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     "health/self-check that exits before the benchmark timeout."
                 ),
                 "smallest_rerun": "bounded sample or timeout-wrapped command",
+            }
+
+        if tool_result.get("status") == "semantic-failure":
+            return {
+                "kind": "semantic-command-failure",
+                "artifact": artifact_hint,
+                "source_command": CodeFactoryAgent._single_line(command),
+                "failure": CodeFactoryAgent._extract_semantic_failure(content)
+                or "command output contains failure text despite return_code=0",
+                "next_action": (
+                    "Do not trust the pipeline exit status. Rerun the smallest direct "
+                    "command with `set -o pipefail` or without `tail`, then choose an "
+                    "available lower-cost path."
+                ),
+                "smallest_rerun": "direct command with pipefail or without output-truncating pipe",
             }
 
         if "segmentation fault" in normalized or "core dumped" in normalized:
@@ -1389,6 +1451,27 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 if re.search(r"(error|exception):", line, re.IGNORECASE):
                     return CodeFactoryAgent._single_line(line, 300)
             return "traceback failure"
+        return None
+
+    @staticmethod
+    def _semantic_failure_reason(content: str) -> str | None:
+        normalized = content.lower()
+        if "return_code=0" not in normalized:
+            return None
+        return CodeFactoryAgent._extract_semantic_failure(content)
+
+    @staticmethod
+    def _extract_semantic_failure(content: str) -> str | None:
+        failure_patterns = [
+            r"ERROR:\s+[^\n]+",
+            r"No space left on device",
+            r"Could not install packages[^\n]*",
+            r"Traceback \(most recent call last\):",
+        ]
+        for pattern in failure_patterns:
+            match = re.search(pattern, content, re.IGNORECASE)
+            if match:
+                return CodeFactoryAgent._single_line(match.group(0), 300)
         return None
 
     def _auto_repair_command_from_tool_result(
@@ -1628,6 +1711,66 @@ fi"""
         )
 
     @staticmethod
+    def _preflight_shell_command(
+        command: str, loop_state: dict[str, Any]
+    ) -> dict[str, str] | None:
+        executable = CodeFactoryAgent._command_executable(command)
+        if not executable:
+            return None
+        missing_commands = loop_state.get("missing_commands")
+        if not isinstance(missing_commands, dict):
+            return None
+        if executable not in missing_commands:
+            return None
+        return {
+            "reason": "previous command not found",
+            "content": (
+                "COMMAND PREFLIGHT BLOCKED: "
+                f"`{executable}` was already unavailable in this task container. "
+                "Do not retry the same missing executable. Use an existing tool, "
+                "`python3`/shell built-ins, or inspect the workspace for the provided "
+                "test/helper entrypoint before continuing."
+            ),
+        }
+
+    @staticmethod
+    def _record_tool_outcome(
+        command: str,
+        return_code: int,
+        stdout: str | None,
+        stderr: str | None,
+        loop_state: dict[str, Any],
+    ) -> None:
+        if return_code != 127:
+            return
+        output = f"{stdout or ''}\n{stderr or ''}".lower()
+        if "command not found" not in output and "not found" not in output:
+            return
+        executable = CodeFactoryAgent._command_executable(command)
+        if not executable:
+            return
+        missing_commands = loop_state.setdefault("missing_commands", {})
+        if isinstance(missing_commands, dict):
+            missing_commands[executable] = True
+
+    @staticmethod
+    def _command_executable(command: str) -> str | None:
+        command_text = CodeFactoryAgent._strip_heredoc_bodies(command).strip()
+        if not command_text:
+            return None
+        first_part = CodeFactoryAgent._compound_command_parts(command_text)[0]
+        pipeline_first = first_part.split("|", 1)[0].strip()
+        try:
+            parts = shlex.split(pipeline_first)
+        except ValueError:
+            parts = pipeline_first.split()
+        if not parts:
+            return None
+        if parts[0] in {"cd", "export", "env"} and len(parts) > 1:
+            return None
+        return parts[0].split("/")[-1]
+
+    @staticmethod
     def _candidate_artifact_started(
         loop_state: dict[str, Any], artifact_hint: str | None
     ) -> bool:
@@ -1639,14 +1782,19 @@ fi"""
         self,
         command: str,
         loop_state: dict[str, Any],
+        step: int,
         artifact_hint: str | None,
     ) -> bool:
         threshold = self._int_env("CODEFACTORY_BENCH_ARTIFACT_COMMAND_AFTER_BLOCKS", 2)
+        step_threshold = self._int_env("CODEFACTORY_BENCH_ARTIFACT_COMMAND_STEP", 5)
         return (
             bool(artifact_hint)
             and not loop_state.get("artifact_started", False)
-            and int(loop_state.get("implementation_required_count") or 0) >= threshold
             and not self._is_artifact_attempt(command, artifact_hint)
+            and (
+                int(loop_state.get("implementation_required_count") or 0) >= threshold
+                or step >= step_threshold
+            )
         )
 
     @staticmethod

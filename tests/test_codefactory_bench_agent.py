@@ -335,12 +335,12 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                 asyncio.run(agent.run("fake Terminal-Bench instruction", env, context))
 
                 self.assertEqual(len(requests), 4)
-                self.assertEqual(len(env.calls), 2)
+                self.assertEqual(len(env.calls), 1)
                 trajectory = json.loads((tmp_path / "trajectory.json").read_text())
                 suppressed_steps = [
                     step for step in trajectory["steps"] if step.get("status") == "suppressed"
                 ]
-                self.assertEqual(len(suppressed_steps), 1)
+                self.assertEqual(len(suppressed_steps), 2)
                 self.assertIn("REPEATED COMMAND SUPPRESSED", suppressed_steps[0]["content"])
         finally:
             server.shutdown()
@@ -388,6 +388,143 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                 ]
                 self.assertEqual(len(implementation_required), 1)
                 self.assertIn("IMPLEMENTATION REQUIRED", implementation_required[0]["content"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_codefactory_agent_requires_implementation_without_artifact_hint(self) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                assistant_tool_call("cat /app/input.txt"),
+                assistant_tool_call("head -20 /app/input.txt"),
+                assistant_final("done"),
+            ]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironment()
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                        "CODEFACTORY_BENCH_INSPECTION_ROUNDS": "1",
+                    },
+                )
+
+                asyncio.run(agent.run("produce the requested answer", env, context))
+
+                self.assertEqual(len(requests), 3)
+                self.assertEqual(len(env.calls), 1)
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                implementation_required = [
+                    step
+                    for step in trajectory["steps"]
+                    if step.get("status") == "implementation-required"
+                ]
+                self.assertEqual(len(implementation_required), 1)
+                assert context.metadata is not None
+                self.assertEqual(context.metadata["implementation_required_blocks"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_codefactory_agent_suppresses_second_repeated_read_by_default(self) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                assistant_tool_call("cat /app/input.txt"),
+                assistant_tool_call("cat /app/input.txt"),
+                assistant_final("done"),
+            ]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironment()
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                    },
+                )
+
+                asyncio.run(agent.run("inspect input then solve", env, context))
+
+                self.assertEqual(len(env.calls), 1)
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                suppressed = [
+                    step for step in trajectory["steps"] if step.get("status") == "suppressed"
+                ]
+                self.assertEqual(len(suppressed), 1)
+                self.assertIn("already ran 1 time", suppressed[0]["content"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_codefactory_agent_preflights_repeated_missing_command(self) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                assistant_tool_call("missing-tool --version"),
+                assistant_tool_call("missing-tool --version"),
+                assistant_final("done"),
+            ]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironmentWithResults(
+                    [
+                        ExecResult(
+                            stdout="",
+                            stderr="/bin/sh: missing-tool: command not found\n",
+                            return_code=127,
+                        )
+                    ]
+                )
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                    },
+                )
+
+                asyncio.run(agent.run("solve without relying on unavailable tools", env, context))
+
+                self.assertEqual(len(env.calls), 1)
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                preflight_blocks = [
+                    step
+                    for step in trajectory["steps"]
+                    if step.get("status") == "preflight-blocked"
+                ]
+                self.assertEqual(len(preflight_blocks), 1)
+                self.assertIn("missing-tool", preflight_blocks[0]["content"])
+                assert context.metadata is not None
+                self.assertEqual(context.metadata["preflight_blocks"], 1)
         finally:
             server.shutdown()
             server.server_close()
@@ -1264,23 +1401,64 @@ gcc -o /app/enc /app/enc.c
             agent._requires_artifact_command(
                 "cat /app/decomp.c",
                 state,
-                "data.comp",
+                step=3,
+                artifact_hint="data.comp",
             )
         )
         self.assertTrue(
             agent._requires_artifact_command(
                 "cd /app && gcc -o decomp decomp.c 2>&1",
                 state,
-                "data.comp",
+                step=3,
+                artifact_hint="data.comp",
             )
         )
         self.assertFalse(
             agent._requires_artifact_command(
                 "python3 - <<'PY'\nopen('/app/data.comp','wb').write(b'x')\nPY",
                 state,
-                "data.comp",
+                step=3,
+                artifact_hint="data.comp",
             )
         )
+
+    def test_artifact_command_gate_blocks_late_non_artifact_probe(self) -> None:
+        agent = CodeFactoryAgent(logs_dir=Path("/tmp"))
+        state = {
+            "implementation_started": False,
+            "artifact_started": False,
+            "implementation_required_count": 0,
+        }
+
+        self.assertTrue(
+            agent._requires_artifact_command(
+                "printf 'A' | /app/decomp | od -c | head -5",
+                state,
+                step=5,
+                artifact_hint="data.comp",
+            )
+        )
+
+    def test_semantic_command_failure_becomes_repair_goal(self) -> None:
+        goal = CodeFactoryAgent._repair_goal_from_tool_result(
+            {
+                "role": "tool",
+                "status": "semantic-failure",
+                "command": "pip install datasets transformers 2>&1 | tail -20",
+                "content": (
+                    "return_code=0\n"
+                    "stdout:\n"
+                    "ERROR: Could not install packages due to an OSError: "
+                    "[Errno 28] No space left on device\n"
+                ),
+            },
+            artifact_hint=None,
+        )
+
+        self.assertIsNotNone(goal)
+        assert goal is not None
+        self.assertEqual(goal["kind"], "semantic-command-failure")
+        self.assertIn("No space left", goal["failure"])
 
 
 if __name__ == "__main__":
