@@ -163,6 +163,7 @@ export interface BenchmarkProviderBridgeRequest {
   concurrency?: number | null;
   /** Deprecated compatibility alias; Harbor `-n` means concurrency. */
   trial_count?: number | null;
+  override_storage_mb?: number | null;
   job_root?: string | null;
   job_name?: string | null;
   adapter_root?: string | null;
@@ -181,6 +182,7 @@ export interface BenchmarkProviderBridgePreview {
   task_names: string[];
   concurrency: number;
   trial_count: number;
+  override_storage_mb?: number | null;
   job_root: string;
   job_name: string;
   job_path: string;

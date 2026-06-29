@@ -168,6 +168,7 @@ pub struct BenchmarkProviderBridgeRequest {
     // Backwards-compatible alias for older clients. Harbor uses `-n` as
     // concurrency, not repeated trial count.
     pub trial_count: Option<u32>,
+    pub override_storage_mb: Option<u32>,
     pub job_root: Option<String>,
     pub job_name: Option<String>,
     pub adapter_root: Option<String>,
@@ -187,6 +188,7 @@ pub struct BenchmarkProviderBridgePreview {
     pub task_names: Vec<String>,
     pub concurrency: u32,
     pub trial_count: u32,
+    pub override_storage_mb: Option<u32>,
     pub job_root: String,
     pub job_name: String,
     pub job_path: String,
@@ -304,6 +306,7 @@ pub fn preview_provider_bridge(
         .unwrap_or(4)
         .max(1);
     let trial_count = 1;
+    let override_storage_mb = request.override_storage_mb.filter(|value| *value > 0);
     let job_root = request
         .job_root
         .as_deref()
@@ -374,6 +377,7 @@ pub fn preview_provider_bridge(
         concurrency,
         &job_root,
         &job_name,
+        override_storage_mb,
     );
     let authorization_phrase = format!(
         "Run {} with endpoint {} model {}",
@@ -394,6 +398,7 @@ pub fn preview_provider_bridge(
         task_names,
         concurrency,
         trial_count,
+        override_storage_mb,
         job_root,
         job_name,
         job_path,
@@ -548,6 +553,7 @@ fn build_authorized_provider_launch(
             preview.concurrency,
             &preview.job_root,
             &preview.job_name,
+            preview.override_storage_mb,
         ),
         env: vec![
             ("CODEFACTORY_BENCH_API_KEY".to_string(), api_key),
@@ -927,6 +933,7 @@ fn harbor_run_args(
     concurrency: u32,
     job_root: &str,
     job_name: &str,
+    override_storage_mb: Option<u32>,
 ) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
@@ -950,8 +957,12 @@ fn harbor_run_args(
         job_root.to_string(),
         "--job-name".to_string(),
         job_name.to_string(),
-        "-y".to_string(),
     ]);
+    if let Some(storage_mb) = override_storage_mb {
+        args.push("--override-storage-mb".to_string());
+        args.push(storage_mb.to_string());
+    }
+    args.push("-y".to_string());
     args
 }
 
@@ -1525,19 +1536,32 @@ fn has_official_constraint_override(value: &Value) -> bool {
     match value {
         Value::Object(map) => map.iter().any(|(key, value)| {
             let normalized = key.replace(['-', '_'], "").to_lowercase();
-            matches!(
-                normalized.as_str(),
-                "timeoutoverride"
-                    | "resourceoverride"
-                    | "resourcesoverride"
-                    | "modifiedtimeout"
-                    | "modifiedresources"
-                    | "comparableoverride"
-            ) || has_official_constraint_override(value)
+            official_constraint_override_key(&normalized, value)
+                || has_official_constraint_override(value)
         }),
         Value::Array(items) => items.iter().any(has_official_constraint_override),
         _ => false,
     }
+}
+
+fn official_constraint_override_key(normalized_key: &str, value: &Value) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    matches!(
+        normalized_key,
+        "timeoutoverride"
+            | "resourceoverride"
+            | "resourcesoverride"
+            | "modifiedtimeout"
+            | "modifiedresources"
+            | "comparableoverride"
+            | "overridestoragemb"
+            | "overridememorymb"
+            | "overridecpus"
+            | "overridegpus"
+            | "overridetpus"
+    )
 }
 
 async fn persist_run(pool: &SqlitePool, run: &BenchmarkRunRecord) -> Result<()> {
@@ -1677,6 +1701,30 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("timeout") && item.contains("resource")),
             "profile must encode official comparability constraints"
+        );
+    }
+
+    #[test]
+    fn official_constraint_override_ignores_null_but_flags_explicit_resource_changes() {
+        let default_harbor_config = json!({
+            "environment": {
+                "override_storage_mb": null,
+                "override_memory_mb": null
+            }
+        });
+        assert!(
+            !has_official_constraint_override(&default_harbor_config),
+            "Harbor default null override fields must stay comparable"
+        );
+
+        let storage_override = json!({
+            "environment": {
+                "override_storage_mb": 65536
+            }
+        });
+        assert!(
+            has_official_constraint_override(&storage_override),
+            "explicit storage override must be marked non-comparable"
         );
     }
 
@@ -2066,7 +2114,10 @@ E: You don't have enough free space in /var/cache/apt/archives/.
 /tests/test.sh: line 19: uvx: command not found
 "#,
         );
-        assert_eq!(verifier_dependency.failure_class.as_deref(), Some("environment"));
+        assert_eq!(
+            verifier_dependency.failure_class.as_deref(),
+            Some("environment")
+        );
         assert_eq!(
             verifier_dependency.failure_reason.as_deref(),
             Some("verifier-dependency-resource")
@@ -2089,6 +2140,7 @@ E: You don't have enough free space in /var/cache/apt/archives/.
                 ]),
                 concurrency: Some(3),
                 trial_count: Some(1),
+                override_storage_mb: None,
                 job_root: Some("/tmp/cf-bench".to_string()),
                 job_name: Some("deepseek-smoke".to_string()),
                 adapter_root: Some("/repo".to_string()),
@@ -2131,6 +2183,33 @@ E: You don't have enough free space in /var/cache/apt/archives/.
     }
 
     #[test]
+    fn provider_bridge_preview_accepts_explicit_storage_override() {
+        let settings = settings_with_deepseek_endpoint();
+        let preview = preview_provider_bridge(
+            &settings,
+            &BenchmarkProviderBridgeRequest {
+                profile_id: TERMINAL_BENCH_21_PROFILE_ID.to_string(),
+                endpoint_name: None,
+                model: None,
+                task_limit: Some(1),
+                task_names: Some(vec!["mteb-retrieve".to_string()]),
+                concurrency: Some(1),
+                trial_count: None,
+                override_storage_mb: Some(65536),
+                job_root: Some("/tmp/cf-bench".to_string()),
+                job_name: Some("storage-override-canary".to_string()),
+                adapter_root: Some("/repo".to_string()),
+            },
+        )
+        .expect("preview");
+
+        assert_eq!(preview.override_storage_mb, Some(65536));
+        assert!(preview
+            .command_preview
+            .contains("--override-storage-mb 65536"));
+    }
+
+    #[test]
     fn provider_bridge_normalizes_terminal_bench_subset_task_names() {
         let names = normalize_task_names(Some(&[
             "write-compressor".to_string(),
@@ -2159,6 +2238,7 @@ E: You don't have enough free space in /var/cache/apt/archives/.
                 task_names: None,
                 concurrency: None,
                 trial_count: Some(1),
+                override_storage_mb: None,
                 job_root: Some("/tmp/cf-bench".to_string()),
                 job_name: Some("deepseek-smoke".to_string()),
                 adapter_root: Some("/repo".to_string()),
@@ -2204,6 +2284,7 @@ E: You don't have enough free space in /var/cache/apt/archives/.
             task_names: None,
             concurrency: None,
             trial_count: Some(1),
+            override_storage_mb: None,
             job_root: Some("/tmp/cf-bench".to_string()),
             job_name: Some("deepseek-smoke".to_string()),
             adapter_root: Some("/repo".to_string()),
@@ -2270,6 +2351,7 @@ E: You don't have enough free space in /var/cache/apt/archives/.
             task_names: None,
             concurrency: None,
             trial_count: Some(1),
+            override_storage_mb: None,
             job_root: Some("/tmp/cf-bench".to_string()),
             job_name: Some("deepseek-smoke".to_string()),
             adapter_root: Some("/repo".to_string()),
@@ -2352,6 +2434,7 @@ E: You don't have enough free space in /var/cache/apt/archives/.
             "CODEFACTORY_BENCH_CONCURRENCY",
             env_u32("CODEFACTORY_BENCH_TRIAL_COUNT", 4),
         );
+        let override_storage_mb = env_u32_opt("CODEFACTORY_BENCH_OVERRIDE_STORAGE_MB");
         let task_names = std::env::var("CODEFACTORY_BENCH_TASK_NAMES")
             .ok()
             .map(|raw| {
@@ -2381,6 +2464,7 @@ E: You don't have enough free space in /var/cache/apt/archives/.
             task_names,
             concurrency: Some(concurrency),
             trial_count: None,
+            override_storage_mb,
             job_root: Some(job_root),
             job_name: Some(job_name),
             adapter_root: Some(repo_root.to_string_lossy().to_string()),
@@ -2388,7 +2472,7 @@ E: You don't have enough free space in /var/cache/apt/archives/.
         let settings = crate::config::settings::load();
         let preview = preview_provider_bridge(&settings, &bridge).expect("preview provider bridge");
         println!(
-            "provider_bridge_preview endpoint={} base_url={} model={} key_ref={} agent={} task_limit={} concurrency={} trial_count={} job_path={}",
+            "provider_bridge_preview endpoint={} base_url={} model={} key_ref={} agent={} task_limit={} concurrency={} trial_count={} override_storage_mb={} job_path={}",
             preview.endpoint_name,
             preview.base_url,
             preview.model,
@@ -2397,6 +2481,10 @@ E: You don't have enough free space in /var/cache/apt/archives/.
             preview.task_limit,
             preview.concurrency,
             preview.trial_count,
+            preview
+                .override_storage_mb
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
             preview.job_path
         );
         assert!(
@@ -2472,6 +2560,13 @@ E: You don't have enough free space in /var/cache/apt/archives/.
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(default)
+    }
+
+    fn env_u32_opt(name: &str) -> Option<u32> {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value > 0)
     }
 
     fn redacted_log_tail(text: &str) -> String {

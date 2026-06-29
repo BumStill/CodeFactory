@@ -282,6 +282,9 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
                 <Metric label="model" value={preview.model} />
                 <Metric label="tasks" value={String(preview.task_limit)} />
                 <Metric label="concurrency" value={String(preview.concurrency)} />
+                {preview.override_storage_mb && (
+                  <Metric label="storage MB" value={String(preview.override_storage_mb)} />
+                )}
               </div>
             )}
             {preview && (

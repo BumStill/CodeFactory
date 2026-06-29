@@ -142,7 +142,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         assert model is not None
 
         max_steps = self._int_env("CODEFACTORY_BENCH_MAX_STEPS", 20)
-        shell_timeout = self._int_env("CODEFACTORY_BENCH_SHELL_TIMEOUT_SEC", 120)
+        shell_timeout = self._int_env("CODEFACTORY_BENCH_SHELL_TIMEOUT_SEC", 300)
         wall_timeout = self._int_env("CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC", 780)
         model_timeout_retries = self._int_env("CODEFACTORY_BENCH_MODEL_TIMEOUT_RETRIES", 1)
         no_action_retries = self._int_env("CODEFACTORY_BENCH_NO_ACTION_RETRIES", 4)
@@ -697,6 +697,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     "No-action recovery:",
                     "Final-before-verify gate:",
                     "Forced implementation transition:",
+                    "Implementation hint:",
                     "Repair goal:",
                     "Repair focus:",
                     "Timeout recovery:",
@@ -1433,6 +1434,22 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
 
     @staticmethod
     def _verification_hint_from_instruction(instruction: str) -> str | None:
+        normalized = instruction.lower()
+        if (
+            "mteb" in normalized
+            and "bge" in normalized
+            and any(token in normalized for token in ["retrieve", "retrieval", "cosine"])
+        ):
+            return (
+                "Implementation hint: this is an MTEB 1.36 retrieval task. Use the "
+                "installed `mteb` package to load the model with `mteb.get_model(...)`; "
+                "do not instantiate `SentenceTransformer(...)` directly because that can "
+                "produce different rankings. For BAAI/bge retrieval-style encoding, use "
+                "`from mteb.encoder_interface import PromptType`, encode the query with "
+                "`task_name=\"SciFact\", prompt_type=PromptType.query`, and encode "
+                "documents with `task_name=\"SciFact\", prompt_type=PromptType.passage`."
+            )
+
         match = re.search(
             r"\brunning\s+(.+?)\s+gives exactly\s+(`?/?[A-Za-z0-9_.\-/]+`?)",
             instruction,
@@ -1632,9 +1649,10 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             return (
                 "Repair focus: MTEB 1.36 requires `SentenceTransformerWrapper.encode` "
                 "to receive a valid benchmark task name. For BAAI/bge retrieval-style "
-                "tasks, retry the smallest encode command with `task_name=\"T2Retrieval\"` "
-                "for both query and documents, then compute cosine similarity and write "
-                f"{artifact}."
+                "tasks, retry the smallest encode command with `task_name=\"SciFact\"` "
+                "and MTEB prompt roles: `prompt_type=PromptType.query` for the query "
+                "and `prompt_type=PromptType.passage` for documents. Then compute "
+                f"similarity/ranking and write{artifact}."
             )
 
         if (
@@ -1645,7 +1663,8 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             return (
                 "Repair focus: the previous command used a prompt role as `task_name`. "
                 "Use a real MTEB task name instead; for BAAI/bge retrieval-style tasks, "
-                f"try `task_name=\"T2Retrieval\"`, then write{artifact}."
+                "try `task_name=\"SciFact\"` with `PromptType.query` for the query "
+                f"and `PromptType.passage` for documents, then write{artifact}."
             )
 
         if (

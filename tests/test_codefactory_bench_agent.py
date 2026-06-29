@@ -1243,6 +1243,20 @@ gcc -o /app/enc /app/enc.c
         self.assertIn("cat data.comp | /app/decomp", hint)
         self.assertIn("cmp -s /tmp/codefactory-bench-output data.txt", hint)
 
+    def test_agent_adds_mteb_retrieval_implementation_hint(self) -> None:
+        hint = CodeFactoryAgent._verification_hint_from_instruction(
+            'Given the query "terminal-bench" retrieve the document with the '
+            "5th highest cosine similarity using the bge-small-zh-v1.5 model. "
+            "You must use the installed mteb package."
+        )
+
+        assert hint is not None
+        self.assertIn("mteb.get_model", hint)
+        self.assertIn("SentenceTransformer", hint)
+        self.assertIn('task_name="SciFact"', hint)
+        self.assertIn("PromptType.query", hint)
+        self.assertIn("PromptType.passage", hint)
+
     def test_agent_emits_phase_progress_reminder_after_inspection(self) -> None:
         reminder = CodeFactoryAgent._phase_progress_reminder(
             step=2,
@@ -1324,6 +1338,10 @@ gcc -o /app/enc /app/enc.c
             },
             {
                 "role": "user",
+                "content": "Implementation hint: use mteb.get_model and PromptType.",
+            },
+            {
+                "role": "user",
                 "content": "Inspection phase should be over. Create `data.comp` now.",
             },
             {
@@ -1371,6 +1389,7 @@ gcc -o /app/enc /app/enc.c
         self.assertNotIn('"role": "tool"', serialized)
         self.assertIn("Segmentation fault", serialized)
         self.assertIn("Verification hint", serialized)
+        self.assertIn("Implementation hint", serialized)
         self.assertIn("Inspection phase should be over", serialized)
         self.assertIn("Timeout recovery", serialized)
         self.assertIn("No-action recovery", serialized)
@@ -1419,7 +1438,9 @@ gcc -o /app/enc /app/enc.c
 
         assert hint is not None
         self.assertIn("MTEB 1.36", hint)
-        self.assertIn('task_name="T2Retrieval"', hint)
+        self.assertIn('task_name="SciFact"', hint)
+        self.assertIn("PromptType.query", hint)
+        self.assertIn("PromptType.passage", hint)
         self.assertIn("/app/result.txt", hint)
 
     def test_auto_repair_command_targets_write_compressor_protocol_failures(self) -> None:

@@ -12,7 +12,7 @@
 
 ## Current State
 - Current phase: implementation slice 7
-- Current checkpoint: full Terminal-Bench 2.1 CodeFactory agent capability run completed and imported. Latest full run is run id `7ff6ef13-4488-4e0f-afd0-a1f9bd16d561`, agent `codefactory-headless`, model backend `deepseek-v4-pro`, dataset `terminal-bench/terminal-bench-2-1`, `89 / 89` trials completed, mean reward `0.06741573033707865`, pass count `6 / 89`, failed count `83 / 89`, exceptions `63`. This is the first full CodeFactory-run score and it is a low capability baseline, not an acceptable product level. The latest score-driven canary on `mteb-retrieve` verified an agent-loop behavior improvement from `227.18s` to `57.17s` and `5` tool calls with `/app/result.txt` artifact completion gating, but reward remains `0.0` because the verifier bootstrap environment still lacks `curl`, `/root/.local/bin/env`, and `uvx`.
+- Current checkpoint: full Terminal-Bench 2.1 CodeFactory agent capability run completed and imported. Latest full run is run id `7ff6ef13-4488-4e0f-afd0-a1f9bd16d561`, agent `codefactory-headless`, model backend `deepseek-v4-pro`, dataset `terminal-bench/terminal-bench-2-1`, `89 / 89` trials completed, mean reward `0.06741573033707865`, pass count `6 / 89`, failed count `83 / 89`, exceptions `63`. This is the first full CodeFactory-run score and it is a low capability baseline, not an acceptable product level. The latest score-driven canary on `mteb-retrieve` produced a real comparable scoring improvement: run `5a4e758d-f949-40ba-8f2d-e0017fa9b722`, `1 / 1` pass, mean reward `1.000`, failure class `None`. This is targeted canary evidence only; it does not replace the latest full-run score or the 18-task regression subset score until the same broader scope is rerun.
 - Next owner: development / QA
 - Updated at: 2026-06-29
 
@@ -83,6 +83,12 @@
 - Fixed canary iteration reporting so single-task canaries are marked `comparable_delta: no` against the 18-task baseline instead of presenting a misleading aggregate score delta.
 - Added MTEB 1.36 repair guidance for `SentenceTransformerWrapper.encode()` requiring `task_name`, artifact hint extraction for `/app/result.txt`, and artifact completion gating after successful expected-artifact writes.
 - Reran `mteb-retrieve` canaries after the environment and artifact-loop fixes. Latest run `addff8cf-2249-4e6c-8463-cc919a1eed93` completed in `57.17s`, used `5` tool calls, wrote `/app/result.txt`, and triggered `Artifact completion gate`; reward stayed `0.0` with failure class `environment` because verifier bootstrap still reports missing `curl`, `/root/.local/bin/env`, and `uvx`. Evidence: `docs/evidence-packs/terminal-bench-21-mteb-cache-artifact-gate-2026-06-29T12-41-55Z.md`.
+- Added explicit non-comparable Harbor storage override plumbing for infrastructure diagnosis only; evidence reports now show `override_storage_mb` and `official_comparable`, and importer comparability ignores Harbor's default null override fields while flagging explicit resource overrides.
+- Tested the storage override hypothesis on `mteb-retrieve`; the run remained reward `0.0` with verifier bootstrap errors, and was correctly marked `official_comparable: no`, proving the override was diagnostic plumbing rather than a score claim.
+- Isolated the real verifier bootstrap root cause to the local Docker overlay being full (`30G / 30G`, `100%`). After targeted cleanup of unused Terminal-Bench images, a `python:3.10-slim-bookworm` `apt-get update` smoke passed.
+- Corrected the MTEB task-family implementation path: use `mteb.get_model("BAAI/bge-small-zh-v1.5", revision=...)`, `task_name="SciFact"`, and `PromptType.query` / `PromptType.passage`, rather than direct `SentenceTransformer` usage or the wrong `T2Retrieval` task name.
+- Fixed context compaction so generated `Implementation hint:` messages are retained in the compacted chat payload, then raised the benchmark shell timeout default to `300s` for model-loading / embedding tasks.
+- Reran the same `mteb-retrieve` canary after environment cleanup, MTEB implementation guidance, hint-retention, and shell-timeout changes. Run `5a4e758d-f949-40ba-8f2d-e0017fa9b722` completed as official-comparable, `1 / 1` pass, mean reward `1.000`, failure class `None`; evidence: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T13-33-52Z.md` and `docs/evidence-packs/terminal-bench-21-iteration-2026-06-29T13-33-52Z.md`.
 
 ## Remaining Items
 - Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
@@ -96,8 +102,9 @@
 - Promote `benchmark-sandbox` from adapter-local command gate to shared CodeFactory policy preset with run/task/container binding.
 - Expand Benchmarks UI beyond P0: add historical run comparison, capability profile trends, and direct evidence-pack export.
 - Compare at least one same-scope baseline/head subset after a score-facing implementation change.
-- Fix or preflight verifier bootstrap dependencies for tasks that require `curl`, `/root/.local/bin/env`, and `uvx`; current agent-loop canaries can produce correct artifacts but still score `0.0` when verifier dependency setup fails.
-- After verifier bootstrap is fixed, rerun the same `mteb-retrieve` single-task canary first, then the 18-task regression subset only if the canary reward or failure class improves.
+- Promote Docker overlay/storage and verifier bootstrap smoke into the benchmark preflight so future environment failures are caught before provider tokens are spent.
+- Rerun the 18-task fixed regression subset after this canary-scoring improvement is committed and CI passes; only that same-scope run can establish the next aggregate CodeFactory score.
+- Reduce residual loop inefficiency seen in the passing MTEB trajectory: repeated result reads, late artifact rewriting, and final-answer discipline should become generic policy rather than task-specific hints.
 
 ## Blockers
 - No current blocker for the already completed local full-run evaluation. The current full-run result is a valid CodeFactory agent capability baseline, not a provider/account blocker.
@@ -152,6 +159,7 @@
 - Bounded canary timeout evidence: `docs/evidence-packs/terminal-bench-21-canary-timeout-2026-06-29T07-15-12Z.md` records the `360s` timeout, partial `2 / 4` completion, and product conclusion that enforcement improved but strategy transition remains missing.
 - Forced transition canary evidence: `docs/evidence-packs/terminal-bench-21-forced-transition-timeout-2026-06-29T08-01-36Z.md` records the `360s` timeout, partial `1 / 4` completion, real forced-prompt trajectory nodes, and the conclusion that prompt-only transition is still not enough.
 - Constrained scaffold evidence: `docs/evidence-packs/terminal-bench-21-constrained-scaffold-2026-06-29T12-07-06Z.md` records the single-task `write-compressor` before/after runtime improvement from `228.60s` to `112.72s` while preserving environment failure attribution.
+- MTEB scoring canary evidence: `docs/evidence-packs/terminal-bench-21-mteb-scoring-canary-2026-06-29.md`, `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T13-33-52Z.md`, and `docs/evidence-packs/terminal-bench-21-iteration-2026-06-29T13-33-52Z.md` record official-comparable run `5a4e758d-f949-40ba-8f2d-e0017fa9b722`, `1 / 1` pass, mean reward `1.000`, failure class `None`.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.

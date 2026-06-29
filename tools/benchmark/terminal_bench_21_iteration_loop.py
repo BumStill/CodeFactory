@@ -173,7 +173,9 @@ def run_subset(
     model: str | None,
     concurrency: int,
     secret_timeout_sec: int,
+    shell_timeout_sec: int,
     run_timeout_sec: int,
+    override_storage_mb: int | None = None,
 ) -> tuple[int, str]:
     command = [
         sys.executable,
@@ -186,9 +188,13 @@ def run_subset(
         str(concurrency),
         "--secret-timeout-sec",
         str(secret_timeout_sec),
+        "--shell-timeout-sec",
+        str(shell_timeout_sec),
     ]
     if model:
         command.extend(["--model", model])
+    if override_storage_mb:
+        command.extend(["--override-storage-mb", str(override_storage_mb)])
     process = subprocess.Popen(
         command,
         cwd=REPO_ROOT,
@@ -280,6 +286,9 @@ def write_iteration_report(
         f"- subset_path: `{subset_path}`",
         f"- endpoint: `{args.endpoint}`",
         f"- model: `{args.model or '<settings default>'}`",
+        f"- shell_timeout_sec: `{args.shell_timeout_sec}`",
+        f"- override_storage_mb: `{args.override_storage_mb or '<none>'}`",
+        f"- official_comparable: `{'no' if args.override_storage_mb else 'yes'}`",
         f"- hypothesis: `{args.hypothesis}`",
         f"- target_failure_class: `{args.target_failure_class}`",
         f"- ran_command: `{'yes' if ran_command else 'no'}`",
@@ -401,7 +410,9 @@ def main() -> int:
     parser.add_argument("--model")
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--secret-timeout-sec", type=int, default=20)
+    parser.add_argument("--shell-timeout-sec", type=int, default=300)
     parser.add_argument("--run-timeout-sec", type=int, default=1800)
+    parser.add_argument("--override-storage-mb", type=int)
     parser.add_argument("--target-failure-class", default="tool-use")
     parser.add_argument("--hypothesis", required=True)
     parser.add_argument(
@@ -444,7 +455,9 @@ def main() -> int:
             model=args.model,
             concurrency=args.concurrency,
             secret_timeout_sec=args.secret_timeout_sec,
+            shell_timeout_sec=args.shell_timeout_sec,
             run_timeout_sec=args.run_timeout_sec,
+            override_storage_mb=args.override_storage_mb,
         )
         head_path = extract_evidence_path(output)
     elif head_path is None:

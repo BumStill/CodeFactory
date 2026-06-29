@@ -116,6 +116,7 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
                     args=mock.Mock(
                         endpoint="deepseek",
                         model=None,
+                        shell_timeout_sec=300,
                         hypothesis="reduce repeated inspection",
                         target_failure_class="tool-use",
                     ),
@@ -157,6 +158,7 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
                     args=mock.Mock(
                         endpoint="deepseek",
                         model=None,
+                        shell_timeout_sec=300,
                         hypothesis="target one task",
                         target_failure_class="environment",
                     ),
@@ -199,6 +201,7 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
                 model=None,
                 concurrency=2,
                 secret_timeout_sec=20,
+                shell_timeout_sec=300,
                 run_timeout_sec=1,
             )
 
@@ -206,6 +209,34 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
         self.assertIn("partial output", output)
         self.assertIn("BENCHMARK_RUN_TIMEOUT: exceeded 1 seconds", output)
         killpg.assert_called_once_with(12345, loop.signal.SIGTERM)
+
+    def test_run_subset_passes_storage_override_to_regression_runner(self) -> None:
+        class CompletedProcess:
+            pid = 12345
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "done\n", None
+
+        with mock.patch.object(loop.subprocess, "Popen", return_value=CompletedProcess()) as popen:
+            exit_code, output = loop.run_subset(
+                Path("/tmp/subset.json"),
+                endpoint="deepseek",
+                model=None,
+                concurrency=1,
+                secret_timeout_sec=20,
+                shell_timeout_sec=300,
+                run_timeout_sec=60,
+                override_storage_mb=65536,
+            )
+
+        command = popen.call_args.args[0]
+        self.assertEqual(exit_code, 0)
+        self.assertIn("done", output)
+        self.assertIn("--shell-timeout-sec", command)
+        self.assertIn("300", command)
+        self.assertIn("--override-storage-mb", command)
+        self.assertIn("65536", command)
 
 
 if __name__ == "__main__":

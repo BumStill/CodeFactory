@@ -47,6 +47,8 @@ def build_env(args: argparse.Namespace, subset: dict) -> dict[str, str]:
     )
     if args.model:
         env["CODEFACTORY_BENCH_MODEL_OVERRIDE"] = args.model
+    if args.override_storage_mb:
+        env["CODEFACTORY_BENCH_OVERRIDE_STORAGE_MB"] = str(args.override_storage_mb)
     return env
 
 
@@ -78,6 +80,8 @@ def safe_plan(
             f"- endpoint: `{args.endpoint}`",
             f"- model: `{model}`",
             f"- concurrency: `{args.concurrency}`",
+            f"- override_storage_mb: `{args.override_storage_mb or '<none>'}`",
+            f"- official_comparable: `{'no' if args.override_storage_mb else 'yes'}`",
             f"- explicit CODEFACTORY_BENCH_API_KEY present: `{explicit_key}`",
             f"- keychain timeout: `{args.secret_timeout_sec}s`",
             f"- job root: `{env['CODEFACTORY_BENCH_JOB_ROOT']}`",
@@ -111,7 +115,8 @@ def run_command(env: dict[str, str]) -> tuple[int, str]:
 def parse_output(output: str) -> dict[str, object]:
     preview_match = re.search(
         r"provider_bridge_preview .*?model=(?P<model>\S+) .*?task_limit=(?P<task_limit>\d+) "
-        r"concurrency=(?P<concurrency>\d+) .*?job_path=(?P<job_path>\S+)",
+        r"concurrency=(?P<concurrency>\d+) .*?override_storage_mb=(?P<override_storage_mb>\S+) "
+        r"job_path=(?P<job_path>\S+)",
         output,
     )
     imported_match = re.search(
@@ -164,6 +169,8 @@ def write_report(
         f"- task_count: `{len(tasks)}`",
         f"- endpoint: `{args.endpoint}`",
         f"- exit_code: `{exit_code}`",
+        f"- override_storage_mb: `{args.override_storage_mb or '<none>'}`",
+        f"- official_comparable: `{'no' if args.override_storage_mb else 'yes'}`",
         f"- explicit_key_present: `{'yes' if os.environ.get('CODEFACTORY_BENCH_API_KEY') else 'no'}`",
         "",
     ]
@@ -175,6 +182,7 @@ def write_report(
                 f"- model: `{preview['model']}`",
                 f"- task_limit: `{preview['task_limit']}`",
                 f"- concurrency: `{preview['concurrency']}`",
+                f"- override_storage_mb: `{preview['override_storage_mb']}`",
                 f"- job_path: `{preview['job_path']}`",
                 "",
             ]
@@ -251,9 +259,10 @@ def main() -> int:
     parser.add_argument("--model")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--model-timeout-sec", type=int, default=120)
-    parser.add_argument("--shell-timeout-sec", type=int, default=120)
+    parser.add_argument("--shell-timeout-sec", type=int, default=300)
     parser.add_argument("--agent-wall-timeout-sec", type=int, default=780)
     parser.add_argument("--secret-timeout-sec", type=int, default=20)
+    parser.add_argument("--override-storage-mb", type=int)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 

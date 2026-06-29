@@ -92,6 +92,21 @@
 - remaining blocker: verifier bootstrap still fails with missing `curl`, `/root/.local/bin/env`, and `uvx`.
 - conclusion: this is a verified agent-loop improvement but not a scoring improvement. The next score-facing step must repair or preflight verifier bootstrap dependencies before running broader regression.
 
+2026-06-29 `mteb-retrieve` scoring canary 结果：
+
+- diagnostic storage override run: `0224b9ba-e6f4-4b45-8bd8-1249b8911561`
+- diagnostic report: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T12-58-09Z.md`
+- diagnostic result: reward `0.0`, failure class `environment`, `official_comparable: no`
+- root cause: local Docker overlay was full (`30G / 30G`, `100%`), causing apt package index/signature and verifier bootstrap failures; a clean `python:3.10-slim-bookworm` `apt-get update` smoke passed after targeted cleanup of unused Terminal-Bench images.
+- implementation changes: MTEB guidance now uses `mteb.get_model("BAAI/bge-small-zh-v1.5", revision=...)`, `task_name="SciFact"`, and `PromptType.query` / `PromptType.passage`; `Implementation hint:` messages survive context compaction; benchmark shell timeout default is `300s`.
+- passing run: `5a4e758d-f949-40ba-8f2d-e0017fa9b722`
+- passing report: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T13-33-52Z.md`
+- iteration report: `docs/evidence-packs/terminal-bench-21-iteration-2026-06-29T13-33-52Z.md`
+- score: `1 / 1`, mean reward `1.000`
+- comparable: `true`
+- failure class: `None`
+- conclusion: this is the first confirmed targeted score improvement in the iteration loop. It is not an aggregate 18-task or 89-task score movement; the next gate must rerun the fixed 18-task regression subset.
+
 ## 问题分层
 
 ### 1. 评测基础设施还不够产品化
@@ -107,8 +122,10 @@
 
 - provider usage capture。
 - canary iteration reports now mark mismatched trial-count comparisons as `comparable_delta: no`, preventing single-task canaries from being reported as aggregate 18-task score deltas.
+- explicit storage override plumbing for infrastructure diagnosis only, with `official_comparable: no` when a resource override is used.
 - `failure_reason`。
 - Docker CPU preflight。
+- Docker storage/rootfs failure has now been proven as a real verifier blocker; storage/apt-smoke preflight must join CPU preflight before future score runs.
 - `task_names` 固定 subset 支持。
 - provider secret lookup timeout。
 - 显式 `CODEFACTORY_BENCH_API_KEY` override。
@@ -223,9 +240,9 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 
 当前下一轮 P0：
 
-1. 修复或前置检查 verifier bootstrap：`curl`、`/root/.local/bin/env`、`uvx`。
-2. 用同一个 `mteb-retrieve` canary 验证 reward/failure_class 是否从 `environment` 迁移。
-3. 只有单题 canary 解除 verifier blocker 后，才跑 18 题 regression subset，避免继续消耗 provider token 但只得到同一个基础设施失败。
+1. 把 Docker overlay/storage、apt bootstrap smoke、Harbor cache footprint 加入 benchmark preflight；失败时直接生成 `environment` blocker report，不启动 provider-backed scoring run。
+2. 在当前 PR 合并前后跑一次固定 18 题 regression subset，建立 canary 改动后的 aggregate score；没有这个 same-scope 结果，不得声称总体能力提升。
+3. 针对 passing MTEB 轨迹里的剩余低效，产品化三条 agent-loop 规则：保留任务族实现 hint、减少重复 artifact inspection、final 前只允许 bounded verification 或明确 blocker。
 
 首轮 canary 的具体调整：
 
@@ -245,6 +262,7 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 - explicit key injection path：`CODEFACTORY_BENCH_API_KEY` 由启动进程显式注入时跳过 OS credential lookup，仍不进入 preview、日志、SQLite、Harbor args 或 evidence pack。
 - subset runner 一键命令：`tools/benchmark/run_terminal_bench_21_regression_subset.py` 读取固定 18 题 subset 并生成 success/blocker evidence。
 - result import 后展示 failure reason：Rust importer 持久化 `failure_reason`，前端 Benchmark 页面按 failure reason 聚合并展示 trial 列表。
+- storage/bootstrap preflight：在 Harbor/provider 启动前执行 Docker rootfs free-space、apt update smoke、Harbor job-root footprint 检查；否则当前 MTEB 这类环境问题会伪装成 agent 低分。
 
 ### P1: 把 exception 变成可修复失败
 
@@ -274,6 +292,7 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 
 建议 gate：
 
+- 当前 targeted canary gate 已经达到 `mteb-retrieve` `1 / 1`、mean reward `1.000`；下一步必须跑 18 题 fixed subset，不能继续用单题结果代表系统能力。
 - 18 题 subset pass 从当前 full-run映射的约 `4 / 18` 附近提升到 `7 / 18` 以上，再跑完整 89 题。
 - 完整 89 题 pass 从 `6 / 89` 提升到 `15 / 89`，才算第一阶段 agent loop 改进有效。
 - 同时记录 cost 和 duration，避免靠无限重试换分数。
