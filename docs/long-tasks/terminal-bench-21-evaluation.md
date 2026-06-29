@@ -66,17 +66,20 @@
 - Added provider credential-access timeout for benchmark bridge: macOS keychain reads now use a bounded, killable `security` subprocess for benchmark launch, so keychain authorization hangs become explicit infrastructure blockers instead of indefinite waits.
 - Added explicit benchmark secret override support: if the launching process already provides `CODEFACTORY_BENCH_API_KEY`, provider bridge uses that in-memory value for the Harbor child process and skips OS credential lookup; the key is still not printed, previewed, persisted, or put into Harbor args.
 - Added fixed subset runner/report script `tools/benchmark/run_terminal_bench_21_regression_subset.py`; it reads the 18-task subset JSON, runs the provider bridge path, and writes success or blocker evidence packs without printing raw keys.
+- Completed P0 evaluation reliability slice: provider credential/keychain failures now return typed `status=blocked`, `failure_kind=credential` results for the Benchmark UI instead of being conflated with Harbor/agent failure; Home now exposes `能力评测`, and the Terminal-Bench page shows probe, provider preview, run blocker, import summary, failure reason counts, and trial-level failure reason.
+- Completed P1 exception-to-repair slice: the headless runner now suppresses unbounded long commands, records background service lifecycle signals, and keeps service supervision / command-timeout outcomes in trajectory metadata instead of letting them disappear into Harbor exceptions.
+- Completed P2 verifier-repair slice: failed self-checks now produce structured `repair-goal` trajectory entries with kind/failure/next action/smallest rerun, and final answers are gated until a candidate artifact has a bounded verification attempt.
 
 ## Remaining Items
 - Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
 - Add cost calculation once provider pricing metadata is available; current adapter captures provider-reported token usage but does not price it.
-- Continue long-horizon execution work: better step budgeting, richer background process lifecycle supervision, broader service readiness templates, long command timeout policy, and resumable artifact verification.
-- Continue verifier-driven repair work: use verifier/self-check stdout as concrete patch goals across more failure shapes and keep expected artifacts first-class state through repair attempts.
-- Generalize post-candidate repair so task-specific protocol repair becomes reusable capability, not only a `write-compressor` special case.
+- Continue long-horizon execution work beyond P1: broaden service readiness templates and use real subset deltas to tune the long command policy.
+- Continue verifier-driven repair work beyond P2: add task-family specific parsers only after the generic `repair-goal` mechanism shows which failure shapes remain frequent.
+- Generalize post-candidate repair further after fixed subset rerun; current P2 includes generic repair-goal recipes plus the existing `write-compressor` task-specific auto-repair.
 - Use `docs/plans/terminal-bench-21-system-improvement-plan.md` as the first score-driven improvement roadmap after the fixed subset rerun produces a comparable delta.
 - Add persisted run fields/UI for evaluation axis, evaluation subject, fixed variables, changed variables, and result attribution.
 - Promote `benchmark-sandbox` from adapter-local command gate to shared CodeFactory policy preset with run/task/container binding.
-- Add Benchmarks UI for run summary, trial details, failure triage, and capability profile.
+- Expand Benchmarks UI beyond P0: add historical run comparison, capability profile trends, and direct evidence-pack export.
 - Compare at least one baseline/head subset after an implementation change.
 
 ## Blockers

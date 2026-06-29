@@ -208,6 +208,8 @@ pub struct StartBenchmarkProviderRunRequest {
 pub struct BenchmarkProviderRunResult {
     pub preview: BenchmarkProviderBridgePreview,
     pub status: String,
+    pub failure_kind: Option<String>,
+    pub blocker: Option<String>,
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
@@ -409,7 +411,13 @@ pub async fn start_provider_benchmark_run(
     settings: &Settings,
     request: StartBenchmarkProviderRunRequest,
 ) -> Result<BenchmarkProviderRunResult> {
-    let launch = resolve_authorized_provider_launch_with_timeout(settings, &request).await?;
+    let launch = match resolve_authorized_provider_launch_with_timeout(settings, &request).await {
+        Ok(launch) => launch,
+        Err(err) if is_provider_credential_blocker(&err) => {
+            return provider_credential_blocker_result(settings, &request, err);
+        }
+        Err(err) => return Err(err),
+    };
     let preview = launch.preview.clone();
     let job_path = preview.job_path.clone();
     let output = tokio::task::spawn_blocking(move || execute_provider_launch(launch))
@@ -430,10 +438,41 @@ pub async fn start_provider_benchmark_run(
     Ok(BenchmarkProviderRunResult {
         preview,
         status,
+        failure_kind: if output.exit_code == Some(0) {
+            None
+        } else {
+            Some("harbor-run".to_string())
+        },
+        blocker: None,
         exit_code: output.exit_code,
         stdout: output.stdout,
         stderr: output.stderr,
         imported,
+    })
+}
+
+fn is_provider_credential_blocker(err: &AppError) -> bool {
+    let message = err.to_string();
+    message.contains("Benchmark provider secret lookup timed out")
+        || message.contains("API key not found for benchmark provider key_ref")
+        || message.contains("API key is empty for benchmark provider key_ref")
+}
+
+fn provider_credential_blocker_result(
+    settings: &Settings,
+    request: &StartBenchmarkProviderRunRequest,
+    err: AppError,
+) -> Result<BenchmarkProviderRunResult> {
+    let preview = authorized_provider_preview(settings, request)?;
+    Ok(BenchmarkProviderRunResult {
+        preview,
+        status: "blocked".to_string(),
+        failure_kind: Some("credential".to_string()),
+        blocker: Some(err.to_string()),
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        imported: None,
     })
 }
 
@@ -2099,6 +2138,46 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Benchmark provider secret lookup timed out"));
+    }
+
+    #[test]
+    fn provider_bridge_maps_credential_failure_to_blocked_result() {
+        let settings = settings_with_deepseek_endpoint();
+        let bridge = BenchmarkProviderBridgeRequest {
+            profile_id: TERMINAL_BENCH_21_PROFILE_ID.to_string(),
+            endpoint_name: None,
+            model: None,
+            task_limit: Some(1),
+            task_names: None,
+            concurrency: None,
+            trial_count: Some(1),
+            job_root: Some("/tmp/cf-bench".to_string()),
+            job_name: Some("deepseek-smoke".to_string()),
+            adapter_root: Some("/repo".to_string()),
+        };
+        let preview = preview_provider_bridge(&settings, &bridge).expect("preview");
+        let result = provider_credential_blocker_result(
+            &settings,
+            &StartBenchmarkProviderRunRequest {
+                bridge,
+                authorization_phrase: preview.authorization_phrase,
+            },
+            AppError::Other(
+                "Benchmark provider secret lookup timed out after 5s; unlock or authorize the OS credential store and retry"
+                    .to_string(),
+            ),
+        )
+        .expect("credential blocker result");
+
+        assert_eq!(result.status, "blocked");
+        assert_eq!(result.failure_kind.as_deref(), Some("credential"));
+        assert!(result.exit_code.is_none());
+        assert!(result.imported.is_none());
+        assert!(result
+            .blocker
+            .as_deref()
+            .unwrap_or_default()
+            .contains("secret lookup timed out"));
     }
 
     #[test]

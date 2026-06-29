@@ -12,6 +12,7 @@ import {
   FolderOpen,
   Clock,
   ShieldCheck,
+  Gauge,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../../stores/chat";
@@ -27,6 +28,7 @@ interface HomePageProps {
   onOpenProject: (sessionId: string) => void;
   onOpenSkills: () => void;
   onOpenControlPlane: () => void;
+  onOpenBenchmarks: () => void;
   onOpenSettings: () => void;
   onOpenProfile: () => void;
 }
@@ -60,6 +62,7 @@ export function HomePage({
   onOpenProject,
   onOpenSkills,
   onOpenControlPlane,
+  onOpenBenchmarks,
   onOpenSettings,
   onOpenProfile,
 }: HomePageProps) {
@@ -180,7 +183,7 @@ export function HomePage({
           {/* ── Three primary entries ─────────────────────────────────── */}
           <section>
             <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-3">开始</h2>
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
               <EntryCard
                 Icon={Plus}
                 title="新建项目"
@@ -201,6 +204,13 @@ export function HomePage({
                 desc="AI 对你的理解，可查看可编辑"
                 tone="muted"
                 onClick={handleProfile}
+              />
+              <EntryCard
+                Icon={Gauge}
+                title="能力评测"
+                desc="Terminal-Bench 2.1 基线、子集回归和失败归因"
+                tone="muted"
+                onClick={onOpenBenchmarks}
               />
             </div>
           </section>

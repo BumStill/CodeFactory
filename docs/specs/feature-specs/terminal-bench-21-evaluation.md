@@ -199,11 +199,15 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 | Adapter | Artifact enforcement loop | 初始 inspection 后，重复读文件、复合只读命令和无关实现命令会被压回 artifact 生成；有目标产物前空回复会恢复为 tool-call 要求 | Python loop tests + real provider smoke trajectory |
 | Adapter | Protocol auto-repair | candidate artifact 自检出现 decompressor crash、size limit 或协议失败时，adapter 能记录自动修复轨迹并产出可验证 artifact；修复不得依赖 task container 中不存在的 Python runtime | Python loop test + real provider smoke reward |
 | Adapter | Exec timeout recovery | `environment.exec` 抛出 command timeout 时，adapter 写入 `exec-error/command-timeout`、更新 metadata，并继续给模型修复机会，不直接 Harbor exception | Python loop test |
-| Adapter | Failed self-check repair | pytest/assertion/traceback 类自检失败会生成具体 repair reminder，要求修改实现并重跑最小失败检查 | Python loop test |
+| Adapter | Failed self-check repair | pytest/assertion/traceback 类自检失败会生成具体 repair reminder 和结构化 `repair-goal`，要求修改实现并重跑最小失败检查 | Python loop test |
+| Adapter | Final-before-verify gate | 候选 artifact 已生成但未运行 bounded verification 时，final answer 会被拦住，要求先执行最小验证或修复 | Python loop test |
 | Adapter | Foreground service supervision | 前台服务启动命令被 suppress，并提示后台启动、日志、pid 和 readiness check，不消耗完整 tool timeout | Python loop test |
+| Adapter | Background service lifecycle | 已后台化的服务命令记录 log、pid、readiness check 是否存在，并写入 trajectory/metadata | Python loop test |
+| Adapter | Long command policy | 无界 `tail -f`、`watch`、长 `sleep` 或未设 sample/step bound 的训练/benchmark 命令被 suppress，并要求 bounded plan | Python loop test |
 | Adapter | Provider tool-choice compatibility | provider 拒绝 forced `tool_choice` 时自动降级为 `auto` 重试，不把兼容性错误误记为 agent 能力结果 | Python provider fallback test |
 | Adapter | Provider bridge preview | 当前 DeepSeek endpoint/model 生成 redacted env 和 Harbor command preview，不暴露 raw key | Rust unit test |
 | Adapter | Provider bridge authorization | 授权短语不匹配时不得 lookup secret；匹配后只把 key 放入 child env | Rust unit test |
+| UI | Benchmark credential blocker | provider keychain/credential failure 返回 `status=blocked`、`failure_kind=credential`，Benchmark 页面展示 blocker，不记为 agent failure | Rust unit test + frontend build |
 | Attribution | Evaluation axis contract | run/PR/evidence 区分 CodeFactory agent 能力、模型后端影响、agent scaffold 对比和评测基础设施 smoke | spec review + fixture test |
 | Regression | Fixed subset runner | 从固定 subset JSON 生成 18 题 provider-backed run；credential 不可用时生成 blocker evidence，不伪造 agent score | runner dry-run + blocker evidence |
 | Policy | benchmark-sandbox policy in task container | workspace command/file edit 自动允许，host path/secret deny | policy unit test |

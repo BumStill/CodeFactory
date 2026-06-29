@@ -5,6 +5,7 @@ import { HomePage } from "./pages/Home/HomePage";
 import { WorkspacePage } from "./pages/Workspace/WorkspacePage";
 import { SkillsPage } from "./pages/Skills/SkillsPage";
 import { ControlPlanePage } from "./pages/ControlPlane/ControlPlanePage";
+import { BenchmarksPage } from "./pages/Benchmarks/BenchmarksPage";
 import { SettingsPage } from "./pages/Settings/SettingsPage";
 import { ProfilePage } from "./pages/Profile/ProfilePage";
 import { ToastContainer } from "./components/Toast";
@@ -16,7 +17,7 @@ import { useChatStore } from "./stores/chat";
 import { invoke } from "./lib/tauri";
 import type { Session } from "./lib/tauri";
 
-export type AppView = "home" | "workspace" | "specs" | "skills" | "settings" | "profile" | "control-plane";
+export type AppView = "home" | "workspace" | "specs" | "skills" | "settings" | "profile" | "control-plane" | "benchmarks";
 
 export default function App() {
   const [view, setView] = useState<AppView>("home");
@@ -80,6 +81,7 @@ export default function App() {
           onOpenProject={openProject}
           onOpenSkills={() => setView("skills")}
           onOpenControlPlane={() => setView("control-plane")}
+          onOpenBenchmarks={() => setView("benchmarks")}
           onOpenSettings={() => setView("settings")}
           onOpenProfile={() => setView("profile")}
         />
@@ -97,6 +99,7 @@ export default function App() {
 
       {view === "skills"   && <SkillsPage   onBack={backToHome} />}
       {view === "control-plane" && <ControlPlanePage onBack={backToHome} />}
+      {view === "benchmarks" && <BenchmarksPage onBack={backToHome} />}
       {view === "profile"  && <ProfilePage  onBack={backToHome} />}
       {view === "settings" && <SettingsPage onBack={() => setView(activeProject ? "workspace" : "home")} />}
 

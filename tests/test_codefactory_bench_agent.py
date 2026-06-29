@@ -406,6 +406,7 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                     "CODEFACTORY_BENCH_API_KEY": "test-key",
                     "CODEFACTORY_BENCH_MODEL": "fake-model",
                     "CODEFACTORY_BENCH_MODEL_TIMEOUT_RETRIES": "1",
+                    "CODEFACTORY_BENCH_FINAL_VERIFY_RETRIES": "0",
                 },
             )
             calls: list[list[dict[str, object]]] = []
@@ -444,7 +445,7 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
 
     def test_codefactory_agent_records_shell_timeout_without_aborting(self) -> None:
         server, requests = start_fake_chat_server(
-            [assistant_tool_call("sleep 999"), assistant_final("done")]
+            [assistant_tool_call("python3 -c 'print(1)'"), assistant_final("done")]
         )
         try:
             import tempfile
@@ -535,6 +536,61 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                 self.assertTrue(
                     any("latest self-check failed" in reminder for reminder in reminders)
                 )
+                repair_goals = [
+                    step
+                    for step in trajectory["steps"]
+                    if step.get("role") == "repair-goal"
+                ]
+                self.assertEqual(len(repair_goals), 1)
+                self.assertEqual(repair_goals[0]["goal"]["kind"], "assertion-failure")
+                assert context.metadata is not None
+                self.assertEqual(context.metadata["repair_goal_count"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_codefactory_agent_requires_final_verification_after_artifact(self) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                assistant_tool_call("cat > /app/data.comp <<'EOF'\nplaceholder\nEOF"),
+                assistant_final("done"),
+                assistant_tool_call("cmp -s /app/data.comp /app/data.comp && echo verification-ok"),
+                assistant_final("done"),
+            ]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironment()
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                    },
+                )
+
+                asyncio.run(agent.run("write data.comp", env, context))
+
+                self.assertEqual(len(requests), 4)
+                self.assertEqual(len(env.calls), 2)
+                self.assertIn("data.comp", env.calls[0]["command"])
+                self.assertIn("verification-ok", env.calls[1]["command"])
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                self.assertTrue(
+                    any(
+                        "Final-before-verify gate:" in step.get("content", "")
+                        for step in trajectory["steps"]
+                        if step.get("role") == "system-reminder"
+                    )
+                )
         finally:
             server.shutdown()
             server.server_close()
@@ -577,6 +633,100 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                 ]
                 self.assertEqual(len(supervision_required), 1)
                 self.assertIn("readiness check", supervision_required[0]["content"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_codefactory_agent_suppresses_unbounded_long_commands(self) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                assistant_tool_call("tail -f /tmp/server.log"),
+                assistant_final("done"),
+            ]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironment()
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                    },
+                )
+
+                asyncio.run(agent.run("inspect logs", env, context))
+
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(env.calls, [])
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                long_blocks = [
+                    step
+                    for step in trajectory["steps"]
+                    if step.get("status") == "long-command-policy-required"
+                ]
+                self.assertEqual(len(long_blocks), 1)
+                assert context.metadata is not None
+                self.assertEqual(context.metadata["long_command_blocks"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_codefactory_agent_records_background_service_lifecycle(self) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                assistant_tool_call(
+                    "python -m http.server 8000 > /tmp/cf-server.log 2>&1 & "
+                    "echo $! > /tmp/cf-server.pid; "
+                    "python3 - <<'PY'\nprint('ready')\nPY"
+                ),
+                assistant_final("done"),
+            ]
+        )
+        try:
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                env = FakeEnvironment()
+                context = AgentContext()
+                agent = CodeFactoryAgent(
+                    logs_dir=tmp_path,
+                    model_name=None,
+                    extra_env={
+                        "CODEFACTORY_BENCH_API_KEY": "test-key",
+                        "CODEFACTORY_BENCH_BASE_URL": (
+                            f"http://127.0.0.1:{server.server_port}/v1"
+                        ),
+                        "CODEFACTORY_BENCH_MODEL": "fake-model",
+                    },
+                )
+
+                asyncio.run(agent.run("start and test the web service", env, context))
+
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(len(env.calls), 1)
+                trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+                lifecycle_steps = [
+                    step
+                    for step in trajectory["steps"]
+                    if step.get("background_process")
+                ]
+                self.assertEqual(len(lifecycle_steps), 1)
+                lifecycle = lifecycle_steps[0]["background_process"]
+                self.assertTrue(lifecycle["log_recorded"])
+                self.assertTrue(lifecycle["pid_recorded"])
+                self.assertTrue(lifecycle["readiness_checked"])
+                assert context.metadata is not None
+                self.assertEqual(context.metadata["background_process_count"], 1)
         finally:
             server.shutdown()
             server.server_close()
@@ -644,6 +794,7 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                         ),
                         "CODEFACTORY_BENCH_MODEL": "fake-model",
                         "CODEFACTORY_BENCH_NO_ACTION_RETRIES": "1",
+                        "CODEFACTORY_BENCH_FINAL_VERIFY_RETRIES": "0",
                     },
                 )
 
@@ -694,6 +845,7 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                         ),
                         "CODEFACTORY_BENCH_MODEL": "fake-model",
                         "CODEFACTORY_BENCH_NO_ACTION_RETRIES": "1",
+                        "CODEFACTORY_BENCH_FINAL_VERIFY_RETRIES": "0",
                     },
                 )
 

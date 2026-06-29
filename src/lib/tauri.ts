@@ -238,6 +238,8 @@ export interface ImportedBenchmarkRun {
 export interface BenchmarkProviderRunResult {
   preview: BenchmarkProviderBridgePreview;
   status: string;
+  failure_kind?: string | null;
+  blocker?: string | null;
   exit_code?: number | null;
   stdout: string;
   stderr: string;

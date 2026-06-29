@@ -191,14 +191,19 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         total_tool_calls = 0
         total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         no_action_recoveries = 0
+        final_verify_recoveries = 0
         command_counts: dict[str, int] = {}
         loop_state: dict[str, Any] = {
             "implementation_started": False,
             "artifact_started": False,
+            "verification_started": False,
             "implementation_required_count": 0,
             "exec_errors": 0,
             "command_timeouts": 0,
             "service_supervision_blocks": 0,
+            "long_command_blocks": 0,
+            "background_processes": [],
+            "repair_goals": [],
         }
 
         def write_logs() -> None:
@@ -309,6 +314,27 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             write_logs()
 
             if not tool_calls:
+                if self._requires_final_verification_recovery(
+                    loop_state,
+                    artifact_hint,
+                    final_verify_recoveries,
+                    self._int_env("CODEFACTORY_BENCH_FINAL_VERIFY_RETRIES", 1),
+                ):
+                    final_verify_recoveries += 1
+                    recovery_prompt = self._final_verification_recovery_prompt(
+                        loop_state,
+                        artifact_hint,
+                    )
+                    messages.append({"role": "user", "content": recovery_prompt})
+                    trajectory.append(
+                        {
+                            "step": step,
+                            "role": "system-reminder",
+                            "content": recovery_prompt,
+                        }
+                    )
+                    write_logs()
+                    continue
                 if self._requires_no_action_recovery(
                     loop_state, artifact_hint, no_action_recoveries, no_action_retries
                 ):
@@ -366,6 +392,21 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 repair_hint = self._repair_hint_from_tool_result(
                     tool_result["trajectory"], artifact_hint
                 )
+                repair_goal = self._repair_goal_from_tool_result(
+                    tool_result["trajectory"], artifact_hint
+                )
+                if repair_goal:
+                    loop_state["repair_goals"].append(repair_goal)
+                    repair_goal_message = self._format_repair_goal(repair_goal)
+                    messages.append({"role": "user", "content": repair_goal_message})
+                    trajectory.append(
+                        {
+                            "step": step,
+                            "role": "repair-goal",
+                            "content": repair_goal_message,
+                            "goal": repair_goal,
+                        }
+                    )
                 if repair_hint:
                     messages.append({"role": "user", "content": repair_hint})
                     trajectory.append(
@@ -457,6 +498,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                         f"for `{artifact_hint}`. Use its output for final verification; "
                         "do not replace the artifact unless the self-check still fails."
                     )
+                    loop_state["verification_started"] = True
                     messages.append({"role": "user", "content": auto_summary})
                     trajectory.append(
                         {
@@ -483,6 +525,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             "service_supervision_blocks": int(
                 loop_state.get("service_supervision_blocks") or 0
             ),
+            "long_command_blocks": int(loop_state.get("long_command_blocks") or 0),
+            "repair_goal_count": len(loop_state.get("repair_goals") or []),
+            "background_process_count": len(loop_state.get("background_processes") or []),
         }
 
     def _write_model_backed_logs(
@@ -535,6 +580,8 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 (
                     "Inspection phase",
                     "No-action recovery:",
+                    "Final-before-verify gate:",
+                    "Repair goal:",
                     "Repair focus:",
                     "Timeout recovery:",
                     "Verification hint:",
@@ -719,6 +766,34 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 },
             }
 
+        long_command_reason = self._long_command_policy_reason(command)
+        if long_command_reason:
+            loop_state["long_command_blocks"] = (
+                int(loop_state.get("long_command_blocks") or 0) + 1
+            )
+            content = (
+                "LONG COMMAND POLICY REQUIRED: this command looks unbounded or "
+                f"likely to consume the benchmark timeout ({long_command_reason}). "
+                "Run a bounded version with `timeout`, a smaller sample, or a "
+                "readiness/health check that exits deterministically. Do not retry "
+                "the unbounded command unchanged."
+            )
+            return {
+                "content": content,
+                "trajectory": {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "tool": name,
+                    "command": command,
+                    "policy": {
+                        "action": "suppress",
+                        "reason": "long command requires bounded plan",
+                    },
+                    "status": "long-command-policy-required",
+                    "content": content,
+                },
+            }
+
         command_key = self._repeat_command_key(command)
         command_counts[command_key] = command_counts.get(command_key, 0) + 1
         repeat_limit = self._int_env("CODEFACTORY_BENCH_REPEAT_COMMAND_LIMIT", 2)
@@ -753,6 +828,11 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         if self._is_artifact_attempt(command, artifact_hint):
             loop_state["artifact_started"] = True
             loop_state["implementation_required_count"] = 0
+        if self._is_verification_attempt(command, artifact_hint):
+            loop_state["verification_started"] = True
+        background_process = self._background_process_lifecycle(command)
+        if background_process:
+            loop_state["background_processes"].append(background_process)
         try:
             result = await environment.exec(
                 command,
@@ -803,6 +883,11 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 "stdout_bytes": len(result.stdout or ""),
                 "stderr_bytes": len(result.stderr or ""),
                 "content": content,
+                **(
+                    {"background_process": background_process}
+                    if background_process
+                    else {}
+                ),
             },
         }
 
@@ -1046,6 +1131,44 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
         )
 
     @staticmethod
+    def _requires_final_verification_recovery(
+        loop_state: dict[str, Any],
+        artifact_hint: str | None,
+        recoveries: int,
+        max_recoveries: int,
+    ) -> bool:
+        return (
+            recoveries < max_recoveries
+            and bool(artifact_hint)
+            and bool(loop_state.get("artifact_started", False))
+            and not bool(loop_state.get("verification_started", False))
+        )
+
+    @staticmethod
+    def _final_verification_recovery_prompt(
+        loop_state: dict[str, Any], artifact_hint: str | None
+    ) -> str:
+        artifact = f"`{artifact_hint}`" if artifact_hint else "the expected artifact"
+        latest_goal = None
+        repair_goals = loop_state.get("repair_goals")
+        if isinstance(repair_goals, list) and repair_goals:
+            latest_goal = repair_goals[-1]
+        repair_tail = ""
+        if isinstance(latest_goal, dict):
+            repair_tail = (
+                f" Use the latest repair goal `{latest_goal.get('kind', 'unknown')}` "
+                "as the verification target."
+            )
+        return (
+            "Final-before-verify gate: a candidate artifact was produced but no "
+            "bounded verification command has run yet. Return exactly one `run_shell` "
+            f"tool call that checks {artifact}: prefer the task's exact command, a "
+            "`cmp`/`diff`/test invocation, or the smallest deterministic self-check. "
+            "If it fails, patch before the final answer."
+            f"{repair_tail}"
+        )
+
+    @staticmethod
     def _remaining_budget_reminder(
         step: int, max_steps: int, artifact_hint: str | None
     ) -> str | None:
@@ -1139,6 +1262,133 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 "files if useful, or switch to a simpler implementation path."
             )
 
+        return None
+
+    @staticmethod
+    def _repair_goal_from_tool_result(
+        tool_result: dict[str, Any], artifact_hint: str | None
+    ) -> dict[str, Any] | None:
+        content = str(tool_result.get("content") or "")
+        normalized = content.lower()
+        command = str(tool_result.get("command") or "")
+        artifact = artifact_hint or "expected artifact"
+
+        if "service supervision required" in normalized:
+            return {
+                "kind": "service-lifecycle",
+                "artifact": artifact_hint,
+                "source_command": CodeFactoryAgent._single_line(command),
+                "failure": "foreground service command would block the agent",
+                "next_action": (
+                    "Start the service in the background, redirect logs, record pid, "
+                    "poll readiness with a bounded loop, then run the client/test command."
+                ),
+                "smallest_rerun": "bounded readiness check plus client/test command",
+            }
+
+        if "long command policy required" in normalized:
+            return {
+                "kind": "bounded-command",
+                "artifact": artifact_hint,
+                "source_command": CodeFactoryAgent._single_line(command),
+                "failure": "command is unbounded or timeout-prone",
+                "next_action": (
+                    "Replace it with `timeout`, a smaller sample, or a deterministic "
+                    "health/self-check that exits before the benchmark timeout."
+                ),
+                "smallest_rerun": "bounded sample or timeout-wrapped command",
+            }
+
+        if "segmentation fault" in normalized or "core dumped" in normalized:
+            return {
+                "kind": "crash",
+                "artifact": artifact_hint,
+                "source_command": CodeFactoryAgent._single_line(command),
+                "failure": "self-check crashed",
+                "next_action": (
+                    f"Patch the generator or artifact protocol for `{artifact}`, then "
+                    "rerun the smallest round-trip command."
+                ),
+                "smallest_rerun": "round-trip artifact check",
+            }
+
+        if "command not found" in normalized:
+            missing = CodeFactoryAgent._extract_missing_command(content)
+            return {
+                "kind": "missing-tool",
+                "artifact": artifact_hint,
+                "source_command": CodeFactoryAgent._single_line(command),
+                "failure": f"missing command{f' `{missing}`' if missing else ''}",
+                "next_action": (
+                    "Use an available shell/coreutils/compiler alternative instead "
+                    "of reinstalling or retrying the same command."
+                ),
+                "smallest_rerun": "available-tool equivalent command",
+            }
+
+        assertion = CodeFactoryAgent._extract_assertion_or_traceback(content)
+        if assertion:
+            return {
+                "kind": "assertion-failure",
+                "artifact": artifact_hint,
+                "source_command": CodeFactoryAgent._single_line(command),
+                "failure": assertion,
+                "next_action": (
+                    "Patch the implementation against this assertion or traceback, "
+                    "then rerun the smallest failing test/check before final answer."
+                ),
+                "smallest_rerun": CodeFactoryAgent._single_line(command)
+                or "smallest failing test/check",
+            }
+
+        if tool_result.get("status") == "exec-error":
+            return {
+                "kind": str(tool_result.get("error_type") or "exec-error"),
+                "artifact": artifact_hint,
+                "source_command": CodeFactoryAgent._single_line(command),
+                "failure": "command failed before returning a normal exit code",
+                "next_action": (
+                    "Run a smaller diagnostic, inspect partial output, or switch "
+                    "to a simpler implementation path."
+                ),
+                "smallest_rerun": "smaller diagnostic command",
+            }
+
+        return None
+
+    @staticmethod
+    def _format_repair_goal(goal: dict[str, Any]) -> str:
+        return (
+            "Repair goal: "
+            f"kind={goal.get('kind', 'unknown')}; "
+            f"failure={goal.get('failure', '')}; "
+            f"next_action={goal.get('next_action', '')}; "
+            f"smallest_rerun={goal.get('smallest_rerun', '')}."
+        )
+
+    @staticmethod
+    def _extract_missing_command(content: str) -> str | None:
+        match = re.search(r"(?P<command>[A-Za-z0-9_.+-]+):\s+command not found", content)
+        if match:
+            return match.group("command")
+        return None
+
+    @staticmethod
+    def _extract_assertion_or_traceback(content: str) -> str | None:
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        for line in lines:
+            lowered = line.lower()
+            if (
+                "assertionerror" in lowered
+                or lowered.startswith("e       assert")
+                or re.search(r"\b\d+\s+failed\b", lowered)
+            ):
+                return CodeFactoryAgent._single_line(line, 300)
+        if "traceback (most recent call last)" in content.lower():
+            for line in reversed(lines):
+                if re.search(r"(error|exception):", line, re.IGNORECASE):
+                    return CodeFactoryAgent._single_line(line, 300)
+            return "traceback failure"
         return None
 
     def _auto_repair_command_from_tool_result(
@@ -1423,6 +1673,90 @@ fi"""
             r"\bmysqld\b",
         ]
         return any(re.search(pattern, command_text) for pattern in service_patterns)
+
+    @staticmethod
+    def _long_command_policy_reason(command: str) -> str | None:
+        command_text = CodeFactoryAgent._strip_heredoc_bodies(command).strip().lower()
+        if not command_text:
+            return None
+        if command_text.startswith("timeout ") or " timeout " in command_text:
+            return None
+        if re.search(r"\bwhile\s+true\b", command_text):
+            return "infinite while loop"
+        if re.search(r"\btail\s+-f\b", command_text):
+            return "tail -f does not terminate"
+        if re.search(r"\bwatch\s+(-n\s+\d+\s+)?", command_text):
+            return "watch does not terminate without timeout"
+        sleep_match = re.search(r"(?:^|[;&|]\s*)sleep\s+(\d+)", command_text)
+        if sleep_match and int(sleep_match.group(1)) >= 120:
+            return f"sleep {sleep_match.group(1)} exceeds bounded command policy"
+        if re.search(r"\b(?:python3?|bash|sh)\s+.*(?:train|finetune|benchmark)\b", command_text):
+            if not re.search(r"\b(?:--max_steps|--epochs\s+1|--limit|--sample|--dry-run)\b", command_text):
+                return "training or benchmark command lacks a sample/step bound"
+        return None
+
+    @staticmethod
+    def _background_process_lifecycle(command: str) -> dict[str, Any] | None:
+        command_text = CodeFactoryAgent._strip_heredoc_bodies(command).strip()
+        normalized = command_text.lower()
+        if not any(token in normalized for token in [" &", "nohup ", "setsid "]):
+            return None
+        service_like = any(
+            re.search(pattern, normalized)
+            for pattern in [
+                r"\bpython3?\s+-m\s+http\.server\b",
+                r"\buvicorn\b",
+                r"\bgunicorn\b",
+                r"\bflask\s+run\b",
+                r"\bnpm\s+(run\s+)?(dev|start)\b",
+                r"\bredis-server\b",
+                r"\bpostgres\b",
+                r"\bmysqld\b",
+            ]
+        )
+        if not service_like:
+            return None
+        has_log = bool(re.search(r">\s*\S+|2>\s*\S+|2>&1", command_text))
+        has_pid = bool(re.search(r"\$!\s*>\s*\S+|echo\s+\$!", command_text))
+        has_readiness = bool(
+            re.search(
+                r"\b(timeout|until|for\s+\w+\s+in|nc\s+-z|curl|wget|python3?\s+- <<)",
+                normalized,
+            )
+        )
+        return {
+            "started": True,
+            "log_recorded": has_log,
+            "pid_recorded": has_pid,
+            "readiness_checked": has_readiness,
+            "summary": (
+                "background service command observed; logs, pid, and bounded "
+                "readiness should be present before client verification"
+            ),
+        }
+
+    @staticmethod
+    def _is_verification_attempt(command: str, artifact_hint: str | None) -> bool:
+        command_text = CodeFactoryAgent._strip_heredoc_bodies(command).lower()
+        if not command_text:
+            return False
+        verification_tokens = [
+            "pytest",
+            "cargo test",
+            "npm test",
+            "pnpm test",
+            "make test",
+            "go test",
+            "cmp ",
+            "diff ",
+            "verification-ok",
+            "verification-failed",
+        ]
+        if any(token in command_text for token in verification_tokens):
+            return True
+        if artifact_hint and artifact_hint.lower() in command_text:
+            return any(token in command_text for token in [" | ", "test -", "[ -", "wc -c"])
+        return False
 
     @staticmethod
     def _is_inspection_only_command(command: str) -> bool:

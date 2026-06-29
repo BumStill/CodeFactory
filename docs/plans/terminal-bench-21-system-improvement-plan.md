@@ -138,10 +138,10 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 
 交付：
 
-- credential/keychain blocker UI。
-- explicit key injection path。
-- subset runner 一键命令。
-- result import 后展示 failure reason。
+- credential/keychain blocker UI：Home 增加 `能力评测` 入口，`Benchmarks / Terminal-Bench 2.1` 页面展示 environment probe、provider bridge preview、credential blocker、run status 和 imported failure reason。
+- explicit key injection path：`CODEFACTORY_BENCH_API_KEY` 由启动进程显式注入时跳过 OS credential lookup，仍不进入 preview、日志、SQLite、Harbor args 或 evidence pack。
+- subset runner 一键命令：`tools/benchmark/run_terminal_bench_21_regression_subset.py` 读取固定 18 题 subset 并生成 success/blocker evidence。
+- result import 后展示 failure reason：Rust importer 持久化 `failure_reason`，前端 Benchmark 页面按 failure reason 聚合并展示 trial 列表。
 
 ### P1: 把 exception 变成可修复失败
 
@@ -151,8 +151,8 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 
 - exec-error recovery。
 - service supervision templates。
-- long command policy。
-- background process lifecycle record。
+- long command policy：无界 `tail -f`、`watch`、长 `sleep`、未设 sample/step bound 的训练/benchmark 命令会被 suppress，并要求 `timeout`、小样本或 deterministic health/self-check。
+- background process lifecycle record：后台服务命令记录 log、pid、readiness check 是否存在，并进入 trajectory metadata。
 
 ### P2: 提升 verifier repair
 
@@ -160,10 +160,10 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 
 交付：
 
-- verifier output parser。
-- repair_goal message。
-- final-before-verify gate。
-- reusable repair recipes。
+- verifier output parser：从 assertion、traceback、missing tool、crash、exec-error、service lifecycle 和 bounded-command failure 中提取结构化修复目标。
+- repair_goal message：trajectory 写入 `repair-goal`，并把 kind、failure、next_action、smallest_rerun 回灌给模型。
+- final-before-verify gate：产物已生成但未运行 bounded verification 时，final answer 会被拦住，要求先跑最小验证。
+- reusable repair recipes：首批 recipe 覆盖 artifact protocol、service lifecycle、bounded command、missing tool、assertion failure 和 crash；`write-compressor` 仍保留 task-specific auto-repair，后续以真实 subset delta 决定是否继续泛化。
 
 ### P3: 提升真实得分
 
