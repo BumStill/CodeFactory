@@ -1409,6 +1409,14 @@ fn classify_failure_detail(reward: f64, evidence: &str) -> FailureDetail {
         ("environment", "harbor-tests-upload-failed")
     } else if text.contains("range of cpus is from") || text.contains("as there are only") {
         ("environment", "docker-cpu-limit")
+    } else if text.contains("no space left on device")
+        || text.contains("not enough free space in /var/cache/apt/archives")
+        || text.contains("failed to fetch http://archive.ubuntu.com")
+        || text.contains("at least one invalid signature was encountered")
+        || text.contains("uvx: command not found")
+        || text.contains("/root/.local/bin/env: no such file or directory")
+    {
+        ("environment", "verifier-dependency-resource")
     } else if text.contains("verifiertimeouterror") {
         ("verification", "verifier-timeout")
     } else if text.contains("agenttimeouterror") {
@@ -2048,6 +2056,21 @@ mod tests {
             classify_failure_detail(0.0, "RuntimeError: Command timed out after 60 seconds");
         assert_eq!(timeout.failure_class.as_deref(), Some("long-horizon"));
         assert_eq!(timeout.failure_reason.as_deref(), Some("command-timeout"));
+
+        let verifier_dependency = classify_failure_detail(
+            0.0,
+            r#"
+E: You don't have enough free space in /var/cache/apt/archives/.
+/tests/test.sh: line 8: curl: command not found
+/tests/test.sh: line 10: /root/.local/bin/env: No such file or directory
+/tests/test.sh: line 19: uvx: command not found
+"#,
+        );
+        assert_eq!(verifier_dependency.failure_class.as_deref(), Some("environment"));
+        assert_eq!(
+            verifier_dependency.failure_reason.as_deref(),
+            Some("verifier-dependency-resource")
+        );
     }
 
     #[test]

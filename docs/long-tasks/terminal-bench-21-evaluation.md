@@ -74,6 +74,9 @@
 - Ran the first score-driven tool-use P0 canary iteration after repeated-inspection and preflight changes: run `77e98d56-2638-4b0c-a941-a84b542d51ff`, `0 / 4` pass, mean reward `0.000`, failure class `tool-use` for all canary tasks.
 - Added harder artifact-command gating, semantic failure detection for `return_code=0` pipelines with failure text, and bounded iteration-runner timeout support.
 - Reran the canary with bounded timeout; the runner returned explicit `124` after `360s` instead of hanging, with partial Harbor state `2 / 4` completed and `0 / 2` pass. Evidence shows the new gates changed trajectory behavior but did not improve score.
+- Added forced implementation transition prompts after `implementation-required` / `artifact-required` blocks, with trajectory and metadata coverage.
+- Reran the canary with forced transition enabled; the runner returned explicit `124` after `360s`, with partial Harbor state `1 / 4` completed and completed reward `0 / 1`. `write-compressor` recorded `3` forced-implementation prompts and an `auto-repair-ok` that wrote `/app/data.comp` at `2476` bytes, but verifier reward remained `0.0` because verifier dependency setup hit apt cache free-space / missing `curl` / missing `uvx` errors.
+- Added failure-classifier coverage for verifier dependency/resource failures so apt cache exhaustion and missing verifier dependency bootstrap tools are attributed to `environment/verifier-dependency-resource` before generic `tool-use` missing-command rules.
 
 ## Remaining Items
 - Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
@@ -88,6 +91,7 @@
 - Expand Benchmarks UI beyond P0: add historical run comparison, capability profile trends, and direct evidence-pack export.
 - Compare at least one baseline/head subset after an implementation change.
 - Next agent-loop slice must turn blocked `implementation-required` / `artifact-required` states into a concrete forced implementation plan; adding more blockers without strategy transition did not improve the canary score.
+- Natural-language forced transition alone is insufficient. Next slice should add constrained implementation mode or deterministic scaffold execution after repeated artifact blocks, while keeping verifier dependency/resource failures separate from agent capability failures.
 
 ## Blockers
 - No current blocker for the already completed local full-run evaluation. The current full-run result is a valid CodeFactory agent capability baseline, not a provider/account blocker.
@@ -140,6 +144,7 @@
 - Iteration loop evidence: `tools/benchmark/terminal_bench_21_iteration_loop.py` is the standard score-driven loop entrypoint for the next agent capability PR; it generates `terminal-bench-21-iteration-*.md` reports with baseline/head/delta/next queue.
 - First score-driven canary evidence: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-29T06-58-36Z.md` records `0 / 4` pass for the canary after the first tool-use P0 iteration.
 - Bounded canary timeout evidence: `docs/evidence-packs/terminal-bench-21-canary-timeout-2026-06-29T07-15-12Z.md` records the `360s` timeout, partial `2 / 4` completion, and product conclusion that enforcement improved but strategy transition remains missing.
+- Forced transition canary evidence: `docs/evidence-packs/terminal-bench-21-forced-transition-timeout-2026-06-29T08-01-36Z.md` records the `360s` timeout, partial `1 / 4` completion, real forced-prompt trajectory nodes, and the conclusion that prompt-only transition is still not enough.
 - Evidence packs: `docs/evidence-packs/terminal-bench-21-first-smoke-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-baseline-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-headless-runner-2026-06-27.md`, `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-27.md`.
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.

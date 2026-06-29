@@ -424,6 +424,12 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
 
                 self.assertEqual(len(requests), 3)
                 self.assertEqual(len(env.calls), 1)
+                third_messages = requests[2]["messages"]
+                third_content = "\n".join(
+                    str(message.get("content") or "") for message in third_messages
+                )
+                self.assertIn("Forced implementation transition", third_content)
+                self.assertIn("Recent commands/results to avoid repeating", third_content)
                 trajectory = json.loads((tmp_path / "trajectory.json").read_text())
                 implementation_required = [
                     step
@@ -431,8 +437,15 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                     if step.get("status") == "implementation-required"
                 ]
                 self.assertEqual(len(implementation_required), 1)
+                forced_prompts = [
+                    step
+                    for step in trajectory["steps"]
+                    if step.get("role") == "forced-implementation"
+                ]
+                self.assertEqual(len(forced_prompts), 1)
                 assert context.metadata is not None
                 self.assertEqual(context.metadata["implementation_required_blocks"], 1)
+                self.assertEqual(context.metadata["forced_implementation_prompts"], 1)
         finally:
             server.shutdown()
             server.server_close()

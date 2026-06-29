@@ -57,6 +57,15 @@
 - partial Harbor state: `2 / 4` completed, completed reward `0 / 2`
 - conclusion: repeated-inspection suppression、artifact gate、semantic failure detection 能改变轨迹并提升可观测性，但还没有把被拦截状态转成有效实现策略，因此没有分数提升。
 
+2026-06-29 forced implementation transition canary 结果：
+
+- report: `docs/evidence-packs/terminal-bench-21-forced-transition-timeout-2026-06-29T08-01-36Z.md`
+- runner exit: `124`
+- timeout: `360s`
+- partial Harbor state: `1 / 4` completed, completed reward `0 / 1`
+- observed behavior: `write-compressor` 真实触发 `3` 个 forced-implementation prompt，并触发 `auto-repair-ok` 写出 `/app/data.comp` `2476` bytes，但 verifier dependency setup 因 apt cache 空间不足、`curl` 缺失和 `uvx` 缺失失败，reward 为 `0.0`
+- conclusion: prompt-only forced transition 已经被证明不足；下一步必须做 constrained implementation mode 或 deterministic scaffold，而不是继续叠自然语言提醒。同时 verifier dependency/resource failure 必须从 agent tool-use failure 中分离。
+
 ## 问题分层
 
 ### 1. 评测基础设施还不够产品化
@@ -79,6 +88,7 @@
 - 18 题固定 regression subset。
 - score-driven iteration runner。
 - iteration runner wall-time timeout：评测卡住时返回 `124` 并写 report，而不是无限等待。
+- verifier dependency/resource failure classifier：apt cache free-space、package index/signature、`curl` / `uvx` bootstrap 缺失等 verifier 环境问题归为 `environment/verifier-dependency-resource`。
 
 下一步标准：
 
@@ -141,11 +151,13 @@
 - foreground service supervision guard。
 - command-not-found preflight。
 - `return_code=0` 但输出包含 `ERROR` / traceback / no-space-left 等语义失败时，记录 `semantic-failure` 并生成 repair goal。
+- forced implementation transition prompt：当 `implementation-required` / `artifact-required` 触发后，把模型切到“下一条命令必须产生产物”的结构化提示，并记录 `forced-implementation` 轨迹节点。
 
 下一步要做：
 
-- 将 `implementation-required` / `artifact-required` 从“拦截消息”升级为“强制实现状态”：注入当前 workspace inventory、expected artifact、已失败命令、最小自检命令，然后要求模型直接写候选实现。
+- 将 `implementation-required` / `artifact-required` 从“自然语言强制提示”升级为“constrained implementation mode”：注入当前 workspace inventory、expected artifact、已失败命令、最小自检命令，并拒绝后续 probe-only 命令；如果模型仍然 probe，则执行确定性的安全 scaffold 或 task-family recipe。
 - 增加 max-blocks escape hatch：同一任务多次被 artifact gate 拦截后，不再继续把控制权交给自由探索，而是进入 constrained implementation prompt 或自动生成最小 scaffold。
+- 扩展 verifier/resource preflight：`write-compressor` 这次 `/app/data.comp` 已写出且小于 byte limit，但 verifier 因 apt/cache/dependency bootstrap 失败给 `0.0`；这类结果不能算 agent artifact repair 失败。
 - tool planner 在执行前做静态风险/收益检查：路径、命令是否存在、是否会常驻、是否需要 cwd、是否会修改 host。
 - 对 `command not found`、`no such file`、`permission denied` 自动生成替代动作建议。
 - 建立 task workspace inventory：文件、可执行、端口、语言生态、测试入口。
@@ -184,7 +196,7 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 首轮 canary 的具体调整：
 
 1. 不再继续单纯加 blocker。已有 blocker 能证明坏行为，但不能自动产生好实现。
-2. 下一轮优先做 `forced implementation transition`：当 inspection budget 或 artifact gate 触发后，把模型从自由工具调用切到结构化实现 prompt。
+2. 下一轮优先做 `constrained implementation mode`：当 inspection budget 或 artifact gate 触发后，把模型从自由工具调用切到结构化实现模式；如果仍继续 probe，系统应拒绝并执行 scaffold/recipe，而不是只提示。
 3. canary gate 保持 4 题，但 runner 必须带 `--run-timeout-sec`，timeout 也要进入 evidence。
 
 ## 优先级路线

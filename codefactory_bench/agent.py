@@ -204,6 +204,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             "long_command_blocks": 0,
             "implementation_required_blocks": 0,
             "preflight_blocks": 0,
+            "forced_implementation_prompts": 0,
             "background_processes": [],
             "repair_goals": [],
             "missing_commands": {},
@@ -392,6 +393,26 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     }
                 )
                 trajectory.append(tool_result["trajectory"])
+                forced_implementation_prompt = self._forced_implementation_prompt(
+                    tool_result["trajectory"],
+                    loop_state,
+                    artifact_hint,
+                    trajectory,
+                )
+                if forced_implementation_prompt:
+                    loop_state["forced_implementation_prompts"] = (
+                        int(loop_state.get("forced_implementation_prompts") or 0) + 1
+                    )
+                    messages.append(
+                        {"role": "user", "content": forced_implementation_prompt}
+                    )
+                    trajectory.append(
+                        {
+                            "step": step,
+                            "role": "forced-implementation",
+                            "content": forced_implementation_prompt,
+                        }
+                    )
                 repair_hint = self._repair_hint_from_tool_result(
                     tool_result["trajectory"], artifact_hint
                 )
@@ -533,6 +554,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 loop_state.get("implementation_required_blocks") or 0
             ),
             "preflight_blocks": int(loop_state.get("preflight_blocks") or 0),
+            "forced_implementation_prompts": int(
+                loop_state.get("forced_implementation_prompts") or 0
+            ),
             "repair_goal_count": len(loop_state.get("repair_goals") or []),
             "background_process_count": len(loop_state.get("background_processes") or []),
         }
@@ -588,6 +612,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                     "Inspection phase",
                     "No-action recovery:",
                     "Final-before-verify gate:",
+                    "Forced implementation transition:",
                     "Repair goal:",
                     "Repair focus:",
                     "Timeout recovery:",
@@ -624,6 +649,10 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
                 )
             elif role == "system-reminder":
                 lines.append(f"- reminder: {self._single_line(str(item.get('content') or ''))}")
+            elif role == "forced-implementation":
+                lines.append(
+                    f"- forced-implementation: {self._single_line(str(item.get('content') or ''))}"
+                )
             elif role == "model-error":
                 lines.append(f"- model-error: {self._single_line(str(item.get('content') or ''))}")
 
@@ -631,6 +660,76 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^\./##' | sort | head -200
             "\n".join(lines),
             self._int_env("CODEFACTORY_BENCH_CONTEXT_SUMMARY_LIMIT", 12000),
         )
+
+    def _forced_implementation_prompt(
+        self,
+        tool_result: dict[str, Any],
+        loop_state: dict[str, Any],
+        artifact_hint: str | None,
+        trajectory: list[dict[str, Any]],
+    ) -> str | None:
+        if tool_result.get("status") not in {
+            "implementation-required",
+            "artifact-required",
+        }:
+            return None
+
+        block_count = int(loop_state.get("implementation_required_blocks") or 0)
+        prompt_count = int(loop_state.get("forced_implementation_prompts") or 0)
+        threshold = self._int_env("CODEFACTORY_BENCH_FORCED_IMPLEMENTATION_BLOCKS", 1)
+        max_prompts = self._int_env("CODEFACTORY_BENCH_FORCED_IMPLEMENTATION_PROMPTS", 3)
+        if block_count < threshold or prompt_count >= max_prompts:
+            return None
+
+        artifact = f"`{artifact_hint}`" if artifact_hint else "the expected artifact"
+        recent_commands = self._recent_tool_commands(trajectory, limit=5)
+        missing_commands = sorted(
+            str(item)
+            for item in (loop_state.get("missing_commands") or {}).keys()
+            if item
+        )
+        recent_section = (
+            "\nRecent commands/results to avoid repeating:\n"
+            + "\n".join(f"- {command}" for command in recent_commands)
+            if recent_commands
+            else ""
+        )
+        missing_section = (
+            "\nUnavailable executables: "
+            + ", ".join(f"`{command}`" for command in missing_commands[:5])
+            + "."
+            if missing_commands
+            else ""
+        )
+        return (
+            "Forced implementation transition: exploration is now over. Return exactly "
+            "one `run_shell` tool call and no prose. The command must create, write, "
+            f"compile, copy, or run a generator that produces {artifact}. Do not read "
+            "task files again, do not retry suppressed commands, and do not install "
+            "packages unless there is no existing shell/Python/compiler path. Prefer a "
+            "small deterministic candidate plus a quick self-check over more probing."
+            f"{recent_section}"
+            f"{missing_section}"
+        )
+
+    @staticmethod
+    def _recent_tool_commands(
+        trajectory: list[dict[str, Any]], limit: int = 5
+    ) -> list[str]:
+        commands: list[str] = []
+        for item in reversed(trajectory):
+            if item.get("role") != "tool":
+                continue
+            command = CodeFactoryAgent._single_line(
+                CodeFactoryAgent._strip_heredoc_bodies(str(item.get("command") or "")),
+                180,
+            )
+            status = str(item.get("status") or "unknown")
+            if command:
+                commands.append(f"{status}: `{command}`")
+            if len(commands) >= limit:
+                break
+        return list(reversed(commands))
 
     async def _handle_tool_call(
         self,
