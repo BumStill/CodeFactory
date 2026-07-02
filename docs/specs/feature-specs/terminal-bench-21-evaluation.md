@@ -121,6 +121,8 @@ PR 描述必须包含：
 
 Model-backed 模式只能读取显式 `CODEFACTORY_BENCH_*` 配置，不读取 CodeFactory desktop settings、macOS keychain、通用 provider env 或用户凭据。
 
+Model-backed loop 必须把 provider 临时错误和 task 能力失败分开。对 `408`、`409`、`429`、`500`、`502`、`503`、`504` 这类 transient chat-completions HTTP 状态，adapter 默认必须重试后再判定失败；重试次数和延迟由 `CODEFACTORY_BENCH_MODEL_HTTP_RETRIES` / `CODEFACTORY_BENCH_MODEL_HTTP_RETRY_DELAY_SEC` 控制。单次 DeepSeek/OpenAI-compatible `HTTP 500` 不得直接让一个历史通过 task 变成 agent exception。
+
 Model-backed loop 必须把 task container 内的 `environment.exec` 异常记录成 trajectory 中的 `exec-error` tool result，而不是让整个 trial 直接变成 Harbor agent exception。至少记录：
 
 - `status=exec-error`
@@ -131,7 +133,21 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 
 对于自检命令返回非零且 stdout/stderr 包含 pytest failure、traceback 或 assertion 失败时，adapter 必须追加 verifier-repair 提示，要求模型基于失败断言修改实现并重跑最小失败检查后再结束。
 
+对于 shell `return_code=0` 但 stdout/stderr 已经包含明确失败文本的情况，adapter 不得把管道退出码当作成功。常见例子包括 `tee`、`tail`、`head` 等管道隐藏了上游命令失败：`timeout: failed to run command`、shell 报 `No such file or directory` / `not found`、`make: *** Error <code>`、apt/dpkg lock failure、`Failed to fetch`。这类 tool result 必须标记为 `semantic-failure`，写入结构化 repair goal，并提示模型用 `set -o pipefail` 或更小的直接命令重跑后再修复。
+
+对于 ELF memory extraction 这类二进制 artifact 任务，adapter 必须把 task-family guidance 写入模型上下文，并在 verifier-style 自检发现覆盖不足、空 JSON、低 key count 或实现缺失时触发协议修复。修复 scaffold 必须基于 ELF program headers 的 `PT_LOAD` segment，把文件偏移 `p_offset + off` 映射到内存地址 `p_vaddr + off`，并用 unsigned 32-bit 读取函数，例如 `Buffer.readUInt32LE(...)`；不得使用 JS bitwise operator 读值，因为它会把高位为 1 的 32-bit 值强制成 signed negative。自检必须验证 JSON keys 是整数地址、values 是 `0..0xffffffff` 范围内的整数，并至少覆盖一个真实编译产物。
+
+对于 PyTorch tensor-parallel linear 这类分布式 autograd 任务，adapter 必须把 `ColumnParallelLinear` / `RowParallelLinear` 的实现契约写入模型上下文，并在 `/app/parallel_linear.py` 缺失、实现缺失、裸 `dist.all_gather` 导致 `does not require grad` / `grad_fn` 失败，或 verifier-style 自检出现 `test_column_parallel_linear` / `parallel_loss.backward` 失败时触发协议修复。修复 scaffold 必须使用 `torch.autograd.Function` 包装 all-gather，使 backward 返回 rank-local gradient chunk；`ColumnParallelLinear` 必须按 `master_weight` dim 0 切分、局部 bias 为零、局部 `F.linear` 后 autograd-safe gather；`RowParallelLinear` 必须按 dim 1 切分、局部输出不加 bias、reduce partial outputs 后再加完整零 bias。不得把 bare `dist.all_gather` 输出直接 `torch.cat` 当作可反传结果。
+
+任何 score-facing canary 通过后，都不得直接声明本轮产品能力已经改进完成。系统必须执行固定 18 题 regression subset 或生成明确 blocker evidence，并比较上一轮 fixed subset 的 pass count、mean reward、历史通过项和 failure class 变化。如果 aggregate 没有提升、历史通过项回落，或 canary pass 在 aggregate 中被 verifier/runtime 问题掩盖，本轮只能标记为 `targeted canary pass, aggregate not held`，下一轮 P0 必须先处理 score-holding regression 或 runtime classification。
+
+评测基础设施必须区分 verifier/runtime failure 和 artifact assertion failure。若 verifier 在真正比较目标产物前失败，例如 `gcc internal compiler error`、Chrome driver unavailable、QEMU/proc/netlink limitation、verifier watchdog stop 后缺失 `reward.txt` / `reward.json`，evidence pack 必须记录 `artifact_state`、`runtime_failure_evidence` 和 `score_interpretation`。这不改变 Terminal-Bench reward，但它决定下一轮是修 CodeFactory agent 能力、修 runner/preflight，还是重跑确认本机 runtime 偶发性。
+
 对于明显的前台服务启动命令，例如 `python -m http.server`、`uvicorn`、`flask run`、`npm start`、`redis-server` 等，adapter 必须要求后台启动、日志重定向、pid 记录和 bounded readiness check；不得直接执行会常驻到 tool timeout 的前台服务命令。已显式后台化、`nohup`、`setsid`、`timeout` 或 daemon 模式的命令不在该拦截范围内。
+
+Benchmark sandbox 默认不得允许外网工具调用，但必须允许容器内 loopback 自检，例如 `curl http://localhost:<port>`、`curl http://127.0.0.1:<port>`、`nc -z localhost <port>`。该豁免只能用于 loopback / unspecified host，外部 host 仍必须拒绝为 `network/exfiltration tool disabled`。
+
+当 runner 或 adapter 为 Docker task container 注入 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 或小写等价变量时，必须同时注入 `NO_PROXY` / `no_proxy`，至少覆盖 `localhost,127.0.0.1,127.0.0.0/8,::1,0.0.0.0`，保证容器内服务自检不会通过宿主机代理返回假阳性或 `502`。
 
 ### Provider Bridge
 
@@ -164,6 +180,8 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 固定 subset 的标准执行入口是 `tools/benchmark/run_terminal_bench_21_regression_subset.py`。该脚本从 subset JSON 读取任务列表，生成 provider bridge 环境变量，调用真实 Harbor provider-backed ignored test，并在成功或阻塞时写入 `docs/evidence-packs/terminal-bench-21-regression-subset-*.md`。脚本不得打印 raw provider key；无显式 `CODEFACTORY_BENCH_API_KEY` 且 OS credential store 不可用时，必须生成 credential blocker evidence。
 
 固定 subset 的离线基线入口是 `tools/benchmark/summarize_terminal_bench_21_subset_baseline.py`。该脚本只读取已完成 full Harbor job 和 subset JSON，不调用 provider、不读取 secret，用于在 credential 或 provider 暂不可用时仍能生成同口径的 subset baseline evidence。该报告必须明确标注 `offline subset projection`，不能冒充新的 provider-backed rerun。
+
+截至 2026-07-02，最新固定 18 题 current-worktree diagnostic aggregate 为 run `c3e8a961-f2f4-4357-8dab-835b9a579b4b`，evidence `docs/evidence-packs/terminal-bench-21-regression-subset-2026-07-02T15-48-42Z.md`，`14 / 18`，mean reward `0.778`。这轮保持前一轮 `13 / 18` 的所有通过项不回退，并新增 `configure-git-webserver` 通过。边界：runner watchdog 仍停止 `query-optimize`，本地 QEMU/emulation 与 Chrome driver warnings 仍存在，因此这是产品诊断聚合分数，不是 clean official-comparable release gate。
 
 ### Iteration Loop
 
@@ -213,6 +231,9 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 | Adapter | Protocol auto-repair | candidate artifact 自检出现 decompressor crash、size limit 或协议失败时，adapter 能记录自动修复轨迹并产出可验证 artifact；修复不得依赖 task container 中不存在的 Python runtime | Python loop test + real provider smoke reward |
 | Adapter | Exec timeout recovery | `environment.exec` 抛出 command timeout 时，adapter 写入 `exec-error/command-timeout`、更新 metadata，并继续给模型修复机会，不直接 Harbor exception | Python loop test |
 | Adapter | Failed self-check repair | pytest/assertion/traceback 类自检失败会生成具体 repair reminder 和结构化 `repair-goal`，要求修改实现并重跑最小失败检查 | Python loop test |
+| Adapter | Pipeline-masked semantic failure | `return_code=0` 但 stdout/stderr 包含 missing executable、`make` error 或 apt/dpkg/fetch failure 时，tool result 标记为 `semantic-failure` 而不是 `ok` | Python loop test + `caffe-cifar-10` canary trajectory |
+| Adapter | Binary artifact task-family repair | ELF memory extraction 任务会提示 `PT_LOAD`、`p_offset` 到 `p_vaddr` 映射和 unsigned 32-bit 读取；覆盖不足或 signed 负值会触发 `/app/extract.js` repair scaffold | Python loop test + `extract-elf` canary trajectory |
+| Adapter | Distributed autograd task-family repair | PyTorch tensor-parallel linear 任务会提示 gradient-preserving all-gather、rank-local backward slice、row-parallel all-reduce 后加 full bias；裸 `dist.all_gather` gradient failure 会触发 `/app/parallel_linear.py` repair scaffold | Python loop test + `torch-tensor-parallelism` canary and 18-task regression trajectory |
 | Adapter | Final-before-verify gate | 候选 artifact 已生成但未运行 bounded verification 时，final answer 会被拦住，要求先执行最小验证或修复 | Python loop test |
 | Adapter | Foreground service supervision | 前台服务启动命令被 suppress，并提示后台启动、日志、pid 和 readiness check，不消耗完整 tool timeout | Python loop test |
 | Adapter | Background service lifecycle | 已后台化的服务命令记录 log、pid、readiness check 是否存在，并写入 trajectory/metadata | Python loop test |
@@ -224,11 +245,13 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 | Attribution | Evaluation axis contract | run/PR/evidence 区分 CodeFactory agent 能力、模型后端影响、agent scaffold 对比和评测基础设施 smoke | spec review + fixture test |
 | Regression | Fixed subset runner | 从固定 subset JSON 生成 18 题 provider-backed run；credential 不可用时生成 blocker evidence，不伪造 agent score | runner dry-run + blocker evidence |
 | Regression | Iteration loop runner | 声明 hypothesis/target failure class 后生成 baseline/head/delta/next queue report；可 dry-run 或执行 canary/regression | Python iteration loop test + evidence report |
+| Regression | Score-holding aggregate gate | 单题 canary pass 后必须跑固定 18 题或生成 blocker；aggregate 回落时标记 `targeted canary pass, aggregate not held`，不得声明总体能力提升 | fixed subset evidence comparison |
 | Policy | benchmark-sandbox policy in task container | workspace command/file edit 自动允许，host path/secret deny | policy unit test |
 | Policy | network/secret deny | fake model 请求 `curl` 或 credential path 时不调用 environment.exec | Python policy test |
 | Failure | 缺失 `result.json` | 标记 `partial_import`，列出缺失文件 | importer test |
 | Failure | Harbor 不存在 | UI 显示 blocker，不影响其他页面 | environment probe test |
 | Failure | timeout/resource 被修改 | comparable=false，官方可比状态标红 | config validation test |
+| Failure | verifier/runtime instability | verifier 自身在比较产物前崩溃、缺 driver、QEMU/proc/netlink 受限或 watchdog 后缺 reward 时，evidence 区分 runtime failure 与 artifact assertion failure | evidence classifier fixture |
 | Observation | classifier 输出 failure class | 每个失败 trial 有 evidence refs 和 assumptions | classifier fixture |
 | Payload | trajectory/artifact 导出 | 不写入长期 memory，不自动复制任务全文 | memory guard test |
 

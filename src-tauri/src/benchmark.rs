@@ -428,8 +428,15 @@ pub async fn start_provider_benchmark_run(
     let output = tokio::task::spawn_blocking(move || execute_provider_launch(launch))
         .await
         .map_err(|err| AppError::Other(format!("Benchmark Harbor worker failed: {err}")))??;
-    let imported = if output.exit_code == Some(0) && Path::new(&job_path).is_dir() {
-        Some(import_harbor_job(pool, Path::new(&job_path)).await?)
+    let imported = if Path::new(&job_path).is_dir() {
+        match import_harbor_job(pool, Path::new(&job_path)).await {
+            Ok(imported) => Some(imported),
+            Err(err) if output.exit_code != Some(0) => {
+                eprintln!("provider_bridge_partial_import_failed: {err}");
+                None
+            }
+            Err(err) => return Err(err),
+        }
     } else {
         None
     };
@@ -962,8 +969,48 @@ fn harbor_run_args(
         args.push("--override-storage-mb".to_string());
         args.push(storage_mb.to_string());
     }
+    let verifier_uv_http_timeout =
+        std::env::var("CODEFACTORY_BENCH_VERIFIER_UV_HTTP_TIMEOUT_SEC").ok();
+    let verifier_uv_torch_backend =
+        std::env::var("CODEFACTORY_BENCH_VERIFIER_UV_TORCH_BACKEND").ok();
+    let verifier_timeout_multiplier =
+        std::env::var("CODEFACTORY_BENCH_VERIFIER_TIMEOUT_MULTIPLIER").ok();
+    append_verifier_timeout_multiplier_arg(&mut args, verifier_timeout_multiplier.as_deref());
+    append_verifier_runtime_env_args(
+        &mut args,
+        verifier_uv_http_timeout.as_deref(),
+        verifier_uv_torch_backend.as_deref(),
+    );
     args.push("-y".to_string());
     args
+}
+
+fn append_verifier_timeout_multiplier_arg(args: &mut Vec<String>, multiplier: Option<&str>) {
+    if let Some(value) = multiplier.map(str::trim) {
+        if !value.is_empty() && value != "0" && value != "1" && value != "1.0" {
+            args.push("--verifier-timeout-multiplier".to_string());
+            args.push(value.to_string());
+        }
+    }
+}
+
+fn append_verifier_runtime_env_args(
+    args: &mut Vec<String>,
+    uv_http_timeout_sec: Option<&str>,
+    uv_torch_backend: Option<&str>,
+) {
+    if let Some(value) = uv_http_timeout_sec.map(str::trim) {
+        if !value.is_empty() && value != "0" {
+            args.push("--verifier-env".to_string());
+            args.push(format!("UV_HTTP_TIMEOUT={value}"));
+        }
+    }
+    if let Some(value) = uv_torch_backend.map(str::trim) {
+        if !value.is_empty() && value != "auto" {
+            args.push("--verifier-env".to_string());
+            args.push(format!("UV_TORCH_BACKEND={value}"));
+        }
+    }
 }
 
 fn normalize_task_names(task_names: Option<&[String]>) -> Vec<String> {
@@ -1188,11 +1235,7 @@ pub async fn import_harbor_job(pool: &SqlitePool, job_path: &Path) -> Result<Imp
         .unwrap_or_else(|| "unknown".to_string());
     let policy_preset = json_string(&config, &["metadata", "policy_preset"])
         .unwrap_or_else(|| "benchmark-sandbox".to_string());
-    let status = if missing_files.is_empty() {
-        json_string(&result, &["status"]).unwrap_or_else(|| "imported".to_string())
-    } else {
-        "partial_import".to_string()
-    };
+    let status = harbor_run_status(&result, &missing_files);
     let comparable = dataset == profile.dataset && !has_official_constraint_override(&config);
     let comparable_reason = if comparable {
         None
@@ -1420,6 +1463,10 @@ fn classify_failure_detail(reward: f64, evidence: &str) -> FailureDetail {
         ("environment", "harbor-tests-upload-failed")
     } else if text.contains("range of cpus is from") || text.contains("as there are only") {
         ("environment", "docker-cpu-limit")
+    } else if text.contains("rewardfilenotfounderror")
+        || text.contains("no reward file found")
+    {
+        ("environment", "verifier-reward-missing")
     } else if text.contains("no space left on device")
         || text.contains("not enough free space in /var/cache/apt/archives")
         || text.contains("failed to fetch http://archive.ubuntu.com")
@@ -1525,6 +1572,22 @@ fn json_i64(value: &Value, path: &[&str]) -> Option<i64> {
         };
     }
     current.as_i64()
+}
+
+fn harbor_run_status(result: &Value, missing_files: &[String]) -> String {
+    if !missing_files.is_empty() {
+        return "partial_import".to_string();
+    }
+    if let Some(status) = json_string(result, &["status"]) {
+        return status;
+    }
+    let unfinished_count = json_i64(result, &["stats", "n_pending_trials"]).unwrap_or(0)
+        + json_i64(result, &["stats", "n_running_trials"]).unwrap_or(0)
+        + json_i64(result, &["stats", "n_cancelled_trials"]).unwrap_or(0);
+    if unfinished_count > 0 {
+        return "partial_import".to_string();
+    }
+    "imported".to_string()
 }
 
 fn duration_ms_from_result(value: &Value) -> Option<i64> {
@@ -2142,6 +2205,19 @@ E: You don't have enough free space in /var/cache/apt/archives/.
             verifier_network_timeout.failure_reason.as_deref(),
             Some("verifier-dependency-resource")
         );
+
+        let missing_reward = classify_failure_detail(
+            0.0,
+            "harbor.verifier.verifier.RewardFileNotFoundError: No reward file found at verifier/reward.txt",
+        );
+        assert_eq!(
+            missing_reward.failure_class.as_deref(),
+            Some("environment")
+        );
+        assert_eq!(
+            missing_reward.failure_reason.as_deref(),
+            Some("verifier-reward-missing")
+        );
     }
 
     #[test]
@@ -2244,6 +2320,31 @@ E: You don't have enough free space in /var/cache/apt/archives/.
                 "terminal-bench/extract-elf".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn provider_bridge_adds_verifier_uv_timeout_env_arg() {
+        let mut args = vec!["run".to_string()];
+        append_verifier_timeout_multiplier_arg(&mut args, Some("3"));
+        append_verifier_runtime_env_args(&mut args, Some("120"), Some("cpu"));
+
+        assert_eq!(
+            args,
+            vec![
+                "run".to_string(),
+                "--verifier-timeout-multiplier".to_string(),
+                "3".to_string(),
+                "--verifier-env".to_string(),
+                "UV_HTTP_TIMEOUT=120".to_string(),
+                "--verifier-env".to_string(),
+                "UV_TORCH_BACKEND=cpu".to_string(),
+            ]
+        );
+
+        let mut disabled_args = vec!["run".to_string()];
+        append_verifier_timeout_multiplier_arg(&mut disabled_args, Some("1.0"));
+        append_verifier_runtime_env_args(&mut disabled_args, Some("0"), Some("auto"));
+        assert_eq!(disabled_args, vec!["run".to_string()]);
     }
 
     #[test]
@@ -2361,6 +2462,141 @@ E: You don't have enough free space in /var/cache/apt/archives/.
     }
 
     #[test]
+    fn harbor_run_status_classifies_unfinished_missing_status_as_partial_import() {
+        let unfinished = json!({
+            "stats": {
+                "n_completed_trials": 2,
+                "n_errored_trials": 1,
+                "n_pending_trials": 16,
+                "n_running_trials": 0,
+                "n_cancelled_trials": 1
+            }
+        });
+        assert_eq!(harbor_run_status(&unfinished, &[]), "partial_import");
+
+        let explicit_completed = json!({
+            "status": "completed",
+            "stats": {
+                "n_pending_trials": 16
+            }
+        });
+        assert_eq!(harbor_run_status(&explicit_completed, &[]), "completed");
+
+        assert_eq!(
+            harbor_run_status(&json!({ "status": "completed" }), &["result.json".to_string()]),
+            "partial_import"
+        );
+        assert_eq!(
+            harbor_run_status(&json!({ "stats": { "n_completed_trials": 2 } }), &[]),
+            "imported"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_harbor_job_persists_partial_unfinished_run() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        ensure_schema(&pool).await.expect("benchmark schema");
+
+        let job_dir = temp_job_dir();
+        fs::write(
+            job_dir.join("config.json"),
+            json!({
+                "job_name": "cf-tb21-codefactory-provider-deepseek",
+                "n_concurrent_trials": 2,
+                "agents": [
+                    {
+                        "name": "codefactory-headless",
+                        "model_name": "deepseek-v4-pro"
+                    }
+                ],
+                "datasets": [
+                    {
+                        "name": "terminal-bench/terminal-bench-2-1",
+                        "ref": "sha256:dataset-ref",
+                        "n_tasks": 18
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write job config");
+        fs::write(
+            job_dir.join("result.json"),
+            json!({
+                "id": "partial-run-id",
+                "started_at": "2026-06-30T01:00:00Z",
+                "finished_at": "2026-06-30T01:09:00Z",
+                "stats": {
+                    "n_completed_trials": 2,
+                    "n_errored_trials": 1,
+                    "n_running_trials": 0,
+                    "n_pending_trials": 16,
+                    "n_cancelled_trials": 1
+                }
+            })
+            .to_string(),
+        )
+        .expect("write result");
+
+        let trial_dir = job_dir.join("write-compressor__abc123");
+        fs::create_dir_all(trial_dir.join("verifier")).expect("create trial");
+        fs::write(
+            trial_dir.join("config.json"),
+            json!({
+                "task": {
+                    "name": "terminal-bench/write-compressor",
+                    "source": "terminal-bench/terminal-bench-2-1"
+                },
+                "trial_name": "write-compressor__abc123",
+                "agent": { "name": "codefactory-headless" }
+            })
+            .to_string(),
+        )
+        .expect("write trial config");
+        fs::write(
+            trial_dir.join("result.json"),
+            json!({
+                "id": "trial-id",
+                "task_name": "terminal-bench/write-compressor",
+                "trial_name": "write-compressor__abc123",
+                "source": "terminal-bench/terminal-bench-2-1",
+                "verifier_result": {
+                    "rewards": { "reward": 1.0 }
+                },
+                "agent_info": {
+                    "name": "codefactory-headless",
+                    "model_info": { "name": "deepseek-v4-pro" }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write trial result");
+
+        let imported = import_harbor_job(&pool, &job_dir)
+            .await
+            .expect("import partial Harbor job");
+
+        assert_eq!(imported.run.id, "partial-run-id");
+        assert_eq!(imported.run.status, "partial_import");
+        assert!(imported.run.comparable);
+        assert_eq!(imported.trials.len(), 1);
+        assert_eq!(imported.trials[0].task_name, "terminal-bench/write-compressor");
+        assert_eq!(imported.trials[0].reward, 1.0);
+
+        let persisted_status: String =
+            sqlx::query_scalar("SELECT status FROM benchmark_runs WHERE id = ?")
+                .bind("partial-run-id")
+                .fetch_one(&pool)
+                .await
+                .expect("read persisted partial status");
+        assert_eq!(persisted_status, "partial_import");
+    }
+
+    #[test]
     fn provider_bridge_authorized_launch_injects_secret_only_into_child_env() {
         let settings = settings_with_deepseek_endpoint();
         let bridge = BenchmarkProviderBridgeRequest {
@@ -2408,6 +2644,27 @@ E: You don't have enough free space in /var/cache/apt/archives/.
             .env_preview
             .iter()
             .any(|item| item.value.contains("test-secret")));
+    }
+
+    fn print_provider_bridge_imported(imported: &ImportedBenchmarkRun) {
+        let total_reward: f64 = imported.trials.iter().map(|trial| trial.reward).sum();
+        let mean_reward = total_reward / imported.trials.len().max(1) as f64;
+        println!(
+            "provider_bridge_imported run={} dataset={} agent={} model={:?} comparable={} trials={} mean_reward={:.3}",
+            imported.run.id,
+            imported.run.dataset,
+            imported.run.agent_name,
+            imported.run.model,
+            imported.run.comparable,
+            imported.trials.len(),
+            mean_reward
+        );
+        for trial in &imported.trials {
+            println!(
+                "provider_bridge_trial task={} reward={} failure_class={:?}",
+                trial.task_name, trial.reward, trial.failure_class
+            );
+        }
     }
 
     fn settings_with_deepseek_endpoint() -> crate::config::settings::Settings {
@@ -2545,27 +2802,29 @@ E: You don't have enough free space in /var/cache/apt/archives/.
                 redacted_log_tail(&result.stderr)
             );
         }
+        if result.status != "completed"
+            && std::env::var("CODEFACTORY_BENCH_ALLOW_PARTIAL_IMPORT").as_deref() == Ok("1")
+        {
+            if let Some(imported) = result.imported {
+                print_provider_bridge_imported(&imported);
+                assert_eq!(imported.run.dataset, TERMINAL_BENCH_21_DATASET);
+                assert_eq!(imported.run.agent_name, "codefactory-headless");
+                assert!(
+                    !imported.trials.is_empty(),
+                    "partial provider-backed Harbor job must include completed trial rows"
+                );
+            } else {
+                println!(
+                    "provider_bridge_no_partial_import job_path={}",
+                    result.preview.job_path
+                );
+            }
+            return;
+        }
         assert_eq!(result.status, "completed", "Harbor provider run failed");
 
         let imported = result.imported.expect("completed run should be imported");
-        let total_reward: f64 = imported.trials.iter().map(|trial| trial.reward).sum();
-        let mean_reward = total_reward / imported.trials.len().max(1) as f64;
-        println!(
-            "provider_bridge_imported run={} dataset={} agent={} model={:?} comparable={} trials={} mean_reward={:.3}",
-            imported.run.id,
-            imported.run.dataset,
-            imported.run.agent_name,
-            imported.run.model,
-            imported.run.comparable,
-            imported.trials.len(),
-            mean_reward
-        );
-        for trial in &imported.trials {
-            println!(
-                "provider_bridge_trial task={} reward={} failure_class={:?}",
-                trial.task_name, trial.reward, trial.failure_class
-            );
-        }
+        print_provider_bridge_imported(&imported);
 
         assert_eq!(imported.run.dataset, TERMINAL_BENCH_21_DATASET);
         assert_eq!(imported.run.agent_name, "codefactory-headless");
