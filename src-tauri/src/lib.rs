@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 mod agent;
+mod benchmark;
 mod codex_auth;
 mod commands;
 mod config;
@@ -57,9 +58,13 @@ fn backup_db_daily(data_dir: &std::path::Path, db_path: &std::path::Path) -> std
     if let Ok(entries) = std::fs::read_dir(data_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(date_str) = name.strip_prefix("codefactory.db.backup-") else { continue };
+            let Some(date_str) = name.strip_prefix("codefactory.db.backup-") else {
+                continue;
+            };
             // Parse YYYYMMDD; ignore malformed.
-            let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y%m%d") else { continue };
+            let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y%m%d") else {
+                continue;
+            };
             let backup_local = date.and_hms_opt(0, 0, 0).unwrap();
             if backup_local < cutoff.naive_local() {
                 let _ = std::fs::remove_file(entry.path());
@@ -157,6 +162,11 @@ pub fn run() {
             commands::backup::export_user_data,
             commands::backup::import_user_data,
             commands::backup::get_data_dir,
+            commands::benchmark::list_benchmark_profiles,
+            commands::benchmark::probe_benchmark_environment,
+            commands::benchmark::preview_benchmark_provider_bridge,
+            commands::benchmark::start_benchmark_provider_run,
+            commands::benchmark::import_benchmark_results,
             commands::checkpoints::create_checkpoint,
             commands::checkpoints::list_checkpoints,
             commands::checkpoints::checkpoint_changeset,

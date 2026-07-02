@@ -36,3 +36,11 @@
 ## C7 治理与证据
 - 每个非平凡特性必须有规格、Req ID、主路径、测试矩阵和证据包。
 - release-facing 任务必须有 live verification 或明确 blocker。
+
+## C8 Terminal-Bench 能力评估
+- 使用 Terminal-Bench 2.1 作为 terminal agent 能力外部标尺。
+- 遵循 `docs/principles/systematic-agent-evaluation.md`：评估主体默认是 CodeFactory agent，模型只是 backend/component attribution。
+- 通过 Harbor 运行或导入 benchmark job，保存 run、trial、reward、trajectory、verifier output 和 artifact evidence。
+- 生成按任务类别、难度、工具路径、失败类型、耗时和成本的能力画像。
+- 支持同一 subset 的 baseline/head 回归对比。
+- Benchmark sandbox policy 只在隔离任务容器内生效，不得污染普通项目权限、长期 memory、默认 prompt 或技能示例。

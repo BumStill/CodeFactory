@@ -118,6 +118,165 @@ export function codexAccount(): Promise<CodexAccount | null> {
   return invoke<CodexAccount | null>("codex_account");
 }
 
+// ── Benchmarks ─────────────────────────────────────────────────────────────
+
+export interface BenchmarkProfile {
+  id: string;
+  dataset: string;
+  harness: string;
+  official_url: string;
+  leaderboard_url: string;
+  comparable_constraints: string[];
+  default_smoke_task_limit: number;
+}
+
+export type BenchmarkProbeStatus = "ok" | "missing" | "warning";
+
+export interface BenchmarkProbeItem {
+  id: string;
+  label: string;
+  status: BenchmarkProbeStatus;
+  detail: string;
+}
+
+export interface BenchmarkEnvironmentProbe {
+  generated_at: string;
+  profile: BenchmarkProfile;
+  ready: boolean;
+  blockers: string[];
+  items: BenchmarkProbeItem[];
+  command_preview: string;
+}
+
+export interface BenchmarkEnvVarPreview {
+  name: string;
+  value: string;
+  secret: boolean;
+}
+
+export interface BenchmarkProviderBridgeRequest {
+  profile_id: string;
+  endpoint_name?: string | null;
+  model?: string | null;
+  task_limit?: number | null;
+  task_names?: string[] | null;
+  concurrency?: number | null;
+  /** Deprecated compatibility alias; Harbor `-n` means concurrency. */
+  trial_count?: number | null;
+  override_storage_mb?: number | null;
+  job_root?: string | null;
+  job_name?: string | null;
+  adapter_root?: string | null;
+}
+
+export interface BenchmarkProviderBridgePreview {
+  generated_at: string;
+  profile: BenchmarkProfile;
+  endpoint_name: string;
+  base_url: string;
+  api_style: string;
+  model: string;
+  key_ref: string;
+  agent_import_path: string;
+  task_limit: number;
+  task_names: string[];
+  concurrency: number;
+  trial_count: number;
+  override_storage_mb?: number | null;
+  job_root: string;
+  job_name: string;
+  job_path: string;
+  adapter_root: string;
+  env_preview: BenchmarkEnvVarPreview[];
+  command_preview: string;
+  authorization_phrase: string;
+  ready: boolean;
+  blockers: string[];
+}
+
+export interface BenchmarkRunRecord {
+  id: string;
+  benchmark_id: string;
+  dataset: string;
+  dataset_version?: string | null;
+  agent_name: string;
+  agent_version?: string | null;
+  model?: string | null;
+  codefactory_version?: string | null;
+  codefactory_git_sha?: string | null;
+  policy_preset: string;
+  harbor_version?: string | null;
+  command: string;
+  job_path: string;
+  status: string;
+  started_at: string;
+  finished_at?: string | null;
+  comparable: boolean;
+  comparable_reason?: string | null;
+  missing_files: string[];
+}
+
+export interface BenchmarkTrialRecord {
+  id: string;
+  run_id: string;
+  task_name: string;
+  category?: string | null;
+  difficulty?: string | null;
+  reward: number;
+  duration_ms?: number | null;
+  error_kind?: string | null;
+  failure_class?: string | null;
+  failure_reason?: string | null;
+  trajectory_path?: string | null;
+  verifier_stdout_path?: string | null;
+  verifier_stderr_path?: string | null;
+}
+
+export interface ImportedBenchmarkRun {
+  run: BenchmarkRunRecord;
+  trials: BenchmarkTrialRecord[];
+}
+
+export interface BenchmarkProviderRunResult {
+  preview: BenchmarkProviderBridgePreview;
+  status: string;
+  failure_kind?: string | null;
+  blocker?: string | null;
+  exit_code?: number | null;
+  stdout: string;
+  stderr: string;
+  imported?: ImportedBenchmarkRun | null;
+}
+
+export function listBenchmarkProfiles(): Promise<BenchmarkProfile[]> {
+  return invoke<BenchmarkProfile[]>("list_benchmark_profiles");
+}
+
+export function probeBenchmarkEnvironment(profileId: string): Promise<BenchmarkEnvironmentProbe> {
+  return invoke<BenchmarkEnvironmentProbe>("probe_benchmark_environment", { profileId });
+}
+
+export function previewBenchmarkProviderBridge(
+  request: BenchmarkProviderBridgeRequest,
+): Promise<BenchmarkProviderBridgePreview> {
+  return invoke<BenchmarkProviderBridgePreview>("preview_benchmark_provider_bridge", { request });
+}
+
+export function startBenchmarkProviderRun(
+  bridge: BenchmarkProviderBridgeRequest,
+  authorizationPhrase: string,
+): Promise<BenchmarkProviderRunResult> {
+  return invoke<BenchmarkProviderRunResult>("start_benchmark_provider_run", {
+    request: { bridge, authorization_phrase: authorizationPhrase },
+  });
+}
+
+export function importBenchmarkResults(jobPath: string): Promise<ImportedBenchmarkRun> {
+  return invoke<ImportedBenchmarkRun>("import_benchmark_results", {
+    request: { job_path: jobPath },
+  });
+}
+
 // ── Quick Task sessions (multi-session) ─────────────────────────────────────
 
 /** Resume the most-recent Quick Task session, creating the first one on

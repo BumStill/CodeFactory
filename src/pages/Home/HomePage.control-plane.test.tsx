@@ -59,6 +59,7 @@ describe("HomePage AI Coding OS entry", () => {
         onOpenProject={() => {}}
         onOpenSkills={() => {}}
         onOpenControlPlane={onOpenControlPlane}
+        onOpenBenchmarks={() => {}}
         onOpenSettings={() => {}}
         onOpenProfile={() => {}}
       />,
@@ -67,5 +68,24 @@ describe("HomePage AI Coding OS entry", () => {
     await userEvent.click(screen.getByRole("button", { name: "AI Coding OS" }));
 
     expect(onOpenControlPlane).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the benchmark page from the primary entries", async () => {
+    const onOpenBenchmarks = vi.fn();
+
+    render(
+      <HomePage
+        onOpenProject={() => {}}
+        onOpenSkills={() => {}}
+        onOpenControlPlane={() => {}}
+        onOpenBenchmarks={onOpenBenchmarks}
+        onOpenSettings={() => {}}
+        onOpenProfile={() => {}}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /能力评测/ }));
+
+    expect(onOpenBenchmarks).toHaveBeenCalledTimes(1);
   });
 });

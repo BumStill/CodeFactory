@@ -221,6 +221,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     .await?;
 
     crate::knowledge::ensure_schema(pool).await?;
+    crate::benchmark::ensure_schema(pool).await?;
 
     Ok(())
 }
@@ -365,6 +366,8 @@ mod tests {
             "knowledge_documents",
             "knowledge_chunks",
             "retrieval_events",
+            "benchmark_runs",
+            "benchmark_trials",
         ] {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
