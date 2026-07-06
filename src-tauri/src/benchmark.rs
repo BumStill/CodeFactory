@@ -18,6 +18,7 @@ use crate::util::no_window::NoWindow;
 const TERMINAL_BENCH_21_PROFILE_ID: &str = "terminal-bench-2.1";
 const TERMINAL_BENCH_21_DATASET: &str = "terminal-bench/terminal-bench-2-1";
 const CODEFACTORY_HARBOR_AGENT: &str = "codefactory_bench.agent:CodeFactoryAgent";
+const BENCH_LOOPBACK_NO_PROXY: &str = "localhost,127.0.0.1,127.0.0.0/8,::1,0.0.0.0";
 const CODEFACTORY_KEYRING_SERVICE: &str = "com.codefactory.app";
 const DEFAULT_PROVIDER_SECRET_LOOKUP_TIMEOUT_SECS: u64 = 20;
 
@@ -973,6 +974,7 @@ fn harbor_run_args(
         std::env::var("CODEFACTORY_BENCH_VERIFIER_UV_HTTP_TIMEOUT_SEC").ok();
     let verifier_uv_torch_backend =
         std::env::var("CODEFACTORY_BENCH_VERIFIER_UV_TORCH_BACKEND").ok();
+    let verifier_proxy = std::env::var("CODEFACTORY_BENCH_VERIFIER_PROXY").ok();
     let verifier_timeout_multiplier =
         std::env::var("CODEFACTORY_BENCH_VERIFIER_TIMEOUT_MULTIPLIER").ok();
     append_verifier_timeout_multiplier_arg(&mut args, verifier_timeout_multiplier.as_deref());
@@ -980,6 +982,7 @@ fn harbor_run_args(
         &mut args,
         verifier_uv_http_timeout.as_deref(),
         verifier_uv_torch_backend.as_deref(),
+        verifier_proxy.as_deref(),
     );
     args.push("-y".to_string());
     args
@@ -998,6 +1001,7 @@ fn append_verifier_runtime_env_args(
     args: &mut Vec<String>,
     uv_http_timeout_sec: Option<&str>,
     uv_torch_backend: Option<&str>,
+    verifier_proxy: Option<&str>,
 ) {
     if let Some(value) = uv_http_timeout_sec.map(str::trim) {
         if !value.is_empty() && value != "0" {
@@ -1009,6 +1013,25 @@ fn append_verifier_runtime_env_args(
         if !value.is_empty() && value != "auto" {
             args.push("--verifier-env".to_string());
             args.push(format!("UV_TORCH_BACKEND={value}"));
+        }
+    }
+    if let Some(value) = verifier_proxy.map(str::trim) {
+        if !value.is_empty() {
+            for key in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                args.push("--verifier-env".to_string());
+                args.push(format!("{key}={value}"));
+            }
+            args.push("--verifier-env".to_string());
+            args.push(format!("NO_PROXY={BENCH_LOOPBACK_NO_PROXY}"));
+            args.push("--verifier-env".to_string());
+            args.push(format!("no_proxy={BENCH_LOOPBACK_NO_PROXY}"));
         }
     }
 }
@@ -2326,7 +2349,12 @@ E: You don't have enough free space in /var/cache/apt/archives/.
     fn provider_bridge_adds_verifier_uv_timeout_env_arg() {
         let mut args = vec!["run".to_string()];
         append_verifier_timeout_multiplier_arg(&mut args, Some("3"));
-        append_verifier_runtime_env_args(&mut args, Some("120"), Some("cpu"));
+        append_verifier_runtime_env_args(
+            &mut args,
+            Some("120"),
+            Some("cpu"),
+            Some("http://host.docker.internal:7897"),
+        );
 
         assert_eq!(
             args,
@@ -2338,12 +2366,28 @@ E: You don't have enough free space in /var/cache/apt/archives/.
                 "UV_HTTP_TIMEOUT=120".to_string(),
                 "--verifier-env".to_string(),
                 "UV_TORCH_BACKEND=cpu".to_string(),
+                "--verifier-env".to_string(),
+                "HTTP_PROXY=http://host.docker.internal:7897".to_string(),
+                "--verifier-env".to_string(),
+                "HTTPS_PROXY=http://host.docker.internal:7897".to_string(),
+                "--verifier-env".to_string(),
+                "ALL_PROXY=http://host.docker.internal:7897".to_string(),
+                "--verifier-env".to_string(),
+                "http_proxy=http://host.docker.internal:7897".to_string(),
+                "--verifier-env".to_string(),
+                "https_proxy=http://host.docker.internal:7897".to_string(),
+                "--verifier-env".to_string(),
+                "all_proxy=http://host.docker.internal:7897".to_string(),
+                "--verifier-env".to_string(),
+                format!("NO_PROXY={BENCH_LOOPBACK_NO_PROXY}"),
+                "--verifier-env".to_string(),
+                format!("no_proxy={BENCH_LOOPBACK_NO_PROXY}"),
             ]
         );
 
         let mut disabled_args = vec!["run".to_string()];
         append_verifier_timeout_multiplier_arg(&mut disabled_args, Some("1.0"));
-        append_verifier_runtime_env_args(&mut disabled_args, Some("0"), Some("auto"));
+        append_verifier_runtime_env_args(&mut disabled_args, Some("0"), Some("auto"), Some(""));
         assert_eq!(disabled_args, vec!["run".to_string()]);
     }
 

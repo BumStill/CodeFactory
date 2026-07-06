@@ -30,6 +30,7 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
             "secret_timeout_sec": 20,
             "model": None,
             "docker_apt_proxy": None,
+            "verifier_proxy": None,
             "provider_proxy": None,
             "provider_bridge_retries": 2,
             "verifier_uv_http_timeout_sec": 120,
@@ -221,6 +222,18 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
         self.assertEqual(env["NO_PROXY"], runner.LOOPBACK_NO_PROXY)
         self.assertEqual(env["no_proxy"], runner.LOOPBACK_NO_PROXY)
 
+    def test_build_env_passes_verifier_proxy_to_bridge_process(self) -> None:
+        subset = {"tasks": [{"name": "mteb-retrieve"}]}
+
+        env = runner.build_env(
+            self.args(verifier_proxy="http://host.docker.internal:7897"), subset
+        )
+
+        self.assertEqual(
+            env["CODEFACTORY_BENCH_VERIFIER_PROXY"],
+            "http://host.docker.internal:7897",
+        )
+
     def test_parse_output_captures_provider_result_status(self) -> None:
         parsed = runner.parse_output(
             "\n".join(
@@ -371,6 +384,132 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
                 {"CODEFACTORY_BENCH_JOB_ROOT": "/tmp"},
                 {"tasks": [{"name": "mteb-retrieve"}]},
             )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("transient-provider-network-failure", output)
+        self.assertEqual(parsed["imported"]["run"], "final-run")
+        self.assertEqual(interventions, [])
+
+    def test_provider_bridge_completed_environment_download_failure_retries(
+        self,
+    ) -> None:
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = Path(tmp) / "job"
+            stdout_path = (
+                job_path
+                / "torch-tensor-parallelism__abc123"
+                / "verifier"
+                / "test-stdout.txt"
+            )
+            stdout_path.parent.mkdir(parents=True)
+            stdout_path.write_text(
+                "\n".join(
+                    [
+                        "  × Failed to download `torch==2.7.0`",
+                        "  ├─▶ Request failed after 3 retries",
+                        "  ╰─▶ tls handshake eof",
+                    ]
+                )
+            )
+
+            def fake_run_command(env, watchdog):
+                calls.append((env, watchdog))
+                if len(calls) == 1:
+                    return (
+                        0,
+                        "\n".join(
+                            [
+                                f"provider_bridge_result status=completed exit_code=Some(0) job_path={job_path}",
+                                "provider_bridge_imported run=env-run dataset=terminal-bench/terminal-bench-2-1 agent=codefactory-headless model=Some(\"deepseek\") comparable=true trials=1 mean_reward=0.000",
+                                "provider_bridge_trial task=terminal-bench/torch-tensor-parallelism reward=0 failure_class=Some(\"environment\")",
+                            ]
+                        ),
+                        [],
+                    )
+                return (
+                    0,
+                    "\n".join(
+                        [
+                            "provider_bridge_result status=completed exit_code=Some(0) job_path=/tmp/job",
+                            "provider_bridge_imported run=final-run dataset=terminal-bench/terminal-bench-2-1 agent=codefactory-headless model=Some(\"deepseek\") comparable=true trials=1 mean_reward=1.000",
+                            "provider_bridge_trial task=terminal-bench/torch-tensor-parallelism reward=1 failure_class=None",
+                        ]
+                    ),
+                    [],
+                )
+
+            with mock.patch.object(runner, "run_command", side_effect=fake_run_command):
+                exit_code, output, parsed, interventions = runner.run_command_with_retries(
+                    self.args(provider_bridge_retries=1),
+                    {"CODEFACTORY_BENCH_JOB_ROOT": "/tmp"},
+                    {"tasks": [{"name": "torch-tensor-parallelism"}]},
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("transient-provider-network-failure", output)
+        self.assertEqual(parsed["imported"]["run"], "final-run")
+        self.assertEqual(interventions, [])
+
+    def test_provider_bridge_completed_verifier_apt_bootstrap_failure_retries_without_environment_class(
+        self,
+    ) -> None:
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = Path(tmp) / "job"
+            stdout_path = (
+                job_path
+                / "torch-tensor-parallelism__abc123"
+                / "verifier"
+                / "test-stdout.txt"
+            )
+            stdout_path.parent.mkdir(parents=True)
+            stdout_path.write_text(
+                "\n".join(
+                    [
+                        "Err:1 http://archive.ubuntu.com/ubuntu noble InRelease",
+                        "  Error reading from server. Remote end closed connection",
+                        "E: Unable to locate package curl",
+                        "/tests/test.sh: line 10: /root/.local/bin/env: No such file or directory",
+                        "/tests/test.sh: line 19: uvx: command not found",
+                    ]
+                )
+            )
+
+            def fake_run_command(env, watchdog):
+                calls.append((env, watchdog))
+                if len(calls) == 1:
+                    return (
+                        0,
+                        "\n".join(
+                            [
+                                f"provider_bridge_result status=completed exit_code=Some(0) job_path={job_path}",
+                                "provider_bridge_imported run=apt-run dataset=terminal-bench/terminal-bench-2-1 agent=codefactory-headless model=Some(\"deepseek\") comparable=true trials=1 mean_reward=0.000",
+                                "provider_bridge_trial task=terminal-bench/torch-tensor-parallelism reward=0 failure_class=Some(\"verification\")",
+                            ]
+                        ),
+                        [],
+                    )
+                return (
+                    0,
+                    "\n".join(
+                        [
+                            "provider_bridge_result status=completed exit_code=Some(0) job_path=/tmp/job",
+                            "provider_bridge_imported run=final-run dataset=terminal-bench/terminal-bench-2-1 agent=codefactory-headless model=Some(\"deepseek\") comparable=true trials=1 mean_reward=1.000",
+                            "provider_bridge_trial task=terminal-bench/torch-tensor-parallelism reward=1 failure_class=None",
+                        ]
+                    ),
+                    [],
+                )
+
+            with mock.patch.object(runner, "run_command", side_effect=fake_run_command):
+                exit_code, output, parsed, interventions = runner.run_command_with_retries(
+                    self.args(provider_bridge_retries=1),
+                    {"CODEFACTORY_BENCH_JOB_ROOT": "/tmp"},
+                    {"tasks": [{"name": "torch-tensor-parallelism"}]},
+                )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(len(calls), 2)

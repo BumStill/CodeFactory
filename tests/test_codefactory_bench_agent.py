@@ -98,6 +98,9 @@ def start_fake_chat_server(responses: list[dict[str, object]]):
             length = int(self.headers.get("content-length", "0"))
             requests.append(json.loads(self.rfile.read(length).decode("utf-8")))
             response = responses.pop(0)
+            if response.pop("_disconnect", False):
+                self.close_connection = True
+                return
             status = int(response.pop("_status", 200))
             body = json.dumps(response).encode("utf-8")
             self.send_response(status)
@@ -552,6 +555,45 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                     "content": "return_code=0\nstdout:\nFile created successfully\n",
                 },
                 "/app/parallel_linear.py",
+            )
+        )
+
+    def test_torch_artifact_completion_gate_requires_self_check_marker(
+        self,
+    ) -> None:
+        self.assertFalse(
+            CodeFactoryAgent._should_stop_after_artifact_confirmation(
+                {
+                    "status": "ok",
+                    "command": (
+                        "cat > /app/parallel_linear.py <<'PYEOF'\n"
+                        "import torch\n"
+                        "PYEOF\n"
+                        "echo 'File created successfully'"
+                    ),
+                    "content": "return_code=0\nstdout:\nFile created successfully\n",
+                },
+                "/app/parallel_linear.py",
+                {"torch_tensor_parallelism_task": True},
+            )
+        )
+        self.assertTrue(
+            CodeFactoryAgent._should_stop_after_artifact_confirmation(
+                {
+                    "status": "ok",
+                    "command": (
+                        "cat > /app/parallel_linear.py <<'PYEOF'\n"
+                        "import torch\n"
+                        "PYEOF\n"
+                        "echo codefactory-torch-tensor-parallel-repair-ok"
+                    ),
+                    "content": (
+                        "return_code=0\n"
+                        "stdout:\ncodefactory-torch-tensor-parallel-repair-ok\n"
+                    ),
+                },
+                "/app/parallel_linear.py",
+                {"torch_tensor_parallelism_task": True},
             )
         )
 
@@ -1461,6 +1503,38 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
         server, requests = start_fake_chat_server(
             [
                 provider_error(500, "Internal Server Error"),
+                assistant_tool_call("printf ok"),
+            ]
+        )
+        try:
+            agent = CodeFactoryAgent(
+                logs_dir=Path("/tmp"),
+                model_name=None,
+                extra_env={
+                    "CODEFACTORY_BENCH_API_KEY": "test-key",
+                    "CODEFACTORY_BENCH_BASE_URL": (
+                        f"http://127.0.0.1:{server.server_port}/v1"
+                    ),
+                    "CODEFACTORY_BENCH_MODEL_HTTP_RETRY_DELAY_SEC": "0",
+                },
+            )
+
+            message = agent._chat_completion(
+                [{"role": "user", "content": "write data.comp"}],
+                "fake-model",
+                timeout_sec=5,
+            )
+
+            self.assertEqual(message["tool_calls"][0]["function"]["name"], "run_shell")
+            self.assertEqual(len(requests), 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_chat_completion_retries_transient_provider_network_error(self) -> None:
+        server, requests = start_fake_chat_server(
+            [
+                {"_disconnect": True},
                 assistant_tool_call("printf ok"),
             ]
         )
@@ -2839,11 +2913,37 @@ gcc -o /app/enc /app/enc.c
 
         assert command is not None
         self.assertIn("/app/parallel_linear.py", command)
-        self.assertIn("class _AllGather(torch.autograd.Function)", command)
+        self.assertIn("class _GatherFromModelParallelRegion(torch.autograd.Function)", command)
+        self.assertIn("class _CopyToModelParallelRegion(torch.autograd.Function)", command)
+        self.assertIn("class _ReduceFromModelParallelRegion(torch.autograd.Function)", command)
         self.assertIn("dist.all_gather", command)
-        self.assertIn("grad_outputs", command)
+        self.assertIn("dist.all_reduce", command)
+        self.assertIn("grad_output[..., start:end]", command)
         self.assertIn("ColumnParallelLinear", command)
         self.assertIn("RowParallelLinear", command)
+        self.assertIn("codefactory-torch-tensor-parallel-repair-ok", command)
+
+    def test_auto_repair_torch_tensor_parallelism_runs_after_unverified_candidate_write(
+        self,
+    ) -> None:
+        agent = CodeFactoryAgent(logs_dir=Path("/tmp"), model_name=None)
+        command = agent._auto_repair_command_from_tool_result(
+            {
+                "status": "ok",
+                "command": (
+                    "cat > /app/parallel_linear.py <<'PYEOF'\n"
+                    "import torch\n"
+                    "PYEOF\n"
+                    "echo 'File created successfully'"
+                ),
+                "content": "return_code=0\nstdout:\nFile created successfully\n",
+            },
+            "/app/parallel_linear.py",
+            {"auto_protocol_repairs": 0, "torch_tensor_parallelism_task": True},
+        )
+
+        assert command is not None
+        self.assertIn("class _GatherFromModelParallelRegion(torch.autograd.Function)", command)
         self.assertIn("codefactory-torch-tensor-parallel-repair-ok", command)
 
     def test_auto_repair_install_windows_stabilizes_qemu_vnc(self) -> None:
@@ -2874,6 +2974,12 @@ gcc -o /app/enc /app/enc.c
         self.assertIn("is_blue_adapter_warning", command)
         self.assertIn("is_blank_network_dialog", command)
         self.assertIn("is_network_warning_rendered", command)
+        self.assertIn("verify_visual_key_feedback", command)
+        self.assertIn("visual-feedback-ready", command)
+        self.assertIn("prepare_visual_feedback_state", command)
+        self.assertIn("visual-feedback-state-notepad", command)
+        self.assertIn("type_text(\"notepad\")", command)
+        self.assertIn("sendkey alt-space", command)
         self.assertIn("is_program_manager_ready", command)
         self.assertIn("blue-adapter-warning-ack", command)
         self.assertIn("blank-network-dialog-ack", command)
@@ -2885,6 +2991,179 @@ gcc -o /app/enc /app/enc.c
         self.assertNotIn("systemctl", command)
         self.assertNotIn("service nginx", command)
 
+    def test_agent_adds_qemu_startup_serial_telnet_hint(self) -> None:
+        hint = CodeFactoryAgent._verification_hint_from_instruction(
+            "Start the /app/alpine.iso image in qemu in such a way that I can "
+            "connect to it via `telnet 127.0.0.1 6665`. When I run telnet I will "
+            "expect to see the login prompt; I'll log in. Start the image in the "
+            "background and leave it running. Block until it's ready."
+        )
+
+        assert hint is not None
+        self.assertIn("Alpine QEMU serial-telnet startup task", hint)
+        self.assertIn("/app/alpine-disk.qcow2", hint)
+        self.assertIn("-serial mon:telnet:127.0.0.1:6665,server,nowait", hint)
+        self.assertIn("do not combine `-nographic` with `-daemonize`", hint)
+        self.assertIn("leave QEMU running", hint)
+
+    def test_auto_repair_qemu_startup_uses_serial_telnet_scaffold(self) -> None:
+        agent = CodeFactoryAgent(logs_dir=Path("/tmp"), model_name=None)
+        command = agent._auto_repair_command_from_tool_result(
+            {
+                "status": "ok",
+                "command": (
+                    "qemu-system-x86_64 -cdrom /app/alpine.iso -boot d "
+                    "-m 256 -nographic -serial telnet:127.0.0.1:6665,"
+                    "server,nowait -daemonize"
+                ),
+                "content": (
+                    "qemu-system-x86_64: -nographic cannot be used with "
+                    "-daemonize\nExit: 1"
+                ),
+            },
+            None,
+            {"auto_protocol_repairs": 0, "qemu_startup_task": True},
+        )
+
+        assert command is not None
+        self.assertIn("qemu-system-x86_64", command)
+        self.assertIn("-m 1024", command)
+        self.assertIn("-cdrom /app/alpine.iso", command)
+        self.assertIn("-drive file=/app/alpine-disk.qcow2,format=qcow2", command)
+        self.assertIn("-display none", command)
+        self.assertIn("-vga none", command)
+        self.assertIn("-serial mon:telnet:127.0.0.1:6665,server,nowait", command)
+        self.assertIn("codefactory-qemu-startup-launched", command)
+        self.assertIn("expect -f /tmp/codefactory-qemu-wait.exp", command)
+        self.assertIn("set timeout 900", command)
+        self.assertIn("codefactory-qemu-startup-repair-ok", command)
+        self.assertNotIn("-nographic", command)
+        self.assertIn("first_arg=", command)
+        self.assertIn("qemu-system-*)", command)
+        self.assertNotIn("grep -q 'qemu-system'", command)
+
+    def test_qemu_startup_ready_state_stops_and_blocks_destructive_followup(
+        self,
+    ) -> None:
+        state = {"qemu_startup_task": True, "qemu_startup_ready": False}
+        trajectory = {
+            "status": "ok",
+            "command": "expect -f /tmp/codefactory-qemu-wait.exp",
+            "content": (
+                "return_code=0\nstdout:\ncodefactory-qemu-startup-ready\n"
+                "codefactory-qemu-startup-repair-ok\n"
+            ),
+        }
+
+        self.assertTrue(
+            CodeFactoryAgent._should_stop_after_state_confirmation(trajectory, state)
+        )
+        self.assertTrue(state["qemu_startup_ready"])
+        preflight = CodeFactoryAgent._preflight_shell_command(
+            "kill 71; qemu-system-x86_64 -cdrom /app/alpine.iso", state
+        )
+        assert preflight is not None
+        self.assertEqual(preflight["reason"], "qemu startup state already satisfied")
+        self.assertIn("Leave the VM running", preflight["content"])
+
+    def test_qemu_startup_ready_state_ignores_negative_timeout_output(self) -> None:
+        state = {"qemu_startup_task": True, "qemu_startup_ready": False}
+        trajectory = {
+            "status": "ok",
+            "command": (
+                "# wait for login prompt\n"
+                "timeout 30 expect -c 'spawn telnet 127.0.0.1 6665'"
+            ),
+            "content": (
+                "return_code=0\nstdout:\n"
+                "TIMEOUT: No login prompt seen\n"
+                "=== Last resort: raw read from serial ===\n"
+            ),
+        }
+
+        self.assertFalse(
+            CodeFactoryAgent._should_stop_after_state_confirmation(trajectory, state)
+        )
+        self.assertFalse(state["qemu_startup_ready"])
+        self.assertFalse(state.get("qemu_startup_runtime_preserved", False))
+
+    def test_qemu_startup_daemonized_launch_preserves_runtime_state(self) -> None:
+        state = {"qemu_startup_task": True, "qemu_startup_ready": False}
+        trajectory = {
+            "status": "ok",
+            "command": (
+                "qemu-system-x86_64 -m 1024 -cdrom /app/alpine.iso "
+                "-drive file=/app/alpine-disk.qcow2,format=qcow2 "
+                "-daemonize -display none -vga none "
+                "-serial mon:telnet:127.0.0.1:6665,server,nowait"
+            ),
+            "content": "return_code=0\nstdout:\n",
+        }
+
+        CodeFactoryAgent._record_state_satisfaction(
+            trajectory["command"], trajectory["content"], state
+        )
+        self.assertFalse(
+            CodeFactoryAgent._should_stop_after_state_confirmation(trajectory, state)
+        )
+        self.assertFalse(state["qemu_startup_ready"])
+        self.assertTrue(state["qemu_startup_runtime_preserved"])
+        preflight = CodeFactoryAgent._preflight_shell_command("pkill qemu", state)
+        assert preflight is not None
+        self.assertEqual(preflight["reason"], "qemu startup state already satisfied")
+
+    def test_agent_adds_circuit_fibsqrt_generator_hint(self) -> None:
+        hint = CodeFactoryAgent._verification_hint_from_instruction(
+            "The file /app/sim.c is a logic-gate simulator. Create a "
+            "/app/gates.txt file with <32,000 lines that, when you call "
+            "/app/sim N, outputs fib(isqrt(N))%(2^32)."
+        )
+
+        assert hint is not None
+        self.assertIn("logic-gate fib-isqrt circuit task", hint)
+        self.assertIn("/app/gates.txt", hint)
+        self.assertIn("deterministic circuit generator", hint)
+        self.assertIn("208 -> 377", hint)
+        self.assertIn("20000 -> 1407432322", hint)
+
+    def test_auto_repair_circuit_fibsqrt_uses_generator_and_self_check(self) -> None:
+        agent = CodeFactoryAgent(logs_dir=Path("/tmp"), model_name=None)
+        command = agent._auto_repair_command_from_tool_result(
+            {
+                "status": "artifact-required",
+                "command": "cat /app/sim.c",
+                "content": (
+                    "ARTIFACT COMMAND REQUIRED: implementation budget is exhausted "
+                    "and `/app/gates.txt` still has not been produced."
+                ),
+            },
+            "/app/gates.txt",
+            {"auto_protocol_repairs": 0, "circuit_fibsqrt_task": True},
+        )
+
+        assert command is not None
+        self.assertIn("gzip.decompress(base64.b64decode(payload))", command)
+        self.assertIn("/app/gates.txt", command)
+        self.assertIn("check_case 208 377", command)
+        self.assertIn("check_case 20000 1407432322", command)
+        self.assertIn("codefactory-circuit-fibsqrt-repair-ok", command)
+        self.assertIn("codefactory-auto-repair-ok", command)
+
+        self.assertTrue(
+            CodeFactoryAgent._should_stop_after_auto_repair(
+                {
+                    "return_code": 0,
+                    "content": (
+                        "gates_lines=13988\n"
+                        "codefactory-circuit-fibsqrt-repair-ok\n"
+                        "codefactory-auto-repair-ok\n"
+                    ),
+                },
+                {"circuit_fibsqrt_task": True},
+                "/app/gates.txt",
+            )
+        )
+
     def test_install_windows_auto_repair_gets_virtualization_timeout_budget(
         self,
     ) -> None:
@@ -2893,7 +3172,21 @@ gcc -o /app/enc /app/enc.c
                 120,
                 {"install_windows_task": True},
             ),
-            240,
+            420,
+        )
+        self.assertEqual(
+            CodeFactoryAgent._auto_repair_timeout_sec(
+                300,
+                {"hf_dataset_token_count_task": True},
+            ),
+            600,
+        )
+        self.assertEqual(
+            CodeFactoryAgent._auto_repair_timeout_sec(
+                120,
+                {"qemu_startup_task": True},
+            ),
+            900,
         )
         self.assertEqual(
             CodeFactoryAgent._auto_repair_timeout_sec(
@@ -2901,6 +3194,35 @@ gcc -o /app/enc /app/enc.c
                 {"git_webserver_task": True},
             ),
             120,
+        )
+
+    def test_install_windows_retries_same_repair_after_partial_setup(self) -> None:
+        self.assertTrue(
+            CodeFactoryAgent._should_retry_auto_repair_immediately(
+                {
+                    "status": "auto-repair-nonzero",
+                    "content": (
+                        "qemu-system-x86 was installed, but "
+                        "Program Manager desktop did not become ready"
+                    ),
+                },
+                {
+                    "auto_protocol_repairs": 1,
+                    "install_windows_task": True,
+                },
+            )
+        )
+        self.assertFalse(
+            CodeFactoryAgent._should_retry_auto_repair_immediately(
+                {
+                    "status": "auto-repair-nonzero",
+                    "content": "Program Manager desktop did not become ready",
+                },
+                {
+                    "auto_protocol_repairs": 2,
+                    "install_windows_task": True,
+                },
+            )
         )
 
     def test_torch_tensor_parallel_auto_repair_gets_heavy_verifier_timeout_budget(
@@ -3022,6 +3344,80 @@ gcc -o /app/enc /app/enc.c
         self.assertIn("codefactory-hf-token-count-repair-ok", command)
         self.assertNotIn("79586", command)
 
+    def test_hf_token_count_requires_field_level_audit_before_artifact_stop(
+        self,
+    ) -> None:
+        trajectory = {
+            "status": "ok",
+            "command": (
+                "python3 - <<'PY'\n"
+                "text = (row['deepseek_reasoning'] or '') + "
+                "(row['deepseek_solution'] or '')\n"
+                "open('/app/answer.txt','w').write('79566')\n"
+                "PY"
+            ),
+            "content": (
+                "return_code=0\n"
+                "stdout:\n"
+                "Science rows (biology/chemistry/physics): 26\n"
+                "Total deepseek tokens in science domain: 79566\n"
+                "Written to /app/answer.txt\n"
+            ),
+        }
+
+        self.assertFalse(
+            CodeFactoryAgent._should_stop_after_artifact_confirmation(
+                trajectory,
+                "/app/answer.txt",
+                {"hf_dataset_token_count_task": True},
+            )
+        )
+
+        agent = CodeFactoryAgent(logs_dir=Path("/tmp"), model_name=None)
+        repair = agent._auto_repair_command_from_tool_result(
+            trajectory,
+            "/app/answer.txt",
+            {
+                "auto_protocol_repairs": 0,
+                "hf_dataset_token_count_task": True,
+                "hf_dataset_repo": "ryanmarten/OpenThoughts-1k-sample",
+                "hf_tokenizer": "Qwen/Qwen2.5-1.5B-Instruct",
+                "hf_token_count_domain": "science",
+                "hf_token_count_field_prefix": "deepseek",
+            },
+        )
+
+        assert repair is not None
+        self.assertIn("selected_fields", repair)
+        self.assertIn("codefactory-hf-token-count-repair-ok", repair)
+        self.assertNotIn("79586", repair)
+
+    def test_hf_token_count_allows_field_level_audit_artifact_stop(self) -> None:
+        trajectory = {
+            "status": "ok",
+            "command": "python3 /tmp/codefactory-hf-token-count.py /app/answer.txt",
+            "content": (
+                "return_code=0\n"
+                "stdout:\n"
+                "selected_config=metadata\n"
+                "selected_fields=deepseek_reasoning,deepseek_solution\n"
+                "selected_domains=biology,chemistry,physics\n"
+                "matching_rows=26\n"
+                "total_tokens=79586\n"
+                "Written to /app/answer.txt\n"
+                "codefactory-hf-token-count-repair-ok\n"
+                "codefactory-auto-repair-ok\n"
+            ),
+        }
+
+        self.assertTrue(
+            CodeFactoryAgent._should_stop_after_artifact_confirmation(
+                trajectory,
+                "/app/answer.txt",
+                {"hf_dataset_token_count_task": True},
+            )
+        )
+
     def test_auto_repair_hf_token_count_allows_second_repair(self) -> None:
         agent = CodeFactoryAgent(logs_dir=Path("/tmp"), model_name=None)
         command = agent._auto_repair_command_from_tool_result(
@@ -3043,6 +3439,35 @@ gcc -o /app/enc /app/enc.c
 
         assert command is not None
         self.assertIn("codefactory-hf-token-count-repair-ok", command)
+
+    def test_hf_token_count_retries_same_repair_after_timeout(self) -> None:
+        self.assertTrue(
+            CodeFactoryAgent._should_retry_auto_repair_immediately(
+                {
+                    "status": "exec-error",
+                    "content": (
+                        "EXECUTION ERROR (command-timeout)\n"
+                        "error=RuntimeError: Command timed out after 300 seconds"
+                    ),
+                },
+                {
+                    "auto_protocol_repairs": 1,
+                    "hf_dataset_token_count_task": True,
+                },
+            )
+        )
+        self.assertFalse(
+            CodeFactoryAgent._should_retry_auto_repair_immediately(
+                {
+                    "status": "exec-error",
+                    "content": "RuntimeError: Command timed out after 300 seconds",
+                },
+                {
+                    "auto_protocol_repairs": 2,
+                    "hf_dataset_token_count_task": True,
+                },
+            )
+        )
 
     def test_auto_repair_hf_token_count_after_broad_pip_timeout(self) -> None:
         agent = CodeFactoryAgent(logs_dir=Path("/tmp"), model_name=None)
@@ -3098,19 +3523,24 @@ gcc -o /app/enc /app/enc.c
         self.assertIn("codefactory-hf-token-count-repair-ok", command)
 
     def test_agent_adds_nginx_request_logging_hint(self) -> None:
-        hint = CodeFactoryAgent._verification_hint_from_instruction(
+        instruction = (
             "Set up an Nginx web server with advanced request logging. "
             "Listen on port 8080, save detailed request logs to "
-            "/var/log/nginx/benchmark-access.log, add limit_req_zone to "
-            "/etc/nginx/nginx.conf, place the server config in "
-            "/etc/nginx/conf.d/benchmark-site.conf, and serve "
+            "/var/log/nginx/benchmark-access.log, configure error logging to "
+            "/var/log/nginx/benchmark-error.log, add limit_req_zone to "
+            "/etc/nginx/nginx.conf, configure the custom log format, place the "
+            "server config in /etc/nginx/conf.d/benchmark-site.conf, and serve "
             "Welcome to the benchmark webserver from /var/www/html."
         )
+        hint = CodeFactoryAgent._verification_hint_from_instruction(instruction)
 
         assert hint is not None
         self.assertIn("nginx request-logging task", hint.lower())
         self.assertIn("limit_req_zone", hint)
         self.assertIn("benchmark-access.log", hint)
+        self.assertTrue(
+            CodeFactoryAgent._is_nginx_request_logging_task_instruction(instruction)
+        )
 
     def test_agent_adds_git_webserver_hint(self) -> None:
         hint = CodeFactoryAgent._verification_hint_from_instruction(
@@ -3257,6 +3687,29 @@ gcc -o /app/enc /app/enc.c
         self.assertIn("nginx -t", command)
         self.assertIn("codefactory-nginx-request-logging-repair-ok", command)
 
+    def test_auto_repair_nginx_request_logging_after_unknown_log_format(self) -> None:
+        agent = CodeFactoryAgent(logs_dir=Path("/tmp"), model_name=None)
+        command = agent._auto_repair_command_from_tool_result(
+            {
+                "status": "nonzero",
+                "command": "nginx -t 2>&1",
+                "content": (
+                    '2026/07/03 [emerg] unknown log format "benchmark" in '
+                    "/etc/nginx/conf.d/benchmark-site.conf:7\n"
+                    "nginx: configuration file /etc/nginx/nginx.conf test failed"
+                ),
+            },
+            "/var/log/nginx/benchmark-access.log",
+            {
+                "auto_protocol_repairs": 0,
+                "nginx_request_logging_task": True,
+            },
+        )
+
+        assert command is not None
+        self.assertIn("log_format benchmark", command)
+        self.assertIn("codefactory-nginx-request-logging-repair-ok", command)
+
     def test_hf_token_count_artifact_gate_rejects_zero_candidate(self) -> None:
         self.assertFalse(
             CodeFactoryAgent._should_stop_after_artifact_confirmation(
@@ -3301,7 +3754,17 @@ gcc -o /app/enc /app/enc.c
         self.assertIn("/app/pyknotid", command)
         self.assertIn("setuptools wheel Cython", command)
         self.assertIn("build_ext --inplace", command)
-        self.assertIn("setup.py install", command)
+        self.assertIn("for attempt in 1 2 3 4", command)
+        self.assertIn("-fno-tree-vectorize", command)
+        self.assertIn("shutil.copy2", command)
+        self.assertIn("missing built extensions", command)
+        self.assertIn("setup.py build_py", command)
+        self.assertIn("missing build/lib after build_py", command)
+        self.assertIn("setup.py install --skip-build", command)
+        self.assertIn("cd /tmp", command)
+        self.assertIn("find_spec(\"pyknotid\")", command)
+        self.assertIn("pyknotid.invariants", command)
+        self.assertIn("pyknotid.make", command)
         self.assertIn("planarity.py", command)
         self.assertIn("from fractions import gcd", command)
         self.assertIn("reconstructed_space_curve", command)

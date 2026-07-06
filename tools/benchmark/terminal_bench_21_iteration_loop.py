@@ -175,6 +175,15 @@ def run_subset(
     secret_timeout_sec: int,
     shell_timeout_sec: int,
     run_timeout_sec: int,
+    agent_wall_timeout_sec: int | None = None,
+    trial_hard_timeout_sec: int | None = None,
+    heavy_verifier_hard_timeout_sec: int | None = None,
+    verifier_uv_http_timeout_sec: int | None = None,
+    verifier_uv_torch_backend: str | None = None,
+    provider_bridge_retries: int | None = None,
+    docker_apt_proxy: str | None = None,
+    verifier_proxy: str | None = None,
+    provider_proxy: str | None = None,
     override_storage_mb: int | None = None,
 ) -> tuple[int, str]:
     command = [
@@ -195,6 +204,28 @@ def run_subset(
         command.extend(["--model", model])
     if override_storage_mb:
         command.extend(["--override-storage-mb", str(override_storage_mb)])
+    if agent_wall_timeout_sec:
+        command.extend(["--agent-wall-timeout-sec", str(agent_wall_timeout_sec)])
+    if trial_hard_timeout_sec:
+        command.extend(["--trial-hard-timeout-sec", str(trial_hard_timeout_sec)])
+    if heavy_verifier_hard_timeout_sec:
+        command.extend(
+            ["--heavy-verifier-hard-timeout-sec", str(heavy_verifier_hard_timeout_sec)]
+        )
+    if verifier_uv_http_timeout_sec:
+        command.extend(
+            ["--verifier-uv-http-timeout-sec", str(verifier_uv_http_timeout_sec)]
+        )
+    if verifier_uv_torch_backend:
+        command.extend(["--verifier-uv-torch-backend", verifier_uv_torch_backend])
+    if provider_bridge_retries is not None:
+        command.extend(["--provider-bridge-retries", str(provider_bridge_retries)])
+    if docker_apt_proxy:
+        command.extend(["--docker-apt-proxy", docker_apt_proxy])
+    if verifier_proxy:
+        command.extend(["--verifier-proxy", verifier_proxy])
+    if provider_proxy:
+        command.extend(["--provider-proxy", provider_proxy])
     process = subprocess.Popen(
         command,
         cwd=REPO_ROOT,
@@ -263,6 +294,29 @@ def format_failure_counts(summary: EvidenceSummary | None) -> list[str]:
     ]
 
 
+def require_product_capability_metadata(args: argparse.Namespace) -> dict[str, str]:
+    fields = {
+        "product_capability_verdict": "--product-capability-verdict",
+        "product_capability_impact": "--product-capability-impact",
+        "product_example": "--product-example",
+        "benchmark_only_boundary": "--benchmark-only-boundary",
+    }
+    values: dict[str, str] = {}
+    missing: list[str] = []
+    for attr, option in fields.items():
+        value = getattr(args, attr, None)
+        if not isinstance(value, str) or not value.strip():
+            missing.append(option)
+            continue
+        values[attr] = value.strip()
+    if missing:
+        raise ValueError(
+            "Terminal-Bench iteration reports require product capability metadata: "
+            + ", ".join(missing)
+        )
+    return values
+
+
 def write_iteration_report(
     args: argparse.Namespace,
     scope: str,
@@ -276,6 +330,11 @@ def write_iteration_report(
     EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
     report_path = EVIDENCE_DIR / f"terminal-bench-21-iteration-{timestamp}.md"
+    product_metadata = require_product_capability_metadata(args)
+    product_verdict = product_metadata["product_capability_verdict"]
+    product_capability = product_metadata["product_capability_impact"]
+    product_example = product_metadata["product_example"]
+    benchmark_boundary = product_metadata["benchmark_only_boundary"]
     lines = [
         "# Terminal-Bench 2.1 Product Iteration Report",
         "",
@@ -290,8 +349,8 @@ def write_iteration_report(
         f"- override_storage_mb: `{args.override_storage_mb or '<none>'}`",
         f"- official_comparable: `{'no' if args.override_storage_mb else 'yes'}`",
         f"- hypothesis: `{args.hypothesis}`",
-        f"- target_failure_class: `{args.target_failure_class}`",
-        f"- ran_command: `{'yes' if ran_command else 'no'}`",
+            f"- target_failure_class: `{args.target_failure_class}`",
+            f"- ran_command: `{'yes' if ran_command else 'no'}`",
     ]
     if exit_code is not None:
         lines.append(f"- exit_code: `{exit_code}`")
@@ -335,6 +394,13 @@ def write_iteration_report(
             f"- pass_count: `{head.pass_count if head and head.pass_count is not None else 'unknown'}`",
             f"- trials: `{head.trials if head and head.trials is not None else 'unknown'}`",
             f"- mean_reward: `{head.mean_reward if head and head.mean_reward is not None else 'unknown'}`",
+            "",
+            "## Product Capability Impact",
+            "",
+            f"- verdict: {product_verdict}",
+            f"- capability: {product_capability}",
+            f"- non_benchmark_example: {product_example}",
+            f"- benchmark_only_boundary: {benchmark_boundary}",
             "",
             "## Delta",
             "",
@@ -412,9 +478,52 @@ def main() -> int:
     parser.add_argument("--secret-timeout-sec", type=int, default=20)
     parser.add_argument("--shell-timeout-sec", type=int, default=300)
     parser.add_argument("--run-timeout-sec", type=int, default=1800)
+    parser.add_argument("--agent-wall-timeout-sec", type=int)
+    parser.add_argument("--trial-hard-timeout-sec", type=int)
+    parser.add_argument("--heavy-verifier-hard-timeout-sec", type=int)
+    parser.add_argument("--verifier-uv-http-timeout-sec", type=int)
+    parser.add_argument("--verifier-uv-torch-backend")
+    parser.add_argument("--provider-bridge-retries", type=int)
+    parser.add_argument("--docker-apt-proxy")
+    parser.add_argument("--verifier-proxy")
+    parser.add_argument("--provider-proxy")
     parser.add_argument("--override-storage-mb", type=int)
     parser.add_argument("--target-failure-class", default="tool-use")
     parser.add_argument("--hypothesis", required=True)
+    parser.add_argument(
+        "--product-capability-verdict",
+        choices=("product-capability", "mixed", "benchmark-only"),
+        required=True,
+        help=(
+            "Whether the iteration is expected to improve CodeFactory's reusable "
+            "product intelligence, is mixed with benchmark-specific scaffold, or "
+            "is benchmark-only."
+        ),
+    )
+    parser.add_argument(
+        "--product-capability-impact",
+        required=True,
+        help=(
+            "Concrete CodeFactory product capability this iteration is intended "
+            "to improve, beyond the benchmark score."
+        ),
+    )
+    parser.add_argument(
+        "--product-example",
+        required=True,
+        help=(
+            "One non-benchmark CodeFactory user scenario that should benefit if "
+            "the product capability improvement is real."
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-only-boundary",
+        required=True,
+        help=(
+            "Which part of the change is benchmark/task-family specific and "
+            "should not be over-claimed as broad product intelligence."
+        ),
+    )
     parser.add_argument(
         "--canary-task",
         action="append",
@@ -456,6 +565,15 @@ def main() -> int:
             concurrency=args.concurrency,
             secret_timeout_sec=args.secret_timeout_sec,
             shell_timeout_sec=args.shell_timeout_sec,
+            agent_wall_timeout_sec=args.agent_wall_timeout_sec,
+            trial_hard_timeout_sec=args.trial_hard_timeout_sec,
+            heavy_verifier_hard_timeout_sec=args.heavy_verifier_hard_timeout_sec,
+            verifier_uv_http_timeout_sec=args.verifier_uv_http_timeout_sec,
+            verifier_uv_torch_backend=args.verifier_uv_torch_backend,
+            provider_bridge_retries=args.provider_bridge_retries,
+            docker_apt_proxy=args.docker_apt_proxy,
+            verifier_proxy=args.verifier_proxy,
+            provider_proxy=args.provider_proxy,
             run_timeout_sec=args.run_timeout_sec,
             override_storage_mb=args.override_storage_mb,
         )

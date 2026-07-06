@@ -181,7 +181,7 @@ Benchmark sandbox 默认不得允许外网工具调用，但必须允许容器�
 
 固定 subset 的离线基线入口是 `tools/benchmark/summarize_terminal_bench_21_subset_baseline.py`。该脚本只读取已完成 full Harbor job 和 subset JSON，不调用 provider、不读取 secret，用于在 credential 或 provider 暂不可用时仍能生成同口径的 subset baseline evidence。该报告必须明确标注 `offline subset projection`，不能冒充新的 provider-backed rerun。
 
-截至 2026-07-02，最新固定 18 题 current-worktree diagnostic aggregate 为 run `c3e8a961-f2f4-4357-8dab-835b9a579b4b`，evidence `docs/evidence-packs/terminal-bench-21-regression-subset-2026-07-02T15-48-42Z.md`，`14 / 18`，mean reward `0.778`。这轮保持前一轮 `13 / 18` 的所有通过项不回退，并新增 `configure-git-webserver` 通过。边界：runner watchdog 仍停止 `query-optimize`，本地 QEMU/emulation 与 Chrome driver warnings 仍存在，因此这是产品诊断聚合分数，不是 clean official-comparable release gate。
+截至 2026-07-06，最新固定 18 题 current-worktree diagnostic aggregate 已完成两轮完整回归稳定性验证：run `565ecdd4-7694-42aa-a3c7-a3bd38f15146` 和 run `bd70de5a-b4ec-4925-8353-7f9000fdcf77` 均为 `16 / 18`，mean reward `0.889`，evidence 分别为 `docs/evidence-packs/terminal-bench-21-regression-subset-2026-07-06T16-00-55Z.md` 和 `docs/evidence-packs/terminal-bench-21-regression-subset-2026-07-06T17-53-49Z.md`。这轮新增并稳定保持 `qemu-startup`，同时把 `count-dataset-tokens` 和 `install-windows-3.11` 的回归修回 pass set。产品化能力是 provider/model transient retry、显式依赖路由、字段级数据计算审计、source-clean native artifact 验证、GUI runtime readiness 与视觉反馈验证；评测边界是固定 18 题、Terminal-Bench task scaffold、本机代理地址、QEMU/VNC 路径和 runner watchdog。剩余失败项为 `caffe-cifar-10` verification failure 与 `query-optimize` watchdog/environment failure，因此这仍是产品诊断聚合分数，不是 clean official-comparable release gate。
 
 ### Iteration Loop
 
@@ -192,6 +192,8 @@ Benchmark sandbox 默认不得允许外网工具调用，但必须允许容器�
 3. 可选执行 provider-backed run；不执行时仍生成 dry-run iteration report。
 4. 读取 baseline/head evidence，生成 pass、mean reward 和 failure class delta。
 5. 写入 `docs/evidence-packs/terminal-bench-21-iteration-*.md`，其中必须包含下一步 improvement queue。
+6. 每轮必须先给 `product_capability_verdict`：`product-capability`、`mixed` 或 `benchmark-only`，再写清楚产品能力影响：`product_capability_impact`、一个非评测场景 `product_example`，以及 `benchmark_only_boundary`。`tools/benchmark/terminal_bench_21_iteration_loop.py` 必须在 CLI 和报告生成层拒绝缺失这些字段；如果某次改动只对跑分 task scaffold 有效，报告必须直接标明，不得包装成 CodeFactory 整体智能化能力的大幅提升。
+7. 本机代理、Docker apt bootstrap、verifier `uv` / PyPI / GitHub 下载、provider bridge transient retry 相关配置必须通过 iteration loop 的正式参数传递，例如 `--provider-proxy`、`--docker-apt-proxy`、`--verifier-proxy` 和 `--provider-bridge-retries`，不得绕开标准 loop 手写一次性 runner 命令；这样 blocker、evidence 和产品化解释才能留在同一条评估链路里。
 
 默认 canary 文件为 `docs/benchmark-subsets/terminal-bench-21-canary-subset-v1.json`，任务为 `write-compressor`、`filter-js-from-html`、`mteb-retrieve`、`count-dataset-tokens`，用于在完整 18 题 regression 前快速验证 agent loop 是否真正改善。canary 只用于开发内循环，不能替代 regression subset 或 full run 作为 release 结论。
 

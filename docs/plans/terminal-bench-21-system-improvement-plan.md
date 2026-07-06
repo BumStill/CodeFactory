@@ -69,6 +69,22 @@
 
 本轮新增产品能力不是只针对评测写死答案，而是可产品化的 agent 执行控制改进：服务/SSH/Git 类任务增加 readiness preflight 和自动修复；确认 artifact 已写入后允许停止，减少“已完成后继续读/继续破坏状态”；长任务自动修复保留 `codefactory-*-repair-ok` marker 供 verifier 归因；Windows/QEMU/Torch/HF 类任务暴露出需要 task-family timeout budget 的通用需求。下一步不能只追 `15 / 18`，还必须把这轮候选改动发布到产品中，否则分数不会转化为用户可用能力。
 
+2026-07-06 最新 18 题 current-worktree 诊断聚合完成两轮 score-holding：
+
+- run 1: `565ecdd4-7694-42aa-a3c7-a3bd38f15146`
+- report 1: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-07-06T16-00-55Z.md`
+- run 2: `bd70de5a-b4ec-4925-8353-7f9000fdcf77`
+- report 2: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-07-06T17-53-49Z.md`
+- subset: `terminal-bench-21-regression-subset-v1`
+- pass: `16 / 18` in both full reruns
+- mean reward: `0.889`
+- aggregate delta: previous fixed-subset diagnostic `14 / 18` -> stable `16 / 18`
+- new/stabilized passes: `qemu-startup`, `count-dataset-tokens`, `install-windows-3.11`
+- remaining reward-zero / environment tasks: `caffe-cifar-10`, `query-optimize`
+- boundary: runner hard-timeout watchdog still stops stale `query-optimize` after `1200s`; `filter-js-from-html` still logs Chrome driver unavailable and falls back to slower non-browser coverage. This is real product-loop progress and a v1.42.0 delivery candidate, but not a clean official-comparable gate.
+
+本轮产品化改动的真实产品能力提升是：provider/model transient network retry、显式 Docker/provider/verifier 代理路由、HuggingFace/远程数据 token 统计的字段级审计、源码目录外 installed-package/native-extension 验证、以及 GUI/VM runtime 的可视 readiness 和输入反馈验证。评测专属边界是固定 18 题、Terminal-Bench 任务脚手架、本机代理地址、`/tmp/qemu-monitor.sock` / VNC `:1` 和 runner watchdog。真实 CodeFactory 场景示例：用户在代理网络下让 CodeFactory 处理一个包含数据集统计、Cython 扩展、后台服务和 VNC 开发环境的仓库时，系统能重试一次 DeepSeek/OpenRouter transient disconnect，显式路由 apt/PyPI/GitHub 下载，按字段审计 token 成本，验证安装后的包而不是源码目录假阳性，并确认 GUI 环境真的能响应键盘后再声明完成。
+
 2026-06-30 最新 18 题 current-worktree 诊断聚合已经超过 clean baseline：
 
 - run: `0082cd94-e9f5-479b-8ba8-5561ebd58732`
@@ -500,6 +516,7 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 - 默认 canary：`docs/benchmark-subsets/terminal-bench-21-canary-subset-v1.json`
 - 输出：`docs/evidence-packs/terminal-bench-21-iteration-*.md`
 - 每轮必须声明：`hypothesis`、`target_failure_class`、`scope`、baseline/head evidence、delta 和 next improvement queue。
+- 每轮还必须声明产品化解释：`product_capability_verdict`（`product-capability` / `mixed` / `benchmark-only`）、`product_capability_impact`、一个非评测场景 `product_example`、以及 `benchmark_only_boundary`。迭代工具必须把这些字段作为 required contract，缺失时直接失败。如果某项修复只是 task-family scaffold 或 runner 特例，必须直接标出；只有能迁移到 CodeFactory 真实 agent 执行、工具控制、状态保持、验证修复、发布链路或用户主路径的部分，才能称为产品智能化能力提升。
 
 推荐循环：
 
@@ -523,6 +540,8 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 10. 当前 6 题结果仍有解释边界：本机 QEMU/emulation 下 verifier warnings 包含 `browser-driver-unavailable` 和 `ERROR: unknown platform bitness`，尤其 `filter-js-from-html` 的 Selenium/Chrome driver 缺失会削弱浏览器类断言解释。分数记录为有效 Harbor reward，但产品下一步必须把 browser/verifier runtime 稳定化作为 P0 评测基础设施任务，而不是把 `6 / 6` 等同于所有 runtime 风险已解决。
 11. 最新 18 题聚合复测已经达到 `14 / 18`、mean reward `0.778`，从上一轮 `13 / 18` 继续提升，并且历史通过项没有回退。`configure-git-webserver` 已在同一固定 subset 中从 reward `0` 变成 reward `1`。
 12. 当前下一轮 P0 顺序改为：先把 `14 / 18` 候选改动走完产品交付链，完成 PR/CI、合并、刻意发版和真实 packaged/headless runtime 验证；然后把 `14 / 18` 做成可重复 score-holding，再选择一个 remaining failure family 冲到 `>= 15 / 18`。优先级是：`qemu-startup` 的状态满足后停止/高风险进程操作门、`query-optimize` verifier watchdog/root-cause 分离与可比性改造、`caffe-cifar-10` 的真实构建/训练小样本闭环、`circuit-fibsqrt` 的逻辑综合与自检生成。`configure-git-webserver`、`install-windows-3.11` 和 `sparql-university` 已在最新 18 题 aggregate 中通过，进入 score-holding 集合。
+13. 最新 18 题聚合复测已经在 2026-07-06 达到两轮稳定 `16 / 18`、mean reward `0.889`。`qemu-startup` 已在两轮完整 run 中通过，满足新增攻克项要求；`count-dataset-tokens` 和 `install-windows-3.11` 回归已修复并在两轮完整 run 中保持 reward `1`。
+14. 当前 P0 顺序改为：把 `16 / 18` 候选走完 PR、CI、刻意发版和 release artifact/latest.json 验证；随后做发布版同口径 headless fixed-subset 回归，确认 live build 仍为 `>= 16 / 18`。下一轮 score-growth 才攻 `caffe-cifar-10` 或 `query-optimize`，目标 `17 / 18`。
 
 首轮 canary 的具体调整：
 
@@ -578,10 +597,10 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 
 建议 gate：
 
-- 当前 fixed subset 最新真实聚合是 run `c3e8a961-f2f4-4357-8dab-835b9a579b4b` 的 `14 / 18`、mean reward `0.778`。它高于最早 full-run 离线投影基线 `4 / 18`，也高于上一轮当前 worktree 诊断 `13 / 18`，所以当前水平已经进入可产品化候选阶段，但仍不是 clean official-comparable gate。
-- score-holding 必须维护最新 `14 / 18` pass set：`build-cython-ext`、`configure-git-webserver`、`count-dataset-tokens`、`extract-elf`、`filter-js-from-html`、`install-windows-3.11`、`kv-store-grpc`、`mteb-retrieve`、`nginx-request-logging`、`protein-assembly`、`sanitize-git-repo`、`sparql-university`、`torch-tensor-parallelism`、`write-compressor` 不得回退。
-- 下一道有效产品门槛是先让这轮 `14 / 18` 候选进入真实产品发布链；发布后再跑同口径 fixed subset 证明 live build 仍达到 `>= 14 / 18` 且无新增历史通过项回归。随后把 `>= 15 / 18` 作为第三阶段 score-growth 目标。
-- 完整 89 题只有在 18 题 fixed subset 发布版稳定 `>= 14 / 18`、`query-optimize` 这类长 verifier 能被 cleanly classified、并且本机 verifier warnings 有明确解释后才值得重跑。否则完整 89 题会继续混淆 agent 能力、运行环境和长尾 verifier 卡死。
+- 当前 fixed subset 最新真实聚合已提升到两轮完整回归稳定 `16 / 18`、mean reward `0.889`：run `565ecdd4-7694-42aa-a3c7-a3bd38f15146` 和 run `bd70de5a-b4ec-4925-8353-7f9000fdcf77`。它高于最早 full-run 离线投影基线 `4 / 18`、上一轮发布候选 `14 / 18`，并且两轮均保持 `qemu-startup` 通过，所以当前水平进入 v1.42.0 产品化交付候选阶段，但仍不是 clean official-comparable gate。
+- score-holding 必须维护最新 `16 / 18` pass set：`build-cython-ext`、`circuit-fibsqrt`、`configure-git-webserver`、`count-dataset-tokens`、`extract-elf`、`filter-js-from-html`、`install-windows-3.11`、`kv-store-grpc`、`mteb-retrieve`、`nginx-request-logging`、`protein-assembly`、`qemu-startup`、`sanitize-git-repo`、`sparql-university`、`torch-tensor-parallelism`、`write-compressor` 不得回退。
+- 下一道有效产品门槛是先让这轮 `16 / 18` 候选进入真实产品发布链；发布后再跑同口径 fixed subset 或 release artifact 触发的 headless runtime 证明 live build 仍达到 `>= 16 / 18` 且无新增历史通过项回归。随后把 `caffe-cifar-10` 或 `query-optimize` 之一作为第三阶段 score-growth 目标，冲 `17 / 18`。
+- 完整 89 题只有在 18 题 fixed subset 发布版稳定 `>= 16 / 18`、`query-optimize` 这类长 verifier 能被 cleanly classified、并且本机 verifier warnings 有明确解释后才值得重跑。否则完整 89 题会继续混淆 agent 能力、运行环境和长尾 verifier 卡死。
 - 完整 89 题 pass 从 `6 / 89` 提升到 `15 / 89`，才算第一阶段 agent loop 改进有效。
 - 同时记录 cost 和 duration，避免靠无限重试换分数。
 
