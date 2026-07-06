@@ -119,6 +119,17 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
                         shell_timeout_sec=300,
                         hypothesis="reduce repeated inspection",
                         target_failure_class="tool-use",
+                        product_capability_verdict="mixed",
+                        product_capability_impact=(
+                            "state-aware agent loop avoids destructive follow-up"
+                        ),
+                        product_example=(
+                            "after starting a dev server and confirming readiness, "
+                            "CodeFactory stops instead of killing it"
+                        ),
+                        benchmark_only_boundary=(
+                            "the canary task itself is only one benchmark scenario"
+                        ),
                     ),
                     scope="canary",
                     subset_path=tmp_path / "subset.json",
@@ -133,6 +144,11 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
             self.assertIn("- pass_count: `1` -> `2` (`+1`)", text)
             self.assertIn("- mean_reward: `0.500000` -> `1.000000` (`+0.500000`)", text)
             self.assertIn("reduce repeated inspection", text)
+            self.assertIn("## Product Capability Impact", text)
+            self.assertIn("- verdict: mixed", text)
+            self.assertIn("state-aware agent loop", text)
+            self.assertIn("dev server", text)
+            self.assertIn("only one benchmark scenario", text)
             self.assertIn("artifact implementation earlier", text)
 
     def test_write_iteration_report_marks_mismatched_trial_counts_not_comparable(
@@ -161,6 +177,18 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
                         shell_timeout_sec=300,
                         hypothesis="target one task",
                         target_failure_class="environment",
+                        product_capability_verdict="benchmark-only",
+                        product_capability_impact=(
+                            "separates evaluation runtime instability from agent output"
+                        ),
+                        product_example=(
+                            "CodeFactory can show a user that a failed run was blocked "
+                            "by Docker storage instead of blaming the model patch"
+                        ),
+                        benchmark_only_boundary=(
+                            "this report compares benchmark evidence and does not change "
+                            "the agent execution loop"
+                        ),
                     ),
                     scope="canary",
                     subset_path=tmp_path / "subset.json",
@@ -175,6 +203,31 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
             self.assertIn("- comparable_delta: `no`", text)
             self.assertIn("different trial counts", text)
             self.assertNotIn("- pass_count: `4` -> `0`", text)
+
+    def test_write_iteration_report_requires_product_capability_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(loop, "EVIDENCE_DIR", Path(tmp)):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "--product-capability-verdict",
+                ):
+                    loop.write_iteration_report(
+                        args=mock.Mock(
+                            endpoint="deepseek",
+                            model=None,
+                            shell_timeout_sec=300,
+                            override_storage_mb=None,
+                            hypothesis="target one task",
+                            target_failure_class="environment",
+                        ),
+                        scope="canary",
+                        subset_path=Path(tmp) / "subset.json",
+                        baseline=None,
+                        head=None,
+                        exit_code=None,
+                        ran_command=False,
+                        output="",
+                    )
 
     def test_run_subset_times_out_and_returns_reportable_output(self) -> None:
         class TimeoutProcess:
@@ -210,7 +263,7 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
         self.assertIn("BENCHMARK_RUN_TIMEOUT: exceeded 1 seconds", output)
         killpg.assert_called_once_with(12345, loop.signal.SIGTERM)
 
-    def test_run_subset_passes_storage_override_to_regression_runner(self) -> None:
+    def test_run_subset_passes_infra_options_to_regression_runner(self) -> None:
         class CompletedProcess:
             pid = 12345
             returncode = 0
@@ -228,6 +281,10 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
                 shell_timeout_sec=300,
                 run_timeout_sec=60,
                 override_storage_mb=65536,
+                provider_bridge_retries=5,
+                docker_apt_proxy="http://host.docker.internal:7897",
+                verifier_proxy="http://host.docker.internal:7897",
+                provider_proxy="http://127.0.0.1:7897",
             )
 
         command = popen.call_args.args[0]
@@ -237,6 +294,13 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
         self.assertIn("300", command)
         self.assertIn("--override-storage-mb", command)
         self.assertIn("65536", command)
+        self.assertIn("--provider-bridge-retries", command)
+        self.assertIn("5", command)
+        self.assertIn("--docker-apt-proxy", command)
+        self.assertIn("http://host.docker.internal:7897", command)
+        self.assertIn("--verifier-proxy", command)
+        self.assertIn("--provider-proxy", command)
+        self.assertIn("http://127.0.0.1:7897", command)
 
 
 if __name__ == "__main__":

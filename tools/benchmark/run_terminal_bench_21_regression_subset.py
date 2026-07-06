@@ -83,8 +83,16 @@ VERIFIER_ENVIRONMENT_WARNING_PATTERNS = [
         re.compile(
             r"UNEXPECTED_EOF_WHILE_READING|"
             r"RemoteDisconnected|"
+            r"Failed to download|"
+            r"Failed to fetch|"
+            r"Error reading from server\. Remote end closed connection|"
+            r"Request failed after \d+ retries|"
+            r"tls handshake eof|"
+            r"error sending request for url|"
             r"Could not find a version that satisfies the requirement pytest|"
             r"No matching distribution found for pytest|"
+            r"Unable to locate package curl|"
+            r"/root/\.local/bin/env: No such file or directory|"
             r"uvx: command not found|"
             r"astral\.sh|"
             r"curl: \((?:18|35|56)\)",
@@ -344,6 +352,8 @@ def build_env(args: argparse.Namespace, subset: dict) -> dict[str, str]:
         env["CODEFACTORY_BENCH_OVERRIDE_STORAGE_MB"] = str(args.override_storage_mb)
     if args.docker_apt_proxy:
         env["CODEFACTORY_BENCH_DOCKER_APT_PROXY"] = args.docker_apt_proxy
+    if args.verifier_proxy:
+        env["CODEFACTORY_BENCH_VERIFIER_PROXY"] = args.verifier_proxy
     if args.provider_proxy:
         env["HTTP_PROXY"] = args.provider_proxy
         env["HTTPS_PROXY"] = args.provider_proxy
@@ -397,6 +407,7 @@ def safe_plan(
             f"- heavy_verifier_timeout_overrides: `{format_timeout_overrides(heavy_verifier_timeout_overrides(args))}`",
             f"- heavy_verifier_timeout_multiplier: `{heavy_verifier_timeout_multiplier(args, subset) or '<none>'}`",
             f"- docker_apt_proxy: `{args.docker_apt_proxy or '<none>'}`",
+            f"- verifier_proxy: `{args.verifier_proxy or '<none>'}`",
             f"- provider_proxy: `{args.provider_proxy or '<none>'}`",
             f"- provider_bridge_retries: `{args.provider_bridge_retries}`",
             f"- verifier_uv_http_timeout_sec: `{args.verifier_uv_http_timeout_sec}`",
@@ -596,6 +607,8 @@ def parse_output(output: str) -> dict[str, object]:
 def is_transient_provider_failure(
     exit_code: int, output: str, parsed: dict[str, object]
 ) -> bool:
+    if exit_code == 0 and is_transient_verifier_environment_failure(parsed):
+        return True
     if exit_code == 0:
         return False
     lowered = output.lower()
@@ -610,6 +623,11 @@ def is_transient_provider_failure(
             "connection aborted",
             "temporarily unavailable",
             "network is unreachable",
+            "failed to download",
+            "failed to fetch",
+            "tls handshake eof",
+            "request failed after",
+            "error sending request",
         ]
     )
     if not has_transient_marker:
@@ -619,6 +637,78 @@ def is_transient_provider_failure(
     provider_result = parsed.get("result") or {}
     if isinstance(provider_result, dict):
         return provider_result.get("status") != "completed"
+    return False
+
+
+def is_transient_verifier_environment_failure(parsed: dict[str, object]) -> bool:
+    trials = parsed.get("trials") or []
+    failed_tasks = [
+        str(trial.get("task") or "").split("/")[-1]
+        for trial in trials
+        if isinstance(trial, dict) and str(trial.get("reward") or "") in {"0", "0.0"}
+    ]
+    if not failed_tasks:
+        return False
+
+    job_path = parsed_job_path(parsed)
+    if not job_path:
+        return False
+    return has_transient_verifier_dependency_failure(job_path, failed_tasks)
+
+
+def parsed_job_path(parsed: dict[str, object]) -> str | None:
+    preview = parsed.get("preview")
+    if isinstance(preview, dict) and preview.get("job_path"):
+        return str(preview["job_path"])
+    provider_result = parsed.get("result")
+    if isinstance(provider_result, dict) and provider_result.get("job_path"):
+        return str(provider_result["job_path"])
+    return None
+
+
+def has_transient_verifier_dependency_failure(
+    job_path: str | Path,
+    failed_tasks: list[str] | None = None,
+) -> bool:
+    root = Path(job_path)
+    if not root.is_dir():
+        return False
+    failed_task_prefixes = {
+        task.lower()
+        for task in failed_tasks or []
+        if task and task.strip()
+    }
+    transient_pattern = re.compile(
+        r"Failed to download|"
+        r"Failed to fetch|"
+        r"Error reading from server\. Remote end closed connection|"
+        r"Request failed after \d+ retries|"
+        r"tls handshake eof|"
+        r"error sending request for url|"
+        r"UNEXPECTED_EOF_WHILE_READING|"
+        r"RemoteDisconnected|"
+        r"connection reset|"
+        r"connection aborted|"
+        r"network is unreachable|"
+        r"temporarily unavailable|"
+        r"Unable to locate package curl|"
+        r"/root/\.local/bin/env: No such file or directory|"
+        r"uvx: command not found|"
+        r"curl: \((?:18|35|56)\)",
+        re.IGNORECASE,
+    )
+    for stdout_path in sorted(root.glob("*/verifier/test-stdout.txt")):
+        trial_name = stdout_path.parents[1].name.lower()
+        if failed_task_prefixes and not any(
+            trial_name.startswith(f"{task}__") for task in failed_task_prefixes
+        ):
+            continue
+        try:
+            text = stdout_path.read_text(errors="replace")
+        except OSError:
+            continue
+        if transient_pattern.search(text):
+            return True
     return False
 
 
@@ -1070,6 +1160,10 @@ def main() -> int:
     parser.add_argument(
         "--docker-apt-proxy",
         default=os.environ.get("CODEFACTORY_BENCH_DOCKER_APT_PROXY"),
+    )
+    parser.add_argument(
+        "--verifier-proxy",
+        default=os.environ.get("CODEFACTORY_BENCH_VERIFIER_PROXY"),
     )
     parser.add_argument("--provider-bridge-retries", type=int, default=2)
     parser.add_argument(
