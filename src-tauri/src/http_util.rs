@@ -13,8 +13,75 @@
 //! or `error` (Anthropic), and surfaces the full text as `AppError::Other`.
 
 use crate::errors::{AppError, Result};
-use reqwest::{Client, Response};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde_json::Value;
+use std::time::Duration;
+
+const MODEL_HTTP_MAX_ATTEMPTS: usize = 3;
+
+fn retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(match attempt {
+        1 => 300,
+        2 => 900,
+        _ => 1500,
+    })
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        408 | 409 | 425 | 429 | 500 | 502 | 503 | 504
+    )
+}
+
+fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
+}
+
+/// Send a provider request with a short retry budget for transient transport
+/// and gateway failures. The builder closure is invoked per attempt because
+/// reqwest request bodies are one-shot.
+pub async fn send_with_retry<F>(label: &str, mut build_request: F) -> Result<Response>
+where
+    F: FnMut() -> RequestBuilder,
+{
+    for attempt in 1..=MODEL_HTTP_MAX_ATTEMPTS {
+        match build_request().send().await {
+            Ok(response) => {
+                let status = response.status();
+                if attempt < MODEL_HTTP_MAX_ATTEMPTS && is_retryable_status(status) {
+                    let detail = response.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        "{} returned transient HTTP {} on attempt {}/{}; retrying in {:?}: {}",
+                        label,
+                        status,
+                        attempt,
+                        MODEL_HTTP_MAX_ATTEMPTS,
+                        retry_delay(attempt),
+                        detail.chars().take(240).collect::<String>()
+                    );
+                    tokio::time::sleep(retry_delay(attempt)).await;
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(err) if attempt < MODEL_HTTP_MAX_ATTEMPTS && is_retryable_reqwest_error(&err) => {
+                tracing::warn!(
+                    "{} transport failure on attempt {}/{}; retrying in {:?}: {}",
+                    label,
+                    attempt,
+                    MODEL_HTTP_MAX_ATTEMPTS,
+                    retry_delay(attempt),
+                    err
+                );
+                tokio::time::sleep(retry_delay(attempt)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(AppError::Other(format!("{label} retry budget exhausted")))
+}
 
 pub async fn check_status(response: Response) -> Result<Response> {
     let status = response.status();
@@ -85,31 +152,89 @@ pub async fn post_chat_completions(
     api_key: &str,
     body: &mut Value,
 ) -> Result<Response> {
-    let mut resp = client
-        .post(url)
-        .bearer_auth(api_key)
-        .header("X-Title", "CodeFactory")
-        .header("Content-Type", "application/json")
-        .json(&*body)
-        .send()
-        .await?;
+    let mut resp = send_with_retry("chat completions request", || {
+        client
+            .post(url)
+            .bearer_auth(api_key)
+            .header("X-Title", "CodeFactory")
+            .header("Content-Type", "application/json")
+            .json(&*body)
+    })
+    .await?;
 
     if resp.status().as_u16() == 400 && body.get("max_tokens").is_some() {
         let err_text = resp.text().await.unwrap_or_default();
         if err_text.contains("max_completion_tokens") {
             crate::config::settings::force_max_completion_tokens(body);
-            resp = client
-                .post(url)
-                .bearer_auth(api_key)
-                .header("X-Title", "CodeFactory")
-                .header("Content-Type", "application/json")
-                .json(&*body)
-                .send()
-                .await?;
+            resp = send_with_retry(
+                "chat completions request after max_tokens adaptation",
+                || {
+                    client
+                        .post(url)
+                        .bearer_auth(api_key)
+                        .header("X-Title", "CodeFactory")
+                        .header("Content-Type", "application/json")
+                        .json(&*body)
+                },
+            )
+            .await?;
         } else {
             return Err(AppError::Other(format!("HTTP 400 Bad Request: {err_text}")));
         }
     }
 
     check_status(resp).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    fn serve_statuses(statuses: Vec<&'static str>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_thread = Arc::clone(&hits);
+
+        std::thread::spawn(move || {
+            for status in statuses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                hits_for_thread.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0_u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = "{}";
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+
+        (url, hits)
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_retries_transient_status() {
+        let (url, hits) = serve_statuses(vec!["503 Service Unavailable", "200 OK"]);
+        let client = Client::new();
+
+        let response = send_with_retry("test model request", || {
+            client.post(&url).json(&json!({"ok": true}))
+        })
+        .await
+        .expect("retry should succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
 }
