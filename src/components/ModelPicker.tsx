@@ -7,7 +7,7 @@ import { invoke } from "../lib/tauri";
 
 export function ModelPicker() {
   const { models, activeModel, updateActiveSessionModel, loadModels, setModel } = useChatStore();
-  const { settings, load: reloadSettings } = useSettingsStore();
+  const { settings, load: reloadSettings, save: saveSettings } = useSettingsStore();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const ref = useRef<HTMLDivElement>(null);
@@ -37,6 +37,8 @@ export function ModelPicker() {
   }, []);
 
   const displayed = activeModel.split("/").pop() ?? activeModel;
+  const activeEndpoint = settings?.default_endpoint ?? "openrouter";
+  const endpointKeys = settings ? Object.keys(settings.endpoints).sort() : [];
   const filtered = models
     .filter(
       (m) =>
@@ -55,14 +57,39 @@ export function ModelPicker() {
       <button
         onClick={() => setOpen((o) => !o)}
         className="flex items-center gap-1 rounded px-2 py-1 text-xs text-gray-400 hover:text-gray-200 hover:bg-surface-3 transition-colors"
+        title={`${activeEndpoint} / ${activeModel}`}
       >
-        <span className="max-w-[160px] truncate">{displayed}</span>
+        <span className="max-w-[160px] truncate">{activeEndpoint} / {displayed}</span>
         <ChevronDown size={12} />
       </button>
 
       {open && (
         <div className="absolute right-0 top-full mt-1 z-50 w-72 rounded-lg border border-border bg-surface-2 shadow-xl">
-          <div className="p-2 border-b border-border">
+          <div className="space-y-2 p-2 border-b border-border">
+            {endpointKeys.length > 1 && (
+              <select
+                value={activeEndpoint}
+                onChange={async (e) => {
+                  if (!settings) return;
+                  const endpointName = e.target.value;
+                  await saveSettings({ ...settings, default_endpoint: endpointName });
+                  await loadModels(endpointName);
+                  const model = await invoke<string>("get_endpoint_active_model", {
+                    endpointName,
+                  }).catch(() => "");
+                  if (model) {
+                    await updateActiveSessionModel(model);
+                  }
+                  await reloadSettings();
+                  setQuery("");
+                }}
+                className="w-full bg-surface-3 rounded px-2 py-1 text-xs text-gray-200 outline-none"
+              >
+                {endpointKeys.map((key) => (
+                  <option key={key} value={key}>{key}</option>
+                ))}
+              </select>
+            )}
             <input
               autoFocus
               value={query}

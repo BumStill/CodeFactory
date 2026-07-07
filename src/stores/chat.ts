@@ -230,6 +230,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const unlistenSessionUpdated = await onSessionUpdated(id, (session) => {
         set((s) => ({
           activeSession: s.activeSession?.id === session.id ? session : s.activeSession,
+          activeModel: s.activeSession?.id === session.id ? session.model_id : s.activeModel,
           sessions: s.sessions.map((existing) => (existing.id === session.id ? session : existing)),
           quickSessions: s.quickSessions.map((existing) =>
             existing.id === session.id ? session : existing,

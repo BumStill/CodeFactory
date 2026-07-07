@@ -8,13 +8,14 @@
 //! The plan is either supplied explicitly or auto-detected from the project
 //! layout by [`detect_verification_plan`].
 
+use crate::util::command_env;
+use crate::util::no_window::NoWindow;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 use tokio::time::{timeout, Duration};
-use crate::util::no_window::NoWindow;
 
 /// Timeout for every command-based check.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -244,6 +245,7 @@ async fn run_command_check(
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command_env::apply_developer_path(&mut cmd);
 
         timeout(CHECK_TIMEOUT, async move {
             match cmd.output().await {
@@ -267,11 +269,13 @@ async fn run_command_check(
         let cmd_owned = cmd_str.to_string();
         let cwd_owned = cwd.to_string();
         timeout(CHECK_TIMEOUT, async move {
-            let mut cmd = tokio::process::Command::new("cmd").no_window();
-            cmd.args(["/C", &cmd_owned])
+            let shell = command_env::shell_invocation(&cmd_owned);
+            let mut cmd = tokio::process::Command::new(shell.program).no_window();
+            cmd.args(shell.args)
                 .current_dir(&cwd_owned)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            command_env::apply_developer_path(&mut cmd);
             match cmd.output().await {
                 Ok(out) => {
                     let mut combined = String::from_utf8_lossy(&out.stdout).to_string();
