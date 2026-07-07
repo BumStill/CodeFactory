@@ -992,20 +992,22 @@ impl AgentLoop {
             "reasoning": { "effort": effort, "summary": "auto" },
         });
 
-        let mut request = self
-            .http
-            .post(&url)
-            .bearer_auth(&access_token)
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "codex_cli_rs")
-            .header("session_id", &self.session_id)
-            .header("Accept", "text/event-stream")
-            .json(&body);
-        if let Some(acct) = &account_id {
-            request = request.header("chatgpt-account-id", acct.as_str());
-        }
-
-        let response = request.send().await?;
+        let response = crate::http_util::send_with_retry("ChatGPT Responses stream request", || {
+            let mut request = self
+                .http
+                .post(&url)
+                .bearer_auth(&access_token)
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "codex_cli_rs")
+                .header("session_id", &self.session_id)
+                .header("Accept", "text/event-stream")
+                .json(&body);
+            if let Some(acct) = &account_id {
+                request = request.header("chatgpt-account-id", acct.as_str());
+            }
+            request
+        })
+        .await?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -1155,14 +1157,17 @@ impl AgentLoop {
         // below, only when the server itself rejects `max_tokens`.
         let mut body = serde_json::to_value(&req)?;
 
-        let mut response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .header("X-Title", "CodeFactory")
-            .json(&body)
-            .send()
-            .await?;
+        let mut response = crate::http_util::send_with_retry(
+            "OpenAI-compatible chat stream request",
+            || {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&self.api_key)
+                    .header("X-Title", "CodeFactory")
+                    .json(&body)
+            },
+        )
+        .await?;
 
         // Reactive safety net for the GPT-5 / o-series `max_tokens` rejection.
         // The name-based adaptation above handles the common ids, but providers,
@@ -1175,14 +1180,17 @@ impl AgentLoop {
             let err_text = response.text().await.unwrap_or_default();
             if err_text.contains("max_completion_tokens") {
                 crate::config::settings::force_max_completion_tokens(&mut body);
-                response = self
-                    .http
-                    .post(&url)
-                    .bearer_auth(&self.api_key)
-                    .header("X-Title", "CodeFactory")
-                    .json(&body)
-                    .send()
-                    .await?;
+                response = crate::http_util::send_with_retry(
+                    "OpenAI-compatible chat stream request after max_tokens adaptation",
+                    || {
+                        self.http
+                            .post(&url)
+                            .bearer_auth(&self.api_key)
+                            .header("X-Title", "CodeFactory")
+                            .json(&body)
+                    },
+                )
+                .await?;
             } else {
                 // A different 400 — surface the provider's real reason.
                 return Err(crate::errors::AppError::Other(format!(

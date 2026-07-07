@@ -50,15 +50,16 @@ impl OpenRouterClient {
         let url = format!("{}/chat/completions", self.base_url);
         let event_name = format!("stream:{session_id}");
 
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .header("X-Title", "CodeFactory")
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
+        let body = serde_json::to_value(&request)?;
+        let response = crate::http_util::send_with_retry("OpenRouter stream request", || {
+            self.http
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .header("X-Title", "CodeFactory")
+                .header("Content-Type", "application/json")
+                .json(&body)
+        })
+        .await?;
         let response = crate::http_util::check_status(response).await?;
 
         let mut stream = response.bytes_stream();
