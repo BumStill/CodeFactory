@@ -62,8 +62,34 @@ describe("chat context stream events", () => {
     });
   });
 
+  it("records model transport retries on the active assistant message", () => {
+    const next = reduceChatStreamEvent(
+      baseState(),
+      {
+        type: "transport_retry",
+        label: "OpenAI-compatible chat stream request",
+        attempt: 1,
+        max_attempts: 3,
+        delay_ms: 300,
+        reason: "HTTP 503 Service Unavailable",
+      },
+      "assistant-1",
+    );
+
+    expect(next.messages[0].transportRetries).toEqual([
+      {
+        label: "OpenAI-compatible chat stream request",
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 300,
+        reason: "HTTP 503 Service Unavailable",
+      },
+    ]);
+  });
+
   it("keeps exactly one reducer branch for each context event type", () => {
     expect(source.match(/case "context_usage"/g)).toHaveLength(1);
     expect(source.match(/case "context_compressed"/g)).toHaveLength(1);
+    expect(source.match(/case "transport_retry"/g)).toHaveLength(1);
   });
 });

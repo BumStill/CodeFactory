@@ -19,6 +19,15 @@ use std::time::Duration;
 
 const MODEL_HTTP_MAX_ATTEMPTS: usize = 3;
 
+#[derive(Debug, Clone)]
+pub struct RetryNotice {
+    pub label: String,
+    pub attempt: usize,
+    pub max_attempts: usize,
+    pub delay: Duration,
+    pub reason: String,
+}
+
 fn retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(match attempt {
         1 => 300,
@@ -45,36 +54,74 @@ pub async fn send_with_retry<F>(label: &str, mut build_request: F) -> Result<Res
 where
     F: FnMut() -> RequestBuilder,
 {
+    send_with_retry_and_notify(label, || build_request(), |_| {}).await
+}
+
+pub async fn send_with_retry_and_notify<F, N>(
+    label: &str,
+    mut build_request: F,
+    mut notify_retry: N,
+) -> Result<Response>
+where
+    F: FnMut() -> RequestBuilder,
+    N: FnMut(RetryNotice),
+{
     for attempt in 1..=MODEL_HTTP_MAX_ATTEMPTS {
         match build_request().send().await {
             Ok(response) => {
                 let status = response.status();
                 if attempt < MODEL_HTTP_MAX_ATTEMPTS && is_retryable_status(status) {
                     let detail = response.text().await.unwrap_or_default();
+                    let delay = retry_delay(attempt);
+                    let reason = format!(
+                        "HTTP {}{}",
+                        status,
+                        if detail.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", detail.chars().take(240).collect::<String>())
+                        }
+                    );
                     tracing::warn!(
                         "{} returned transient HTTP {} on attempt {}/{}; retrying in {:?}: {}",
                         label,
                         status,
                         attempt,
                         MODEL_HTTP_MAX_ATTEMPTS,
-                        retry_delay(attempt),
+                        delay,
                         detail.chars().take(240).collect::<String>()
                     );
-                    tokio::time::sleep(retry_delay(attempt)).await;
+                    notify_retry(RetryNotice {
+                        label: label.to_string(),
+                        attempt,
+                        max_attempts: MODEL_HTTP_MAX_ATTEMPTS,
+                        delay,
+                        reason,
+                    });
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 return Ok(response);
             }
             Err(err) if attempt < MODEL_HTTP_MAX_ATTEMPTS && is_retryable_reqwest_error(&err) => {
+                let delay = retry_delay(attempt);
+                let reason = format!("transport error: {err}");
                 tracing::warn!(
                     "{} transport failure on attempt {}/{}; retrying in {:?}: {}",
                     label,
                     attempt,
                     MODEL_HTTP_MAX_ATTEMPTS,
-                    retry_delay(attempt),
+                    delay,
                     err
                 );
-                tokio::time::sleep(retry_delay(attempt)).await;
+                notify_retry(RetryNotice {
+                    label: label.to_string(),
+                    attempt,
+                    max_attempts: MODEL_HTTP_MAX_ATTEMPTS,
+                    delay,
+                    reason,
+                });
+                tokio::time::sleep(delay).await;
             }
             Err(err) => return Err(err.into()),
         }
@@ -236,5 +283,27 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_notifies_transient_status() {
+        let (url, _hits) = serve_statuses(vec!["503 Service Unavailable", "200 OK"]);
+        let client = Client::new();
+        let mut notices = Vec::new();
+
+        let response = send_with_retry_and_notify(
+            "test model request",
+            || client.post(&url).json(&json!({"ok": true})),
+            |notice| notices.push(notice),
+        )
+        .await
+        .expect("retry should succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].label, "test model request");
+        assert_eq!(notices[0].attempt, 1);
+        assert_eq!(notices[0].max_attempts, 3);
+        assert!(notices[0].reason.contains("HTTP 503"));
     }
 }

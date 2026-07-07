@@ -21,6 +21,7 @@ export interface UIMessage {
   role: "user" | "assistant" | "tool" | "system";
   content: string;
   toolCalls?: ToolCallState[];
+  transportRetries?: TransportRetryState[];
   inputTokens?: number;
   outputTokens?: number;
   createdAt: number;
@@ -28,6 +29,14 @@ export interface UIMessage {
    *  state (done/error). Absent while still streaming (the UI ticks live off
    *  `createdAt` instead) and for plain user messages. */
   durationMs?: number;
+}
+
+export interface TransportRetryState {
+  label: string;
+  attempt: number;
+  maxAttempts: number;
+  delayMs: number;
+  reason: string;
 }
 
 export interface ContextUsage {
@@ -172,6 +181,28 @@ export function reduceChatStreamEvent(
           tokensFreed: event.tokens_freed,
           id: Date.now(),
         },
+      };
+
+    case "transport_retry":
+      return {
+        ...state,
+        messages: state.messages.map((m) =>
+          m.id === msgId
+            ? {
+                ...m,
+                transportRetries: [
+                  ...(m.transportRetries ?? []),
+                  {
+                    label: event.label,
+                    attempt: event.attempt,
+                    maxAttempts: event.max_attempts,
+                    delayMs: event.delay_ms,
+                    reason: event.reason,
+                  },
+                ],
+              }
+            : m,
+        ),
       };
 
     case "tool_call_args_delta":

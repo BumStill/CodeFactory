@@ -229,6 +229,15 @@ pub enum StreamEvent {
         elided_count: usize,
         tokens_freed: u32,
     },
+    /// The provider request hit a transient transport or gateway failure and
+    /// is being retried in-place instead of failing the user-visible turn.
+    TransportRetry {
+        label: String,
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        reason: String,
+    },
     Error {
         message: String,
     },

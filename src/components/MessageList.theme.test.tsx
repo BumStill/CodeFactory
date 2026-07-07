@@ -9,7 +9,7 @@
 // visual bug we shipped in v0.5.1 and want to prevent regressing.
 
 import { describe, it, expect } from "vitest";
-import { render } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { MessageList } from "./MessageList";
 import type { UIMessage } from "../stores/chatEvents";
 
@@ -58,6 +58,33 @@ describe("MessageList theme readability", () => {
     const cls = code!.className;
     // Forbidden: unconditional text-amber-200 (was the v0.5.1 bug).
     expect(cls).not.toMatch(/(^|\s)text-amber-200(\s|$)/);
+  });
+
+  it("shows model transport retry status on the assistant message", () => {
+    render(
+      <MessageList
+        messages={[
+          baseMsg({
+            content: "",
+            transportRetries: [
+              {
+                label: "OpenAI-compatible chat stream request",
+                attempt: 1,
+                maxAttempts: 3,
+                delayMs: 300,
+                reason: "HTTP 503 Service Unavailable",
+              },
+            ],
+          }),
+        ]}
+        streaming={true}
+        cwd={null}
+      />,
+    );
+
+    expect(screen.getByText(/模型连接重试 1\/3/)).toBeTruthy();
+    expect(screen.getByText(/HTTP 503 Service Unavailable/)).toBeTruthy();
+    expect(screen.queryByText(/Thinking/)).toBeNull();
   });
 
 });

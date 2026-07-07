@@ -238,7 +238,11 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
     );
   }
 
-  const showThinkingHint = isStreamingTail && !msg.content && (!msg.toolCalls || msg.toolCalls.length === 0);
+  const showThinkingHint =
+    isStreamingTail &&
+    !msg.content &&
+    (!msg.toolCalls || msg.toolCalls.length === 0) &&
+    (!msg.transportRetries || msg.transportRetries.length === 0);
   // Show Remember only once streaming has settled — a half-written
   // message isn't worth saving as a fact.
   const showRemember = !!cwd && !isStreamingTail && !!msg.content;
@@ -255,6 +259,14 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
     <div className="group text-sm text-gray-200 space-y-1.5">
       {msg.toolCalls?.map((tc) => (
         <ToolCallCard key={tc.id} tc={tc} />
+      ))}
+      {msg.transportRetries?.map((retry, index) => (
+        <div
+          key={`${retry.attempt}-${index}`}
+          className="w-fit max-w-full rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] leading-snug text-amber-800 dark:text-amber-200 break-words"
+        >
+          模型连接重试 {retry.attempt}/{retry.maxAttempts} · {retry.reason}
+        </div>
       ))}
       {msg.content && (
         <div className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">

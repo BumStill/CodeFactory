@@ -30,6 +30,14 @@ export type StreamEvent =
   | { type: "done"; input_tokens: number; output_tokens: number }
   | { type: "context_usage"; used_tokens: number; limit_tokens: number }
   | { type: "context_compressed"; elided_count: number; tokens_freed: number }
+  | {
+      type: "transport_retry";
+      label: string;
+      attempt: number;
+      max_attempts: number;
+      delay_ms: number;
+      reason: string;
+    }
   | { type: "error"; message: string };
 
 export interface Session {
