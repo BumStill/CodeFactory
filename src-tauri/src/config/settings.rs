@@ -292,6 +292,21 @@ pub struct ShellConfig {
     pub shell: String,
 }
 
+fn default_shell_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "powershell"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "zsh"
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        "bash"
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         let mut endpoints = HashMap::new();
@@ -334,7 +349,7 @@ impl Default for Settings {
                 full_access: false,
             },
             shell: ShellConfig {
-                shell: "powershell".into(),
+                shell: default_shell_name().into(),
             },
             hooks: vec![],
             mcp_servers: vec![],
@@ -385,6 +400,54 @@ mod reasoning_effort_tests {
         }))
         .expect("settings without reasoning_effort should deserialize");
         assert_eq!(s.reasoning_effort, ReasoningEffort::Medium);
+    }
+
+    #[test]
+    fn resolves_chatgpt_request_to_supported_endpoint_model() {
+        let mut settings = Settings::default();
+        settings.default_endpoint = "chatgpt".into();
+        settings.default_model = "anthropic/claude-opus-4-7".into();
+        settings.endpoints.insert(
+            "chatgpt".into(),
+            Endpoint {
+                base_url: "https://chatgpt.com/backend-api/codex".into(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                custom_models: vec![CustomModel {
+                    id: "gpt-5.5".into(),
+                    name: Some("GPT-5.5".into()),
+                    context_length: Some(272000),
+                }],
+                active_model: Some("gpt-5.5".into()),
+            },
+        );
+
+        let resolved = settings.resolve_model_for_endpoint("chatgpt", "anthropic/claude-opus-4-7");
+
+        assert_eq!(resolved.as_deref(), Some("gpt-5.5"));
+    }
+
+    #[test]
+    fn resolves_direct_endpoint_to_active_model_even_without_custom_list() {
+        let mut settings = Settings::default();
+        settings.default_endpoint = "deepseek".into();
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://api.deepseek.com".into(),
+                key_ref: Some("codefactory.endpoint.deepseek".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+
+        let resolved = settings.resolve_model_for_endpoint(
+            "deepseek",
+            "anthropic/claude-opus-4-7",
+        );
+
+        assert_eq!(resolved.as_deref(), Some("deepseek-v4-pro"));
     }
 }
 
@@ -489,11 +552,16 @@ pub fn load() -> Settings {
     // dropped write_docx untouched.
     {
         let p = &mut settings.permissions;
-        if p.allow.iter().any(|t| t == "write_docx")
-            && !p.allow.iter().any(|t| t == "read_xlsx")
-        {
+        if p.allow.iter().any(|t| t == "write_docx") && !p.allow.iter().any(|t| t == "read_xlsx") {
             p.allow.push("read_xlsx".into());
             p.allow.push("edit_xlsx".into());
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        if settings.shell.shell == "powershell" || settings.shell.shell == "cmd" {
+            settings.shell.shell = default_shell_name().into();
         }
     }
 
@@ -595,6 +663,56 @@ impl Settings {
             return self.default_model.clone();
         }
         String::new()
+    }
+
+    /// Resolve the model that is safe to send to a concrete endpoint.
+    ///
+    /// Sessions store only `model_id` for backward compatibility. If the user
+    /// switches the default endpoint after a session was created, that stored
+    /// model can belong to a different provider. ChatGPT/Codex is strict about
+    /// accepted model slugs, and direct custom endpoints usually expect the
+    /// endpoint's own active model. This resolver repairs that mismatch before
+    /// the request leaves the app.
+    pub fn resolve_model_for_endpoint(
+        &self,
+        endpoint_name: &str,
+        requested_model: &str,
+    ) -> Option<String> {
+        let ep = self.endpoints.get(endpoint_name)?;
+        let requested = requested_model.trim();
+        let active = ep.active_model.as_deref().unwrap_or("").trim();
+
+        if !requested.is_empty() && requested == active {
+            return Some(requested.to_string());
+        }
+
+        if !requested.is_empty() && ep.custom_models.iter().any(|m| m.id == requested) {
+            return Some(requested.to_string());
+        }
+
+        let has_endpoint_model = !active.is_empty() || !ep.custom_models.is_empty();
+        let should_repair_to_endpoint_model = matches!(ep.api_style, ApiStyle::Chatgpt)
+            || (has_endpoint_model && !ep.base_url.contains("openrouter.ai"));
+
+        if should_repair_to_endpoint_model {
+            if !active.is_empty() {
+                return Some(active.to_string());
+            }
+            if let Some(first) = ep.custom_models.first() {
+                return Some(first.id.clone());
+            }
+        }
+
+        if !requested.is_empty() {
+            return Some(requested.to_string());
+        }
+
+        let fallback = self.active_model_for(endpoint_name);
+        if fallback.is_empty() {
+            None
+        } else {
+            Some(fallback)
+        }
     }
 
     /// Set the active model for an endpoint. Returns true if anything changed.

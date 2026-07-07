@@ -179,10 +179,46 @@ pub async fn send_message(
         .unwrap_or_else(|| format!("codefactory.endpoint.{}", settings.default_endpoint));
     let api_key = crate::secrets::get_key(&key_ref)?.unwrap_or_default();
 
+    let resolved_model = settings
+        .resolve_model_for_endpoint(&settings.default_endpoint, &session.model_id)
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "No model configured for endpoint '{}'. Please choose a model in the picker.",
+                settings.default_endpoint
+            ))
+        })?;
+
+    if resolved_model != session.model_id {
+        tracing::warn!(
+            "send_message: repaired session model '{}' to endpoint '{}' active model '{}'",
+            session.model_id,
+            settings.default_endpoint,
+            resolved_model
+        );
+        let pool = state.db.read().await;
+        let now = Utc::now().timestamp_millis();
+        sqlx::query("UPDATE sessions SET model_id = ?, updated_at = ? WHERE id = ?")
+            .bind(&resolved_model)
+            .bind(now)
+            .bind(&session_id)
+            .execute(&*pool)
+            .await?;
+        if let Ok(updated_session) = sqlx::query_as::<_, crate::storage::Session>(
+            "SELECT * FROM sessions WHERE id = ?",
+        )
+        .bind(&session_id)
+        .fetch_one(&*pool)
+        .await
+        {
+            let event_name = format!("session_updated:{}", session_id);
+            app.emit(&event_name, &updated_session).ok();
+        }
+    }
+
     tracing::info!(
         "send_message: endpoint={} model={} key_ref={} key_len={}",
         endpoint.base_url,
-        session.model_id,
+        resolved_model,
         key_ref,
         api_key.len(),
     );
@@ -253,7 +289,7 @@ pub async fn send_message(
             app,
             db,
             session_id_clone,
-            session.model_id,
+            resolved_model,
             endpoint.base_url,
             api_key,
             api_style,
@@ -336,6 +372,15 @@ pub async fn send_message_anonymous(
         .ok_or_else(|| AppError::Other("No default endpoint configured".into()))?
         .clone();
     let api_style = endpoint.api_style.clone();
+    let resolved_model = settings
+        .resolve_model_for_endpoint(&settings.default_endpoint, &model_id)
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "No model configured for endpoint '{}'. Please choose a model in the picker.",
+                settings.default_endpoint
+            ))
+        })?;
+
     let key_ref = endpoint
         .key_ref
         .clone()
@@ -390,7 +435,7 @@ pub async fn send_message_anonymous(
             app,
             db,
             session_id_clone,
-            model_id,
+            resolved_model,
             endpoint.base_url,
             api_key,
             api_style,

@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::util::command_env;
 use crate::util::no_window::NoWindow;
 
 use super::{shell_policy, ExecCtx, ToolOutput};
@@ -30,8 +31,9 @@ pub fn definition() -> ToolDefinition {
         r#type: "function".into(),
         function: FunctionDefinition {
             name: "bash".into(),
-            description: "Run a shell command via PowerShell. Returns stdout+stderr. Timeout 120s."
-                .into(),
+            description:
+                "Run a shell command in the project directory. Returns stdout+stderr. Timeout 120s."
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -67,23 +69,25 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     }
     let risk = policy.risk();
 
-    let result = timeout(
-        Duration::from_secs(TIMEOUT_SECS),
-        Command::new("powershell")
-            .no_window()
-            .args(["-NonInteractive", "-NoProfile", "-Command", &a.command])
-            .current_dir(&ctx.cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output(),
-    )
-    .await;
+    let shell = command_env::shell_invocation(&a.command);
+    let mut cmd = Command::new(shell.program).no_window();
+    cmd.args(shell.args)
+        .current_dir(&ctx.cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command_env::apply_developer_path(&mut cmd);
+
+    let result = timeout(Duration::from_secs(TIMEOUT_SECS), cmd.output()).await;
 
     match result {
         Err(_) => Ok(ToolOutput::err(format!(
             "Command timed out after {TIMEOUT_SECS}s"
         ))),
-        Ok(Err(e)) => Ok(ToolOutput::err(format!("Failed to spawn process: {e}"))),
+        Ok(Err(e)) => Ok(ToolOutput::err(format!(
+            "Failed to spawn shell '{}': {e}. PATH={}",
+            shell.program,
+            std::env::var("PATH").unwrap_or_else(|_| "<unset>".into())
+        ))),
         Ok(Ok(output)) => {
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -145,7 +149,12 @@ mod tests {
     #[tokio::test]
     async fn successful_command_output_includes_shell_audit_metadata() {
         if std::process::Command::new("powershell")
-            .args(["-NonInteractive", "-NoProfile", "-Command", "$PSVersionTable.PSVersion"])
+            .args([
+                "-NonInteractive",
+                "-NoProfile",
+                "-Command",
+                "$PSVersionTable.PSVersion",
+            ])
             .output()
             .is_err()
         {
@@ -173,5 +182,32 @@ mod tests {
         assert!(output.content.contains("risk=low"));
         assert!(output.content.contains("exit_code=0"));
         assert!(output.content.contains("cwd="));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_command_uses_available_platform_shell() {
+        let cwd = std::env::temp_dir().join(format!("codefactory-bash-unix-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+
+        let output = execute(
+            json!({
+                "command": "printf codefactory-shell-ok",
+            }),
+            &ExecCtx::new(cwd.clone(), None),
+        )
+        .await
+        .expect("tool returns output");
+
+        let _ = std::fs::remove_dir_all(cwd);
+
+        assert!(
+            !output.is_error,
+            "expected platform shell success, got: {}",
+            output.content
+        );
+        assert!(output.content.contains("codefactory-shell-ok"));
+        assert!(output.content.contains("[shell-audit]"));
+        assert!(output.content.contains("exit_code=0"));
     }
 }

@@ -16,6 +16,10 @@ interface Props {
 }
 
 type Tab = "endpoints" | "permissions" | "general" | "hooks" | "remotes" | "appearance" | "about";
+const SHELL_OPTIONS =
+  typeof navigator !== "undefined" && /Mac|Linux/.test(navigator.platform)
+    ? ["zsh", "bash", "powershell", "cmd"]
+    : ["powershell", "cmd", "bash"];
 
 // ── Hooks types ───────────────────────────────────────────────────────────────
 
@@ -444,7 +448,9 @@ export function SettingsPage({ onBack }: Props) {
     Promise.all(
       keys.map(async (k) => {
         const ep = settings.endpoints[k];
-        const apiKey = ep.key_ref ? (await getApiKey(ep.key_ref)) ?? "" : "";
+        const apiKey = ep.key_ref
+          ? (await getApiKey(ep.key_ref).catch(() => null)) ?? ""
+          : "";
         const draft: EndpointDraft = {
           key: k,
           base_url: ep.base_url,
@@ -650,7 +656,7 @@ export function SettingsPage({ onBack }: Props) {
               ))}
 
             {endpointDrafts.filter((d) => d.key !== CHATGPT_ENDPOINT_KEY).length === 0 && (
-              <p className="text-xs text-gray-600">尚未配置端点。</p>
+              <p className="text-xs text-gray-600">尚未配置自定义 API 端点。</p>
             )}
 
             {showAddEp && (
@@ -732,7 +738,7 @@ export function SettingsPage({ onBack }: Props) {
             <div className="space-y-1">
               <label className="text-xs text-gray-500">Shell</label>
               <div className="flex gap-3">
-                {["powershell", "cmd", "bash"].map((s) => (
+                {SHELL_OPTIONS.map((s) => (
                   <label key={s} className="flex items-center gap-1.5 cursor-pointer">
                     <input
                       type="radio"
