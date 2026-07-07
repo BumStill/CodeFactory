@@ -51,14 +51,30 @@ impl OpenRouterClient {
         let event_name = format!("stream:{session_id}");
 
         let body = serde_json::to_value(&request)?;
-        let response = crate::http_util::send_with_retry("OpenRouter stream request", || {
-            self.http
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .header("X-Title", "CodeFactory")
-                .header("Content-Type", "application/json")
-                .json(&body)
-        })
+        let response = crate::http_util::send_with_retry_and_notify(
+            "OpenRouter stream request",
+            || {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&self.api_key)
+                    .header("X-Title", "CodeFactory")
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+            },
+            |notice| {
+                app.emit(
+                    &event_name,
+                    StreamEvent::TransportRetry {
+                        label: notice.label,
+                        attempt: notice.attempt as u32,
+                        max_attempts: notice.max_attempts as u32,
+                        delay_ms: notice.delay.as_millis() as u64,
+                        reason: notice.reason,
+                    },
+                )
+                .ok();
+            },
+        )
         .await?;
         let response = crate::http_util::check_status(response).await?;
 

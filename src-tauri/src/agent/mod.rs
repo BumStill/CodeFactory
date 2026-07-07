@@ -326,6 +326,24 @@ pub struct AgentExecutionContext {
 }
 
 impl AgentLoop {
+    fn emit_transport_retry(
+        app: &AppHandle,
+        event_name: &str,
+        notice: crate::http_util::RetryNotice,
+    ) {
+        app.emit(
+            event_name,
+            StreamEvent::TransportRetry {
+                label: notice.label,
+                attempt: notice.attempt as u32,
+                max_attempts: notice.max_attempts as u32,
+                delay_ms: notice.delay.as_millis() as u64,
+                reason: notice.reason,
+            },
+        )
+        .ok();
+    }
+
     pub fn new(
         app: AppHandle,
         db: SqlitePool,
@@ -992,21 +1010,25 @@ impl AgentLoop {
             "reasoning": { "effort": effort, "summary": "auto" },
         });
 
-        let response = crate::http_util::send_with_retry("ChatGPT Responses stream request", || {
-            let mut request = self
-                .http
-                .post(&url)
-                .bearer_auth(&access_token)
-                .header("OpenAI-Beta", "responses=experimental")
-                .header("originator", "codex_cli_rs")
-                .header("session_id", &self.session_id)
-                .header("Accept", "text/event-stream")
-                .json(&body);
-            if let Some(acct) = &account_id {
-                request = request.header("chatgpt-account-id", acct.as_str());
-            }
-            request
-        })
+        let response = crate::http_util::send_with_retry_and_notify(
+            "ChatGPT Responses stream request",
+            || {
+                let mut request = self
+                    .http
+                    .post(&url)
+                    .bearer_auth(&access_token)
+                    .header("OpenAI-Beta", "responses=experimental")
+                    .header("originator", "codex_cli_rs")
+                    .header("session_id", &self.session_id)
+                    .header("Accept", "text/event-stream")
+                    .json(&body);
+                if let Some(acct) = &account_id {
+                    request = request.header("chatgpt-account-id", acct.as_str());
+                }
+                request
+            },
+            |notice| Self::emit_transport_retry(&self.app, event_name, notice),
+        )
         .await?;
         let status = response.status();
         if !status.is_success() {
@@ -1157,7 +1179,7 @@ impl AgentLoop {
         // below, only when the server itself rejects `max_tokens`.
         let mut body = serde_json::to_value(&req)?;
 
-        let mut response = crate::http_util::send_with_retry(
+        let mut response = crate::http_util::send_with_retry_and_notify(
             "OpenAI-compatible chat stream request",
             || {
                 self.http
@@ -1166,6 +1188,7 @@ impl AgentLoop {
                     .header("X-Title", "CodeFactory")
                     .json(&body)
             },
+            |notice| Self::emit_transport_retry(&self.app, event_name, notice),
         )
         .await?;
 
@@ -1180,7 +1203,7 @@ impl AgentLoop {
             let err_text = response.text().await.unwrap_or_default();
             if err_text.contains("max_completion_tokens") {
                 crate::config::settings::force_max_completion_tokens(&mut body);
-                response = crate::http_util::send_with_retry(
+                response = crate::http_util::send_with_retry_and_notify(
                     "OpenAI-compatible chat stream request after max_tokens adaptation",
                     || {
                         self.http
@@ -1189,6 +1212,7 @@ impl AgentLoop {
                             .header("X-Title", "CodeFactory")
                             .json(&body)
                     },
+                    |notice| Self::emit_transport_retry(&self.app, event_name, notice),
                 )
                 .await?;
             } else {
