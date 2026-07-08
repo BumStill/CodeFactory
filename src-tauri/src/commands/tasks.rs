@@ -315,6 +315,15 @@ pub async fn cancel_implementation(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn retry_failed_tasks(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<u64, AppError> {
+    let pool = state.db.read().await;
+    tasks::retry_failed_tasks(&pool, &session_id).await
+}
+
 /// Return the persisted verification results for a task.
 /// Returns an empty Vec when the task hasn't been verified yet.
 #[tauri::command]

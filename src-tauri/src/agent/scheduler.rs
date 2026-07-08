@@ -50,6 +50,47 @@ const MAX_ATTEMPTS: u32 = 3;
 /// Poll interval when no new tasks can be dispatched but some are still in flight.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+#[derive(Debug)]
+enum VerificationAttemptDecision {
+    Retry { error: String },
+    Finish(SubagentResult),
+}
+
+fn failed_verification_message(verif_results: &[verification::VerificationResult]) -> String {
+    let mut verif_msg = String::from("Previous attempt failed verification:\n");
+    for r in verif_results {
+        if !r.passed {
+            verif_msg.push_str(&format!(
+                "- {}: FAILED\n  {}\n",
+                r.check,
+                r.output.lines().take(20).collect::<Vec<_>>().join("\n  ")
+            ));
+        }
+    }
+    verif_msg.push_str("Please fix the above errors.");
+    verif_msg
+}
+
+fn settle_result_after_verification(
+    mut result: SubagentResult,
+    verif_results: &[verification::VerificationResult],
+    attempt: u32,
+    max_attempts: u32,
+) -> VerificationAttemptDecision {
+    if !verif_results.iter().any(|r| !r.passed) {
+        return VerificationAttemptDecision::Finish(result);
+    }
+
+    let error = failed_verification_message(verif_results);
+    if attempt < max_attempts {
+        return VerificationAttemptDecision::Retry { error };
+    }
+
+    result.completed = false;
+    result.summary = format!("Failed after {max_attempts} attempts (verification):\n{error}");
+    VerificationAttemptDecision::Finish(result)
+}
+
 #[derive(Clone)]
 pub struct TaskScheduler {
     pub pool: SqlitePool,
@@ -224,6 +265,7 @@ impl TaskScheduler {
                     for attempt in 1..=MAX_ATTEMPTS {
                         // Emit retry event on attempts 2+.
                         if attempt > 1 {
+                            tasks::increment_attempt(&pool, &task_id).await.ok();
                             emit_retry(&app, &session_id_for_task, &task_id, attempt);
                         }
 
@@ -417,52 +459,41 @@ impl TaskScheduler {
                                     .ok();
                                 }
 
-                                let any_failed = verif_results.iter().any(|r| !r.passed);
-
-                                if any_failed && attempt < MAX_ATTEMPTS {
-                                    // Build a rich error message for the next brief.
-                                    let mut verif_msg = String::from(
-                                        "Previous attempt failed verification:\n",
-                                    );
-                                    for r in &verif_results {
-                                        if !r.passed {
-                                            verif_msg.push_str(&format!(
-                                                "- {}: FAILED\n  {}\n",
-                                                r.check,
-                                                r.output.lines().take(20).collect::<Vec<_>>().join("\n  ")
-                                            ));
-                                        }
+                                match settle_result_after_verification(
+                                    result,
+                                    &verif_results,
+                                    attempt,
+                                    MAX_ATTEMPTS,
+                                ) {
+                                    VerificationAttemptDecision::Retry { error } => {
+                                        tracing::warn!(
+                                            "scheduler: task {} attempt {attempt} failed verification",
+                                            task_id
+                                        );
+                                        prev_error = Some(error);
+                                        emit_task(
+                                            &app,
+                                            &session_id_for_task,
+                                            "task_progress",
+                                            &TaskEventPayload {
+                                                task_id: &task_id,
+                                                title: None,
+                                                message: Some(&format!(
+                                                    "Attempt {attempt} incomplete, retrying…"
+                                                )),
+                                                result: None,
+                                                error: None,
+                                                files_changed: None,
+                                                cwd: None,
+                                            },
+                                        );
+                                        continue;
                                     }
-                                    verif_msg
-                                        .push_str("Please fix the above errors.");
-
-                                    tracing::warn!(
-                                        "scheduler: task {} attempt {attempt} failed verification",
-                                        task_id
-                                    );
-                                    prev_error = Some(verif_msg.clone());
-                                    emit_task(
-                                        &app,
-                                        &session_id_for_task,
-                                        "task_progress",
-                                        &TaskEventPayload {
-                                            task_id: &task_id,
-                                            title: None,
-                                            message: Some(&format!(
-                                                "Attempt {attempt} incomplete, retrying…"
-                                            )),
-                                            result: None,
-                                            error: None,
-                                            files_changed: None,
-                                            cwd: None,
-                                        },
-                                    );
-                                    continue;
+                                    VerificationAttemptDecision::Finish(outcome) => {
+                                        final_outcome = Some(outcome);
+                                        break;
+                                    }
                                 }
-
-                                // Success (or exhausted but verification is the stopper).
-                                final_outcome = Some(result);
-                                break;
                             }
                         }
                     }
@@ -729,5 +760,76 @@ fn emit_retry(app: &AppHandle, session_id: &str, task_id: &str, attempt: u32) {
     let event = format!("task_retry:{}", session_id);
     if let Err(e) = app.emit(&event, RetryEventPayload { task_id, attempt }) {
         tracing::warn!("failed to emit retry event: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::subagent::SubagentResult;
+    use crate::agent::verification::VerificationResult;
+
+    fn completed_subagent_result() -> SubagentResult {
+        SubagentResult {
+            completed: true,
+            summary: "implementation done".into(),
+            sub_session_id: "sub-1".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn final_failed_verification_settles_as_failed() {
+        let results = vec![VerificationResult {
+            check: "npm test".into(),
+            passed: false,
+            output: "expected red test".into(),
+            duration_ms: 12,
+        }];
+
+        let decision = settle_result_after_verification(
+            completed_subagent_result(),
+            &results,
+            MAX_ATTEMPTS,
+            MAX_ATTEMPTS,
+        );
+
+        match decision {
+            VerificationAttemptDecision::Finish(outcome) => {
+                assert!(!outcome.completed);
+                assert!(outcome.summary.contains("verification"));
+                assert!(outcome.summary.contains("npm test"));
+            }
+            VerificationAttemptDecision::Retry { .. } => {
+                panic!("final attempt must not retry forever")
+            }
+        }
+    }
+
+    #[test]
+    fn non_final_failed_verification_requests_retry() {
+        let results = vec![VerificationResult {
+            check: "cargo test".into(),
+            passed: false,
+            output: "compiler error".into(),
+            duration_ms: 7,
+        }];
+
+        let decision = settle_result_after_verification(
+            completed_subagent_result(),
+            &results,
+            1,
+            MAX_ATTEMPTS,
+        );
+
+        match decision {
+            VerificationAttemptDecision::Retry { error } => {
+                assert!(error.contains("cargo test"));
+                assert!(error.contains("compiler error"));
+            }
+            VerificationAttemptDecision::Finish(_) => {
+                panic!("non-final failed verification should retry")
+            }
+        }
     }
 }
