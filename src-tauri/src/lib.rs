@@ -233,6 +233,7 @@ pub fn run() {
             commands::tasks::get_task_dependencies,
             commands::tasks::start_implementation,
             commands::tasks::cancel_implementation,
+            commands::tasks::retry_failed_tasks,
             commands::tasks::get_verification_results,
             commands::tasks::run_verification_now,
             commands::specs::list_specs,

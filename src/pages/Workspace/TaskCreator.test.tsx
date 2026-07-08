@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   loadTasks: vi.fn(),
   subscribe: vi.fn().mockResolvedValue(() => {}),
   start: vi.fn(),
+  retryFailedTasks: vi.fn(),
 }));
 
 vi.mock("../../lib/tauri", async (orig) => {
@@ -114,6 +115,7 @@ const fakeState = {
   loadTasks: mocks.loadTasks,
   subscribe: mocks.subscribe,
   createTaskTree: mocks.createTaskTree,
+  retryFailedTasks: mocks.retryFailedTasks,
   start: mocks.start,
   cancel: vi.fn(),
 };
@@ -173,6 +175,11 @@ describe("AI task decomposition flow", () => {
     });
     mocks.createTaskTree.mockClear();
     mocks.start.mockClear();
+    mocks.retryFailedTasks.mockReset();
+    mocks.retryFailedTasks.mockResolvedValue(1);
+    fakeState.tasks = {};
+    fakeState.running = {};
+    fakeState.executionLog = {};
     // Isolate the 自主 toggle between tests. localStorage persists in CI (Node's
     // experimental localStorage) but throws in the local runner — guard it so the
     // autonomous test can't leak its on-state into the reviewed-flow tests.
@@ -321,6 +328,46 @@ describe("AI task decomposition flow", () => {
 
     // The reviewed-flow modal never appeared.
     expect(screen.queryByText(/审核并确认任务/)).not.toBeInTheDocument();
+  });
+
+  it("surfaces a repair loop for failed tasks", async () => {
+    const user = userEvent.setup();
+    fakeState.tasks = {
+      s1: [
+        {
+          id: "task-failed",
+          session_id: "s1",
+          title: "跑测试并修复失败",
+          description: "npm test",
+          status: "failed",
+          cwd: "/Users/x/proj",
+          parent_task_id: null,
+          sub_session_id: null,
+          created_at: "2026-07-08T00:00:00Z",
+          started_at: "2026-07-08T00:00:01Z",
+          completed_at: "2026-07-08T00:00:02Z",
+          result: null,
+          error: "npm test failed",
+          attempt_count: 3,
+          verification_results: JSON.stringify([
+            { check: "npm test", passed: false, output: "expected failure", duration_ms: 12 },
+          ]),
+          task_context_json: null,
+          spec_req_id: null,
+          spec_title: null,
+        },
+      ],
+    };
+
+    render(
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+    );
+
+    const repair = await screen.findByRole("button", { name: /修复失败项/ });
+    await user.click(repair);
+
+    await waitFor(() => expect(mocks.retryFailedTasks).toHaveBeenCalledWith("s1"));
+    expect(mocks.start).toHaveBeenCalledWith("s1", undefined, undefined);
   });
 
   it("autonomous + 先写规范: writes a spec, decomposes it, links tasks to the spec", async () => {

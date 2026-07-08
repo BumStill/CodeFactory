@@ -249,9 +249,21 @@ pub async fn mark_task_cancelled(pool: &SqlitePool, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn retry_failed_tasks(pool: &SqlitePool, session_id: &str) -> Result<u64> {
+    let result = sqlx::query(
+        "UPDATE task_runs \
+         SET status = 'pending', started_at = NULL, completed_at = NULL, error = NULL, \
+             result = NULL, verification_results = NULL \
+         WHERE session_id = ? AND status IN ('failed', 'cancelled')",
+    )
+    .bind(session_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 // Scaffolding: standalone attempt bump for retry flows; mark_task_started also
 // increments on (re)start, so this stays until retries call it directly.
-#[allow(dead_code)]
 pub async fn increment_attempt(pool: &SqlitePool, id: &str) -> Result<()> {
     sqlx::query("UPDATE task_runs SET attempt_count = attempt_count + 1 WHERE id = ?")
         .bind(id)
@@ -353,4 +365,96 @@ pub async fn is_task_ready(pool: &SqlitePool, task_id: &str) -> Result<bool> {
     .fetch_one(pool)
     .await?;
     Ok(row.0 == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        sqlx::query(
+            "CREATE TABLE task_runs (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                cwd TEXT NOT NULL,
+                parent_task_id TEXT,
+                sub_session_id TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                result TEXT,
+                error TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                verification_results TEXT,
+                task_context_json TEXT,
+                acceptance_criteria_json TEXT,
+                spec_req_id TEXT,
+                spec_title TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create schema");
+        pool
+    }
+
+    fn task(id: &str, status: &str) -> TaskRun {
+        TaskRun {
+            id: id.into(),
+            session_id: "session-1".into(),
+            title: format!("task {id}"),
+            description: "test task".into(),
+            status: status.into(),
+            cwd: "/tmp/project".into(),
+            parent_task_id: None,
+            sub_session_id: None,
+            created_at: "2026-07-08T00:00:00Z".into(),
+            started_at: Some("2026-07-08T00:01:00Z".into()),
+            completed_at: Some("2026-07-08T00:02:00Z".into()),
+            result: Some("stale result".into()),
+            error: Some("stale error".into()),
+            attempt_count: 3,
+            verification_results: Some(r#"[{"check":"test","passed":false}]"#.into()),
+            task_context_json: None,
+            acceptance_criteria_json: None,
+            spec_req_id: None,
+            spec_title: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_failed_tasks_resets_repairable_rows_to_pending() {
+        let pool = test_pool().await;
+        insert_task(&pool, &task("failed-1", "failed")).await.unwrap();
+        insert_task(&pool, &task("cancelled-1", "cancelled")).await.unwrap();
+        insert_task(&pool, &task("completed-1", "completed")).await.unwrap();
+
+        let changed = retry_failed_tasks(&pool, "session-1").await.unwrap();
+        assert_eq!(changed, 2);
+
+        for id in ["failed-1", "cancelled-1"] {
+            let repaired = get_task(&pool, id).await.unwrap().unwrap();
+            assert_eq!(repaired.status, "pending");
+            assert_eq!(repaired.started_at, None);
+            assert_eq!(repaired.completed_at, None);
+            assert_eq!(repaired.result, None);
+            assert_eq!(repaired.error, None);
+            assert_eq!(repaired.verification_results, None);
+            assert_eq!(repaired.attempt_count, 3);
+        }
+
+        let untouched = get_task(&pool, "completed-1").await.unwrap().unwrap();
+        assert_eq!(untouched.status, "completed");
+        assert_eq!(untouched.result.as_deref(), Some("stale result"));
+        assert_eq!(untouched.error.as_deref(), Some("stale error"));
+    }
 }

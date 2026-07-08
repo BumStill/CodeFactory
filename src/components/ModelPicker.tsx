@@ -10,6 +10,7 @@ export function ModelPicker() {
   const { settings, load: reloadSettings, save: saveSettings } = useSettingsStore();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [loadingEndpoint, setLoadingEndpoint] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
 
   // When the active endpoint changes:
@@ -20,12 +21,19 @@ export function ModelPicker() {
   //      was the root cause of the v0.3.5 400 reports.
   useEffect(() => {
     const ep = settings?.default_endpoint ?? "openrouter";
-    loadModels(ep);
+    let cancelled = false;
+    setLoadingEndpoint(ep);
+    loadModels(ep).finally(() => {
+      if (!cancelled) setLoadingEndpoint(null);
+    });
     invoke<string>("get_endpoint_active_model", { endpointName: ep })
       .then((m) => {
-        if (m && m !== activeModel) setModel(m);
+        if (!cancelled && m && m !== activeModel) setModel(m);
       })
       .catch(() => { /* first run / endpoint without a saved model */ });
+    return () => {
+      cancelled = true;
+    };
   }, [settings?.default_endpoint]);
 
   useEffect(() => {
@@ -39,6 +47,7 @@ export function ModelPicker() {
   const displayed = activeModel.split("/").pop() ?? activeModel;
   const activeEndpoint = settings?.default_endpoint ?? "openrouter";
   const endpointKeys = settings ? Object.keys(settings.endpoints).sort() : [];
+  const modelListLoading = loadingEndpoint !== null;
   const filtered = models
     .filter(
       (m) =>
@@ -72,16 +81,21 @@ export function ModelPicker() {
                 onChange={async (e) => {
                   if (!settings) return;
                   const endpointName = e.target.value;
-                  await saveSettings({ ...settings, default_endpoint: endpointName });
-                  await loadModels(endpointName);
-                  const model = await invoke<string>("get_endpoint_active_model", {
-                    endpointName,
-                  }).catch(() => "");
-                  if (model) {
-                    await updateActiveSessionModel(model);
-                  }
-                  await reloadSettings();
+                  setLoadingEndpoint(endpointName);
                   setQuery("");
+                  try {
+                    await saveSettings({ ...settings, default_endpoint: endpointName });
+                    await loadModels(endpointName);
+                    const model = await invoke<string>("get_endpoint_active_model", {
+                      endpointName,
+                    }).catch(() => "");
+                    if (model) {
+                      await updateActiveSessionModel(model);
+                    }
+                    await reloadSettings();
+                  } finally {
+                    setLoadingEndpoint(null);
+                  }
                 }}
                 className="w-full bg-surface-3 rounded px-2 py-1 text-xs text-gray-200 outline-none"
               >
@@ -94,12 +108,15 @@ export function ModelPicker() {
               autoFocus
               value={query}
               onChange={(e) => setQuery(e.target.value)}
+              disabled={modelListLoading}
               placeholder="搜索模型…"
-              className="w-full bg-surface-3 rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none"
+              className="w-full bg-surface-3 rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none disabled:opacity-50"
             />
           </div>
           <ul className="max-h-64 overflow-y-auto py-1">
-            {filtered.slice(0, 50).map((m) => (
+            {modelListLoading ? (
+              <li className="px-3 py-2 text-xs text-gray-600">正在加载模型…</li>
+            ) : filtered.slice(0, 50).map((m) => (
               <li key={m.id}>
                 <button
                   className={`flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-xs hover:bg-surface-3 transition-colors ${
@@ -129,7 +146,7 @@ export function ModelPicker() {
                 </button>
               </li>
             ))}
-            {filtered.length === 0 && (
+            {!modelListLoading && filtered.length === 0 && (
               <li className="px-3 py-2 text-xs text-gray-600">未找到模型</li>
             )}
           </ul>

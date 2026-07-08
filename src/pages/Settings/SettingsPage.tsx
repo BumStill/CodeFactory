@@ -104,7 +104,7 @@ interface EndpointDraft {
   key: string;       // map key in settings.endpoints
   base_url: string;
   api_style: ApiStyle;
-  api_key: string;   // loaded/saved separately via keychain
+  api_key: string;   // replacement-only input; saved key values are not read by default
   key_ref?: string;  // e.g. "codefactory.endpoint.myname"
   custom_models: CustomModel[];
 }
@@ -212,6 +212,12 @@ function EndpointCard({
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const hasSavedKeyRef = Boolean(local.key_ref);
+
+  useEffect(() => {
+    setLocal(draft);
+    setShowKey(false);
+  }, [draft]);
 
   const dirty =
     local.base_url !== draft.base_url ||
@@ -276,16 +282,23 @@ function EndpointCard({
             type={showKey ? "text" : "password"}
             value={local.api_key}
             onChange={(e) => setLocal({ ...local, api_key: e.target.value })}
-            placeholder="sk-…"
+            placeholder={hasSavedKeyRef ? "已保存，输入新密钥以替换" : "sk-…"}
             className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
           />
           <button
             onClick={() => setShowKey((v) => !v)}
-            className="p-1 rounded border border-border text-gray-500 hover:text-gray-300"
+            disabled={local.api_key.length === 0}
+            className="p-1 rounded border border-border text-gray-500 hover:text-gray-300 disabled:opacity-40 disabled:hover:text-gray-500"
+            title="显示/隐藏本次输入的密钥"
           >
             {showKey ? <EyeOff size={12} /> : <Eye size={12} />}
           </button>
         </div>
+        <p className="text-[11px] leading-4 text-gray-600">
+          {hasSavedKeyRef
+            ? "已配置系统凭据引用；默认不读取明文，输入新密钥后保存会替换。"
+            : "保存时会写入系统凭据库，不会保存在设置备份中。"}
+        </p>
       </div>
 
       {/* API Style */}
@@ -420,7 +433,7 @@ function AddEndpointModal({
 // ── Main Settings Page ────────────────────────────────────────────────────────
 
 export function SettingsPage({ onBack }: Props) {
-  const { settings, load, save, saveApiKey, getApiKey } = useSettingsStore();
+  const { settings, load, save, saveApiKey } = useSettingsStore();
   const [tab, setTab] = useState<Tab>("endpoints");
   const [endpointDrafts, setEndpointDrafts] = useState<EndpointDraft[]>([]);
   const [showAddEp, setShowAddEp] = useState(false);
@@ -443,25 +456,19 @@ export function SettingsPage({ onBack }: Props) {
   useEffect(() => {
     if (!settings) return;
 
-    // Build endpoint drafts — load API keys in parallel
-    const keys = Object.keys(settings.endpoints);
-    Promise.all(
-      keys.map(async (k) => {
-        const ep = settings.endpoints[k];
-        const apiKey = ep.key_ref
-          ? (await getApiKey(ep.key_ref).catch(() => null)) ?? ""
-          : "";
-        const draft: EndpointDraft = {
-          key: k,
-          base_url: ep.base_url,
-          api_style: ep.api_style,
-          api_key: apiKey,
-          key_ref: ep.key_ref,
-          custom_models: ep.custom_models ?? [],
-        };
-        return draft;
-      })
-    ).then((drafts) => setEndpointDrafts(drafts));
+    // Build endpoint drafts without reading saved keychain values. Reading raw
+    // API keys can trigger OS password prompts on macOS, and the settings page
+    // only needs to know whether a key reference exists.
+    setEndpointDrafts(
+      Object.entries(settings.endpoints).map(([key, ep]) => ({
+        key,
+        base_url: ep.base_url,
+        api_style: ep.api_style,
+        api_key: "",
+        key_ref: ep.key_ref,
+        custom_models: ep.custom_models ?? [],
+      })),
+    );
 
     setPermDraft({ ...settings.permissions });
     setGeneralDraft({
@@ -483,10 +490,14 @@ export function SettingsPage({ onBack }: Props) {
   // ── Endpoint handlers ──────────────────────────────────────────────────────
 
   const handleSaveEndpoint = async (draft: EndpointDraft) => {
-    // Persist API key to keychain
-    const keyRef = draft.key_ref ?? `codefactory.endpoint.${draft.key}`;
-    if (draft.api_key) {
-      await saveApiKey(keyRef, draft.api_key);
+    // Persist a replacement API key only when the user typed one. Existing
+    // key_ref values are preserved, but saved keychain values are never read
+    // back into the form.
+    const replacementApiKey = draft.api_key.trim();
+    const keyRef =
+      draft.key_ref ?? (replacementApiKey ? `codefactory.endpoint.${draft.key}` : undefined);
+    if (replacementApiKey && keyRef) {
+      await saveApiKey(keyRef, replacementApiKey);
     }
 
     // Rebuild endpoints map.
@@ -500,7 +511,7 @@ export function SettingsPage({ onBack }: Props) {
     newEndpoints[draft.key] = {
       base_url: draft.base_url,
       api_style: draft.api_style,
-      key_ref: keyRef,
+      ...(keyRef ? { key_ref: keyRef } : {}),
       custom_models: cleanedModels,
     };
     await save({ ...settings, endpoints: newEndpoints });
@@ -514,7 +525,7 @@ export function SettingsPage({ onBack }: Props) {
     setEndpointDrafts((prev) =>
       prev.map((d) =>
         d.key === draft.key
-          ? { ...draft, key_ref: keyRef, custom_models: cleanedModels }
+          ? { ...draft, api_key: "", key_ref: keyRef, custom_models: cleanedModels }
           : d,
       ),
     );
@@ -542,6 +553,7 @@ export function SettingsPage({ onBack }: Props) {
         base_url: ep.base_url,
         api_style: ep.api_style,
         api_key: "",
+        key_ref: ep.key_ref,
         custom_models: ep.custom_models ?? [],
       },
     ]);
@@ -1754,7 +1766,7 @@ function DataSection() {
         </div>
         <p className="text-[11px] text-gray-600 leading-relaxed">
           所有会话、消息和设置都保存在这里。卸载并重装后依然保留。
-          API Key 单独存储在 Windows 凭据管理器中，不包含在备份内。
+          API Key 单独存储在系统凭据库中，不包含在备份内。
         </p>
       </div>
 

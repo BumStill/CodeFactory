@@ -469,15 +469,19 @@ function buildSpecPrompt(intent: string, reqId: string | null, title: string): s
 }
 
 function TasksColumn({ sessionId }: { sessionId: string }) {
-  const { tasks, running, loadTasks, subscribe, createTaskTree, start, cancel } = useTasksStore();
+  const { tasks, running, loadTasks, subscribe, createTaskTree, start, cancel, retryFailedTasks } = useTasksStore();
   const { activeSession } = useChatStore();
   const { libraries } = useKnowledgeStore();
   const { createSpec, saveSpec } = useSpecsStore();
   const sessionTasks: TaskRun[] = tasks[sessionId] ?? [];
   const isRunning = running[sessionId] ?? false;
   const pendingCount = sessionTasks.filter((t) => t.status === "pending").length;
+  const runningCount = sessionTasks.filter((t) => t.status === "running").length;
+  const completedCount = sessionTasks.filter((t) => t.status === "completed").length;
+  const failedCount = sessionTasks.filter((t) => t.status === "failed" || t.status === "cancelled").length;
   const [creatorOpen, setCreatorOpen] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [repairBusy, setRepairBusy] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   // 自主模式 (②-2): describe intent → auto-decompose → auto-create → auto-start,
   // no modal, no manual review/start. Persisted so it survives reloads. When
@@ -634,6 +638,22 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
     }
   };
 
+  const handleRepairFailed = async () => {
+    if (repairBusy || isRunning || failedCount === 0) return;
+    setRepairBusy(true);
+    setStartError(null);
+    try {
+      const retried = await retryFailedTasks(sessionId);
+      if (retried > 0) {
+        await start(sessionId, undefined, undefined);
+      }
+    } catch (e) {
+      setStartError(String(e));
+    } finally {
+      setRepairBusy(false);
+    }
+  };
+
   return (
     <div className={`flex shrink-0 flex-col border-t border-border ${collapsed ? "" : "max-h-[55%] min-h-0"}`}>
       <div className="flex items-center justify-between px-3 py-2 border-b border-border gap-2">
@@ -686,6 +706,21 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
               </button>
             )
           )}
+          {!isRunning && failedCount > 0 && (
+            <button
+              onClick={handleRepairFailed}
+              disabled={repairBusy}
+              className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-amber-700 dark:text-amber-300 bg-amber-500/10 hover:bg-amber-500/20 transition-colors disabled:opacity-40"
+              title={`重置 ${failedCount} 个失败/取消任务为待处理，并立即重新执行`}
+            >
+              {repairBusy ? (
+                <Loader2 size={9} className="animate-spin" />
+              ) : (
+                <RefreshCw size={9} />
+              )}
+              修复失败项
+            </button>
+          )}
           {!autonomous && (
             <button
               onClick={() => setCreatorOpen(true)}
@@ -702,6 +737,14 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
           {startError && (
             <div className="px-3 py-2 text-[10px] text-red-700 dark:text-red-300 bg-red-500/10 border-b border-red-500/20">
               {startError}
+            </div>
+          )}
+          {sessionTasks.length > 0 && (
+            <div className="flex items-center gap-2 border-b border-border px-3 py-1 text-[10px] text-gray-600">
+              <span>完成 {completedCount}</span>
+              <span>待处理 {pendingCount}</span>
+              {runningCount > 0 && <span className="text-accent">运行中 {runningCount}</span>}
+              {failedCount > 0 && <span className="text-amber-700 dark:text-amber-300">待修复 {failedCount}</span>}
             </div>
           )}
           {autonomous && (
