@@ -329,6 +329,18 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun }: Row
               <span className="text-red-400 truncate">{task.error}</span>
             )}
           </div>
+          {task.failure_attribution && (
+            <div
+              className="mt-1 flex items-start gap-1 rounded bg-amber-500/10 px-1.5 py-1 text-[10px] text-amber-700 dark:text-amber-300"
+              title={`${task.failure_attribution.summary}\n下一步：${task.failure_attribution.next_action}`}
+            >
+              <AlertCircle size={11} className="mt-0.5 shrink-0" />
+              <span className="shrink-0 font-medium">{task.failure_attribution.label}</span>
+              <span className="min-w-0 truncate text-amber-800/80 dark:text-amber-200/80">
+                {task.failure_attribution.next_action}
+              </span>
+            </div>
+          )}
         </div>
       </div>
 

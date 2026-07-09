@@ -107,6 +107,16 @@ pub struct TaskRun {
     pub spec_title: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TaskFailureAttribution {
+    pub kind: String,
+    pub label: String,
+    pub summary: String,
+    pub next_action: String,
+    pub repairable: bool,
+    pub source: String,
+}
+
 pub async fn insert_task(pool: &SqlitePool, task: &TaskRun) -> Result<()> {
     sqlx::query(
         "INSERT INTO task_runs (id, session_id, title, description, status, cwd, parent_task_id, \
@@ -329,6 +339,213 @@ pub async fn list_pending_tasks_for_session(
     Ok(rows)
 }
 
+#[derive(Debug, Deserialize)]
+struct StoredVerificationResult {
+    check: Option<String>,
+    passed: bool,
+    output: Option<String>,
+}
+
+pub fn classify_task_failure(task: &TaskRun) -> Option<TaskFailureAttribution> {
+    if task.status == "cancelled" {
+        return Some(TaskFailureAttribution {
+            kind: "cancelled".into(),
+            label: "已取消".into(),
+            summary: "任务被取消，尚未形成完成证据。".into(),
+            next_action: "确认任务仍然有效后重新执行。".into(),
+            repairable: true,
+            source: "status".into(),
+        });
+    }
+
+    if task.status != "failed" {
+        return None;
+    }
+
+    let raw = format!(
+        "{}\n{}",
+        task.error.as_deref().unwrap_or_default(),
+        task.result.as_deref().unwrap_or_default()
+    );
+    let text = raw.to_lowercase();
+    let summary = concise_evidence(&raw);
+
+    if has_any(
+        &text,
+        &[
+            "http 402",
+            "insufficient balance",
+            "api key",
+            "invalid key",
+            "unauthorized",
+            "401",
+            "403",
+            "429",
+            "rate limit",
+            "invalid model",
+            "provider",
+            "model request",
+        ],
+    ) {
+        return Some(TaskFailureAttribution {
+            kind: "model-provider".into(),
+            label: "模型/Provider".into(),
+            summary,
+            next_action: "修复 endpoint、API key、余额或模型 route 后再重试。".into(),
+            repairable: false,
+            source: "error".into(),
+        });
+    }
+
+    if has_any(
+        &text,
+        &[
+            "permission denied",
+            "denied",
+            "not allowed",
+            "outside cwd",
+            "hard deny",
+            "user denied",
+            "policy denied",
+        ],
+    ) {
+        return Some(TaskFailureAttribution {
+            kind: "permission".into(),
+            label: "权限/策略".into(),
+            summary,
+            next_action: "调整授权、cwd 边界或任务范围后再执行。".into(),
+            repairable: false,
+            source: "error".into(),
+        });
+    }
+
+    if has_any(
+        &text,
+        &[
+            "executable is unavailable",
+            "command not found",
+            "no such file or directory",
+            "enoent",
+            "failed to run command",
+            "spawn ",
+            "not installed",
+            "missing executable",
+        ],
+    ) {
+        return Some(TaskFailureAttribution {
+            kind: "shell-runtime".into(),
+            label: "运行环境".into(),
+            summary,
+            next_action: "修复 PATH、依赖安装或命令环境后再重试。".into(),
+            repairable: false,
+            source: "error".into(),
+        });
+    }
+
+    if has_any(
+        &text,
+        &[
+            "npm test failed",
+            "pytest",
+            "cargo test",
+            "test failed",
+            "tests failed",
+            "assertion",
+            "expected",
+            "actual",
+            "traceback",
+            "panic",
+        ],
+    ) {
+        return Some(TaskFailureAttribution {
+            kind: "test-failure".into(),
+            label: "测试失败".into(),
+            summary,
+            next_action: "根据失败断言修改实现，并重跑最小测试。".into(),
+            repairable: true,
+            source: "error".into(),
+        });
+    }
+
+    if let Some(summary) = failed_verification_summary(task) {
+        return Some(TaskFailureAttribution {
+            kind: "verification".into(),
+            label: "验收失败".into(),
+            summary,
+            next_action: "读取失败验收项，修实现并重跑同一检查。".into(),
+            repairable: true,
+            source: "verification_results".into(),
+        });
+    }
+
+    if has_any(&text, &["verification", "acceptance check failed", "验收"]) {
+        return Some(TaskFailureAttribution {
+            kind: "verification".into(),
+            label: "验收失败".into(),
+            summary,
+            next_action: "读取失败验收项，修实现并重跑同一检查。".into(),
+            repairable: true,
+            source: "error".into(),
+        });
+    }
+
+    Some(TaskFailureAttribution {
+        kind: "unknown".into(),
+        label: "未分类".into(),
+        summary,
+        next_action: "展开任务详情和子会话，补充失败证据后再修复。".into(),
+        repairable: false,
+        source: "error".into(),
+    })
+}
+
+fn failed_verification_summary(task: &TaskRun) -> Option<String> {
+    let raw = task.verification_results.as_deref()?;
+    let results: Vec<StoredVerificationResult> = serde_json::from_str(raw).ok()?;
+    let failed: Vec<&StoredVerificationResult> = results.iter().filter(|r| !r.passed).collect();
+    if failed.is_empty() {
+        return None;
+    }
+
+    let names: Vec<String> = failed
+        .iter()
+        .take(2)
+        .map(|r| r.check.as_deref().unwrap_or("验收检查").to_string())
+        .collect();
+    let mut summary = format!(
+        "{} / {} 个验收检查失败：{}",
+        failed.len(),
+        results.len(),
+        names.join(", ")
+    );
+    if let Some(output) = failed.iter().find_map(|r| r.output.as_deref()) {
+        let evidence = concise_evidence(output);
+        if !evidence.is_empty() {
+            summary.push_str(&format!("；{evidence}"));
+        }
+    }
+    Some(summary)
+}
+
+fn has_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn concise_evidence(raw: &str) -> String {
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("没有可用失败摘要。");
+    const MAX: usize = 160;
+    if line.chars().count() <= MAX {
+        return line.to_string();
+    }
+    let mut out: String = line.chars().take(MAX).collect();
+    out.push_str("...");
+    out
+}
+
 pub async fn add_dependency(
     pool: &SqlitePool,
     task_id: &str,
@@ -456,5 +673,37 @@ mod tests {
         assert_eq!(untouched.status, "completed");
         assert_eq!(untouched.result.as_deref(), Some("stale result"));
         assert_eq!(untouched.error.as_deref(), Some("stale error"));
+    }
+
+    #[test]
+    fn classifies_failed_verification_from_results() {
+        let mut row = task("verify-1", "failed");
+        row.error = Some("Failed after 3 attempts (verification)".into());
+        row.verification_results = Some(
+            r#"[{"check":"npm test","passed":false,"output":"expected true","duration_ms":12}]"#
+                .into(),
+        );
+
+        let attribution = classify_task_failure(&row).expect("failed task should be classified");
+
+        assert_eq!(attribution.kind, "verification");
+        assert_eq!(attribution.label, "验收失败");
+        assert!(attribution.next_action.contains("失败验收项"));
+        assert!(attribution.repairable);
+    }
+
+    #[test]
+    fn classifies_provider_and_runtime_failures_separately() {
+        let mut provider = task("provider-1", "failed");
+        provider.error = Some("HTTP 402 Insufficient Balance from provider".into());
+        let provider_attr = classify_task_failure(&provider).unwrap();
+        assert_eq!(provider_attr.kind, "model-provider");
+        assert!(!provider_attr.repairable);
+
+        let mut runtime = task("runtime-1", "failed");
+        runtime.error = Some("npm executable is unavailable in this environment".into());
+        let runtime_attr = classify_task_failure(&runtime).unwrap();
+        assert_eq!(runtime_attr.kind, "shell-runtime");
+        assert!(runtime_attr.next_action.contains("PATH"));
     }
 }

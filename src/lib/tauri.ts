@@ -447,6 +447,22 @@ export interface TaskConnectorContext {
   knowledge_libraries: TaskKnowledgeLibraryContext[];
 }
 
+export interface TaskFailureAttribution {
+  kind:
+    | "model-provider"
+    | "permission"
+    | "shell-runtime"
+    | "test-failure"
+    | "verification"
+    | "cancelled"
+    | "unknown";
+  label: string;
+  summary: string;
+  next_action: string;
+  repairable: boolean;
+  source: string;
+}
+
 export interface TaskRun {
   id: string;
   session_id: string;
@@ -466,6 +482,8 @@ export interface TaskRun {
   verification_results: string | null;
   /** JSON-encoded TaskConnectorContext; null when no connector scope is attached. */
   task_context_json: string | null;
+  /** Derived failure attribution; not persisted in SQLite. */
+  failure_attribution?: TaskFailureAttribution | null;
   /** The spec this task was decomposed from (set by a spec's 开始实现); null for
    *  ad-hoc Workspace tasks. Surfaces the spec→task link in the task tree. */
   spec_req_id?: string | null;
