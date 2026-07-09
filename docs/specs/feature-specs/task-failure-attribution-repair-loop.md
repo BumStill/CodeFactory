@@ -11,14 +11,14 @@ Terminal-Bench 2.1 只能作为失败样本和能力评估输入，不允许把�
 | Req ID | User request | Normalized requirement | Surfaces | Validation method | Owner |
 | --- | --- | --- | --- | --- | --- |
 | CF-FR-R1 | 能力提升要落到 CodeFactory 主产品路径 | Workspace 任务列表对 failed/cancelled task 展示失败类型、证据来源和下一步修复建议 | backend + UI | Rust classifier tests + Workspace UI test + real app task-column check | development |
-| CF-FR-R2 | 形成迭代 loop | `修复失败项` 不只是按钮；它必须基于失败状态形成“归因 -> 修复动作 -> 重新执行 -> 验证证据”的闭环 | task scheduler + UI | retry/reset tests + product path verification | development |
+| CF-FR-R2 | 形成迭代 loop | `修复失败项` 不只是按钮；它必须基于失败状态形成“归因 -> 修复动作 -> 重新执行 -> 验证证据”的闭环，且只自动重跑 `repairable=true` 的失败 | task scheduler + UI | retry/reset tests + product path verification | development |
 | CF-FR-R3 | 不针对 bench 定制 | 分类规则只读取通用 task 字段：`status`、`error`、`result`、`verification_results`；不得读取 benchmark task name 或 Terminal-Bench artifact path | backend | unit test + code review grep | QA |
 | CF-FR-R4 | 用户能区分责任边界 | provider/credential、permission、shell runtime、test failure、verification failure、cancelled、unknown 必须分开展示 | backend + UI | fixture classification tests | QA |
 | CF-FR-R5 | 兼容旧数据 | 不要求 SQLite schema migration；旧 `task_runs` 读取后按现有字段派生 attribution | storage + Tauri serialization | cargo test + existing app DB smoke | development |
 
 ## Primary User Path
 
-P-FR-1: 用户打开 CodeFactory，进入一个 project session。左侧任务列显示任务状态。如果某个任务失败或取消，系统在任务行下方显示失败归因标签和下一步建议。用户点击 `修复失败项` 后，系统把 failed/cancelled 任务重置为 pending 并启动同一 session 的执行；任务重新运行后，状态、验证结果和 evidence pack 继续更新。
+P-FR-1: 用户打开 CodeFactory，进入一个 project session。左侧任务列显示任务状态。如果某个任务失败或取消，系统在任务行下方显示失败归因标签和下一步建议。用户点击 `修复可修复项` 后，系统只把 `repairable=true` 的 failed/cancelled 任务重置为 pending 并启动同一 session 的执行；不可自动修复的 provider、权限或运行环境失败必须保持失败状态并提示用户先处理原因。任务重新运行后，状态、验证结果和 evidence pack 继续更新。
 
 P-FR-2: 如果失败来自 provider/credential、权限或 shell runtime，UI 必须让用户看到这不是“模型不会写代码”的同类问题；下一步建议应指向充值/更换模型、授权、配置 PATH/依赖，而不是盲目重试代码。
 
@@ -49,6 +49,7 @@ P-FR-2: 如果失败来自 provider/credential、权限或 shell runtime，UI �
 | failed task with failed `verification_results` | classified as `verification`, UI shows `验收失败` and next action |
 | provider billing/credential error | classified as `model-provider`, marked not blindly repairable |
 | missing command or executable | classified as `shell-runtime` |
+| repair loop with mixed failed tasks | only `repairable=true` tasks are reset/re-run; provider/runtime/permission failures stay failed |
 | assertion/test failure | classified as `test-failure` |
 | cancelled task | classified as `cancelled` |
 | old task without new persisted fields | list still loads and derives attribution from existing fields |

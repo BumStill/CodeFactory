@@ -260,16 +260,37 @@ pub async fn mark_task_cancelled(pool: &SqlitePool, id: &str) -> Result<()> {
 }
 
 pub async fn retry_failed_tasks(pool: &SqlitePool, session_id: &str) -> Result<u64> {
-    let result = sqlx::query(
-        "UPDATE task_runs \
-         SET status = 'pending', started_at = NULL, completed_at = NULL, error = NULL, \
-             result = NULL, verification_results = NULL \
-         WHERE session_id = ? AND status IN ('failed', 'cancelled')",
-    )
-    .bind(session_id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    let repairable_ids: Vec<String> = list_session_tasks(pool, session_id)
+        .await?
+        .into_iter()
+        .filter(|task| task.status == "failed" || task.status == "cancelled")
+        .filter(|task| {
+            classify_task_failure(task)
+                .map(|attribution| attribution.repairable)
+                .unwrap_or(false)
+        })
+        .map(|task| task.id)
+        .collect();
+
+    if repairable_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = pool.begin().await?;
+    for id in &repairable_ids {
+        sqlx::query(
+            "UPDATE task_runs \
+             SET status = 'pending', started_at = NULL, completed_at = NULL, error = NULL, \
+                 result = NULL, verification_results = NULL \
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    Ok(repairable_ids.len() as u64)
 }
 
 // Scaffolding: standalone attempt bump for retry flows; mark_task_started also
@@ -653,6 +674,14 @@ mod tests {
         let pool = test_pool().await;
         insert_task(&pool, &task("failed-1", "failed")).await.unwrap();
         insert_task(&pool, &task("cancelled-1", "cancelled")).await.unwrap();
+        let mut provider = task("provider-1", "failed");
+        provider.error = Some("HTTP 402 Insufficient Balance from provider".into());
+        provider.verification_results = None;
+        insert_task(&pool, &provider).await.unwrap();
+        let mut runtime = task("runtime-1", "failed");
+        runtime.error = Some("npm executable is unavailable in this environment".into());
+        runtime.verification_results = None;
+        insert_task(&pool, &runtime).await.unwrap();
         insert_task(&pool, &task("completed-1", "completed")).await.unwrap();
 
         let changed = retry_failed_tasks(&pool, "session-1").await.unwrap();
@@ -673,6 +702,12 @@ mod tests {
         assert_eq!(untouched.status, "completed");
         assert_eq!(untouched.result.as_deref(), Some("stale result"));
         assert_eq!(untouched.error.as_deref(), Some("stale error"));
+
+        for id in ["provider-1", "runtime-1"] {
+            let blocked = get_task(&pool, id).await.unwrap().unwrap();
+            assert_eq!(blocked.status, "failed");
+            assert!(blocked.error.is_some());
+        }
     }
 
     #[test]

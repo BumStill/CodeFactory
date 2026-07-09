@@ -49,4 +49,5 @@
 - Workspace 任务系统必须把 failed/cancelled task 归因为 provider/credential、permission、shell runtime、test failure、verification failure、cancelled 或 unknown。
 - 归因来自通用任务字段，不读取 benchmark 名称或 Terminal-Bench 专用路径。
 - 用户在任务列中能看到失败类型、证据来源和下一步建议，再决定是否点击 `修复失败项` 进入重试。
+- `修复失败项` 只允许自动重置 `repairable=true` 的任务；provider/key、权限、运行环境等需要用户先处理原因的失败必须保持 failed，避免盲目消耗模型调用。
 - 自动修复闭环必须回到同一 project session 的任务执行、验证结果和 evidence pack，而不是只更新 benchmark 分数。

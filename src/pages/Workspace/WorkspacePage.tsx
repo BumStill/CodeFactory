@@ -478,7 +478,10 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
   const pendingCount = sessionTasks.filter((t) => t.status === "pending").length;
   const runningCount = sessionTasks.filter((t) => t.status === "running").length;
   const completedCount = sessionTasks.filter((t) => t.status === "completed").length;
-  const failedCount = sessionTasks.filter((t) => t.status === "failed" || t.status === "cancelled").length;
+  const failedTasks = sessionTasks.filter((t) => t.status === "failed" || t.status === "cancelled");
+  const failedCount = failedTasks.length;
+  const repairableFailedCount = failedTasks.filter((t) => t.failure_attribution?.repairable).length;
+  const blockedFailedCount = failedCount - repairableFailedCount;
   const [creatorOpen, setCreatorOpen] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [repairBusy, setRepairBusy] = useState(false);
@@ -639,7 +642,7 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
   };
 
   const handleRepairFailed = async () => {
-    if (repairBusy || isRunning || failedCount === 0) return;
+    if (repairBusy || isRunning || repairableFailedCount === 0) return;
     setRepairBusy(true);
     setStartError(null);
     try {
@@ -709,16 +712,20 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
           {!isRunning && failedCount > 0 && (
             <button
               onClick={handleRepairFailed}
-              disabled={repairBusy}
-              className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-amber-700 dark:text-amber-300 bg-amber-500/10 hover:bg-amber-500/20 transition-colors disabled:opacity-40"
-              title={`重置 ${failedCount} 个失败/取消任务为待处理，并立即重新执行`}
+              disabled={repairBusy || repairableFailedCount === 0}
+              className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-amber-700 dark:text-amber-300 bg-amber-500/10 hover:bg-amber-500/20 transition-colors disabled:opacity-40 disabled:hover:bg-amber-500/10"
+              title={
+                repairableFailedCount > 0
+                  ? `重置 ${repairableFailedCount} 个可修复失败任务为待处理，并立即重新执行；${blockedFailedCount} 个需要先处理失败原因`
+                  : "没有可自动修复项；请先处理模型、权限或运行环境问题"
+              }
             >
               {repairBusy ? (
                 <Loader2 size={9} className="animate-spin" />
               ) : (
                 <RefreshCw size={9} />
               )}
-              修复失败项
+              {repairableFailedCount > 0 ? "修复可修复项" : "先处理失败原因"}
             </button>
           )}
           {!autonomous && (
@@ -744,7 +751,12 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
               <span>完成 {completedCount}</span>
               <span>待处理 {pendingCount}</span>
               {runningCount > 0 && <span className="text-accent">运行中 {runningCount}</span>}
-              {failedCount > 0 && <span className="text-amber-700 dark:text-amber-300">待修复 {failedCount}</span>}
+              {repairableFailedCount > 0 && (
+                <span className="text-amber-700 dark:text-amber-300">可修复 {repairableFailedCount}</span>
+              )}
+              {blockedFailedCount > 0 && (
+                <span className="text-red-700 dark:text-red-300">需处理 {blockedFailedCount}</span>
+              )}
             </div>
           )}
           {autonomous && (
