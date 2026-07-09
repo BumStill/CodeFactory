@@ -352,6 +352,14 @@ describe("AI task decomposition flow", () => {
           verification_results: JSON.stringify([
             { check: "npm test", passed: false, output: "expected failure", duration_ms: 12 },
           ]),
+          failure_attribution: {
+            kind: "verification",
+            label: "验收失败",
+            summary: "npm test 验收未通过",
+            next_action: "读取失败验收项，修实现并重跑同一检查。",
+            repairable: true,
+            source: "verification_results",
+          },
           task_context_json: null,
           spec_req_id: null,
           spec_title: null,
@@ -364,6 +372,8 @@ describe("AI task decomposition flow", () => {
     );
 
     const repair = await screen.findByRole("button", { name: /修复失败项/ });
+    expect(screen.getByText("验收失败")).toBeInTheDocument();
+    expect(screen.getByText(/读取失败验收项/)).toBeInTheDocument();
     await user.click(repair);
 
     await waitFor(() => expect(mocks.retryFailedTasks).toHaveBeenCalledWith("s1"));

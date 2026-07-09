@@ -1136,6 +1136,18 @@ function TaskRow({ task, depth }: { task: TaskRun; depth: number }) {
               <span className="truncate">规范《{task.spec_title}》</span>
             </div>
           )}
+          {task.failure_attribution && (
+            <div
+              className="mt-0.5 flex items-start gap-1 rounded bg-amber-500/10 px-1 py-0.5 text-[9px] text-amber-700 dark:text-amber-300"
+              title={`${task.failure_attribution.summary}\n下一步：${task.failure_attribution.next_action}`}
+            >
+              <AlertTriangle size={9} className="mt-0.5 shrink-0" />
+              <span className="shrink-0 font-medium">{task.failure_attribution.label}</span>
+              <span className="min-w-0 truncate text-amber-800/80 dark:text-amber-200/80">
+                {task.failure_attribution.next_action}
+              </span>
+            </div>
+          )}
           {knowledgeCount > 0 && (
             <div
               className="mt-0.5 flex items-center gap-1 text-[9px] text-gray-600"

@@ -18,7 +18,7 @@ use crate::agent::scheduler::TaskScheduler;
 use crate::agent::verification::{self, VerificationResult};
 use crate::commands::evidence;
 use crate::errors::AppError;
-use crate::storage::tasks::{self, TaskConnectorContext, TaskRun};
+use crate::storage::tasks::{self, classify_task_failure, TaskConnectorContext, TaskFailureAttribution, TaskRun};
 use crate::AppState;
 use crate::util::no_window::NoWindow;
 
@@ -50,6 +50,24 @@ pub struct TaskInput {
 pub struct TaskDep {
     pub task_tmp_id: String,
     pub depends_on_tmp_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskRunView {
+    #[serde(flatten)]
+    pub task: TaskRun,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_attribution: Option<TaskFailureAttribution>,
+}
+
+impl From<TaskRun> for TaskRunView {
+    fn from(task: TaskRun) -> Self {
+        let failure_attribution = classify_task_failure(&task);
+        Self {
+            task,
+            failure_attribution,
+        }
+    }
 }
 
 /// Persist a task tree. `tmp_id`s are mapped to fresh UUIDs and then dependencies
@@ -126,22 +144,23 @@ pub async fn create_task_tree(
 pub async fn list_tasks(
     session_id: String,
     state: State<'_, AppState>,
-) -> Result<Vec<TaskRun>, AppError> {
+) -> Result<Vec<TaskRunView>, AppError> {
     let pool = state.db.read().await;
     let rows = tasks::list_session_tasks(&pool, &session_id).await?;
-    Ok(rows)
+    Ok(rows.into_iter().map(TaskRunView::from).collect())
 }
 
 #[tauri::command]
 pub async fn get_task_detail(
     task_id: String,
     state: State<'_, AppState>,
-) -> Result<TaskRun, String> {
+) -> Result<TaskRunView, String> {
     let pool = state.db.read().await;
     let row = tasks::get_task(&pool, &task_id)
         .await
         .map_err(|e| e.to_string())?;
-    row.ok_or_else(|| format!("Task '{}' not found", task_id))
+    row.map(TaskRunView::from)
+        .ok_or_else(|| format!("Task '{}' not found", task_id))
 }
 
 /// Returns the dependency edges for a task (real DB ids of tasks it depends on).

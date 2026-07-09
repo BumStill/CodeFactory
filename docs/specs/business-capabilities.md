@@ -44,3 +44,9 @@
 - 生成按任务类别、难度、工具路径、失败类型、耗时和成本的能力画像。
 - 支持同一 subset 的 baseline/head 回归对比。
 - Benchmark sandbox policy 只在隔离任务容器内生效，不得污染普通项目权限、长期 memory、默认 prompt 或技能示例。
+
+## C9 任务失败归因与修复闭环
+- Workspace 任务系统必须把 failed/cancelled task 归因为 provider/credential、permission、shell runtime、test failure、verification failure、cancelled 或 unknown。
+- 归因来自通用任务字段，不读取 benchmark 名称或 Terminal-Bench 专用路径。
+- 用户在任务列中能看到失败类型、证据来源和下一步建议，再决定是否点击 `修复失败项` 进入重试。
+- 自动修复闭环必须回到同一 project session 的任务执行、验证结果和 evidence pack，而不是只更新 benchmark 分数。
