@@ -371,13 +371,61 @@ describe("AI task decomposition flow", () => {
       <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
-    const repair = await screen.findByRole("button", { name: /修复失败项/ });
+    const repair = await screen.findByRole("button", { name: /修复可修复项/ });
     expect(screen.getByText("验收失败")).toBeInTheDocument();
     expect(screen.getByText(/读取失败验收项/)).toBeInTheDocument();
     await user.click(repair);
 
     await waitFor(() => expect(mocks.retryFailedTasks).toHaveBeenCalledWith("s1"));
     expect(mocks.start).toHaveBeenCalledWith("s1", undefined, undefined);
+  });
+
+  it("does not blindly retry non-repairable provider failures", async () => {
+    const user = userEvent.setup();
+    fakeState.tasks = {
+      s1: [
+        {
+          id: "task-provider-failed",
+          session_id: "s1",
+          title: "模型调用失败",
+          description: "provider failure",
+          status: "failed",
+          cwd: "/Users/x/proj",
+          parent_task_id: null,
+          sub_session_id: null,
+          created_at: "2026-07-08T00:00:00Z",
+          started_at: "2026-07-08T00:00:01Z",
+          completed_at: "2026-07-08T00:00:02Z",
+          result: null,
+          error: "HTTP 402 Insufficient Balance from provider",
+          attempt_count: 1,
+          verification_results: null,
+          failure_attribution: {
+            kind: "model-provider",
+            label: "模型/Provider",
+            summary: "HTTP 402 Insufficient Balance from provider",
+            next_action: "修复 endpoint、API key、余额或模型 route 后再重试。",
+            repairable: false,
+            source: "error",
+          },
+          task_context_json: null,
+          spec_req_id: null,
+          spec_title: null,
+        },
+      ],
+    };
+
+    render(
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+    );
+
+    expect(await screen.findByText("模型/Provider")).toBeInTheDocument();
+    const repair = screen.getByRole("button", { name: /先处理失败原因/ });
+    expect(repair).toBeDisabled();
+    await user.click(repair);
+
+    expect(mocks.retryFailedTasks).not.toHaveBeenCalled();
+    expect(mocks.start).not.toHaveBeenCalled();
   });
 
   it("autonomous + 先写规范: writes a spec, decomposes it, links tasks to the spec", async () => {
