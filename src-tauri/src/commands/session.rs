@@ -7,6 +7,13 @@ use crate::errors::AppError;
 use crate::storage::{Message, Session};
 use crate::AppState;
 
+fn resolve_new_session_model(
+    settings: &crate::config::Settings,
+    requested_model: &str,
+) -> Option<String> {
+    settings.resolve_model_for_endpoint(&settings.default_endpoint, requested_model)
+}
+
 #[tauri::command]
 pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Session>, AppError> {
     let pool = state.db.read().await;
@@ -32,16 +39,17 @@ pub async fn get_or_create_quick_session(
     model_id: String,
     state: State<'_, AppState>,
 ) -> Result<Session, AppError> {
-    let pool = state.db.read().await;
-
     // Try to find an existing quick session first.
-    if let Ok(existing) = sqlx::query_as::<_, Session>(
-        "SELECT * FROM sessions WHERE kind = 'quick' ORDER BY updated_at DESC LIMIT 1",
-    )
-    .fetch_one(&*pool)
-    .await
     {
-        return Ok(existing);
+        let pool = state.db.read().await;
+        if let Ok(existing) = sqlx::query_as::<_, Session>(
+            "SELECT * FROM sessions WHERE kind = 'quick' ORDER BY updated_at DESC LIMIT 1",
+        )
+        .fetch_one(&*pool)
+        .await
+        {
+            return Ok(existing);
+        }
     }
 
     // Create one. cwd = ~/.codefactory/quick — auto-mkdir so the agent's
@@ -53,8 +61,17 @@ pub async fn get_or_create_quick_session(
         AppError::Other(format!("create quick-task dir failed: {e}"))
     })?;
 
+    let settings = state.settings.read().await.clone();
+    let model_id = resolve_new_session_model(&settings, &model_id).ok_or_else(|| {
+        AppError::Other(format!(
+            "No model configured for endpoint '{}'. Please choose a model in the picker.",
+            settings.default_endpoint
+        ))
+    })?;
+
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp_millis();
+    let pool = state.db.read().await;
     sqlx::query(
         "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at, kind) \
          VALUES (?,?,?,?,?,?,'quick')",
@@ -83,7 +100,13 @@ pub async fn create_quick_session(
     model_id: String,
     state: State<'_, AppState>,
 ) -> Result<Session, AppError> {
-    let pool = state.db.read().await;
+    let settings = state.settings.read().await.clone();
+    let resolved_model = resolve_new_session_model(&settings, &model_id).ok_or_else(|| {
+        AppError::Other(format!(
+            "No model configured for endpoint '{}'. Please choose a model in the picker.",
+            settings.default_endpoint
+        ))
+    })?;
     let id = Uuid::new_v4().to_string();
     let home = dirs::home_dir()
         .ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
@@ -91,6 +114,7 @@ pub async fn create_quick_session(
     std::fs::create_dir_all(&quick_dir)
         .map_err(|e| AppError::Other(format!("create quick-task dir failed: {e}")))?;
     let now = Utc::now().timestamp_millis();
+    let pool = state.db.read().await;
     sqlx::query(
         "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at, kind) \
          VALUES (?,?,?,?,?,?,'quick')",
@@ -98,7 +122,7 @@ pub async fn create_quick_session(
     .bind(&id)
     .bind("快速任务")
     .bind(quick_dir.to_string_lossy().to_string())
-    .bind(&model_id)
+    .bind(&resolved_model)
     .bind(now)
     .bind(now)
     .execute(&*pool)
@@ -155,6 +179,22 @@ pub async fn create_session(
     model_id: String,
     state: State<'_, AppState>,
 ) -> Result<Session, AppError> {
+    let settings = state.settings.read().await.clone();
+    let resolved_model = resolve_new_session_model(&settings, &model_id).ok_or_else(|| {
+        AppError::Other(format!(
+            "No model configured for endpoint '{}'. Please choose a model in the picker.",
+            settings.default_endpoint
+        ))
+    })?;
+    if resolved_model != model_id {
+        tracing::warn!(
+            "create_session: repaired requested model '{}' to endpoint '{}' active model '{}'",
+            model_id,
+            settings.default_endpoint,
+            resolved_model
+        );
+    }
+
     let pool = state.db.read().await;
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp_millis();
@@ -165,7 +205,7 @@ pub async fn create_session(
     .bind(&id)
     .bind(&title)
     .bind(&cwd)
-    .bind(&model_id)
+    .bind(&resolved_model)
     .bind(now)
     .bind(now)
     .execute(&*pool)
@@ -303,4 +343,32 @@ pub async fn get_messages(
     .fetch_all(&*pool)
     .await?;
     Ok(messages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_session_model_falls_back_to_the_active_model_for_the_current_endpoint() {
+        let mut settings = crate::config::Settings::default();
+        settings.default_endpoint = "deepseek".into();
+        settings.endpoints.insert(
+            "deepseek".into(),
+            crate::config::settings::Endpoint {
+                base_url: "https://api.deepseek.com".into(),
+                key_ref: Some("codefactory.endpoint.deepseek".into()),
+                api_style: crate::config::settings::ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+
+        let resolved = resolve_new_session_model(
+            &settings,
+            "anthropic/claude-opus-4-7",
+        );
+
+        assert_eq!(resolved.as_deref(), Some("deepseek-v4-pro"));
+    }
 }

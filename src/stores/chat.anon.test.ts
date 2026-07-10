@@ -43,6 +43,27 @@ beforeEach(() => {
 });
 
 describe("anonymous chat store flow", () => {
+  it("uses the backend-resolved model immediately after creating a project session", async () => {
+    invokeMock.mockResolvedValueOnce({
+      id: "p-resolved",
+      title: "project",
+      cwd: "/tmp/project",
+      model_id: "deepseek-v4-pro",
+      created_at: 1,
+      updated_at: 1,
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      kind: "project",
+    });
+
+    await useChatStore.getState().createSession(
+      "/tmp/project",
+      "anthropic/claude-opus-4-7",
+    );
+
+    expect(useChatStore.getState().activeModel).toBe("deepseek-v4-pro");
+  });
+
   it("startAnonymousSession creates a blank in-memory anonymous session", () => {
     const s = useChatStore.getState().startAnonymousSession();
     expect(s.kind).toBe("anonymous");

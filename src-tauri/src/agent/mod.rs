@@ -459,7 +459,7 @@ impl AgentLoop {
             blocks.push(context_budget::Block::new(user_ctx, 0, 2500));
         }
         let mut system_prompt = context_budget::assemble(
-            self.mode.system_prompt().to_string(),
+            base_system_prompt(self.mode, &self.cwd),
             blocks,
             SYSTEM_PROMPT_BUDGET,
         );
@@ -2003,9 +2003,22 @@ fn project_knowledge_blocks(cwd: &Path) -> Vec<context_budget::Block> {
 /// budgeted prompt (which also folds in skills + user context).
 fn build_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
     context_budget::assemble(
-        mode.system_prompt().to_string(),
+        base_system_prompt(mode, cwd),
         project_knowledge_blocks(cwd),
         PROJECT_CONTEXT_BUDGET,
+    )
+}
+
+/// Fixed agent contract plus the exact project root for this session. Keeping
+/// cwd in the non-evictable base prevents the model from guessing container
+/// conventions such as `/workspace` before its first tool call.
+fn base_system_prompt(mode: AgentMode, cwd: &Path) -> String {
+    format!(
+        "{}\n\n# Working Directory\n\
+         The project root and default tool working directory is:\n{}\n\
+         Use this exact path or paths relative to it. Do not assume `/workspace` or another container path.",
+        mode.system_prompt(),
+        cwd.to_string_lossy()
     )
 }
 
@@ -2241,6 +2254,23 @@ mod tests {
         assert!(prompt.starts_with(SYSTEM_PROMPT));
         assert!(prompt.contains("CODEFACTORY.md"));
         assert!(prompt.contains("Use the repo-local memory."));
+
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn system_prompt_names_the_exact_project_working_directory() {
+        let cwd = std::env::temp_dir().join(format!(
+            "codefactory-working-directory-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let prompt = build_system_prompt(&cwd);
+
+        assert!(prompt.contains("# Working Directory"));
+        assert!(prompt.contains(&cwd.to_string_lossy().to_string()));
+        assert!(prompt.contains("Do not assume `/workspace`"));
 
         std::fs::remove_dir_all(cwd).unwrap();
     }
