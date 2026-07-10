@@ -8,6 +8,7 @@
 - 该结果低于 2026-07-06 两轮稳定的 `16 / 18`，说明当前发布前 score-holding 已破坏，不能继续用历史最好分代表当前状态。排除三个有直接环境/验证器证据的 trial 后，可归因 Agent 子集为 `12 / 15`（`80%`）；这是诊断归因，不替代原始分。
 - 已安装 v1.42.7 的真实产品编码任务完成 `3 / 3` 测试，产品矩阵评分 `9 / 10`；但首轮暴露了过期模型状态和错误 `/workspace` 假设。
 - 通用产品修复已通过 PR `#100` 合并并进入 v1.42.8 发布：所有新项目/快速任务会话在入库前按 endpoint 校正模型，Agent 在首个工具调用前获得准确项目根目录。没有新增 Terminal-Bench task-specific 分支。
+- 正式安装的 v1.42.8 已完成同类 P1 复验：新项目发送前显示 `deepseek / deepseek-v4-pro`，首个命令直接使用 `/private/tmp/codefactory-product-eval-context-fix`，Agent 在 51.1 秒内完成分析、修改和内部复验，独立终端再次验证 `3 / 3`。两项产品缺陷均已在发布路径闭环。
 
 当前水平应定义为：**真实产品主路径可用，但 terminal-agent 能力处于中等且不稳定水平**。它能稳定完成常见文件、数据、服务、QEMU、Torch 和 gRPC 类任务，但在源码构建、长安装、服务 readiness 和本机重 verifier 上仍会回退。
 
@@ -22,6 +23,7 @@
 | 外部 Agent 能力 | v1.42.7 `codefactory-headless` + `deepseek-v4-pro` | 固定 18 题、concurrency 2、1200s watchdog | `12 / 18`，`0.667` | 当前环境下的完整诊断基线 |
 | 产品主路径 | `/Applications/CodeFactory.app` v1.42.7 | 固定 npm fixture、DeepSeek、默认权限 | `9 / 10`，外部复验 `3 / 3` | 已安装 App 能完成普通代码修复闭环 |
 | 产品修复验证 | CodeFactoryDev（PR #100） | stale Claude store + DeepSeek endpoint | 发送前 UI/SQLite 均为 `deepseek-v4-pro` | 新会话模型权威状态已前移到创建阶段 |
+| 发布版 P1 复验 | `/Applications/CodeFactory.app` v1.42.8 | 全新失败 fixture、DeepSeek、两次单次项目权限 | 发送前模型正确；首命令 cwd 正确；内部及外部测试均 `3 / 3` | 模型与 cwd 修复已在正式安装版真实用户路径生效 |
 | 发布交付 | PR #100 / v1.42.8 | PR、CI、刻意发版 | PR/CI、Windows/macOS build、macOS artifact smoke、正式发布均通过 | 产品修复已进入正式发布 |
 
 ## 18 题结果
@@ -90,4 +92,4 @@
 - `12 / 18` 是当前完整诊断分；`16 / 18` 是历史 score-holding 参照，不是本轮结果。
 - 产品修复 PR：`https://github.com/BumStill/CodeFactory/pull/100`，合并 commit `8073de9c5a9dfa5acf6fa27574ddde4d3e3d26ef`；PR CI 和合并后 main CI 均通过。
 - 正式发布：`https://github.com/BumStill/CodeFactory/releases/tag/v1.42.8`。Windows、macOS build、DMG 临时安装、bundle/version/arm64、真实窗口稳定和隔离数据库初始化均通过。
-- 同一 DMG 已安装到 `/Applications/CodeFactory.app`，本机 bundle version 为 `1.42.8` 且进程从该路径稳定启动。最终已安装 App 的交互式新项目复验因 macOS 当时锁屏未执行；不得把进程存在单独解释为完整 P1 通过。
+- 同一 DMG 已安装到 `/Applications/CodeFactory.app`，本机 bundle version 为 `1.42.8` 且进程从该路径稳定启动。解锁后完成交互式新项目 P1：外部基线 `0 / 3`，发送前 UI 为 `deepseek / deepseek-v4-pro`，首个 bash 命令为 `cd /private/tmp/codefactory-product-eval-context-fix && npm test 2>&1`，Agent 修改后内部复验通过，独立终端复验为 `3 / 3`。
