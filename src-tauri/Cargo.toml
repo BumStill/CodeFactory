@@ -61,6 +61,9 @@ getrandom = "0.2"          # PKCE verifier + CSRF state randomness (lighter than
 tracing  = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 panic         = "abort"
 codegen-units = 1

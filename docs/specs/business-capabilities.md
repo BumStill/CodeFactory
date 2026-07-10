@@ -51,3 +51,9 @@
 - 用户在任务列中能看到失败类型、证据来源和下一步建议，再决定是否点击 `修复失败项` 进入重试。
 - `修复失败项` 只允许自动重置 `repairable=true` 的任务；provider/key、权限、运行环境等需要用户先处理原因的失败必须保持 failed，避免盲目消耗模型调用。
 - 自动修复闭环必须回到同一 project session 的任务执行、验证结果和 evidence pack，而不是只更新 benchmark 分数。
+
+## C10 有界控制面观察
+- ControlPlane 的 Git 子进程必须有硬超时并在超时后终止，不允许页面永久加载。
+- Git timeout、Git unavailable、非 Git 目录和普通 probe failure 必须分开归因。
+- 单个 Git probe 失败时继续返回 Authority、Memory、Capabilities、filesystem delivery fields 和其他可用 Git 字段。
+- 用户能看到 partial risk，并在 Git 恢复后通过刷新回到完整快照。

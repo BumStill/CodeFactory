@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   AlertTriangle,
@@ -40,15 +40,25 @@ interface CapabilitySummary {
   detail: string;
 }
 
+type GitProbeStatus = "ok" | "partial" | "not_repository" | "unavailable" | "not_checked";
+
+interface GitProbeSummary {
+  status: GitProbeStatus;
+  timeout_ms: number;
+  timed_out: string[];
+  failed: string[];
+}
+
 interface DeliverySummary {
   git_branch?: string | null;
-  is_dirty: boolean;
-  dirty_count: number;
+  is_dirty: boolean | null;
+  dirty_count: number | null;
   sync_gate_present: boolean;
-  sync_gate_configured: boolean;
+  sync_gate_configured: boolean | null;
   release_workflow_present: boolean;
   auto_release_present: boolean;
   latest_release_tag?: string | null;
+  git_probe?: GitProbeSummary;
 }
 
 interface ControlPlaneRisk {
@@ -69,6 +79,27 @@ interface ControlPlaneSnapshot {
 
 interface ControlPlanePageProps {
   onBack: () => void;
+}
+
+const CONTROL_PLANE_REQUEST_TIMEOUT_MS = 8_000;
+
+async function requestControlPlaneSnapshot(cwd: string | null): Promise<ControlPlaneSnapshot> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const watchdog = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(
+      () => reject(new Error("控制面请求超过 8 秒，请重试。")),
+      CONTROL_PLANE_REQUEST_TIMEOUT_MS,
+    );
+  });
+
+  try {
+    return await Promise.race([
+      invoke<ControlPlaneSnapshot>("get_control_plane_snapshot", { cwd }),
+      watchdog,
+    ]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
 }
 
 function StatusBadge({ status }: { status: Status }) {
@@ -142,22 +173,84 @@ function CapabilityGrid({ items }: { items: CapabilitySummary[] }) {
   );
 }
 
+function gitContextLabel(delivery: DeliverySummary): string {
+  if (delivery.git_branch) return delivery.git_branch;
+  switch (delivery.git_probe?.status) {
+    case "partial":
+      return "Git 状态部分可用";
+    case "unavailable":
+      return "Git unavailable";
+    case "not_checked":
+      return "Git not checked";
+    case "not_repository":
+      return "not a git repo";
+    case "ok":
+      return "branch unavailable";
+    default:
+      return "not a git repo";
+  }
+}
+
+function gitObservationLabel(probe?: GitProbeSummary): string {
+  if (!probe) return "legacy";
+  if (probe.status === "ok") return "complete";
+  if (probe.status === "not_repository") return "not applicable";
+  if (probe.status === "unavailable") return "Git unavailable";
+  if (probe.status === "not_checked") return "not checked";
+
+  const reasons = [];
+  if (probe.timed_out.length > 0) reasons.push(`${probe.timed_out.join(", ")} timed out`);
+  if (probe.failed.length > 0) reasons.push(`${probe.failed.join(", ")} failed`);
+  return reasons.length > 0 ? `partial · ${reasons.join(" · ")}` : "partial";
+}
+
+function unknownGitField(delivery: DeliverySummary, probeName: string): boolean {
+  const probe = delivery.git_probe;
+  if (!probe) return false;
+  return (
+    probe.status === "unavailable" ||
+    probe.status === "not_checked" ||
+    (probe.status === "partial" &&
+      (probe.timed_out.includes("repository") || probe.failed.includes("repository"))) ||
+    probe.timed_out.includes(probeName) ||
+    probe.failed.includes(probeName)
+  );
+}
+
 function DeliveryPanel({ delivery }: { delivery: DeliverySummary }) {
+  const gitNotApplicable = delivery.git_probe?.status === "not_repository";
+  const dirtyState = gitNotApplicable
+    ? "not applicable"
+    : unknownGitField(delivery, "status") || delivery.is_dirty === null
+      ? "unknown"
+      : delivery.is_dirty === true
+        ? `${delivery.dirty_count ?? "?"} item(s)`
+        : "clean";
+  const syncHookState = gitNotApplicable
+    ? "not applicable"
+    : !delivery.sync_gate_present
+      ? "missing"
+      : unknownGitField(delivery, "hook") || delivery.sync_gate_configured === null
+        ? "unknown"
+        : delivery.sync_gate_configured
+          ? "configured"
+          : "not configured";
+  const latestTag = delivery.latest_release_tag
+    ? delivery.latest_release_tag
+    : delivery.git_probe?.status === "not_repository"
+      ? "not applicable"
+      : unknownGitField(delivery, "tag")
+        ? "unknown"
+        : "none";
   const rows = [
-    ["Branch", delivery.git_branch ?? "not a git repo"],
-    ["Dirty tree", delivery.is_dirty ? `${delivery.dirty_count} item(s)` : "clean"],
+    ["Git observation", gitObservationLabel(delivery.git_probe)],
+    ["Branch", gitContextLabel(delivery)],
+    ["Dirty tree", dirtyState],
     ["Sync gate", delivery.sync_gate_present ? "present" : "missing"],
-    [
-      "Sync hook config",
-      delivery.sync_gate_configured
-        ? "configured"
-        : delivery.sync_gate_present
-          ? "not configured"
-          : "missing",
-    ],
+    ["Sync hook config", syncHookState],
     ["Release workflow", delivery.release_workflow_present ? "present" : "missing"],
     ["Auto Release", delivery.auto_release_present ? "present" : "missing"],
-    ["Latest tag", delivery.latest_release_tag ?? "none"],
+    ["Latest tag", latestTag],
   ];
   return (
     <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
@@ -241,28 +334,36 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
   const [snapshot, setSnapshot] = useState<ControlPlaneSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestSequence = useRef(0);
 
   const generatedAt = useMemo(() => {
     if (!snapshot?.generated_at) return "";
     return new Date(snapshot.generated_at).toLocaleString();
   }, [snapshot?.generated_at]);
 
-  const load = async () => {
+  const load = useCallback(async () => {
+    const requestId = ++requestSequence.current;
     setLoading(true);
     setError(null);
     try {
-      const next = await invoke<ControlPlaneSnapshot>("get_control_plane_snapshot", { cwd });
+      const next = await requestControlPlaneSnapshot(cwd);
+      if (requestId !== requestSequence.current) return;
       setSnapshot(next);
     } catch (e) {
-      setError(String(e));
+      if (requestId !== requestSequence.current) return;
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
+      if (requestId !== requestSequence.current) return;
       setLoading(false);
     }
-  };
+  }, [cwd]);
 
   useEffect(() => {
-    load();
-  }, [cwd]);
+    void load();
+    return () => {
+      requestSequence.current += 1;
+    };
+  }, [load]);
 
   return (
     <div className="flex h-full flex-col bg-surface-0">
@@ -310,7 +411,7 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
               <div className="mb-4 flex flex-wrap items-center gap-3 text-xs text-gray-500">
                 <span className="inline-flex items-center gap-1">
                   <GitBranch size={13} />
-                  {snapshot.delivery.git_branch ?? "not a git repo"}
+                  {gitContextLabel(snapshot.delivery)}
                 </span>
                 <span>{generatedAt}</span>
               </div>

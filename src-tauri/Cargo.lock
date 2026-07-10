@@ -395,6 +395,7 @@ dependencies = [
  "git2",
  "globset",
  "keyring",
+ "libc",
  "memchr",
  "once_cell",
  "portable-pty",
