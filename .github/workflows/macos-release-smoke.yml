@@ -1,0 +1,44 @@
+name: macOS Release Artifact Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to verify, for example v1.42.6
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download published DMG
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/codefactory-release"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'CodeFactory_*_aarch64.dmg' \
+            --dir "$RUNNER_TEMP/codefactory-release"
+
+      - name: Verify installed macOS release artifact
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          DMG_DIR="$RUNNER_TEMP/codefactory-release"
+          DMG_COUNT="$(find "$DMG_DIR" -type f -name '*.dmg' | wc -l | tr -d ' ')"
+          if [ "$DMG_COUNT" != "1" ]; then
+            echo "::error::expected exactly one arm64 DMG, found $DMG_COUNT"
+            exit 1
+          fi
+          DMG_PATH="$(find "$DMG_DIR" -type f -name '*.dmg' -print -quit)"
+          scripts/verify-macos-release-artifact.sh "$DMG_PATH" "${RELEASE_TAG#v}"

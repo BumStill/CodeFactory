@@ -239,6 +239,16 @@ jobs:
           # a macOS bundle, so override to the mac bundles for this build only.
           args: --target aarch64-apple-darwin --bundles app,dmg
 
+      - name: Verify installed macOS release artifact
+        shell: bash
+        run: |
+          DMG_PATH="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -type f -name '*.dmg' -print -quit)"
+          if [ -z "$DMG_PATH" ]; then
+            echo "::error::macOS DMG was not produced"
+            exit 1
+          fi
+          scripts/verify-macos-release-artifact.sh "$DMG_PATH" "${GITHUB_REF_NAME#v}"
+
   # ── Step 4: assemble the cross-platform updater manifest, then publish ────
   # Each build job uploaded its own latest.json, but neither carries the other
   # platform's entry. Rebuild ONE authoritative latest.json from the .sig assets

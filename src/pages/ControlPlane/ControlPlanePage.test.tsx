@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -27,7 +27,7 @@ describe("ControlPlanePage", () => {
   });
 
   it("renders the AI Coding OS snapshot sections", async () => {
-    mocks.invoke.mockResolvedValue({
+    const snapshot = {
       generated_at: "2026-06-26T13:03:18Z",
       cwd: "/Users/leo/Projects/CodeFactory",
       authority: [
@@ -67,18 +67,21 @@ describe("ControlPlanePage", () => {
         latest_release_tag: "v1.39.1",
       },
       risks: [],
+    };
+    mocks.invoke.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return snapshot;
     });
 
     render(<ControlPlanePage onBack={vi.fn()} />);
 
-    await waitFor(() =>
-      expect(mocks.invoke).toHaveBeenCalledWith("get_control_plane_snapshot", {
-        cwd: "/Users/leo/Projects/CodeFactory",
-      }),
-    );
+    expect(screen.getByText("加载控制面…")).toBeInTheDocument();
+    expect(await screen.findByText("Authority Surfaces")).toBeInTheDocument();
+    expect(mocks.invoke).toHaveBeenCalledWith("get_control_plane_snapshot", {
+      cwd: "/Users/leo/Projects/CodeFactory",
+    });
 
     expect(screen.getByText("AI Coding OS")).toBeInTheDocument();
-    expect(screen.getByText("Authority Surfaces")).toBeInTheDocument();
     expect(screen.getByText("Memory Lifecycle")).toBeInTheDocument();
     expect(screen.getByText("Capability Registry")).toBeInTheDocument();
     expect(screen.getByText("Delivery Gates")).toBeInTheDocument();
