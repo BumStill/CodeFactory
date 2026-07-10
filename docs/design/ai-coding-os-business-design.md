@@ -23,6 +23,7 @@ CodeFactory 过去的定位是本地 AI 编程工作台：打开项目、选择�
 | AICOS-B3 | 记忆不再只是聊天缓存 | 控制面展示 pending/accepted/rejected learning events，作为 memory proposal lifecycle 的 v1 状态 |
 | AICOS-B4 | 技能、MCP、知识库、hooks、Git remote 统一成能力视图 | 控制面展示 capability 数量、启用数量和风险提示 |
 | AICOS-B5 | Git/发布交付门禁可见 | 控制面展示当前分支、dirty 状态、sync gate 文件是否存在、当前 checkout 是否启用该 hook、release workflow、latest release 标记 |
+| AICOS-B6 | 单个外部观察失败不拖死整个控制面 | Git 探测有硬超时；失败时返回部分快照并明确标注 timeout、Git 不可用或非 Git 目录 |
 
 ## v1 范围
 
@@ -35,6 +36,7 @@ CodeFactory 过去的定位是本地 AI 编程工作台：打开项目、选择�
 - 聚合 learning events 的 proposal 状态。
 - 聚合 Skills、MCP、Knowledge、Hooks、Git remotes 的 capability 状态。
 - 聚合 Git branch、dirty tree、sync hook 文件与本地 `core.hooksPath` 配置、release workflow 的 delivery gate 状态。
+- Git 观察采用有界、可降级执行；慢仓库不阻塞 Authority、Memory 和 Capability 结果。
 - 提供测试覆盖，确保控制面能从真实项目状态生成快照。
 
 不包含：
@@ -56,6 +58,7 @@ CodeFactory 过去的定位是本地 AI 编程工作台：打开项目、选择�
 
 - 用户从 Home 能进入“AI Coding OS”控制面。
 - 打开 CodeFactory 项目时，控制面能看到本仓库的规则、spec、hook、release、capability 和 git 状态。
+- Git 状态超时或失败时，页面在有界时间内显示部分快照和明确风险，恢复后可以刷新回完整状态。
 - 没有项目时，控制面也能展示全局能力状态并明确缺少项目上下文。
 - 单元测试覆盖后端快照逻辑和前端渲染。
 - 本次变更通过治理验证、前端测试、构建、PR CI，并发布到新版本。

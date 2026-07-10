@@ -47,6 +47,19 @@ struct ControlPlaneSnapshot {
 }
 ```
 
+Git delivery observation 是 additive contract：
+
+```rust
+struct GitProbeSummary {
+  status: ok | partial | not_repository | unavailable | not_checked,
+  timeout_ms: u64,
+  timed_out: Vec<String>,
+  failed: Vec<String>,
+}
+```
+
+所有 Git probe 使用 Tokio child process 和 2000ms timeout。实现必须显式 `spawn`、并发读取 stdout/stderr，并对 `child.wait()` 计时；超时后终止整个进程树、`wait` 回收直接 child，并有界结束管道 reader，避免后代进程继续持有 stdout/stderr 让请求卡住。`kill_on_drop(true)` 只作为任务取消或 panic 的兜底。probe 固定 `LC_ALL=C`、`LANG=C`、关闭 pager 和 terminal prompt，避免本地化错误误分类或隐式交互。仓库识别完成后，branch、status、hook config 和 tag probe 并行执行；单项失败只降低 `git_probe.status`，不使 `get_control_plane_snapshot` 整体失败。
+
 ### Authority
 
 每个 authority surface 返回：
@@ -102,9 +115,11 @@ Delivery summary 返回：
 - `release_workflow_present`
 - `auto_release_present`
 - `latest_release_tag`
+- `git_probe`
 
 `latest_release_tag` v1 从本地 tag 推断；GitHub release 是否公开仍由发布流程用 `gh release view` 验证。
 `sync_gate_present` 只表示 `.githooks/pre-commit` 文件存在；`sync_gate_configured` 还要读取当前仓库的 `core.hooksPath`，确认本 checkout 真正在使用版本化 hook。
+`git_probe` 区分完整、部分、非 Git 目录、Git 不可用和未执行；timeout/failed probe names 同时进入 Risks，前端不得用 `not a git repo` 覆盖其他失败类型。
 
 ## 存储策略
 

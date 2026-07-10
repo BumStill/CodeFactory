@@ -74,6 +74,13 @@ Workspace 后续可追加同入口，但 v1 先在 Home 顶部提供全局入口
 - Delivery 扫描该 cwd 的 git 状态。
 - Memory summary 过滤该 cwd 的 learning events。
 
+### Git 观察降级
+
+- 正常完成时，Delivery Gates 显示 `Git observation: complete`。
+- 任一 probe 超时时，保留其余快照，显示 `Git 状态部分可用` 和具体 timeout probe；不得继续无限 spinner。
+- Git executable 不可用时显示 `Git unavailable`，非 Git 目录显示 `not a git repository`，两者不能混淆。
+- 用户点击刷新时保留上一份快照；Git 恢复后完整快照替换 partial 状态，风险消失。
+
 ### 风险
 
 风险只呈现事实，不替用户做不可逆动作：
@@ -107,3 +114,4 @@ v1 只读：
 - 状态项不会因为长路径或长标签溢出。
 - 风险列表明确显示 blocker，而不是隐藏在控制台日志里。
 - Delivery Gates 明确区分 sync hook 文件存在与本地 git 配置已启用。
+- Git probe 卡住时页面在有界时间内返回部分快照；恢复后刷新回完整状态。
