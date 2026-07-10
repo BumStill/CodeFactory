@@ -597,6 +597,7 @@ Terminal-Bench 2.1 对 CodeFactory 的价值不是一次总分，而是持续生
 
 建议 gate：
 
+- 2026-07-10 的 v1.42.7 当前发布诊断 run `3f86d0e1-e7a9-465e-9deb-034ee38d4d1a` 为 `12 / 18`、mean reward `0.667`，低于历史两轮 `16 / 18`。当前 P0 已从“冲 17/18”回退为“先恢复 score-holding”：`build-cython-ext`、`configure-git-webserver` 是确认的 Agent 回归；`install-windows-3.11` 是 VNC 截图尺寸不一致导致的 verifier 歧义；`filter-js-from-html` 必须在 Linux/x86 clean runner 重新归因。在同一发布版重新达到 `>= 16 / 18` 前，不得用历史最好分代表当前能力。系统报告见 `docs/evidence-packs/codefactory-systematic-agent-evaluation-2026-07-10.md`。
 - 当前 fixed subset 最新真实聚合已提升到两轮完整回归稳定 `16 / 18`、mean reward `0.889`：run `565ecdd4-7694-42aa-a3c7-a3bd38f15146` 和 run `bd70de5a-b4ec-4925-8353-7f9000fdcf77`。它高于最早 full-run 离线投影基线 `4 / 18`、上一轮发布候选 `14 / 18`，并且两轮均保持 `qemu-startup` 通过，所以当前水平进入 v1.42.0 产品化交付候选阶段，但仍不是 clean official-comparable gate。
 - score-holding 必须维护最新 `16 / 18` pass set：`build-cython-ext`、`circuit-fibsqrt`、`configure-git-webserver`、`count-dataset-tokens`、`extract-elf`、`filter-js-from-html`、`install-windows-3.11`、`kv-store-grpc`、`mteb-retrieve`、`nginx-request-logging`、`protein-assembly`、`qemu-startup`、`sanitize-git-repo`、`sparql-university`、`torch-tensor-parallelism`、`write-compressor` 不得回退。
 - 下一道有效产品门槛是先让这轮 `16 / 18` 候选进入真实产品发布链；发布后再跑同口径 fixed subset 或 release artifact 触发的 headless runtime 证明 live build 仍达到 `>= 16 / 18` 且无新增历史通过项回归。随后把 `caffe-cifar-10` 或 `query-optimize` 之一作为第三阶段 score-growth 目标，冲 `17 / 18`。
