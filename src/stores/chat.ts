@@ -147,6 +147,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     set((s) => ({
       sessions: [session, ...s.sessions],
       activeSession: session,
+      activeModel: session.model_id,
       runtime: { ...s.runtime, [session.id]: freshRuntime() },
     }));
     return session;

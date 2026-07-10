@@ -449,6 +449,36 @@ mod reasoning_effort_tests {
 
         assert_eq!(resolved.as_deref(), Some("deepseek-v4-pro"));
     }
+
+    #[test]
+    fn resolves_stale_direct_provider_model_to_openrouter_active_model() {
+        let mut settings = Settings::default();
+        settings.default_endpoint = "openrouter".into();
+        let endpoint = settings.endpoints.get_mut("openrouter").unwrap();
+        endpoint.active_model = Some("anthropic/claude-sonnet-4".into());
+
+        let resolved = settings.resolve_model_for_endpoint(
+            "openrouter",
+            "deepseek-v4-pro",
+        );
+
+        assert_eq!(resolved.as_deref(), Some("anthropic/claude-sonnet-4"));
+    }
+
+    #[test]
+    fn preserves_explicit_openrouter_session_model_when_endpoint_active_model_changes() {
+        let mut settings = Settings::default();
+        settings.default_endpoint = "openrouter".into();
+        let endpoint = settings.endpoints.get_mut("openrouter").unwrap();
+        endpoint.active_model = Some("anthropic/claude-sonnet-4".into());
+
+        let resolved = settings.resolve_model_for_endpoint(
+            "openrouter",
+            "google/gemini-2.5-pro",
+        );
+
+        assert_eq!(resolved.as_deref(), Some("google/gemini-2.5-pro"));
+    }
 }
 
 /// Active settings location. Lives alongside the SQLite DB under the Tauri
@@ -690,9 +720,21 @@ impl Settings {
             return Some(requested.to_string());
         }
 
+        // OpenRouter's remote catalog uses provider-qualified `owner/model`
+        // ids. They are not copied into custom_models, and a session may keep
+        // one even after another session changes the endpoint-wide active
+        // model. Preserve that explicit per-session choice. Unqualified slugs
+        // from direct providers or ChatGPT still fall through to repair.
+        if ep.base_url.contains("openrouter.ai") && requested.contains('/') {
+            return Some(requested.to_string());
+        }
+
         let has_endpoint_model = !active.is_empty() || !ep.custom_models.is_empty();
-        let should_repair_to_endpoint_model = matches!(ep.api_style, ApiStyle::Chatgpt)
-            || (has_endpoint_model && !ep.base_url.contains("openrouter.ai"));
+        // A remaining model that is neither active nor explicitly compatible
+        // is stale. ModelPicker persists a real selection as active before
+        // session creation, so this repairs provider-switch races.
+        let should_repair_to_endpoint_model =
+            matches!(ep.api_style, ApiStyle::Chatgpt) || has_endpoint_model;
 
         if should_repair_to_endpoint_model {
             if !active.is_empty() {
