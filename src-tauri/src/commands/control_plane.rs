@@ -963,18 +963,24 @@ mod tests {
     #[test]
     #[ignore]
     fn control_plane_timeout_child_fixture() {
-        let Some(path) = std::env::var_os("CODEFACTORY_CONTROL_PLANE_TIMEOUT_SENTINEL") else {
+        let Some(state_dir) = std::env::var_os("CODEFACTORY_CONTROL_PLANE_TIMEOUT_STATE_DIR")
+        else {
             return;
         };
-        std::thread::sleep(std::time::Duration::from_millis(350));
-        std::fs::write(path, "child survived timeout").unwrap();
+        std::fs::write(
+            std::path::Path::new(&state_dir).join("pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(30));
     }
 
     #[cfg(unix)]
     #[test]
     #[ignore]
     fn control_plane_timeout_parent_fixture() {
-        let Some(sentinel) = std::env::var_os("CODEFACTORY_CONTROL_PLANE_TIMEOUT_SENTINEL") else {
+        let Some(state_dir) = std::env::var_os("CODEFACTORY_CONTROL_PLANE_TIMEOUT_STATE_DIR")
+        else {
             return;
         };
         let _ = std::process::Command::new(std::env::current_exe().unwrap())
@@ -983,13 +989,52 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("CODEFACTORY_CONTROL_PLANE_TIMEOUT_SENTINEL", sentinel)
+            .env("CODEFACTORY_CONTROL_PLANE_TIMEOUT_STATE_DIR", state_dir)
             .status();
     }
 
+    fn timeout_fixture_pid(state_dir: &Path) -> u32 {
+        std::fs::read_to_string(state_dir.join("pid"))
+            .expect("timeout fixture should report its pid before the probe deadline")
+            .trim()
+            .parse()
+            .expect("timeout fixture pid should be numeric")
+    }
+
+    #[cfg(unix)]
+    fn assert_process_stopped(pid: u32, label: &str) {
+        for _ in 0..20 {
+            let result = unsafe { libc::kill(pid as i32, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        panic!("timed-out {label} process {pid} kept running");
+    }
+
+    #[cfg(windows)]
+    fn assert_process_stopped(pid: u32, label: &str) {
+        // `taskkill` returning success means the process was still alive. It
+        // also cleans up that process before the assertion fails.
+        let output = std::process::Command::new("taskkill")
+            .no_window()
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output()
+            .expect("taskkill should be available on Windows");
+        assert!(
+            !output.status.success(),
+            "timed-out {label} process {pid} kept running"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn process_timeout_stops_child_before_delayed_write() {
-        let sentinel = tmp_project().join("sentinel");
+    async fn process_timeout_stops_and_reaps_child() {
+        let state_dir = tmp_project();
         let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -997,21 +1042,23 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("CODEFACTORY_CONTROL_PLANE_TIMEOUT_SENTINEL", &sentinel);
+            .env("CODEFACTORY_CONTROL_PLANE_TIMEOUT_STATE_DIR", &state_dir);
 
-        let result =
-            process_output_with_timeout(command, std::time::Duration::from_millis(50)).await;
+        let result = process_output_with_timeout(
+            command,
+            std::time::Duration::from_millis(GIT_PROBE_TIMEOUT_MS),
+        )
+        .await;
 
         assert!(matches!(result, Err(GitCommandFailureKind::Timeout)));
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-        assert!(!sentinel.exists(), "timed-out child kept running");
-        let _ = std::fs::remove_dir_all(sentinel.parent().unwrap());
+        assert_process_stopped(timeout_fixture_pid(&state_dir), "child");
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_timeout_stops_descendants_holding_output_pipes() {
-        let sentinel = tmp_project().join("sentinel");
+        let state_dir = tmp_project();
         let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -1019,14 +1066,16 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("CODEFACTORY_CONTROL_PLANE_TIMEOUT_SENTINEL", &sentinel);
+            .env("CODEFACTORY_CONTROL_PLANE_TIMEOUT_STATE_DIR", &state_dir);
 
-        let result =
-            process_output_with_timeout(command, std::time::Duration::from_millis(50)).await;
+        let result = process_output_with_timeout(
+            command,
+            std::time::Duration::from_millis(GIT_PROBE_TIMEOUT_MS),
+        )
+        .await;
 
         assert!(matches!(result, Err(GitCommandFailureKind::Timeout)));
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-        assert!(!sentinel.exists(), "timed-out descendant kept running");
-        let _ = std::fs::remove_dir_all(sentinel.parent().unwrap());
+        assert_process_stopped(timeout_fixture_pid(&state_dir), "descendant");
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 }
