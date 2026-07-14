@@ -32,7 +32,16 @@ use super::AgentMode;
 /// the message as approval. A false negative just makes the agent ask (safe);
 /// a false positive would execute against the user's wishes (unsafe).
 const NEGATIONS_CJK: &[&str] = &[
-    "不", "别", "甭", "暂停", "先别", "等等", "等一下", "稍等", "再想", "再说",
+    "不",
+    "别",
+    "甭",
+    "暂停",
+    "先别",
+    "等等",
+    "等一下",
+    "稍等",
+    "再想",
+    "再说",
 ];
 /// Negation cues — whole-token-matched (English).
 const NEGATIONS_EN: &[&str] = &[
@@ -42,22 +51,48 @@ const NEGATIONS_EN: &[&str] = &[
 /// Unambiguous go-ahead phrases (CJK, substring). Fire even inside a longer
 /// sentence — "我同意执行并要求输出 ppt" is carried by "同意".
 const STRONG_CJK: &[&str] = &[
-    "同意", "批准", "执行吧", "开始吧", "动手", "做吧", "搞吧", "去吧",
-    "就这样", "就这么", "可以执行", "照这个", "按这个", "确认执行",
+    "同意",
+    "批准",
+    "执行吧",
+    "开始吧",
+    "动手",
+    "做吧",
+    "搞吧",
+    "去吧",
+    "就这样",
+    "就这么",
+    "可以执行",
+    "照这个",
+    "按这个",
+    "确认执行",
     // Bare confirmations: after a draft the user types "确认/确定" to mean go.
     // Promoted from the weak tier so they execute even without a trailing "?".
-    "确认", "确定",
+    "确认",
+    "确定",
 ];
 /// Strong approvals (English, whole multi-word phrases — substring is fine
 /// because the phrase itself is unambiguous).
 const STRONG_EN_PHRASES: &[&str] = &[
-    "go ahead", "do it", "ship it", "make it so", "let's go", "lets go",
-    "go for it", "sounds good", "looks good",
+    "go ahead",
+    "do it",
+    "ship it",
+    "make it so",
+    "let's go",
+    "lets go",
+    "go for it",
+    "sounds good",
+    "looks good",
 ];
 /// Strong approvals (English, single word — whole-token so "approve" never
 /// fires on "disapprove").
-const STRONG_EN_WORDS: &[&str] =
-    &["approve", "approved", "proceed", "lgtm", "confirm", "confirmed"];
+const STRONG_EN_WORDS: &[&str] = &[
+    "approve",
+    "approved",
+    "proceed",
+    "lgtm",
+    "confirm",
+    "confirmed",
+];
 
 /// Weak/standalone approvals — only count when the message is essentially
 /// *just* the approval. "好的，但是…" is a refinement, not a green light.
@@ -162,7 +197,9 @@ mod tests {
 
     #[test]
     fn pending_proposal_detects_trailing_question_both_scripts() {
-        assert!(is_pending_proposal("…here's the plan.\n\nReady to proceed?"));
+        assert!(is_pending_proposal(
+            "…here's the plan.\n\nReady to proceed?"
+        ));
         assert!(is_pending_proposal("…方案如上，可以开始吗？"));
         assert!(is_pending_proposal("Ready to proceed?   \n")); // trailing ws
         assert!(!is_pending_proposal("Done. Files changed: a.rs, b.rs."));
@@ -186,7 +223,9 @@ mod tests {
         assert!(is_approval("yes"));
         // Long message that merely starts with an approval word is a refinement.
         assert!(!is_approval("好的，但是先把数据库那块改成 Postgres 再说"));
-        assert!(!is_approval("ok but first rename the module and add a test"));
+        assert!(!is_approval(
+            "ok but first rename the module and add a test"
+        ));
     }
 
     #[test]
@@ -234,7 +273,10 @@ mod tests {
             AgentMode::Interactive
         );
         // First turn of a session.
-        assert_eq!(decide_chat_mode(None, "帮我做个 ppt"), AgentMode::Interactive);
+        assert_eq!(
+            decide_chat_mode(None, "帮我做个 ppt"),
+            AgentMode::Interactive
+        );
     }
 
     #[test]

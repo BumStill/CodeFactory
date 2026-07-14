@@ -94,7 +94,7 @@ pub fn create(cwd: &Path, label: &str) -> CheckpointResult<Option<String>> {
         // anchors are easy to enumerate or clean up later.
         let ref_name = format!("refs/codefactory/checkpoints/{}", &stash_sha[..12]);
         let _ = Command::new("git")
-        .no_window()
+            .no_window()
             .args(["update-ref", &ref_name, &stash_sha])
             .current_dir(cwd)
             .output();
@@ -115,7 +115,11 @@ pub fn create(cwd: &Path, label: &str) -> CheckpointResult<Option<String>> {
         return Ok(None);
     }
     let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
-    Ok(if head_sha.is_empty() { None } else { Some(head_sha) })
+    Ok(if head_sha.is_empty() {
+        None
+    } else {
+        Some(head_sha)
+    })
 }
 
 /// Restore the working tree of `cwd` to the contents of the checkpoint
@@ -205,7 +209,7 @@ fn is_git_repo(cwd: &Path) -> bool {
     let p: PathBuf = cwd.join(".git");
     p.exists()
         || Command::new("git")
-        .no_window()
+            .no_window()
             .args(["rev-parse", "--git-dir"])
             .current_dir(cwd)
             .output()
@@ -221,20 +225,44 @@ mod tests {
 
     fn init_repo(dir: &Path) {
         Command::new("git")
-        .no_window().args(["init"]).current_dir(dir).output().unwrap();
+            .no_window()
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
         Command::new("git")
-        .no_window().args(["config", "user.email", "t@t"]).current_dir(dir).output().unwrap();
+            .no_window()
+            .args(["config", "user.email", "t@t"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
         Command::new("git")
-        .no_window().args(["config", "user.name", "t"]).current_dir(dir).output().unwrap();
+            .no_window()
+            .args(["config", "user.name", "t"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
         // Disable Windows autocrlf so byte-exact comparisons in the asserts
         // below don't break on CRLF translation.
         Command::new("git")
-        .no_window().args(["config", "core.autocrlf", "false"]).current_dir(dir).output().unwrap();
+            .no_window()
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
         fs::write(dir.join("a.txt"), "hello\n").unwrap();
         Command::new("git")
-        .no_window().args(["add", "."]).current_dir(dir).output().unwrap();
+            .no_window()
+            .args(["add", "."])
+            .current_dir(dir)
+            .output()
+            .unwrap();
         Command::new("git")
-        .no_window().args(["commit", "-m", "init"]).current_dir(dir).output().unwrap();
+            .no_window()
+            .args(["commit", "-m", "init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
     }
 
     fn tmp() -> PathBuf {
@@ -291,7 +319,10 @@ mod tests {
         fs::write(dir.join("b.txt"), "new\n").unwrap();
         let changes = changeset(&dir, &sha).expect("ok");
         let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
-        assert!(paths.contains(&"a.txt"), "a.txt should be in changeset: {changes:?}");
+        assert!(
+            paths.contains(&"a.txt"),
+            "a.txt should be in changeset: {changes:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

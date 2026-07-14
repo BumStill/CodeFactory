@@ -15,12 +15,18 @@ pub mod verification;
 pub use dispatch::decide_chat_mode;
 
 use chrono::Utc;
+use codefactory_agent_core::{
+    build_budget_convergence_prompt, build_completion_ready_prompt,
+    build_completion_recovery_prompt, classify_command, evaluate_budget_command,
+    sanitize_completion_summary, should_prompt_budget_convergence, CompletionEvidence,
+    CompletionGate, PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
+};
 use futures_util::StreamExt;
 use reqwest::Client;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
@@ -65,6 +71,9 @@ const MAX_RETRIES_PER_BLOCKER: usize = 5;
 #[allow(dead_code)]
 const MAX_DISTINCT_APPROACHES: usize = 3;
 
+const EXECUTION_COMPLETION_CONTRACT: &str =
+    include_str!("../../../agent_contracts/execution_completion.md");
+
 /// Selects which behavior contract the AgentLoop runs under.
 ///
 /// - `Interactive`: chat panel. Plan-first, ask before non-trivial work,
@@ -88,16 +97,16 @@ impl AgentMode {
     pub fn max_iterations(&self) -> usize {
         match self {
             AgentMode::Interactive => MAX_ITERATIONS_INTERACTIVE,
-            AgentMode::Execute     => MAX_ITERATIONS_EXECUTE,
-            AgentMode::Autonomous  => MAX_ITERATIONS_AUTONOMOUS,
+            AgentMode::Execute => MAX_ITERATIONS_EXECUTE,
+            AgentMode::Autonomous => MAX_ITERATIONS_AUTONOMOUS,
         }
     }
 
     pub fn system_prompt(&self) -> &'static str {
         match self {
             AgentMode::Interactive => SYSTEM_PROMPT,
-            AgentMode::Execute     => SYSTEM_PROMPT_EXECUTE,
-            AgentMode::Autonomous  => SYSTEM_PROMPT_AUTONOMOUS,
+            AgentMode::Execute => SYSTEM_PROMPT_EXECUTE,
+            AgentMode::Autonomous => SYSTEM_PROMPT_AUTONOMOUS,
         }
     }
 }
@@ -362,9 +371,19 @@ impl AgentLoop {
         // behavior. Subagent + autonomous task runners call
         // `new_with_mode` explicitly.
         Self::new_with_mode(
-            app, db, session_id, model_id, base_url, api_key, api_style,
-            cwd, settings, pending_permissions, mcp_manager,
-            execution_context, AgentMode::Interactive,
+            app,
+            db,
+            session_id,
+            model_id,
+            base_url,
+            api_key,
+            api_style,
+            cwd,
+            settings,
+            pending_permissions,
+            mcp_manager,
+            execution_context,
+            AgentMode::Interactive,
         )
     }
 
@@ -452,7 +471,11 @@ impl AgentLoop {
         let cwd_str = self.cwd.to_string_lossy();
         let mut blocks = project_knowledge_blocks(&self.cwd);
         for body in crate::commands::skills::enabled_skill_prompts(&self.app).await {
-            blocks.push(context_budget::Block::new(format!("---\n\n{body}"), 2, 4000));
+            blocks.push(context_budget::Block::new(
+                format!("---\n\n{body}"),
+                2,
+                4000,
+            ));
         }
         let user_ctx = user_context::build_prefs_and_learnings(&self.db, &cwd_str).await;
         if !user_ctx.is_empty() {
@@ -497,6 +520,12 @@ impl AgentLoop {
         event_name: &str,
         system_prompt: &str,
     ) -> Result<()> {
+        let completion_instruction = history
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
         let mut messages = self.build_openai_messages(history, system_prompt);
         let hook_runner = {
             let settings = self.settings.read().await;
@@ -506,7 +535,13 @@ impl AgentLoop {
         // Did we emit a terminal Done/Error this run? Used to guarantee the
         // stream always closes even if the loop runs to its iteration ceiling.
         let mut emitted_terminal = false;
-        for _ in 0..self.mode.max_iterations() {
+        let mut completion_gate =
+            CompletionGate::new_for_instruction(false, &completion_instruction);
+        let mut completion_sequence = 0_u64;
+        let mut last_completion_nudge_sequence = None;
+        let mut progress_tracker = ProgressTracker::new(8);
+        let max_iterations = self.mode.max_iterations();
+        for iteration in 0..max_iterations {
             // Cooperative cancellation: if the user hit "stop" for this chat
             // turn, end the stream cleanly between rounds. Checked here (not
             // mid tool-call) so in-flight work isn't hard-killed. No-op unless
@@ -517,7 +552,10 @@ impl AgentLoop {
                     self.app
                         .emit(
                             &event_name,
-                            StreamEvent::Done { input_tokens: 0, output_tokens: 0 },
+                            StreamEvent::Done {
+                                input_tokens: 0,
+                                output_tokens: 0,
+                            },
                         )
                         .ok();
                     emitted_terminal = true;
@@ -551,11 +589,16 @@ impl AgentLoop {
                     .ok();
             }
 
+            let active_tool_defs = tool_defs;
             let (text, tool_calls, usage, reasoning) = match self.api_style {
                 ApiStyle::Chatgpt => {
-                    self.call_chatgpt_model(&messages, tool_defs, event_name).await?
+                    self.call_chatgpt_model(&messages, active_tool_defs, event_name)
+                        .await?
                 }
-                _ => self.call_openai_model(&messages, tool_defs, event_name).await?,
+                _ => {
+                    self.call_openai_model(&messages, active_tool_defs, event_name)
+                        .await?
+                }
             };
 
             // Emit real (provider-reported) context-usage right after each
@@ -581,13 +624,33 @@ impl AgentLoop {
                     "assistant",
                     &text,
                     usage.as_ref(),
-                    if tool_calls.is_empty() { None } else { Some(&tool_calls) },
+                    if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(&tool_calls)
+                    },
                     reasoning.as_deref(),
                 )
                 .await?;
             }
 
             if tool_calls.is_empty() {
+                if self.mode != AgentMode::Interactive {
+                    let evidence = completion_gate.evidence();
+                    if !evidence.completed {
+                        messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: MessageContent::Text(build_completion_recovery_prompt(
+                                &evidence,
+                            )),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
+                            reasoning_content: None,
+                        });
+                        continue;
+                    }
+                }
                 // Always emit a terminal Done so the frontend's `streaming`
                 // flag clears — even when the provider omitted usage on the
                 // final turn. Previously Done was gated behind `usage`, so a
@@ -623,7 +686,9 @@ impl AgentLoop {
                             &endpoint,
                             inp,
                             out,
-                        ).await {
+                        )
+                        .await
+                        {
                             tracing::warn!("Failed to record cost entry: {e}");
                         } else {
                             self.app.emit("token-usage-recorded", &self.session_id).ok();
@@ -634,10 +699,12 @@ impl AgentLoop {
             }
 
             let mut result_messages = Vec::new();
+            let mut progress_prompt = None;
 
             for tc in &tool_calls {
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                let completion_args = args.clone();
 
                 // Extract bash command for finer-grained permission matching
                 let bash_cmd = if tc.function.name == "bash" {
@@ -667,23 +734,42 @@ impl AgentLoop {
                 let decision =
                     decide_permission(&permission_policy, &tc.function.name, bash_cmd.as_deref());
 
-                let denial_content = match decision {
-                    PermissionDecision::Allow => None,
-                    PermissionDecision::Ask => {
-                        if self.request_permission(&event_name, tc, args.clone()).await {
-                            None
-                        } else {
-                            Some(
-                                "Tool call denied by user. Please try a different approach."
-                                    .to_string(),
-                            )
+                let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
+                let completion_evidence = completion_gate.evidence();
+                let acceptance_audit_round = completion_evidence.completed
+                    && completion_evidence
+                        .last_successful_verification_sequence
+                        .is_some()
+                    && completion_evidence.last_successful_verification_sequence
+                        == last_completion_nudge_sequence;
+                let denial_content = if let Some(content) = autonomous_budget_denial(
+                    self.mode,
+                    remaining,
+                    acceptance_audit_round,
+                    &completion_evidence,
+                    &tc.function.name,
+                    &args,
+                ) {
+                    Some(content)
+                } else {
+                    match decision {
+                        PermissionDecision::Allow => None,
+                        PermissionDecision::Ask => {
+                            if self.request_permission(&event_name, tc, args.clone()).await {
+                                None
+                            } else {
+                                Some(
+                                    "Tool call denied by user. Please try a different approach."
+                                        .to_string(),
+                                )
+                            }
                         }
-                    }
-                    PermissionDecision::Deny(reason) => {
-                        tracing::warn!("Tool '{}' denied: {reason}", tc.function.name);
-                        Some(format!(
-                            "Tool call denied: {reason}. Please try a different approach."
-                        ))
+                        PermissionDecision::Deny(reason) => {
+                            tracing::warn!("Tool '{}' denied: {reason}", tc.function.name);
+                            Some(format!(
+                                "Tool call denied: {reason}. Please try a different approach."
+                            ))
+                        }
                     }
                 };
 
@@ -704,7 +790,7 @@ impl AgentLoop {
                         tool_calls: None,
                         tool_call_id: Some(tc.id.clone()),
                         name: Some(tc.function.name.clone()),
-                    reasoning_content: None,
+                        reasoning_content: None,
                     });
                     continue;
                 }
@@ -734,7 +820,7 @@ impl AgentLoop {
                         tool_calls: None,
                         tool_call_id: Some(tc.id.clone()),
                         name: Some(tc.function.name.clone()),
-                    reasoning_content: None,
+                        reasoning_content: None,
                     });
                     continue;
                 }
@@ -758,7 +844,11 @@ impl AgentLoop {
                 // Check if this is an MCP tool
                 let mcp_server = self.mcp_manager.find_tool_server(&tc.function.name).await;
                 let output = if let Some(server_id) = mcp_server {
-                    match self.mcp_manager.call_tool(&server_id, &tc.function.name, args).await {
+                    match self
+                        .mcp_manager
+                        .call_tool(&server_id, &tc.function.name, args)
+                        .await
+                    {
                         Ok(text) => tools::ToolOutput::ok(text),
                         Err(e) => tools::ToolOutput::err(format!("MCP error: {e}")),
                     }
@@ -766,6 +856,17 @@ impl AgentLoop {
                     tools::dispatch(&tc.function.name, args, &ctx).await?
                 };
                 let duration_ms = tool_start.elapsed().as_millis() as u64;
+
+                if let Some(prompt) = record_completion_outcome(
+                    &mut completion_gate,
+                    &mut progress_tracker,
+                    &mut completion_sequence,
+                    &tc.function.name,
+                    &completion_args,
+                    &output,
+                ) {
+                    progress_prompt = Some(prompt);
+                }
 
                 // Post-tool hook
                 hook_runner
@@ -830,6 +931,48 @@ impl AgentLoop {
                 reasoning_content: reasoning,
             });
             messages.extend(result_messages);
+            if let Some(prompt) = progress_prompt {
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: MessageContent::Text(prompt),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                });
+            }
+            if self.mode != AgentMode::Interactive {
+                let evidence = completion_gate.evidence();
+                if evidence.completed
+                    && evidence.last_successful_verification_sequence
+                        != last_completion_nudge_sequence
+                {
+                    last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
+                    messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: MessageContent::Text(build_completion_ready_prompt().to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                    });
+                } else {
+                    let remaining = max_iterations.saturating_sub(iteration + 1);
+                    if should_prompt_budget_convergence(remaining as u32) {
+                        messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: MessageContent::Text(build_budget_convergence_prompt(
+                                remaining as u32,
+                                &evidence,
+                            )),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
+                            reasoning_content: None,
+                        });
+                    }
+                }
+            }
         }
 
         // Safety net: the loop only emits a terminal Done when the model
@@ -922,6 +1065,7 @@ impl AgentLoop {
         event_name: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         use futures_util::StreamExt;
+        let finalization_response = tool_defs.is_empty();
 
         let (access_token, account_id) = crate::codex_auth::valid_access_token().await?;
         // The ChatGPT backend URL is fixed — use the canonical constant rather
@@ -998,17 +1142,19 @@ impl AgentLoop {
             .unwrap_or(global)
             .as_str();
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model_id,
             "instructions": instructions,
             "input": input,
-            "tools": tools,
-            "tool_choice": "auto",
+            "tool_choice": if tools.is_empty() { "none" } else { "auto" },
             "parallel_tool_calls": false,
             "store": false,
             "stream": true,
             "reasoning": { "effort": effort, "summary": "auto" },
         });
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(tools);
+        }
 
         let response = crate::http_util::send_with_retry_and_notify(
             "ChatGPT Responses stream request",
@@ -1045,8 +1191,10 @@ impl AgentLoop {
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut usage: Option<Usage> = None;
         let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
+        let mut saw_terminal_marker = false;
+        let mut malformed_data_lines = 0_usize;
 
-        while let Some(chunk) = byte_stream.next().await {
+        'sse: while let Some(chunk) = byte_stream.next().await {
             let bytes = chunk?;
             byte_buffer.extend_from_slice(&bytes);
             while let Some(nl) = byte_buffer.iter().position(|&b| b == b'\n') {
@@ -1057,19 +1205,28 @@ impl AgentLoop {
                     continue;
                 };
                 if data.trim() == "[DONE]" {
+                    saw_terminal_marker = true;
                     byte_buffer.clear();
-                    break;
+                    break 'sse;
                 }
                 let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) else {
+                    malformed_data_lines += 1;
                     continue;
                 };
                 match ev.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                     "response.output_text.delta" => {
                         if let Some(d) = ev.get("delta").and_then(|v| v.as_str()) {
                             if !d.is_empty() {
-                                self.app
-                                    .emit(event_name, StreamEvent::TextDelta { content: d.to_string() })
-                                    .ok();
+                                if !finalization_response {
+                                    self.app
+                                        .emit(
+                                            event_name,
+                                            StreamEvent::TextDelta {
+                                                content: d.to_string(),
+                                            },
+                                        )
+                                        .ok();
+                                }
                                 text_buf.push_str(d);
                             }
                         }
@@ -1108,8 +1265,10 @@ impl AgentLoop {
                         }
                     }
                     "response.completed" => {
+                        saw_terminal_marker = true;
                         if let Some(u) = ev.get("response").and_then(|r| r.get("usage")) {
-                            let inp = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                            let inp =
+                                u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                             let out =
                                 u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                             usage = Some(Usage {
@@ -1136,6 +1295,25 @@ impl AgentLoop {
             }
         }
 
+        validate_openai_sse_completion(
+            saw_terminal_marker,
+            byte_buffer.len(),
+            malformed_data_lines,
+        )
+        .map_err(crate::errors::AppError::Other)?;
+
+        if finalization_response {
+            text_buf = sanitize_completion_summary(&text_buf);
+            tool_calls.clear();
+            self.app
+                .emit(
+                    event_name,
+                    StreamEvent::TextDelta {
+                        content: text_buf.clone(),
+                    },
+                )
+                .ok();
+        }
         let reasoning = if reasoning_buf.is_empty() {
             None
         } else {
@@ -1150,24 +1328,27 @@ impl AgentLoop {
         tool_defs: &[ToolDefinition],
         event_name: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
+        let finalization_response = tool_defs.is_empty();
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         // Strip OpenRouter-style "vendor/" prefix when talking to a direct
         // provider API. Defensive against ids that linger from earlier
         // OpenRouter use after the user switches endpoint.
-        let outbound_model = crate::config::settings::normalize_model_id(
-            &self.model_id, &self.base_url,
-        );
+        let outbound_model =
+            crate::config::settings::normalize_model_id(&self.model_id, &self.base_url);
 
+        let (tools, tool_choice) = openai_tool_controls(tool_defs);
         let req = ChatRequest {
             model: outbound_model,
             messages: messages.to_vec(),
-            tools: Some(tool_defs.to_vec()),
-            tool_choice: Some(serde_json::json!("auto")),
+            tools,
+            tool_choice: Some(tool_choice),
             stream: true,
             temperature: 0.2,
             max_tokens: 8192,
-            stream_options: Some(StreamOptions { include_usage: true }),
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
         };
 
         // Send the request as-is — including `max_tokens` + `temperature`. We do
@@ -1232,6 +1413,8 @@ impl AgentLoop {
         let mut reasoning_buf = String::new();
         let mut tc_map: HashMap<u32, (String, String, String)> = HashMap::new();
         let mut usage: Option<Usage> = None;
+        let mut saw_terminal_marker = false;
+        let mut malformed_data_lines = 0_usize;
 
         // SSE line buffering — critical correctness fix.
         //
@@ -1252,7 +1435,7 @@ impl AgentLoop {
         // never sees an incomplete codepoint.
         let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
 
-        while let Some(chunk) = byte_stream.next().await {
+        'sse: while let Some(chunk) = byte_stream.next().await {
             let bytes = chunk?;
             byte_buffer.extend_from_slice(&bytes);
 
@@ -1265,22 +1448,29 @@ impl AgentLoop {
                     continue;
                 };
                 if data.trim() == "[DONE]" {
+                    saw_terminal_marker = true;
                     byte_buffer.clear();
-                    break;
+                    break 'sse;
                 }
                 let Ok(sc) = serde_json::from_str::<StreamChunk>(data) else {
                     tracing::warn!("dropped malformed SSE data line (len={})", data.len());
+                    malformed_data_lines += 1;
                     continue;
                 };
                 if let Some(u) = sc.usage {
                     usage = Some(u);
                 }
                 for choice in sc.choices {
+                    if choice.finish_reason.is_some() {
+                        saw_terminal_marker = true;
+                    }
                     let delta = choice.delta;
                     if let Some(t) = delta.content.filter(|s| !s.is_empty()) {
-                        self.app
-                            .emit(&event_name, StreamEvent::TextDelta { content: t.clone() })
-                            .ok();
+                        if !finalization_response {
+                            self.app
+                                .emit(&event_name, StreamEvent::TextDelta { content: t.clone() })
+                                .ok();
+                        }
                         text_buf.push_str(&t);
                     }
                     // DeepSeek reasoner family streams a separate reasoning_content
@@ -1311,6 +1501,13 @@ impl AgentLoop {
             }
         }
 
+        validate_openai_sse_completion(
+            saw_terminal_marker,
+            byte_buffer.len(),
+            malformed_data_lines,
+        )
+        .map_err(crate::errors::AppError::Other)?;
+
         let mut tool_calls: Vec<ToolCall> = tc_map
             .into_iter()
             .filter(|(_, (id, name, _))| !id.is_empty() && !name.is_empty())
@@ -1325,7 +1522,24 @@ impl AgentLoop {
             .collect();
         tool_calls.sort_by_key(|tc| tc.id.clone());
 
-        let reasoning = if reasoning_buf.is_empty() { None } else { Some(reasoning_buf) };
+        if finalization_response {
+            text_buf = sanitize_completion_summary(&text_buf);
+            tool_calls.clear();
+            self.app
+                .emit(
+                    &event_name,
+                    StreamEvent::TextDelta {
+                        content: text_buf.clone(),
+                    },
+                )
+                .ok();
+        }
+
+        let reasoning = if reasoning_buf.is_empty() {
+            None
+        } else {
+            Some(reasoning_buf)
+        };
         Ok((text_buf, tool_calls, usage, reasoning))
     }
 
@@ -1368,14 +1582,18 @@ impl AgentLoop {
         Ok(())
     }
 
-    fn build_openai_messages(&self, history: Vec<Message>, system_prompt: &str) -> Vec<ChatMessage> {
+    fn build_openai_messages(
+        &self,
+        history: Vec<Message>,
+        system_prompt: &str,
+    ) -> Vec<ChatMessage> {
         let mut msgs = vec![ChatMessage {
             role: "system".into(),
             content: MessageContent::Text(system_prompt.to_string()),
             tool_calls: None,
             tool_call_id: None,
             name: None,
-                    reasoning_content: None,
+            reasoning_content: None,
         }];
 
         for m in history {
@@ -1389,7 +1607,7 @@ impl AgentLoop {
                         tool_calls: None,
                         tool_call_id: Some(tool_call_id),
                         name: None,
-                    reasoning_content: None,
+                        reasoning_content: None,
                     });
                 }
                 "assistant" => {
@@ -1471,9 +1689,8 @@ impl AgentLoop {
                         }));
                     }
                     for tc in &tool_calls {
-                        let input: serde_json::Value =
-                            serde_json::from_str(&tc.function.arguments)
-                                .unwrap_or(serde_json::json!({}));
+                        let input: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                            .unwrap_or(serde_json::json!({}));
                         content_blocks.push(serde_json::json!({
                             "type": "tool_use",
                             "id": tc.id,
@@ -1518,6 +1735,12 @@ impl AgentLoop {
         event_name: &str,
         system_prompt: &str,
     ) -> Result<()> {
+        let completion_instruction = history
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
         let mut messages = self.build_anthropic_messages(history);
         let hook_runner = {
             let settings = self.settings.read().await;
@@ -1527,7 +1750,13 @@ impl AgentLoop {
         // Did we emit a terminal Done/Error this run? Used to guarantee the
         // stream always closes even if the loop runs to its iteration ceiling.
         let mut emitted_terminal = false;
-        for _ in 0..self.mode.max_iterations() {
+        let mut completion_gate =
+            CompletionGate::new_for_instruction(false, &completion_instruction);
+        let mut completion_sequence = 0_u64;
+        let mut last_completion_nudge_sequence = None;
+        let mut progress_tracker = ProgressTracker::new(8);
+        let max_iterations = self.mode.max_iterations();
+        for iteration in 0..max_iterations {
             // Cooperative cancellation: if the user hit "stop" for this chat
             // turn, end the stream cleanly between rounds. Checked here (not
             // mid tool-call) so in-flight work isn't hard-killed. No-op unless
@@ -1538,7 +1767,10 @@ impl AgentLoop {
                     self.app
                         .emit(
                             event_name,
-                            StreamEvent::Done { input_tokens: 0, output_tokens: 0 },
+                            StreamEvent::Done {
+                                input_tokens: 0,
+                                output_tokens: 0,
+                            },
                         )
                         .ok();
                     emitted_terminal = true;
@@ -1558,6 +1790,7 @@ impl AgentLoop {
                 context::resolve_context_length(&settings, &endpoint, &self.model_id, None)
             };
 
+            let active_tool_defs = tool_defs;
             let resp = anthropic_client::stream_anthropic(
                 &self.http,
                 &self.base_url,
@@ -1565,7 +1798,7 @@ impl AgentLoop {
                 &self.model_id,
                 system_prompt,
                 messages.clone(),
-                tool_defs,
+                active_tool_defs,
                 &self.app,
                 event_name,
             )
@@ -1595,13 +1828,30 @@ impl AgentLoop {
                     "assistant",
                     &text,
                     None,
-                    if tool_calls.is_empty() { None } else { Some(&tool_calls) },
+                    if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(&tool_calls)
+                    },
                     None,
                 )
                 .await?;
             }
 
             if tool_calls.is_empty() {
+                if self.mode != AgentMode::Interactive {
+                    let evidence = completion_gate.evidence();
+                    if !evidence.completed {
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": [{
+                                "type": "text",
+                                "text": build_completion_recovery_prompt(&evidence),
+                            }],
+                        }));
+                        continue;
+                    }
+                }
                 emitted_terminal = true;
                 let inp = resp.input_tokens;
                 let out = resp.output_tokens;
@@ -1627,7 +1877,9 @@ impl AgentLoop {
                         &endpoint,
                         inp,
                         out,
-                    ).await {
+                    )
+                    .await
+                    {
                         tracing::warn!("Failed to record cost entry (anthropic): {e}");
                     } else {
                         self.app.emit("token-usage-recorded", &self.session_id).ok();
@@ -1643,8 +1895,7 @@ impl AgentLoop {
             }
             for tc in &tool_calls {
                 let input: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments)
-                        .unwrap_or(serde_json::json!({}));
+                    serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
                 assistant_content.push(serde_json::json!({
                     "type": "tool_use",
                     "id": tc.id,
@@ -1659,10 +1910,12 @@ impl AgentLoop {
 
             // Execute tools and collect tool_result blocks
             let mut tool_result_blocks: Vec<serde_json::Value> = Vec::new();
+            let mut progress_prompt = None;
 
             for tc in &tool_calls {
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                let completion_args = args.clone();
 
                 let bash_cmd = if tc.function.name == "bash" {
                     args.get("command")
@@ -1679,23 +1932,42 @@ impl AgentLoop {
                 let decision =
                     decide_permission(&permission_policy, &tc.function.name, bash_cmd.as_deref());
 
-                let denial_content = match decision {
-                    PermissionDecision::Allow => None,
-                    PermissionDecision::Ask => {
-                        if self.request_permission(event_name, tc, args.clone()).await {
-                            None
-                        } else {
-                            Some(
-                                "Tool call denied by user. Please try a different approach."
-                                    .to_string(),
-                            )
+                let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
+                let completion_evidence = completion_gate.evidence();
+                let acceptance_audit_round = completion_evidence.completed
+                    && completion_evidence
+                        .last_successful_verification_sequence
+                        .is_some()
+                    && completion_evidence.last_successful_verification_sequence
+                        == last_completion_nudge_sequence;
+                let denial_content = if let Some(content) = autonomous_budget_denial(
+                    self.mode,
+                    remaining,
+                    acceptance_audit_round,
+                    &completion_evidence,
+                    &tc.function.name,
+                    &args,
+                ) {
+                    Some(content)
+                } else {
+                    match decision {
+                        PermissionDecision::Allow => None,
+                        PermissionDecision::Ask => {
+                            if self.request_permission(event_name, tc, args.clone()).await {
+                                None
+                            } else {
+                                Some(
+                                    "Tool call denied by user. Please try a different approach."
+                                        .to_string(),
+                                )
+                            }
                         }
-                    }
-                    PermissionDecision::Deny(reason) => {
-                        tracing::warn!("Tool '{}' denied: {reason}", tc.function.name);
-                        Some(format!(
-                            "Tool call denied: {reason}. Please try a different approach."
-                        ))
+                        PermissionDecision::Deny(reason) => {
+                            tracing::warn!("Tool '{}' denied: {reason}", tc.function.name);
+                            Some(format!(
+                                "Tool call denied: {reason}. Please try a different approach."
+                            ))
+                        }
                     }
                 };
 
@@ -1764,7 +2036,11 @@ impl AgentLoop {
                 // Check if this is an MCP tool
                 let mcp_server = self.mcp_manager.find_tool_server(&tc.function.name).await;
                 let output = if let Some(server_id) = mcp_server {
-                    match self.mcp_manager.call_tool(&server_id, &tc.function.name, args).await {
+                    match self
+                        .mcp_manager
+                        .call_tool(&server_id, &tc.function.name, args)
+                        .await
+                    {
                         Ok(text) => tools::ToolOutput::ok(text),
                         Err(e) => tools::ToolOutput::err(format!("MCP error: {e}")),
                     }
@@ -1772,6 +2048,17 @@ impl AgentLoop {
                     tools::dispatch(&tc.function.name, args, &ctx).await?
                 };
                 let duration_ms = tool_start.elapsed().as_millis() as u64;
+
+                if let Some(prompt) = record_completion_outcome(
+                    &mut completion_gate,
+                    &mut progress_tracker,
+                    &mut completion_sequence,
+                    &tc.function.name,
+                    &completion_args,
+                    &output,
+                ) {
+                    progress_prompt = Some(prompt);
+                }
 
                 // Post-tool hook
                 hook_runner
@@ -1830,6 +2117,39 @@ impl AgentLoop {
                     "content": tool_result_blocks,
                 }));
             }
+            if let Some(prompt) = progress_prompt {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}],
+                }));
+            }
+            if self.mode != AgentMode::Interactive {
+                let evidence = completion_gate.evidence();
+                if evidence.completed
+                    && evidence.last_successful_verification_sequence
+                        != last_completion_nudge_sequence
+                {
+                    last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": build_completion_ready_prompt(),
+                        }],
+                    }));
+                } else {
+                    let remaining = max_iterations.saturating_sub(iteration + 1);
+                    if should_prompt_budget_convergence(remaining as u32) {
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": [{
+                                "type": "text",
+                                "text": build_budget_convergence_prompt(remaining as u32, &evidence),
+                            }],
+                        }));
+                    }
+                }
+            }
         }
 
         // Safety net: see run_openai — if the loop exhausted its iteration
@@ -1853,6 +2173,109 @@ impl AgentLoop {
 
         Ok(())
     }
+}
+
+fn openai_tool_controls(
+    tool_defs: &[ToolDefinition],
+) -> (Option<Vec<ToolDefinition>>, serde_json::Value) {
+    if tool_defs.is_empty() {
+        (None, serde_json::json!("none"))
+    } else {
+        (Some(tool_defs.to_vec()), serde_json::json!("auto"))
+    }
+}
+
+fn validate_openai_sse_completion(
+    saw_terminal_marker: bool,
+    pending_bytes: usize,
+    malformed_data_lines: usize,
+) -> std::result::Result<(), String> {
+    if malformed_data_lines > 0 {
+        return Err(format!(
+            "OpenAI-compatible stream contained {malformed_data_lines} malformed SSE data line(s)"
+        ));
+    }
+    if pending_bytes > 0 {
+        return Err(format!(
+            "OpenAI-compatible stream ended with {pending_bytes} incomplete byte(s)"
+        ));
+    }
+    if !saw_terminal_marker {
+        return Err("OpenAI-compatible stream ended before [DONE] or finish_reason".to_owned());
+    }
+    Ok(())
+}
+
+fn completion_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (String, ToolKind) {
+    let command = args
+        .get("command")
+        .and_then(|value| value.as_str())
+        .unwrap_or(tool_name)
+        .to_string();
+    let kind = if tool_name == "bash" {
+        classify_command(&command, 300_000)
+    } else if tool_name.starts_with("write_")
+        || tool_name.starts_with("edit_")
+        || matches!(tool_name, "write_file" | "edit_file")
+    {
+        ToolKind::Mutation
+    } else {
+        ToolKind::ReadOnly
+    };
+    (command, kind)
+}
+
+fn autonomous_budget_denial(
+    mode: AgentMode,
+    remaining_model_rounds: u32,
+    acceptance_audit_round: bool,
+    evidence: &CompletionEvidence,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
+    if mode == AgentMode::Interactive || acceptance_audit_round {
+        return None;
+    }
+    let (command, kind) = completion_command_and_kind(tool_name, args);
+    match evaluate_budget_command(
+        remaining_model_rounds,
+        evidence,
+        &command,
+        &kind,
+    ) {
+        PolicyDecision::Allow => None,
+        PolicyDecision::Deny { reason, .. } => Some(format!(
+            "Tool call denied by execution budget: {reason}. Resolve the current completion blocker or finalize."
+        )),
+    }
+}
+
+fn record_completion_outcome(
+    gate: &mut CompletionGate,
+    progress: &mut ProgressTracker,
+    sequence: &mut u64,
+    tool_name: &str,
+    args: &serde_json::Value,
+    output: &tools::ToolOutput,
+) -> Option<String> {
+    *sequence += 1;
+    let (command, kind) = completion_command_and_kind(tool_name, args);
+    let outcome = ToolOutcome {
+        request_id: format!("desktop-tool-{sequence}"),
+        command,
+        kind,
+        sequence: *sequence,
+        started_at_ms: 0,
+        finished_at_ms: 0,
+        return_code: Some(if output.is_error { 1 } else { 0 }),
+        stdout: output.content.clone(),
+        stderr: String::new(),
+        error: output.is_error.then(|| output.content.clone()),
+        semantic_failure: false,
+    }
+    .with_detected_semantic_failure();
+    gate.record(&outcome);
+    progress.record(&outcome)
 }
 
 /// Convert an MCP tool descriptor into the OpenAI-compatible ToolDefinition format.
@@ -1952,7 +2375,10 @@ fn project_knowledge_blocks(cwd: &Path) -> Vec<context_budget::Block> {
     // .cursorrules / .claude/ family) + legacy `CODEFACTORY.md`, combined under
     // one heading. Each source keeps its prior 4000-char cap.
     let sources: [(&str, std::path::PathBuf); 2] = [
-        (".codefactory/memory.md", cwd.join(".codefactory").join("memory.md")),
+        (
+            ".codefactory/memory.md",
+            cwd.join(".codefactory").join("memory.md"),
+        ),
         ("CODEFACTORY.md", cwd.join("CODEFACTORY.md")),
     ];
     let mut mem = String::new();
@@ -2014,10 +2440,11 @@ fn build_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
 /// conventions such as `/workspace` before its first tool call.
 fn base_system_prompt(mode: AgentMode, cwd: &Path) -> String {
     format!(
-        "{}\n\n# Working Directory\n\
+        "{}\n\n{}\n\n# Working Directory\n\
          The project root and default tool working directory is:\n{}\n\
          Use this exact path or paths relative to it. Do not assume `/workspace` or another container path.",
         mode.system_prompt(),
+        EXECUTION_COMPLETION_CONTRACT,
         cwd.to_string_lossy()
     )
 }
@@ -2145,10 +2572,14 @@ mod tests {
         // Autonomous must be MUCH larger — the goal is letting subagents
         // run end-to-end without the 30-turn ceiling that caused tasks
         // to abort mid-implementation in v1.0.x.
-        assert!(autonomous >= interactive * 4,
-            "autonomous budget ({autonomous}) must be at least 4× interactive ({interactive})");
-        assert!(autonomous >= 100,
-            "autonomous budget ({autonomous}) too small for real task work");
+        assert!(
+            autonomous >= interactive * 4,
+            "autonomous budget ({autonomous}) must be at least 4× interactive ({interactive})"
+        );
+        assert!(
+            autonomous >= 100,
+            "autonomous budget ({autonomous}) too small for real task work"
+        );
     }
 
     #[test]
@@ -2157,14 +2588,22 @@ mod tests {
         // The whole spec for autonomous mode: the model must NOT stop to ask.
         // If someone weakens these phrases, the v1.0 'stops every 30 seconds'
         // bug returns silently.
-        assert!(prompt.contains("AUTONOMOUS"),
-            "autonomous prompt must self-identify as such");
-        assert!(prompt.contains("Never stop to ask"),
-            "autonomous prompt must explicitly forbid 'should I proceed?'");
-        assert!(prompt.contains("Failure is not a stopping condition"),
-            "autonomous prompt must mandate failure-iteration");
-        assert!(prompt.contains("acceptance criteria"),
-            "autonomous prompt must reference acceptance criteria");
+        assert!(
+            prompt.contains("AUTONOMOUS"),
+            "autonomous prompt must self-identify as such"
+        );
+        assert!(
+            prompt.contains("Never stop to ask"),
+            "autonomous prompt must explicitly forbid 'should I proceed?'"
+        );
+        assert!(
+            prompt.contains("Failure is not a stopping condition"),
+            "autonomous prompt must mandate failure-iteration"
+        );
+        assert!(
+            prompt.contains("acceptance criteria"),
+            "autonomous prompt must reference acceptance criteria"
+        );
     }
 
     #[test]
@@ -2172,8 +2611,10 @@ mod tests {
         // Interactive mode keeps the existing user-facing contract:
         // plan-first, ask before non-trivial work.
         let prompt = AgentMode::Interactive.system_prompt();
-        assert!(prompt.contains("Plan-first"),
-            "interactive prompt must keep plan-first guidance");
+        assert!(
+            prompt.contains("Plan-first"),
+            "interactive prompt must keep plan-first guidance"
+        );
     }
 
     fn policy(allow: &[&str], ask: &[&str], deny: &[&str]) -> PermissionPolicy {
@@ -2219,11 +2660,7 @@ mod tests {
         let mut policy = policy(&[], &[], &[]);
         policy.full_access = true;
         assert_eq!(
-            decide_permission(
-                &policy,
-                "bash",
-                Some("Remove-Item -Recurse -Force .\\dist")
-            ),
+            decide_permission(&policy, "bash", Some("Remove-Item -Recurse -Force .\\dist")),
             PermissionDecision::Ask
         );
     }
@@ -2279,7 +2716,11 @@ mod tests {
     fn project_knowledge_blocks_cover_memory_readme_config_with_priorities() {
         let cwd = std::env::temp_dir().join(format!("codefactory-pkb-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(cwd.join(".codefactory")).unwrap();
-        std::fs::write(cwd.join(".codefactory").join("memory.md"), "remember pnpm not npm").unwrap();
+        std::fs::write(
+            cwd.join(".codefactory").join("memory.md"),
+            "remember pnpm not npm",
+        )
+        .unwrap();
         std::fs::write(cwd.join("README.md"), "# MyProj\nhello world").unwrap();
         std::fs::write(cwd.join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
 
@@ -2299,5 +2740,127 @@ mod tests {
         assert!(blocks[2].content.contains("name = \"x\""));
 
         std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[test]
+    fn desktop_completion_gate_requires_verification_after_a_write() {
+        let mut gate = CompletionGate::default();
+        let mut progress = ProgressTracker::new(8);
+        let mut sequence = 0;
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            "write_file",
+            &serde_json::json!({"path": "src/example.rs", "content": "fn main() {}"}),
+            &tools::ToolOutput::ok("written"),
+        );
+        assert!(!gate.evidence().completed);
+
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            "bash",
+            &serde_json::json!({"command": "cargo test"}),
+            &tools::ToolOutput::ok("test result: ok"),
+        );
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn desktop_completion_gate_rejects_unprobed_background_service() {
+        let mut gate = CompletionGate::default();
+        let mut progress = ProgressTracker::new(8);
+        let mut sequence = 0;
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            "bash",
+            &serde_json::json!({
+                "command": "nohup ./server >server.log 2>&1 & echo $! >server.pid"
+            }),
+            &tools::ToolOutput::ok("started"),
+        );
+        assert!(!gate.evidence().completed);
+
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            "bash",
+            &serde_json::json!({
+                "command": "timeout 10 curl --fail http://127.0.0.1:8080/health"
+            }),
+            &tools::ToolOutput::ok("healthy"),
+        );
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn autonomous_desktop_budget_converges_without_affecting_interactive_chat() {
+        let evidence = CompletionEvidence {
+            required_source_scan_extensions: vec![".py".to_owned(), ".pyx".to_owned()],
+            blockers: vec![
+                "source compatibility work requires a clean repository-wide residual scan"
+                    .to_owned(),
+            ],
+            ..CompletionEvidence::default()
+        };
+        let unrelated = serde_json::json!({"command": "pytest tests/test_unrelated.py"});
+        assert!(autonomous_budget_denial(
+            AgentMode::Autonomous,
+            8,
+            false,
+            &evidence,
+            "bash",
+            &unrelated,
+        )
+        .is_some());
+        assert!(autonomous_budget_denial(
+            AgentMode::Interactive,
+            8,
+            false,
+            &evidence,
+            "bash",
+            &unrelated,
+        )
+        .is_none());
+
+        let source_edit = serde_json::json!({
+            "path": "pkg/fast.pyx",
+            "old_text": "np.int",
+            "new_text": "np.int64"
+        });
+        assert!(autonomous_budget_denial(
+            AgentMode::Autonomous,
+            8,
+            false,
+            &evidence,
+            "edit_file",
+            &source_edit,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn completion_finalization_disables_openai_tools() {
+        let (tools, tool_choice) = openai_tool_controls(&[]);
+
+        assert!(tools.is_none());
+        assert_eq!(tool_choice, serde_json::json!("none"));
+    }
+
+    #[test]
+    fn incomplete_openai_sse_stream_is_rejected() {
+        let error = validate_openai_sse_completion(false, 0, 0).unwrap_err();
+        assert!(error.contains("[DONE]"));
+    }
+
+    #[test]
+    fn malformed_or_partial_openai_sse_stream_is_rejected() {
+        assert!(validate_openai_sse_completion(true, 0, 1).is_err());
+        assert!(validate_openai_sse_completion(true, 8, 0).is_err());
     }
 }

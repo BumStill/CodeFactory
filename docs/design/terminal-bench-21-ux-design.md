@@ -31,6 +31,7 @@ Benchmarks
 │ Benchmarks / Terminal-Bench 2.1                  Refresh   │
 ├────────────────────────────────────────────────────────────┤
 │ Environment: Harbor OK | Docker OK | Dataset 2.1 | Policy  │
+│ Integrity: shared contract <sha> | contamination scan PASS │
 ├────────────────────────────────────────────────────────────┤
 │ Latest Run                                                 │
 │ status reward tasks pass/fail duration cost build artifact │
@@ -106,6 +107,8 @@ Benchmarks
 | Partial import | 展示已导入字段和缺失 artifacts |
 | Failed verifier | 显示 verifier stdout/stderr，不把失败等同于系统崩溃 |
 | Official constraint risk | timeouts/resources 被修改时标红，禁止标记为 official-comparable |
+| Benchmark contamination | 显示命中的 task fingerprint/verifier access；run 标记为 diagnostic，禁止作为产品能力分数 |
+| Runtime mismatch | thin Python bridge + Rust sidecar 显示 `rust-core headless`；桌面 AgentLoop 显示 `rust-core desktop`；旧 Python solver 显示 `legacy contaminated` 且不可计分 |
 
 ## 用户可见术语
 
@@ -115,6 +118,7 @@ Benchmarks
 - `Comparable`: 是否保持官方 dataset、timeout、resource、agent/model 记录完整。
 - `Failure Class`: CodeFactory 对失败原因的产品归类。
 - `Artifact`: Harbor 产出的 result、trajectory、verifier 输出和文件证据。
+- `Integrity`: shared contract hash、contamination scan、runtime subject 是否完整。
 
 ## 不做
 

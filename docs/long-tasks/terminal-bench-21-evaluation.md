@@ -4,14 +4,19 @@
 - Task ID: CF-LT-TB21
 - Title: Terminal-Bench 2.1 ability evaluation system
 - Feature spec: `docs/specs/feature-specs/terminal-bench-21-evaluation.md`
-- Related Req IDs: CF-TB-R1, CF-TB-R2, CF-TB-R3, CF-TB-R4, CF-TB-R5, CF-TB-R6, CF-TB-R7
+- Related Req IDs: CF-TB-R1 through CF-TB-R19
 
 ## Completion Standard
-- Done means: CodeFactory can run or import a Terminal-Bench 2.1 Harbor job, persist run/trial/artifact evidence, classify failures, show capability profile, and compare a regression subset across builds with real evidence.
+- Done means: CodeFactory 的同一发布版本在无 task-specific 定制、无 hidden verifier 读取、共享 Rust 主 Agent completion contract 且 integrity metadata 完整的前提下，固定 18 题达到 `18 / 18`；首个恢复发布至少 `16 / 18` 且有效历史通过集零回退；每轮完成测试、真实 App、PR/CI、发布和复评，最终补齐 clean Linux/x86 与完整 89 题评估。
 - Blocked means: Harbor/Docker/dataset/agent-adapter/runtime access prevents real smoke verification, with exact command, error, and next action recorded.
 
 ## Current State
-- Current phase: released product-context repair + score-holding recovery
+- Current phase: contaminated baseline retirement + shared Rust product-path recovery; not live, no PR/CI/release for this worktree yet.
+- Integrity reset: the historical `16 / 18`, later `12 / 18`, and older `6 / 89` results were produced by an adapter containing fixed-task fingerprints, task-family hints/repair scripts, success markers, and hidden verifier access. They remain audit evidence only and are invalid as CodeFactory product capability scores or release gates. Historical entries below are retained as chronology, not as current truth.
+- Current valid aggregate: run `677cbb1a-b24b-422b-8a64-d4895b15af07`, fixed subset `6 / 18`, mean reward `0.333`, all 18 trials closed and integrity-comparable. Passing tasks are `configure-git-webserver`, `extract-elf`, `kv-store-grpc`, `nginx-request-logging`, `qemu-startup`, and `sparql-university`. This is the first honest shared-Rust-path aggregate baseline and is far below the `>=16 / 18` first release gate.
+- Latest completed source-build diagnostic: run `9b978180-44e1-4f72-bf32-6a0571672db8`, evidence `docs/evidence-packs/terminal-bench-21-regression-subset-2026-07-14T09-55-29Z.md`, `build-cython-ext` `0 / 1`. The run used the honest thin bridge/shared Rust path, made `19` model requests and `19` tool calls, but spent the final budget repairing incomplete NumPy alias coverage and never reached successful project tests. Earlier run `3a4e5b28-793f-4192-bcb4-1089b47d7329` reached a successful README/runtime path but also omitted project tests. The subsequent local canary was explicitly cancelled before completion to stop accumulating unshipped work; it is not a score. A non-benchmark real-App acceptance fixture then confirmed the desktop Agent first observed `npm test` at `2 / 3`, repaired the actual JavaScript source with a one-line change, reran the complete suite to `3 / 3`, and only then emitted its final success response; the App's persisted session record and an independent test rerun agree on the result.
+- Current deterministic product slice: shared completion evidence now requires explicit project tests, stage policy stops speculative dependency churn after install, compatibility guidance derives local import aliases, and headless tool output uses bounded head/tail compaction. Rust workspace and Python bridge regressions pass locally. Delivery status remains `not live`: no commit/PR/CI/merge/release or installed-build verification has completed yet.
+- Active target: first recover a valid same-version `>=16 / 18` with zero regression across the honest pass set, then reach `18 / 18`, ship through PR/CI/release and real App verification, and finally run clean Linux/x86 plus the full 89 tasks.
 - Latest complete fixed-subset diagnostic is run `3f86d0e1-e7a9-465e-9deb-034ee38d4d1a`, evidence `docs/evidence-packs/terminal-bench-21-regression-subset-2026-07-10T07-41-20Z.md`, `12 / 18`, mean reward `0.667`. All 18 trials closed; `filter-js-from-html` and `query-optimize` were stopped by the 1200s runner watchdog, so this is a complete current diagnostic but not a clean official-comparable score. Compared with the two historical `16 / 18` runs, `build-cython-ext` and `configure-git-webserver` are confirmed score-holding regressions; `install-windows-3.11` passed 3/4 assertions but its visual verifier compared incompatible screenshot dimensions (`400×720` vs `480×640`), so it is environment/verifier ambiguity; `filter-js-from-html` is an environment watchdog regression; `caffe-cifar-10` and `query-optimize` remain unresolved. Excluding the three direct environment/verifier cases gives an attribution-only Agent slice of `12 / 15` (`80%`), not an alternative official score.
 - The same iteration included an installed v1.42.7 product-path coding task (`3 / 3` external tests, product matrix `9 / 10`) and shipped generic product fixes through PR `#100` / v1.42.8: endpoint-authoritative model binding for every new project/quick session and exact cwd injection into the live Agent system prompt. PR CI, main CI, Windows/macOS builds, macOS DMG temporary-install/window/database smoke, public release, and local `/Applications/CodeFactory.app` version/startup all passed. The final interactive installed-App P1 rerun also passed after unlock: the new project showed `deepseek / deepseek-v4-pro` before send, the first command used the exact `/private/tmp/codefactory-product-eval-context-fix` cwd, and both Agent-internal and independent external tests passed `3 / 3`. These changes are on the CodeFactory primary path and contain no Terminal-Bench task-specific behavior.
 - Current checkpoint: full Terminal-Bench 2.1 CodeFactory agent capability run completed and imported. Latest full run is run id `7ff6ef13-4488-4e0f-afd0-a1f9bd16d561`, agent `codefactory-headless`, model backend `deepseek-v4-pro`, dataset `terminal-bench/terminal-bench-2-1`, `89 / 89` trials completed, mean reward `0.06741573033707865`, pass count `6 / 89`, failed count `83 / 89`, exceptions `63`. This is the first full CodeFactory-run score and it is a low capability baseline, not an acceptable product level.
@@ -28,7 +33,7 @@
 - Latest 18-task diagnostic attempt is evidence `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-30T06-25-27Z.md`, Harbor run `16cd508e-33ba-442a-815e-51cd0f5cdfbf`; provider bridge again failed with `httpx.ConnectError` after `2 / 18` trials. `write-compressor` self-checked successfully, but its verifier failed in Ubuntu `apt` bootstrap due `archive.ubuntu.com` / `security.ubuntu.com` connection failures before assertions. Follow-up product fix: runner preflight now checks both Debian Bookworm and Ubuntu Noble apt/curl bootstrap before provider launch.
 - Latest `filter-js-from-html` diagnostic chain: evidence `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-30T03-06-08Z.md` first proved agent-side sanitizer auto-repair could trigger but verifier bootstrap failed; evidence `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-30T03-07-54Z.md` then showed the strengthened Docker preflight blocking the same apt/curl failure before provider spend; evidence `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-30T03-40-10Z.md` showed a clean official-comparable run still failed `0 / 1` because clean HTML was modified; evidence `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-30T04-02-30Z.md` now records clean official-comparable `1 / 1`, mean reward `1.000`.
 - Next owner: development / QA
-- Updated at: 2026-07-10
+- Updated at: 2026-07-14
 
 ## Completed Items
 - Verified current external Terminal-Bench 2.1 run surface from official sources.
@@ -128,22 +133,13 @@
 - Closed the current 6-task score-holding loop: run `6bab8a25-da1f-4d18-9e40-a19166227a2d` imported all `6` trials with `6 / 6` pass, mean reward `1.000`, failure class `None` for every task, evidence `docs/evidence-packs/terminal-bench-21-regression-subset-2026-06-30T17-27-46Z.md`. This is the first clean provider-backed proof that the six current task-family repairs aggregate in one run.
 
 ## Remaining Items
-- Use `terminal-bench-21-regression-subset-v1` as the default targeted/regression scope for the next agent-loop PR.
-- Use `tools/benchmark/terminal_bench_21_iteration_loop.py --scope canary --hypothesis <...>` as the default first gate for each agent-loop improvement before spending a full 18-task run.
-- Add cost calculation once provider pricing metadata is available; current adapter captures provider-reported token usage but does not price it.
-- Continue long-horizon execution work beyond P1: broaden service readiness templates and use real subset deltas to tune the long command policy.
-- Continue verifier-driven repair work beyond P2: add task-family specific parsers only after the generic `repair-goal` mechanism shows which failure shapes remain frequent.
-- Generalize post-candidate repair further after fixed subset rerun; current P2 includes generic repair-goal recipes plus the existing `write-compressor` task-specific auto-repair.
-- Use `docs/plans/terminal-bench-21-system-improvement-plan.md` as the first score-driven improvement roadmap after the fixed subset rerun produces a comparable delta.
-- Add persisted run fields/UI for evaluation axis, evaluation subject, fixed variables, changed variables, and result attribution.
-- Promote `benchmark-sandbox` from adapter-local command gate to shared CodeFactory policy preset with run/task/container binding.
-- Expand Benchmarks UI beyond P0: add historical run comparison, capability profile trends, and direct evidence-pack export.
-- Compare at least one same-scope baseline/head subset after a score-facing implementation change.
-- Keep the resource-preflighted 18-task run as the latest clean fixed-subset baseline: current clean provider-backed aggregate is `4 / 18`, mean reward `0.222`, with `0` Harbor exceptions.
-- Treat the post-`sanitize` current-worktree 18-task run as an aggregate regression signal: it is `3 / 18`, mean reward `0.167`, and confirms same-task `sanitize-git-repo` improvement but no aggregate gain.
-- Next score-facing target: exceed the `4 / 18` clean baseline, not merely recover it. `write-compressor`, `kv-store-grpc`, `filter-js-from-html`, `count-dataset-tokens`, `build-cython-ext`, and `protein-assembly` now have a clean aggregated `6 / 6` score-holding pass, so the next meaningful gate is a broader 18-task diagnostic/clean run. Do not use local `query-optimize` as the next score canary because it is currently a verifier/runtime diagnostic task on this Mac; classify or isolate it before using it as aggregate pass/fail evidence.
-- Next diagnostic regression run should use the watchdog default plus partial-import mode so transient Harbor/provider/network failure still yields imported completed trials. The next clean regression gate should pass `--trial-hard-timeout-sec 0`, but it may still block locally if `query-optimize` remains in the fixed subset under Mac/QEMU.
-- Reduce residual loop inefficiency seen in the passing MTEB trajectory: repeated result reads, late artifact rewriting, and final-answer discipline should become generic policy rather than task-specific hints.
+- Stop local score iteration and ship the current deterministic generic product slice first: real desktop CodeFactory verification, PR/CI, merge, deliberate release, installed-build verification, then released-build canary. This is required by CF-TB-R19 and is not conditional on the canary already passing.
+- Rerun the honest `build-cython-ext` source-delivery canary on the released build without changing task, verifier, timeout, resource, or bridge behavior; use its failure family for the next separately shipped product slice.
+- Rerun the fixed 18 tasks on the exact released build. The first recovery gate is `>=16 / 18` with no regression across the honest six-task pass set; the final local gate is `18 / 18`.
+- For every new failure family, derive the next change from public instruction, repository state, command outcomes and verifier-level result classification. Do not reintroduce task names, fixed repositories, expected answers, hidden tests, success markers or task-specific repair scripts into product code.
+- After local `18 / 18`, reproduce on clean Linux/x86, then run the complete 89 tasks and publish the systematic capability analysis and product roadmap requested by the user.
+- Persist evaluation axis, subject, fixed/changed variables, wall budget, contract hash, contamination scan, pass-set delta and usage into the product run ledger and Benchmarks UI.
+- Add provider pricing metadata only after score integrity and release gates are satisfied; token usage is an observability dimension, not a substitute for capability score.
 
 ## Blockers
 - No current blocker for the already completed local full-run evaluation. The current full-run result is a valid CodeFactory agent capability baseline, not a provider/account blocker.
@@ -229,7 +225,7 @@
 - Latest evidence pack: `docs/evidence-packs/terminal-bench-21-codefactory-provider-deepseek-2026-06-28.md`.
 - Systematic evaluation principle: `docs/principles/systematic-agent-evaluation.md`.
 - Score-driven improvement roadmap: `docs/plans/terminal-bench-21-system-improvement-plan.md`.
-- Release evidence: not live. The `14 / 18` result is a release candidate improvement in a feature worktree; it still requires PR/CI, merge, deliberate release, and packaged/headless runtime verification before it can be called live product improvement.
+- Release evidence: not live. The current shared-Rust/thin-bridge product slice exists only in `codex/agent-score-recovery-16`; local tests and diagnostic runs do not make it productized. PR/CI, merge, deliberate release, installed-build verification, and released-build rerun are still required.
 - Blocking evidence: none for local full-run evaluation; current valid run is a low-score baseline and not a release/leaderboard claim.
 
 ## AI Collaboration

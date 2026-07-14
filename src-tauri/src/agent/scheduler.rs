@@ -156,9 +156,9 @@ impl TaskScheduler {
                         t.description
                     ));
                 }
-                if let Some(context) =
-                    tasks::TaskConnectorContext::from_json(all_tasks[0].task_context_json.as_deref())
-                {
+                if let Some(context) = tasks::TaskConnectorContext::from_json(
+                    all_tasks[0].task_context_json.as_deref(),
+                ) {
                     let rendered = context.render_markdown();
                     if !rendered.is_empty() {
                         brief_content.push_str(&rendered);
@@ -244,7 +244,12 @@ impl TaskScheduler {
                     .as_deref()
                     .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
                     .filter(|v| !v.is_empty())
-                    .map(|v| v.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"));
+                    .map(|v| {
+                        v.iter()
+                            .map(|c| format!("- {}", c))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    });
 
                 tokio::spawn(async move {
                     let _permit = permit; // released on drop
@@ -334,9 +339,7 @@ impl TaskScheduler {
                                 &TaskEventPayload {
                                     task_id: &task_id,
                                     title: None,
-                                    message: Some(&format!(
-                                        "Attempt {attempt}/{MAX_ATTEMPTS}…"
-                                    )),
+                                    message: Some(&format!("Attempt {attempt}/{MAX_ATTEMPTS}…")),
                                     result: None,
                                     error: None,
                                     files_changed: None,
@@ -383,21 +386,14 @@ impl TaskScheduler {
                             }
                             Ok(result) => {
                                 // Persist sub-session link.
-                                tasks::set_sub_session(
-                                    &pool,
-                                    &task_id,
-                                    &result.sub_session_id,
-                                )
-                                .await
-                                .ok();
+                                tasks::set_sub_session(&pool, &task_id, &result.sub_session_id)
+                                    .await
+                                    .ok();
 
                                 // ── Acceptance check ────────────────────────
                                 if let Some(ref ac) = result.acceptance_check {
                                     if !ac.passed {
-                                        let msg = format!(
-                                            "Acceptance check failed: {}",
-                                            ac.reason
-                                        );
+                                        let msg = format!("Acceptance check failed: {}", ac.reason);
                                         tracing::warn!(
                                             "scheduler: task {} attempt {attempt} acceptance failed: {}",
                                             task_id,
@@ -436,8 +432,7 @@ impl TaskScheduler {
                                 }
 
                                 // ── Verification ─────────────────────────────
-                                let verif_plan =
-                                    verification::detect_verification_plan(&task_cwd);
+                                let verif_plan = verification::detect_verification_plan(&task_cwd);
                                 let verif_results = verification::run_verification(
                                     &verif_plan,
                                     &app,
@@ -447,16 +442,10 @@ impl TaskScheduler {
                                 .await;
 
                                 // Persist verification results.
-                                if let Ok(json) =
-                                    serde_json::to_string(&verif_results)
-                                {
-                                    tasks::save_verification_results(
-                                        &pool,
-                                        &task_id,
-                                        &json,
-                                    )
-                                    .await
-                                    .ok();
+                                if let Ok(json) = serde_json::to_string(&verif_results) {
+                                    tasks::save_verification_results(&pool, &task_id, &json)
+                                        .await
+                                        .ok();
                                 }
 
                                 match settle_result_after_verification(
@@ -508,31 +497,22 @@ impl TaskScheduler {
 
                     match final_outcome {
                         Some(result) if result.completed => {
-                            let result_json = serde_json::to_string(&result)
-                                .unwrap_or_else(|_| "{}".into());
+                            let result_json =
+                                serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
                             tasks::mark_task_completed(&pool, &task_id, &result_json)
                                 .await
                                 .ok();
                             // Append result to shared brief
-                            let brief_path =
-                                format!("{}/_codefactory_brief.md", task_cwd);
+                            let brief_path = format!("{}/_codefactory_brief.md", task_cwd);
                             if std::path::Path::new(&brief_path).exists() {
                                 let result_entry = format!(
                                     "\n### \u{2705} {} \u{2014} done\n{}\n",
                                     task_title,
-                                    result
-                                        .summary
-                                        .chars()
-                                        .take(500)
-                                        .collect::<String>()
+                                    result.summary.chars().take(500).collect::<String>()
                                 );
-                                if let Ok(mut existing) =
-                                    std::fs::read_to_string(&brief_path)
-                                {
-                                    existing = existing.replace(
-                                        "_(will be updated as tasks complete)_",
-                                        "",
-                                    );
+                                if let Ok(mut existing) = std::fs::read_to_string(&brief_path) {
+                                    existing = existing
+                                        .replace("_(will be updated as tasks complete)_", "");
                                     existing.push_str(&result_entry);
                                     let _ = std::fs::write(&brief_path, &existing);
                                 }
@@ -558,28 +538,19 @@ impl TaskScheduler {
                         }
                         Some(result) => {
                             // Completed=false after retries (e.g. acceptance failure).
-                            let err = prev_error
-                                .clone()
-                                .unwrap_or_else(|| result.summary.clone());
-                            tasks::mark_task_failed(&pool, &task_id, &err)
-                                .await
-                                .ok();
+                            let err = prev_error.clone().unwrap_or_else(|| result.summary.clone());
+                            tasks::mark_task_failed(&pool, &task_id, &err).await.ok();
                             // Append failure to shared brief
-                            let brief_path =
-                                format!("{}/_codefactory_brief.md", task_cwd);
+                            let brief_path = format!("{}/_codefactory_brief.md", task_cwd);
                             if std::path::Path::new(&brief_path).exists() {
                                 let result_entry = format!(
                                     "\n### \u{274c} {} \u{2014} failed\n{}\n",
                                     task_title,
                                     err.chars().take(300).collect::<String>()
                                 );
-                                if let Ok(mut existing) =
-                                    std::fs::read_to_string(&brief_path)
-                                {
-                                    existing = existing.replace(
-                                        "_(will be updated as tasks complete)_",
-                                        "",
-                                    );
+                                if let Ok(mut existing) = std::fs::read_to_string(&brief_path) {
+                                    existing = existing
+                                        .replace("_(will be updated as tasks complete)_", "");
                                     existing.push_str(&result_entry);
                                     let _ = std::fs::write(&brief_path, &existing);
                                 }
@@ -601,28 +572,21 @@ impl TaskScheduler {
                         }
                         None => {
                             // All attempts returned Err.
-                            let err = prev_error.clone().unwrap_or_else(|| {
-                                format!("Failed after {MAX_ATTEMPTS} attempts")
-                            });
-                            tasks::mark_task_failed(&pool, &task_id, &err)
-                                .await
-                                .ok();
+                            let err = prev_error
+                                .clone()
+                                .unwrap_or_else(|| format!("Failed after {MAX_ATTEMPTS} attempts"));
+                            tasks::mark_task_failed(&pool, &task_id, &err).await.ok();
                             // Append failure to shared brief
-                            let brief_path =
-                                format!("{}/_codefactory_brief.md", task_cwd);
+                            let brief_path = format!("{}/_codefactory_brief.md", task_cwd);
                             if std::path::Path::new(&brief_path).exists() {
                                 let result_entry = format!(
                                     "\n### \u{274c} {} \u{2014} failed\n{}\n",
                                     task_title,
                                     err.chars().take(300).collect::<String>()
                                 );
-                                if let Ok(mut existing) =
-                                    std::fs::read_to_string(&brief_path)
-                                {
-                                    existing = existing.replace(
-                                        "_(will be updated as tasks complete)_",
-                                        "",
-                                    );
+                                if let Ok(mut existing) = std::fs::read_to_string(&brief_path) {
+                                    existing = existing
+                                        .replace("_(will be updated as tasks complete)_", "");
                                     existing.push_str(&result_entry);
                                     let _ = std::fs::write(&brief_path, &existing);
                                 }
@@ -645,7 +609,11 @@ impl TaskScheduler {
                     }
 
                     // ── Post-task hook ───────────────────────────────────────
-                    let post_status = if hook_completed { "completed" } else { "failed" };
+                    let post_status = if hook_completed {
+                        "completed"
+                    } else {
+                        "failed"
+                    };
                     let post_summary = hook_summary;
                     hook_runner
                         .fire(HookEvent::PostTask {
@@ -661,10 +629,9 @@ impl TaskScheduler {
 
             // 4. If nothing is in flight and no new tasks were dispatched and
             //    no pending tasks remain, we're done.
-            let remaining_pending =
-                tasks::list_pending_tasks_for_session(&self.pool, &session_id)
-                    .await?
-                    .len();
+            let remaining_pending = tasks::list_pending_tasks_for_session(&self.pool, &session_id)
+                .await?
+                .len();
             let in_flight = self.running.lock().await.len();
             if !dispatched_any && in_flight == 0 && remaining_pending == 0 {
                 tracing::info!("scheduler: session {} drained", session_id);
@@ -682,8 +649,7 @@ impl TaskScheduler {
         session_id: &str,
         app_handle: &AppHandle,
     ) -> Result<(), AppError> {
-        let pending =
-            tasks::list_pending_tasks_for_session(&self.pool, session_id).await?;
+        let pending = tasks::list_pending_tasks_for_session(&self.pool, session_id).await?;
         for t in pending {
             tasks::mark_task_cancelled(&self.pool, &t.id).await.ok();
             emit_task(
@@ -744,12 +710,7 @@ struct RetryEventPayload<'a> {
     attempt: u32,
 }
 
-fn emit_task(
-    app: &AppHandle,
-    session_id: &str,
-    kind: &str,
-    payload: &TaskEventPayload<'_>,
-) {
+fn emit_task(app: &AppHandle, session_id: &str, kind: &str, payload: &TaskEventPayload<'_>) {
     let event = format!("{}:{}", kind, session_id);
     if let Err(e) = app.emit(&event, payload) {
         tracing::warn!("failed to emit {} event: {}", event, e);

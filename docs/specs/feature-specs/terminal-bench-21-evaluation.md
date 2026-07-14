@@ -23,6 +23,17 @@
 | CF-TB-R6 | 保持可审计和安全 | benchmark policy 只在 Harbor sandbox 生效，不污染普通项目权限和长期 memory | permission + memory + audit | policy unit test + memory write guard |
 | CF-TB-R7 | 区分 agent 评估和模型评估 | 所有 run、PR、证据包和 UI 都必须声明 evaluation axis、evaluation subject、fixed variables、changed variables 和 result attribution | docs + backend + UI | spec review + fixture attribution test |
 | CF-TB-R8 | 形成产品能力迭代 loop | 每轮 agent 能力改动必须声明 hypothesis、target failure class、评估 scope，并生成 baseline/head/delta/next queue 的 iteration report | benchmark runner + docs + PR evidence | iteration loop dry-run test + real subset evidence |
+| CF-TB-R9 | 防止 task-specific 跑分污染 | adapter 不得读取 hidden verifier/solution，也不得按 task name、固定 repo、artifact、领域答案或 instruction fingerprint 注入专用 hint/auto-repair | adapter + CI | contamination scanner + source review |
+| CF-TB-R10 | 主产品与 headless 共享完成语义 | Rust AgentLoop 与 Rust headless sidecar 调用同一 `codefactory-agent-core` policy/completion gate，并加载同一 `agent_contracts/execution_completion.md`；环境枚举、版本打印、路径输出等 inspection 不得冒充 post-change verification；Python 仅为 Harbor JSONL bridge，run metadata 保存 contract SHA-256 | agent core + desktop loop + sidecar + adapter + run ledger | core tests + protocol tests + contract hash assertion + 真实 App |
+| CF-TB-R11 | 污染 run 不进入能力基线 | contamination scan、contract hash 或 runtime subject 缺失时，run 只能标记 `benchmark-contaminated diagnostic`，不得用于 release gate、历史最好分或外部水平结论 | importer + UI + evidence | attribution validation test + UI state |
+| CF-TB-R12 | 固定 18 题与全量门禁 | 固定 18 题最终门禁为同一发布版本 `18 / 18`；首个恢复发布允许 `>=16 / 18`，但必须对该轮有效历史通过集零回退。其后补齐 clean Linux/x86 复评与完整 89 题评估 | runner + release ledger + CI | fixed-subset aggregate + pass-set diff + clean Linux/x86 job + full 89 report |
+| CF-TB-R13 | 依赖获取遵守真实环境能力 | Headless bridge 继承 Harbor 已生效的网络策略；`public` 与 `allowlist` 会如实告知共享 Agent core 可获取任务所需依赖，`no-network` 保持拒绝，具体 host 边界继续由 Harbor 强制执行并写入 run metadata | adapter + agent core + sidecar + run ledger | Python policy inheritance test + Rust prompt/policy tests + real dependency task |
+| CF-TB-R14 | 长任务按真实墙钟预算收敛 | Harbor/任务调度器的有效 Agent 时限必须通过 thin bridge 传入 Rust headless；Agent 在剩余三分之二时开始收敛、剩余三分之一时禁止扩 scope，并为最终完成消息保留至少 30 秒。模型重试和工具 timeout 共用同一总 deadline，不能通过重试叠加突破外部预算 | adapter + agent core + sidecar | Rust time-budget tests + Python budget bridge test + real long-horizon trajectory |
+| CF-TB-R15 | 源码交付使用结构化完成证据 | 当需求明确要求 source build/install 时，共享 completion gate 必须记录最后源码修改、成功源码安装、安装后离开源码目录的 runtime/import smoke 和项目验证；任一阶段缺失都不得结束。源码兼容性扫描允许输出摘要，但必须覆盖构建输入并以严格非零退出表达残留命中 | agent core + desktop loop + sidecar | shared core tests + real source-build canary + real App source task |
+| CF-TB-R16 | 源码交付阶段按失败证据推进 | 到达交付检查点后，源码修改、安装、源码目录外运行、项目测试必须按顺序推进；成功安装后不得继续猜测性安装依赖，只有紧邻的真实运行或测试失败才能打开依赖恢复与一次诊断/修复循环 | agent core + sidecar | stage-policy tests + real source-build trajectory |
+| CF-TB-R17 | 明确要求的项目测试是完成条件 | 当原始需求明确要求 repository/project tests 时，只有最后源码修改、安装和外部运行之后的成功项目测试才能解锁完成；测试运行器缺失、失败测试或被管道掩盖的零退出均不得进入 finalization | agent core + desktop loop + sidecar | completion-evidence tests + real App + canary |
+| CF-TB-R18 | 长输出保留可诊断头尾并压缩上下文 | Headless 对编译、安装和测试输出保留命令开头证据与结果/错误尾部，中段压缩；模型上下文达到预算后保留 contract、原始任务和最近完整工具轮次，避免长日志反复进入 provider 请求 | headless sidecar | truncation/compaction tests + usage delta |
+| CF-TB-R19 | 确定性改进必须先交付再继续调分 | 每个已通过独立测试的通用能力切片必须先完成真实 App 验证、PR/CI、合并和适用版本发布，再用该发布版本复评；不得连续堆积多轮本地评分改动后才发布，也不得把“位于主产品源码”称为“已产品化” | delivery loop + release ledger + evidence | PR/CI/release URL + installed build SHA/version + released-build rerun |
 
 ## Primary User Path
 
@@ -112,6 +123,8 @@ PR 描述必须包含：
 - `--agent-import-path`: 自定义 CodeFactory agent adapter 的 import path。
 - `-a oracle`: 只用于验证 Harbor/Docker/dataset/verifier/import 链路，不代表 CodeFactory agent 能力。
 
+Runner 默认不得修改 Harbor 的 task、agent、verifier timeout 或 resource。`agent wall timeout`、trial watchdog、heavy-verifier watchdog、verifier timeout multiplier 和 storage override 均为显式诊断选项；任一启用后，报告必须自动标记 `official_comparable=no` 并列出干预原因，不能进入发布门禁分数。
+
 当前已验证的 CodeFactory import path 是 `codefactory_bench.agent:CodeFactoryAgent`。历史首个真实 run 使用 `codefactory-headless-baseline` / `baseline-no-model`，只证明 Harbor 能运行 CodeFactory-owned adapter 并把结果导回 CodeFactory；不得把该 0 分 baseline 声明为完整 CodeFactory agent 能力。
 
 当前 adapter 名称为 `codefactory-headless`，支持两种模式：
@@ -135,9 +148,7 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 
 对于 shell `return_code=0` 但 stdout/stderr 已经包含明确失败文本的情况，adapter 不得把管道退出码当作成功。常见例子包括 `tee`、`tail`、`head` 等管道隐藏了上游命令失败：`timeout: failed to run command`、shell 报 `No such file or directory` / `not found`、`make: *** Error <code>`、apt/dpkg lock failure、`Failed to fetch`。这类 tool result 必须标记为 `semantic-failure`，写入结构化 repair goal，并提示模型用 `set -o pipefail` 或更小的直接命令重跑后再修复。
 
-对于 ELF memory extraction 这类二进制 artifact 任务，adapter 必须把 task-family guidance 写入模型上下文，并在 verifier-style 自检发现覆盖不足、空 JSON、低 key count 或实现缺失时触发协议修复。修复 scaffold 必须基于 ELF program headers 的 `PT_LOAD` segment，把文件偏移 `p_offset + off` 映射到内存地址 `p_vaddr + off`，并用 unsigned 32-bit 读取函数，例如 `Buffer.readUInt32LE(...)`；不得使用 JS bitwise operator 读值，因为它会把高位为 1 的 32-bit 值强制成 signed negative。自检必须验证 JSON keys 是整数地址、values 是 `0..0xffffffff` 范围内的整数，并至少覆盖一个真实编译产物。
-
-对于 PyTorch tensor-parallel linear 这类分布式 autograd 任务，adapter 必须把 `ColumnParallelLinear` / `RowParallelLinear` 的实现契约写入模型上下文，并在 `/app/parallel_linear.py` 缺失、实现缺失、裸 `dist.all_gather` 导致 `does not require grad` / `grad_fn` 失败，或 verifier-style 自检出现 `test_column_parallel_linear` / `parallel_loss.backward` 失败时触发协议修复。修复 scaffold 必须使用 `torch.autograd.Function` 包装 all-gather，使 backward 返回 rank-local gradient chunk；`ColumnParallelLinear` 必须按 `master_weight` dim 0 切分、局部 bias 为零、局部 `F.linear` 后 autograd-safe gather；`RowParallelLinear` 必须按 dim 1 切分、局部输出不加 bias、reduce partial outputs 后再加完整零 bias。不得把 bare `dist.all_gather` 输出直接 `torch.cat` 当作可反传结果。
+对于 artifact、编译扩展、服务或库 API 任务，Agent 只能从用户原始需求、仓库公开源码、构建配置和实际错误中推导实现，不得由 adapter 注入 task family、固定仓库、领域算法、答案 scaffold 或预期 marker。完成前必须把每个明确点名的组件或行为映射到真实功能检查；文件存在、import 成功、编译成功或单一 happy path 不能替代行为验收。源码构建还必须枚举构建配置引用的实际输入，包括生成源码和编译源码，避免只扫描熟悉的文件后缀。
 
 任何 score-facing canary 通过后，都不得直接声明本轮产品能力已经改进完成。系统必须执行固定 18 题 regression subset 或生成明确 blocker evidence，并比较上一轮 fixed subset 的 pass count、mean reward、历史通过项和 failure class 变化。如果 aggregate 没有提升、历史通过项回落，或 canary pass 在 aggregate 中被 verifier/runtime 问题掩盖，本轮只能标记为 `targeted canary pass, aggregate not held`，下一轮 P0 必须先处理 score-holding regression 或 runtime classification。
 
@@ -145,7 +156,7 @@ Model-backed loop 必须把 task container 内的 `environment.exec` 异常记�
 
 对于明显的前台服务启动命令，例如 `python -m http.server`、`uvicorn`、`flask run`、`npm start`、`redis-server` 等，adapter 必须要求后台启动、日志重定向、pid 记录和 bounded readiness check；不得直接执行会常驻到 tool timeout 的前台服务命令。已显式后台化、`nohup`、`setsid`、`timeout` 或 daemon 模式的命令不在该拦截范围内。
 
-Benchmark sandbox 默认不得允许外网工具调用，但必须允许容器内 loopback 自检，例如 `curl http://localhost:<port>`、`curl http://127.0.0.1:<port>`、`nc -z localhost <port>`。该豁免只能用于 loopback / unspecified host，外部 host 仍必须拒绝为 `network/exfiltration tool disabled`。
+Benchmark bridge 不得用固定布尔值覆盖评测环境能力。它必须继承 Harbor 已生效的网络策略：`public` 允许任务所需的依赖或源码获取；`allowlist` 允许 Agent 发起命令，但 host 白名单仍由 Harbor 环境强制执行；`no-network` 只允许 loopback 自检，例如 `curl http://localhost:<port>`、`curl http://127.0.0.1:<port>`、`nc -z localhost <port>`。系统提示、命令 policy 和 run metadata 必须反映同一个有效策略。桌面主路径继续使用用户权限审批与 shell safety policy，不继承 benchmark sandbox 的权限捷径。
 
 当 runner 或 adapter 为 Docker task container 注入 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 或小写等价变量时，必须同时注入 `NO_PROXY` / `no_proxy`，至少覆盖 `localhost,127.0.0.1,127.0.0.0/8,::1,0.0.0.0`，保证容器内服务自检不会通过宿主机代理返回假阳性或 `502`。
 
@@ -181,7 +192,9 @@ Benchmark sandbox 默认不得允许外网工具调用，但必须允许容器�
 
 固定 subset 的离线基线入口是 `tools/benchmark/summarize_terminal_bench_21_subset_baseline.py`。该脚本只读取已完成 full Harbor job 和 subset JSON，不调用 provider、不读取 secret，用于在 credential 或 provider 暂不可用时仍能生成同口径的 subset baseline evidence。该报告必须明确标注 `offline subset projection`，不能冒充新的 provider-backed rerun。
 
-截至 2026-07-06，最新固定 18 题 current-worktree diagnostic aggregate 已完成两轮完整回归稳定性验证：run `565ecdd4-7694-42aa-a3c7-a3bd38f15146` 和 run `bd70de5a-b4ec-4925-8353-7f9000fdcf77` 均为 `16 / 18`，mean reward `0.889`，evidence 分别为 `docs/evidence-packs/terminal-bench-21-regression-subset-2026-07-06T16-00-55Z.md` 和 `docs/evidence-packs/terminal-bench-21-regression-subset-2026-07-06T17-53-49Z.md`。这轮新增并稳定保持 `qemu-startup`，同时把 `count-dataset-tokens` 和 `install-windows-3.11` 的回归修回 pass set。产品化能力是 provider/model transient retry、显式依赖路由、字段级数据计算审计、source-clean native artifact 验证、GUI runtime readiness 与视觉反馈验证；评测边界是固定 18 题、Terminal-Bench task scaffold、本机代理地址、QEMU/VNC 路径和 runner watchdog。剩余失败项为 `caffe-cifar-10` verification failure 与 `query-optimize` watchdog/environment failure，因此这仍是产品诊断聚合分数，不是 clean official-comparable release gate。
+截至 2026-07-10 的完整性复审发现，历史 `16 / 18` 与当前 `12 / 18` adapter 内含 fixed-task instruction fingerprint、专用 hint/auto-repair、成功 marker，并在 setup 路径读取 `/tests/test.sh`。这些 run 保留为历史诊断证据，但重新分类为 `benchmark-contaminated diagnostic`，不得继续作为 CodeFactory 主产品能力基线。下一次有效基线必须先满足 CF-TB-R9 至 R11，再重新运行固定 18 题。
+
+发布门禁按两阶段执行：第一阶段在同一个候选版本上恢复有效 `>=16 / 18`，且相对该版本迭代循环中已经诚实通过的任务集合零回退；第二阶段继续提升到固定 18 题 `18 / 18`。这两个分数都必须来自 thin Harbor bridge、Rust headless、共享 contract 和完整 integrity metadata。完成固定 18 题后，必须在 clean Linux/x86 环境复现，再运行完整 89 题；macOS/QEMU diagnostic 不能替代 clean Linux/x86 证据。
 
 ### Iteration Loop
 
@@ -229,18 +242,19 @@ Benchmark sandbox 默认不得允许外网工具调用，但必须允许容器�
 | Adapter | custom agent adapter command 生成 | 使用 `terminal-bench/terminal-bench-2-1` 和 import path | command assertion |
 | Adapter | CodeFactory baseline adapter smoke | Harbor 能 import `codefactory_bench.agent:CodeFactoryAgent`，trial 无 exception，CodeFactory importer 读回 agent identity 和 reward | Harbor job + ignored real import test |
 | Adapter | Model-backed headless loop | fake OpenAI-compatible server 返回 `run_shell` tool call，adapter 执行 Harbor environment command 并写 trajectory | Python integration test |
-| Adapter | Artifact enforcement loop | 初始 inspection 后，重复读文件、复合只读命令和无关实现命令会被压回 artifact 生成；有目标产物前空回复会恢复为 tool-call 要求 | Python loop tests + real provider smoke trajectory |
-| Adapter | Protocol auto-repair | candidate artifact 自检出现 decompressor crash、size limit 或协议失败时，adapter 能记录自动修复轨迹并产出可验证 artifact；修复不得依赖 task container 中不存在的 Python runtime | Python loop test + real provider smoke reward |
-| Adapter | Exec timeout recovery | `environment.exec` 抛出 command timeout 时，adapter 写入 `exec-error/command-timeout`、更新 metadata，并继续给模型修复机会，不直接 Harbor exception | Python loop test |
-| Adapter | Failed self-check repair | pytest/assertion/traceback 类自检失败会生成具体 repair reminder 和结构化 `repair-goal`，要求修改实现并重跑最小失败检查 | Python loop test |
-| Adapter | Pipeline-masked semantic failure | `return_code=0` 但 stdout/stderr 包含 missing executable、`make` error 或 apt/dpkg/fetch failure 时，tool result 标记为 `semantic-failure` 而不是 `ok` | Python loop test + `caffe-cifar-10` canary trajectory |
-| Adapter | Binary artifact task-family repair | ELF memory extraction 任务会提示 `PT_LOAD`、`p_offset` 到 `p_vaddr` 映射和 unsigned 32-bit 读取；覆盖不足或 signed 负值会触发 `/app/extract.js` repair scaffold | Python loop test + `extract-elf` canary trajectory |
-| Adapter | Distributed autograd task-family repair | PyTorch tensor-parallel linear 任务会提示 gradient-preserving all-gather、rank-local backward slice、row-parallel all-reduce 后加 full bias；裸 `dist.all_gather` gradient failure 会触发 `/app/parallel_linear.py` repair scaffold | Python loop test + `torch-tensor-parallelism` canary and 18-task regression trajectory |
-| Adapter | Final-before-verify gate | 候选 artifact 已生成但未运行 bounded verification 时，final answer 会被拦住，要求先执行最小验证或修复 | Python loop test |
-| Adapter | Foreground service supervision | 前台服务启动命令被 suppress，并提示后台启动、日志、pid 和 readiness check，不消耗完整 tool timeout | Python loop test |
-| Adapter | Background service lifecycle | 已后台化的服务命令记录 log、pid、readiness check 是否存在，并写入 trajectory/metadata | Python loop test |
-| Adapter | Long command policy | 无界 `tail -f`、`watch`、长 `sleep` 或未设 sample/step bound 的训练/benchmark 命令被 suppress，并要求 bounded plan | Python loop test |
-| Adapter | Provider tool-choice compatibility | provider 拒绝 forced `tool_choice` 时自动降级为 `auto` 重试，不把兼容性错误误记为 agent 能力结果 | Python provider fallback test |
+| Core | Inspection budget | 连续只读检查达到通用预算后，`ProgressTracker` 要求形成最小候选实现；任一 mutation 重置预算 | Rust core tests + real product/canary trajectory |
+| Core | Semantic failure | `return_code=0` 但输出含明确失败证据时，不得解锁完成门禁，后续必须修改或重新验证 | Rust core tests |
+| Core | Inspection is not verification | 依赖安装或修改失败后，打印环境、版本、搜索路径或文件列表即使返回 0 也不能解锁完成；必须运行任务相关测试、构建、项目入口或功能探针 | shared core tests + real App |
+| Core | Final-before-verify gate | 最后一次 mutation 后没有更新的成功 build/runtime/test 证据时，桌面与 headless 都不能结束 | shared core tests + desktop tests + real App |
+| Core | Background service lifecycle | 服务启动后必须存在 PID/pidfile/process handle、日志、bounded readiness 和真实 functional/client probe | shared core tests + real App service scenario |
+| Desktop | Streaming response integrity | OpenAI-compatible 与 ChatGPT Responses SSE 必须看到 `[DONE]`、`finish_reason` 或 `response.completed`，且不得存在 malformed data line 或残留半行；已展示的半截响应报明确传输错误，不自动重放工具 | Rust desktop stream tests + real App interrupted-stream scenario |
+| Headless | Model response recovery | 响应体截断、瞬时 transport 或 `429/5xx` 只在有限预算内重试；最终错误保留状态和截断诊断，不能被 sidecar cleanup 覆盖 | Rust HTTP tests + Python bridge lifecycle test |
+| Headless | Tool failure protocol | 命令超时、环境异常或 policy deny 可以返回 `return_code=null` 与结构化 error；Rust sidecar 将其记录为失败证据并继续模型闭环，不得因 JSON 类型错误终止 trial | Rust JSONL protocol test + real timeout trajectory |
+| Headless | Total timeout ownership | Harbor/产品任务调度器是总时限唯一来源；bridge 把该有效时限传入 sidecar，模型重试、工具执行和最终回复共用同一墙钟预算，并保留 30 秒结束窗口 | Python bridge + Rust runner tests + Harbor task timeout evidence |
+| Core | Source delivery stages | source-build/install 需求必须依次满足源码修改后的全输入 clean scan、成功安装、源码目录外 runtime/import smoke 和项目验证；日志摘要不能因非空而误判 clean scan 失败 | shared core tests + source-build canary |
+| Headless | Context compaction | 保留共享 contract、原始任务和最近完整 tool round；旧输出压缩后不突破上下文预算 | Rust headless tests + usage metadata |
+| Adapter | Thin bridge protocol | Python 只启动 sidecar、转发 `ToolRequest`/`ToolResult`、记录 metadata，不包含模型调用、prompt、policy、任务分类或 repair | Python integration + contamination scan |
+| Policy | Bounded command policy | hidden verifier、solution、secret 始终拒绝；外部网络按有效环境策略决定，loopback probe 与正常 workspace build/test 允许 | Rust core policy tests |
 | Adapter | Provider bridge preview | 当前 DeepSeek endpoint/model 生成 redacted env 和 Harbor command preview，不暴露 raw key | Rust unit test |
 | Adapter | Provider bridge authorization | 授权短语不匹配时不得 lookup secret；匹配后只把 key 放入 child env | Rust unit test |
 | UI | Benchmark credential blocker | provider keychain/credential failure 返回 `status=blocked`、`failure_kind=credential`，Benchmark 页面展示 blocker，不记为 agent failure | Rust unit test + frontend build |
@@ -249,7 +263,7 @@ Benchmark sandbox 默认不得允许外网工具调用，但必须允许容器�
 | Regression | Iteration loop runner | 声明 hypothesis/target failure class 后生成 baseline/head/delta/next queue report；可 dry-run 或执行 canary/regression | Python iteration loop test + evidence report |
 | Regression | Score-holding aggregate gate | 单题 canary pass 后必须跑固定 18 题或生成 blocker；aggregate 回落时标记 `targeted canary pass, aggregate not held`，不得声明总体能力提升 | fixed subset evidence comparison |
 | Policy | benchmark-sandbox policy in task container | workspace command/file edit 自动允许，host path/secret deny | policy unit test |
-| Policy | network/secret deny | fake model 请求 `curl` 或 credential path 时不调用 environment.exec | Python policy test |
+| Policy | network policy inheritance | fake Harbor `public`/`allowlist`/`no-network` 策略分别映射到共享 core 能力，metadata 记录有效策略，host enforcement 不被 bridge 绕过 | Python bridge test + Rust core policy test |
 | Failure | 缺失 `result.json` | 标记 `partial_import`，列出缺失文件 | importer test |
 | Failure | Harbor 不存在 | UI 显示 blocker，不影响其他页面 | environment probe test |
 | Failure | timeout/resource 被修改 | comparable=false，官方可比状态标红 | config validation test |

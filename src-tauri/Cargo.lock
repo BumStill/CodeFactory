@@ -388,6 +388,7 @@ dependencies = [
  "base64 0.22.1",
  "calamine",
  "chrono",
+ "codefactory-agent-core",
  "dashmap",
  "dirs 5.0.1",
  "futures-util",
@@ -419,6 +420,27 @@ dependencies = [
  "uuid",
  "walkdir",
  "zip 4.6.1",
+]
+
+[[package]]
+name = "codefactory-agent-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2",
+ "url",
+]
+
+[[package]]
+name = "codefactory-agent-headless"
+version = "0.1.0"
+dependencies = [
+ "codefactory-agent-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

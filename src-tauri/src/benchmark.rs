@@ -3,6 +3,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::ffi::OsString;
 use std::fs;
@@ -21,6 +22,9 @@ const CODEFACTORY_HARBOR_AGENT: &str = "codefactory_bench.agent:CodeFactoryAgent
 const BENCH_LOOPBACK_NO_PROXY: &str = "localhost,127.0.0.1,127.0.0.0/8,::1,0.0.0.0";
 const CODEFACTORY_KEYRING_SERVICE: &str = "com.codefactory.app";
 const DEFAULT_PROVIDER_SECRET_LOOKUP_TIMEOUT_SECS: u64 = 20;
+const BENCHMARK_INTEGRITY_DIAGNOSTIC_STATUS: &str = "benchmark_contaminated_diagnostic";
+const EXECUTION_COMPLETION_CONTRACT: &[u8] =
+    include_bytes!("../../agent_contracts/execution_completion.md");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BenchmarkProfile {
@@ -1258,18 +1262,37 @@ pub async fn import_harbor_job(pool: &SqlitePool, job_path: &Path) -> Result<Imp
         .unwrap_or_else(|| "unknown".to_string());
     let policy_preset = json_string(&config, &["metadata", "policy_preset"])
         .unwrap_or_else(|| "benchmark-sandbox".to_string());
-    let status = harbor_run_status(&result, &missing_files);
-    let comparable = dataset == profile.dataset && !has_official_constraint_override(&config);
-    let comparable_reason = if comparable {
-        None
-    } else if dataset != profile.dataset {
-        Some(format!(
+    let harbor_status = harbor_run_status(&result, &missing_files);
+    let trial_integrity_issues = validate_trial_integrity(job_path)?;
+    let status = if trial_integrity_issues.is_empty() {
+        harbor_status.clone()
+    } else {
+        BENCHMARK_INTEGRITY_DIAGNOSTIC_STATUS.to_string()
+    };
+    let mut comparability_issues = Vec::new();
+    if dataset != profile.dataset {
+        comparability_issues.push(format!(
             "dataset mismatch: expected {}, got {dataset}",
             profile.dataset
-        ))
-    } else {
-        Some("timeout/resource override marker found in job config".to_string())
-    };
+        ));
+    }
+    if has_official_constraint_override(&config) {
+        comparability_issues
+            .push("timeout/resource override marker found in job config".to_string());
+    }
+    if !harbor_status_is_complete(&harbor_status) {
+        comparability_issues.push(format!(
+            "run status {harbor_status} is not a complete successful evaluation"
+        ));
+    }
+    if !trial_integrity_issues.is_empty() {
+        comparability_issues.push(format!(
+            "trial integrity check failed: {}",
+            trial_integrity_issues.join("; ")
+        ));
+    }
+    let comparable = comparability_issues.is_empty();
+    let comparable_reason = (!comparable).then(|| comparability_issues.join("; "));
 
     let run = BenchmarkRunRecord {
         id: json_string(&result, &["id"])
@@ -1320,6 +1343,92 @@ fn read_json_file(path: PathBuf, missing_files: &mut Vec<String>) -> Result<Valu
     }
     let raw = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&raw)?)
+}
+
+fn execution_completion_contract_sha256() -> String {
+    format!("{:x}", Sha256::digest(EXECUTION_COMPLETION_CONTRACT))
+}
+
+fn validate_trial_integrity(job_path: &Path) -> Result<Vec<String>> {
+    let expected_contract_sha = execution_completion_contract_sha256();
+    let mut issues = Vec::new();
+
+    for trial_dir in harbor_trial_dirs(job_path)? {
+        let trial_name = trial_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| trial_dir.to_string_lossy().to_string());
+        let metadata_path = trial_dir.join("agent").join("run-metadata.json");
+        let raw = match fs::read_to_string(&metadata_path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                issues.push(format!("{trial_name}: missing agent/run-metadata.json"));
+                continue;
+            }
+            Err(error) => {
+                issues.push(format!(
+                    "{trial_name}: cannot read agent/run-metadata.json: {error}"
+                ));
+                continue;
+            }
+        };
+        let metadata: Value = match serde_json::from_str(&raw) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                issues.push(format!(
+                    "{trial_name}: invalid agent/run-metadata.json: {error}"
+                ));
+                continue;
+            }
+        };
+
+        match json_string(&metadata, &["runtime_subject"]) {
+            Some(subject) if subject == "rust-core" => {}
+            Some(subject) => issues.push(format!(
+                "{trial_name}: runtime_subject expected rust-core, got {subject}"
+            )),
+            None => issues.push(format!("{trial_name}: missing runtime_subject")),
+        }
+        match json_string(&metadata, &["mode"]) {
+            Some(mode) if mode == "model-backed" => {}
+            Some(mode) => issues.push(format!(
+                "{trial_name}: mode expected model-backed, got {mode}"
+            )),
+            None => issues.push(format!("{trial_name}: missing mode")),
+        }
+        let contract_sha = json_string(&metadata, &["contract_sha256"]);
+        let execution_contract_sha = json_string(&metadata, &["execution_contract_sha256"]);
+        if let (Some(contract_sha), Some(execution_contract_sha)) =
+            (&contract_sha, &execution_contract_sha)
+        {
+            if contract_sha != execution_contract_sha {
+                issues.push(format!(
+                    "{trial_name}: contract_sha256 and execution_contract_sha256 disagree"
+                ));
+                continue;
+            }
+        }
+        match contract_sha.or(execution_contract_sha) {
+            Some(contract_sha) if contract_sha == expected_contract_sha => {}
+            Some(contract_sha) => issues.push(format!(
+                "{trial_name}: contract SHA-256 mismatch (expected {expected_contract_sha}, got {contract_sha})"
+            )),
+            None => issues.push(format!(
+                "{trial_name}: missing contract_sha256 or execution_contract_sha256"
+            )),
+        }
+        match json_string(&metadata, &["integrity", "contamination_scan"]) {
+            Some(scan) if scan == "pass" => {}
+            Some(scan) => issues.push(format!(
+                "{trial_name}: integrity.contamination_scan expected pass, got {scan}"
+            )),
+            None => issues.push(format!(
+                "{trial_name}: missing integrity.contamination_scan"
+            )),
+        }
+    }
+
+    Ok(issues)
 }
 
 fn import_trials(run_id: &str, job_path: &Path) -> Result<Vec<BenchmarkTrialRecord>> {
@@ -1463,9 +1572,10 @@ fn classify_failure_detail(reward: f64, evidence: &str) -> FailureDetail {
         };
     }
     let text = evidence.to_lowercase();
-    let (class, reason) = if text.contains("permission")
-        || text.contains("denied")
-        || text.contains("not allowed")
+    let (class, reason) = if text.contains("policy denied command")
+        || text.contains("permission denied")
+        || text.contains("access denied")
+        || text.contains("not allowed by policy")
         || text.contains("outside workspace")
     {
         ("policy", "policy-denied-command")
@@ -1486,9 +1596,7 @@ fn classify_failure_detail(reward: f64, evidence: &str) -> FailureDetail {
         ("environment", "harbor-tests-upload-failed")
     } else if text.contains("range of cpus is from") || text.contains("as there are only") {
         ("environment", "docker-cpu-limit")
-    } else if text.contains("rewardfilenotfounderror")
-        || text.contains("no reward file found")
-    {
+    } else if text.contains("rewardfilenotfounderror") || text.contains("no reward file found") {
         ("environment", "verifier-reward-missing")
     } else if text.contains("no space left on device")
         || text.contains("not enough free space in /var/cache/apt/archives")
@@ -1519,6 +1627,7 @@ fn classify_failure_detail(reward: f64, evidence: &str) -> FailureDetail {
         || text.contains("expected")
         || text.contains("pytest")
         || text.contains("test failed")
+        || text.contains("failed test")
     {
         ("verification", "verifier-assertion-failed")
     } else if text.contains("timeout") || text.contains("timed out") {
@@ -1601,16 +1710,24 @@ fn harbor_run_status(result: &Value, missing_files: &[String]) -> String {
     if !missing_files.is_empty() {
         return "partial_import".to_string();
     }
-    if let Some(status) = json_string(result, &["status"]) {
-        return status;
-    }
+    let errored_count = json_i64(result, &["stats", "n_errored_trials"]).unwrap_or(0);
     let unfinished_count = json_i64(result, &["stats", "n_pending_trials"]).unwrap_or(0)
         + json_i64(result, &["stats", "n_running_trials"]).unwrap_or(0)
         + json_i64(result, &["stats", "n_cancelled_trials"]).unwrap_or(0);
     if unfinished_count > 0 {
         return "partial_import".to_string();
     }
+    if errored_count > 0 {
+        return "completed_with_errors".to_string();
+    }
+    if let Some(status) = json_string(result, &["status"]) {
+        return status;
+    }
     "imported".to_string()
+}
+
+fn harbor_status_is_complete(status: &str) -> bool {
+    matches!(status, "completed" | "completed_with_errors" | "imported")
 }
 
 fn duration_ms_from_result(value: &Value) -> Option<i64> {
@@ -1769,6 +1886,63 @@ mod tests {
         dir
     }
 
+    fn write_minimal_harbor_job(job_dir: &Path) {
+        fs::write(
+            job_dir.join("config.json"),
+            json!({
+                "dataset": TERMINAL_BENCH_21_DATASET,
+                "agent": "codefactory-headless"
+            })
+            .to_string(),
+        )
+        .expect("write job config");
+        fs::write(
+            job_dir.join("result.json"),
+            json!({ "id": Uuid::new_v4().to_string(), "status": "completed" }).to_string(),
+        )
+        .expect("write job result");
+    }
+
+    fn write_trial(job_dir: &Path, name: &str, metadata: Option<Value>) {
+        let trial_dir = job_dir.join("trials").join(name);
+        fs::create_dir_all(&trial_dir).expect("create trial dir");
+        fs::write(
+            trial_dir.join("config.json"),
+            json!({ "task_name": name }).to_string(),
+        )
+        .expect("write trial config");
+        fs::write(
+            trial_dir.join("result.json"),
+            json!({ "task_name": name, "reward": 1.0 }).to_string(),
+        )
+        .expect("write trial result");
+        if let Some(metadata) = metadata {
+            write_trial_metadata(&trial_dir, metadata);
+        }
+    }
+
+    fn write_trial_metadata(trial_dir: &Path, metadata: Value) {
+        fs::create_dir_all(trial_dir.join("agent")).expect("create agent dir");
+        fs::write(
+            trial_dir.join("agent").join("run-metadata.json"),
+            metadata.to_string(),
+        )
+        .expect("write run metadata");
+    }
+
+    fn write_clean_trial_metadata(trial_dir: &Path) {
+        write_trial_metadata(trial_dir, clean_trial_metadata());
+    }
+
+    fn clean_trial_metadata() -> Value {
+        json!({
+            "runtime_subject": "rust-core",
+            "mode": "model-backed",
+            "execution_contract_sha256": execution_completion_contract_sha256(),
+            "integrity": { "contamination_scan": "pass" }
+        })
+    }
+
     #[test]
     fn terminal_bench_21_profile_is_locked_to_official_dataset() {
         let profile = terminal_bench_21_profile();
@@ -1909,6 +2083,7 @@ mod tests {
             json!({ "reward": 1.0 }).to_string(),
         )
         .expect("write pass result");
+        write_clean_trial_metadata(&pass_dir);
 
         let fail_dir = job_dir.join("trials").join("task-fail");
         fs::create_dir_all(fail_dir.join("verifier")).expect("create fail trial");
@@ -1922,6 +2097,7 @@ mod tests {
             json!({ "reward": 0.0, "duration_ms": 42000 }).to_string(),
         )
         .expect("write fail result");
+        write_clean_trial_metadata(&fail_dir);
         fs::write(
             fail_dir.join("verifier").join("test-stderr.txt"),
             "Permission denied while writing outside workspace",
@@ -1961,6 +2137,188 @@ mod tests {
         .await
         .expect("read failure reason");
         assert_eq!(persisted_reason, "policy-denied-command");
+    }
+
+    #[tokio::test]
+    async fn import_harbor_job_keeps_clean_trial_integrity_comparable() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        ensure_schema(&pool).await.expect("benchmark schema");
+
+        let job_dir = temp_job_dir();
+        write_minimal_harbor_job(&job_dir);
+        write_trial(&job_dir, "clean-trial", Some(clean_trial_metadata()));
+        write_trial(
+            &job_dir,
+            "clean-contract-alias",
+            Some(json!({
+                "runtime_subject": "rust-core",
+                "mode": "model-backed",
+                "contract_sha256": execution_completion_contract_sha256(),
+                "integrity": { "contamination_scan": "pass" }
+            })),
+        );
+
+        let imported = import_harbor_job(&pool, &job_dir)
+            .await
+            .expect("import clean Harbor job");
+
+        assert_eq!(imported.run.status, "completed");
+        assert!(imported.run.comparable);
+        assert_eq!(imported.run.comparable_reason, None);
+    }
+
+    #[tokio::test]
+    async fn import_harbor_job_marks_invalid_trial_integrity_diagnostic() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        ensure_schema(&pool).await.expect("benchmark schema");
+
+        let job_dir = temp_job_dir();
+        write_minimal_harbor_job(&job_dir);
+        write_trial(&job_dir, "clean-trial", Some(clean_trial_metadata()));
+        write_trial(&job_dir, "missing-metadata", None);
+        write_trial(
+            &job_dir,
+            "wrong-runtime",
+            Some(json!({
+                "runtime_subject": "python-adapter",
+                "mode": "model-backed",
+                "execution_contract_sha256": execution_completion_contract_sha256(),
+                "integrity": { "contamination_scan": "pass" }
+            })),
+        );
+        write_trial(
+            &job_dir,
+            "wrong-contract",
+            Some(json!({
+                "runtime_subject": "rust-core",
+                "mode": "model-backed",
+                "execution_contract_sha256": "not-the-repository-contract",
+                "integrity": { "contamination_scan": "pass" }
+            })),
+        );
+        write_trial(
+            &job_dir,
+            "contaminated",
+            Some(json!({
+                "runtime_subject": "rust-core",
+                "mode": "model-backed",
+                "execution_contract_sha256": execution_completion_contract_sha256(),
+                "integrity": { "contamination_scan": "fail" }
+            })),
+        );
+        write_trial(
+            &job_dir,
+            "missing-runtime",
+            Some(json!({
+                "mode": "model-backed",
+                "execution_contract_sha256": execution_completion_contract_sha256(),
+                "integrity": { "contamination_scan": "pass" }
+            })),
+        );
+        write_trial(
+            &job_dir,
+            "missing-contract",
+            Some(json!({
+                "runtime_subject": "rust-core",
+                "mode": "model-backed",
+                "integrity": { "contamination_scan": "pass" }
+            })),
+        );
+        write_trial(
+            &job_dir,
+            "missing-scan",
+            Some(json!({
+                "runtime_subject": "rust-core",
+                "mode": "model-backed",
+                "execution_contract_sha256": execution_completion_contract_sha256(),
+                "integrity": {}
+            })),
+        );
+        write_trial(
+            &job_dir,
+            "conflicting-contract-fields",
+            Some(json!({
+                "runtime_subject": "rust-core",
+                "mode": "model-backed",
+                "contract_sha256": execution_completion_contract_sha256(),
+                "execution_contract_sha256": "different-contract",
+                "integrity": { "contamination_scan": "pass" }
+            })),
+        );
+        write_trial(
+            &job_dir,
+            "baseline-mode",
+            Some(json!({
+                "runtime_subject": "rust-core",
+                "mode": "baseline-no-model",
+                "execution_contract_sha256": execution_completion_contract_sha256(),
+                "integrity": { "contamination_scan": "pass" }
+            })),
+        );
+        write_trial(
+            &job_dir,
+            "missing-mode",
+            Some(json!({
+                "runtime_subject": "rust-core",
+                "execution_contract_sha256": execution_completion_contract_sha256(),
+                "integrity": { "contamination_scan": "pass" }
+            })),
+        );
+        write_trial(&job_dir, "invalid-json", Some(clean_trial_metadata()));
+        fs::write(
+            job_dir
+                .join("trials")
+                .join("invalid-json")
+                .join("agent")
+                .join("run-metadata.json"),
+            "{not json",
+        )
+        .expect("write invalid run metadata");
+
+        let imported = import_harbor_job(&pool, &job_dir)
+            .await
+            .expect("import invalid Harbor job as diagnostic");
+
+        assert_eq!(imported.run.status, "benchmark_contaminated_diagnostic");
+        assert!(!imported.run.comparable);
+        let reason = imported
+            .run
+            .comparable_reason
+            .as_deref()
+            .expect("diagnostic reason");
+        assert!(reason.contains("missing-metadata: missing agent/run-metadata.json"));
+        assert!(reason.contains("wrong-runtime: runtime_subject expected rust-core"));
+        assert!(reason.contains("wrong-contract: contract SHA-256 mismatch"));
+        assert!(reason.contains("contaminated: integrity.contamination_scan expected pass"));
+        assert!(reason.contains("missing-runtime: missing runtime_subject"));
+        assert!(reason
+            .contains("missing-contract: missing contract_sha256 or execution_contract_sha256"));
+        assert!(reason.contains("missing-scan: missing integrity.contamination_scan"));
+        assert!(reason.contains("baseline-mode: mode expected model-backed"));
+        assert!(reason.contains("missing-mode: missing mode"));
+        assert!(reason.contains(
+            "conflicting-contract-fields: contract_sha256 and execution_contract_sha256 disagree"
+        ));
+        assert!(reason.contains("invalid-json: invalid agent/run-metadata.json"));
+
+        let persisted: (String, i64, String) = sqlx::query_as(
+            "SELECT status, comparable, comparable_reason FROM benchmark_runs WHERE id = ?",
+        )
+        .bind(&imported.run.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read persisted diagnostic run");
+        assert_eq!(persisted.0, "benchmark_contaminated_diagnostic");
+        assert_eq!(persisted.1, 0);
+        assert_eq!(persisted.2, reason);
     }
 
     #[tokio::test]
@@ -2041,7 +2399,6 @@ mod tests {
         fs::write(trial_dir.join("verifier").join("reward.txt"), "1.0").expect("write reward");
         fs::write(trial_dir.join("verifier").join("test-stdout.txt"), "passed")
             .expect("write stdout");
-
         let imported = import_harbor_job(&pool, &job_dir)
             .await
             .expect("import real Harbor layout");
@@ -2053,7 +2410,8 @@ mod tests {
             imported.run.dataset_version.as_deref(),
             Some("sha256:dataset-ref")
         );
-        assert!(imported.run.comparable);
+        assert!(!imported.run.comparable);
+        assert_eq!(imported.run.status, "benchmark_contaminated_diagnostic");
         assert_eq!(imported.trials.len(), 1);
         assert_eq!(
             imported.trials[0].task_name,
@@ -2149,7 +2507,6 @@ mod tests {
         fs::write(trial_dir.join("verifier").join("reward.txt"), "0").expect("write reward");
         fs::write(trial_dir.join("verifier").join("test-stdout.txt"), "failed")
             .expect("write stdout");
-
         let imported = import_harbor_job(&pool, &job_dir)
             .await
             .expect("import custom Harbor agent layout");
@@ -2168,6 +2525,21 @@ mod tests {
         );
 
         assert_eq!(failure.as_deref(), Some("model-provider"));
+    }
+
+    #[test]
+    fn failure_classifier_ignores_generic_pip_permission_warning() {
+        let failure = classify_failure_detail(
+            0.0,
+            "WARNING: Running pip as the root user can result in broken permissions.\n\
+             FAILED test_pyknotid_core_import - ModuleNotFoundError: No module named 'pyknotid'",
+        );
+
+        assert_eq!(failure.failure_class.as_deref(), Some("verification"));
+        assert_eq!(
+            failure.failure_reason.as_deref(),
+            Some("verifier-assertion-failed")
+        );
     }
 
     #[test]
@@ -2233,10 +2605,7 @@ E: You don't have enough free space in /var/cache/apt/archives/.
             0.0,
             "harbor.verifier.verifier.RewardFileNotFoundError: No reward file found at verifier/reward.txt",
         );
-        assert_eq!(
-            missing_reward.failure_class.as_deref(),
-            Some("environment")
-        );
+        assert_eq!(missing_reward.failure_class.as_deref(), Some("environment"));
         assert_eq!(
             missing_reward.failure_reason.as_deref(),
             Some("verifier-reward-missing")
@@ -2524,16 +2893,38 @@ E: You don't have enough free space in /var/cache/apt/archives/.
                 "n_pending_trials": 16
             }
         });
-        assert_eq!(harbor_run_status(&explicit_completed, &[]), "completed");
+        assert_eq!(
+            harbor_run_status(&explicit_completed, &[]),
+            "partial_import",
+            "unfinished counters must override an inconsistent completed label"
+        );
 
         assert_eq!(
-            harbor_run_status(&json!({ "status": "completed" }), &["result.json".to_string()]),
+            harbor_run_status(
+                &json!({ "status": "completed" }),
+                &["result.json".to_string()]
+            ),
             "partial_import"
         );
         assert_eq!(
             harbor_run_status(&json!({ "stats": { "n_completed_trials": 2 } }), &[]),
             "imported"
         );
+
+        let completed_with_trial_errors = json!({
+            "stats": {
+                "n_completed_trials": 18,
+                "n_errored_trials": 12,
+                "n_pending_trials": 0,
+                "n_running_trials": 0,
+                "n_cancelled_trials": 0
+            }
+        });
+        assert_eq!(
+            harbor_run_status(&completed_with_trial_errors, &[]),
+            "completed_with_errors"
+        );
+        assert!(harbor_status_is_complete("completed_with_errors"));
     }
 
     #[tokio::test]
@@ -2619,6 +3010,7 @@ E: You don't have enough free space in /var/cache/apt/archives/.
             .to_string(),
         )
         .expect("write trial result");
+        write_clean_trial_metadata(&trial_dir);
 
         let imported = import_harbor_job(&pool, &job_dir)
             .await
@@ -2626,9 +3018,18 @@ E: You don't have enough free space in /var/cache/apt/archives/.
 
         assert_eq!(imported.run.id, "partial-run-id");
         assert_eq!(imported.run.status, "partial_import");
-        assert!(imported.run.comparable);
+        assert!(!imported.run.comparable);
+        assert!(imported
+            .run
+            .comparable_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("run status partial_import"));
         assert_eq!(imported.trials.len(), 1);
-        assert_eq!(imported.trials[0].task_name, "terminal-bench/write-compressor");
+        assert_eq!(
+            imported.trials[0].task_name,
+            "terminal-bench/write-compressor"
+        );
         assert_eq!(imported.trials[0].reward, 1.0);
 
         let persisted_status: String =

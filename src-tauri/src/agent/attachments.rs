@@ -180,7 +180,11 @@ fn has_image_extension(path: &str) -> bool {
     Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|ext| IMAGE_EXTS.iter().any(|known| known.eq_ignore_ascii_case(ext)))
+        .map(|ext| {
+            IMAGE_EXTS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(ext))
+        })
         .unwrap_or(false)
 }
 
@@ -201,11 +205,14 @@ fn read_as_base64(path: &str) -> Option<(String, String)> {
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
-    let ext = Path::new(path).extension().and_then(|e| e.to_str())?.to_lowercase();
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_lowercase();
     let mime = match ext.as_str() {
-        "png"  => "image/png",
+        "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
-        "gif"  => "image/gif",
+        "gif" => "image/gif",
         "webp" => "image/webp",
         _ => return None,
     };
@@ -220,15 +227,11 @@ mod tests {
     fn write_temp_png() -> String {
         // 1×1 transparent PNG, the smallest valid file we can use.
         let bytes: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
-            0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41,
-            0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
-            0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
-            0x42, 0x60, 0x82,
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
         let path = std::env::temp_dir().join(format!(
             "codefactory-test-{}.png",
@@ -253,10 +256,12 @@ mod tests {
 
     #[test]
     fn ignores_missing_file() {
-        let parts = extract_openai_parts(
-            "look ![x](file:///tmp/definitely-does-not-exist-xyz.png)",
+        let parts =
+            extract_openai_parts("look ![x](file:///tmp/definitely-does-not-exist-xyz.png)");
+        assert!(
+            parts.is_empty(),
+            "missing files should leave caller in text mode"
         );
-        assert!(parts.is_empty(), "missing files should leave caller in text mode");
     }
 
     #[test]
@@ -264,11 +269,21 @@ mod tests {
         let path = write_temp_png();
         let msg = format!("here it is:\n\n![scr](file://{})\n\nthoughts?", path);
         let parts = extract_openai_parts(&msg);
-        assert_eq!(parts.len(), 3, "expected text + image + text, got {:?}", parts);
+        assert_eq!(
+            parts.len(),
+            3,
+            "expected text + image + text, got {:?}",
+            parts
+        );
         assert_eq!(parts[0].r#type, "text");
         assert!(parts[0].text.as_ref().unwrap().contains("here it is"));
         assert_eq!(parts[1].r#type, "image_url");
-        assert!(parts[1].image_url.as_ref().unwrap().url.starts_with("data:image/png;base64,"));
+        assert!(parts[1]
+            .image_url
+            .as_ref()
+            .unwrap()
+            .url
+            .starts_with("data:image/png;base64,"));
         assert_eq!(parts[2].r#type, "text");
         assert!(parts[2].text.as_ref().unwrap().contains("thoughts"));
         std::fs::remove_file(&path).ok();
@@ -291,24 +306,18 @@ mod tests {
         // which doesn't open on Windows. We don't actually need a real
         // Windows path here — we're testing the *parse*, the file just
         // won't open (which is fine, ignores_missing_file behaviour).
-        let parsed = find_file_image_links(
-            "look ![s](file:///C:/Users/leo/x.png)",
-        );
+        let parsed = find_file_image_links("look ![s](file:///C:/Users/leo/x.png)");
         assert_eq!(parsed.len(), 1);
         // After unwrap, the leading slash before the drive letter is gone.
         assert_eq!(parsed[0].2, "C:/Users/leo/x.png");
 
         // Two-slash variant (browser-style relative): "file://C:/..." → keep as-is.
-        let parsed = find_file_image_links(
-            "![s](file://C:/Users/leo/y.png)",
-        );
+        let parsed = find_file_image_links("![s](file://C:/Users/leo/y.png)");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].2, "C:/Users/leo/y.png");
 
         // Unix path control: must still get the leading slash back.
-        let parsed = find_file_image_links(
-            "![s](file:///var/x.png)",
-        );
+        let parsed = find_file_image_links("![s](file:///var/x.png)");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].2, "/var/x.png");
     }

@@ -70,21 +70,19 @@ async fn build_preferences_section(pool: &SqlitePool, cwd: &str) -> Option<Strin
     // Two-tier resolution: global defaults + per-project overrides.
     // Project wins on key conflicts so users can override globals locally
     // (e.g. "I want TDD everywhere, but in this experimental repo I don't").
-    let global: Vec<(String, String)> = sqlx::query_as(
-        "SELECT key, value FROM user_preferences WHERE cwd = ? ORDER BY key",
-    )
-    .bind(GLOBAL_CWD)
-    .fetch_all(pool)
-    .await
-    .ok()?;
+    let global: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, value FROM user_preferences WHERE cwd = ? ORDER BY key")
+            .bind(GLOBAL_CWD)
+            .fetch_all(pool)
+            .await
+            .ok()?;
 
-    let project: Vec<(String, String)> = sqlx::query_as(
-        "SELECT key, value FROM user_preferences WHERE cwd = ? ORDER BY key",
-    )
-    .bind(cwd)
-    .fetch_all(pool)
-    .await
-    .ok()?;
+    let project: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, value FROM user_preferences WHERE cwd = ? ORDER BY key")
+            .bind(cwd)
+            .fetch_all(pool)
+            .await
+            .ok()?;
 
     // Merge: start with global, override with project entries.
     let mut merged: HashMap<String, String> = HashMap::new();
@@ -145,7 +143,10 @@ fn build_memory_section(cwd: &str) -> Option<String> {
     } else {
         trimmed.to_string()
     };
-    Some(format!("### Project memory (.codefactory/memory.md)\n{}", snippet))
+    Some(format!(
+        "### Project memory (.codefactory/memory.md)\n{}",
+        snippet
+    ))
 }
 
 #[cfg(test)]
@@ -165,7 +166,9 @@ mod tests {
                 PRIMARY KEY (cwd, key)
             )",
         )
-        .execute(&pool).await.unwrap();
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "CREATE TABLE learning_events (
                 id TEXT PRIMARY KEY, session_id TEXT, cwd TEXT,
@@ -173,7 +176,9 @@ mod tests {
                 created_at TEXT, decided_at TEXT
             )",
         )
-        .execute(&pool).await.unwrap();
+        .execute(&pool)
+        .await
+        .unwrap();
         pool
     }
 
@@ -193,7 +198,10 @@ mod tests {
         )
         .execute(&pool).await.unwrap();
         let s = build(&pool, "/proj").await;
-        assert!(s.contains("### Preferences"), "expected preferences section, got: {s}");
+        assert!(
+            s.contains("### Preferences"),
+            "expected preferences section, got: {s}"
+        );
         assert!(s.contains("- autonomy_level: high"));
     }
 
@@ -203,7 +211,9 @@ mod tests {
         sqlx::query(
             "INSERT INTO user_preferences VALUES ('/proj','code_style','','default','2026-01-01')",
         )
-        .execute(&pool).await.unwrap();
+        .execute(&pool)
+        .await
+        .unwrap();
         let s = build(&pool, "/proj").await;
         assert_eq!(s, "", "empty values should produce no preferences section");
     }
@@ -218,15 +228,23 @@ mod tests {
              ('_global_','autonomy_level','low','user','2026-01-01'), \
              ('/proj','communication_style','verbose','user','2026-01-02')",
         )
-        .execute(&pool).await.unwrap();
+        .execute(&pool)
+        .await
+        .unwrap();
         let s = build(&pool, "/proj").await;
-        assert!(s.contains("communication_style: verbose"),
-            "project should override global, got: {s}");
-        assert!(!s.contains("communication_style: concise"),
-            "global must not leak through, got: {s}");
+        assert!(
+            s.contains("communication_style: verbose"),
+            "project should override global, got: {s}"
+        );
+        assert!(
+            !s.contains("communication_style: concise"),
+            "global must not leak through, got: {s}"
+        );
         // Non-conflicting global still appears
-        assert!(s.contains("autonomy_level: low"),
-            "non-conflicting global must inherit, got: {s}");
+        assert!(
+            s.contains("autonomy_level: low"),
+            "non-conflicting global must inherit, got: {s}"
+        );
     }
 
     #[tokio::test]
@@ -236,7 +254,9 @@ mod tests {
             "INSERT INTO user_preferences VALUES \
              ('_global_','testing_habit','tdd','user','2026-01-01')",
         )
-        .execute(&pool).await.unwrap();
+        .execute(&pool)
+        .await
+        .unwrap();
         let s = build(&pool, "/proj").await;
         assert!(s.contains("testing_habit: tdd"));
     }
@@ -246,14 +266,21 @@ mod tests {
         let pool = fresh_pool().await;
         for (id, status, sug) in [
             ("a", "accepted", "always add empty-array test"),
-            ("b", "pending",  "ignore me"),
+            ("b", "pending", "ignore me"),
             ("c", "rejected", "ignore me too"),
         ] {
             sqlx::query("INSERT INTO learning_events VALUES (?,?,?,?,?,?,?,?)")
-                .bind(id).bind("s1").bind("/proj")
-                .bind("obs").bind(sug).bind(status)
-                .bind("2026-01-01").bind("2026-01-02")
-                .execute(&pool).await.unwrap();
+                .bind(id)
+                .bind("s1")
+                .bind("/proj")
+                .bind("obs")
+                .bind(sug)
+                .bind(status)
+                .bind("2026-01-01")
+                .bind("2026-01-02")
+                .execute(&pool)
+                .await
+                .unwrap();
         }
         let s = build(&pool, "/proj").await;
         assert!(s.contains("always add empty-array test"));
@@ -268,11 +295,17 @@ mod tests {
         )
         .execute(&pool).await.unwrap();
         let s = build_prefs_and_learnings(&pool, "/proj").await;
-        assert!(s.contains("### Preferences"), "expected preferences, got: {s}");
+        assert!(
+            s.contains("### Preferences"),
+            "expected preferences, got: {s}"
+        );
         assert!(s.contains("- autonomy_level: high"));
         // The chat variant must never carry the memory section (it's injected
         // separately by build_system_prompt_for and would otherwise duplicate).
-        assert!(!s.contains("Project memory"), "memory must be excluded, got: {s}");
+        assert!(
+            !s.contains("Project memory"),
+            "memory must be excluded, got: {s}"
+        );
     }
 
     #[tokio::test]

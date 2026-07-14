@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+use codefactory_agent_core::effective_command_timeout_sec;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::process::Stdio;
@@ -14,7 +15,8 @@ use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
 const OUTPUT_LIMIT: usize = 30_000;
-const TIMEOUT_SECS: u64 = 120;
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const MAX_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Deserialize)]
 struct Args {
@@ -32,7 +34,7 @@ pub fn definition() -> ToolDefinition {
         function: FunctionDefinition {
             name: "bash".into(),
             description:
-                "Run a shell command in the project directory. Returns stdout+stderr. Timeout 120s."
+                "Run a shell command in the project directory. Returns stdout+stderr. Timeout 120s, or up to 300s for builds and dependency installation."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -77,11 +79,13 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         .stderr(Stdio::piped());
     command_env::apply_developer_path(&mut cmd);
 
-    let result = timeout(Duration::from_secs(TIMEOUT_SECS), cmd.output()).await;
+    let timeout_secs =
+        effective_command_timeout_sec(&a.command, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
+    let result = timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
 
     match result {
         Err(_) => Ok(ToolOutput::err(format!(
-            "Command timed out after {TIMEOUT_SECS}s"
+            "Command timed out after {timeout_secs}s"
         ))),
         Ok(Err(e)) => Ok(ToolOutput::err(format!(
             "Failed to spawn shell '{}': {e}. PATH={}",
