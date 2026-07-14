@@ -34,6 +34,9 @@
 | CF-TB-R17 | 明确要求的项目测试是完成条件 | 当原始需求明确要求 repository/project tests 时，只有最后源码修改、安装和外部运行之后的成功项目测试才能解锁完成；测试运行器缺失、失败测试或被管道掩盖的零退出均不得进入 finalization | agent core + desktop loop + sidecar | completion-evidence tests + real App + canary |
 | CF-TB-R18 | 长输出保留可诊断头尾并压缩上下文 | Headless 对编译、安装和测试输出保留命令开头证据与结果/错误尾部，中段压缩；模型上下文达到预算后保留 contract、原始任务和最近完整工具轮次，避免长日志反复进入 provider 请求 | headless sidecar | truncation/compaction tests + usage delta |
 | CF-TB-R19 | 确定性改进必须先交付再继续调分 | 每个已通过独立测试的通用能力切片必须先完成真实 App 验证、PR/CI、合并和适用版本发布，再用该发布版本复评；不得连续堆积多轮本地评分改动后才发布，也不得把“位于主产品源码”称为“已产品化” | delivery loop + release ledger + evidence | PR/CI/release URL + installed build SHA/version + released-build rerun |
+| CF-TB-R20 | 复合命令中的源码修改不能因后续阶段失败而丢失 | 只要已获准的工具调用包含明确源码/文件修改，后续 build、install、runtime 任一阶段失败时仍记录最后源码修改 sequence，并使旧安装、运行和测试证据失效；纯依赖安装和被 policy 拒绝的命令不得误记为源码修改 | agent core + desktop loop + sidecar | failure-first completion-evidence tests + real App mixed-command task |
+| CF-TB-R21 | 昂贵重建前完成别名感知兼容扫描 | 源码兼容任务必须从仓库推导全部本地 import alias，覆盖构建配置观察到的源码/生成/编译输入扩展，批量完成修改并以 clean residual scan 结束；存在残留扫描 blocker 时只允许仓库级 alias discovery、纠正性修改和最终 clean scan，不得进入下一次 build/install，避免部分扫描后反复重建耗尽预算 | shared contract + agent core + desktop loop + sidecar | budget-policy tests + real App compatibility task + released-build source canary |
+| CF-TB-R22 | 中文源码交付要求启用同一完成门禁 | CodeFactory 中文主路径中的“兼容/已移除/弃用/源码迁移”“从源码安装/源码构建/编译扩展”“项目测试/测试套件”等表达必须启用与英文任务相同的 compatibility、source delivery 和 project-test gates；不得因任务语言不同降级完成标准 | agent core + desktop loop + sidecar | Chinese instruction gate test + real Chinese App task |
 
 ## Primary User Path
 
@@ -207,6 +210,7 @@ Benchmark bridge 不得用固定布尔值覆盖评测环境能力。它必须继
 5. 写入 `docs/evidence-packs/terminal-bench-21-iteration-*.md`，其中必须包含下一步 improvement queue。
 6. 每轮必须先给 `product_capability_verdict`：`product-capability`、`mixed` 或 `benchmark-only`，再写清楚产品能力影响：`product_capability_impact`、一个非评测场景 `product_example`，以及 `benchmark_only_boundary`。`tools/benchmark/terminal_bench_21_iteration_loop.py` 必须在 CLI 和报告生成层拒绝缺失这些字段；如果某次改动只对跑分 task scaffold 有效，报告必须直接标明，不得包装成 CodeFactory 整体智能化能力的大幅提升。
 7. 本机代理、Docker apt bootstrap、verifier `uv` / PyPI / GitHub 下载、provider bridge transient retry 相关配置必须通过 iteration loop 的正式参数传递，例如 `--provider-proxy`、`--docker-apt-proxy`、`--verifier-proxy` 和 `--provider-bridge-retries`，不得绕开标准 loop 手写一次性 runner 命令；这样 blocker、evidence 和产品化解释才能留在同一条评估链路里。
+8. 确定性通用修复通过独立测试后，先用非 benchmark 的真实 App 任务验证，再走 PR/CI/合并/发布和安装包验证；随后只能用该发布 tag 构建的 headless 复评。复评失败转化为下一轮通用产品缺陷，但不撤销已验证发布事实，也不得把 targeted canary 当作固定 18 题总分。
 
 默认 canary 文件为 `docs/benchmark-subsets/terminal-bench-21-canary-subset-v1.json`，任务为 `write-compressor`、`filter-js-from-html`、`mteb-retrieve`、`count-dataset-tokens`，用于在完整 18 题 regression 前快速验证 agent loop 是否真正改善。canary 只用于开发内循环，不能替代 regression subset 或 full run 作为 release 结论。
 

@@ -46,7 +46,11 @@ Harbor 的有效 Agent wall timeout 由 thin bridge 原样传给 Rust sidecar。
 
 `CompletionGate` 对源码交付维护独立 sequence：最后源码修改、成功 source install、install 后在源码目录外的 runtime/import smoke、项目验证。兼容性扫描必须递归覆盖构建配置引用的 `.py`、`.pyx`、`.pxd`、生成 `.c` 等输入，并通过明确的 `exit 1/0`、`sys.exit` 或 `test ! -s` 契约表达残留命中；正常输出 `PASSED` 或摘要不应被误判为失败。
 
-当原始需求明确要求项目测试时，`CompletionGate` 额外记录最后一次成功项目测试，并要求其 sequence 晚于最后源码修改、安装和外部运行。源码兼容迁移还必须从源码 import 语句推导本地 alias，扫描与替换使用 token boundary 和幂等规则，避免只覆盖常见别名或产生二次替换。
+当原始需求明确要求项目测试时，`CompletionGate` 额外记录最后一次成功项目测试，并要求其 sequence 晚于最后源码修改、安装和外部运行。已获准的复合工具调用只要包含明确文件修改，即使后续 build/install/runtime 失败，也必须推进最后源码修改 sequence 并使旧交付证据失效；纯依赖安装或 policy deny 不得误记为修改。
+
+源码兼容迁移必须在首次昂贵 build/install 前从仓库 import 语句推导全部本地 alias，覆盖构建配置已观察到的源码、生成和编译输入扩展。扫描与替换使用 token boundary 和幂等规则，相关修改应批量完成；最后一次修改后的 clean residual scan 是下一次 build/install 的前置门禁，避免只覆盖常见别名、产生二次替换或在部分扫描后反复重建。门禁激活后仍允许仓库级 alias discovery、纠正性源码修改和带干净退出契约的最终 residual scan，使 Agent 能从不完整别名盘点中恢复；其他探索及 build/install 继续拒绝。
+
+`CompletionGate::new_for_instruction` 的任务意图识别覆盖产品支持的中英文表达。中文“兼容/已移除/弃用/迁移”“从源码安装/源码构建/编译扩展”“项目测试/测试套件”必须映射到与英文 `compatibility`、`install from source`、`project tests` 相同的 gate，任务语言不得改变完成证据强度。
 
 Headless 工具输出进入模型前采用 bounded head/tail compaction：保留命令/阶段开头与错误或成功尾部，压缩中间编译日志；总上下文达到预算时保留共享 contract、原始任务和最近完整 tool round。完整 stdout/stderr 仍留在 trajectory 作为审计证据，不以缩短模型上下文为由删除运行证据。
 

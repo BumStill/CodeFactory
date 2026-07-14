@@ -17,9 +17,12 @@ shared by the desktop Agent and headless evaluation runtime.
    stages apply. Enumerate the actual build inputs from manifests and build
    configuration, including generated or compiled source inputs, and apply a
    compatibility fix across that complete input set. Derive local import aliases
-   from the source instead of assuming one canonical module name, and use
-   token-safe, idempotent replacements. Rerun the same compatibility
-   scan after editing; build or import success is insufficient while unresolved matches remain.
+   from the source before the first expensive build or installation instead of
+   assuming one canonical module name. Scan every alias across every observed
+   source and build-input extension, then batch token-safe, idempotent edits.
+   Rerun the same compatibility scan after editing and before rebuilding or
+   installing; do not rebuild after only a partial alias scan. Build or import
+   success is insufficient while unresolved matches remain.
    Map every explicitly named
    required component to an executed functional check through its public API.
    Importing or locating a compiled extension, plugin, or native library is not a functional check.
