@@ -99,13 +99,17 @@ fn guess_context_from_name(model_id: &str) -> Option<u32> {
 
     // Google Gemini — 1M+ for Pro, 1M for Flash
     if id.contains("gemini") {
-        if id.contains("pro") { return Some(2_000_000); }
+        if id.contains("pro") {
+            return Some(2_000_000);
+        }
         return Some(1_000_000);
     }
 
     // DeepSeek family
     if id.starts_with("deepseek") {
-        if id.contains("v4") { return Some(131_072); }
+        if id.contains("v4") {
+            return Some(131_072);
+        }
         if id.contains("v3") || id.contains("chat") || id.contains("reasoner") {
             return Some(65_536);
         }
@@ -236,7 +240,8 @@ pub fn compress_if_needed(
                 if est >= MIN_ELIDE_TOKENS {
                     let bytes = original.len();
                     let preview: String = original.chars().take(120).collect();
-                    let replacement = format!(
+                    let replacement =
+                        format!(
                         "[elided to fit context window — {} bytes / ~{} tokens]\n\nPreview:\n{}{}",
                         bytes,
                         est,

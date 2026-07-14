@@ -6,6 +6,10 @@ authors = []
 edition = "2021"
 license = "Apache-2.0"
 
+[workspace]
+members = [".", "crates/agent-core", "crates/agent-headless"]
+resolver = "2"
+
 [lib]
 name = "codefactory_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -60,6 +64,7 @@ sha2     = "0.10"          # PKCE S256 challenge for Codex/ChatGPT OAuth
 getrandom = "0.2"          # PKCE verifier + CSRF state randomness (lighter than rand)
 tracing  = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+codefactory-agent-core = { path = "crates/agent-core" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

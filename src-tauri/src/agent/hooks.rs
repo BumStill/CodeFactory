@@ -128,8 +128,10 @@ impl HookRunner {
     ) -> bool {
         match &config.action {
             HookAction::LogToFile { path } => {
-                let line =
-                    format!("{}\n", serde_json::to_string(event_json).unwrap_or_default());
+                let line = format!(
+                    "{}\n",
+                    serde_json::to_string(event_json).unwrap_or_default()
+                );
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -142,7 +144,8 @@ impl HookRunner {
 
             HookAction::RunCommand { command, cwd } => {
                 let is_pre_tool = matches!(event, HookEvent::PreTool { .. });
-                let result = std::process::Command::new("powershell").no_window()
+                let result = std::process::Command::new("powershell")
+                    .no_window()
                     .args(["-NonInteractive", "-Command", command])
                     .current_dir(cwd.as_deref().unwrap_or("."))
                     .output();
@@ -161,9 +164,7 @@ impl HookRunner {
             }
 
             HookAction::EmitEvent { event_name } => {
-                self.app_handle
-                    .emit(event_name, event_json.clone())
-                    .ok();
+                self.app_handle.emit(event_name, event_json.clone()).ok();
                 false
             }
 
@@ -177,7 +178,8 @@ impl HookRunner {
                         .replace("{task_title}", summary)
                         .replace("{task_id}", task_id)
                         .replace("{req_id}", task_id);
-                    let _ = std::process::Command::new("powershell").no_window()
+                    let _ = std::process::Command::new("powershell")
+                        .no_window()
                         .args([
                             "-NonInteractive",
                             "-Command",

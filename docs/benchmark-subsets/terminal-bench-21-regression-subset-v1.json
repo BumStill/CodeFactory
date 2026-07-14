@@ -18,6 +18,7 @@
   "tasks": [
     {
       "name": "write-compressor",
+      "agent_timeout_sec": 900,
       "baseline_reward": 1,
       "baseline_failure_class": null,
       "bucket": "passed-smoke",
@@ -25,6 +26,7 @@
     },
     {
       "name": "extract-elf",
+      "agent_timeout_sec": 900,
       "baseline_reward": 1,
       "baseline_failure_class": null,
       "bucket": "passed-smoke",
@@ -32,6 +34,7 @@
     },
     {
       "name": "filter-js-from-html",
+      "agent_timeout_sec": 1800,
       "baseline_reward": 1,
       "baseline_failure_class": null,
       "bucket": "passed-smoke",
@@ -39,6 +42,7 @@
     },
     {
       "name": "nginx-request-logging",
+      "agent_timeout_sec": 900,
       "baseline_reward": 1,
       "baseline_failure_class": null,
       "bucket": "passed-smoke",
@@ -46,6 +50,7 @@
     },
     {
       "name": "circuit-fibsqrt",
+      "agent_timeout_sec": 3600,
       "baseline_reward": 0,
       "baseline_failure_class": "verification",
       "bucket": "verifier-zero",
@@ -53,6 +58,7 @@
     },
     {
       "name": "configure-git-webserver",
+      "agent_timeout_sec": 900,
       "baseline_reward": 0,
       "baseline_failure_class": "verification",
       "bucket": "verifier-zero",
@@ -60,6 +66,7 @@
     },
     {
       "name": "mteb-retrieve",
+      "agent_timeout_sec": 1800,
       "baseline_reward": 0,
       "baseline_failure_class": "verification",
       "bucket": "verifier-zero",
@@ -67,6 +74,7 @@
     },
     {
       "name": "sanitize-git-repo",
+      "agent_timeout_sec": 900,
       "baseline_reward": 0,
       "baseline_failure_class": "verification",
       "bucket": "verifier-zero",
@@ -74,6 +82,7 @@
     },
     {
       "name": "query-optimize",
+      "agent_timeout_sec": 900,
       "baseline_reward": 0,
       "baseline_failure_class": "verification",
       "bucket": "verifier-timeout",
@@ -81,6 +90,7 @@
     },
     {
       "name": "count-dataset-tokens",
+      "agent_timeout_sec": 900,
       "baseline_reward": 0,
       "baseline_failure_class": "tool-use",
       "bucket": "tool-use",
@@ -88,6 +98,7 @@
     },
     {
       "name": "install-windows-3.11",
+      "agent_timeout_sec": 3600,
       "baseline_reward": 0,
       "baseline_failure_class": "tool-use",
       "bucket": "tool-use",
@@ -95,6 +106,7 @@
     },
     {
       "name": "protein-assembly",
+      "agent_timeout_sec": 1800,
       "baseline_reward": 0,
       "baseline_failure_class": "tool-use",
       "bucket": "tool-use",
@@ -102,6 +114,7 @@
     },
     {
       "name": "build-cython-ext",
+      "agent_timeout_sec": 900,
       "baseline_reward": 0,
       "baseline_failure_class": "long-horizon",
       "bucket": "command-timeout",
@@ -109,6 +122,7 @@
     },
     {
       "name": "kv-store-grpc",
+      "agent_timeout_sec": 900,
       "baseline_reward": 0,
       "baseline_failure_class": "long-horizon",
       "bucket": "command-timeout",
@@ -116,6 +130,7 @@
     },
     {
       "name": "sparql-university",
+      "agent_timeout_sec": 900,
       "baseline_reward": 0,
       "baseline_failure_class": "long-horizon",
       "bucket": "command-timeout",
@@ -123,6 +138,7 @@
     },
     {
       "name": "torch-tensor-parallelism",
+      "agent_timeout_sec": 900,
       "baseline_reward": 0,
       "baseline_failure_class": "long-horizon",
       "bucket": "command-timeout",
@@ -130,6 +146,7 @@
     },
     {
       "name": "caffe-cifar-10",
+      "agent_timeout_sec": 3600,
       "baseline_reward": 0,
       "baseline_failure_class": "environment",
       "bucket": "docker-resource",
@@ -137,6 +154,7 @@
     },
     {
       "name": "qemu-startup",
+      "agent_timeout_sec": 900,
       "baseline_reward": 0,
       "baseline_failure_class": "environment",
       "bucket": "harbor-tests-upload",

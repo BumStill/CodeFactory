@@ -68,8 +68,7 @@ mod tests {
         b.feed(b"ct-Object\"}}]}\n");
         let line = b.take_line().expect("line should be complete now");
         assert_eq!(
-            line,
-            r#"data: {"choices":[{"delta":{"content":"Select-Object"}}]}"#,
+            line, r#"data: {"choices":[{"delta":{"content":"Select-Object"}}]}"#,
             "the bash command 'Select-Object' must survive the split — \
              before the fix it would arrive truncated as 'Sele' or 'Select-Obj'"
         );

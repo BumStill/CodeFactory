@@ -22,7 +22,7 @@ CodeFactory UI / CLI
 | 模块 | 职责 | v1 数据来源 |
 | --- | --- | --- |
 | Benchmark Registry | 固化 benchmark 名称、版本、官方命令、约束和证据要求 | 本地 profile + 官方链接 |
-| Harbor Environment Probe | 检查 `harbor`、Docker、provider key、磁盘空间和网络 | shell command + config |
+| Harbor Environment Probe | 检查 `harbor`、Docker、provider key、磁盘空间和网络；将 Harbor 的有效 network policy 注入共享 Agent core | shell command + config |
 | Harbor Runner | 生成 job config，执行 smoke/subset/full run，记录 stdout/stderr | `harbor run` |
 | CodeFactory Agent Adapter | 让 Harbor 以自定义 agent 方式调用 CodeFactory | Python adapter + headless CodeFactory runner |
 | Benchmark Policy | 在 sandbox 内自动允许合理文件/命令操作，同时保留 hard deny | settings + tool permission engine |
@@ -34,11 +34,33 @@ CodeFactory UI / CLI
 
 ## Agent 接入方式
 
+### 评测完整性与共享执行契约
+
+`codefactory-headless` 必须和桌面主产品共享 `agent_contracts/execution_completion.md`，并由同一个 Rust `codefactory-agent-core` 执行 policy、tool outcome 分类和 completion gate，至少统一以下完成语义：
+
+- 源码构建任务必须完成 build、install、离开源码目录的 runtime/import smoke、项目测试四段证据。
+- 后台服务任务必须记录 PID、日志、bounded readiness 和真实 client/functional probe。
+- 最终回复前必须存在晚于最后一次实现修改的成功验证；失败必须继续迭代或形成明确 blocker。
+
+Harbor 的有效 Agent wall timeout 由 thin bridge 原样传给 Rust sidecar。sidecar 以单一 `Instant` 计算剩余时间：进入总预算后 2/3 区间即持续提示收敛，进入最后 1/3 后 completion budget 拒绝新的范围扩张，最后 30 秒不再启动模型或工具调用而用于写出结构化 `Finished`。模型 transport 的有限重试共享同一个总 deadline，单次工具 timeout 也被剩余墙钟预算裁剪，避免各层 timeout 相加后由 Harbor 强杀而丢失结果与 usage。
+
+`CompletionGate` 对源码交付维护独立 sequence：最后源码修改、成功 source install、install 后在源码目录外的 runtime/import smoke、项目验证。兼容性扫描必须递归覆盖构建配置引用的 `.py`、`.pyx`、`.pxd`、生成 `.c` 等输入，并通过明确的 `exit 1/0`、`sys.exit` 或 `test ! -s` 契约表达残留命中；正常输出 `PASSED` 或摘要不应被误判为失败。
+
+当原始需求明确要求项目测试时，`CompletionGate` 额外记录最后一次成功项目测试，并要求其 sequence 晚于最后源码修改、安装和外部运行。源码兼容迁移还必须从源码 import 语句推导本地 alias，扫描与替换使用 token boundary 和幂等规则，避免只覆盖常见别名或产生二次替换。
+
+Headless 工具输出进入模型前采用 bounded head/tail compaction：保留命令/阶段开头与错误或成功尾部，压缩中间编译日志；总上下文达到预算时保留共享 contract、原始任务和最近完整 tool round。完整 stdout/stderr 仍留在 trajectory 作为审计证据，不以缩短模型上下文为由删除运行证据。
+
+adapter 可以按通用能力类型维护状态，但不得按 benchmark task name、固定 repo、固定 artifact、领域答案、instruction fingerprint 或成功 marker 选择专用脚本。adapter 也不得读取 `/tests`、verifier 文件或 solution。每个 run 必须记录共享 contract SHA-256 和 contamination scan 结果；缺失任一项时 `evaluation_axis=codefactory-agent-capability` 无效。
+
+运行拓扑固定为 `Desktop AgentLoop -> codefactory-agent-core` 与 `Harbor -> thin Python bridge -> codefactory-agent-headless -> codefactory-agent-core`。Python 只负责把 JSONL `ToolRequest` 转发给 Harbor `BaseEnvironment.exec` 并回传结构化 `ToolResult`，不得包含模型调用、prompt、policy、任务分类或 repair。单次 trial 不允许在 Rust sidecar 失败后静默退回旧 Python solver。
+
+桌面端和 headless 允许有不同外围适配器，但结束判定必须来自同一 `CompletionGate`：桌面纯只读请求可以正常结束；一旦发生 mutation、失败命令或后台服务启动，则必须有更新的成功验证。headless coding run 额外要求至少发生一次真实工具行动，避免空回答被误判完成。
+
 ### v1: External Agent Adapter
 
 优先实现 Harbor `BaseAgent` adapter。它通过 Harbor `BaseEnvironment.exec` 与任务容器交互，调用 CodeFactory headless runner 决策下一步命令和文件操作。
 
-当前 adapter 是 `codefactory_bench.agent:CodeFactoryAgent`。历史第一步跑通的是 no-model baseline；当前实现已增加 model-backed headless loop：仅从显式 `CODEFACTORY_BENCH_*` 读取模型配置，通过 OpenAI-compatible chat-completions 生成 `run_shell` tool call，经 `benchmark-sandbox` command gate 后用 Harbor `BaseEnvironment.exec` 在 task container 内执行，并写出 trajectory。
+当前 adapter 是 `codefactory_bench.agent:CodeFactoryAgent`。它仅从显式 `CODEFACTORY_BENCH_*` 接收启动配置，启动 `codefactory-agent-headless`，并把 sidecar 的 `run_shell` 请求交给 Harbor task container 执行；模型 transport、prompt、benchmark policy 和 completion gate 均位于共享 Rust runtime。no-model baseline 只保留为基础设施诊断，不计 agent 能力分。
 
 产品侧新增 provider bridge，解决“本地 CodeFactory 已配置 DeepSeek，但 benchmark adapter 不能隐式读取桌面设置”的边界：
 

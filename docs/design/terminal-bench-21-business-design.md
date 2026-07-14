@@ -38,6 +38,7 @@ CodeFactory 的定位需要从“本地 AI 编程工作台”升级为：
 | CF-TB-B4 | 失败能转成产品改进队列 | 每个失败 trial 归类到 tool/runtime/planning/context/verification/policy/environment 等原因 |
 | CF-TB-B5 | 每次产品改进可回归验证 | 关键 PR 能选定 subset 或 smoke suite，对比改动前后 reward、error、cost、latency |
 | CF-TB-B6 | 防 benchmark contamination | 不把 Terminal-Bench 任务数据写进训练语料、长期 memory、默认 prompt 或产品示例 |
+| CF-TB-B7 | 分数必须衡量产品能力 | adapter 通过污染扫描，禁止按 task、repo、artifact、领域答案或 instruction fingerprint 注入专用 hint/repair；主产品与 headless 使用同一执行完成契约 |
 
 ## 产品原则
 
@@ -47,6 +48,9 @@ CodeFactory 的定位需要从“本地 AI 编程工作台”升级为：
 4. **官方约束不可绕开。** 不能修改 Terminal-Bench 2.1 的 timeouts/resources；不能把 benchmark canary 或任务内容纳入训练/记忆。
 5. **真实运行证据优先。** 本地单元测试、UI 页面或配置存在都不能替代 Harbor job artifact 和 verifier reward。
 6. **评估主体必须明确。** Terminal-Bench 评的是 agent system；`CodeFactory agent using DeepSeek` 是 CodeFactory agent 的一次运行配置，不是 DeepSeek 本身的 benchmark 结果。
+7. **被专用修复污染的分数无效。** 如果 adapter 读取 hidden verifier、按固定题指纹分支，或内置某题答案/脚本，该 run 只能标记为 `benchmark-contaminated diagnostic`，不得进入产品能力基线、发布门禁或对外水平判断。
+8. **能力必须在真实产品路径复用。** 例如“修改后重新验证”和“服务启动后做 bounded readiness/client probe”必须同时改善桌面 CodeFactory 的普通开发任务；仅在 Harbor adapter 中出现的行为不计产品提升。
+9. **确定性改进必须先交付。** 通用能力切片通过独立回归后，先完成真实 App、PR/CI、合并和适用发布，再开始下一轮评分优化；位于主产品源码但尚未发布的改动仍是 `not live`。
 
 ## 系统化评估矩阵
 

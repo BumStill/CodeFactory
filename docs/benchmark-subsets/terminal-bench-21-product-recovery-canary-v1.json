@@ -1,0 +1,61 @@
+{
+  "id": "terminal-bench-21-product-recovery-canary-v1",
+  "dataset": "terminal-bench/terminal-bench-2-1",
+  "dataset_ref": "sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a",
+  "source_subset": "terminal-bench-21-regression-subset-v1",
+  "evaluation_axis": "codefactory-agent-capability",
+  "evaluation_subject": "codefactory-headless",
+  "model_backend": "deepseek-v4-pro",
+  "created_at": "2026-07-13",
+  "selection_policy": "Six-task recovery canary covering retained passes plus general network-policy inheritance, source builds, background service readiness, nullable tool failures, and post-mutation verification before the fixed 18-task release-gate run.",
+  "tasks": [
+    {
+      "name": "extract-elf",
+      "agent_timeout_sec": 900,
+      "baseline_reward": 1,
+      "baseline_failure_class": null,
+      "bucket": "retained-pass",
+      "reason": "Retained artifact-inspection pass and post-mutation verification guard."
+    },
+    {
+      "name": "filter-js-from-html",
+      "agent_timeout_sec": 1800,
+      "baseline_reward": 1,
+      "baseline_failure_class": null,
+      "bucket": "retained-pass",
+      "reason": "Retained transformation pass and completion-integrity guard."
+    },
+    {
+      "name": "kv-store-grpc",
+      "agent_timeout_sec": 900,
+      "baseline_reward": 0,
+      "baseline_failure_class": "long-horizon",
+      "bucket": "network-service",
+      "reason": "Exercises environment network-policy inheritance, dependency installation, service startup, and functional readiness."
+    },
+    {
+      "name": "build-cython-ext",
+      "agent_timeout_sec": 900,
+      "baseline_reward": 0,
+      "baseline_failure_class": "long-horizon",
+      "bucket": "source-build",
+      "reason": "Exercises ordinary dependency retrieval, source build, installation, and runtime verification."
+    },
+    {
+      "name": "nginx-request-logging",
+      "agent_timeout_sec": 900,
+      "baseline_reward": 0,
+      "baseline_failure_class": "verification",
+      "bucket": "background-service",
+      "reason": "Exercises configuration mutation, background process lifecycle, bounded readiness, and client verification."
+    },
+    {
+      "name": "mteb-retrieve",
+      "agent_timeout_sec": 1800,
+      "baseline_reward": 0,
+      "baseline_failure_class": "infrastructure",
+      "bucket": "tool-failure-protocol",
+      "reason": "Exercises timeout results without exit codes and continued model-led diagnosis."
+    }
+  ]
+}

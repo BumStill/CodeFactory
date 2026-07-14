@@ -115,10 +115,7 @@ pub async fn stream_anthropic(
 
             match event_type.as_str() {
                 "content_block_start" => {
-                    let idx = event
-                        .get("index")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as usize;
+                    let idx = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     current_block_idx = idx;
 
                     let block_type = event
@@ -158,7 +155,12 @@ pub async fn stream_anthropic(
                                 .to_string();
                             if !text.is_empty() {
                                 app_handle
-                                    .emit(event_name, StreamEvent::TextDelta { content: text.clone() })
+                                    .emit(
+                                        event_name,
+                                        StreamEvent::TextDelta {
+                                            content: text.clone(),
+                                        },
+                                    )
                                     .ok();
                                 text_buf.push_str(&text);
                             }
@@ -197,13 +199,19 @@ pub async fn stream_anthropic(
                 }
                 "message_start" => {
                     // {"type":"message_start","message":{"usage":{"input_tokens":N,...}}}
-                    if let Some(u) = event.pointer("/message/usage/input_tokens").and_then(|v| v.as_i64()) {
+                    if let Some(u) = event
+                        .pointer("/message/usage/input_tokens")
+                        .and_then(|v| v.as_i64())
+                    {
                         input_tokens = u;
                     }
                 }
                 "message_delta" => {
                     // {"type":"message_delta","usage":{"output_tokens":N}}
-                    if let Some(u) = event.pointer("/usage/output_tokens").and_then(|v| v.as_i64()) {
+                    if let Some(u) = event
+                        .pointer("/usage/output_tokens")
+                        .and_then(|v| v.as_i64())
+                    {
                         output_tokens = u;
                     }
                 }

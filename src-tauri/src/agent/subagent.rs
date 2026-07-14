@@ -26,8 +26,8 @@ use crate::agent::{AgentExecutionContext, AgentLoop};
 use crate::config::settings::{ApiStyle, Settings};
 use crate::errors::{AppError, Result};
 use crate::mcp::McpManager;
-use crate::storage::Message;
 use crate::storage::tasks::TaskConnectorContext;
+use crate::storage::Message;
 use crate::PendingPermissionMap;
 
 /// Brief handed to a subagent. The brief MUST be self-contained — the
@@ -218,7 +218,8 @@ pub async fn run_subagent(
         Err(_) => {
             tracing::warn!(
                 "subagent task '{}' hit {}s wall-clock cap; aborting",
-                brief.title, PER_TASK_TIMEOUT_SECS
+                brief.title,
+                PER_TASK_TIMEOUT_SECS
             );
             return Err(AppError::Other(format!(
                 "Task exceeded {}s execution cap and was aborted to prevent drift",
@@ -454,15 +455,16 @@ pub(crate) async fn run_acceptance_check(
     // Send as-is; post_chat_completions reactively switches to
     // max_completion_tokens only if the server rejects max_tokens (no-op for the
     // Anthropic shape above, and for endpoints happy with the legacy fields).
-    let response = match crate::http_util::post_chat_completions(&client, &url, api_key, &mut body).await {
-        Ok(r) => r,
-        Err(e) => {
-            return AcceptanceCheck {
-                passed: false,
-                reason: format!("HTTP error during acceptance check: {e}"),
-            };
-        }
-    };
+    let response =
+        match crate::http_util::post_chat_completions(&client, &url, api_key, &mut body).await {
+            Ok(r) => r,
+            Err(e) => {
+                return AcceptanceCheck {
+                    passed: false,
+                    reason: format!("HTTP error during acceptance check: {e}"),
+                };
+            }
+        };
 
     let raw_json: serde_json::Value = match response.json().await {
         Ok(v) => v,
@@ -501,7 +503,10 @@ pub(crate) async fn run_acceptance_check(
         }
         Err(_) => AcceptanceCheck {
             passed: false,
-            reason: format!("Could not parse acceptance-check JSON: {}", truncate(clean, 200)),
+            reason: format!(
+                "Could not parse acceptance-check JSON: {}",
+                truncate(clean, 200)
+            ),
         },
     }
 }

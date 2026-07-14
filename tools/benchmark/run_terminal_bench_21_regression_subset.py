@@ -20,9 +20,9 @@ SUBSET_PATH = REPO_ROOT / "docs/benchmark-subsets/terminal-bench-21-regression-s
 EVIDENCE_DIR = REPO_ROOT / "docs/evidence-packs"
 LOOPBACK_NO_PROXY = "localhost,127.0.0.1,127.0.0.0/8,::1,0.0.0.0"
 TEST_NAME = "benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_from_local_settings"
-DEFAULT_TRIAL_HARD_TIMEOUT_SEC = 1200
-DEFAULT_HEAVY_VERIFIER_HARD_TIMEOUT_SEC = 2400
-DEFAULT_HEAVY_VERIFIER_TIMEOUT_MULTIPLIER = 3.0
+DEFAULT_TRIAL_HARD_TIMEOUT_SEC = 0
+DEFAULT_HEAVY_VERIFIER_HARD_TIMEOUT_SEC = 0
+DEFAULT_HEAVY_VERIFIER_TIMEOUT_MULTIPLIER = 1.0
 HEAVY_VERIFIER_TRIAL_PREFIXES = ("torch-tensor-parallelism",)
 BOOTSTRAP_SMOKE_IMAGES = [
     ("debian-bookworm", "python:3.10-slim-bookworm"),
@@ -243,6 +243,14 @@ def comparable_label(args: argparse.Namespace, interventions: list[WatchdogInter
         return "no"
     if getattr(args, "trial_hard_timeout_sec", 0):
         return "no"
+    if float(getattr(args, "heavy_verifier_timeout_multiplier", 0) or 0) > 1:
+        return "no"
+    if getattr(args, "verifier_uv_http_timeout_sec", None):
+        return "no"
+    if getattr(args, "verifier_uv_torch_backend", None):
+        return "no"
+    if getattr(args, "verifier_proxy", None):
+        return "no"
     if interventions:
         return "no"
     return "yes"
@@ -295,6 +303,14 @@ def comparability_notes(
         notes.append("explicit Harbor storage override was used")
     if getattr(args, "trial_hard_timeout_sec", 0):
         notes.append("runner-level trial hard timeout watchdog was enabled")
+    if float(getattr(args, "heavy_verifier_timeout_multiplier", 0) or 0) > 1:
+        notes.append("Harbor verifier timeout multiplier was modified")
+    if (
+        getattr(args, "verifier_uv_http_timeout_sec", None)
+        or getattr(args, "verifier_uv_torch_backend", None)
+        or getattr(args, "verifier_proxy", None)
+    ):
+        notes.append("Harbor verifier runtime environment was modified")
     if interventions:
         notes.append("watchdog stopped one or more stale trial containers")
     return notes
@@ -314,6 +330,8 @@ def load_subset(path: Path) -> dict:
 def build_env(args: argparse.Namespace, subset: dict) -> dict[str, str]:
     tasks = [str(item["name"]).strip() for item in subset["tasks"]]
     env = os.environ.copy()
+    env.pop("CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC", None)
+    env.pop("CODEFACTORY_BENCH_TASK_AGENT_TIMEOUTS_JSON", None)
     current_pythonpath = env.get("PYTHONPATH")
     env.update(
         {
@@ -329,18 +347,33 @@ def build_env(args: argparse.Namespace, subset: dict) -> dict[str, str]:
             "CODEFACTORY_BENCH_CONCURRENCY": str(args.concurrency),
             "CODEFACTORY_BENCH_MODEL_TIMEOUT_SEC": str(args.model_timeout_sec),
             "CODEFACTORY_BENCH_SHELL_TIMEOUT_SEC": str(args.shell_timeout_sec),
-            "CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC": str(args.agent_wall_timeout_sec),
             "CODEFACTORY_BENCH_SECRET_TIMEOUT_SEC": str(args.secret_timeout_sec),
             "CODEFACTORY_BENCH_JOB_ROOT": str(REPO_ROOT / ".codefactory/benchmark-jobs"),
             "CODEFACTORY_BENCH_ALLOW_PARTIAL_IMPORT": "1",
-            "CODEFACTORY_BENCH_VERIFIER_UV_HTTP_TIMEOUT_SEC": str(
-                args.verifier_uv_http_timeout_sec
-            ),
-            "CODEFACTORY_BENCH_VERIFIER_UV_TORCH_BACKEND": str(
-                args.verifier_uv_torch_backend
-            ),
         }
     )
+    task_agent_timeouts = {
+        str(item["name"]).strip(): int(item["agent_timeout_sec"])
+        for item in subset["tasks"]
+        if isinstance(item.get("agent_timeout_sec"), (int, float))
+        and item["agent_timeout_sec"] > 0
+    }
+    if task_agent_timeouts:
+        env["CODEFACTORY_BENCH_TASK_AGENT_TIMEOUTS_JSON"] = json.dumps(
+            task_agent_timeouts, sort_keys=True, separators=(",", ":")
+        )
+    if args.agent_wall_timeout_sec > 0:
+        env["CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC"] = str(
+            args.agent_wall_timeout_sec
+        )
+    if args.verifier_uv_http_timeout_sec:
+        env["CODEFACTORY_BENCH_VERIFIER_UV_HTTP_TIMEOUT_SEC"] = str(
+            args.verifier_uv_http_timeout_sec
+        )
+    if args.verifier_uv_torch_backend:
+        env["CODEFACTORY_BENCH_VERIFIER_UV_TORCH_BACKEND"] = str(
+            args.verifier_uv_torch_backend
+        )
     verifier_timeout_multiplier = heavy_verifier_timeout_multiplier(args, subset)
     if verifier_timeout_multiplier:
         env["CODEFACTORY_BENCH_VERIFIER_TIMEOUT_MULTIPLIER"] = (
@@ -410,8 +443,8 @@ def safe_plan(
             f"- verifier_proxy: `{args.verifier_proxy or '<none>'}`",
             f"- provider_proxy: `{args.provider_proxy or '<none>'}`",
             f"- provider_bridge_retries: `{args.provider_bridge_retries}`",
-            f"- verifier_uv_http_timeout_sec: `{args.verifier_uv_http_timeout_sec}`",
-            f"- verifier_uv_torch_backend: `{args.verifier_uv_torch_backend}`",
+            f"- verifier_uv_http_timeout_sec: `{args.verifier_uv_http_timeout_sec or '<none>'}`",
+            f"- verifier_uv_torch_backend: `{args.verifier_uv_torch_backend or '<none>'}`",
             "- partial_import_diagnostic: `enabled`",
             f"- job root: `{env['CODEFACTORY_BENCH_JOB_ROOT']}`",
             f"- agent PYTHONPATH root: `{REPO_ROOT}`",
@@ -793,7 +826,7 @@ def write_preflight_blocker_report(
         f"- official_comparable: `{comparable_label(args)}`",
         f"- explicit_key_present: `{'yes' if os.environ.get('CODEFACTORY_BENCH_API_KEY') else 'no'}`",
         f"- heavy_verifier_timeout_overrides: `{format_timeout_overrides(heavy_verifier_timeout_overrides(args))}`",
-        f"- verifier_uv_torch_backend: `{args.verifier_uv_torch_backend}`",
+        f"- verifier_uv_torch_backend: `{args.verifier_uv_torch_backend or '<none>'}`",
         "",
         "## Blocker",
         "",
@@ -838,9 +871,14 @@ def write_report(
         else None
     )
     partial_job = load_partial_job(job_path) if job_path else None
+    agent_usage = load_agent_usage(job_path)
     verifier_warnings = detect_verifier_environment_warnings(job_path)
     interventions = interventions or []
     official_comparable = comparable_label(args, interventions)
+    if exit_code == 124:
+        official_comparable = "no"
+    if imported and str(imported.get("comparable", "")).lower() != "true":
+        official_comparable = "no"
     provider_status = provider_result["status"] if provider_result else ""
     partial_imported_failed_run = bool(
         imported and (exit_code != 0 or provider_status not in ("", "completed"))
@@ -860,11 +898,15 @@ def write_report(
         f"- trial_hard_timeout_sec: `{args.trial_hard_timeout_sec or '<disabled>'}`",
         f"- heavy_verifier_timeout_overrides: `{format_timeout_overrides(heavy_verifier_timeout_overrides(args))}`",
         f"- heavy_verifier_timeout_multiplier: `{heavy_verifier_timeout_multiplier(args, subset) or '<none>'}`",
-        f"- verifier_uv_torch_backend: `{args.verifier_uv_torch_backend}`",
+        f"- verifier_uv_torch_backend: `{args.verifier_uv_torch_backend or '<none>'}`",
         "- partial_import_diagnostic: `enabled`",
         "",
     ]
     notes = comparability_notes(args, interventions)
+    if exit_code == 124:
+        notes.append("benchmark process exceeded its outer wall timeout")
+    if imported and str(imported.get("comparable", "")).lower() != "true":
+        notes.append("imported Harbor run was marked non-comparable")
     if notes:
         lines.extend(
             [
@@ -895,6 +937,20 @@ def write_report(
                 f"- status: `{provider_result['status']}`",
                 f"- exit_code: `{provider_result['exit_code']}`",
                 f"- job_path: `{provider_result['job_path']}`",
+                "",
+            ]
+        )
+    if agent_usage:
+        lines.extend(
+            [
+                "## Agent Usage",
+                "",
+                f"- trials_with_metadata: `{agent_usage['trials_with_metadata']}`",
+                f"- model_requests: `{agent_usage['model_requests']}`",
+                f"- prompt_tokens: `{agent_usage['prompt_tokens']}`",
+                f"- completion_tokens: `{agent_usage['completion_tokens']}`",
+                f"- total_tokens: `{agent_usage['total_tokens']}`",
+                f"- tool_calls: `{agent_usage['tool_calls']}`",
                 "",
             ]
         )
@@ -1009,6 +1065,46 @@ def write_report(
     return report_path
 
 
+def load_agent_usage(job_path: str | Path | None) -> dict[str, int] | None:
+    if not job_path:
+        return None
+    root = Path(job_path)
+    if not root.is_dir():
+        return None
+    totals = {
+        "trials_with_metadata": 0,
+        "model_requests": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "tool_calls": 0,
+    }
+    for metadata_path in sorted(root.glob("*/agent/run-metadata.json")):
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if metadata.get("runtime_subject") != "rust-core":
+            continue
+        usage = metadata.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+        totals["trials_with_metadata"] += 1
+        for field in (
+            "model_requests",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+        ):
+            value = usage.get(field)
+            if isinstance(value, int) and value >= 0:
+                totals[field] += value
+        tool_calls = metadata.get("tool_calls")
+        if isinstance(tool_calls, int) and tool_calls >= 0:
+            totals["tool_calls"] += tool_calls
+    return totals if totals["trials_with_metadata"] else None
+
+
 def load_partial_job(job_path: str) -> list[str] | None:
     root = Path(job_path)
     run_result_path = root / "result.json"
@@ -1120,7 +1216,12 @@ def main() -> int:
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--model-timeout-sec", type=int, default=120)
     parser.add_argument("--shell-timeout-sec", type=int, default=300)
-    parser.add_argument("--agent-wall-timeout-sec", type=int, default=780)
+    parser.add_argument(
+        "--agent-wall-timeout-sec",
+        type=int,
+        default=0,
+        help="Optional CodeFactory sidecar wall timeout. Default 0 delegates to Harbor.",
+    )
     parser.add_argument(
         "--trial-hard-timeout-sec",
         type=int,
@@ -1173,8 +1274,10 @@ def main() -> int:
     parser.add_argument(
         "--verifier-uv-http-timeout-sec",
         type=int,
-        default=int(
-            os.environ.get("CODEFACTORY_BENCH_VERIFIER_UV_HTTP_TIMEOUT_SEC", "120")
+        default=(
+            int(os.environ["CODEFACTORY_BENCH_VERIFIER_UV_HTTP_TIMEOUT_SEC"])
+            if os.environ.get("CODEFACTORY_BENCH_VERIFIER_UV_HTTP_TIMEOUT_SEC")
+            else None
         ),
         help=(
             "UV_HTTP_TIMEOUT value passed through the provider bridge to Harbor "
@@ -1183,7 +1286,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--verifier-uv-torch-backend",
-        default=os.environ.get("CODEFACTORY_BENCH_VERIFIER_UV_TORCH_BACKEND", "cpu"),
+        default=os.environ.get("CODEFACTORY_BENCH_VERIFIER_UV_TORCH_BACKEND"),
         help=(
             "UV_TORCH_BACKEND value passed to Harbor verifiers. The default cpu "
             "avoids pulling CUDA wheels in local Mac/QEMU diagnostic runs."

@@ -29,13 +29,31 @@ pub struct VerificationPlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VerificationCheck {
-    CargoCheck { cwd: String },
-    CargoTest { cwd: String, test_filter: Option<String> },
-    TscCheck { cwd: String },
-    PnpmLint { cwd: String },
-    CustomCommand { cwd: String, command: String, expected_exit_code: i32 },
-    FileExists { path: String },
-    FileContains { path: String, pattern: String },
+    CargoCheck {
+        cwd: String,
+    },
+    CargoTest {
+        cwd: String,
+        test_filter: Option<String>,
+    },
+    TscCheck {
+        cwd: String,
+    },
+    PnpmLint {
+        cwd: String,
+    },
+    CustomCommand {
+        cwd: String,
+        command: String,
+        expected_exit_code: i32,
+    },
+    FileExists {
+        path: String,
+    },
+    FileContains {
+        path: String,
+        pattern: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,15 +80,21 @@ pub fn detect_verification_plan(cwd: &str) -> VerificationPlan {
         // Pure Rust project at root
         let root_cargo = format!("{}/Cargo.toml", cwd);
         if Path::new(&root_cargo).exists() {
-            checks.push(VerificationCheck::CargoCheck { cwd: cwd.to_string() });
+            checks.push(VerificationCheck::CargoCheck {
+                cwd: cwd.to_string(),
+            });
         }
     }
 
     // JS/TS project
     let pkg_json = format!("{}/package.json", cwd);
     if Path::new(&pkg_json).exists() {
-        checks.push(VerificationCheck::TscCheck { cwd: cwd.to_string() });
-        checks.push(VerificationCheck::PnpmLint { cwd: cwd.to_string() });
+        checks.push(VerificationCheck::TscCheck {
+            cwd: cwd.to_string(),
+        });
+        checks.push(VerificationCheck::PnpmLint {
+            cwd: cwd.to_string(),
+        });
     }
 
     // Soft check — always present
@@ -157,9 +181,11 @@ async fn run_single_check(check: &VerificationCheck) -> VerificationResult {
                 }
             }
         }
-        VerificationCheck::CustomCommand { cwd, command, expected_exit_code } => {
-            run_command_check(command, cwd, &[], Some(command), *expected_exit_code).await
-        }
+        VerificationCheck::CustomCommand {
+            cwd,
+            command,
+            expected_exit_code,
+        } => run_command_check(command, cwd, &[], Some(command), *expected_exit_code).await,
         VerificationCheck::FileExists { path } => {
             let t = Instant::now();
             let exists = Path::new(path).exists();

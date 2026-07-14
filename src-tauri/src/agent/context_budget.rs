@@ -162,7 +162,11 @@ mod tests {
 
     #[test]
     fn empty_blocks_skipped() {
-        let out = assemble("BASE".into(), vec![block("   ", 0, 100), block("X", 1, 100)], 1000);
+        let out = assemble(
+            "BASE".into(),
+            vec![block("   ", 0, 100), block("X", 1, 100)],
+            1000,
+        );
         assert_eq!(out, "BASE\n\nX");
     }
 }

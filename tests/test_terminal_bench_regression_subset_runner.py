@@ -1,4 +1,5 @@
 import argparse
+import json
 import subprocess
 import tempfile
 import unittest
@@ -22,7 +23,7 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
             "override_storage_mb": None,
             "trial_hard_timeout_sec": 1200,
             "heavy_verifier_hard_timeout_sec": 2400,
-            "heavy_verifier_timeout_multiplier": 3.0,
+            "heavy_verifier_timeout_multiplier": 1.0,
             "watchdog_poll_interval_sec": 15,
             "model_timeout_sec": 120,
             "shell_timeout_sec": 300,
@@ -33,8 +34,8 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
             "verifier_proxy": None,
             "provider_proxy": None,
             "provider_bridge_retries": 2,
-            "verifier_uv_http_timeout_sec": 120,
-            "verifier_uv_torch_backend": "cpu",
+            "verifier_uv_http_timeout_sec": None,
+            "verifier_uv_torch_backend": None,
         }
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -181,11 +182,64 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
         env = runner.build_env(self.args(concurrency=2), subset)
 
         self.assertEqual(env["CODEFACTORY_BENCH_ALLOW_PARTIAL_IMPORT"], "1")
-        self.assertEqual(env["CODEFACTORY_BENCH_VERIFIER_UV_HTTP_TIMEOUT_SEC"], "120")
-        self.assertEqual(env["CODEFACTORY_BENCH_VERIFIER_UV_TORCH_BACKEND"], "cpu")
+        self.assertNotIn("CODEFACTORY_BENCH_VERIFIER_UV_HTTP_TIMEOUT_SEC", env)
+        self.assertNotIn("CODEFACTORY_BENCH_VERIFIER_UV_TORCH_BACKEND", env)
         self.assertNotIn("CODEFACTORY_BENCH_VERIFIER_TIMEOUT_MULTIPLIER", env)
         self.assertEqual(
             env["CODEFACTORY_BENCH_TASK_NAMES"], "write-compressor,kv-store-grpc"
+        )
+
+    def test_build_env_does_not_override_harbor_agent_timeout_by_default(self) -> None:
+        subset = {"tasks": [{"name": "terminal-bench/example"}]}
+
+        env = runner.build_env(self.args(agent_wall_timeout_sec=0), subset)
+
+        self.assertNotIn("CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC", env)
+
+    def test_build_env_passes_official_per_task_agent_budgets_without_overriding_harbor(self) -> None:
+        subset = {
+            "tasks": [
+                {"name": "build-cython-ext", "agent_timeout_sec": 900},
+                {"name": "filter-js-from-html", "agent_timeout_sec": 1800},
+            ]
+        }
+
+        env = runner.build_env(self.args(agent_wall_timeout_sec=0), subset)
+
+        self.assertEqual(
+            json.loads(env["CODEFACTORY_BENCH_TASK_AGENT_TIMEOUTS_JSON"]),
+            {"build-cython-ext": 900, "filter-js-from-html": 1800},
+        )
+        self.assertNotIn("CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC", env)
+
+    def test_timeout_multiplier_marks_run_noncomparable(self) -> None:
+        args = self.args(
+            trial_hard_timeout_sec=0,
+            heavy_verifier_hard_timeout_sec=0,
+            heavy_verifier_timeout_multiplier=3.0,
+        )
+
+        self.assertEqual(runner.comparable_label(args), "no")
+        self.assertTrue(
+            any("verifier timeout multiplier" in note for note in runner.comparability_notes(args))
+        )
+
+    def test_verifier_runtime_override_is_explicit_and_noncomparable(self) -> None:
+        args = self.args(
+            trial_hard_timeout_sec=0,
+            agent_wall_timeout_sec=0,
+            verifier_uv_http_timeout_sec=120,
+            verifier_uv_torch_backend="cpu",
+        )
+        subset = {"tasks": [{"name": "terminal-bench/example"}]}
+
+        env = runner.build_env(args, subset)
+
+        self.assertEqual(env["CODEFACTORY_BENCH_VERIFIER_UV_HTTP_TIMEOUT_SEC"], "120")
+        self.assertEqual(env["CODEFACTORY_BENCH_VERIFIER_UV_TORCH_BACKEND"], "cpu")
+        self.assertEqual(runner.comparable_label(args), "no")
+        self.assertTrue(
+            any("verifier runtime environment" in note for note in runner.comparability_notes(args))
         )
 
     def test_build_env_sets_harbor_verifier_timeout_multiplier_for_heavy_task(
@@ -193,7 +247,9 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
     ) -> None:
         subset = {"tasks": [{"name": "terminal-bench/torch-tensor-parallelism"}]}
 
-        env = runner.build_env(self.args(), subset)
+        env = runner.build_env(
+            self.args(heavy_verifier_timeout_multiplier=3.0), subset
+        )
 
         self.assertEqual(env["CODEFACTORY_BENCH_VERIFIER_TIMEOUT_MULTIPLIER"], "3")
 
@@ -704,6 +760,86 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
             self.assertIn("- official_comparable: `no`", text)
             self.assertIn("runner-level trial hard timeout watchdog was enabled", text)
 
+    def test_report_marks_outer_timeout_non_comparable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.args()
+            subset = {
+                "id": "subset",
+                "source_run_id": "source",
+                "tasks": [{"name": "write-compressor"}],
+            }
+            parsed = {
+                "preview": {
+                    "model": "deepseek-v4-pro",
+                    "task_limit": "1",
+                    "concurrency": "1",
+                    "override_storage_mb": "<none>",
+                    "job_path": str(Path(tmp) / "job"),
+                }
+            }
+            with mock.patch.object(runner, "EVIDENCE_DIR", Path(tmp)):
+                report = runner.write_report(
+                    args,
+                    subset,
+                    124,
+                    "BENCHMARK_RUN_TIMEOUT: exceeded 1800 seconds",
+                    parsed,
+                    [],
+                )
+
+            text = report.read_text()
+            self.assertIn("- official_comparable: `no`", text)
+            self.assertIn("benchmark process exceeded its outer wall timeout", text)
+
+    def test_report_uses_imported_run_comparability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.args(
+                trial_hard_timeout_sec=0,
+                agent_wall_timeout_sec=0,
+            )
+            subset = {
+                "id": "subset",
+                "source_run_id": "source",
+                "tasks": [{"name": "mteb-retrieve"}],
+            }
+            job_path = Path(tmp) / "job"
+            parsed = {
+                "preview": {
+                    "model": "deepseek-v4-pro",
+                    "task_limit": "1",
+                    "concurrency": "1",
+                    "override_storage_mb": "<none>",
+                    "job_path": str(job_path),
+                },
+                "result": {
+                    "status": "completed",
+                    "exit_code": "0",
+                    "job_path": str(job_path),
+                },
+                "imported": {
+                    "run": "run-id",
+                    "dataset": "terminal-bench/terminal-bench-2-1",
+                    "agent": "codefactory-headless",
+                    "model": 'Some("deepseek-v4-pro")',
+                    "comparable": "false",
+                    "trials": "1",
+                    "mean_reward": "0.000",
+                },
+                "trials": [
+                    {
+                        "task": "terminal-bench/mteb-retrieve",
+                        "reward": "0",
+                        "failure_class": 'Some("verification")',
+                    }
+                ],
+            }
+            with mock.patch.object(runner, "EVIDENCE_DIR", Path(tmp)):
+                report = runner.write_report(args, subset, 0, "output", parsed, [])
+
+            text = report.read_text()
+            self.assertIn("- official_comparable: `no`", text)
+            self.assertIn("imported Harbor run was marked non-comparable", text)
+
     def test_detects_verifier_browser_environment_warnings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stdout_path = (
@@ -783,6 +919,48 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
             self.assertIn("## Verifier Environment Warnings", text)
             self.assertIn("browser-driver-unavailable", text)
             self.assertIn("Unable to obtain driver for chrome", text)
+
+    def test_report_aggregates_rust_agent_usage_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = Path(tmp) / "job"
+            metadata_path = job_path / "task__abc" / "agent" / "run-metadata.json"
+            metadata_path.parent.mkdir(parents=True)
+            metadata_path.write_text(
+                '{"runtime_subject":"rust-core","usage":{"prompt_tokens":10,'
+                '"completion_tokens":4,"total_tokens":14,"model_requests":2},'
+                '"tool_calls":3}'
+            )
+            args = self.args(trial_hard_timeout_sec=0, heavy_verifier_hard_timeout_sec=0)
+            subset = {"id": "subset", "tasks": [{"name": "task"}]}
+            parsed = {
+                "result": {"status": "completed", "exit_code": "0", "job_path": str(job_path)},
+                "preview": {
+                    "model": "deepseek-v4-pro",
+                    "task_limit": "1",
+                    "concurrency": "1",
+                    "override_storage_mb": "<none>",
+                    "job_path": str(job_path),
+                },
+                "imported": {
+                    "run": "run-id",
+                    "dataset": "terminal-bench/terminal-bench-2-1",
+                    "agent": "codefactory-headless",
+                    "model": 'Some("deepseek-v4-pro")',
+                    "comparable": "true",
+                    "trials": "1",
+                    "mean_reward": "1.000",
+                },
+                "trials": [{"task": "task", "reward": "1", "failure_class": "None"}],
+            }
+
+            with mock.patch.object(runner, "EVIDENCE_DIR", Path(tmp)):
+                report = runner.write_report(args, subset, 0, "output", parsed, [])
+
+            text = report.read_text()
+            self.assertIn("## Agent Usage", text)
+            self.assertIn("- model_requests: `2`", text)
+            self.assertIn("- total_tokens: `14`", text)
+            self.assertIn("- tool_calls: `3`", text)
 
 
 if __name__ == "__main__":
