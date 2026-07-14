@@ -12,7 +12,7 @@
 
 ## Current State
 - Current phase: Phase 0 — Trace Truth
-- Current checkpoint: PR #104 的首个 Trace Truth 切片 CI 已绿；隔离 `CodeFactoryEvolutionDev` 已完成 hook cancel、重启恢复、跨会话 miner、人工采纳与记忆写入实测；本轮完整性加固已提交，待推送并重跑 PR CI，Phase 0 尚未整体验收
+- Current checkpoint: PR #104 的隔离 `CodeFactoryEvolutionDev` 已完成 hook cancel、重启恢复、跨会话 miner、人工采纳与记忆写入实测；完整性加固 `e0acbd5` 已推送，CI 与两项 governance checks 全绿，Phase 0 尚未整体验收
 - Next owner: 当前 PR delivery 与 Phase 0 实地验收，随后才进入结构化 extractor 与统一候选模型
 - Updated at: 2026-07-14
 
@@ -55,7 +55,7 @@
 - Post-mortem: 实地日志发现旧 `default_model=gpt-5.5` 被错误发往 DeepSeek；已改为 endpoint active-model。随后真实请求暴露 max_tokens=500 时只有 reasoning/无 final content；已加入 reasoning 隔离和 2000-token 有界重试并通过回归测试，但本轮尚未取得真实模型候选，仍列为剩余证据。
 - Quick scope: 单个 Quick session 可进入 chat post-mortem，但“新建快速任务”使用独立 scratch cwd；当前 cross-session miner 按精确 cwd 聚合，因此 Quick-to-Quick 模式尚没有稳定 scope，不伪装为已覆盖。
 - Integrity review: 独立架构复审提出 JSON 脱敏、terminal/replay 原子一致性、旧 support 口径和 preference key 四类高风险边界；均先补失败测试再修复，目标与完整回归已通过。
-- Release evidence: PR #104 仍为 draft；上一提交的 CI/governance checks 已绿，本轮变更尚待推送后重新跑 CI；not live，尚未合并、刻意发版或安装包验证。
+- Release evidence: PR #104 仍为 draft；完整性加固 `e0acbd5` 的 CI/check（frontend typecheck、Vitest、Cargo check、Cargo test）和两项 governance-baseline 全绿；not live，尚未合并、刻意发版或安装包验证。
 - Blocking evidence: 当前 main 的 self-evolution 查询读空已由代码审计确认。
 
 ## AI Collaboration
