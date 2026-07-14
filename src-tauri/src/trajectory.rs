@@ -21,7 +21,7 @@ static SENSITIVE_TEXT_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"\b(?:sk-[A-Za-z0-9_-]{6,}|gh[pousr]_[A-Za-z0-9_]{6,})\b")
             .expect("token regex"),
         Regex::new(
-            r#"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|authorization|cookie|credential)\s*[:=]\s*)[^\s,;'"`&\\]+"#,
+            r#"(?i)(["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|authorization|cookie|credential)["']?\s*[:=]\s*["']?)[^\s,;'"`&\\}]+"#,
         )
         .expect("assignment secret regex"),
         Regex::new(r"(?i)(://[^:/\s]+:)[^@/\s]+@").expect("url userinfo regex"),
@@ -124,7 +124,11 @@ pub(crate) fn redact_tool_result_for_storage(result: &str) -> String {
 }
 
 pub(crate) fn redact_derived_message_for_storage(message: &str) -> String {
-    redact_text(message, usize::MAX)
+    match serde_json::from_str::<Value>(message) {
+        Ok(value) => serde_json::to_string(&redact_json_with_limit(&value, usize::MAX))
+            .unwrap_or_else(|_| redact_text(message, usize::MAX)),
+        Err(_) => redact_text(message, usize::MAX),
+    }
 }
 
 fn redacted_arguments(arguments: &Value) -> String {
@@ -165,6 +169,7 @@ pub(crate) async fn record_tool_call_started(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn record_tool_call_finished(
     pool: &SqlitePool,
     session_id: &str,
@@ -197,6 +202,70 @@ pub(crate) async fn record_tool_call_finished(
             "normalized tool call missing for completion: {id}"
         )));
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_terminal_tool_outcome(
+    pool: &SqlitePool,
+    session_id: &str,
+    provider_tool_call_id: &str,
+    status: &str,
+    result: Option<&str>,
+    error: Option<&str>,
+    duration_ms: i64,
+) -> Result<(), AppError> {
+    if !matches!(status, "done" | "error" | "denied") {
+        return Err(AppError::Other(format!(
+            "unsupported normalized tool-call status: {status}"
+        )));
+    }
+
+    let mut transaction = pool.begin().await?;
+    let trace_id = trace_record_id(session_id, provider_tool_call_id);
+    let redacted_result = result.map(|text| redact_text(text, MAX_RESULT_CHARS));
+    let redacted_error = error.map(|text| redact_text(text, MAX_ERROR_CHARS));
+    let updated = sqlx::query(
+        "UPDATE tool_calls SET result = ?, status = ?, error = ?, duration_ms = ? WHERE id = ?",
+    )
+    .bind(redacted_result)
+    .bind(status)
+    .bind(redacted_error)
+    .bind(duration_ms.max(0))
+    .bind(&trace_id)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::Other(format!(
+            "normalized tool call missing for completion: {trace_id}"
+        )));
+    }
+
+    // Provider replay requires one tool-result message for every declared
+    // tool call, including permission denials, hook cancellations, and
+    // dispatch failures. Use a stable id and update its content together with
+    // the normalized row so a terminal-state retry cannot leave stale replay.
+    let replay_message_id = format!("{trace_id}:result");
+    let replay_text = redact_tool_result_for_storage(result.or(error).unwrap_or(""));
+    let content = serde_json::json!({
+        "tool_call_id": provider_tool_call_id,
+        "content": replay_text,
+        "status": status,
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO messages (id, session_id, role, content, created_at) \
+         VALUES (?, ?, 'tool', ?, ?) \
+         ON CONFLICT(id) DO UPDATE SET \
+             session_id = excluded.session_id, role = 'tool', content = excluded.content",
+    )
+    .bind(replay_message_id)
+    .bind(session_id)
+    .bind(content)
+    .bind(Utc::now().timestamp_millis())
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -290,6 +359,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn derived_json_redaction_masks_quoted_secret_keys() {
+        let message = r#"{"token":"CF_EVO_JSON_SECRET","nested":{"password":"CF_EVO_JSON_PASSWORD"},"safe":"visible"}"#;
+
+        let persisted = redact_derived_message_for_storage(message);
+
+        assert!(!persisted.contains("CF_EVO_JSON_SECRET"));
+        assert!(!persisted.contains("CF_EVO_JSON_PASSWORD"));
+        assert!(persisted.contains("visible"));
+        let parsed: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(parsed["token"], "<redacted>");
+        assert_eq!(parsed["nested"]["password"], "<redacted>");
+    }
+
+    #[test]
+    fn derived_json_redaction_handles_escaped_and_non_string_secret_values() {
+        let message = json!({
+            "token": "prefix\\\"CF_EVO_ESCAPED_SUFFIX",
+            "password": 123456,
+            "authorization": true,
+            "safe": "visible"
+        })
+        .to_string();
+
+        let persisted = redact_derived_message_for_storage(&message);
+        let parsed: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+
+        assert!(!persisted.contains("CF_EVO_ESCAPED_SUFFIX"));
+        assert_eq!(parsed["token"], "<redacted>");
+        assert_eq!(parsed["password"], "<redacted>");
+        assert_eq!(parsed["authorization"], "<redacted>");
+        assert_eq!(parsed["safe"], "visible");
+    }
+
     #[tokio::test]
     async fn normalized_tool_lifecycle_persists_redacted_success() {
         let pool = test_pool().await;
@@ -374,5 +477,156 @@ mod tests {
         assert_eq!(row.get::<String, _>("status"), "error");
         assert_eq!(row.get::<i64, _>("duration_ms"), 7);
         assert!(!row.get::<String, _>("error").contains("super-secret"));
+    }
+
+    #[tokio::test]
+    async fn terminal_outcomes_always_persist_one_redacted_replay_message() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (call_id, status, result, error, duration_ms) in [
+            (
+                "call-done",
+                "done",
+                Some(r#"{"safe":"visible","token":"CF_EVO_DONE_SECRET"}"#),
+                None,
+                19,
+            ),
+            (
+                "call-error",
+                "error",
+                None,
+                Some(r#"dispatch failed: {"password":"CF_EVO_ERROR_SECRET"}"#),
+                7,
+            ),
+            (
+                "call-denied",
+                "denied",
+                None,
+                Some("Tool call cancelled by hook."),
+                0,
+            ),
+        ] {
+            record_tool_call_started(
+                &pool,
+                "session-1",
+                "assistant-message-1",
+                call_id,
+                "bash",
+                &json!({"command":"printf ok"}),
+            )
+            .await
+            .unwrap();
+
+            record_terminal_tool_outcome(
+                &pool,
+                "session-1",
+                call_id,
+                status,
+                result,
+                error,
+                duration_ms,
+            )
+            .await
+            .unwrap();
+        }
+
+        record_terminal_tool_outcome(
+            &pool,
+            "session-1",
+            "call-denied",
+            "denied",
+            None,
+            Some("Tool call cancelled by hook."),
+            0,
+        )
+        .await
+        .unwrap();
+
+        record_terminal_tool_outcome(
+            &pool,
+            "session-1",
+            "call-error",
+            "done",
+            Some(r#"{"safe":"recovered"}"#),
+            None,
+            11,
+        )
+        .await
+        .unwrap();
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, content FROM messages ORDER BY created_at ASC",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|(role, _)| role == "tool"));
+        let joined = rows.iter().map(|(_, content)| content.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("call-done"));
+        assert!(joined.contains("call-error"));
+        assert!(joined.contains("call-denied"));
+        assert!(joined.contains("visible"));
+        assert!(joined.contains("recovered"));
+        assert!(!joined.contains("dispatch failed"));
+        assert!(!joined.contains("CF_EVO_DONE_SECRET"));
+        assert!(!joined.contains("CF_EVO_ERROR_SECRET"));
+
+        let terminal_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tool_calls WHERE status IN ('done','error','denied')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(terminal_count, 3);
+    }
+
+    #[tokio::test]
+    async fn terminal_outcome_rolls_back_when_replay_cannot_be_persisted() {
+        let pool = test_pool().await;
+        record_tool_call_started(
+            &pool,
+            "session-atomic",
+            "assistant-message-atomic",
+            "call-atomic",
+            "bash",
+            &json!({"command":"printf ok"}),
+        )
+        .await
+        .unwrap();
+
+        let error = record_terminal_tool_outcome(
+            &pool,
+            "session-atomic",
+            "call-atomic",
+            "done",
+            Some("ok"),
+            None,
+            3,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("messages"));
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT status, result FROM tool_calls WHERE id = ?")
+                .bind("session-atomic:call-atomic")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "pending");
+        assert!(row.1.is_none());
     }
 }

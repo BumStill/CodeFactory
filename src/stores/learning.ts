@@ -31,7 +31,7 @@ export interface LearningEvent {
   kind: "memory" | "preference" | "pattern";
   pref_key: string | null;
   pref_value: string | null;
-  /** Sessions of evidence behind a mined insight (0 for per-session events). */
+  /** Support count for a mined insight; evidence_json.support_unit names the unit. */
   support_count: number;
   /** Raw metrics behind a mined insight, as a JSON string ("{}" otherwise). */
   evidence_json: string;

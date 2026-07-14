@@ -19,6 +19,10 @@ Model round
 
 `messages.tool_calls` 继续用于模型对话重放，但持久副本先脱敏且不做轨迹限长；规范化 `tool_calls` 是分析、Evidence 与审计真相源，使用限长摘要。两者职责不同，不能删除前者或继续让分析读取空表。
 
+terminal outcome 必须在同一 SQLite 事务中更新规范化 row，并以稳定 message id upsert 对应的 `role=tool` replay message；任一步失败都整体回滚。同一个 provider call 的终态被修正时更新原 replay，不新增或保留旧结果。消息重放按 `created_at, rowid` 排序，避免 0ms 拒绝路径同毫秒写入时顺序不稳定。
+
+replay JSON 同时保存 provider `tool_call_id`、脱敏内容和 `done|error|denied` 终态。前端历史加载不能把 `role=tool` 当普通聊天消息丢弃：必须先解析 assistant 的 tool declaration，重建工具卡，再把 replay 按 `tool_call_id` 折叠回所属 assistant message。旧 replay 没有 status 时只为兼容默认 `done`，新数据不得丢失 error/denied。
+
 ## 3. Phase 0 合同
 
 ### `tool_calls`
@@ -48,6 +52,7 @@ Model round
 
 - 递归屏蔽 `api_key`、`token`、`password`、`secret`、`authorization`、`cookie`、`credential` 等 key。
 - 屏蔽 Bearer、OpenAI/GitHub 常见 token、私钥块和 URL userinfo。
+- 完整 JSON 派生消息先用 `serde_json` 解析，再按敏感 key 递归替换并重新序列化；只有无法解析的普通文本才使用正则 fallback，避免转义字符串残留或数字/布尔值破坏 JSON。
 - normalized arguments、result、error 分别限长；provider replay message 只脱敏、不截断，避免破坏长参数和上下文。
 - 用户主动输入继续遵循现有聊天历史保留语义；系统派生的 assistant、reasoning、tool result、tool declaration、normalized trace 与 Evidence 不复制命中的敏感值。
 - `reasoning_content` 不进入 Evolution 分析或 Evidence；现有 provider 重放副本仅做脱敏持久化。
@@ -57,7 +62,11 @@ Model round
 
 `run_postmortem` 优先使用 task outcome；没有 `task_runs` 时，使用同 session 的有限用户/助手轮次摘要和规范化工具状态统计。摘要必须先脱敏和限长，不复制完整对话或工具结果。
 
+模型生成的 post-mortem candidate 在去重和持久化前再次脱敏与限长；`kind=preference` 的 key 仅允许单行、64 字符以内的 snake_case（`^[a-z][a-z0-9_]{0,63}$`），否则降级为 memory，避免非结构化 key 进入后续系统提示词。
+
 空 session 返回空；有足够持久消息的 project/Quick session 不得仅因没有 task_run 而返回空输入。LLM 调用仍为 best-effort，不能阻塞正常聊天。
+
+推理模型若首轮只有 `reasoning_content`、没有最终 `content`，不得把 reasoning 当候选；系统只记录 finish reason/是否存在 reasoning 等元数据，并将当前请求实际使用的 `max_tokens` 或 `max_completion_tokens` 扩到 2000 后有界重试一次。重试仍无最终内容时返回空候选，不循环、不把隐式推理写入学习日志。
 
 ## 6. Evidence
 

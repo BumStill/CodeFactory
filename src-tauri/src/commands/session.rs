@@ -337,7 +337,7 @@ pub async fn get_messages(
 ) -> Result<Vec<Message>, AppError> {
     let pool = state.db.read().await;
     let messages = sqlx::query_as::<_, Message>(
-        "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+        "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
     )
     .bind(&session_id)
     .fetch_all(&*pool)

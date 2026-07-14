@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::process::Output;
 use tauri::State;
 
 use crate::config::settings;
-use crate::AppState;
+use crate::util::command_env;
 use crate::util::no_window::NoWindow;
+use crate::AppState;
 
 // ── Hook data structures ──────────────────────────────────────────────────────
 
@@ -25,6 +28,16 @@ pub struct HookConfig {
     pub action: HookAction,
     pub enabled: bool,
     pub filter: Option<String>,
+}
+
+pub(crate) fn run_hook_command(command: &str, cwd: Option<&Path>) -> std::io::Result<Output> {
+    let shell = command_env::shell_invocation(command);
+    let mut process = std::process::Command::new(shell.program).no_window();
+    process.args(shell.args);
+    if let Some(cwd) = cwd {
+        process.current_dir(cwd);
+    }
+    process.output()
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
@@ -101,10 +114,7 @@ pub async fn test_hook(id: String, state: State<'_, AppState>) -> Result<String,
             Ok(format!("Appended test entry to {path}"))
         }
         HookAction::RunCommand { command, cwd } => {
-            let output = std::process::Command::new("powershell").no_window()
-                .args(["-NonInteractive", "-Command", command])
-                .current_dir(cwd.as_deref().unwrap_or("."))
-                .output()
+            let output = run_hook_command(command, cwd.as_deref().map(Path::new))
                 .map_err(|e| e.to_string())?;
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -124,5 +134,29 @@ pub async fn test_hook(id: String, state: State<'_, AppState>) -> Result<String,
                 "AutoGitCommit test: would run `git add -A && git commit -m \"{msg}\"`"
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_commands_use_the_platform_shell_and_preserve_exit_status() {
+        let cwd = std::env::temp_dir().join(format!(
+            "codefactory-hook-shell-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let allowed = run_hook_command("printf codefactory-hook-ok", Some(&cwd)).unwrap();
+        assert!(allowed.status.success());
+        assert_eq!(String::from_utf8_lossy(&allowed.stdout), "codefactory-hook-ok");
+
+        let cancelled = run_hook_command("exit 7", Some(&cwd)).unwrap();
+        assert_eq!(cancelled.status.code(), Some(7));
+
+        std::fs::remove_dir_all(cwd).unwrap();
     }
 }

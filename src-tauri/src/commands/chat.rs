@@ -236,7 +236,7 @@ pub async fn send_message(
     let history = {
         let pool = state.db.read().await;
         sqlx::query_as::<_, crate::storage::Message>(
-            "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+            "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
         )
         .bind(&session_id)
         .fetch_all(&*pool)

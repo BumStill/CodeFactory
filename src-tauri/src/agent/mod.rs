@@ -942,32 +942,6 @@ impl AgentLoop {
                     )
                     .ok();
 
-                // Persist the tool result — skipped entirely for anonymous runs.
-                // The in-memory `result_messages` push below still carries it
-                // through this turn so the model sees the tool output.
-                if !self.anonymous {
-                    let now = Utc::now().timestamp_millis();
-                    let msg_id = Uuid::new_v4().to_string();
-                    let persisted_output =
-                        crate::trajectory::redact_tool_result_for_storage(&output.content);
-                    let tool_content = serde_json::json!({
-                        "tool_call_id": tc.id,
-                        "content": persisted_output
-                    })
-                    .to_string();
-
-                    sqlx::query(
-                        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-                    )
-                    .bind(&msg_id)
-                    .bind(&self.session_id)
-                    .bind("tool")
-                    .bind(&tool_content)
-                    .bind(now)
-                    .execute(&self.db)
-                    .await?;
-                }
-
                 result_messages.push(ChatMessage {
                     role: "tool".into(),
                     content: MessageContent::Text(output.content),
@@ -1652,7 +1626,7 @@ impl AgentLoop {
         if self.anonymous {
             return Ok(());
         }
-        crate::trajectory::record_tool_call_finished(
+        crate::trajectory::record_terminal_tool_outcome(
             &self.db,
             &self.session_id,
             &tool_call.id,
@@ -2225,31 +2199,6 @@ impl AgentLoop {
                         },
                     )
                     .ok();
-
-                // Persist tool result to DB — skipped for anonymous runs; the
-                // in-memory `tool_result_blocks` below still feeds it back to
-                // the model this turn.
-                if !self.anonymous {
-                    let now = Utc::now().timestamp_millis();
-                    let msg_id = Uuid::new_v4().to_string();
-                    let persisted_output =
-                        crate::trajectory::redact_tool_result_for_storage(&output.content);
-                    let tool_content = serde_json::json!({
-                        "tool_call_id": tc.id,
-                        "content": persisted_output
-                    })
-                    .to_string();
-                    sqlx::query(
-                        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-                    )
-                    .bind(&msg_id)
-                    .bind(&self.session_id)
-                    .bind("tool")
-                    .bind(&tool_content)
-                    .bind(now)
-                    .execute(&self.db)
-                    .await?;
-                }
 
                 tool_result_blocks.push(serde_json::json!({
                     "type": "tool_result",

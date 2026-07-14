@@ -117,4 +117,34 @@ describe("learning store", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("list_learning_events", { cwd: "/proj" });
   });
+
+  it("mine creates pending patterns through the backend and reloads the review list", async () => {
+    const pattern = {
+      ...mkEvent("pattern-1"),
+      session_id: "",
+      kind: "pattern" as const,
+      support_count: 2,
+      evidence_json: JSON.stringify({
+        detector: "tool_reliability",
+        support_unit: "sessions",
+        session_count: 2,
+        total_calls: 8,
+        errors: 2,
+        rate: 25,
+      }),
+    };
+    invokeMock.mockResolvedValueOnce([pattern]); // mine_cross_session_patterns
+    invokeMock.mockResolvedValueOnce([pattern]); // list_learning_events refresh
+
+    const count = await useLearningStore.getState().mine("/proj");
+
+    expect(count).toBe(1);
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "mine_cross_session_patterns", {
+      cwd: "/proj",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "list_learning_events", {
+      cwd: "/proj",
+    });
+    expect(useLearningStore.getState().events["/proj"]).toEqual([pattern]);
+  });
 });

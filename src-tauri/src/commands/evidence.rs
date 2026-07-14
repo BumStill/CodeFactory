@@ -82,7 +82,7 @@ pub async fn collect_evidence_pack(
     let messages: Vec<(String, String, String, Option<String>, Option<i64>, Option<i64>, i64)> =
         sqlx::query_as(
             "SELECT id, role, content, tool_calls, input_tokens, output_tokens, created_at \
-             FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+             FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
         )
         .bind(session_id)
         .fetch_all(pool)
@@ -869,7 +869,7 @@ mod tests {
              VALUES ('tool-1', 'message-1', 'bash', ?, ?, 'done', 42, 1)",
         )
         .bind(r#"{"command":"printf token=CF_EVO_EVIDENCE_SECRET"}"#)
-        .bind("token=CF_EVO_EVIDENCE_SECRET")
+        .bind(r#"{"token":"CF_EVO_EVIDENCE_SECRET","safe":"visible"}"#)
         .execute(&pool)
         .await
         .unwrap();
@@ -890,6 +890,7 @@ mod tests {
         assert!(tool_calls.contains(r#""status":"done""#));
         assert!(tool_calls.contains(r#""duration_ms":42"#));
         assert!(tool_calls.contains("<redacted>"));
+        assert!(tool_calls.contains("visible"));
         assert!(!tool_calls.contains("CF_EVO_EVIDENCE_SECRET"));
 
         pool.close().await;

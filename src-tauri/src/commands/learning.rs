@@ -19,7 +19,6 @@
 use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
 use sqlx::SqlitePool;
 use tauri::{command, AppHandle, Emitter, State};
 use uuid::Uuid;
@@ -49,8 +48,9 @@ pub struct LearningEvent {
     /// Only populated when kind == 'preference'.
     #[serde(default)]
     pub pref_value: Option<String>,
-    /// Self-evolution P1: sessions of evidence behind a mined insight
-    /// (0 for per-session post-mortem rows). kind == 'pattern' rows set it.
+    /// Self-evolution P1: support count behind a mined insight. The exact unit
+    /// is declared by evidence_json.support_unit (sessions or decisions).
+    /// Per-session post-mortem rows keep this at 0.
     #[serde(default)]
     pub support_count: i64,
     /// Raw metrics behind a mined insight, as JSON ("{}" for non-mined rows).
@@ -206,16 +206,55 @@ struct AiRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct AiResponseChoice {
     message: AiResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AiResponseMessage {
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AiResponse {
     choices: Vec<AiResponseChoice>,
+}
+
+struct PostmortemCompletion {
+    text: String,
+    reasoning_present: bool,
+    finish_reason: Option<String>,
+}
+
+fn extract_postmortem_completion(response: AiResponse) -> PostmortemCompletion {
+    let Some(choice) = response.choices.into_iter().next() else {
+        return PostmortemCompletion {
+            text: String::new(),
+            reasoning_present: false,
+            finish_reason: None,
+        };
+    };
+    PostmortemCompletion {
+        text: choice.message.content.unwrap_or_default(),
+        reasoning_present: choice
+            .message
+            .reasoning_content
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|reasoning| !reasoning.is_empty()),
+        finish_reason: choice.finish_reason,
+    }
+}
+
+fn expand_postmortem_completion_budget(body: &mut serde_json::Value) {
+    let field = if body.get("max_completion_tokens").is_some() {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    body[field] = serde_json::Value::from(2_000);
 }
 
 fn resolve_postmortem_model(settings: &crate::config::Settings) -> Option<String> {
@@ -235,6 +274,111 @@ struct PostmortemEntry {
     pref_key: Option<String>,
     #[serde(default)]
     pref_value: Option<String>,
+}
+
+fn valid_preference_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+        && chars.clone().count() < 64
+        && chars.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
+fn sanitize_postmortem_entry(mut entry: PostmortemEntry) -> Option<PostmortemEntry> {
+    entry.observation = crate::trajectory::redact_text(entry.observation.trim(), 2_000);
+    entry.suggestion = crate::trajectory::redact_text(entry.suggestion.trim(), 1_000);
+    entry.pref_key = entry
+        .pref_key
+        .map(|value| crate::trajectory::redact_text(value.trim(), 120));
+    entry.pref_value = entry
+        .pref_value
+        .map(|value| crate::trajectory::redact_text(value.trim(), 500));
+    if entry.kind.as_deref() == Some("preference")
+        && !entry
+            .pref_key
+            .as_deref()
+            .map(valid_preference_key)
+            .unwrap_or(false)
+    {
+        entry.kind = Some("memory".into());
+        entry.pref_key = None;
+        entry.pref_value = None;
+    }
+    if entry.observation.is_empty() || entry.suggestion.is_empty() {
+        None
+    } else {
+        Some(entry)
+    }
+}
+
+async fn persist_postmortem_entries(
+    pool: &SqlitePool,
+    session_id: &str,
+    cwd: &str,
+    entries: Vec<PostmortemEntry>,
+    seen: &mut std::collections::HashSet<String>,
+) -> Result<Vec<LearningEvent>, AppError> {
+    let now = Utc::now().to_rfc3339();
+    let mut created = Vec::new();
+    for entry in entries.into_iter().filter_map(sanitize_postmortem_entry) {
+        if !seen.insert(norm_suggestion(&entry.suggestion)) {
+            continue;
+        }
+
+        // Resolve kind defensively: only honour 'preference' when the
+        // structured payload is present. Invalid payloads remain reviewable as
+        // memory candidates instead of creating unusable preference rows.
+        let raw_kind = entry.kind.as_deref().unwrap_or("memory");
+        let (kind, pref_key, pref_value): (&str, Option<String>, Option<String>) =
+            if raw_kind == "preference"
+                && entry
+                    .pref_key
+                    .as_ref()
+                    .map(|key| !key.trim().is_empty())
+                    .unwrap_or(false)
+            {
+                let key = entry.pref_key.as_ref().unwrap().trim().to_string();
+                let value = entry.pref_value.unwrap_or_default().trim().to_string();
+                ("preference", Some(key), Some(value))
+            } else {
+                ("memory", None, None)
+            };
+
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO learning_events \
+             (id, session_id, cwd, observation, suggestion, status, created_at, kind, pref_key, pref_value) \
+             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(session_id)
+        .bind(cwd)
+        .bind(&entry.observation)
+        .bind(&entry.suggestion)
+        .bind(&now)
+        .bind(kind)
+        .bind(&pref_key)
+        .bind(&pref_value)
+        .execute(pool)
+        .await?;
+        created.push(LearningEvent {
+            id,
+            session_id: session_id.to_string(),
+            cwd: cwd.to_string(),
+            observation: entry.observation,
+            suggestion: entry.suggestion,
+            status: "pending".into(),
+            created_at: now.clone(),
+            decided_at: None,
+            kind: kind.into(),
+            pref_key,
+            pref_value,
+            support_count: 0,
+            evidence_json: "{}".into(),
+        });
+    }
+    Ok(created)
 }
 
 /// Normalize a suggestion for duplicate detection: trim, lowercase, and
@@ -320,10 +464,10 @@ pub async fn run_postmortem(
     // instead of returning an unconditional empty result.
     let messages: Vec<(String, String)> = sqlx::query_as(
         "SELECT role, content FROM (\
-            SELECT role, content, created_at FROM messages \
+            SELECT role, content, created_at, rowid AS message_rowid FROM messages \
             WHERE session_id = ? AND role IN ('user','assistant') \
-            ORDER BY created_at DESC LIMIT 12\
-         ) ORDER BY created_at ASC",
+            ORDER BY created_at DESC, rowid DESC LIMIT 12\
+         ) ORDER BY created_at ASC, message_rowid ASC",
     )
     .bind(&session_id)
     .fetch_all(&*pool)
@@ -372,7 +516,7 @@ pub async fn run_postmortem(
     // contradictions) and into a dedup set that guards the insert below.
     let known_suggestions: Vec<String> = existing
         .iter()
-        .map(|(s,)| s.trim().to_string())
+        .map(|(s,)| crate::trajectory::redact_text(s.trim(), 1_000))
         .filter(|s| !s.is_empty())
         .collect();
     let mut seen: std::collections::HashSet<String> =
@@ -482,12 +626,47 @@ Examples:\n\
         }
     };
 
-    let text = resp
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
+    let mut completion = extract_postmortem_completion(resp);
+    if completion.text.trim().is_empty() {
+        tracing::warn!(
+            "postmortem returned no final content (finish_reason={:?}, reasoning_present={}); retrying with expanded completion budget",
+            completion.finish_reason,
+            completion.reasoning_present
+        );
+        expand_postmortem_completion_budget(&mut body);
+        let retry_response = match crate::http_util::post_chat_completions(
+            &client,
+            &url,
+            &api_key,
+            &mut body,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!("postmortem expanded-budget retry failed: {error}");
+                return Ok(vec![]);
+            }
+        };
+        let retry_resp: AiResponse = match retry_response.json().await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!("postmortem expanded-budget JSON parse failed: {error}");
+                return Ok(vec![]);
+            }
+        };
+        completion = extract_postmortem_completion(retry_resp);
+    }
+
+    let text = completion.text;
+    if text.trim().is_empty() {
+        tracing::warn!(
+            "postmortem produced no final content after bounded retry (finish_reason={:?}, reasoning_present={})",
+            completion.finish_reason,
+            completion.reasoning_present
+        );
+        return Ok(vec![]);
+    }
     let trimmed = text.trim();
     let json_str = trimmed
         .strip_prefix("```json")
@@ -498,76 +677,16 @@ Examples:\n\
     let entries: Vec<PostmortemEntry> = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("postmortem parse failed: {e}, raw: {json_str}");
+            let preview = crate::trajectory::redact_text(json_str, 500);
+            tracing::warn!("postmortem parse failed: {e}, redacted preview: {preview}");
             return Ok(vec![]);
         }
     };
 
     // ── Persist as pending learning events
     let pool = state.db.read().await;
-    let now = Utc::now().to_rfc3339();
-    let mut created: Vec<LearningEvent> = Vec::new();
-    for e in entries {
-        // Skip empty fields.
-        let obs = e.observation.trim();
-        let sug = e.suggestion.trim();
-        if obs.is_empty() || sug.is_empty() {
-            continue;
-        }
-        // Drop exact duplicates — of an already-known learning OR one we just
-        // emitted this round. norm_suggestion folds case + whitespace so trivial
-        // rewordings of the same fact don't pile up now that learnings are
-        // injected into every chat.
-        if !seen.insert(norm_suggestion(sug)) {
-            continue;
-        }
-        // Resolve kind defensively: only honour 'preference' when the
-        // structured payload is actually present, else fall back to memory.
-        // This protects against the model returning kind="preference" with
-        // a missing pref_key — the row would otherwise be unactionable.
-        let raw_kind = e.kind.as_deref().unwrap_or("memory");
-        let (kind, pref_key, pref_value): (&str, Option<String>, Option<String>) =
-            if raw_kind == "preference" && e.pref_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
-                let key = e.pref_key.as_ref().unwrap().trim().to_string();
-                let val = e.pref_value.unwrap_or_default().trim().to_string();
-                ("preference", Some(key), Some(val))
-            } else {
-                ("memory", None, None)
-            };
-
-        let id = Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO learning_events \
-             (id, session_id, cwd, observation, suggestion, status, created_at, kind, pref_key, pref_value) \
-             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(&session_id)
-        .bind(&cwd)
-        .bind(obs)
-        .bind(sug)
-        .bind(&now)
-        .bind(kind)
-        .bind(&pref_key)
-        .bind(&pref_value)
-        .execute(&*pool)
-        .await?;
-        created.push(LearningEvent {
-            id,
-            session_id: session_id.clone(),
-            cwd: cwd.clone(),
-            observation: obs.into(),
-            suggestion: sug.into(),
-            status: "pending".into(),
-            created_at: now.clone(),
-            decided_at: None,
-            kind: kind.into(),
-            pref_key,
-            pref_value,
-            support_count: 0,
-            evidence_json: "{}".into(),
-        });
-    }
+    let created =
+        persist_postmortem_entries(&pool, &session_id, &cwd, entries, &mut seen).await?;
 
     // Notify UI so the Profile page + Workspace "记忆增量" panel can
     // refresh without polling. Per-cwd channel so two open projects
@@ -665,6 +784,7 @@ pub struct PatternInsight {
 
 #[derive(Debug, Clone)]
 pub struct ToolCallRow {
+    pub session_id: String,
     pub tool_name: String,
     pub status: String,
     pub error: Option<String>,
@@ -672,6 +792,7 @@ pub struct ToolCallRow {
 
 #[derive(Debug, Clone)]
 pub struct TaskRow {
+    pub session_id: String,
     // Fetched by the task queries but not yet consumed by the retry/pattern
     // detectors (which key off attempt_count + error); kept to match the row shape.
     #[allow(dead_code)]
@@ -692,18 +813,26 @@ fn pct(n: i64, d: i64) -> i64 {
 
 /// Tools whose recent failure rate is high enough to warn about.
 fn detect_tool_reliability(rows: &[ToolCallRow]) -> Vec<PatternInsight> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     let mut total: HashMap<&str, i64> = HashMap::new();
     let mut errs: HashMap<&str, i64> = HashMap::new();
     let mut sample: HashMap<&str, String> = HashMap::new();
+    let mut sessions: HashMap<&str, HashSet<&str>> = HashMap::new();
     for r in rows {
+        if !matches!(r.status.as_str(), "done" | "error") {
+            continue;
+        }
         *total.entry(r.tool_name.as_str()).or_default() += 1;
+        sessions
+            .entry(r.tool_name.as_str())
+            .or_default()
+            .insert(r.session_id.as_str());
         if r.status == "error" {
             *errs.entry(r.tool_name.as_str()).or_default() += 1;
             if let Some(e) = &r.error {
                 sample
                     .entry(r.tool_name.as_str())
-                    .or_insert_with(|| e.chars().take(80).collect());
+                    .or_insert_with(|| crate::trajectory::redact_text(e, 80));
             }
         }
     }
@@ -711,16 +840,26 @@ fn detect_tool_reliability(rows: &[ToolCallRow]) -> Vec<PatternInsight> {
     for (tool, &t) in &total {
         let e = errs.get(tool).copied().unwrap_or(0);
         let rate = pct(e, t);
-        if t >= 8 && rate >= 25 {
+        let session_count = sessions.get(tool).map_or(0, |items| items.len() as i64);
+        if t >= 8 && rate >= 25 && session_count >= 2 {
             let ex = sample.get(tool).cloned().unwrap_or_default();
             let tail = if ex.is_empty() { String::new() } else { format!("，最常见：{ex}") };
             out.push(PatternInsight {
-                observation: format!("工具 `{tool}` 最近 {t} 次调用失败 {e} 次（{rate}%）{tail}。"),
+                observation: format!("工具 `{tool}` 跨 {session_count} 个 session 的最近 {t} 次调用失败 {e} 次（{rate}%）{tail}。"),
                 suggestion: format!(
                     "`{tool}` 近期失败率偏高（{e}/{t}，{rate}%）——调用前先核对前置条件，或考虑替代方案。"
                 ),
-                support_count: t,
-                evidence: serde_json::json!({"detector":"tool_reliability","tool":tool,"total":t,"errors":e,"rate":rate}),
+                support_count: session_count,
+                evidence: serde_json::json!({
+                    "detector":"tool_reliability",
+                    "support_unit":"sessions",
+                    "tool":tool,
+                    "total":t,
+                    "total_calls":t,
+                    "errors":e,
+                    "rate":rate,
+                    "session_count":session_count
+                }),
             });
         }
     }
@@ -730,30 +869,37 @@ fn detect_tool_reliability(rows: &[ToolCallRow]) -> Vec<PatternInsight> {
 
 /// A failure that keeps forcing retries across tasks.
 fn detect_retry_prone(rows: &[TaskRow]) -> Vec<PatternInsight> {
-    use std::collections::HashMap;
-    let mut by_err: HashMap<String, (i64, String)> = HashMap::new();
+    use std::collections::{HashMap, HashSet};
+    let mut by_err: HashMap<String, (i64, String, HashSet<String>)> = HashMap::new();
     for r in rows {
         if r.attempt_count < 2 {
             continue;
         }
-        let raw = r.error.clone().unwrap_or_default();
+        let raw = crate::trajectory::redact_text(r.error.as_deref().unwrap_or_default(), 120);
         let key = norm_suggestion(&raw.chars().take(50).collect::<String>());
         if key.is_empty() {
             continue;
         }
         let entry = by_err
             .entry(key)
-            .or_insert((0, raw.chars().take(60).collect()));
+            .or_insert((0, raw.chars().take(60).collect(), HashSet::new()));
         entry.0 += 1;
+        entry.2.insert(r.session_id.clone());
     }
     let mut out: Vec<PatternInsight> = by_err
         .into_iter()
-        .filter(|(_, (count, _))| *count >= 3)
-        .map(|(_, (count, sample))| PatternInsight {
-            observation: format!("有 {count} 个任务因「{sample}」反复重试。"),
+        .filter(|(_, (count, _, sessions))| *count >= 3 && sessions.len() >= 2)
+        .map(|(_, (count, sample, sessions))| PatternInsight {
+            observation: format!("跨 {} 个 session 有 {count} 个任务因「{sample}」反复重试。", sessions.len()),
             suggestion: format!("反复踩坑：「{sample}」导致多次重试——值得加一道前置检查或固定解法。"),
-            support_count: count,
-            evidence: serde_json::json!({"detector":"retry_prone","count":count,"sample":sample}),
+            support_count: sessions.len() as i64,
+            evidence: serde_json::json!({
+                "detector":"retry_prone",
+                "support_unit":"sessions",
+                "task_count":count,
+                "session_count":sessions.len(),
+                "sample":sample
+            }),
         })
         .collect();
     out.sort_by(|a, b| b.support_count.cmp(&a.support_count));
@@ -798,7 +944,15 @@ fn detect_learning_calibration(rows: &[LearningDecisionRow]) -> Vec<PatternInsig
             observation: obs,
             suggestion: sug,
             support_count: d,
-            evidence: serde_json::json!({"detector":"learning_calibration","kind":kind,"decided":d,"accepted":a,"accept_rate":rate}),
+            evidence: serde_json::json!({
+                "detector":"learning_calibration",
+                "support_unit":"decisions",
+                "kind":kind,
+                "decided":d,
+                "decision_count":d,
+                "accepted":a,
+                "accept_rate":rate
+            }),
         });
     }
     out.sort_by(|a, b| b.support_count.cmp(&a.support_count));
@@ -819,47 +973,47 @@ fn run_detectors(
     out
 }
 
-/// Cross-session pattern miner. Aggregates the cwd's recent outcome data, runs
-/// the detectors, dedups against existing learnings (A3's norm_suggestion), and
-/// inserts the survivors as kind='pattern' pending rows — which accept-route
-/// like memory, so an accepted insight reaches chat via A1's injection.
-#[command]
-pub async fn mine_cross_session_patterns(
-    cwd: String,
-    app: AppHandle,
-    state: State<'_, AppState>,
+async fn mine_cross_session_patterns_for_pool(
+    cwd: &str,
+    pool: &SqlitePool,
 ) -> Result<Vec<LearningEvent>, AppError> {
-    let pool = state.db.read().await;
-
     // Tool calls in this project (tool_calls → messages → sessions.cwd).
-    let tools: Vec<ToolCallRow> = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT tc.tool_name, tc.status, tc.error \
+    let tools: Vec<ToolCallRow> = sqlx::query_as::<_, (String, String, String, Option<String>)>(
+        "SELECT s.id, tc.tool_name, tc.status, tc.error \
          FROM tool_calls tc \
          JOIN messages m ON tc.message_id = m.id \
          JOIN sessions s ON m.session_id = s.id \
          WHERE s.cwd = ? AND tc.status IN ('done','error') \
          ORDER BY tc.created_at DESC LIMIT 4000",
     )
-    .bind(&cwd)
-    .fetch_all(&*pool)
-    .await
-    .unwrap_or_default()
+    .bind(cwd)
+    .fetch_all(pool)
+    .await?
     .into_iter()
-    .map(|(tool_name, status, error)| ToolCallRow { tool_name, status, error })
+    .map(|(session_id, tool_name, status, error)| ToolCallRow {
+        session_id,
+        tool_name,
+        status,
+        error,
+    })
     .collect();
 
     // Task runs in this project (task_runs → sessions.cwd).
-    let tasks: Vec<TaskRow> = sqlx::query_as::<_, (String, i64, Option<String>)>(
-        "SELECT t.status, t.attempt_count, t.error \
+    let tasks: Vec<TaskRow> = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
+        "SELECT s.id, t.status, t.attempt_count, t.error \
          FROM task_runs t JOIN sessions s ON t.session_id = s.id \
          WHERE s.cwd = ? ORDER BY t.created_at DESC LIMIT 2000",
     )
-    .bind(&cwd)
-    .fetch_all(&*pool)
-    .await
-    .unwrap_or_default()
+    .bind(cwd)
+    .fetch_all(pool)
+    .await?
     .into_iter()
-    .map(|(status, attempt_count, error)| TaskRow { status, attempt_count, error })
+    .map(|(session_id, status, attempt_count, error)| TaskRow {
+        session_id,
+        status,
+        attempt_count,
+        error,
+    })
     .collect();
 
     // Decided learnings (accept/reject calibration).
@@ -867,10 +1021,9 @@ pub async fn mine_cross_session_patterns(
         "SELECT kind, status FROM learning_events \
          WHERE cwd = ? AND status IN ('accepted','rejected')",
     )
-    .bind(&cwd)
-    .fetch_all(&*pool)
-    .await
-    .unwrap_or_default()
+    .bind(cwd)
+    .fetch_all(pool)
+    .await?
     .into_iter()
     .map(|(kind, status)| LearningDecisionRow { kind, status })
     .collect();
@@ -879,10 +1032,9 @@ pub async fn mine_cross_session_patterns(
     let existing: Vec<(String,)> = sqlx::query_as(
         "SELECT suggestion FROM learning_events WHERE cwd = ? AND status IN ('accepted','pending')",
     )
-    .bind(&cwd)
-    .fetch_all(&*pool)
-    .await
-    .unwrap_or_default();
+    .bind(cwd)
+    .fetch_all(pool)
+    .await?;
     let mut seen: std::collections::HashSet<String> =
         existing.iter().map(|(s,)| norm_suggestion(s)).collect();
 
@@ -903,18 +1055,18 @@ pub async fn mine_cross_session_patterns(
              VALUES (?, '', ?, ?, ?, 'pending', ?, 'pattern', ?, ?)",
         )
         .bind(&id)
-        .bind(&cwd)
+        .bind(cwd)
         .bind(&ins.observation)
         .bind(&ins.suggestion)
         .bind(&now)
         .bind(ins.support_count)
         .bind(&evidence)
-        .execute(&*pool)
+        .execute(pool)
         .await?;
         created.push(LearningEvent {
             id,
             session_id: String::new(),
-            cwd: cwd.clone(),
+            cwd: cwd.to_string(),
             observation: ins.observation,
             suggestion: ins.suggestion,
             status: "pending".into(),
@@ -927,6 +1079,21 @@ pub async fn mine_cross_session_patterns(
             evidence_json: evidence,
         });
     }
+    Ok(created)
+}
+
+/// Cross-session pattern miner. Aggregates the cwd's recent outcome data, runs
+/// the detectors, dedups against existing learnings (A3's norm_suggestion), and
+/// inserts the survivors as kind='pattern' pending rows — which accept-route
+/// like memory, so an accepted insight reaches chat via A1's injection.
+#[command]
+pub async fn mine_cross_session_patterns(
+    cwd: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<LearningEvent>, AppError> {
+    let pool = state.db.read().await;
+    let created = mine_cross_session_patterns_for_pool(&cwd, &pool).await?;
     drop(pool);
 
     if !created.is_empty() {
@@ -993,24 +1160,35 @@ fn build_improvement_proposal(
 #[command]
 pub async fn self_improvement_proposal(state: State<'_, AppState>) -> Result<String, AppError> {
     let pool = state.db.read().await;
-    let tools: Vec<ToolCallRow> = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT tool_name, status, error FROM tool_calls \
-         WHERE status IN ('done','error') ORDER BY created_at DESC LIMIT 8000",
+    let tools: Vec<ToolCallRow> = sqlx::query_as::<_, (String, String, String, Option<String>)>(
+        "SELECT m.session_id, tc.tool_name, tc.status, tc.error FROM tool_calls tc \
+         JOIN messages m ON m.id = tc.message_id \
+         WHERE tc.status IN ('done','error') ORDER BY tc.created_at DESC LIMIT 8000",
     )
     .fetch_all(&*pool)
     .await
     .unwrap_or_default()
     .into_iter()
-    .map(|(tool_name, status, error)| ToolCallRow { tool_name, status, error })
+    .map(|(session_id, tool_name, status, error)| ToolCallRow {
+        session_id,
+        tool_name,
+        status,
+        error,
+    })
     .collect();
-    let tasks: Vec<TaskRow> = sqlx::query_as::<_, (String, i64, Option<String>)>(
-        "SELECT status, attempt_count, error FROM task_runs ORDER BY created_at DESC LIMIT 4000",
+    let tasks: Vec<TaskRow> = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
+        "SELECT session_id, status, attempt_count, error FROM task_runs ORDER BY created_at DESC LIMIT 4000",
     )
     .fetch_all(&*pool)
     .await
     .unwrap_or_default()
     .into_iter()
-    .map(|(status, attempt_count, error)| TaskRow { status, attempt_count, error })
+    .map(|(session_id, status, attempt_count, error)| TaskRow {
+        session_id,
+        status,
+        attempt_count,
+        error,
+    })
     .collect();
     drop(pool);
 
@@ -1078,15 +1256,21 @@ pub async fn propose_tool_gates(
     state: State<'_, AppState>,
 ) -> Result<Vec<ToolGateProposal>, AppError> {
     let pool = state.db.read().await;
-    let tools: Vec<ToolCallRow> = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT tool_name, status, error FROM tool_calls \
-         WHERE status IN ('done','error') ORDER BY created_at DESC LIMIT 8000",
+    let tools: Vec<ToolCallRow> = sqlx::query_as::<_, (String, String, String, Option<String>)>(
+        "SELECT m.session_id, tc.tool_name, tc.status, tc.error FROM tool_calls tc \
+         JOIN messages m ON m.id = tc.message_id \
+         WHERE tc.status IN ('done','error') ORDER BY tc.created_at DESC LIMIT 8000",
     )
     .fetch_all(&*pool)
     .await
     .unwrap_or_default()
     .into_iter()
-    .map(|(tool_name, status, error)| ToolCallRow { tool_name, status, error })
+    .map(|(session_id, tool_name, status, error)| ToolCallRow {
+        session_id,
+        tool_name,
+        status,
+        error,
+    })
     .collect();
     drop(pool);
     let allow = state.settings.read().await.permissions.allow.clone();
@@ -1144,6 +1328,119 @@ mod tests {
             resolve_postmortem_model(&settings).as_deref(),
             Some("deepseek-v4-pro")
         );
+    }
+
+    #[test]
+    fn postmortem_response_never_uses_reasoning_as_candidate_content() {
+        let response: AiResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "content": null,
+                    "reasoning_content": "private chain of thought"
+                }
+            }]
+        }))
+        .unwrap();
+
+        let completion = extract_postmortem_completion(response);
+
+        assert!(completion.text.is_empty());
+        assert!(completion.reasoning_present);
+        assert_eq!(completion.finish_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn postmortem_retry_expands_whichever_completion_budget_field_is_active() {
+        let mut max_tokens = serde_json::json!({"max_tokens": 500});
+        expand_postmortem_completion_budget(&mut max_tokens);
+        assert_eq!(max_tokens["max_tokens"], 2_000);
+        assert!(max_tokens.get("max_completion_tokens").is_none());
+
+        let mut max_completion_tokens = serde_json::json!({"max_completion_tokens": 500});
+        expand_postmortem_completion_budget(&mut max_completion_tokens);
+        assert_eq!(max_completion_tokens["max_completion_tokens"], 2_000);
+        assert!(max_completion_tokens.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn postmortem_candidates_are_redacted_before_dedup_and_storage() {
+        let entry = PostmortemEntry {
+            observation: r#"Model echoed {"token":"CF_EVO_CANDIDATE_TOKEN"}"#.into(),
+            suggestion: "Remember password=CF_EVO_CANDIDATE_PASSWORD".into(),
+            kind: Some("preference".into()),
+            pref_key: Some("testing_habit".into()),
+            pref_value: Some("Bearer CF_EVO_CANDIDATE_BEARER".into()),
+        };
+
+        let sanitized = sanitize_postmortem_entry(entry).unwrap();
+        let serialized = serde_json::to_string(&serde_json::json!({
+            "observation": sanitized.observation,
+            "suggestion": sanitized.suggestion,
+            "pref_key": sanitized.pref_key,
+            "pref_value": sanitized.pref_value,
+        }))
+        .unwrap();
+
+        assert!(!serialized.contains("CF_EVO_CANDIDATE_TOKEN"));
+        assert!(!serialized.contains("CF_EVO_CANDIDATE_PASSWORD"));
+        assert!(!serialized.contains("CF_EVO_CANDIDATE_BEARER"));
+        assert!(serialized.contains("<redacted>"));
+    }
+
+    #[test]
+    fn postmortem_invalid_preference_key_downgrades_to_memory() {
+        let entry = PostmortemEntry {
+            observation: "Observed a stable preference".into(),
+            suggestion: "Remember the preference safely".into(),
+            kind: Some("preference".into()),
+            pref_key: Some("bad-key\nSYSTEM override".into()),
+            pref_value: Some("unsafe value".into()),
+        };
+
+        let sanitized = sanitize_postmortem_entry(entry).unwrap();
+
+        assert_eq!(sanitized.kind.as_deref(), Some("memory"));
+        assert!(sanitized.pref_key.is_none());
+        assert!(sanitized.pref_value.is_none());
+    }
+
+    #[tokio::test]
+    async fn postmortem_storage_keeps_model_candidates_pending_and_redacted() {
+        let pool = fresh_miner_pool().await;
+        let entries = vec![PostmortemEntry {
+            observation: r#"Observed {"token":"CF_EVO_STORED_TOKEN"}"#.into(),
+            suggestion: "Remember password=CF_EVO_STORED_PASSWORD".into(),
+            kind: Some("preference".into()),
+            pref_key: Some("testing_habit".into()),
+            pref_value: Some("Bearer CF_EVO_STORED_BEARER".into()),
+        }];
+        let mut seen = std::collections::HashSet::new();
+
+        let created = persist_postmortem_entries(
+            &pool,
+            "session-postmortem",
+            "/proj",
+            entries,
+            &mut seen,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].status, "pending");
+        let row: (String, String, String, Option<String>) = sqlx::query_as(
+            "SELECT observation, suggestion, status, pref_value FROM learning_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let serialized = serde_json::to_string(&row).unwrap();
+        assert!(!serialized.contains("CF_EVO_STORED_TOKEN"));
+        assert!(!serialized.contains("CF_EVO_STORED_PASSWORD"));
+        assert!(!serialized.contains("CF_EVO_STORED_BEARER"));
+        assert!(serialized.contains("<redacted>"));
+        assert_eq!(row.2, "pending");
     }
 
     #[test]
@@ -1217,17 +1514,17 @@ mod tests {
         // flaky_gated: 9 calls, all errors → flaky, but NOT in `allow` (already gated).
         // bash: 10 calls, all errors → flaky + "allowed", but special-cased (already asks).
         let mut rows = Vec::new();
-        for _ in 0..6 {
-            rows.push(tc("edit_file", "ok", None));
+        for i in 0..6 {
+            rows.push(tc(if i % 2 == 0 { "s1" } else { "s2" }, "edit_file", "done", None));
         }
-        for _ in 0..4 {
-            rows.push(tc("edit_file", "error", Some("boom")));
+        for i in 0..4 {
+            rows.push(tc(if i % 2 == 0 { "s1" } else { "s2" }, "edit_file", "error", Some("boom")));
         }
-        for _ in 0..9 {
-            rows.push(tc("flaky_gated", "error", Some("x")));
+        for i in 0..9 {
+            rows.push(tc(if i % 2 == 0 { "s1" } else { "s2" }, "flaky_gated", "error", Some("x")));
         }
-        for _ in 0..10 {
-            rows.push(tc("bash", "error", Some("e")));
+        for i in 0..10 {
+            rows.push(tc(if i % 2 == 0 { "s1" } else { "s2" }, "bash", "error", Some("e")));
         }
         let insights = detect_tool_reliability(&rows);
         let allow = vec!["edit_file".to_string(), "bash".to_string(), "read_file".to_string()];
@@ -1303,24 +1600,29 @@ mod tests {
         );
     }
 
-    fn tc(name: &str, status: &str, err: Option<&str>) -> ToolCallRow {
-        ToolCallRow { tool_name: name.into(), status: status.into(), error: err.map(Into::into) }
+    fn tc(session_id: &str, name: &str, status: &str, err: Option<&str>) -> ToolCallRow {
+        ToolCallRow {
+            session_id: session_id.into(),
+            tool_name: name.into(),
+            status: status.into(),
+            error: err.map(Into::into),
+        }
     }
 
     #[test]
     fn tool_reliability_flags_only_high_volume_high_error_tools() {
         let mut rows = Vec::new();
         // flaky: 10 calls, 4 errors (40%) → flagged.
-        for i in 0..10 { rows.push(tc("bash", if i < 4 { "error" } else { "done" }, Some("pwsh not found"))); }
+        for i in 0..10 { rows.push(tc(if i % 2 == 0 { "s1" } else { "s2" }, "bash", if i < 4 { "error" } else { "done" }, Some("pwsh not found"))); }
         // reliable: 12 calls, 1 error (8%) → not flagged.
-        for i in 0..12 { rows.push(tc("read_file", if i < 1 { "error" } else { "done" }, None)); }
+        for i in 0..12 { rows.push(tc(if i % 2 == 0 { "s1" } else { "s2" }, "read_file", if i < 1 { "error" } else { "done" }, None)); }
         // flaky but low-volume: 5 calls, 3 errors → not flagged (< 8 calls).
-        for i in 0..5 { rows.push(tc("write_xlsx", if i < 3 { "error" } else { "done" }, None)); }
+        for i in 0..5 { rows.push(tc(if i % 2 == 0 { "s1" } else { "s2" }, "write_xlsx", if i < 3 { "error" } else { "done" }, None)); }
 
         let out = detect_tool_reliability(&rows);
         assert_eq!(out.len(), 1, "only the high-volume flaky tool is flagged");
         assert!(out[0].suggestion.contains("bash"));
-        assert_eq!(out[0].support_count, 10);
+        assert_eq!(out[0].support_count, 2);
         assert!(out[0].evidence.get("rate").and_then(|v| v.as_i64()) == Some(40));
     }
 
@@ -1328,13 +1630,13 @@ mod tests {
     fn retry_prone_groups_by_error_and_needs_three() {
         let rows = vec![
             // Same recurring failure (case/whitespace fold to one key) on retries.
-            TaskRow { status: "completed".into(), attempt_count: 3, error: Some("schannel: server closed abruptly".into()) },
-            TaskRow { status: "completed".into(), attempt_count: 2, error: Some("schannel: server closed abruptly".into()) },
-            TaskRow { status: "failed".into(), attempt_count: 4, error: Some("Schannel:  server  closed  abruptly".into()) },
+            TaskRow { session_id: "s1".into(), status: "completed".into(), attempt_count: 3, error: Some("schannel: server closed abruptly".into()) },
+            TaskRow { session_id: "s2".into(), status: "completed".into(), attempt_count: 2, error: Some("schannel: server closed abruptly".into()) },
+            TaskRow { session_id: "s3".into(), status: "failed".into(), attempt_count: 4, error: Some("Schannel:  server  closed  abruptly".into()) },
             // single-attempt → ignored even though same error.
-            TaskRow { status: "completed".into(), attempt_count: 1, error: Some("schannel: server closed abruptly".into()) },
+            TaskRow { session_id: "s1".into(), status: "completed".into(), attempt_count: 1, error: Some("schannel: server closed abruptly".into()) },
             // a different one-off retry error → its own group, below threshold.
-            TaskRow { status: "failed".into(), attempt_count: 2, error: Some("totally different".into()) },
+            TaskRow { session_id: "s4".into(), status: "failed".into(), attempt_count: 2, error: Some("totally different".into()) },
         ];
         let out = detect_retry_prone(&rows);
         assert_eq!(out.len(), 1, "only the 3x recurring retry error is surfaced");
@@ -1397,5 +1699,129 @@ mod tests {
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().any(|(id,)| id == "a"));
         assert!(pending.iter().any(|(id,)| id == "c"));
+    }
+
+    async fn fresh_miner_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for ddl in [
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT NOT NULL)",
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL)",
+            "CREATE TABLE tool_calls (
+                id TEXT PRIMARY KEY, message_id TEXT NOT NULL, tool_name TEXT NOT NULL,
+                status TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL
+            )",
+            "CREATE TABLE task_runs (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, status TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL, error TEXT, created_at TEXT NOT NULL
+            )",
+            "CREATE TABLE learning_events (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, cwd TEXT NOT NULL,
+                observation TEXT NOT NULL, suggestion TEXT NOT NULL, status TEXT NOT NULL,
+                created_at TEXT NOT NULL, decided_at TEXT, kind TEXT NOT NULL DEFAULT 'memory',
+                pref_key TEXT, pref_value TEXT, support_count INTEGER NOT NULL DEFAULT 0,
+                evidence_json TEXT NOT NULL DEFAULT '{}'
+            )",
+        ] {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    #[tokio::test]
+    async fn miner_requires_real_cross_session_support_and_ignores_non_terminal_rows() {
+        let pool = fresh_miner_pool().await;
+        for (session_id, cwd) in [("s1", "/proj"), ("s2", "/proj"), ("other", "/other")] {
+            sqlx::query("INSERT INTO sessions (id, cwd) VALUES (?, ?)")
+                .bind(session_id)
+                .bind(cwd)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO messages (id, session_id) VALUES (?, ?)")
+                .bind(format!("m-{session_id}"))
+                .bind(session_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let mut created_at = 1_i64;
+        for (session_id, status, error) in [
+            ("s1", "done", None),
+            ("s1", "done", None),
+            ("s1", "done", None),
+            ("s1", "error", Some("password=CF_EVO_MINER_SECRET")),
+            ("s2", "done", None),
+            ("s2", "done", None),
+            ("s2", "done", None),
+            ("s2", "error", Some("password=CF_EVO_MINER_SECRET")),
+            ("s1", "denied", Some("user denied")),
+            ("s2", "pending", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO tool_calls (id, message_id, tool_name, status, error, created_at) \
+                 VALUES (?, ?, 'edit_file', ?, ?, ?)",
+            )
+            .bind(format!("tc-{created_at}"))
+            .bind(format!("m-{session_id}"))
+            .bind(status)
+            .bind(error)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+            created_at += 1;
+        }
+
+        // Eight errors in one session must not be called a cross-session pattern.
+        for index in 0..8 {
+            sqlx::query(
+                "INSERT INTO tool_calls (id, message_id, tool_name, status, error, created_at) \
+                 VALUES (?, 'm-s1', 'single_session_tool', 'error', 'boom', ?)",
+            )
+            .bind(format!("single-{index}"))
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+            created_at += 1;
+        }
+
+        // A different cwd must never influence this project's denominator.
+        for index in 0..8 {
+            sqlx::query(
+                "INSERT INTO tool_calls (id, message_id, tool_name, status, error, created_at) \
+                 VALUES (?, 'm-other', 'edit_file', 'error', 'other cwd', ?)",
+            )
+            .bind(format!("other-{index}"))
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+            created_at += 1;
+        }
+
+        let created = mine_cross_session_patterns_for_pool("/proj", &pool)
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].support_count, 2);
+        assert!(!created[0].observation.contains("CF_EVO_MINER_SECRET"));
+        assert!(!created[0].suggestion.contains("CF_EVO_MINER_SECRET"));
+        let evidence: serde_json::Value =
+            serde_json::from_str(&created[0].evidence_json).unwrap();
+        assert_eq!(evidence["total_calls"], 8);
+        assert_eq!(evidence["errors"], 2);
+        assert_eq!(evidence["rate"], 25);
+        assert_eq!(evidence["session_count"], 2);
+
+        let second = mine_cross_session_patterns_for_pool("/proj", &pool)
+            .await
+            .unwrap();
+        assert!(second.is_empty(), "second scan must deduplicate the same pattern");
     }
 }

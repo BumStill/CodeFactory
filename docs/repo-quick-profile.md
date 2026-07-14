@@ -3,7 +3,7 @@
 ## Task Entry
 - Repository: `CodeFactory`
 - 产品类型：Windows AI 编程 Agent 桌面客户端。
-- 当前状态：`v1.43.0` 基线已包含桌面聊天、受控工具、知识、学习/自进化框架、Control Plane 与 Terminal-Bench 2.1 评估面；Evolution Agent 正按 `docs/long-tasks/evolution-agent-closed-loop.md` 修复真实轨迹底座。
+- 当前状态：`v1.43.1` 基线已包含桌面聊天、受控工具、知识、学习/自进化框架、Control Plane 与 Terminal-Bench 2.1 评估面；Evolution Agent 正按 `docs/long-tasks/evolution-agent-closed-loop.md` 修复真实轨迹底座。
 - 日常任务先加载本文件、任务说明和 quick gate 结果。
 - quick gate 标记 release、compatibility、observation、payload、viewport 或 governance-change 时，再加载 `docs/repo-governance-profile.md`。
 
@@ -30,6 +30,12 @@
 - UI 主路径：目标视口截图或录屏，证明输入、审批、diff、命令输出和结果状态不互相遮挡。
 - Release 路径：安装包或发布地址、build metadata、`/health` 或等价健康证据、回滚边界、主路径 live verification。
 - AI Collaboration：context scope、assumptions、review point、validation result。
+
+## Dev 实地验证权限基线
+- CodeFactory 的本地 Dev、隔离 wrapper、临时 app bundle 及其他等价验证环境，在执行真实主路径前默认先启用并保存“信任模式（完全放手）”；agent 自行完成权限设置和授权，不把普通工具确认交给用户。
+- 只有验收目标本身是权限询问、拒绝、hook cancel 或权限绕过防护时，才临时切换到 ask/deny；该场景结束后恢复完全权限，并在证据中写明切换范围。
+- 完全权限只用于当前已授权任务内的产品工具调用，不扩大部署、外发消息、账号、支付、交易、数据删除等外部或高风险操作权限。
+- 并行任务存在时优先使用独立 identifier、数据目录和 app wrapper，避免改动或抢占其他任务的 Dev 环境。
 
 ## 快速命令
 - 治理基线：`python tools/governance/validate_repo_governance_baseline.py`

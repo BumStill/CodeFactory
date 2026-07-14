@@ -33,16 +33,19 @@ Phase 0 不先新增大而全的看板，而是让现有 Profile 学习日志、
 - 普通聊天无 task run：仍可使用会话摘要；不得显示永久空态。
 - anonymous：明确“无痕会话不会进入自进化分析”。
 - 脱敏命中：详情以 `<redacted>` 展示，不提供绕过按钮。
+- pattern 证据徽标只在 `evidence_json.support_unit` 明确声明时显示“session”或“决策”；旧记录缺少单位时统一显示中性的“条证据”，避免把历史调用数/任务数误说成跨会话数。
 
 ## 5. Viewport
 
 - 目标：1366×768 与窄窗口。
 - Review 主动作在首屏可见；详情可折叠；错误与隐私状态不能只靠颜色。
 - 长路径、错误和参数摘要必须换行或截断，不能撑破卡片。
-- 真实桌面验证使用 `/Applications/CodeFactoryDev.app`，不能只依赖 jsdom。
+- 真实桌面验证使用已注册的 CodeFactory Dev app wrapper，不能只依赖 jsdom；并行任务存在时使用独立 identifier、端口和数据目录，不抢占共享 wrapper。
+- 普通 Dev 验收开始前由 agent 自行启用并保存“信任模式（完全放手）”，不把产品工具授权交给用户；只有权限询问、拒绝、hook cancel 或绕过防护本身是验收目标时才临时切回 ask/deny，结束后恢复完全权限。
+- 完全权限只覆盖当前任务内的产品工具调用，不扩大部署、外发、账号、支付、交易、数据删除等权限。
 
 ## 6. Phase 0 实地验收
 
 在同一真实项目分别执行：allow 成功、ask 后拒绝、hook cancel、工具返回 error、dispatch error。核对工具卡和 SQLite 的 tool、status、duration、error、cwd、session；重启后仍可追溯。再执行 anonymous 同类动作，确认计数不变。最后从 Profile 运行跨会话分析，并验证它读取真实新轨迹而不是 fixture。
 
-2026-07-14 本地切片已实地走过 allow 成功、ask 后拒绝、工具 error、重启后 DB 回溯与 anonymous 零持久化；hook cancel、dispatch error 和跨会话 miner 仍是 Phase 0 剩余验收，不得从单元测试推定通过。
+2026-07-14 隔离的 `CodeFactoryEvolutionDev` 已实地走过 allow/error、ask/hook cancel、完全权限无弹窗、进程重启后 done/error 工具卡恢复、两个同项目 session 的跨会话 miner、Profile 人工采纳、写入项目记忆和重复分析去重。真实 miner 展示 `bash` 跨 2 个 session、19 次调用、5 次错误、26%，与数据库一致。anonymous 零持久化沿用本日早先实测；真实 dispatch error 和修复后的 post-mortem 模型候选仍是 Phase 0 剩余证据，不得从单元测试推定通过。

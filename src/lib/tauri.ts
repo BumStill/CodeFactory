@@ -66,6 +66,8 @@ export interface Message {
   model_id?: string;
   input_tokens?: number;
   output_tokens?: number;
+  /** Serialized provider tool declarations on assistant messages. */
+  tool_calls?: string | null;
   created_at: number;
 }
 

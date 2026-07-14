@@ -35,12 +35,19 @@
 | Permission | ask 后拒绝 | status=denied、duration=0，不计工具失败 | UI decision + DB row |
 | Hook | pre-tool cancel | status=denied，不执行工具 | hook log + DB row |
 | Runtime error | dispatch 返回 Err | status=error 后再传播错误 | regression test + DB row |
+| Replay | done/error/denied terminal state | normalized row 与唯一 tool replay message 同事务一致；重试更新旧 replay | rollback + error→done integration |
+| Replay | assistant/replay 同毫秒写入 | provider history 用 `created_at,rowid` 稳定排序 | query assertion + restart path |
+| Replay | app 重启后加载历史会话 | assistant declaration 与 `role=tool` replay 重新折叠成同一工具卡，保留 done/error/denied | store hydration test + real restart UI |
 | Chat | 无 task_run 的普通/Quick 会话 | 生成有限脱敏 session summary | prompt-builder test + real chat |
 | Privacy | anonymous 同类调用 | DB/session/learning/evidence/cost 计数不变 | 前后计数 |
 | Privacy | user 输入含测试 secret，模型/工具复述 | 用户原始消息按既有历史保留；assistant/tool/trace/Evidence 均不复制原值 | DB 字段级 grep |
+| Privacy | JSON 敏感值含转义字符串、数字或布尔值 | 先 parse 后递归脱敏，输出仍是合法 JSON | structured redaction fixtures |
+| Safety | 模型返回非法 preference key | 降级为 memory，不写入 user_preferences/system prompt | sanitizer + storage assertion |
 | Compatibility | v1.43.0 旧 DB | 启动后表/索引存在，旧消息可重放 | migration fixture |
 | Evidence | 生成 evidence pack | 读取 normalized rows，含 status/error/duration，无 secret | pack field assertion |
-| Analysis | 运行跨会话挖掘 | 只基于 done/error，真实信号非 fixture | query + UI + DB |
+| Analysis | 运行跨会话挖掘 | 只基于 done/error，至少来自两个不同 session，真实信号非 fixture | query + UI + DB |
+| Analysis | 展示新旧 pattern evidence | 新数据按声明 unit 展示；legacy count 不误标为 session | Profile component test + real UI |
+| Review | 采纳 pattern 候选 | event 变为 accepted，建议只写入当前项目记忆；重复分析不新增同候选 | Profile action + DB + memory.md |
 
 ## 5. 完成边界
 

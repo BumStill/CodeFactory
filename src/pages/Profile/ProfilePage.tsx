@@ -50,7 +50,7 @@ export function ProfilePage({ onBack }: ProfilePageProps) {
 
   // Pick the most-recently-touched session as the default focus, since
   // it's almost always what the user wants to edit right now.
-  const initialCwd = useMemo(() => sessions[0]?.cwd ?? null, [sessions.length]);
+  const initialCwd = useMemo(() => sessions[0]?.cwd ?? null, [sessions]);
   const [selectedCwd, setSelectedCwd] = useState<string | null>(null);
 
   useEffect(() => {
@@ -893,7 +893,46 @@ export function ToolGateSection() {
   );
 }
 
-function LearningEventCard({
+function patternEvidenceSummary(event: LearningEvent): string {
+  if (event.kind !== "pattern") return "";
+  try {
+    const evidence = JSON.parse(event.evidence_json) as Record<string, unknown>;
+    const detector = String(evidence.detector ?? "");
+    const hasSessionEvidence =
+      evidence.support_unit === "sessions" || typeof evidence.session_count === "number";
+    if (detector === "tool_reliability" && hasSessionEvidence) {
+      return `${Number(evidence.session_count ?? event.support_count)} 个 session · ${Number(evidence.total_calls ?? evidence.total ?? 0)} 次调用 · ${Number(evidence.errors ?? 0)} 次错误 · ${Number(evidence.rate ?? 0)}%`;
+    }
+    if (detector === "retry_prone" && hasSessionEvidence) {
+      return `${Number(evidence.session_count ?? event.support_count)} 个 session · ${Number(evidence.task_count ?? 0)} 个重试任务`;
+    }
+    if (detector === "learning_calibration") {
+      return `${Number(evidence.decision_count ?? evidence.decided ?? event.support_count)} 次人工决定`;
+    }
+  } catch {
+    // Legacy rows may contain malformed evidence; keep the review surface
+    // usable and state the generic support count instead of hiding the card.
+  }
+  return `${event.support_count} 条支持证据`;
+}
+
+function patternSupportLabel(event: LearningEvent): string {
+  if (event.kind !== "pattern") return "";
+  try {
+    const evidence = JSON.parse(event.evidence_json) as Record<string, unknown>;
+    if (evidence.support_unit === "sessions") {
+      return `${event.support_count} 个 session`;
+    }
+    if (evidence.support_unit === "decisions") {
+      return `${event.support_count} 次决策`;
+    }
+  } catch {
+    // Fall through to the neutral legacy label.
+  }
+  return `${event.support_count} 条证据`;
+}
+
+export function LearningEventCard({
   event,
   busy,
   onAccept,
@@ -906,6 +945,8 @@ function LearningEventCard({
 }) {
   const isPref = event.kind === "preference";
   const isPattern = event.kind === "pattern";
+  const evidenceSummary = patternEvidenceSummary(event);
+  const supportLabel = patternSupportLabel(event);
   return (
     <div className="rounded-lg border border-accent/40 bg-accent/5 p-4">
       <div className="flex items-start gap-2 mb-2">
@@ -923,11 +964,11 @@ function LearningEventCard({
             isPref
               ? "采纳后写入「个人偏好」表"
               : isPattern
-                ? `跨会话挖掘的模式（${event.support_count} 次证据），采纳后追加到 memory.md`
+                ? `跨会话挖掘的模式（${evidenceSummary}），采纳后追加到 memory.md`
                 : "采纳后追加到 memory.md"
           }
         >
-          {isPref ? "偏好" : isPattern ? `模式 · ${event.support_count}会话` : "记忆"}
+          {isPref ? "偏好" : isPattern ? `模式 · ${supportLabel}` : "记忆"}
         </span>
       </div>
       <div className="rounded bg-surface-2 border border-border px-3 py-2 mb-3">
@@ -938,6 +979,11 @@ function LearningEventCard({
         {isPref && event.pref_key && (
           <p className="mt-1 text-[10px] text-gray-500 font-mono">
             → {event.pref_key} = <span className="text-accent">{event.pref_value ?? ""}</span>
+          </p>
+        )}
+        {isPattern && evidenceSummary && (
+          <p className="mt-1 text-[10px] text-gray-500">
+            证据：{evidenceSummary}
           </p>
         )}
       </div>
@@ -961,4 +1007,3 @@ function LearningEventCard({
     </div>
   );
 }
-
