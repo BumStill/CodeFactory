@@ -807,6 +807,32 @@ pub fn evaluate_budget_command_with_time(
         && wall_time.is_some_and(|(remaining, total)| {
             total > 0 && remaining <= total.saturating_mul(2) / 3
         });
+
+    let required_extensions = evidence
+        .required_source_scan_extensions
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let source_scan_blocked = !required_extensions.is_empty()
+        && evidence
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("source compatibility"));
+    if source_scan_blocked {
+        let source_mutation = matches!(kind, ToolKind::Mutation)
+            && !is_dependency_install_command(&command.to_ascii_lowercase());
+        if source_mutation
+            || is_repository_alias_discovery_command(command)
+            || is_repository_source_scan_command(command, &required_extensions)
+        {
+            return PolicyDecision::Allow;
+        }
+        return deny(
+            "execution_budget",
+            "before another build or install, derive every local import alias from the repository and complete the required clean residual scan across all observed source/build-input extensions; make the scan return 0 only when no unresolved matches remain",
+        );
+    }
+
     if remaining_model_rounds > 8 && !time_finalization_window && !source_delivery_checkpoint {
         return PolicyDecision::Allow;
     }
@@ -903,28 +929,6 @@ pub fn evaluate_budget_command_with_time(
         }
     }
 
-    let required_extensions = evidence
-        .required_source_scan_extensions
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let source_scan_blocked = !required_extensions.is_empty()
-        && evidence
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("source compatibility"));
-    if source_scan_blocked {
-        let source_mutation = matches!(kind, ToolKind::Mutation)
-            && !is_dependency_install_command(&command.to_ascii_lowercase());
-        if source_mutation || is_repository_source_scan_command(command, &required_extensions) {
-            return PolicyDecision::Allow;
-        }
-        return deny(
-            "execution_budget",
-            "resolve the outstanding source compatibility edit or complete the required repository-wide residual scan before expanding scope",
-        );
-    }
-
     let time_read_only_exhausted =
         wall_time.is_some_and(|(remaining, total)| total > 0 && remaining <= (total / 6).max(60));
     if (remaining_model_rounds <= 3 || time_read_only_exhausted)
@@ -988,9 +992,18 @@ impl CompletionGate {
                 "runtime upgrade",
                 "dependency upgrade",
                 "api upgrade",
+                "不兼容",
+                "兼容",
+                "已移除",
+                "弃用",
+                "废弃",
+                "源码迁移",
+                "运行时升级",
+                "依赖升级",
+                "api 升级",
             ],
         );
-        let source_delivery_required = lower.contains("install")
+        let source_delivery_required = (lower.contains("install") || lower.contains("安装"))
             && contains_any(
                 &lower,
                 &[
@@ -999,10 +1012,24 @@ impl CompletionGate {
                     "compile extension",
                     "compiled extension",
                     "build extension",
+                    "从源码",
+                    "源码构建",
+                    "编译扩展",
+                    "构建扩展",
                 ],
             );
-        let project_tests_required =
-            source_delivery_required && contains_any(&lower, &["test", "pytest", "test suite"]);
+        let project_tests_required = source_delivery_required
+            && contains_any(
+                &lower,
+                &[
+                    "test",
+                    "pytest",
+                    "test suite",
+                    "项目测试",
+                    "测试套件",
+                    "完整测试",
+                ],
+            );
         Self::new_with_source_requirements(
             require_action,
             source_compatibility_audit_required,
@@ -1336,9 +1363,37 @@ fn collect_source_extensions(text: &str, extensions: &mut BTreeSet<String>) {
 }
 
 fn is_source_mutation(outcome: &ToolOutcome) -> bool {
-    outcome.succeeded()
-        && matches!(outcome.kind, ToolKind::Mutation)
-        && !is_dependency_install_command(&outcome.command.to_ascii_lowercase())
+    if !matches!(outcome.kind, ToolKind::Mutation)
+        || outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("policy denied command"))
+    {
+        return false;
+    }
+
+    let lower_command = outcome.command.to_ascii_lowercase();
+    has_explicit_file_mutation(&lower_command)
+        || (outcome.succeeded() && !is_dependency_install_command(&lower_command))
+}
+
+fn has_explicit_file_mutation(command: &str) -> bool {
+    contains_any(
+        command,
+        &[
+            "apply_patch",
+            "sed -i",
+            "perl -pi",
+            "tee ",
+            "cat >",
+            "cat >>",
+            "touch ",
+            "rm ",
+            "mv ",
+            "cp ",
+            "git apply",
+        ],
+    )
 }
 
 fn detect_missing_test_runner(outcome: &ToolOutcome) -> Option<&'static str> {
@@ -1449,6 +1504,26 @@ fn is_repository_source_scan_command(
     required_extensions
         .iter()
         .all(|extension| lower.contains(extension))
+}
+
+fn is_repository_alias_discovery_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let repository_wide = lower.contains("rg ")
+        || lower.contains("grep -r")
+        || lower.contains("grep --recursive")
+        || lower.contains("find ")
+        || lower.contains("os.walk(");
+    let alias_focused = contains_any(
+        &lower,
+        &[
+            "^(import|from)",
+            "import ",
+            "from ",
+            " require(",
+            "require(",
+        ],
+    );
+    repository_wide && alias_focused
 }
 
 fn source_scan_has_clean_exit_contract(command: &str) -> bool {
@@ -2175,7 +2250,7 @@ mod tests {
     }
 
     #[test]
-    fn source_midpoint_delivery_stages_take_priority_over_residual_scan() {
+    fn source_compatibility_scan_precedes_rebuild_at_midpoint() {
         let evidence = CompletionEvidence {
             require_action: true,
             outcome_count: 20,
@@ -2190,7 +2265,7 @@ mod tests {
             ..CompletionEvidence::default()
         };
 
-        assert!(!evaluate_budget_command_with_time(
+        assert!(evaluate_budget_command_with_time(
             50,
             Some((430, 900)),
             &evidence,
@@ -2198,7 +2273,7 @@ mod tests {
             &ToolKind::ReadOnly,
         )
         .is_allowed());
-        assert!(evaluate_budget_command_with_time(
+        assert!(!evaluate_budget_command_with_time(
             50,
             Some((430, 900)),
             &evidence,
@@ -2394,6 +2469,136 @@ mod tests {
         complete_scan.stdout = "PASSED: no unresolved compatibility matches".to_owned();
         gate.record(&complete_scan);
         assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn failed_compound_source_edit_is_recorded_before_delivery_recovery() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Update this package for runtime compatibility, compile the extensions, install from source, and run the project tests.",
+        );
+
+        let mut build_inputs = outcome(1, ToolKind::ReadOnly, 0);
+        build_inputs.command = "cat setup.py".to_owned();
+        build_inputs.stdout = "Extension('pkg.fast', ['pkg/fast.pyx'])".to_owned();
+        gate.record(&build_inputs);
+
+        let mut mixed = outcome(2, ToolKind::Mutation, 1);
+        mixed.command = "sed -i 's/legacy/modern/' pkg/main.py && python setup.py build_ext --inplace && pip install -e . --no-build-isolation && cd /tmp && python -c 'import pkg'".to_owned();
+        mixed.stdout = "Runtime import failed after the source edit".to_owned();
+        gate.record(&mixed);
+
+        let evidence = gate.evidence();
+        assert_eq!(evidence.last_source_mutation_sequence, Some(2));
+        assert!(evidence
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("clean repository-wide residual scan")));
+        assert!(evidence
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("install from source after the last source edit")));
+    }
+
+    #[test]
+    fn failed_non_editing_mutation_does_not_record_a_source_edit() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Compile and install this source package, then run the project tests.",
+        );
+        let mut failed_build = outcome(1, ToolKind::Mutation, 1);
+        failed_build.command = "python setup.py build_ext --inplace".to_owned();
+        failed_build.stderr = "compiler failed".to_owned();
+
+        gate.record(&failed_build);
+
+        assert_eq!(gate.evidence().last_source_mutation_sequence, None);
+    }
+
+    #[test]
+    fn chinese_source_compatibility_instruction_enables_delivery_gates() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "修复源码包的兼容性，构建编译扩展，从源码安装，在源码目录外验证，并运行完整项目测试。",
+        );
+        let mut build_inputs = outcome(1, ToolKind::ReadOnly, 0);
+        build_inputs.command = "cat setup.py".to_owned();
+        build_inputs.stdout = "Extension('pkg.fast', ['pkg/native.c'])".to_owned();
+        gate.record(&build_inputs);
+
+        let mut edit = outcome(2, ToolKind::Mutation, 0);
+        edit.command = "sed -i 's/old_api/new_api/g' pkg/main.py".to_owned();
+        gate.record(&edit);
+
+        let evidence = gate.evidence();
+        assert!(evidence.source_delivery_required);
+        assert!(evidence.project_tests_required);
+        assert!(evidence
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("clean repository-wide residual scan")));
+        assert!(evidence
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("successful install from source")));
+        assert!(evidence
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("successful project tests")));
+    }
+
+    #[test]
+    fn source_checkpoint_blocks_rebuild_until_alias_aware_residual_scan() {
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 4,
+            last_mutation_sequence: Some(4),
+            last_failure_sequence: None,
+            required_source_scan_extensions: vec![".py".to_owned(), ".pyx".to_owned()],
+            source_delivery_required: true,
+            last_source_mutation_sequence: Some(4),
+            blockers: vec![
+                "source compatibility work requires a clean repository-wide residual scan"
+                    .to_owned(),
+            ],
+            ..CompletionEvidence::default()
+        };
+
+        assert!(!evaluate_budget_command_with_time(
+            20,
+            Some((500, 900)),
+            &evidence,
+            "python setup.py build_ext --inplace && pip install -e .",
+            &ToolKind::Mutation,
+        )
+        .is_allowed());
+
+        assert!(!evaluate_budget_command_with_time(
+            20,
+            Some((800, 900)),
+            &evidence,
+            "python setup.py build_ext --inplace && pip install -e .",
+            &ToolKind::Mutation,
+        )
+        .is_allowed());
+
+        assert!(evaluate_budget_command_with_time(
+            20,
+            Some((500, 900)),
+            &evidence,
+            "rg '^(import|from) ' --glob '*.py' --glob '*.pyx' .",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+
+        assert!(evaluate_budget_command_with_time(
+            20,
+            Some((500, 900)),
+            &evidence,
+            "rg '^(import|from) ' --glob '*.py' --glob '*.pyx' . >/tmp/import-aliases; rg 'legacy_api' --glob '*.py' --glob '*.pyx' . >/tmp/residuals; test ! -s /tmp/residuals",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
     }
 
     #[test]
