@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "codefactory"
-version = "1.42.8"
+version = "1.43.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
