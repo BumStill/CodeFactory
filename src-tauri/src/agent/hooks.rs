@@ -84,6 +84,16 @@ impl HookRunner {
         }
     }
 
+    /// Anonymous sessions promise no persistent learning/audit residue. Hooks
+    /// may write files or run external commands, so they are disabled entirely
+    /// for that mode instead of trying to classify individual hook actions.
+    pub fn disabled(app_handle: AppHandle) -> Self {
+        Self {
+            configs: Vec::new(),
+            app_handle,
+        }
+    }
+
     /// Fire a hook event. Returns `false` if a `pre_tool` hook cancels the call.
     pub async fn fire(&self, event: HookEvent) -> bool {
         let event_name = event.event_name();

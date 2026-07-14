@@ -11,6 +11,7 @@ mod knowledge;
 mod mcp;
 mod openrouter;
 mod secrets;
+mod trajectory;
 mod storage;
 mod tools;
 mod util;

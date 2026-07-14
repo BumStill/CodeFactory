@@ -104,6 +104,31 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         .execute(pool)
         .await?;
 
+    // CF-EVO-R1: normalized tool lifecycle is the observation truth source.
+    // Historic databases may only have messages.tool_calls JSON, so create
+    // the table idempotently instead of trusting a migration version slot.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS tool_calls (
+            id          TEXT PRIMARY KEY,
+            message_id  TEXT NOT NULL,
+            tool_name   TEXT NOT NULL,
+            arguments   TEXT NOT NULL DEFAULT '{}',
+            result      TEXT,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            error       TEXT,
+            duration_ms INTEGER,
+            created_at  INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_tool_calls_status ON tool_calls(status)")
+        .execute(pool)
+        .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS task_dependencies (
             task_id            TEXT NOT NULL,
@@ -366,6 +391,7 @@ mod tests {
             "knowledge_documents",
             "knowledge_chunks",
             "retrieval_events",
+            "tool_calls",
             "benchmark_runs",
             "benchmark_trials",
         ] {
@@ -388,5 +414,17 @@ mod tests {
             task_cols.contains(&"task_context_json".to_string()),
             "task_runs must persist connector context for task execution evidence. Got: {task_cols:?}"
         );
+
+        let tool_cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('tool_calls')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        for expected in ["arguments", "result", "status", "error", "duration_ms"] {
+            assert!(
+                tool_cols.contains(&expected.to_string()),
+                "tool_calls must expose {expected}. Got: {tool_cols:?}"
+            );
+        }
     }
 }

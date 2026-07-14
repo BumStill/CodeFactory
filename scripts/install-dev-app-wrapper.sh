@@ -11,7 +11,7 @@
 #      whose CFBundleIdentifier is `com.codefactory.dev` (distinct from
 #      the production `com.codefactory.app` so the two can coexist).
 #   2. The bundle's executable is a thin shim that runs the project's
-#      `pnpm tauri dev` in this checkout.
+#      `pnpm tauri dev` with a dev-only Tauri identifier in this checkout.
 #   3. Register the bundle with LaunchServices (`lsregister -f`).
 #
 # Idempotent. Re-running upgrades the existing wrapper.
@@ -92,7 +92,7 @@ export PATH="$CARGO_BIN:$(dirname "$PNPM_PATH"):/usr/local/bin:/opt/homebrew/bin
 cd "$PROJECT_ROOT"
 
 # Log stdout/stderr so dev-app failures don't disappear silently.
-exec "$PNPM_PATH" tauri dev >> "/tmp/CodeFactoryDev-\$(date +%Y%m%d).log" 2>&1
+exec "$PNPM_PATH" tauri dev --config "src-tauri/tauri.dev.conf.json" >> "/tmp/CodeFactoryDev-\$(date +%Y%m%d).log" 2>&1
 EOF
 
 chmod +x "$APP_PATH/Contents/MacOS/$DISPLAY_NAME"

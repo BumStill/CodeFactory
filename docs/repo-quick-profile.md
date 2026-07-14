@@ -3,7 +3,7 @@
 ## Task Entry
 - Repository: `CodeFactory`
 - 产品类型：Windows AI 编程 Agent 桌面客户端。
-- 当前状态：已存在 Tauri 2 + React + TypeScript 基础聊天、模型列表、工具调用和权限流代码。
+- 当前状态：`v1.43.0` 基线已包含桌面聊天、受控工具、知识、学习/自进化框架、Control Plane 与 Terminal-Bench 2.1 评估面；Evolution Agent 正按 `docs/long-tasks/evolution-agent-closed-loop.md` 修复真实轨迹底座。
 - 日常任务先加载本文件、任务说明和 quick gate 结果。
 - quick gate 标记 release、compatibility、observation、payload、viewport 或 governance-change 时，再加载 `docs/repo-governance-profile.md`。
 
@@ -37,5 +37,5 @@
 - 长任务记录：`python tools/governance/validate_long_task_record.py --task-record-path <path>`
 
 ## 当前阻塞
-- 发布通道、安装包签名、真实 OpenRouter 主路径和自动更新尚未完成。
-- 浏览器主路径验证可覆盖前端构建和静态 UI；真实 Tauri 工具执行仍需要桌面运行环境、API Key 和代表性项目样本。
+- Evolution Agent 的统一候选/Review/materializer/通用 Evals 尚未完成；Phase 0 先补真实规范化工具轨迹与脱敏证据。
+- release-facing 完成仍需 PR+CI、安装包以及真实 CodeFactoryDev/发布版本的主路径证据；浏览器和 mock 不能替代桌面工具执行。

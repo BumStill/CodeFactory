@@ -12,8 +12,9 @@
 //! future sessions) or Reject (event marked rejected, not shown again).
 //!
 //! Token economy: post-mortem runs **once per session**, not per task.
-//! Input is bounded to a short summary of task titles + status. Output
-//! capped at 500 tokens. Uses the user's default model — no new config.
+//! Input is bounded to a short summary of task outcomes when available,
+//! otherwise to redacted chat/tool evidence. Output is capped at 500 tokens
+//! and uses the user's default model — no new config.
 
 use chrono::Utc;
 use reqwest::Client;
@@ -217,6 +218,13 @@ struct AiResponse {
     choices: Vec<AiResponseChoice>,
 }
 
+fn resolve_postmortem_model(settings: &crate::config::Settings) -> Option<String> {
+    settings.resolve_model_for_endpoint(
+        &settings.default_endpoint,
+        &settings.default_model,
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct PostmortemEntry {
     observation: String,
@@ -307,6 +315,30 @@ pub async fn run_postmortem(
     .bind(&session_id)
     .fetch_all(&*pool)
     .await?;
+    // A normal project/Quick chat usually has no task_runs. Preserve a small,
+    // redacted conversation sample so the chat-end trigger has real evidence
+    // instead of returning an unconditional empty result.
+    let messages: Vec<(String, String)> = sqlx::query_as(
+        "SELECT role, content FROM (\
+            SELECT role, content, created_at FROM messages \
+            WHERE session_id = ? AND role IN ('user','assistant') \
+            ORDER BY created_at DESC LIMIT 12\
+         ) ORDER BY created_at ASC",
+    )
+    .bind(&session_id)
+    .fetch_all(&*pool)
+    .await
+    .unwrap_or_default();
+    let tools: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT tc.tool_name, tc.status, tc.error FROM tool_calls tc \
+         JOIN messages m ON m.id = tc.message_id \
+         WHERE m.session_id = ? AND tc.status IN ('done','error','denied') \
+         ORDER BY tc.created_at ASC LIMIT 100",
+    )
+    .bind(&session_id)
+    .fetch_all(&*pool)
+    .await
+    .unwrap_or_default();
     // Existing learnings for this project — lets the model avoid repeating what
     // it already knows (folded into the prompt below) and lets us drop exact
     // duplicates defensively on insert.
@@ -331,23 +363,10 @@ pub async fn run_postmortem(
     .unwrap_or_default();
     drop(pool);
 
-    if rows.is_empty() {
+    let summary = build_postmortem_summary(&rows, &messages, &tools);
+    if summary.is_empty() {
         return Ok(vec![]);
     }
-
-    let summary = rows
-        .iter()
-        .enumerate()
-        .map(|(i, (title, status, result, error))| {
-            let outcome = match status.as_str() {
-                "completed" => result.as_deref().unwrap_or("").chars().take(80).collect::<String>(),
-                "failed" => format!("FAIL: {}", error.as_deref().unwrap_or("").chars().take(80).collect::<String>()),
-                other => other.into(),
-            };
-            format!("{}. [{}] {} — {}", i + 1, status, title, outcome)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
 
     // What we already know — folded into the prompt (avoid repeats / flag
     // contradictions) and into a dedup set that guards the insert below.
@@ -377,7 +396,11 @@ observation CONTRADICTS one, still report it but prefix its suggestion with \
     // ── Build prompt
     let settings = state.settings.read().await.clone();
     let ep_name = &settings.default_endpoint;
-    let model = settings.default_model.clone();
+    let model = resolve_postmortem_model(&settings).ok_or_else(|| {
+        AppError::Other(format!(
+            "No post-mortem model configured for endpoint '{ep_name}'"
+        ))
+    })?;
     let endpoint = settings
         .endpoints
         .get(ep_name)
@@ -418,7 +441,7 @@ Examples:\n\
   {{\"observation\": \"This project uses pnpm not npm.\", \
 \"suggestion\": \"This project uses pnpm — never run npm commands here.\", \"kind\": \"memory\"}}\n\
 ]\n\n\
-{calibration}{known_block}Tasks from this session:\n{summary}"
+{calibration}{known_block}Evidence from this session:\n{summary}"
     );
 
     let req = AiRequest {
@@ -557,6 +580,69 @@ Examples:\n\
     }
 
     Ok(created)
+}
+
+fn build_postmortem_summary(
+    tasks: &[(String, String, Option<String>, Option<String>)],
+    messages: &[(String, String)],
+    tools: &[(String, String, Option<String>)],
+) -> String {
+    let mut lines = Vec::new();
+    if !tasks.is_empty() {
+        lines.push("Task outcomes:".to_string());
+        lines.extend(
+            tasks
+                .iter()
+                .enumerate()
+                .map(|(index, (title, status, result, error))| {
+                    let raw_outcome = match status.as_str() {
+                        "completed" => result.as_deref().unwrap_or(""),
+                        "failed" => error.as_deref().unwrap_or(""),
+                        other => other,
+                    };
+                    let outcome = crate::trajectory::redact_text(raw_outcome, 80);
+                    let prefix = if status == "failed" { "FAIL: " } else { "" };
+                    format!(
+                        "{}. [{}] {} — {prefix}{outcome}",
+                        index + 1,
+                        status,
+                        crate::trajectory::redact_text(title, 100),
+                    )
+                }),
+        );
+    } else if !messages.is_empty() {
+        lines.push("Conversation turns (bounded, redacted):".to_string());
+        lines.extend(messages.iter().enumerate().map(|(index, (role, content))| {
+            format!(
+                "{}. [{}] {}",
+                index + 1,
+                role,
+                crate::trajectory::redact_text(content, 160)
+            )
+        }));
+    }
+
+    if !tools.is_empty() {
+        use std::collections::BTreeMap;
+        let mut counts: BTreeMap<(&str, &str), i64> = BTreeMap::new();
+        for (name, status, _) in tools {
+            *counts.entry((name.as_str(), status.as_str())).or_default() += 1;
+        }
+        lines.push("Tool outcomes:".to_string());
+        lines.extend(
+            counts
+                .into_iter()
+                .map(|((name, status), count)| format!("- {name}: {status} × {count}")),
+        );
+        if let Some((name, _, Some(error))) = tools.iter().find(|(_, status, _)| status == "error") {
+            lines.push(format!(
+                "- sample error from {name}: {}",
+                crate::trajectory::redact_text(error, 100)
+            ));
+        }
+    }
+
+    lines.join("\n")
 }
 
 // ── Self-evolution P1: cross-session pattern mining ───────────────────────────
@@ -751,7 +837,8 @@ pub async fn mine_cross_session_patterns(
          FROM tool_calls tc \
          JOIN messages m ON tc.message_id = m.id \
          JOIN sessions s ON m.session_id = s.id \
-         WHERE s.cwd = ? ORDER BY tc.created_at DESC LIMIT 4000",
+         WHERE s.cwd = ? AND tc.status IN ('done','error') \
+         ORDER BY tc.created_at DESC LIMIT 4000",
     )
     .bind(&cwd)
     .fetch_all(&*pool)
@@ -907,7 +994,8 @@ fn build_improvement_proposal(
 pub async fn self_improvement_proposal(state: State<'_, AppState>) -> Result<String, AppError> {
     let pool = state.db.read().await;
     let tools: Vec<ToolCallRow> = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT tool_name, status, error FROM tool_calls ORDER BY created_at DESC LIMIT 8000",
+        "SELECT tool_name, status, error FROM tool_calls \
+         WHERE status IN ('done','error') ORDER BY created_at DESC LIMIT 8000",
     )
     .fetch_all(&*pool)
     .await
@@ -991,7 +1079,8 @@ pub async fn propose_tool_gates(
 ) -> Result<Vec<ToolGateProposal>, AppError> {
     let pool = state.db.read().await;
     let tools: Vec<ToolCallRow> = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT tool_name, status, error FROM tool_calls ORDER BY created_at DESC LIMIT 8000",
+        "SELECT tool_name, status, error FROM tool_calls \
+         WHERE status IN ('done','error') ORDER BY created_at DESC LIMIT 8000",
     )
     .fetch_all(&*pool)
     .await
@@ -1034,6 +1123,74 @@ mod tests {
     // Storage-only tests; the post-mortem AI call needs a live endpoint.
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn postmortem_uses_the_active_model_for_the_selected_endpoint() {
+        let mut settings = crate::config::Settings::default();
+        settings.default_endpoint = "deepseek".into();
+        settings.default_model = "gpt-5.5".into();
+        settings.endpoints.insert(
+            "deepseek".into(),
+            crate::config::settings::Endpoint {
+                base_url: "https://api.deepseek.com".into(),
+                key_ref: Some("codefactory.endpoint.deepseek".into()),
+                api_style: crate::config::settings::ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+
+        assert_eq!(
+            resolve_postmortem_model(&settings).as_deref(),
+            Some("deepseek-v4-pro")
+        );
+    }
+
+    #[test]
+    fn postmortem_summary_falls_back_to_redacted_chat_and_tool_outcomes() {
+        let summary = build_postmortem_summary(
+            &[],
+            &[
+                (
+                    "user".into(),
+                    "Use token=super-secret and please add tests".into(),
+                ),
+                ("assistant".into(), "Done".into()),
+            ],
+            &[
+                ("read_file".into(), "done".into(), None),
+                (
+                    "bash".into(),
+                    "error".into(),
+                    Some("Bearer error-secret failed".into()),
+                ),
+            ],
+        );
+        assert!(summary.contains("Conversation turns"));
+        assert!(summary.contains("please add tests"));
+        assert!(summary.contains("bash: error × 1"));
+        assert!(!summary.contains("super-secret"));
+        assert!(!summary.contains("error-secret"));
+    }
+
+    #[test]
+    fn postmortem_summary_prefers_task_outcomes_when_available() {
+        let summary = build_postmortem_summary(
+            &[(
+                "Run release".into(),
+                "failed".into(),
+                None,
+                Some("password=hunter2".into()),
+            )],
+            &[("user".into(), "chat fallback should not appear".into())],
+            &[],
+        );
+        assert!(summary.contains("Task outcomes"));
+        assert!(summary.contains("Run release"));
+        assert!(summary.contains("FAIL"));
+        assert!(!summary.contains("hunter2"));
+        assert!(!summary.contains("chat fallback should not appear"));
+    }
 
     #[test]
     fn improvement_proposal_is_read_only_and_lists_friction() {
