@@ -83,6 +83,49 @@ pub struct AppState {
     pub interjections: commands::interjections::InterjectionQueue,
 }
 
+/// Handle the release-only Evolution smoke mode before Tauri initializes.
+/// Returns `false` for ordinary app startup and exits non-zero on smoke failure.
+pub fn run_evolution_smoke_cli() -> bool {
+    let mut args = std::env::args();
+    let _program = args.next();
+    let Some(flag) = args.next() else {
+        return false;
+    };
+    if flag != "--evolution-smoke" {
+        return false;
+    }
+    let Some(output) = args.next() else {
+        eprintln!("usage: CodeFactory --evolution-smoke <receipt.json>");
+        std::process::exit(2);
+    };
+    if args.next().is_some() {
+        eprintln!("usage: CodeFactory --evolution-smoke <receipt.json>");
+        std::process::exit(2);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("Evolution release smoke could not start: {error}");
+            std::process::exit(1);
+        });
+    match runtime.block_on(commands::evolution::run_release_smoke(
+        std::path::Path::new(&output),
+    )) {
+        Ok(receipt) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&receipt).unwrap_or_default()
+            );
+            true
+        }
+        Err(error) => {
+            eprintln!("Evolution release smoke failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -188,6 +231,12 @@ pub fn run() {
             commands::learning::self_improvement_proposal,
             commands::learning::propose_tool_gates,
             commands::learning::apply_tool_gate,
+            commands::evolution::list_evolution_candidate_states,
+            commands::evolution::approve_learning_event,
+            commands::evolution::list_evolution_eval_case_results,
+            commands::evolution::rerun_evolution_eval,
+            commands::evolution::activate_evolution_candidate,
+            commands::evolution::rollback_evolution_activation,
             commands::preferences::list_user_preferences,
             commands::preferences::get_effective_user_preference,
             commands::preferences::upsert_user_preference,

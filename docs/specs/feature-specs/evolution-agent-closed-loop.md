@@ -19,6 +19,16 @@
 | CF-EVO-R13 | 用户补充 | 页面如实区分 proposed/approved/materialized/eval/active；Phase 0/1 不得假装已接 Evals 或 activation | review UI + governance | state contract review + negative UI assertion | planning + QA |
 | CF-EVO-R14 | 仓库规则 | 工作台完成声明同时满足成功、边界、重启、viewport 与 release 分层验收 | desktop-ui + sqlite + release | real app matrix + PR/CI + installer evidence | QA + release |
 | CF-EVO-R15 | 用户补充 | 本机锁屏不能阻断验证、合并或上线；不得绕过锁屏，改由不依赖交互桌面的 headless 浏览器 viewport/keyboard gate 与远端 macOS DMG smoke 继续执行；receipt 不得伪造 OS 锁屏观测 | browser harness + CI + release | 1366/390 headless receipt + PR checks + macOS artifact smoke | QA + release |
+| CF-EVO-R16 | Phase 4 | 新候选的人工批准与生效分离；批准冻结不可变 revision，批准前后 live memory/preference 均不变化 | candidate/review | SQLite + prompt context before/after | development + QA |
+| CF-EVO-R17 | Phase 4 | 每个 Eval run 绑定 exact candidate/revision、runner 与 manifest hash；旧 `accepted` 不追溯补写 Eval 或 activation | eval schema + compatibility | old DB migration + field assertions | architecture + QA |
+| CF-EVO-R18 | Phase 4 | 首版激活安全 Evals 对 baseline/treatment 使用同一确定性 manifest，覆盖 project scope、隐私、类型白名单、隔离注入、幂等和回滚准备度 | eval runner | Rust integration + release binary smoke | development + QA |
+| CF-EVO-R19 | Phase 4 | verdict schema/UI 严格区分 `passed/failed/inconclusive/error`；首版确定性安全 suite 产生 passed/failed，runner 异常产生 error，inconclusive 保留给后续证据不足型 case；只有全部 required case 通过才允许自动激活 | eval runner + UI | failure/error/retry tests | development + QA |
+| CF-EVO-R20 | Phase 4 | 自动激活需要本次人工批准显式选择且默认关闭，只允许 project-scope memory/pattern 与非安全白名单偏好 | activation policy | allow/deny matrix + UI assertion | product + QA |
+| CF-EVO-R21 | Phase 4 | activation 使用 exact revision + Eval + expected target fingerprint 门禁，写入 active 状态与 receipt；重复/并发调用只能生效一次 | activation | concurrency + stale target tests | architecture + QA |
+| CF-EVO-R22 | Phase 4 | rollback 只撤销 exact activation；偏好被用户后改时进入 conflict，不覆盖新值；memory 使用独立 active row 原子停用 | rollback | CAS/idempotency/restart tests | development + QA |
+| CF-EVO-R23 | 用户补充 | 工作台显性展示 Evals、自动激活、case 结果、exact run/receipt、失败原因和回滚动作，并与端到端作业日志同页关联 | evolution UI | component + 1366/390 headless | frontend + QA |
+| CF-EVO-R24 | Compatibility | 旧 `accepted` 继续显示“历史已生效（未评测）”；新链路不再复用它表示 approved/eval/active | migration + UI | legacy fixture + negative assertion | architecture + QA |
+| CF-EVO-R25 | Release | 锁屏安全交付除 headless/CI/DMG 启动外，精确 release executable 必须在隔离临时目录执行真实 stage→Eval fail/pass→activate→rollback smoke | release binary + workflow | JSON receipt on macOS/Windows artifact | QA + release |
 
 ## 2. Primary User Path
 
@@ -74,9 +84,14 @@
 | Viewport | 审核队列和详情 | 1366×768 主从同屏；窄窗口单列 list/detail，主动作可达且无水平溢出 | screenshots/video + keyboard path |
 | Lock screen | 本机在验收或交付期间锁屏 | 不请求解锁、不绕过系统安全；headless 1366/390 完整决定、历史、日志与键盘交互继续，390 决策栏位于 viewport 内；PR/CI/合并/发版通过 CLI 与远端 runner 完成 | JSON receipt（`interactive_desktop_required=false`、`os_lock_state_observed=not_measured`）+ screenshots + CI log + macOS DMG smoke |
 | Release | Dev 通过后的发布声明 | PR+CI、安装包/build metadata、发布版重跑主路径；此前保持 not live | PR checks + installer + live evidence |
+| Phase 4 approval | 批准候选且未选自动激活 | 生成 immutable revision；live context 不变；Eval 通过后停在 pending_activation | DB revision/run + prompt context |
+| Phase 4 auto | 批准时显式选择自动激活 | exact revision 的 required cases 全过后只激活一次，下一 session context 使用 active revision | DB receipt + context assertion |
+| Phase 4 hard fail | secret/scope/unsupported preference/stale target | verdict failed 或 inconclusive；旧 active 不变且无成功 receipt | case rows + target fingerprint |
+| Phase 4 rollback | active memory/preference 回滚 | exact receipt 变 rolled_back；下一 session 不再使用该 memory 或恢复此前 preference；用户后改产生 conflict | CAS + restart + context assertion |
+| Release functional smoke | 精确 DMG/Windows executable | 隔离目录完成 stage→Eval fail/no switch→Eval pass→activate→rollback，输出无 secret 的 JSON receipt | artifact executable receipt |
 
 ## 5. 完成边界
 
 单元测试、构建、UI 空态或一条非空数组都不是完成。Phase 0 仅在真实 app 主路径、边界路径、持久化、匿名、脱敏、Evidence、一级入口、project 深链和人工审核全部有证据后完成。本轮持久 job slice 还必须证明结构化日志、人工决定幂等、失败可追溯和重启中断明确终态；partial/dropped 与失败节点续跑属于后续 Phase 1 扩展。
 
-R9-R11 的首期工作台只是对现有 `learning_events` 的可信审核投影，不等于统一候选状态机。当前 memory/preference 采纳有有限、脱敏的 materialize receipt；版本化变更请求、candidate revision/review、类型化 materializer、通用 rollback、Evals 与 activation 仍在后续阶段。未接入前不得显示或宣称已通过、已激活。Dev app 验证、PR 或 CI 通过仍是 `not live`，必须经过刻意发版、安装包启动和发布版本真实路径才可声明 live。
+R9-R15 的 v1.44.0 工作台仍是对 `learning_events` 的可信审核投影。R16-R25 开始把新批准 lazy-adopt 为独立 immutable candidate revision；`learning_events` 只保留来源与 legacy 决定，不能再承载 Eval/activation 真相。首版 Evals 是“激活安全回归”，证明变更可被安全、隔离、幂等地生效和回滚，不证明任务成功率提升。Dev app 验证、PR 或 CI 通过仍是 `not live`，必须经过刻意发版、精确发布二进制功能 smoke 和公开产物验证才可声明 live。

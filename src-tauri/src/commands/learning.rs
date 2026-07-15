@@ -329,7 +329,10 @@ async fn list_learning_events_for_pool(
                 kind, pref_key, pref_value, support_count, evidence_json, job_id \
          FROM learning_events
          WHERE cwd = ? AND (
-           status = 'pending' OR id IN (
+           (status = 'pending' AND id NOT IN (
+             SELECT source_learning_event_id FROM improvement_candidates
+             WHERE source_learning_event_id IS NOT NULL
+           )) OR id IN (
              SELECT id FROM learning_events
              WHERE cwd = ? AND status <> 'pending'
              ORDER BY COALESCE(decided_at, created_at) DESC, rowid DESC LIMIT 100
@@ -3181,6 +3184,12 @@ mod tests {
                 cwd TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
                 source TEXT NOT NULL DEFAULT 'user', updated_at TEXT NOT NULL,
                 PRIMARY KEY (cwd, key)
+            )",
+            "CREATE TABLE improvement_candidates (
+                id TEXT PRIMARY KEY, cwd TEXT NOT NULL, kind TEXT NOT NULL,
+                source_learning_event_id TEXT UNIQUE, current_revision INTEGER NOT NULL,
+                current_state TEXT NOT NULL, state_version INTEGER NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             )",
         ] {
             sqlx::query(ddl).execute(&pool).await.unwrap();

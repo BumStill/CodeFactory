@@ -16,7 +16,7 @@ CodeFactory 已有 session、message、task、learning、knowledge、skill、evi
 
 业务上必须先修“观察层数据真相”，否则继续做聚类、Review 工作台或指标看板只会把空数据包装成能力。
 
-完成真实轨迹底座后，审核能力也不能继续埋在「我的画像」的长页面里。产品需要一个一级「进化审查」入口，让用户从真实轨迹、分析作业、待审候选到人工决定都能在一个明确的工作面中完成；但首期只是对现有 `learning_events` 的可信投影，不得借新页面宣称统一候选状态机、Evals 或 activation 已经存在。
+完成真实轨迹底座后，审核能力也不能继续埋在「我的画像」的长页面里。产品需要一个一级「进化审查」入口，让用户从真实轨迹、分析作业、待审候选到人工决定都能在一个明确的工作面中完成。v1.44.0 首期只是对现有 `learning_events` 的可信投影；Phase 4 才引入独立候选状态机、Evals 与 activation，二者不能混写。
 
 ## 3. 目标用户与价值
 
@@ -61,9 +61,9 @@ CodeFactory 已有 session、message、task、learning、knowledge、skill、evi
 - 「作业与日志」同页展示持久分析作业：范围锁定、轨迹读取、隐私处理、信号提取、聚合去重、候选生成、等待人工审核。展示结构化计数与脱敏诊断，不直接暴露 raw log 或 reasoning。
 - 薄工作台继续复用 `learning_events` 的 pending/accepted/rejected 与现有 miner；本轮同时加入最小持久 `evolution_jobs`/节点日志、人工决定幂等和重启中断明确终态。它仍是本机同步 ledger，不是分布式队列或通用工作流引擎。
 
-### 真实边界
+### v1.44.0 已发布边界（Phase 4 的兼容基线）
 
-- 本轮只到「真实信号 -> 待审候选 -> 人工采纳/拒绝 -> memory/preference 有限物化 receipt」；通用 Evals、类型化 materializer/rollback、activation 和产品代码变更尚未接入。
+- v1.44.0 只到「真实信号 -> 待审候选 -> 人工采纳/拒绝 -> memory/preference 有限物化 receipt」；当时通用 Evals、类型化 materializer/rollback、activation 和产品代码变更尚未接入。
 - 页面不得显示假的「评估通过」「已激活」或从进度条推断生效。当前 memory/preference/tool gate 的明确动作仍按现有人工门禁执行，其他候选只展示建议。
 - `Request changes -> revision N+1` 依赖 `improvement_candidates`、`candidate_reviews` 与 `expected_revision`，仍属于统一 Review 的后续阶段；不得用修改原 `learning_events` 文本冒充版本化变更请求。
 
@@ -87,3 +87,19 @@ Release-facing 完成必须再经过 PR+CI、刻意发版、安装包启动和�
 本机锁屏不得成为合并或上线 blocker，也不得通过绕过 macOS 锁屏安全来解决。工作台 UX 门禁采用三层证据：解锁时取得的真实 Dev App 路径；可在锁屏状态运行的 headless Chromium 宽/窄视口交互验收；GitHub macOS runner 对真实 DMG、精确 app bundle、稳定窗口和隔离数据库的发布验收。三层分别证明桌面集成、布局交互与发布产物，不能互相冒充；锁屏时允许 headless + CI 继续推进，发布版仍必须由远端 macOS artifact smoke 通过后才能声明 live。
 
 任何“工具卡可见但规范化轨迹为 0”、真实执行与状态/耗时不一致、匿名会话产生记录或敏感值泄露，均直接拒绝验收。
+
+## 8. Phase 4 业务决策：Evals 与自动激活
+
+v1.44.0 的“采纳”会立即写入项目记忆或偏好，因此不能在该结果后补一个 `eval_passed` 标签冒充门禁。Phase 4 对新批准采用独立链路：
+
+```text
+待审 -> 人工批准并冻结 revision -> 激活安全 Evals -> 待激活/自动激活 -> active -> 可回滚
+```
+
+- 自动激活不跳过人工批准，只省略 Eval 通过后的第二次确认；确认区默认关闭自动激活，用户可对本次候选显式开启。
+- 首版只支持当前 project 的 additive memory/pattern 与 `communication_style`、`testing_habit`、`code_style`、`response_language` 偏好。`autonomy_level`、权限、模型/provider、费用、全局/Quick、Skill、tool gate、Harness、代码、PR、部署和发布不在自动激活白名单。
+- memory/pattern 还要通过策略敏感词门禁；绕过审批/权限、自动合并/部署/发布、完全权限、自动执行和破坏性命令等候选只能留下失败 Eval 与日志，不能显示自动激活开关，也没有 override。
+- 首版 Eval 名称为“激活安全回归”：冻结同一 manifest 下的 baseline/treatment，确定性检查 scope、隐私、目标契约、跨项目隔离、只注入一次、目标未漂移和可回滚。它不声称候选提升了任务成功率；真正的效果 Evals 需要项目维护的可执行 oracle 与 holdout case 后再扩展。
+- 全部 required case 通过才是 `passed`；不支持或样本/目标不可比为 `inconclusive`，运行故障为 `error`，安全/隔离/回归断言失败为 `failed`。后三者都不得自动激活。
+- 激活保存 before/after hash、exact revision、Eval run 与 receipt。回滚只撤销 exact activation；用户已修改的偏好不得被覆盖。
+- 旧 `learning_events.status=accepted` 原样保留为“历史已生效（未评测）”，不追溯制造 Eval 或 activation 证据。
