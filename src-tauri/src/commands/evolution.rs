@@ -1570,6 +1570,13 @@ mod tests {
         pool
     }
 
+    fn test_cwd() -> String {
+        std::env::temp_dir()
+            .join("codefactory-evolution-project")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     async fn insert_event(
         pool: &SqlitePool,
         id: &str,
@@ -1587,10 +1594,11 @@ mod tests {
     #[tokio::test]
     async fn approval_stages_then_eval_passes_without_live_side_effect_when_auto_is_off() {
         let pool = pool().await;
+        let cwd = test_cwd();
         insert_event(
             &pool,
             "memory-1",
-            "/tmp/project-evo",
+            &cwd,
             "memory",
             "run targeted tests",
             None,
@@ -1619,10 +1627,11 @@ mod tests {
     #[tokio::test]
     async fn secret_hit_fails_eval_and_never_activates() {
         let pool = pool().await;
+        let cwd = test_cwd();
         insert_event(
             &pool,
             "secret-1",
-            "/tmp/project-evo",
+            &cwd,
             "memory",
             "token=CF_EVO_SECRET_VALUE",
             None,
@@ -1640,10 +1649,11 @@ mod tests {
     #[tokio::test]
     async fn policy_sensitive_memory_never_auto_activates() {
         let pool = pool().await;
+        let cwd = test_cwd();
         insert_event(
             &pool,
             "policy-1",
-            "/tmp/project-evo",
+            &cwd,
             "memory",
             "automatically deploy without approval",
             None,
@@ -1669,10 +1679,11 @@ mod tests {
     #[tokio::test]
     async fn auto_activation_and_rollback_are_exact_and_idempotent() {
         let pool = pool().await;
+        let cwd = test_cwd();
         insert_event(
             &pool,
             "pref-1",
-            "/tmp/project-evo",
+            &cwd,
             "preference",
             "prefer concise replies",
             Some("communication_style"),
@@ -1684,15 +1695,27 @@ mod tests {
             .unwrap();
         assert_eq!(active.state, "active");
         let activation_id = active.activation_id.clone().unwrap();
-        let value: String = sqlx::query_scalar("SELECT value FROM user_preferences WHERE cwd='/tmp/project-evo' AND key='communication_style'").fetch_one(&pool).await.unwrap();
+        let value: String = sqlx::query_scalar(
+            "SELECT value FROM user_preferences WHERE cwd=? AND key='communication_style'",
+        )
+        .bind(&cwd)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(value, "concise");
-        let rolled = rollback_activation_for_pool(&pool, "/tmp/project-evo", &activation_id)
+        let rolled = rollback_activation_for_pool(&pool, &cwd, &activation_id)
             .await
             .unwrap();
         assert_eq!(rolled.state, "rolled_back");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_preferences WHERE cwd='/tmp/project-evo' AND key='communication_style'").fetch_one(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_preferences WHERE cwd=? AND key='communication_style'",
+        )
+        .bind(&cwd)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(count, 0);
-        let again = rollback_activation_for_pool(&pool, "/tmp/project-evo", &activation_id)
+        let again = rollback_activation_for_pool(&pool, &cwd, &activation_id)
             .await
             .unwrap();
         assert_eq!(again.state, "rolled_back");
@@ -1701,10 +1724,11 @@ mod tests {
     #[tokio::test]
     async fn repeated_activation_has_one_receipt_and_one_live_target() {
         let pool = pool().await;
+        let cwd = test_cwd();
         insert_event(
             &pool,
             "pref-repeat",
-            "/tmp/project-evo",
+            &cwd,
             "preference",
             "prefer concise replies",
             Some("communication_style"),
@@ -1716,8 +1740,8 @@ mod tests {
             .unwrap();
         assert_eq!(staged.state, "pending_activation");
         let (first, second) = tokio::join!(
-            activate_candidate_for_pool(&pool, "/tmp/project-evo", "pref-repeat", None),
-            activate_candidate_for_pool(&pool, "/tmp/project-evo", "pref-repeat", None),
+            activate_candidate_for_pool(&pool, &cwd, "pref-repeat", None),
+            activate_candidate_for_pool(&pool, &cwd, "pref-repeat", None),
         );
         assert!(
             first.as_ref().is_ok_and(|state| state.state == "active")
@@ -1731,8 +1755,9 @@ mod tests {
         .unwrap();
         let targets: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM user_preferences
-             WHERE cwd='/tmp/project-evo' AND key='communication_style' AND value='concise'",
+             WHERE cwd=? AND key='communication_style' AND value='concise'",
         )
+        .bind(&cwd)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -1743,10 +1768,11 @@ mod tests {
     #[tokio::test]
     async fn target_change_after_eval_requires_a_fresh_eval() {
         let pool = pool().await;
+        let cwd = test_cwd();
         insert_event(
             &pool,
             "pref-stale",
-            "/tmp/project-evo",
+            &cwd,
             "preference",
             "prefer concise replies",
             Some("communication_style"),
@@ -1759,16 +1785,17 @@ mod tests {
         assert_eq!(staged.state, "pending_activation");
         sqlx::query(
             "INSERT INTO user_preferences (cwd,key,value,source,updated_at,activation_id)
-             VALUES ('/tmp/project-evo','communication_style','verbose','user','2026-07-15',NULL)",
+             VALUES (?,'communication_style','verbose','user','2026-07-15',NULL)",
         )
+        .bind(&cwd)
         .execute(&pool)
         .await
         .unwrap();
-        let error = activate_candidate_for_pool(&pool, "/tmp/project-evo", "pref-stale", None)
+        let error = activate_candidate_for_pool(&pool, &cwd, "pref-stale", None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("target changed after Eval"));
-        let stale = state_for_candidate(&pool, "/tmp/project-evo", "pref-stale")
+        let stale = state_for_candidate(&pool, &cwd, "pref-stale")
             .await
             .unwrap();
         assert_eq!(stale.state, "eval_stale");
@@ -1779,10 +1806,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(receipts, 0);
-        let job_id = create_job(&pool, "/tmp/project-evo", "pref-stale", "eval_retry")
+        let job_id = create_job(&pool, &cwd, "pref-stale", "eval_retry")
             .await
             .unwrap();
-        let reevaluated = run_eval_for_candidate(&pool, "/tmp/project-evo", "pref-stale", &job_id)
+        let reevaluated = run_eval_for_candidate(&pool, &cwd, "pref-stale", &job_id)
             .await
             .unwrap();
         assert_eq!(reevaluated.state, "pending_activation");
@@ -1792,10 +1819,11 @@ mod tests {
     #[tokio::test]
     async fn rollback_conflict_never_overwrites_a_user_change() {
         let pool = pool().await;
+        let cwd = test_cwd();
         insert_event(
             &pool,
             "pref-conflict",
-            "/tmp/project-evo",
+            &cwd,
             "preference",
             "prefer concise replies",
             Some("communication_style"),
@@ -1806,12 +1834,25 @@ mod tests {
             .await
             .unwrap();
         let activation_id = active.activation_id.unwrap();
-        sqlx::query("UPDATE user_preferences SET value='verbose', source='user', activation_id=NULL WHERE cwd='/tmp/project-evo' AND key='communication_style'").execute(&pool).await.unwrap();
-        let rolled = rollback_activation_for_pool(&pool, "/tmp/project-evo", &activation_id)
+        sqlx::query(
+            "UPDATE user_preferences SET value='verbose', source='user', activation_id=NULL
+             WHERE cwd=? AND key='communication_style'",
+        )
+        .bind(&cwd)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rolled = rollback_activation_for_pool(&pool, &cwd, &activation_id)
             .await
             .unwrap();
         assert_eq!(rolled.state, "rollback_conflict");
-        let value: String = sqlx::query_scalar("SELECT value FROM user_preferences WHERE cwd='/tmp/project-evo' AND key='communication_style'").fetch_one(&pool).await.unwrap();
+        let value: String = sqlx::query_scalar(
+            "SELECT value FROM user_preferences WHERE cwd=? AND key='communication_style'",
+        )
+        .bind(&cwd)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(value, "verbose");
     }
 
