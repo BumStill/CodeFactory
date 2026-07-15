@@ -107,3 +107,5 @@
 PR `#106` 的第一次 GitHub-hosted canary `29395835212` 在结构断言上返回成功，但下载并目视复核的 `window.png` 显示 WebView 为白屏。原因是窗口截图包含每边约 `56` 像素的黑色阴影区，旧内容采样仍被阴影颜色干扰。该次绿色 check 不作为 GUI 通过证据。门禁随后改为根据逻辑窗口尺寸推导 scale 与阴影，只采样真实窗口中央内容，并在最多 `20` 秒内等待 WebView 绘制。旧远端白屏按新算法为 `1` 个颜色桶、`0 / 625` 非主色采样，必定失败；本地真实 onboarding 截图为 `10` 个颜色桶、`208 / 576` 非主色采样。修复后的 hosted canary 才能决定 `remote-real-app-gui` 是否成立。
 
 第二次 hosted canary `29396893121` 正确阻止了候选，但在 WebView 等待期间一次 `screencapture` 返回非零后提前退出，未跑满有界重试且没有上传诊断文件。脚本现在把单次捕获失败视为可重试观察错误，最多继续 `20` 次；最终仍失败时写入 `failure.json` 并保留 `window-last.png`，CI 继续失败但证据 artifact 可用于定位。该基础设施修复后的第三次 canary 仍需通过。
+
+第三次 hosted canary `29397252551` 在截图前失败。字段检查发现窗口观察器把 `width` / `height` 写为 `Int`，新裁剪代码却只按 `Double` 读取，因此错误返回 `screenshotUnavailable`，并非 App 内容结论。脚本现在兼容整数和浮点窗口字段；后续 canary 才会真正进入内容重试。

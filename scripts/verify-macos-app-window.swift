@@ -216,8 +216,12 @@ func writeEvidence(
     guard CGPreflightScreenCaptureAccess() else {
         throw SmokeError.screenCapturePermissionDenied
     }
-    guard let logicalWindowWidth = window["width"] as? Double,
-          let logicalWindowHeight = window["height"] as? Double,
+    let logicalWindowWidth = (window["width"] as? Int).map(Double.init)
+        ?? (window["width"] as? Double)
+    let logicalWindowHeight = (window["height"] as? Int).map(Double.init)
+        ?? (window["height"] as? Double)
+    guard let logicalWindowWidth,
+          let logicalWindowHeight,
           logicalWindowWidth > 0,
           logicalWindowHeight > 0
     else {
