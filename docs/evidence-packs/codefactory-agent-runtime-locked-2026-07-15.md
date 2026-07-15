@@ -49,7 +49,7 @@
 - OS credential 第一次授权仍可能要求用户在解锁状态确认；已授权的 credential 和运行中的 Runtime 不依赖屏幕。
 - 用户主动锁屏不会被绕过。
 - 本地锁屏时不执行辅助功能点击；PR 的精确候选 App 和发布 DMG 改由 GitHub macOS 可见会话生成 PID 绑定的窗口元数据和非空截图。
-- 新远端门禁只有在 PR workflow 和 release workflow 实际通过后，才能作为 `remote-real-app-gui` / `released-artifact-gui` 证据；本地脚本通过不等于远端已通过。
+- PR 远端门禁已经实际通过，可作为当前候选的 `remote-real-app-gui` 证据；`released-artifact-gui` 仍必须等待正式 release workflow 和 published-tag smoke 实际通过。
 
 ## 当前候选锁屏复跑
 
@@ -109,3 +109,17 @@ PR `#106` 的第一次 GitHub-hosted canary `29395835212` 在结构断言上返�
 第二次 hosted canary `29396893121` 正确阻止了候选，但在 WebView 等待期间一次 `screencapture` 返回非零后提前退出，未跑满有界重试且没有上传诊断文件。脚本现在把单次捕获失败视为可重试观察错误，最多继续 `20` 次；最终仍失败时写入 `failure.json` 并保留 `window-last.png`，CI 继续失败但证据 artifact 可用于定位。该基础设施修复后的第三次 canary 仍需通过。
 
 第三次 hosted canary `29397252551` 在截图前失败。字段检查发现窗口观察器把 `width` / `height` 写为 `Int`，新裁剪代码却只按 `Double` 读取，因此错误返回 `screenshotUnavailable`，并非 App 内容结论。脚本现在兼容整数和浮点窗口字段；后续 canary 才会真正进入内容重试。
+
+第四次 hosted canary `29397472969` 在 GitHub `macos-latest` 可见会话中通过，并经过下载截图的人工目视复核。截图显示 CodeFactory 主窗口和真实 onboarding 内容，不是空白 WebView、窗口阴影或标题栏造成的假阳性：
+
+- proof tier: `remote-real-app-gui`
+- status: `ok`
+- PID: `4728`
+- logical window: `1024 x 674`, layer `0`, alpha `1`, window id `34`
+- screenshot: `1136 x 786`, `180810` bytes
+- content color buckets: `27`
+- content varied samples: `308 / 625`
+- render attempt: `1`
+- screenshot SHA-256: `b4ef56432a065fd5d6552a0b8cba206cac3eadabd37e9a779ac27fd4e7e42331`
+
+同一候选的 CI、两项 governance baseline 和 `remote-real-app-gui` 均为绿色。该证据只证明 PR 精确候选 App 在远程真实 GUI 会话可启动并渲染；候选仍是 `not live`，必须继续完成合并、刻意发版、发布 DMG smoke、published-tag smoke 和已发布版本锁屏 canary。
