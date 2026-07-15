@@ -427,6 +427,7 @@ def run_runtime_acceptance(
         "model_timeout_sec": max(1, model_timeout_sec),
         "shell_timeout_sec": max(1, shell_timeout_sec),
         "wall_time_budget_sec": max(1, wall_time_budget_sec),
+        "working_directory": str(cwd),
         "allow_network": allow_network,
         "policy_profile": "product",
         "execution_contract_sha256": contract_sha,

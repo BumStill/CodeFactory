@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
 use url::Url;
 
 pub const EXECUTION_CONTRACT: &str = include_str!(concat!(
@@ -731,6 +732,8 @@ fn has_command_level_bound(command: &str) -> bool {
 pub struct ToolOutcome {
     pub request_id: String,
     pub command: String,
+    #[serde(default)]
+    pub working_directory: Option<String>,
     pub kind: ToolKind,
     pub sequence: u64,
     pub started_at_ms: u64,
@@ -851,7 +854,24 @@ pub fn evaluate_budget_command(
     command: &str,
     kind: &ToolKind,
 ) -> PolicyDecision {
-    evaluate_budget_command_with_time(remaining_model_rounds, None, evidence, command, kind)
+    evaluate_budget_command_in_directory(remaining_model_rounds, evidence, command, kind, None)
+}
+
+pub fn evaluate_budget_command_in_directory(
+    remaining_model_rounds: u32,
+    evidence: &CompletionEvidence,
+    command: &str,
+    kind: &ToolKind,
+    working_directory: Option<&str>,
+) -> PolicyDecision {
+    evaluate_budget_command_with_time_in_directory(
+        remaining_model_rounds,
+        None,
+        evidence,
+        command,
+        kind,
+        working_directory,
+    )
 }
 
 pub fn evaluate_budget_command_with_time(
@@ -861,6 +881,24 @@ pub fn evaluate_budget_command_with_time(
     command: &str,
     kind: &ToolKind,
 ) -> PolicyDecision {
+    evaluate_budget_command_with_time_in_directory(
+        remaining_model_rounds,
+        wall_time,
+        evidence,
+        command,
+        kind,
+        None,
+    )
+}
+
+pub fn evaluate_budget_command_with_time_in_directory(
+    remaining_model_rounds: u32,
+    wall_time: Option<(u64, u64)>,
+    evidence: &CompletionEvidence,
+    command: &str,
+    kind: &ToolKind,
+    working_directory: Option<&str>,
+) -> PolicyDecision {
     let time_finalization_window =
         wall_time.is_some_and(|(remaining, total)| total > 0 && remaining <= total / 3);
     let source_delivery_checkpoint = evidence.source_delivery_required
@@ -869,7 +907,7 @@ pub fn evaluate_budget_command_with_time(
         });
     if evidence.source_delivery_required {
         let delivery_stage_count = [
-            is_source_install_command(command),
+            is_source_install_command_in(command, working_directory),
             is_external_source_runtime_command(command),
             is_project_test_command(command),
         ]
@@ -966,7 +1004,7 @@ pub fn evaluate_budget_command_with_time(
             _ => true,
         };
         if source_install_missing {
-            if is_source_install_command(command)
+            if is_source_install_command_in(command, working_directory)
                 || dependency_recovery
                 || repair_mutation
                 || failure_diagnostic
@@ -1184,7 +1222,8 @@ impl CompletionGate {
             }
         }
         if self.source_delivery_required && outcome.succeeded() {
-            if is_source_install_command(&outcome.command) {
+            if is_source_install_command_in(&outcome.command, outcome.working_directory.as_deref())
+            {
                 self.last_source_install_sequence = Some(outcome.sequence);
             } else if self.last_source_install_sequence.is_some()
                 && is_external_source_runtime_command(&outcome.command)
@@ -1576,7 +1615,137 @@ fn detect_missing_test_runner(outcome: &ToolOutcome) -> Option<&'static str> {
     None
 }
 
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn simple_and_segments(command: &str) -> Option<Vec<Vec<String>>> {
+    let mut segments = Vec::new();
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut token_started = false;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut chars = command.chars().peekable();
+
+    let finish_token = |tokens: &mut Vec<String>, token: &mut String, started: &mut bool| {
+        if *started {
+            tokens.push(std::mem::take(token));
+            *started = false;
+        }
+    };
+    let finish_segment = |segments: &mut Vec<Vec<String>>, tokens: &mut Vec<String>| {
+        if tokens.is_empty() {
+            return false;
+        }
+        segments.push(std::mem::take(tokens));
+        true
+    };
+
+    while let Some(character) = chars.next() {
+        if escaped {
+            token.push(character);
+            token_started = true;
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                } else {
+                    token.push(character);
+                }
+                token_started = true;
+            }
+            Some('"') => {
+                if character == '"' {
+                    quote = None;
+                } else if character == '\\' {
+                    if chars
+                        .peek()
+                        .is_some_and(|next| matches!(next, '"' | '\\' | '$' | '`'))
+                    {
+                        escaped = true;
+                    } else {
+                        token.push(character);
+                    }
+                } else if character == '`'
+                    || character == '$' && chars.peek().is_some_and(|next| *next == '(')
+                {
+                    return None;
+                } else {
+                    token.push(character);
+                }
+                token_started = true;
+            }
+            Some(_) => unreachable!(),
+            None => match character {
+                '\'' | '"' => {
+                    quote = Some(character);
+                    token_started = true;
+                }
+                '\\' => {
+                    if chars.peek().is_some_and(|next| {
+                        matches!(next, '\\' | '\'' | '"' | ' ' | '\t' | '&' | '|' | ';')
+                    }) {
+                        escaped = true;
+                    } else {
+                        token.push(character);
+                        token_started = true;
+                    }
+                }
+                ' ' | '\t' | '\r' => {
+                    finish_token(&mut tokens, &mut token, &mut token_started);
+                }
+                '&' if chars.peek().is_some_and(|next| *next == '&') => {
+                    chars.next();
+                    finish_token(&mut tokens, &mut token, &mut token_started);
+                    if !finish_segment(&mut segments, &mut tokens) {
+                        return None;
+                    }
+                }
+                '&' if tokens.is_empty()
+                    && !token_started
+                    && chars.peek().is_some_and(|next| next.is_whitespace()) =>
+                {
+                    tokens.push("&".to_owned());
+                }
+                ';' | '\n' | '|' | '&' | '(' | ')' | '`' => return None,
+                '$' if chars.peek().is_some_and(|next| *next == '(') => return None,
+                _ => {
+                    token.push(character);
+                    token_started = true;
+                }
+            },
+        }
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    finish_token(&mut tokens, &mut token, &mut token_started);
+    if !finish_segment(&mut segments, &mut tokens) {
+        return None;
+    }
+    Some(segments)
+}
+
+#[cfg(test)]
 fn is_source_install_command(command: &str) -> bool {
+    is_source_install_command_in(command, None)
+}
+
+fn is_source_install_command_in(command: &str, working_directory: Option<&str>) -> bool {
     fn is_current_directory(target: &str) -> bool {
         matches!(target, "." | "./")
     }
@@ -1600,36 +1769,136 @@ fn is_source_install_command(command: &str) -> bool {
             "--prefix",
             "--python",
             "--config-settings",
+            "--cache-dir",
+            "--platform",
+            "--python-version",
+            "--implementation",
+            "--abi",
+            "--upgrade-strategy",
+            "--root-user-action",
+            "--progress-bar",
+            "--report",
+            "--timeout",
+            "--retries",
+            "--cert",
+            "--client-cert",
+            "--no-binary",
+            "--only-binary",
+            "--link-mode",
+            "--index-strategy",
+            "--proxy",
+            "--exists-action",
+            "--keyring-provider",
+            "--use-feature",
+            "--use-deprecated",
         ];
+        const OPTIONS_WITHOUT_VALUES: &[&str] = &[
+            "--no-deps",
+            "--no-index",
+            "--no-build-isolation",
+            "--use-pep517",
+            "--no-use-pep517",
+            "--pre",
+            "--upgrade",
+            "-u",
+            "--force-reinstall",
+            "--ignore-installed",
+            "--user",
+            "--compile",
+            "--no-compile",
+            "--no-clean",
+            "--break-system-packages",
+            "--require-hashes",
+            "--prefer-binary",
+            "-q",
+            "--quiet",
+            "-v",
+            "--verbose",
+            "--disable-pip-version-check",
+            "--isolated",
+            "--no-input",
+            "--system",
+            "--refresh",
+            "--reinstall",
+            "--no-cache-dir",
+            "--no-color",
+        ];
+        const NON_INSTALLING_OPTIONS: &[&str] = &["-h", "--help", "--dry-run"];
 
         let mut index = 0;
+        let mut found_current_source = false;
+        let mut positional_only = false;
         while index < args.len() {
             let argument = args[index].as_str();
+            if NON_INSTALLING_OPTIONS.contains(&argument) {
+                return false;
+            }
+            if argument == "--" {
+                positional_only = true;
+                index += 1;
+                continue;
+            }
             if matches!(argument, "-e" | "--editable") {
-                return args
-                    .get(index + 1)
-                    .is_some_and(|target| is_current_directory(target));
+                let Some(target) = args.get(index + 1) else {
+                    return false;
+                };
+                found_current_source |= is_current_directory(target);
+                index += 2;
+                continue;
             }
             if let Some(target) = argument
                 .strip_prefix("--editable=")
                 .or_else(|| argument.strip_prefix("-e="))
             {
-                return is_current_directory(target);
-            }
-            if OPTIONS_WITH_VALUES.contains(&argument) {
-                index += 2;
-                continue;
-            }
-            if argument.starts_with('-') {
+                found_current_source |= is_current_directory(target);
                 index += 1;
                 continue;
             }
+            if let Some(target) = argument.strip_prefix("-e") {
+                if target.is_empty() {
+                    return false;
+                }
+                found_current_source |= is_current_directory(target);
+                index += 1;
+                continue;
+            }
+            if !positional_only && OPTIONS_WITH_VALUES.contains(&argument) {
+                if args.get(index + 1).is_none() {
+                    return false;
+                }
+                index += 2;
+                continue;
+            }
+            if !positional_only
+                && OPTIONS_WITH_VALUES
+                    .iter()
+                    .any(|option| argument.starts_with(&format!("{option}=")))
+            {
+                index += 1;
+                continue;
+            }
+            if !positional_only && OPTIONS_WITHOUT_VALUES.contains(&argument) {
+                index += 1;
+                continue;
+            }
+            if !positional_only
+                && argument.starts_with('-')
+                && argument[1..]
+                    .chars()
+                    .all(|character| matches!(character, 'q' | 'v'))
+            {
+                index += 1;
+                continue;
+            }
+            if !positional_only && argument.starts_with('-') {
+                return false;
+            }
             if is_current_directory(argument) {
-                return true;
+                found_current_source = true;
             }
             index += 1;
         }
-        false
+        found_current_source
     }
 
     fn is_environment_assignment(token: &str) -> bool {
@@ -1641,85 +1910,190 @@ fn is_source_install_command(command: &str) -> bool {
         })
     }
 
-    for segment in command
-        .split([';', '\n'])
-        .flat_map(|part| part.split("&&"))
-        .flat_map(|part| part.split("||"))
-    {
-        let tokens = segment
-            .split_whitespace()
-            .map(|token| {
-                token
-                    .trim_matches(|character: char| {
-                        matches!(character, '\'' | '"' | '(' | ')')
-                    })
-                    .to_ascii_lowercase()
-            })
-            .filter(|token| !token.is_empty())
+    fn is_py_version_selector(token: &str) -> bool {
+        let Some(version) = token.strip_prefix('-') else {
+            return false;
+        };
+        !version.is_empty()
+            && !version.starts_with('.')
+            && !version.ends_with('.')
+            && version
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '.')
+            && !version.contains("..")
+    }
+
+    let Some(segments) = simple_and_segments(command) else {
+        return false;
+    };
+    let source_root = working_directory
+        .map(PathBuf::from)
+        .map(|path| normalize_lexical_path(&path));
+    let mut effective_directory = source_root.clone();
+    let mut inside_source_workspace = true;
+
+    for tokens in segments {
+        let lower_tokens = tokens
+            .iter()
+            .map(|token| token.to_ascii_lowercase())
             .collect::<Vec<_>>();
-        let start = tokens
+        let mut start = tokens
             .iter()
             .position(|token| !is_environment_assignment(token))
             .unwrap_or(tokens.len());
-        let Some(executable) = tokens
+        if lower_tokens.get(start).is_some_and(|token| token == "&") {
+            start += 1;
+        }
+        let Some(executable) = lower_tokens
             .get(start)
-            .and_then(|token| token.rsplit('/').next())
+            .and_then(|token| token.rsplit(['/', '\\']).next())
         else {
             continue;
         };
 
-        let install_index = if matches!(executable, "pip" | "pip3")
-            && tokens.get(start + 1).is_some_and(|token| token == "install")
+        if executable == "cd" {
+            let Some(target) = tokens.get(start + 1) else {
+                inside_source_workspace = false;
+                effective_directory = None;
+                continue;
+            };
+            if is_current_directory(target) {
+                continue;
+            }
+            let Some(current) = effective_directory.as_ref() else {
+                inside_source_workspace = false;
+                continue;
+            };
+            let target_path = Path::new(target);
+            let next_directory = if target_path.is_absolute() {
+                normalize_lexical_path(target_path)
+            } else {
+                normalize_lexical_path(&current.join(target_path))
+            };
+            inside_source_workspace = source_root
+                .as_ref()
+                .is_some_and(|root| next_directory == *root);
+            effective_directory = Some(next_directory);
+            continue;
+        }
+        if executable == "export"
+            && lower_tokens[start + 1..]
+                .iter()
+                .all(|token| is_environment_assignment(token))
+        {
+            continue;
+        }
+
+        let python_module_index = if executable.starts_with("python") {
+            Some(start + 1)
+        } else if matches!(executable, "py" | "py.exe") {
+            Some(
+                start
+                    + if lower_tokens
+                        .get(start + 1)
+                        .is_some_and(|token| is_py_version_selector(token))
+                    {
+                        2
+                    } else {
+                        1
+                    },
+            )
+        } else {
+            None
+        };
+        let install_index = if matches!(executable, "pip" | "pip3" | "pip.exe" | "pip3.exe")
+            && lower_tokens
+                .get(start + 1)
+                .is_some_and(|token| token == "install")
         {
             Some(start + 1)
-        } else if executable.starts_with("python")
-            && tokens.get(start + 1).is_some_and(|token| token == "-m")
-            && tokens
-                .get(start + 2)
-                .is_some_and(|token| matches!(token.as_str(), "pip" | "pip3"))
-            && tokens.get(start + 3).is_some_and(|token| token == "install")
-        {
-            Some(start + 3)
+        } else if python_module_index.is_some_and(|module_index| {
+            lower_tokens
+                .get(module_index)
+                .is_some_and(|token| token == "-m")
+                && lower_tokens
+                    .get(module_index + 1)
+                    .is_some_and(|token| matches!(token.as_str(), "pip" | "pip3"))
+                && lower_tokens
+                    .get(module_index + 2)
+                    .is_some_and(|token| token == "install")
+        }) {
+            Some(python_module_index.expect("checked above") + 2)
         } else if executable == "uv"
-            && tokens.get(start + 1).is_some_and(|token| token == "pip")
-            && tokens.get(start + 2).is_some_and(|token| token == "install")
+            && lower_tokens
+                .get(start + 1)
+                .is_some_and(|token| token == "pip")
+            && lower_tokens
+                .get(start + 2)
+                .is_some_and(|token| token == "install")
         {
             Some(start + 2)
         } else {
             None
         };
         if let Some(install_index) = install_index {
-            if pip_installs_current_source(&tokens[install_index + 1..]) {
+            if inside_source_workspace
+                && pip_installs_current_source(&lower_tokens[install_index + 1..])
+            {
                 return true;
             }
-            continue;
+            return false;
         }
 
-        let command_args = &tokens[start + 1..];
-        if (executable == "setup.py"
-            || executable.starts_with("python")
-                && command_args.first().is_some_and(|token| token == "setup.py"))
+        let command_args = &lower_tokens[start + 1..];
+        let path_targets_current_setup = |path: &str| {
+            if matches!(path, "setup.py" | "./setup.py") {
+                return inside_source_workspace;
+            }
+            let (Some(current), Some(root)) = (effective_directory.as_ref(), source_root.as_ref())
+            else {
+                return false;
+            };
+            let path = Path::new(path);
+            let resolved = if path.is_absolute() {
+                normalize_lexical_path(path)
+            } else {
+                normalize_lexical_path(&current.join(path))
+            };
+            resolved == root.join("setup.py")
+        };
+        let direct_setup = executable == "setup.py" && path_targets_current_setup(&tokens[start]);
+        let python_setup = executable.starts_with("python")
+            && tokens
+                .get(start + 1)
+                .is_some_and(|path| path_targets_current_setup(path));
+        let non_installing = command_args
+            .iter()
+            .any(|token| matches!(token.as_str(), "-h" | "--help" | "--dry-run"));
+        if !non_installing
+            && (direct_setup || python_setup)
             && command_args.iter().any(|token| token == "install")
         {
-            return true;
+            return inside_source_workspace;
         }
         if executable == "cargo"
             && command_args.first().is_some_and(|token| token == "install")
-            && command_args.windows(2).any(|pair| {
-                pair[0] == "--path" && is_current_directory(pair[1].as_str())
-            })
+            && !non_installing
+            && !command_args.iter().any(|token| token == "--list")
+            && command_args
+                .windows(2)
+                .any(|pair| pair[0] == "--path" && is_current_directory(pair[1].as_str()))
         {
-            return true;
+            return inside_source_workspace;
         }
         if executable == "npm"
             && command_args.first().is_some_and(|token| token == "install")
+            && !non_installing
             && command_args.windows(2).any(|pair| {
                 matches!(pair[0].as_str(), "-g" | "--global")
                     && is_current_directory(pair[1].as_str())
             })
         {
-            return true;
+            return inside_source_workspace;
         }
+        // A successful overall shell command does not prove that an arbitrary
+        // earlier segment preserved the effective directory or install state.
+        return false;
     }
     false
 }
@@ -2043,6 +2417,7 @@ mod tests {
         ToolOutcome {
             request_id: format!("tool-{sequence}"),
             command: "command".to_owned(),
+            working_directory: None,
             kind,
             sequence,
             started_at_ms: sequence * 10,
@@ -2795,8 +3170,9 @@ mod tests {
 
     #[test]
     fn source_install_detection_accepts_python_module_pip_with_options() {
-        assert!(is_source_install_command(
-            "cd /workspace && .venv/bin/python -m pip install --no-index --no-build-isolation --no-deps -e ."
+        assert!(is_source_install_command_in(
+            "cd /workspace && .venv/bin/python -m pip install --no-index --no-build-isolation --no-deps -e .",
+            Some("/workspace"),
         ));
         assert!(is_source_install_command(
             ".venv/bin/pip3 install --no-deps --editable ./"
@@ -2807,9 +3183,74 @@ mod tests {
         assert!(!is_source_install_command(
             "pip install --find-links . pytest"
         ));
-        assert!(!is_source_install_command("pip install -e ../other-project"));
+        assert!(!is_source_install_command(
+            "pip install -e ../other-project"
+        ));
         assert!(!is_source_install_command(
             "rg --fixed-strings 'pip install .' docs"
+        ));
+        assert!(!is_source_install_command("printf 'x && pip install .'"));
+        assert!(!is_source_install_command(
+            "cd ../other-project && pip install ."
+        ));
+        assert!(!is_source_install_command_in(
+            "cd ../other-project && pip install .",
+            Some("/workspace"),
+        ));
+        assert!(!is_source_install_command_in(
+            "cd /other-project && pip install .",
+            Some("/workspace"),
+        ));
+        assert!(!is_source_install_command(
+            "pip install --cache-dir . --help"
+        ));
+        assert!(!is_source_install_command_in(
+            "../other-project/setup.py install",
+            Some("/workspace"),
+        ));
+        assert!(is_source_install_command_in(
+            "export PIP_NO_INDEX=1 && pip install .",
+            Some("/workspace"),
+        ));
+        assert!(!is_source_install_command_in(
+            "source .venv/bin/activate && pip install .",
+            Some("/workspace"),
+        ));
+        assert!(!is_source_install_command_in(
+            "cd /workspace/subproject && python -m pip install -q -e .",
+            Some("/workspace"),
+        ));
+        assert!(!is_source_install_command_in(
+            "cd /workspace/linked-project && pip install .",
+            Some("/workspace"),
+        ));
+        assert!(is_source_install_command("pip install -e."));
+        assert!(is_source_install_command("pip install -qq -e ."));
+        assert!(is_source_install_command(
+            "pip install --proxy http://127.0.0.1:8080 -e ."
+        ));
+        assert!(is_source_install_command(
+            "uv pip install --system --disable-pip-version-check ."
+        ));
+        assert!(!is_source_install_command_in(
+            "python setup.py install --help",
+            Some("/workspace"),
+        ));
+        assert!(!is_source_install_command_in(
+            "npm install -g . --dry-run",
+            Some("/workspace"),
+        ));
+        assert!(is_source_install_command(
+            r".venv\Scripts\python.exe -m pip install ."
+        ));
+        assert!(is_source_install_command(
+            r".venv\Scripts\pip.exe install ."
+        ));
+        assert!(is_source_install_command("py -m pip install ."));
+        assert!(is_source_install_command("py -3 -m pip install ."));
+        assert!(is_source_install_command("py -3.12 -m pip install ."));
+        assert!(is_source_install_command(
+            r#"& "C:\Program Files\Python\python.exe" -m pip install ."#
         ));
     }
 

@@ -95,6 +95,7 @@ class RuntimeAcceptanceTests(unittest.TestCase):
 
                     start = json.loads(sys.stdin.readline())
                     assert start["api_key"]
+                    assert start["working_directory"].endswith("/project")
                     print(json.dumps({
                         "type": "tool_request",
                         "id": "tool-1",

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import posixpath
 import shlex
 import time
 from pathlib import Path
@@ -179,6 +180,10 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
         api_key = self._bench_env("CODEFACTORY_BENCH_API_KEY")
         assert model and api_key
         allow_network, network_policy = self._resolve_network_policy(environment)
+        container_directory = await self._resolve_container_directory(environment)
+        working_directory, project_root_confirmed = await self._resolve_project_directory(
+            environment, container_directory
+        )
 
         process = await asyncio.create_subprocess_exec(
             str(binary),
@@ -200,6 +205,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
             "model_timeout_sec": self._int_env("CODEFACTORY_BENCH_MODEL_TIMEOUT_SEC", 90),
             "shell_timeout_sec": self._int_env("CODEFACTORY_BENCH_SHELL_TIMEOUT_SEC", 300),
             "wall_time_budget_sec": self._execution_budget_sec(),
+            "working_directory": working_directory,
             "allow_network": allow_network,
             "execution_contract_sha256": contract_sha,
         }
@@ -240,10 +246,23 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
                 message_type = message["type"]
                 if message_type == "tool_request":
                     trajectory.append(self._redact_protocol_message(message))
-                    tool_result = await self._execute_tool_request(message, environment)
+                    tool_result = await self._execute_tool_request(
+                        message, environment, working_directory
+                    )
+                    tool_result["working_directory"] = working_directory
+                    next_working_directory = working_directory
+                    if tool_result.get("return_code") == 0 and not project_root_confirmed:
+                        (
+                            next_working_directory,
+                            project_root_confirmed,
+                        ) = await self._resolve_project_directory(
+                            environment, container_directory
+                        )
+                    tool_result["next_working_directory"] = next_working_directory
                     trajectory.append(self._redact_protocol_message(tool_result))
                     process.stdin.write((json.dumps(tool_result) + "\n").encode("utf-8"))
                     await process.stdin.drain()
+                    working_directory = next_working_directory
                     self._write_trajectory(trajectory, contract_sha)
                     continue
                 if message_type == "event":
@@ -310,6 +329,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
             "instruction_sha256": instruction_sha,
             "execution_contract_sha256": contract_sha,
             "network_policy": network_policy,
+            "working_directory": working_directory,
             "execution_budget_sec": self._execution_budget_sec(),
             "completion_evidence": finished.get("completion_evidence") or {},
             "usage": finished.get("usage") or {},
@@ -326,6 +346,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
         self,
         request_message: dict[str, Any],
         environment: BaseEnvironment,
+        working_directory: str,
     ) -> dict[str, Any]:
         request_id = str(request_message.get("id") or "")
         command = str(request_message.get("command") or "").strip()
@@ -335,6 +356,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
         try:
             result = await environment.exec(
                 command,
+                cwd=working_directory,
                 env=self._tool_execution_env(),
                 timeout_sec=max(1, min(timeout_sec, 900)),
             )
@@ -355,6 +377,58 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
                 "stderr": "",
                 "error": self._single_line(f"{type(exc).__name__}: {exc}", 2000),
             }
+
+    async def _resolve_container_directory(self, environment: BaseEnvironment) -> str:
+        result = await environment.exec(
+            "pwd -P",
+            env=self._tool_execution_env(),
+            timeout_sec=30,
+        )
+        lines = (result.stdout or "").strip().splitlines()
+        if result.return_code != 0 or not lines:
+            raise RuntimeError("CodeFactory could not resolve the Harbor working directory")
+        resolved = lines[0].strip()
+        if not resolved.startswith("/"):
+            raise RuntimeError("Harbor returned a non-absolute working directory")
+        return resolved
+
+    async def _resolve_project_directory(
+        self, environment: BaseEnvironment, container_directory: str
+    ) -> tuple[str, bool]:
+        manifest_scan = await environment.exec(
+            "find . -maxdepth 3 "
+            "\\( -path './node_modules' -o -path './.venv' -o -path './venv' "
+            "-o -path './target' -o -path './.git' \\) -prune -o "
+            "-type f \\( -name pyproject.toml -o -name setup.py -o -name setup.cfg "
+            "-o -name package.json -o -name Cargo.toml -o -name go.mod \\) -print0",
+            cwd=container_directory,
+            env=self._tool_execution_env(),
+            timeout_sec=30,
+        )
+        if manifest_scan.return_code != 0:
+            return container_directory, False
+
+        project_roots: set[str] = set()
+        for manifest in (manifest_scan.stdout or "").split("\0"):
+            manifest = manifest.strip()
+            if not manifest:
+                continue
+            candidate = posixpath.normpath(posixpath.join(container_directory, manifest))
+            try:
+                if (
+                    posixpath.commonpath((container_directory, candidate))
+                    != container_directory
+                ):
+                    continue
+            except ValueError:
+                continue
+            project_roots.add(posixpath.dirname(candidate))
+
+        if container_directory in project_roots:
+            return container_directory, True
+        if len(project_roots) == 1:
+            return project_roots.pop(), True
+        return container_directory, False
 
     def _resolve_sidecar_binary(self) -> Path:
         explicit = self._bench_env("CODEFACTORY_BENCH_AGENT_BINARY")

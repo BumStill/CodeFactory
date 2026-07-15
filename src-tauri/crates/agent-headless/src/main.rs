@@ -2,14 +2,15 @@ use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
     build_completion_recovery_prompt, build_product_system_prompt, build_system_prompt,
     build_time_convergence_prompt, classify_command, effective_command_timeout_sec,
-    evaluate_budget_command_with_time, execution_contract_sha256, sanitize_completion_summary,
-    should_prompt_budget_convergence, should_prompt_time_convergence, BenchmarkPolicy,
-    CompletionEvidence, CompletionGate, PolicyDecision, ProductPolicy, ProgressTracker,
-    ToolOutcome,
+    evaluate_budget_command_with_time_in_directory, execution_contract_sha256,
+    sanitize_completion_summary, should_prompt_budget_convergence, should_prompt_time_convergence,
+    BenchmarkPolicy, CompletionEvidence, CompletionGate, PolicyDecision, ProductPolicy,
+    ProgressTracker, ToolOutcome,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{
@@ -62,6 +63,8 @@ enum InputMessage {
         shell_timeout_sec: u64,
         #[serde(default)]
         wall_time_budget_sec: Option<u64>,
+        #[serde(default)]
+        working_directory: Option<String>,
         allow_network: bool,
         #[serde(default)]
         policy_profile: RuntimePolicyProfile,
@@ -74,6 +77,8 @@ enum InputMessage {
         stdout: String,
         stderr: String,
         error: Option<String>,
+        #[serde(default)]
+        next_working_directory: Option<String>,
     },
 }
 
@@ -105,6 +110,7 @@ struct StartConfig {
     model_timeout_sec: u64,
     shell_timeout_sec: u64,
     wall_time_budget_sec: Option<u64>,
+    working_directory: Option<String>,
     allow_network: bool,
     policy_profile: RuntimePolicyProfile,
 }
@@ -211,7 +217,7 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let config = read_start(input).await?;
+    let mut config = read_start(input).await?;
     let client = Client::builder()
         .timeout(Duration::from_secs(config.model_timeout_sec.max(1)))
         .build()?;
@@ -341,17 +347,19 @@ where
                     }
                 }
                 PolicyDecision::Allow => {
-                    evaluate_budget_command_with_time(
+                    evaluate_budget_command_with_time_in_directory(
                         remaining,
                         wall_time,
                         &gate.evidence(),
                         &tool_call.command,
                         &kind,
+                        config.working_directory.as_deref(),
                     )
                 }
                 denied => denied,
             };
-            let (return_code, stdout, stderr, error) = match policy_decision {
+            let (return_code, stdout, stderr, error, next_working_directory) = match policy_decision
+            {
                 PolicyDecision::Allow => {
                     write_output(
                         output,
@@ -369,12 +377,14 @@ where
                     String::new(),
                     String::new(),
                     Some(format!("policy denied command ({rule}): {reason}")),
+                    None,
                 ),
             };
 
             let outcome = ToolOutcome {
                 request_id: tool_call.id.clone(),
                 command: tool_call.command.clone(),
+                working_directory: config.working_directory.clone(),
                 kind,
                 sequence,
                 started_at_ms,
@@ -387,6 +397,13 @@ where
             }
             .with_detected_semantic_failure();
             gate.record(&outcome);
+            if let Some(next_working_directory) = next_working_directory
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty() && Path::new(path).is_absolute())
+            {
+                config.working_directory = Some(next_working_directory.to_owned());
+            }
             let policy_denied = error
                 .as_deref()
                 .is_some_and(|message| message.starts_with("policy denied command"));
@@ -475,6 +492,7 @@ where
             model_timeout_sec,
             shell_timeout_sec,
             wall_time_budget_sec,
+            working_directory,
             allow_network,
             policy_profile,
             execution_contract_sha256: bridge_hash,
@@ -495,6 +513,7 @@ where
                 model_timeout_sec,
                 shell_timeout_sec,
                 wall_time_budget_sec,
+                working_directory,
                 allow_network,
                 policy_profile,
             })
@@ -506,7 +525,7 @@ where
 async fn read_tool_result<R>(
     input: &mut R,
     expected_id: &str,
-) -> Result<(Option<i32>, String, String, Option<String>), HeadlessError>
+) -> Result<(Option<i32>, String, String, Option<String>, Option<String>), HeadlessError>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -520,7 +539,8 @@ where
             stdout,
             stderr,
             error,
-        } if id == expected_id => Ok((return_code, stdout, stderr, error)),
+            next_working_directory,
+        } if id == expected_id => Ok((return_code, stdout, stderr, error, next_working_directory)),
         InputMessage::ToolResult { id, .. } => Err(HeadlessError::UnexpectedToolResult {
             expected: expected_id.to_owned(),
             actual: id,
@@ -885,7 +905,8 @@ mod tests {
         let line = concat!(
             "{\"type\":\"tool_result\",\"id\":\"call-1\",",
             "\"return_code\":null,\"stdout\":\"\",\"stderr\":\"\",",
-            "\"error\":\"command timed out\"}\n"
+            "\"error\":\"command timed out\",",
+            "\"next_working_directory\":\"/workspace/project\"}\n"
         );
         let mut input = BufReader::new(line.as_bytes());
 
@@ -893,6 +914,7 @@ mod tests {
 
         assert_eq!(result.0, None);
         assert_eq!(result.3.as_deref(), Some("command timed out"));
+        assert_eq!(result.4.as_deref(), Some("/workspace/project"));
     }
 
     #[test]
@@ -1317,6 +1339,7 @@ mod tests {
             model_timeout_sec: 5,
             shell_timeout_sec: 30,
             wall_time_budget_sec: None,
+            working_directory: Some("/workspace".to_owned()),
             allow_network: false,
             policy_profile: RuntimePolicyProfile::Benchmark,
         };

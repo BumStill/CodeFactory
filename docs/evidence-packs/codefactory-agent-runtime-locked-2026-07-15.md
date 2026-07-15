@@ -102,7 +102,7 @@
 - trajectory SHA-256: `8f8bad5161f0236be6cb483f44bf4cbd219d0fc46fd0ae6707cf79acbda11d49`
 - trajectory: `34` JSONL rows, `22690` bytes
 
-本地远端门禁脚本预演启动了精确 debug App，绑定实际 PID 观察到 `1200x800`、layer `0`、alpha `1` 的稳定窗口，并生成 `680 KB` 非空截图。候选随后合入最新 `v1.44.0` 主干并再次完成可追踪的 debug App 构建，进程退出码为 `0`，当前 App 可执行文件 SHA-256 为 `f216040c205acfc32fa5031456a0c4ff16f81a6d84189ba3c0acb85600426ecd`。本地预演证明脚本可执行；精确当前候选的 GitHub-hosted macOS 窗口与截图结果仍必须由 PR CI 给出。
+本地远端门禁脚本预演启动了精确 debug App，绑定实际 PID 观察到 `1200x800`、layer `0`、alpha `1` 的稳定窗口，并生成 `680 KB` 非空截图。候选随后持续合入最新主干，并保留 Evolution Evals smoke 与真实窗口 smoke 两套正式发布门禁。独立复核全部修复后的最终候选再次构建成功，bundle id 为 `com.codefactory.app`，版本为 `1.45.1`，arm64 App 可执行文件 SHA-256 为 `fa3945057e99e13393fb0f0130c77dd8f6f12c2c85ab0c1c06227a35e56c8632`。
 
 PR `#106` 的第一次 GitHub-hosted canary `29395835212` 在结构断言上返回成功，但下载并目视复核的 `window.png` 显示 WebView 为白屏。原因是窗口截图包含每边约 `56` 像素的黑色阴影区，旧内容采样仍被阴影颜色干扰。该次绿色 check 不作为 GUI 通过证据。门禁随后改为根据逻辑窗口尺寸推导 scale 与阴影，只采样真实窗口中央内容，并在最多 `20` 秒内等待 WebView 绘制。旧远端白屏按新算法为 `1` 个颜色桶、`0 / 625` 非主色采样，必定失败；本地真实 onboarding 截图为 `10` 个颜色桶、`208 / 576` 非主色采样。修复后的 hosted canary 才能决定 `remote-real-app-gui` 是否成立。
 
@@ -123,3 +123,5 @@ PR `#106` 的第一次 GitHub-hosted canary `29395835212` 在结构断言上返�
 - screenshot SHA-256: `b4ef56432a065fd5d6552a0b8cba206cac3eadabd37e9a779ac27fd4e7e42331`
 
 同一候选的 CI、两项 governance baseline 和 `remote-real-app-gui` 均为绿色。该证据只证明 PR 精确候选 App 在远程真实 GUI 会话可启动并渲染；候选仍是 `not live`，必须继续完成合并、刻意发版、发布 DMG smoke、published-tag smoke 和已发布版本锁屏 canary。
+
+最终独立复核还发现源码安装证据解析会把引号中的 `pip install .` 文本、未知 pip 参数的值或其他项目的安装误记为当前项目安装。失败回归先复现误判，随后产品共享 Agent core 改为引号感知的保守 shell 解析，并在桌面主路径把真实项目工作目录写入工具结果；headless 的前置门禁和结果记录同样使用真实项目根。Terminal-Bench 薄适配器先读取容器物理目录，再通过标准 `pyproject.toml`、`setup.py`、`package.json`、`Cargo.toml`、`go.mod` 等 manifest 做有界项目根发现：默认根有 manifest 时优先使用，只有一个嵌套项目时选择该根，多个候选时保守留在默认根。若源码在任务运行后才被克隆，适配器会在成功工具调用后重新发现根目录，通过向后兼容的协议字段让下一次工具执行、前置策略和完成证据同步切换；当前工具仍按它实际执行的旧目录记账。现在只有有效目录仍等于该项目根时，`.` / `./` 安装才记入完成证据；相对和绝对其他项目、嵌套无关仓库、其他路径的 `setup.py`、未知参数及 `--help` / `--dry-run` 均被拒绝。合法的 pip/uv 常用参数与 Windows `pip.exe`、`py -3/-3.12 -m pip`、PowerShell 调用保持支持；只含环境赋值的 `export ... && pip install .` 保持通过，可能改变目录的 `source` 脚本保守拒绝。合入 `v1.45.1` 主干后的验证为 Rust 主 crate `293 passed / 6 ignored`、shared core `57 passed`、headless `13 passed`、Python `68 / 68`、frontend `172 / 172`，并再次完成双视口 Evolution headless gate、production frontend build 和 debug App bundle。最终独立审查未发现 P0/P1。

@@ -26,10 +26,14 @@ class FakeEnvironment:
         self,
         results: list[ExecResult] | None = None,
         network_mode: str = "no-network",
+        project_manifests: str = "",
+        project_manifests_after_command: dict[str, str] | None = None,
     ) -> None:
         self.calls: list[dict[str, object]] = []
         self.results = list(results or [])
         self.network_policy = FakeNetworkPolicy(network_mode)
+        self.project_manifests = project_manifests
+        self.project_manifests_after_command = dict(project_manifests_after_command or {})
 
     async def exec(
         self,
@@ -48,6 +52,12 @@ class FakeEnvironment:
                 "user": user,
             }
         )
+        if command == "pwd -P":
+            return ExecResult(stdout="/workspace\n", stderr="", return_code=0)
+        if command.startswith("find . -maxdepth 3"):
+            return ExecResult(stdout=self.project_manifests, stderr="", return_code=0)
+        if command in self.project_manifests_after_command:
+            self.project_manifests = self.project_manifests_after_command[command]
         if self.results:
             return self.results.pop(0)
         return ExecResult(stdout="ok", stderr="", return_code=0)
@@ -122,8 +132,12 @@ print(json.dumps({"type":"finished","final_text":"verified","execution_contract_
 
             asyncio.run(agent.run("Implement and verify the requested change", env, context))
 
-            self.assertEqual(len(env.calls), 1)
-            self.assertEqual(env.calls[0]["command"], "python -m unittest")
+            self.assertEqual(len(env.calls), 4)
+            self.assertEqual(env.calls[0]["command"], "pwd -P")
+            self.assertTrue(str(env.calls[1]["command"]).startswith("find . -maxdepth 3"))
+            self.assertEqual(env.calls[2]["command"], "python -m unittest")
+            self.assertEqual(env.calls[2]["cwd"], "/workspace")
+            self.assertTrue(str(env.calls[3]["command"]).startswith("find . -maxdepth 3"))
             trajectory = json.loads((root / "trajectory.json").read_text())
             self.assertEqual(trajectory["runtime_subject"], "rust-core")
             self.assertEqual(trajectory["steps"][0]["type"], "tool_request")
@@ -131,6 +145,51 @@ print(json.dumps({"type":"finished","final_text":"verified","execution_contract_
             assert context.metadata is not None
             self.assertTrue(context.metadata["completion_evidence"]["ready"])
             self.assertEqual(context.metadata["usage"]["total_tokens"], 14)
+            self.assertEqual(context.metadata["working_directory"], "/workspace")
+
+    def test_model_run_adopts_project_created_after_sidecar_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sidecar = self._write_sidecar(
+                root,
+                """import json, sys
+start = json.loads(sys.stdin.readline())
+assert start["working_directory"] == "/workspace", start
+print(json.dumps({"type":"tool_request","id":"clone","command":"git clone fixture pyknotid","timeout_sec":30}), flush=True)
+clone = json.loads(sys.stdin.readline())
+assert clone["next_working_directory"] == "/workspace/pyknotid", clone
+print(json.dumps({"type":"tool_request","id":"install","command":"pip install -e .","timeout_sec":30}), flush=True)
+install = json.loads(sys.stdin.readline())
+assert install["working_directory"] == "/workspace/pyknotid", install
+print(json.dumps({"type":"finished","final_text":"verified","execution_contract_sha256":start["execution_contract_sha256"],"completion_evidence":{"ready":True},"usage":{}}), flush=True)
+""",
+            )
+            environment = FakeEnvironment(
+                results=[
+                    ExecResult(stdout="cloned", stderr="", return_code=0),
+                    ExecResult(stdout="installed", stderr="", return_code=0),
+                ],
+                project_manifests_after_command={
+                    "git clone fixture pyknotid": "./pyknotid/setup.py\0"
+                },
+            )
+            agent = CodeFactoryAgent(
+                logs_dir=root,
+                model_name="test-model",
+                extra_env={
+                    "CODEFACTORY_BENCH_API_KEY": "test-key",
+                    "CODEFACTORY_BENCH_AGENT_BINARY": str(sidecar),
+                },
+            )
+
+            asyncio.run(agent.run("Clone, fix, install, and verify", environment, AgentContext()))
+
+            commands = [str(call["command"]) for call in environment.calls]
+            self.assertIn("git clone fixture pyknotid", commands)
+            install_call = next(
+                call for call in environment.calls if call["command"] == "pip install -e ."
+            )
+            self.assertEqual(install_call["cwd"], "/workspace/pyknotid")
 
     def test_model_run_inherits_harbor_network_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -218,6 +277,7 @@ print(json.dumps({"type":"finished","final_text":"ok","execution_contract_sha256
                 """import json, sys
 start = json.loads(sys.stdin.readline())
 assert start["wall_time_budget_sec"] == 900, start
+assert start["working_directory"] == "/workspace/pyknotid", start
 print(json.dumps({"type":"finished","final_text":"ok","execution_contract_sha256":start["execution_contract_sha256"],"completion_evidence":{"ready":True},"usage":{}}), flush=True)
 """,
             )
@@ -233,7 +293,8 @@ print(json.dumps({"type":"finished","final_text":"ok","execution_contract_sha256
                 },
             )
 
-            asyncio.run(agent.run("Complete a timed coding task", FakeEnvironment(), AgentContext()))
+            environment = FakeEnvironment(project_manifests="./pyknotid/setup.py\0")
+            asyncio.run(agent.run("Complete a timed coding task", environment, AgentContext()))
 
     def test_sidecar_secret_is_passed_only_in_start_message_and_not_logged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -286,7 +347,9 @@ print("not-json", flush=True)
             with self.assertRaisesRegex(RuntimeError, "protocol"):
                 asyncio.run(agent.run("Inspect the workspace", env, context))
 
-            self.assertEqual(env.calls, [])
+            self.assertEqual(len(env.calls), 2)
+            self.assertEqual(env.calls[0]["command"], "pwd -P")
+            self.assertTrue(str(env.calls[1]["command"]).startswith("find . -maxdepth 3"))
 
     def test_exited_sidecar_preserves_original_stderr_instead_of_cleanup_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

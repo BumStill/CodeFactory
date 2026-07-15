@@ -18,7 +18,7 @@ pub use dispatch::decide_chat_mode;
 use chrono::Utc;
 use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
-    build_completion_recovery_prompt, classify_command, evaluate_budget_command,
+    build_completion_recovery_prompt, classify_command, evaluate_budget_command_in_directory,
     sanitize_completion_summary, should_prompt_budget_convergence, CompletionEvidence,
     CompletionGate, PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
 };
@@ -763,6 +763,7 @@ impl AgentLoop {
                     &completion_evidence,
                     &tc.function.name,
                     &args,
+                    &self.cwd,
                 ) {
                     Some(content)
                 } else {
@@ -926,6 +927,7 @@ impl AgentLoop {
                     &mut completion_gate,
                     &mut progress_tracker,
                     &mut completion_sequence,
+                    &self.cwd,
                     &tc.function.name,
                     &completion_args,
                     &output,
@@ -2043,6 +2045,7 @@ impl AgentLoop {
                     &completion_evidence,
                     &tc.function.name,
                     &args,
+                    &self.cwd,
                 ) {
                     Some(content)
                 } else {
@@ -2200,6 +2203,7 @@ impl AgentLoop {
                     &mut completion_gate,
                     &mut progress_tracker,
                     &mut completion_sequence,
+                    &self.cwd,
                     &tc.function.name,
                     &completion_args,
                     &output,
@@ -2401,6 +2405,7 @@ fn autonomous_budget_denial(
     evidence: &CompletionEvidence,
     tool_name: &str,
     args: &serde_json::Value,
+    working_directory: &Path,
 ) -> Option<String> {
     let (command, kind) = completion_command_and_kind(tool_name, args);
     // Interactive chat is not constrained by the autonomous round budget, but
@@ -2410,11 +2415,12 @@ fn autonomous_budget_denial(
     } else {
         remaining_model_rounds
     };
-    match evaluate_budget_command(
+    match evaluate_budget_command_in_directory(
         effective_remaining,
         evidence,
         &command,
         &kind,
+        working_directory.to_str(),
     ) {
         PolicyDecision::Allow => None,
         PolicyDecision::Deny { reason, .. } => Some(format!(
@@ -2427,6 +2433,7 @@ fn record_completion_outcome(
     gate: &mut CompletionGate,
     progress: &mut ProgressTracker,
     sequence: &mut u64,
+    working_directory: &Path,
     tool_name: &str,
     args: &serde_json::Value,
     output: &tools::ToolOutput,
@@ -2436,6 +2443,7 @@ fn record_completion_outcome(
     let outcome = ToolOutcome {
         request_id: format!("desktop-tool-{sequence}"),
         command,
+        working_directory: Some(working_directory.to_string_lossy().into_owned()),
         kind,
         sequence: *sequence,
         started_at_ms: 0,
@@ -3133,6 +3141,7 @@ mod tests {
             &mut gate,
             &mut progress,
             &mut sequence,
+            Path::new("/workspace"),
             "write_file",
             &serde_json::json!({"path": "src/example.rs", "content": "fn main() {}"}),
             &tools::ToolOutput::ok("written"),
@@ -3143,6 +3152,7 @@ mod tests {
             &mut gate,
             &mut progress,
             &mut sequence,
+            Path::new("/workspace"),
             "bash",
             &serde_json::json!({"command": "cargo test"}),
             &tools::ToolOutput::ok("test result: ok"),
@@ -3159,6 +3169,7 @@ mod tests {
             &mut gate,
             &mut progress,
             &mut sequence,
+            Path::new("/workspace"),
             "bash",
             &serde_json::json!({
                 "command": "nohup ./server >server.log 2>&1 & echo $! >server.pid"
@@ -3171,6 +3182,7 @@ mod tests {
             &mut gate,
             &mut progress,
             &mut sequence,
+            Path::new("/workspace"),
             "bash",
             &serde_json::json!({
                 "command": "timeout 10 curl --fail http://127.0.0.1:8080/health"
@@ -3191,17 +3203,28 @@ mod tests {
             ..CompletionEvidence::default()
         };
         let unrelated = serde_json::json!({"command": "pytest tests/test_unrelated.py"});
-        assert!(
-            autonomous_budget_denial(AgentMode::Autonomous, 8, &evidence, "bash", &unrelated,)
-                .is_some()
-        );
+        assert!(autonomous_budget_denial(
+            AgentMode::Autonomous,
+            8,
+            &evidence,
+            "bash",
+            &unrelated,
+            Path::new("/workspace"),
+        )
+        .is_some());
 
         let fragile_scan = serde_json::json!({
             "command": "cd /workspace && result=$(grep -r --include='*.py' 'old_value' pkg/ tests/ 2>&1); rc=$?; if [ $rc -gt 1 ]; then exit $rc; elif [ $rc -eq 0 ]; then exit 1; else echo 'CLEAN: no old_value references'; fi"
         });
-        let denial =
-            autonomous_budget_denial(AgentMode::Interactive, 64, &evidence, "bash", &fragile_scan)
-                .expect("interactive mode must reject a fragile compatibility scan");
+        let denial = autonomous_budget_denial(
+            AgentMode::Interactive,
+            64,
+            &evidence,
+            "bash",
+            &fragile_scan,
+            Path::new("/workspace"),
+        )
+        .expect("interactive mode must reject a fragile compatibility scan");
         assert!(denial.contains("temporary results file"));
         assert!(denial.contains("test ! -s"));
 
@@ -3214,6 +3237,7 @@ mod tests {
             &evidence,
             "bash",
             &robust_scan,
+            Path::new("/workspace"),
         )
         .is_none());
 
@@ -3228,6 +3252,7 @@ mod tests {
             &evidence,
             "edit_file",
             &source_edit,
+            Path::new("/workspace"),
         )
         .is_none());
 
@@ -3237,6 +3262,7 @@ mod tests {
             &CompletionEvidence::default(),
             "bash",
             &unrelated,
+            Path::new("/workspace"),
         )
         .is_none());
     }
@@ -3327,7 +3353,10 @@ mod tests {
         let repaired = repair_openai_tool_protocol(vec![
             provider_message(
                 "assistant",
-                Some(vec![provider_tool_call("call-a"), provider_tool_call("call-b")]),
+                Some(vec![
+                    provider_tool_call("call-a"),
+                    provider_tool_call("call-b"),
+                ]),
                 None,
             ),
             provider_message("tool", None, Some("call-a")),
@@ -3340,7 +3369,10 @@ mod tests {
             .filter_map(|message| message.tool_call_id.as_deref())
             .collect();
         assert_eq!(tool_ids, vec!["call-a", "call-b"]);
-        assert_eq!(repaired.last().map(|message| message.role.as_str()), Some("user"));
+        assert_eq!(
+            repaired.last().map(|message| message.role.as_str()),
+            Some("user")
+        );
     }
 
     #[test]
@@ -3429,6 +3461,7 @@ mod tests {
             &mut gate,
             &mut progress,
             &mut sequence,
+            Path::new("/workspace"),
             "edit_file",
             &serde_json::json!({
                 "path": "/workspace/compatdemo/service.py",
@@ -3454,6 +3487,7 @@ mod tests {
             &evidence,
             "bash",
             &fragile_scan,
+            Path::new("/workspace"),
         )
         .is_some());
     }
