@@ -231,6 +231,7 @@ func writeEvidence(
     var variedPixels = 0
     var renderedAttempt: Int?
     var lastContentReason = "no screenshot captured"
+    let lastScreenshotURL = evidenceDirectory.appendingPathComponent("window-last.png")
 
     // The native window can become stable before the WebView paints. Retry a
     // bounded number of captures and validate only the interior of the actual
@@ -238,17 +239,29 @@ func writeEvidence(
     for attempt in 1...20 {
         try? FileManager.default.removeItem(at: screenshotURL)
         let capture = Process()
+        let captureError = Pipe()
         capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
         capture.arguments = ["-x", "-l", String(windowID), screenshotURL.path]
+        capture.standardError = captureError
         try capture.run()
         capture.waitUntilExit()
+        let captureErrorText = String(
+            data: captureError.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard capture.terminationStatus == 0,
               let image = NSImage(contentsOf: screenshotURL),
               let tiff = image.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiff)
         else {
-            throw SmokeError.screenshotUnavailable(windowID)
+            lastContentReason = "capture attempt \(attempt) failed status=\(capture.terminationStatus) error=\(captureErrorText)"
+            if attempt < 20 {
+                Thread.sleep(forTimeInterval: 1)
+            }
+            continue
         }
+        try? FileManager.default.removeItem(at: lastScreenshotURL)
+        try? FileManager.default.copyItem(at: screenshotURL, to: lastScreenshotURL)
         screenshotWidth = bitmap.pixelsWide
         screenshotHeight = bitmap.pixelsHigh
         guard screenshotWidth >= 800, screenshotHeight >= 600 else {
@@ -303,6 +316,20 @@ func writeEvidence(
     }
 
     guard let renderedAttempt else {
+        let failureMetadata: [String: Any] = [
+            "status": "error",
+            "proof_tier": ProcessInfo.processInfo.environment["CODEFACTORY_GUI_PROOF_TIER"]
+                ?? "remote-real-app-gui",
+            "app": appURL.path,
+            "pid": Int(pid),
+            "reason": lastContentReason,
+            "window": window,
+        ]
+        let failureData = try JSONSerialization.data(
+            withJSONObject: failureMetadata,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        try failureData.write(to: evidenceDirectory.appendingPathComponent("failure.json"))
         throw SmokeError.screenshotBlank(windowID, lastContentReason)
     }
 
