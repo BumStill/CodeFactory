@@ -387,6 +387,13 @@ export interface Settings {
   /** True once the user has completed (or skipped) first-run onboarding.
    *  Optional for backward compat — missing/false triggers the overlay. */
   onboarded?: boolean;
+  /** Max concurrent subagents for parallel tasks (backend clamps to 1..=8).
+   *  Optional for backward compat — missing → 3. */
+  max_parallel_tasks?: number;
+  /** Disk isolation for parallel subagents. Optional for backward compat —
+   *  missing → "shared". "worktree" runs each task in its own git worktree
+   *  and merges verified diffs back; non-git cwds fall back to shared. */
+  subagent_isolation?: 'shared' | 'worktree';
 }
 
 // ── Git ─────────────────────────────────────────────────────────────────────

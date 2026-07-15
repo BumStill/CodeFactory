@@ -18,30 +18,42 @@
 //!
 //! # Concurrency model
 //! A `Semaphore(max_parallel)` gates how many subagent futures can run at
-//! once. Each spawned future holds its own permit until it finishes. The
-//! scheduler loop is single-threaded — it owns the DB read for "what's
-//! ready next?" and the event emission. Cancellation is cooperative via an
-//! `AtomicBool` checked at the top of each iteration; in-flight subagents
-//! are NOT killed mid-flight (they always finish their current iteration).
+//! once (`Settings::max_parallel_tasks`, clamped to 1..=8). Each spawned
+//! future holds its own permit until it finishes. The scheduler loop is
+//! single-threaded — it owns the DB read for "what's ready next?" and the
+//! event emission. Cancellation is cooperative via an `AtomicBool` checked
+//! at the top of each iteration; in-flight subagents are NOT killed
+//! mid-flight (they always finish their current iteration).
+//!
+//! # Disk isolation
+//! With `Settings::subagent_isolation == Worktree`, each task runs in its
+//! own git worktree (see [`crate::agent::worktree`]): the brief cwd and
+//! verification both point into the worktree, and the diff is applied back
+//! onto the user's tree only after verification passes. Merge-backs are
+//! serialized per session so concurrent tasks never interleave `git apply`
+//! on the same checkout. Non-git cwds fall back to today's shared-cwd mode.
 
 use serde::Serialize;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::agent::hooks::{HookEvent, HookRunner};
 use crate::agent::subagent::{self, SubagentBrief, SubagentResult};
 use crate::agent::verification;
-use crate::config::settings::Settings;
+use crate::agent::worktree;
+use crate::config::settings::{Settings, SubagentIsolation};
 use crate::errors::AppError;
 use crate::storage::tasks;
 use crate::PendingPermissionMap;
 
-/// Max concurrent subagents per scheduler instance.
+/// Default max concurrent subagents; the live cap comes from
+/// `Settings::max_parallel_tasks` in [`TaskScheduler::run_session`].
 pub const MAX_PARALLEL: usize = 3;
 
 /// Max retry attempts per task (including the first attempt).
@@ -131,7 +143,27 @@ impl TaskScheduler {
         pending_perms: PendingPermissionMap,
         interjections: crate::commands::interjections::InterjectionQueue,
     ) -> Result<(), AppError> {
-        let semaphore = Arc::new(Semaphore::new(self.max_parallel));
+        let max_parallel = usize::from(settings.max_parallel_tasks.clamp(1, 8));
+        let semaphore = Arc::new(Semaphore::new(max_parallel));
+
+        // Worktree isolation: resolve the container dir once. Worktrees live
+        // under the app data dir — never inside the user's project — so
+        // nothing ever shows up in their `git status`.
+        let worktree_container: Option<PathBuf> =
+            if settings.subagent_isolation == SubagentIsolation::Worktree {
+                Some(
+                    app_handle
+                        .path()
+                        .app_data_dir()
+                        .unwrap_or_else(|_| std::env::temp_dir().join("codefactory"))
+                        .join("task-worktrees"),
+                )
+            } else {
+                None
+            };
+        // Serializes merge-backs within this session: concurrent tasks must
+        // not interleave `git apply` on the same user checkout.
+        let merge_lock = Arc::new(Mutex::new(()));
 
         // Write shared brief listing all tasks for parallel subagents to read
         {
@@ -231,6 +263,8 @@ impl TaskScheduler {
                 let interjections_clone = interjections.clone();
                 let session_id_for_task = session_id.clone();
                 let running = self.running.clone();
+                let worktree_container = worktree_container.clone();
+                let merge_lock = merge_lock.clone();
                 let task_id = task.id.clone();
                 let task_cwd = task.cwd.clone();
                 let task_title = task.title.clone();
@@ -262,6 +296,63 @@ impl TaskScheduler {
                             title: task_title.clone(),
                         })
                         .await;
+
+                    // ── Worktree isolation (optional) ───────────────────────
+                    // One worktree per task, reused across attempts so partial
+                    // progress carries over exactly like shared mode. Non-git
+                    // cwds (or repos without a commit) fall back to shared.
+                    let mut task_worktree: Option<worktree::TaskWorktree> = None;
+                    let mut effective_cwd = task_cwd.clone();
+                    if let Some(ref container) = worktree_container {
+                        match worktree::create(std::path::Path::new(&task_cwd), &task_id, container)
+                        {
+                            Ok(wt) => {
+                                effective_cwd = wt.effective_cwd.display().to_string();
+                                emit_task(
+                                    &app,
+                                    &session_id_for_task,
+                                    "task_progress",
+                                    &TaskEventPayload {
+                                        task_id: &task_id,
+                                        title: None,
+                                        message: Some(&format!(
+                                            "Running isolated on branch {}",
+                                            wt.branch
+                                        )),
+                                        result: None,
+                                        error: None,
+                                        files_changed: None,
+                                        cwd: None,
+                                    },
+                                );
+                                task_worktree = Some(wt);
+                            }
+                            Err(e) => {
+                                tracing::info!(
+                                    "scheduler: task {} worktree isolation unavailable ({e}); \
+                                     falling back to shared cwd",
+                                    task_id
+                                );
+                                emit_task(
+                                    &app,
+                                    &session_id_for_task,
+                                    "task_progress",
+                                    &TaskEventPayload {
+                                        task_id: &task_id,
+                                        title: None,
+                                        message: Some(&format!(
+                                            "Worktree isolation unavailable ({e}); \
+                                             running in shared directory"
+                                        )),
+                                        result: None,
+                                        error: None,
+                                        files_changed: None,
+                                        cwd: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
 
                     // ── Retry loop ──────────────────────────────────────────
                     let mut prev_error: Option<String> = None;
@@ -312,7 +403,7 @@ impl TaskScheduler {
                             task_id: task_id.clone(),
                             title: task_title.clone(),
                             description,
-                            cwd: task_cwd.clone(),
+                            cwd: effective_cwd.clone(),
                             parent_summary,
                             allowed_tools: vec![
                                 "read_file".into(),
@@ -432,7 +523,11 @@ impl TaskScheduler {
                                 }
 
                                 // ── Verification ─────────────────────────────
-                                let verif_plan = verification::detect_verification_plan(&task_cwd);
+                                // Runs against the effective cwd: in worktree
+                                // mode that's the isolated checkout, so only
+                                // verified work ever merges back.
+                                let verif_plan =
+                                    verification::detect_verification_plan(&effective_cwd);
                                 let verif_results = verification::run_verification(
                                     &verif_plan,
                                     &app,
@@ -481,6 +576,60 @@ impl TaskScheduler {
                                     VerificationAttemptDecision::Finish(outcome) => {
                                         final_outcome = Some(outcome);
                                         break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Merge back isolated work (verify-then-merge) ────────
+                    // Only verified, completed outcomes merge; a conflict is
+                    // all-or-nothing (user tree untouched) and downgrades the
+                    // task to failed with the branch + patch preserved for
+                    // manual recovery. Failed tasks keep their worktree.
+                    if let Some(ref wt) = task_worktree {
+                        let completed_ok = final_outcome.as_ref().map_or(false, |r| r.completed);
+                        if completed_ok {
+                            let _merge_guard = merge_lock.lock().await;
+                            match worktree::merge_back(wt) {
+                                Ok(worktree::MergeOutcome::Applied)
+                                | Ok(worktree::MergeOutcome::NoChanges) => {
+                                    if let Some(ref mut r) = final_outcome {
+                                        r.files_changed = worktree::remap_paths(
+                                            std::mem::take(&mut r.files_changed),
+                                            wt,
+                                        );
+                                    }
+                                    worktree::cleanup(wt, true);
+                                }
+                                Ok(worktree::MergeOutcome::Conflict { message }) => {
+                                    let note = format!(
+                                        "Merge-back conflict: {message}. Work preserved on \
+                                         branch '{}' with patch at {}.",
+                                        wt.branch,
+                                        wt.patch_path.display()
+                                    );
+                                    tracing::warn!("scheduler: task {} {}", task_id, note);
+                                    prev_error = Some(note.clone());
+                                    if let Some(ref mut r) = final_outcome {
+                                        r.completed = false;
+                                        r.summary =
+                                            format!("{note}\n\nOriginal summary:\n{}", r.summary);
+                                    }
+                                }
+                                Err(e) => {
+                                    let note = format!(
+                                        "Merge-back failed: {e}. Work preserved on branch '{}' \
+                                         at {}.",
+                                        wt.branch,
+                                        wt.worktree_root.display()
+                                    );
+                                    tracing::warn!("scheduler: task {} {}", task_id, note);
+                                    prev_error = Some(note.clone());
+                                    if let Some(ref mut r) = final_outcome {
+                                        r.completed = false;
+                                        r.summary =
+                                            format!("{note}\n\nOriginal summary:\n{}", r.summary);
                                     }
                                 }
                             }
