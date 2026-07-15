@@ -96,6 +96,49 @@ pub async fn list_user_preferences(
         .collect())
 }
 
+/// Read the effective preference without seeding defaults: a project value
+/// wins, otherwise the global value is returned. The evolution review surface
+/// uses this for a truthful before/after preview without mutating state before
+/// the user makes a decision.
+#[command]
+pub async fn get_effective_user_preference(
+    cwd: String,
+    key: String,
+    state: State<'_, AppState>,
+) -> Result<Option<UserPreference>, AppError> {
+    let pool = state.db.read().await;
+    get_effective_user_preference_for_pool(&cwd, &key, &pool).await
+}
+
+async fn get_effective_user_preference_for_pool(
+    cwd: &str,
+    key: &str,
+    pool: &sqlx::SqlitePool,
+) -> Result<Option<UserPreference>, AppError> {
+    let row: Option<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT cwd, key, value, source, updated_at
+         FROM user_preferences
+         WHERE cwd IN (?, ?) AND key = ?
+         ORDER BY CASE WHEN cwd = ? THEN 0 ELSE 1 END
+         LIMIT 1",
+    )
+    .bind(cwd)
+    .bind(GLOBAL_CWD)
+    .bind(key)
+    .bind(cwd)
+    .fetch_optional(pool)
+    .await?;
+    Ok(
+        row.map(|(cwd, key, value, source, updated_at)| UserPreference {
+            cwd,
+            key,
+            value,
+            source,
+            updated_at,
+        }),
+    )
+}
+
 #[command]
 pub async fn upsert_user_preference(
     cwd: String,
@@ -203,5 +246,42 @@ mod tests {
         .fetch_one(&pool).await.unwrap();
         assert_eq!(row.0, "high");
         assert_eq!(row.1, "user");
+    }
+
+    #[tokio::test]
+    async fn effective_preference_falls_back_to_global_and_project_overrides() {
+        let pool = fresh_pool().await;
+        for (cwd, value) in [(GLOBAL_CWD, "global"), ("/proj", "project")] {
+            sqlx::query(
+                "INSERT INTO user_preferences (cwd, key, value, source, updated_at)
+                 VALUES (?, 'communication_style', ?, 'user', '2026-07-15')",
+            )
+            .bind(cwd)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let project = get_effective_user_preference_for_pool("/proj", "communication_style", &pool)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (project.cwd.as_str(), project.value.as_str()),
+            ("/proj", "project")
+        );
+        let global = get_effective_user_preference_for_pool("/other", "communication_style", &pool)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (global.cwd.as_str(), global.value.as_str()),
+            (GLOBAL_CWD, "global")
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_preferences")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "effective reads must not seed or mutate defaults");
     }
 }

@@ -5,9 +5,11 @@
 > 也只读取 `task_runs`。因此 P1/P3/P4 暂时只能视为“实现框架已存在、真实观察层
 > 未闭合”，不能以 shipped 文案作为产品完成证据。修复顺序与验收见
 > `docs/specs/feature-specs/evolution-agent-closed-loop.md`。
-> `codex/evolution-agent-loop` 已完成本地 Trace Truth 首个切片与真实 App 证据，
-> 但在 PR+CI、合并与发布前仍是 `not live`；完整 Phase 0 也仍有 hook/dispatch/miner
-> 验收项，不能提前恢复 shipped 声明。
+> `codex/evolution-agent-loop` 已完成本地 Trace Truth 首个切片，以及一级「进化审查」
+> 工作台、人工采纳/拒绝、持久 job/event 日志和重启中断终态的真实 Dev App 证据。
+> 但在本轮 PR+CI、合并、刻意发版与发布包主路径验证前仍是 `not live`；通用
+> Evals/activation、versioned review、Quick 稳定 scope 和其余底座证据仍未完成，
+> 不能提前恢复完整 shipped 声明。
 
 > CodeFactory's tagline is **软件工厂 · 本地助手 · 自进化**. "Self-evolution" is
 > the system by which the product gets better from its own use — the factory

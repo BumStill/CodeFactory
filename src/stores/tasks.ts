@@ -10,6 +10,7 @@ import type {
   TaskRun,
   VerificationResult,
 } from "../lib/tauri";
+import { useSettingsStore } from "./settings";
 
 // ── Evidence pack notification store ─────────────────────────────────────────
 
@@ -246,7 +247,7 @@ export const useTasksStore = create<TasksState>((set, get) => ({
               // src-tauri/src/commands/learning.rs for the token economy
               // rationale. Failure is silent; the next session will retry.
               const cwd = all[0]?.cwd;
-              if (cwd) {
+              if (cwd && useSettingsStore.getState().settings?.remote_postmortem_enabled === true) {
                 invoke("run_postmortem", { sessionId, cwd }).catch((e) => {
                   // eslint-disable-next-line no-console
                   console.warn("postmortem failed (non-fatal)", e);

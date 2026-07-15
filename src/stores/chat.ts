@@ -12,6 +12,7 @@ import {
   type ToolCallState,
   type UIMessage,
 } from "./chatEvents";
+import { useSettingsStore } from "./settings";
 
 export type { PendingPermission, ToolCallState, UIMessage };
 
@@ -582,6 +583,7 @@ function handleStreamEvent(
       session &&
       session.kind !== "anonymous" &&
       event.type === "done" &&
+      useSettingsStore.getState().settings?.remote_postmortem_enabled === true &&
       (get().runtime[sessionId]?.messages.length ?? 0) >= POSTMORTEM_MIN_MESSAGES
     ) {
       const last = _lastPostmortemAt[session.id] ?? 0;

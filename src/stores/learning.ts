@@ -35,6 +35,8 @@ export interface LearningEvent {
   support_count: number;
   /** Raw metrics behind a mined insight, as a JSON string ("{}" otherwise). */
   evidence_json: string;
+  /** Persisted analysis job that produced this candidate; null for legacy rows. */
+  job_id?: string | null;
 }
 
 interface LearningStore {

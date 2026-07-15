@@ -20,6 +20,7 @@ import { CostDashboardSection } from "../../components/CostDashboardSection";
 
 interface ProfilePageProps {
   onBack: () => void;
+  onOpenEvolution?: (cwd?: string) => void;
 }
 
 interface ProjectMemory {
@@ -41,7 +42,7 @@ interface ProjectMemory {
  * and emit `learning_events_updated:{cwd}` so the Workspace right-rail
  * panel stays in sync without polling.
  */
-export function ProfilePage({ onBack }: ProfilePageProps) {
+export function ProfilePage({ onBack, onOpenEvolution }: ProfilePageProps) {
   const { sessions, loadSessions } = useChatStore();
 
   useEffect(() => {
@@ -82,7 +83,23 @@ export function ProfilePage({ onBack }: ProfilePageProps) {
             onSelectCwd={setSelectedCwd}
           />
 
-          <LearningLogSection selectedCwd={selectedCwd} />
+          <section className="rounded-lg border border-accent/30 bg-accent/5 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-400">进化审查</h2>
+                <p className="mt-1 text-xs leading-relaxed text-gray-500">
+                  学习候选、人工采纳和端到端作业日志已迁移到独立工作台。
+                </p>
+              </div>
+              <button
+                onClick={() => onOpenEvolution?.(selectedCwd ?? undefined)}
+                disabled={!onOpenEvolution}
+                className="rounded bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover disabled:opacity-50"
+              >
+                前往进化审查
+              </button>
+            </div>
+          </section>
 
           <SelfImprovementSection />
 
@@ -468,7 +485,7 @@ function ProjectMemorySection({
 // note in WorkspacePage.tsx; same Zustand-referential-equality trap.
 const EMPTY_LEARNING_EVENTS: LearningEvent[] = [];
 
-function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
+export function LearningLogSection({ selectedCwd }: { selectedCwd: string | null }) {
   const events = useLearningStore(
     (s) => (selectedCwd ? s.events[selectedCwd] ?? EMPTY_LEARNING_EVENTS : EMPTY_LEARNING_EVENTS),
   );
