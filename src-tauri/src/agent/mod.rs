@@ -18,14 +18,14 @@ pub use dispatch::decide_chat_mode;
 use chrono::Utc;
 use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
-    build_completion_recovery_prompt, classify_command, evaluate_budget_command,
+    build_completion_recovery_prompt, classify_command, evaluate_budget_command_in_directory,
     sanitize_completion_summary, should_prompt_budget_convergence, CompletionEvidence,
     CompletionGate, PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
 };
 use futures_util::StreamExt;
 use reqwest::Client;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -543,6 +543,7 @@ impl AgentLoop {
         let mut completion_sequence = 0_u64;
         let mut last_completion_nudge_sequence = None;
         let mut progress_tracker = ProgressTracker::new(8);
+        let mut finalization_pending = false;
         let max_iterations = self.mode.max_iterations();
         for iteration in 0..max_iterations {
             // Cooperative cancellation: if the user hit "stop" for this chat
@@ -579,7 +580,10 @@ impl AgentLoop {
                 system_prompt,
                 context_limit,
             );
-            messages = compression.messages;
+            // Storage repair is not enough: context compression can change the
+            // final provider payload. Enforce the OpenAI tool-call protocol at
+            // the last possible boundary before every model request.
+            messages = repair_openai_tool_protocol(compression.messages);
             if compression.compressed {
                 self.app
                     .emit(
@@ -592,7 +596,7 @@ impl AgentLoop {
                     .ok();
             }
 
-            let active_tool_defs = tool_defs;
+            let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
             let (text, tool_calls, usage, reasoning) = match self.api_style {
                 ApiStyle::Chatgpt => {
                     self.call_chatgpt_model(&messages, active_tool_defs, event_name)
@@ -603,6 +607,7 @@ impl AgentLoop {
                         .await?
                 }
             };
+            finalization_pending = false;
 
             // Emit real (provider-reported) context-usage right after each
             // round-trip so the UI bar tracks actual usage, not just our
@@ -655,21 +660,17 @@ impl AgentLoop {
             }
 
             if tool_calls.is_empty() {
-                if self.mode != AgentMode::Interactive {
-                    let evidence = completion_gate.evidence();
-                    if !evidence.completed {
-                        messages.push(ChatMessage {
-                            role: "user".into(),
-                            content: MessageContent::Text(build_completion_recovery_prompt(
-                                &evidence,
-                            )),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                            reasoning_content: None,
-                        });
-                        continue;
-                    }
+                let evidence = completion_gate.evidence();
+                if let Some(prompt) = completion_recovery_prompt(&evidence) {
+                    messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: MessageContent::Text(prompt),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                    });
+                    continue;
                 }
                 // Always emit a terminal Done so the frontend's `streaming`
                 // flag clears — even when the provider omitted usage on the
@@ -756,19 +757,13 @@ impl AgentLoop {
 
                 let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
                 let completion_evidence = completion_gate.evidence();
-                let acceptance_audit_round = completion_evidence.completed
-                    && completion_evidence
-                        .last_successful_verification_sequence
-                        .is_some()
-                    && completion_evidence.last_successful_verification_sequence
-                        == last_completion_nudge_sequence;
                 let denial_content = if let Some(content) = autonomous_budget_denial(
                     self.mode,
                     remaining,
-                    acceptance_audit_round,
                     &completion_evidence,
                     &tc.function.name,
                     &args,
+                    &self.cwd,
                 ) {
                     Some(content)
                 } else {
@@ -806,6 +801,14 @@ impl AgentLoop {
                             },
                         )
                         .ok();
+                    persist_tool_result_message(
+                        &self.db,
+                        &self.session_id,
+                        self.anonymous,
+                        &tc.id,
+                        &content,
+                    )
+                    .await?;
                     result_messages.push(ChatMessage {
                         role: "tool".into(),
                         content: MessageContent::Text(content),
@@ -838,6 +841,14 @@ impl AgentLoop {
                             },
                         )
                         .ok();
+                    persist_tool_result_message(
+                        &self.db,
+                        &self.session_id,
+                        self.anonymous,
+                        &tc.id,
+                        &content,
+                    )
+                    .await?;
                     result_messages.push(ChatMessage {
                         role: "tool".into(),
                         content: MessageContent::Text(content),
@@ -916,6 +927,7 @@ impl AgentLoop {
                     &mut completion_gate,
                     &mut progress_tracker,
                     &mut completion_sequence,
+                    &self.cwd,
                     &tc.function.name,
                     &completion_args,
                     &output,
@@ -942,6 +954,15 @@ impl AgentLoop {
                         },
                     )
                     .ok();
+
+                persist_tool_result_message(
+                    &self.db,
+                    &self.session_id,
+                    self.anonymous,
+                    &tc.id,
+                    &output.content,
+                )
+                .await?;
 
                 result_messages.push(ChatMessage {
                     role: "tool".into(),
@@ -972,36 +993,34 @@ impl AgentLoop {
                     reasoning_content: None,
                 });
             }
-            if self.mode != AgentMode::Interactive {
-                let evidence = completion_gate.evidence();
-                if evidence.completed
-                    && evidence.last_successful_verification_sequence
-                        != last_completion_nudge_sequence
-                {
-                    last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
+            let evidence = completion_gate.evidence();
+            if evidence.completed
+                && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
+            {
+                last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
+                finalization_pending = true;
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: MessageContent::Text(build_completion_ready_prompt().to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                });
+            } else if self.mode != AgentMode::Interactive {
+                let remaining = max_iterations.saturating_sub(iteration + 1);
+                if should_prompt_budget_convergence(remaining as u32) {
                     messages.push(ChatMessage {
                         role: "user".into(),
-                        content: MessageContent::Text(build_completion_ready_prompt().to_string()),
+                        content: MessageContent::Text(build_budget_convergence_prompt(
+                            remaining as u32,
+                            &evidence,
+                        )),
                         tool_calls: None,
                         tool_call_id: None,
                         name: None,
                         reasoning_content: None,
                     });
-                } else {
-                    let remaining = max_iterations.saturating_sub(iteration + 1);
-                    if should_prompt_budget_convergence(remaining as u32) {
-                        messages.push(ChatMessage {
-                            role: "user".into(),
-                            content: MessageContent::Text(build_budget_convergence_prompt(
-                                remaining as u32,
-                                &evidence,
-                            )),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                            reasoning_content: None,
-                        });
-                    }
                 }
             }
         }
@@ -1653,7 +1672,7 @@ impl AgentLoop {
             reasoning_content: None,
         }];
 
-        for m in history {
+        for m in repair_incomplete_tool_history(history) {
             match m.role.as_str() {
                 "tool" => {
                     // Content stored as: {"tool_call_id": "…", "content": "…"}
@@ -1717,7 +1736,7 @@ impl AgentLoop {
     fn build_anthropic_messages(&self, history: Vec<Message>) -> Vec<serde_json::Value> {
         let mut msgs: Vec<serde_json::Value> = Vec::new();
 
-        for m in history {
+        for m in repair_incomplete_tool_history(history) {
             match m.role.as_str() {
                 "tool" => {
                     let (tool_call_id, content) = parse_tool_message_content(&m.content);
@@ -1814,6 +1833,7 @@ impl AgentLoop {
         let mut completion_sequence = 0_u64;
         let mut last_completion_nudge_sequence = None;
         let mut progress_tracker = ProgressTracker::new(8);
+        let mut finalization_pending = false;
         let max_iterations = self.mode.max_iterations();
         for iteration in 0..max_iterations {
             // Cooperative cancellation: if the user hit "stop" for this chat
@@ -1849,7 +1869,7 @@ impl AgentLoop {
                 context::resolve_context_length(&settings, &endpoint, &self.model_id, None)
             };
 
-            let active_tool_defs = tool_defs;
+            let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
             let resp = anthropic_client::stream_anthropic(
                 &self.http,
                 &self.base_url,
@@ -1862,6 +1882,7 @@ impl AgentLoop {
                 event_name,
             )
             .await?;
+            finalization_pending = false;
 
             // Emit context usage if Anthropic reported it (it sets 0 when missing)
             if resp.input_tokens > 0 {
@@ -1914,18 +1935,16 @@ impl AgentLoop {
             }
 
             if tool_calls.is_empty() {
-                if self.mode != AgentMode::Interactive {
-                    let evidence = completion_gate.evidence();
-                    if !evidence.completed {
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": [{
-                                "type": "text",
-                                "text": build_completion_recovery_prompt(&evidence),
-                            }],
-                        }));
-                        continue;
-                    }
+                let evidence = completion_gate.evidence();
+                if let Some(prompt) = completion_recovery_prompt(&evidence) {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": prompt,
+                        }],
+                    }));
+                    continue;
                 }
                 emitted_terminal = true;
                 let inp = resp.input_tokens;
@@ -2020,19 +2039,13 @@ impl AgentLoop {
 
                 let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
                 let completion_evidence = completion_gate.evidence();
-                let acceptance_audit_round = completion_evidence.completed
-                    && completion_evidence
-                        .last_successful_verification_sequence
-                        .is_some()
-                    && completion_evidence.last_successful_verification_sequence
-                        == last_completion_nudge_sequence;
                 let denial_content = if let Some(content) = autonomous_budget_denial(
                     self.mode,
                     remaining,
-                    acceptance_audit_round,
                     &completion_evidence,
                     &tc.function.name,
                     &args,
+                    &self.cwd,
                 ) {
                     Some(content)
                 } else {
@@ -2070,6 +2083,14 @@ impl AgentLoop {
                             },
                         )
                         .ok();
+                    persist_tool_result_message(
+                        &self.db,
+                        &self.session_id,
+                        self.anonymous,
+                        &tc.id,
+                        &content,
+                    )
+                    .await?;
                     tool_result_blocks.push(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": tc.id,
@@ -2099,6 +2120,14 @@ impl AgentLoop {
                             },
                         )
                         .ok();
+                    persist_tool_result_message(
+                        &self.db,
+                        &self.session_id,
+                        self.anonymous,
+                        &tc.id,
+                        &content,
+                    )
+                    .await?;
                     tool_result_blocks.push(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": tc.id,
@@ -2174,6 +2203,7 @@ impl AgentLoop {
                     &mut completion_gate,
                     &mut progress_tracker,
                     &mut completion_sequence,
+                    &self.cwd,
                     &tc.function.name,
                     &completion_args,
                     &output,
@@ -2201,6 +2231,15 @@ impl AgentLoop {
                     )
                     .ok();
 
+                persist_tool_result_message(
+                    &self.db,
+                    &self.session_id,
+                    self.anonymous,
+                    &tc.id,
+                    &output.content,
+                )
+                .await?;
+
                 tool_result_blocks.push(serde_json::json!({
                     "type": "tool_result",
                     "tool_use_id": tc.id,
@@ -2221,31 +2260,29 @@ impl AgentLoop {
                     "content": [{"type": "text", "text": prompt}],
                 }));
             }
-            if self.mode != AgentMode::Interactive {
-                let evidence = completion_gate.evidence();
-                if evidence.completed
-                    && evidence.last_successful_verification_sequence
-                        != last_completion_nudge_sequence
-                {
-                    last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
+            let evidence = completion_gate.evidence();
+            if evidence.completed
+                && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
+            {
+                last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
+                finalization_pending = true;
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": build_completion_ready_prompt(),
+                    }],
+                }));
+            } else if self.mode != AgentMode::Interactive {
+                let remaining = max_iterations.saturating_sub(iteration + 1);
+                if should_prompt_budget_convergence(remaining as u32) {
                     messages.push(serde_json::json!({
                         "role": "user",
                         "content": [{
                             "type": "text",
-                            "text": build_completion_ready_prompt(),
+                            "text": build_budget_convergence_prompt(remaining as u32, &evidence),
                         }],
                     }));
-                } else {
-                    let remaining = max_iterations.saturating_sub(iteration + 1);
-                    if should_prompt_budget_convergence(remaining as u32) {
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": [{
-                                "type": "text",
-                                "text": build_budget_convergence_prompt(remaining as u32, &evidence),
-                            }],
-                        }));
-                    }
                 }
             }
         }
@@ -2283,6 +2320,17 @@ fn openai_tool_controls(
     }
 }
 
+fn active_tool_definitions(
+    tool_defs: &[ToolDefinition],
+    finalization_pending: bool,
+) -> &[ToolDefinition] {
+    if finalization_pending {
+        &[]
+    } else {
+        tool_defs
+    }
+}
+
 fn validate_openai_sse_completion(
     saw_terminal_marker: bool,
     pending_bytes: usize,
@@ -2308,8 +2356,32 @@ fn completion_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (St
     let command = args
         .get("command")
         .and_then(|value| value.as_str())
-        .unwrap_or(tool_name)
-        .to_string();
+        .map(str::to_owned)
+        .or_else(|| {
+            let pattern = args
+                .get("pattern")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let path = args
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let base = match (pattern.is_empty(), path.is_empty()) {
+                (false, false) => Some(format!("{tool_name} {pattern} {path}")),
+                (false, true) => Some(format!("{tool_name} {pattern} .")),
+                (true, false) => Some(format!("{tool_name} {path}")),
+                (true, true) => None,
+            }?;
+            let glob = args
+                .get("glob")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty());
+            Some(match glob {
+                Some(glob) => format!("{base} --glob {glob}"),
+                None => base,
+            })
+        })
+        .unwrap_or_else(|| tool_name.to_owned());
     let kind = if tool_name == "bash" {
         classify_command(&command, 300_000)
     } else if tool_name.starts_with("write_")
@@ -2323,27 +2395,36 @@ fn completion_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (St
     (command, kind)
 }
 
+fn completion_recovery_prompt(evidence: &CompletionEvidence) -> Option<String> {
+    (!evidence.completed).then(|| build_completion_recovery_prompt(evidence))
+}
+
 fn autonomous_budget_denial(
     mode: AgentMode,
     remaining_model_rounds: u32,
-    acceptance_audit_round: bool,
     evidence: &CompletionEvidence,
     tool_name: &str,
     args: &serde_json::Value,
+    working_directory: &Path,
 ) -> Option<String> {
-    if mode == AgentMode::Interactive || acceptance_audit_round {
-        return None;
-    }
     let (command, kind) = completion_command_and_kind(tool_name, args);
-    match evaluate_budget_command(
-        remaining_model_rounds,
+    // Interactive chat is not constrained by the autonomous round budget, but
+    // deterministic completion invariants still apply to model-generated tools.
+    let effective_remaining = if mode == AgentMode::Interactive {
+        u32::MAX
+    } else {
+        remaining_model_rounds
+    };
+    match evaluate_budget_command_in_directory(
+        effective_remaining,
         evidence,
         &command,
         &kind,
+        working_directory.to_str(),
     ) {
         PolicyDecision::Allow => None,
         PolicyDecision::Deny { reason, .. } => Some(format!(
-            "Tool call denied by execution budget: {reason}. Resolve the current completion blocker or finalize."
+            "Tool call denied by completion policy: {reason}. Resolve the current completion blocker or finalize."
         )),
     }
 }
@@ -2352,6 +2433,7 @@ fn record_completion_outcome(
     gate: &mut CompletionGate,
     progress: &mut ProgressTracker,
     sequence: &mut u64,
+    working_directory: &Path,
     tool_name: &str,
     args: &serde_json::Value,
     output: &tools::ToolOutput,
@@ -2361,6 +2443,7 @@ fn record_completion_outcome(
     let outcome = ToolOutcome {
         request_id: format!("desktop-tool-{sequence}"),
         command,
+        working_directory: Some(working_directory.to_string_lossy().into_owned()),
         kind,
         sequence: *sequence,
         started_at_ms: 0,
@@ -2405,6 +2488,174 @@ fn parse_tool_message_content(raw: &str) -> (String, String) {
         return (id, content);
     }
     (String::new(), raw.to_string())
+}
+
+async fn persist_tool_result_message(
+    db: &SqlitePool,
+    session_id: &str,
+    anonymous: bool,
+    tool_call_id: &str,
+    content: &str,
+) -> Result<()> {
+    if anonymous {
+        return Ok(());
+    }
+    let tool_content = serde_json::json!({
+        "tool_call_id": tool_call_id,
+        "content": content,
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(session_id)
+    .bind("tool")
+    .bind(tool_content)
+    .bind(Utc::now().timestamp_millis())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+fn repair_incomplete_tool_history(history: Vec<Message>) -> Vec<Message> {
+    fn synthetic_tool_message(session_id: &str, tool_call_id: &str, created_at: i64) -> Message {
+        Message {
+            id: format!("recovered-tool-{tool_call_id}"),
+            session_id: session_id.to_owned(),
+            role: "tool".into(),
+            content: serde_json::json!({
+                "tool_call_id": tool_call_id,
+                "content": "Tool result unavailable in persisted history; continue from current workspace state.",
+            })
+            .to_string(),
+            model_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            tool_calls: None,
+            reasoning_content: None,
+            created_at,
+        }
+    }
+
+    let mut repaired = Vec::with_capacity(history.len());
+    let mut pending_tool_calls: Vec<String> = Vec::new();
+    let mut last_session_id = String::new();
+    let mut last_created_at = 0;
+
+    for message in history {
+        last_session_id = message.session_id.clone();
+        last_created_at = message.created_at;
+        if message.role != "tool" && !pending_tool_calls.is_empty() {
+            for tool_call_id in pending_tool_calls.drain(..) {
+                repaired.push(synthetic_tool_message(
+                    &message.session_id,
+                    &tool_call_id,
+                    message.created_at.saturating_sub(1),
+                ));
+            }
+        }
+
+        if message.role == "tool" {
+            let (tool_call_id, _) = parse_tool_message_content(&message.content);
+            if let Some(index) = pending_tool_calls
+                .iter()
+                .position(|pending| pending == &tool_call_id)
+            {
+                pending_tool_calls.remove(index);
+                repaired.push(message);
+            }
+            continue;
+        }
+
+        if message.role == "assistant" {
+            pending_tool_calls = message
+                .tool_calls
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<ToolCall>>(raw).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tool_call| tool_call.id)
+                .collect();
+        }
+        repaired.push(message);
+    }
+
+    for tool_call_id in pending_tool_calls {
+        repaired.push(synthetic_tool_message(
+            &last_session_id,
+            &tool_call_id,
+            last_created_at.saturating_add(1),
+        ));
+    }
+    repaired
+}
+
+fn repair_openai_tool_protocol(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    fn synthetic_tool_message(tool_call_id: String) -> ChatMessage {
+        ChatMessage {
+            role: "tool".into(),
+            content: MessageContent::Text(
+                "Tool result unavailable in persisted history; continue from current workspace state."
+                    .into(),
+            ),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id),
+            name: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn append_missing_results(repaired: &mut Vec<ChatMessage>, pending: &mut Vec<String>) {
+        repaired.extend(pending.drain(..).map(synthetic_tool_message));
+    }
+
+    let mut repaired = Vec::with_capacity(messages.len());
+    let mut pending_tool_calls: Vec<String> = Vec::new();
+
+    for mut message in messages {
+        if message.role != "tool" && !pending_tool_calls.is_empty() {
+            append_missing_results(&mut repaired, &mut pending_tool_calls);
+        }
+
+        if message.role == "tool" {
+            let Some(tool_call_id) = message.tool_call_id.as_deref() else {
+                continue;
+            };
+            let Some(index) = pending_tool_calls
+                .iter()
+                .position(|pending| pending == tool_call_id)
+            else {
+                continue;
+            };
+            pending_tool_calls.remove(index);
+            repaired.push(message);
+            continue;
+        }
+
+        if message.role == "assistant" {
+            if let Some(tool_calls) = message.tool_calls.as_mut() {
+                let mut seen_ids = HashSet::new();
+                tool_calls.retain(|tool_call| {
+                    !tool_call.id.trim().is_empty() && seen_ids.insert(tool_call.id.clone())
+                });
+                if tool_calls.is_empty() {
+                    message.tool_calls = None;
+                }
+            }
+            pending_tool_calls = message
+                .tool_calls
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|tool_call| tool_call.id.clone())
+                .collect();
+        }
+        repaired.push(message);
+    }
+
+    append_missing_results(&mut repaired, &mut pending_tool_calls);
+    repaired
 }
 
 /// Read at most `max_chars` UTF-8 chars from a file, appending "…" if truncated.
@@ -2655,6 +2906,47 @@ fn glob_match(pattern: &str, input: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn stored_message(role: &str, content: &str, tool_calls: Option<String>) -> Message {
+        Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: "session-1".into(),
+            role: role.into(),
+            content: content.into(),
+            model_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            tool_calls,
+            reasoning_content: None,
+            created_at: 1,
+        }
+    }
+
+    fn provider_message(
+        role: &str,
+        tool_calls: Option<Vec<ToolCall>>,
+        tool_call_id: Option<&str>,
+    ) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: MessageContent::Text(String::new()),
+            tool_calls,
+            tool_call_id: tool_call_id.map(str::to_owned),
+            name: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn provider_tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: "{}".into(),
+            },
+        }
+    }
+
     // ── AgentMode contract tests ─────────────────────────────────────────
     //
     // The whole reason AgentMode exists is to flip two switches:
@@ -2849,6 +3141,7 @@ mod tests {
             &mut gate,
             &mut progress,
             &mut sequence,
+            Path::new("/workspace"),
             "write_file",
             &serde_json::json!({"path": "src/example.rs", "content": "fn main() {}"}),
             &tools::ToolOutput::ok("written"),
@@ -2859,6 +3152,7 @@ mod tests {
             &mut gate,
             &mut progress,
             &mut sequence,
+            Path::new("/workspace"),
             "bash",
             &serde_json::json!({"command": "cargo test"}),
             &tools::ToolOutput::ok("test result: ok"),
@@ -2875,6 +3169,7 @@ mod tests {
             &mut gate,
             &mut progress,
             &mut sequence,
+            Path::new("/workspace"),
             "bash",
             &serde_json::json!({
                 "command": "nohup ./server >server.log 2>&1 & echo $! >server.pid"
@@ -2887,6 +3182,7 @@ mod tests {
             &mut gate,
             &mut progress,
             &mut sequence,
+            Path::new("/workspace"),
             "bash",
             &serde_json::json!({
                 "command": "timeout 10 curl --fail http://127.0.0.1:8080/health"
@@ -2897,9 +3193,9 @@ mod tests {
     }
 
     #[test]
-    fn autonomous_desktop_budget_converges_without_affecting_interactive_chat() {
+    fn desktop_compatibility_invariants_apply_to_interactive_and_autonomous_modes() {
         let evidence = CompletionEvidence {
-            required_source_scan_extensions: vec![".py".to_owned(), ".pyx".to_owned()],
+            required_source_scan_extensions: vec![".py".to_owned()],
             blockers: vec![
                 "source compatibility work requires a clean repository-wide residual scan"
                     .to_owned(),
@@ -2910,19 +3206,38 @@ mod tests {
         assert!(autonomous_budget_denial(
             AgentMode::Autonomous,
             8,
-            false,
             &evidence,
             "bash",
             &unrelated,
+            Path::new("/workspace"),
         )
         .is_some());
-        assert!(autonomous_budget_denial(
+
+        let fragile_scan = serde_json::json!({
+            "command": "cd /workspace && result=$(grep -r --include='*.py' 'old_value' pkg/ tests/ 2>&1); rc=$?; if [ $rc -gt 1 ]; then exit $rc; elif [ $rc -eq 0 ]; then exit 1; else echo 'CLEAN: no old_value references'; fi"
+        });
+        let denial = autonomous_budget_denial(
             AgentMode::Interactive,
-            8,
-            false,
+            64,
             &evidence,
             "bash",
-            &unrelated,
+            &fragile_scan,
+            Path::new("/workspace"),
+        )
+        .expect("interactive mode must reject a fragile compatibility scan");
+        assert!(denial.contains("temporary results file"));
+        assert!(denial.contains("test ! -s"));
+
+        let robust_scan = serde_json::json!({
+            "command": "cd /workspace && results=$(mktemp); errors=$(mktemp); grep -r --include='*.py' 'old_value' pkg/ tests/ >\"$results\" 2>\"$errors\"; rc=$?; if [ \"$rc\" -gt 1 ]; then cat \"$errors\" >&2; exit \"$rc\"; fi; test ! -s \"$results\""
+        });
+        assert!(autonomous_budget_denial(
+            AgentMode::Interactive,
+            64,
+            &evidence,
+            "bash",
+            &robust_scan,
+            Path::new("/workspace"),
         )
         .is_none());
 
@@ -2934,12 +3249,247 @@ mod tests {
         assert!(autonomous_budget_denial(
             AgentMode::Autonomous,
             8,
-            false,
             &evidence,
             "edit_file",
             &source_edit,
+            Path::new("/workspace"),
         )
         .is_none());
+
+        assert!(autonomous_budget_denial(
+            AgentMode::Interactive,
+            0,
+            &CompletionEvidence::default(),
+            "bash",
+            &unrelated,
+            Path::new("/workspace"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn interactive_finalization_recovers_when_completion_evidence_is_incomplete() {
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 1,
+            blockers: vec![
+                "source compatibility work requires a clean repository-wide residual scan"
+                    .to_owned(),
+            ],
+            ..CompletionEvidence::default()
+        };
+
+        let prompt = completion_recovery_prompt(&evidence)
+            .expect("interactive finalization must continue after a mutation with blockers");
+        assert!(prompt.contains("source compatibility"));
+        assert!(completion_recovery_prompt(&CompletionEvidence {
+            completed: true,
+            ..CompletionEvidence::default()
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn completion_tool_evidence_preserves_grep_pattern_and_path() {
+        let (command, kind) = completion_command_and_kind(
+            "grep",
+            &serde_json::json!({
+                "pattern": "^(import|from)",
+                "path": "src",
+                "glob": "*.py"
+            }),
+        );
+
+        assert_eq!(kind, ToolKind::ReadOnly);
+        assert!(command.contains("^(import|from)"));
+        assert!(command.contains("src"));
+        assert!(command.contains("--glob *.py"));
+
+        let (root_command, _) =
+            completion_command_and_kind("grep", &serde_json::json!({"pattern": "^(import|from)"}));
+        assert_eq!(root_command, "grep ^(import|from) .");
+    }
+
+    #[test]
+    fn persisted_history_repairs_missing_tool_results_before_the_next_user_turn() {
+        let tool_calls = serde_json::json!([{
+            "id": "call-denied",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}
+        }])
+        .to_string();
+        let repaired = repair_incomplete_tool_history(vec![
+            stored_message("assistant", "", Some(tool_calls)),
+            stored_message("user", "continue", None),
+        ]);
+
+        assert_eq!(repaired.len(), 3);
+        assert_eq!(repaired[1].role, "tool");
+        let (tool_call_id, content) = parse_tool_message_content(&repaired[1].content);
+        assert_eq!(tool_call_id, "call-denied");
+        assert!(content.contains("unavailable in persisted history"));
+        assert_eq!(repaired[2].role, "user");
+    }
+
+    #[test]
+    fn provider_payload_repairs_missing_tool_result_before_user_message() {
+        let repaired = repair_openai_tool_protocol(vec![
+            provider_message(
+                "assistant",
+                Some(vec![provider_tool_call("call-missing")]),
+                None,
+            ),
+            provider_message("user", None, None),
+        ]);
+
+        assert_eq!(repaired.len(), 3);
+        assert_eq!(repaired[1].role, "tool");
+        assert_eq!(repaired[1].tool_call_id.as_deref(), Some("call-missing"));
+        assert_eq!(repaired[2].role, "user");
+    }
+
+    #[test]
+    fn provider_payload_repairs_only_missing_result_for_multi_tool_assistant() {
+        let repaired = repair_openai_tool_protocol(vec![
+            provider_message(
+                "assistant",
+                Some(vec![
+                    provider_tool_call("call-a"),
+                    provider_tool_call("call-b"),
+                ]),
+                None,
+            ),
+            provider_message("tool", None, Some("call-a")),
+            provider_message("user", None, None),
+        ]);
+
+        let tool_ids: Vec<_> = repaired
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(tool_ids, vec!["call-a", "call-b"]);
+        assert_eq!(
+            repaired.last().map(|message| message.role.as_str()),
+            Some("user")
+        );
+    }
+
+    #[test]
+    fn provider_payload_drops_orphan_tool_result() {
+        let repaired = repair_openai_tool_protocol(vec![
+            provider_message("system", None, None),
+            provider_message("tool", None, Some("call-orphan")),
+            provider_message("user", None, None),
+        ]);
+
+        assert_eq!(repaired.len(), 2);
+        assert!(repaired.iter().all(|message| message.role != "tool"));
+    }
+
+    #[test]
+    fn provider_payload_drops_empty_and_duplicate_tool_call_ids() {
+        let repaired = repair_openai_tool_protocol(vec![
+            provider_message(
+                "assistant",
+                Some(vec![
+                    provider_tool_call(""),
+                    provider_tool_call("call-a"),
+                    provider_tool_call("call-a"),
+                ]),
+                None,
+            ),
+            provider_message("user", None, None),
+        ]);
+
+        let assistant_calls = repaired[0].tool_calls.as_deref().unwrap();
+        assert_eq!(assistant_calls.len(), 1);
+        assert_eq!(assistant_calls[0].id, "call-a");
+        assert_eq!(
+            repaired
+                .iter()
+                .filter(|message| message.role == "tool")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_tool_results_are_persisted_for_future_provider_replay() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at INTEGER)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        persist_tool_result_message(
+            &pool,
+            "session-1",
+            false,
+            "call-denied",
+            "Tool call denied by completion policy",
+        )
+        .await
+        .unwrap();
+
+        let (role, content): (String, String) =
+            sqlx::query_as("SELECT role, content FROM messages LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(role, "tool");
+        let (tool_call_id, persisted_content) = parse_tool_message_content(&content);
+        assert_eq!(tool_call_id, "call-denied");
+        assert_eq!(persisted_content, "Tool call denied by completion policy");
+    }
+
+    #[test]
+    fn desktop_edit_path_activates_interactive_compatibility_scan_gate() {
+        let mut gate = CompletionGate::new_for_instruction(
+            false,
+            "修复 runtime 升级后已移除 API 的源码兼容问题。",
+        );
+        let mut progress = ProgressTracker::new(8);
+        let mut sequence = 0;
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "edit_file",
+            &serde_json::json!({
+                "path": "/workspace/compatdemo/service.py",
+                "old_string": "rt.old_value(value)",
+                "new_string": "rt.new_value(value)"
+            }),
+            &tools::ToolOutput::ok("Edited /workspace/compatdemo/service.py"),
+        );
+
+        let evidence = gate.evidence();
+        assert_eq!(evidence.required_source_scan_extensions, vec![".py"]);
+        assert!(evidence
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("clean repository-wide residual scan")));
+
+        let fragile_scan = serde_json::json!({
+            "command": "cd /workspace && result=$(grep -r --include='*.py' 'old_value' compatdemo/ tests/ 2>&1); rc=$?; if [ $rc -gt 1 ]; then exit $rc; elif [ $rc -eq 0 ]; then exit 1; else echo 'CLEAN: no old_value references'; fi"
+        });
+        assert!(autonomous_budget_denial(
+            AgentMode::Interactive,
+            64,
+            &evidence,
+            "bash",
+            &fragile_scan,
+            Path::new("/workspace"),
+        )
+        .is_some());
     }
 
     #[test]
@@ -2948,6 +3498,17 @@ mod tests {
 
         assert!(tools.is_none());
         assert_eq!(tool_choice, serde_json::json!("none"));
+    }
+
+    #[test]
+    fn completion_finalization_selects_an_empty_tool_surface() {
+        let definitions = tools::all_definitions();
+
+        assert!(active_tool_definitions(&definitions, true).is_empty());
+        assert_eq!(
+            active_tool_definitions(&definitions, false).len(),
+            definitions.len()
+        );
     }
 
     #[test]

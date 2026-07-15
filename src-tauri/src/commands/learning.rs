@@ -26,6 +26,8 @@ use tauri::{command, AppHandle, Emitter, State};
 use uuid::Uuid;
 
 use crate::commands::memory::ProjectMemory;
+use crate::commands::specs::{run_one_shot_text, AiMessage as OneShotAiMessage};
+use crate::config::settings::ApiStyle;
 use crate::errors::AppError;
 use crate::AppState;
 
@@ -1530,9 +1532,6 @@ observation CONTRADICTS one, still report it but prefix its suggestion with \
     } else {
         String::new()
     };
-    let base_url = endpoint.base_url.trim_end_matches('/');
-    let url = format!("{base_url}/chat/completions");
-
     let prompt = format!(
         "You just finished a session for a user. Reflect on the task outcomes below and \
 identify 0-3 NON-OBVIOUS observations about how this user works that would help future sessions. \
@@ -1561,82 +1560,144 @@ Examples:\n\
 ]\n\n\
 {calibration}{known_block}Evidence from this session:\n{summary}"
     );
-
-    let req = AiRequest {
-        model,
-        messages: vec![AiMessage {
-            role: "user",
-            content: prompt,
-        }],
-        stream: false,
-        temperature: 0.3,
-        max_tokens: 500, // hard cap — see module-level doc on token economy
-    };
-
-    let mut body = match serde_json::to_value(&req) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!("postmortem serialize failed: {e}");
-            return Ok(vec![]);
-        }
-    };
-
-    let client = Client::new();
-    // Send as-is; post_chat_completions reactively switches to
-    // max_completion_tokens only if the server rejects max_tokens. Best-effort:
-    // any failure just yields no learnings.
-    let response =
-        match crate::http_util::post_chat_completions(&client, &url, &api_key, &mut body).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("postmortem request failed: {e}");
-                return Ok(vec![]);
-            }
-        };
-    let resp: AiResponse = match response.json().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("postmortem JSON parse failed: {e}");
-            return Ok(vec![]);
-        }
-    };
-
-    let mut completion = extract_postmortem_completion(resp);
-    if completion.text.trim().is_empty() {
-        tracing::warn!(
-            "postmortem returned no final content (finish_reason={:?}, reasoning_present={}); retrying with expanded completion budget",
-            completion.finish_reason,
-            completion.reasoning_present
-        );
-        expand_postmortem_completion_budget(&mut body);
-        let retry_response =
-            match crate::http_util::post_chat_completions(&client, &url, &api_key, &mut body).await
-            {
-                Ok(response) => response,
+    let text = match endpoint.api_style {
+        ApiStyle::Openai => {
+            let base_url = endpoint.base_url.trim_end_matches('/');
+            let url = format!("{base_url}/chat/completions");
+            let req = AiRequest {
+                model: model.clone(),
+                messages: vec![AiMessage {
+                    role: "user",
+                    content: prompt.clone(),
+                }],
+                stream: false,
+                temperature: 0.3,
+                max_tokens: 500,
+            };
+            let mut body = match serde_json::to_value(&req) {
+                Ok(body) => body,
                 Err(error) => {
-                    tracing::warn!("postmortem expanded-budget retry failed: {error}");
+                    tracing::warn!("postmortem serialize failed: {error}");
                     return Ok(vec![]);
                 }
             };
-        let retry_resp: AiResponse = match retry_response.json().await {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!("postmortem expanded-budget JSON parse failed: {error}");
+            let client = Client::new();
+            let response = match crate::http_util::post_chat_completions(
+                &client,
+                &url,
+                &api_key,
+                &mut body,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!("postmortem request failed: {error}");
+                    return Ok(vec![]);
+                }
+            };
+            let response: AiResponse = match response.json().await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!("postmortem JSON parse failed: {error}");
+                    return Ok(vec![]);
+                }
+            };
+            let mut completion = extract_postmortem_completion(response);
+            if completion.text.trim().is_empty() {
+                tracing::warn!(
+                    "postmortem returned no final content (finish_reason={:?}, reasoning_present={}); retrying with expanded completion budget",
+                    completion.finish_reason,
+                    completion.reasoning_present
+                );
+                expand_postmortem_completion_budget(&mut body);
+                let retry_response = match crate::http_util::post_chat_completions(
+                    &client,
+                    &url,
+                    &api_key,
+                    &mut body,
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::warn!("postmortem expanded-budget retry failed: {error}");
+                        return Ok(vec![]);
+                    }
+                };
+                let retry_response: AiResponse = match retry_response.json().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::warn!("postmortem expanded-budget JSON parse failed: {error}");
+                        return Ok(vec![]);
+                    }
+                };
+                completion = extract_postmortem_completion(retry_response);
+            }
+            if completion.text.trim().is_empty() {
+                tracing::warn!(
+                    "postmortem produced no final content after bounded retry (finish_reason={:?}, reasoning_present={})",
+                    completion.finish_reason,
+                    completion.reasoning_present
+                );
                 return Ok(vec![]);
             }
-        };
-        completion = extract_postmortem_completion(retry_resp);
-    }
-
-    let text = completion.text;
-    if text.trim().is_empty() {
-        tracing::warn!(
-            "postmortem produced no final content after bounded retry (finish_reason={:?}, reasoning_present={})",
-            completion.finish_reason,
-            completion.reasoning_present
-        );
-        return Ok(vec![]);
-    }
+            completion.text
+        }
+        ApiStyle::Anthropic => {
+            let messages = || {
+                vec![OneShotAiMessage {
+                    role: "user".into(),
+                    content: prompt.clone(),
+                }]
+            };
+            let mut completion = match run_one_shot_text(
+                &endpoint.base_url,
+                &api_key,
+                &model,
+                &endpoint.api_style,
+                messages(),
+                500,
+                0.3,
+            )
+            .await
+            {
+                Ok(completion) => completion,
+                Err(error) => {
+                    tracing::warn!("postmortem request failed: {error}");
+                    return Ok(vec![]);
+                }
+            };
+            if completion.trim().is_empty() {
+                completion = match run_one_shot_text(
+                    &endpoint.base_url,
+                    &api_key,
+                    &model,
+                    &endpoint.api_style,
+                    messages(),
+                    2_000,
+                    0.3,
+                )
+                .await
+                {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        tracing::warn!("postmortem expanded-budget retry failed: {error}");
+                        return Ok(vec![]);
+                    }
+                };
+            }
+            if completion.trim().is_empty() {
+                tracing::warn!("postmortem produced no final content after bounded retry");
+                return Ok(vec![]);
+            }
+            completion
+        }
+        ApiStyle::Chatgpt => {
+            tracing::warn!("postmortem does not support ChatGPT endpoints");
+            return Ok(vec![]);
+        }
+    };
     let trimmed = text.trim();
     let json_str = trimmed
         .strip_prefix("```json")

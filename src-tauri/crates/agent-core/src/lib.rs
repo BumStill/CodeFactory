@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
 use url::Url;
 
 pub const EXECUTION_CONTRACT: &str = include_str!(concat!(
@@ -14,15 +15,34 @@ pub fn execution_contract_sha256() -> String {
 }
 
 pub fn build_system_prompt(allow_external_network: bool) -> String {
+    build_scoped_system_prompt(allow_external_network, true)
+}
+
+pub fn build_product_system_prompt(allow_external_network: bool) -> String {
+    format!(
+        "{}\n\nThe selected project is the writable workspace. Use $TMPDIR for temporary files; writes outside the workspace and $TMPDIR are denied.",
+        build_scoped_system_prompt(allow_external_network, false)
+    )
+}
+
+fn build_scoped_system_prompt(
+    allow_external_network: bool,
+    include_benchmark_boundaries: bool,
+) -> String {
     let network_capability = if allow_external_network {
         "External network access is available under the active environment policy. Use it only \
 for task-required dependency or source retrieval; the environment remains the enforcement point."
     } else {
         "Network access is denied by default except for loopback functional probes."
     };
+    let benchmark_boundary = if include_benchmark_boundaries {
+        "Never inspect hidden verifiers or benchmark solutions. "
+    } else {
+        ""
+    };
     format!(
         "You are CodeFactory's autonomous coding agent. Work only through the provided tools. \
-Never inspect hidden verifiers, benchmark solutions, or secret stores. {network_capability} Do not \
+{benchmark_boundary}Never inspect secret stores. {network_capability} Do not \
 claim completion until the shared completion gate accepts structured execution evidence.\n\n{}",
         EXECUTION_CONTRACT.trim()
     )
@@ -94,8 +114,12 @@ finish build, install, run outside the source directory, named component behavio
 focused project tests in that order; inspect the build configuration plus generated and compiled \
 source inputs rather than scanning only one familiar file type. For compatibility migrations, \
 derive local import aliases from the source and scan every discovered alias with token-safe, \
-idempotent replacements; then rerun the same issue scan and \
-require no unresolved matches before finalizing. Once the current source revision installs, do not \
+idempotent replacements. Start from each exact failing API member reported by build, runtime, or \
+tests, then add candidate spellings only when repository references or a language adapter support \
+them. Write matches to a temporary results file, preserve the `grep` or `rg` status, reject status greater than 1, \
+and finish with `test ! -s`; do not mask search errors or let the normal no-match status turn a \
+clean scan into a failed command. Then rerun \
+the same issue scan and require no unresolved matches before finalizing. Once the current source revision installs, do not \
 keep installing speculative dependencies before the external runtime or focused tests expose a \
 concrete missing dependency. For a background service, finish \
 PID, logs, bounded readiness, and a real client probe. \
@@ -140,11 +164,24 @@ impl PolicyDecision {
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkPolicy {
+    product: ProductPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProductPolicy {
     allow_loopback_network: bool,
     allow_external_network: bool,
 }
 
 impl Default for BenchmarkPolicy {
+    fn default() -> Self {
+        Self {
+            product: ProductPolicy::default(),
+        }
+    }
+}
+
+impl Default for ProductPolicy {
     fn default() -> Self {
         Self {
             allow_loopback_network: true,
@@ -153,7 +190,7 @@ impl Default for BenchmarkPolicy {
     }
 }
 
-impl BenchmarkPolicy {
+impl ProductPolicy {
     pub fn new(allow_network: bool) -> Self {
         Self {
             allow_loopback_network: true,
@@ -174,45 +211,6 @@ impl BenchmarkPolicy {
 
     pub fn evaluate_command(&self, command: &str) -> PolicyDecision {
         let lower = command.to_ascii_lowercase();
-
-        if is_root_wide_hidden_artifact_discovery(&lower)
-            || contains_any(
-                &lower,
-                &[
-                    "/tests/",
-                    "/tests ",
-                    "/tests\"",
-                    "/tests'",
-                    "/tests/test.sh",
-                    "hidden_verifier",
-                    "hidden-verifier",
-                    "/grader/",
-                ],
-            )
-        {
-            return deny(
-                "hidden_verifier",
-                "access to hidden verifier or grader paths is prohibited",
-            );
-        }
-
-        if contains_any(
-            &lower,
-            &[
-                "/solution/",
-                "/solution.",
-                "/solution ",
-                "solution.sh",
-                "answer.sh",
-                "/answers/",
-            ],
-        ) {
-            return deny(
-                "benchmark_solution",
-                "access to benchmark solution artifacts is prohibited",
-            );
-        }
-
         if contains_any(
             &lower,
             &[
@@ -310,6 +308,68 @@ impl BenchmarkPolicy {
         }
 
         None
+    }
+}
+
+impl BenchmarkPolicy {
+    pub fn new(allow_network: bool) -> Self {
+        Self {
+            product: ProductPolicy::new(allow_network),
+        }
+    }
+
+    pub fn deny_all_network() -> Self {
+        Self {
+            product: ProductPolicy::deny_all_network(),
+        }
+    }
+
+    pub fn with_network_access(allow_external_network: bool) -> Self {
+        Self::new(allow_external_network)
+    }
+
+    pub fn evaluate_command(&self, command: &str) -> PolicyDecision {
+        let lower = command.to_ascii_lowercase();
+
+        if is_root_wide_hidden_artifact_discovery(&lower)
+            || contains_any(
+                &lower,
+                &[
+                    "/tests/",
+                    "/tests ",
+                    "/tests\"",
+                    "/tests'",
+                    "/tests/test.sh",
+                    "hidden_verifier",
+                    "hidden-verifier",
+                    "/grader/",
+                ],
+            )
+        {
+            return deny(
+                "hidden_verifier",
+                "access to hidden verifier or grader paths is prohibited",
+            );
+        }
+
+        if contains_any(
+            &lower,
+            &[
+                "/solution/",
+                "/solution.",
+                "/solution ",
+                "solution.sh",
+                "answer.sh",
+                "/answers/",
+            ],
+        ) {
+            return deny(
+                "benchmark_solution",
+                "access to benchmark solution artifacts is prohibited",
+            );
+        }
+
+        self.product.evaluate_command(command)
     }
 }
 
@@ -672,6 +732,8 @@ fn has_command_level_bound(command: &str) -> bool {
 pub struct ToolOutcome {
     pub request_id: String,
     pub command: String,
+    #[serde(default)]
+    pub working_directory: Option<String>,
     pub kind: ToolKind,
     pub sequence: u64,
     pub started_at_ms: u64,
@@ -772,6 +834,7 @@ pub struct CompletionEvidence {
     pub last_service_log_evidence_sequence: Option<u64>,
     pub last_bounded_probe_sequence: Option<u64>,
     pub required_source_scan_extensions: Vec<String>,
+    pub source_evidence_paths: Vec<String>,
     pub last_source_scan_sequence: Option<u64>,
     pub source_delivery_required: bool,
     pub project_tests_required: bool,
@@ -791,7 +854,24 @@ pub fn evaluate_budget_command(
     command: &str,
     kind: &ToolKind,
 ) -> PolicyDecision {
-    evaluate_budget_command_with_time(remaining_model_rounds, None, evidence, command, kind)
+    evaluate_budget_command_in_directory(remaining_model_rounds, evidence, command, kind, None)
+}
+
+pub fn evaluate_budget_command_in_directory(
+    remaining_model_rounds: u32,
+    evidence: &CompletionEvidence,
+    command: &str,
+    kind: &ToolKind,
+    working_directory: Option<&str>,
+) -> PolicyDecision {
+    evaluate_budget_command_with_time_in_directory(
+        remaining_model_rounds,
+        None,
+        evidence,
+        command,
+        kind,
+        working_directory,
+    )
 }
 
 pub fn evaluate_budget_command_with_time(
@@ -801,15 +881,54 @@ pub fn evaluate_budget_command_with_time(
     command: &str,
     kind: &ToolKind,
 ) -> PolicyDecision {
+    evaluate_budget_command_with_time_in_directory(
+        remaining_model_rounds,
+        wall_time,
+        evidence,
+        command,
+        kind,
+        None,
+    )
+}
+
+pub fn evaluate_budget_command_with_time_in_directory(
+    remaining_model_rounds: u32,
+    wall_time: Option<(u64, u64)>,
+    evidence: &CompletionEvidence,
+    command: &str,
+    kind: &ToolKind,
+    working_directory: Option<&str>,
+) -> PolicyDecision {
     let time_finalization_window =
         wall_time.is_some_and(|(remaining, total)| total > 0 && remaining <= total / 3);
     let source_delivery_checkpoint = evidence.source_delivery_required
         && wall_time.is_some_and(|(remaining, total)| {
             total > 0 && remaining <= total.saturating_mul(2) / 3
         });
+    if evidence.source_delivery_required {
+        let delivery_stage_count = [
+            is_source_install_command_in(command, working_directory),
+            is_external_source_runtime_command(command),
+            is_project_test_command(command),
+        ]
+        .into_iter()
+        .filter(|stage_present| *stage_present)
+        .count();
+        if delivery_stage_count > 1 {
+            return deny(
+                "execution_budget",
+                "use one tool call per delivery stage so structured evidence can prove ordering: install from source, then run outside the source directory, then run project tests",
+            );
+        }
+    }
 
     let required_extensions = evidence
         .required_source_scan_extensions
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let source_evidence_paths = evidence
+        .source_evidence_paths
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -820,16 +939,21 @@ pub fn evaluate_budget_command_with_time(
             .any(|blocker| blocker.contains("source compatibility"));
     if source_scan_blocked {
         let source_mutation = matches!(kind, ToolKind::Mutation)
-            && !is_dependency_install_command(&command.to_ascii_lowercase());
+            && !is_source_build_or_install_command(&command.to_ascii_lowercase());
         if source_mutation
-            || is_repository_alias_discovery_command(command)
+            || is_bounded_source_evidence_read(
+                command,
+                &required_extensions,
+                &source_evidence_paths,
+            )
+            || is_repository_alias_discovery_command(command, &required_extensions)
             || is_repository_source_scan_command(command, &required_extensions)
         {
             return PolicyDecision::Allow;
         }
         return deny(
             "execution_budget",
-            "before another build or install, derive every local import alias from the repository and complete the required clean residual scan across all observed source/build-input extensions; make the scan return 0 only when no unresolved matches remain",
+            "before another build or install, derive every local import alias from the repository and complete the required clean residual scan across all observed source/build-input extensions; derive candidate spellings from exact failures, repository references, or a language adapter, write matches to a temporary results file, preserve the grep/rg status, reject status greater than 1, and finish with `test ! -s`",
         );
     }
 
@@ -880,7 +1004,7 @@ pub fn evaluate_budget_command_with_time(
             _ => true,
         };
         if source_install_missing {
-            if is_source_install_command(command)
+            if is_source_install_command_in(command, working_directory)
                 || dependency_recovery
                 || repair_mutation
                 || failure_diagnostic
@@ -959,8 +1083,10 @@ pub struct CompletionGate {
     source_delivery_required: bool,
     project_tests_required: bool,
     required_source_scan_extensions: BTreeSet<String>,
+    source_evidence_paths: BTreeSet<String>,
     last_source_mutation_sequence: Option<u64>,
     last_source_scan_sequence: Option<u64>,
+    last_failed_clean_source_scan_sequence: Option<u64>,
     last_source_install_sequence: Option<u64>,
     last_external_source_runtime_sequence: Option<u64>,
     last_project_test_sequence: Option<u64>,
@@ -1060,8 +1186,10 @@ impl CompletionGate {
             source_delivery_required,
             project_tests_required,
             required_source_scan_extensions: BTreeSet::new(),
+            source_evidence_paths: BTreeSet::new(),
             last_source_mutation_sequence: None,
             last_source_scan_sequence: None,
+            last_failed_clean_source_scan_sequence: None,
             last_source_install_sequence: None,
             last_external_source_runtime_sequence: None,
             last_project_test_sequence: None,
@@ -1078,12 +1206,24 @@ impl CompletionGate {
         if self.source_compatibility_audit_required {
             self.required_source_scan_extensions
                 .extend(observed_build_input_extensions(outcome));
+            self.source_evidence_paths
+                .extend(observed_source_evidence_paths(outcome));
             if is_clean_repository_source_scan(outcome, &self.required_source_scan_extensions) {
                 self.last_source_scan_sequence = Some(outcome.sequence);
+                self.last_failed_clean_source_scan_sequence = None;
+            } else if !outcome.succeeded()
+                && is_repository_source_scan_attempt(
+                    &outcome.command,
+                    &self.required_source_scan_extensions,
+                )
+                && source_scan_output_claims_clean(outcome)
+            {
+                self.last_failed_clean_source_scan_sequence = Some(outcome.sequence);
             }
         }
         if self.source_delivery_required && outcome.succeeded() {
-            if is_source_install_command(&outcome.command) {
+            if is_source_install_command_in(&outcome.command, outcome.working_directory.as_deref())
+            {
                 self.last_source_install_sequence = Some(outcome.sequence);
             } else if self.last_source_install_sequence.is_some()
                 && is_external_source_runtime_command(&outcome.command)
@@ -1230,6 +1370,15 @@ impl CompletionGate {
             && !self.required_source_scan_extensions.is_empty()
         {
             if let Some(source_mutation_sequence) = self.last_source_mutation_sequence {
+                if self
+                    .last_failed_clean_source_scan_sequence
+                    .is_some_and(|sequence| sequence >= source_mutation_sequence)
+                {
+                    blockers.push(
+                        "source compatibility residual scan reported zero residual matches but exited nonzero; rerun once by writing matches to a temporary results file, preserving the grep/rg status, rejecting status greater than 1, and finishing with `test ! -s`"
+                            .to_owned(),
+                    );
+                }
                 if !self
                     .last_source_scan_sequence
                     .is_some_and(|sequence| sequence > source_mutation_sequence)
@@ -1297,6 +1446,7 @@ impl CompletionGate {
                 .iter()
                 .cloned()
                 .collect(),
+            source_evidence_paths: self.source_evidence_paths.iter().cloned().collect(),
             last_source_scan_sequence: self.last_source_scan_sequence,
             source_delivery_required: self.source_delivery_required,
             project_tests_required: self.project_tests_required,
@@ -1346,6 +1496,54 @@ fn observed_build_input_extensions(outcome: &ToolOutcome) -> BTreeSet<String> {
         collect_source_extensions(&outcome.command, &mut extensions);
     }
     extensions
+}
+
+fn observed_source_evidence_paths(outcome: &ToolOutcome) -> BTreeSet<String> {
+    let lower_command = outcome.command.to_ascii_lowercase();
+    let inspects_build_config = contains_any(
+        &lower_command,
+        &[
+            "setup.py",
+            "pyproject.toml",
+            "cargo.toml",
+            "cmakelists.txt",
+            "meson.build",
+            "makefile",
+            "package.json",
+            "build.gradle",
+            "pom.xml",
+        ],
+    );
+    let mut paths = BTreeSet::new();
+    if is_source_mutation(outcome) {
+        collect_source_paths(&outcome.command, &mut paths);
+    }
+    if inspects_build_config {
+        collect_source_paths(&outcome.stdout, &mut paths);
+        collect_source_paths(&outcome.stderr, &mut paths);
+    }
+    paths
+}
+
+fn collect_source_paths(text: &str, paths: &mut BTreeSet<String>) {
+    for token in text.split_whitespace() {
+        let candidate = token
+            .trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+                )
+            })
+            .replace('\\', "/");
+        let lower = candidate.to_ascii_lowercase();
+        if SOURCE_INPUT_EXTENSIONS
+            .iter()
+            .any(|extension| lower.len() > extension.len() && lower.ends_with(extension))
+            && !has_ignored_source_component(&lower)
+        {
+            paths.insert(candidate);
+        }
+    }
 }
 
 fn collect_source_extensions(text: &str, extensions: &mut BTreeSet<String>) {
@@ -1417,26 +1615,513 @@ fn detect_missing_test_runner(outcome: &ToolOutcome) -> Option<&'static str> {
     None
 }
 
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn simple_and_segments(command: &str) -> Option<Vec<Vec<String>>> {
+    let mut segments = Vec::new();
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut token_started = false;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut chars = command.chars().peekable();
+
+    let finish_token = |tokens: &mut Vec<String>, token: &mut String, started: &mut bool| {
+        if *started {
+            tokens.push(std::mem::take(token));
+            *started = false;
+        }
+    };
+    let finish_segment = |segments: &mut Vec<Vec<String>>, tokens: &mut Vec<String>| {
+        if tokens.is_empty() {
+            return false;
+        }
+        segments.push(std::mem::take(tokens));
+        true
+    };
+
+    while let Some(character) = chars.next() {
+        if escaped {
+            token.push(character);
+            token_started = true;
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                } else {
+                    token.push(character);
+                }
+                token_started = true;
+            }
+            Some('"') => {
+                if character == '"' {
+                    quote = None;
+                } else if character == '\\' {
+                    if chars
+                        .peek()
+                        .is_some_and(|next| matches!(next, '"' | '\\' | '$' | '`'))
+                    {
+                        escaped = true;
+                    } else {
+                        token.push(character);
+                    }
+                } else if character == '`'
+                    || character == '$' && chars.peek().is_some_and(|next| *next == '(')
+                {
+                    return None;
+                } else {
+                    token.push(character);
+                }
+                token_started = true;
+            }
+            Some(_) => unreachable!(),
+            None => match character {
+                '\'' | '"' => {
+                    quote = Some(character);
+                    token_started = true;
+                }
+                '\\' => {
+                    if chars.peek().is_some_and(|next| {
+                        matches!(next, '\\' | '\'' | '"' | ' ' | '\t' | '&' | '|' | ';')
+                    }) {
+                        escaped = true;
+                    } else {
+                        token.push(character);
+                        token_started = true;
+                    }
+                }
+                ' ' | '\t' | '\r' => {
+                    finish_token(&mut tokens, &mut token, &mut token_started);
+                }
+                '&' if chars.peek().is_some_and(|next| *next == '&') => {
+                    chars.next();
+                    finish_token(&mut tokens, &mut token, &mut token_started);
+                    if !finish_segment(&mut segments, &mut tokens) {
+                        return None;
+                    }
+                }
+                '&' if tokens.is_empty()
+                    && !token_started
+                    && chars.peek().is_some_and(|next| next.is_whitespace()) =>
+                {
+                    tokens.push("&".to_owned());
+                }
+                ';' | '\n' | '|' | '&' | '(' | ')' | '`' => return None,
+                '$' if chars.peek().is_some_and(|next| *next == '(') => return None,
+                _ => {
+                    token.push(character);
+                    token_started = true;
+                }
+            },
+        }
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    finish_token(&mut tokens, &mut token, &mut token_started);
+    if !finish_segment(&mut segments, &mut tokens) {
+        return None;
+    }
+    Some(segments)
+}
+
+#[cfg(test)]
 fn is_source_install_command(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    contains_any(
-        &lower,
-        &[
-            "pip install -e .",
-            "pip3 install -e .",
-            "python -m pip install -e .",
-            "python3 -m pip install -e .",
-            "pip install .",
-            "pip3 install .",
-            "python -m pip install .",
-            "python3 -m pip install .",
-            "uv pip install -e .",
-            "uv pip install .",
-            "setup.py install",
-            "cargo install --path ",
-            "npm install -g .",
-        ],
-    )
+    is_source_install_command_in(command, None)
+}
+
+fn is_source_install_command_in(command: &str, working_directory: Option<&str>) -> bool {
+    fn is_current_directory(target: &str) -> bool {
+        matches!(target, "." | "./")
+    }
+
+    fn pip_installs_current_source(args: &[String]) -> bool {
+        const OPTIONS_WITH_VALUES: &[&str] = &[
+            "-c",
+            "--constraint",
+            "-f",
+            "--find-links",
+            "-i",
+            "--index-url",
+            "--extra-index-url",
+            "--trusted-host",
+            "-r",
+            "--requirement",
+            "--src",
+            "-t",
+            "--target",
+            "--root",
+            "--prefix",
+            "--python",
+            "--config-settings",
+            "--cache-dir",
+            "--platform",
+            "--python-version",
+            "--implementation",
+            "--abi",
+            "--upgrade-strategy",
+            "--root-user-action",
+            "--progress-bar",
+            "--report",
+            "--timeout",
+            "--retries",
+            "--cert",
+            "--client-cert",
+            "--no-binary",
+            "--only-binary",
+            "--link-mode",
+            "--index-strategy",
+            "--proxy",
+            "--exists-action",
+            "--keyring-provider",
+            "--use-feature",
+            "--use-deprecated",
+        ];
+        const OPTIONS_WITHOUT_VALUES: &[&str] = &[
+            "--no-deps",
+            "--no-index",
+            "--no-build-isolation",
+            "--use-pep517",
+            "--no-use-pep517",
+            "--pre",
+            "--upgrade",
+            "-u",
+            "--force-reinstall",
+            "--ignore-installed",
+            "--user",
+            "--compile",
+            "--no-compile",
+            "--no-clean",
+            "--break-system-packages",
+            "--require-hashes",
+            "--prefer-binary",
+            "-q",
+            "--quiet",
+            "-v",
+            "--verbose",
+            "--disable-pip-version-check",
+            "--isolated",
+            "--no-input",
+            "--system",
+            "--refresh",
+            "--reinstall",
+            "--no-cache-dir",
+            "--no-color",
+        ];
+        const NON_INSTALLING_OPTIONS: &[&str] = &["-h", "--help", "--dry-run"];
+
+        let mut index = 0;
+        let mut found_current_source = false;
+        let mut positional_only = false;
+        while index < args.len() {
+            let argument = args[index].as_str();
+            if NON_INSTALLING_OPTIONS.contains(&argument) {
+                return false;
+            }
+            if argument == "--" {
+                positional_only = true;
+                index += 1;
+                continue;
+            }
+            if matches!(argument, "-e" | "--editable") {
+                let Some(target) = args.get(index + 1) else {
+                    return false;
+                };
+                found_current_source |= is_current_directory(target);
+                index += 2;
+                continue;
+            }
+            if let Some(target) = argument
+                .strip_prefix("--editable=")
+                .or_else(|| argument.strip_prefix("-e="))
+            {
+                found_current_source |= is_current_directory(target);
+                index += 1;
+                continue;
+            }
+            if let Some(target) = argument.strip_prefix("-e") {
+                if target.is_empty() {
+                    return false;
+                }
+                found_current_source |= is_current_directory(target);
+                index += 1;
+                continue;
+            }
+            if !positional_only && OPTIONS_WITH_VALUES.contains(&argument) {
+                if args.get(index + 1).is_none() {
+                    return false;
+                }
+                index += 2;
+                continue;
+            }
+            if !positional_only
+                && OPTIONS_WITH_VALUES
+                    .iter()
+                    .any(|option| argument.starts_with(&format!("{option}=")))
+            {
+                index += 1;
+                continue;
+            }
+            if !positional_only && OPTIONS_WITHOUT_VALUES.contains(&argument) {
+                index += 1;
+                continue;
+            }
+            if !positional_only
+                && argument.starts_with('-')
+                && argument[1..]
+                    .chars()
+                    .all(|character| matches!(character, 'q' | 'v'))
+            {
+                index += 1;
+                continue;
+            }
+            if !positional_only && argument.starts_with('-') {
+                return false;
+            }
+            if is_current_directory(argument) {
+                found_current_source = true;
+            }
+            index += 1;
+        }
+        found_current_source
+    }
+
+    fn is_environment_assignment(token: &str) -> bool {
+        token.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+    }
+
+    fn is_py_version_selector(token: &str) -> bool {
+        let Some(version) = token.strip_prefix('-') else {
+            return false;
+        };
+        !version.is_empty()
+            && !version.starts_with('.')
+            && !version.ends_with('.')
+            && version
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '.')
+            && !version.contains("..")
+    }
+
+    let Some(segments) = simple_and_segments(command) else {
+        return false;
+    };
+    let source_root = working_directory
+        .map(PathBuf::from)
+        .map(|path| normalize_lexical_path(&path));
+    let mut effective_directory = source_root.clone();
+    let mut inside_source_workspace = true;
+
+    for tokens in segments {
+        let lower_tokens = tokens
+            .iter()
+            .map(|token| token.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let mut start = tokens
+            .iter()
+            .position(|token| !is_environment_assignment(token))
+            .unwrap_or(tokens.len());
+        if lower_tokens.get(start).is_some_and(|token| token == "&") {
+            start += 1;
+        }
+        let Some(executable) = lower_tokens
+            .get(start)
+            .and_then(|token| token.rsplit(['/', '\\']).next())
+        else {
+            continue;
+        };
+
+        if executable == "cd" {
+            let Some(target) = tokens.get(start + 1) else {
+                inside_source_workspace = false;
+                effective_directory = None;
+                continue;
+            };
+            if is_current_directory(target) {
+                continue;
+            }
+            let Some(current) = effective_directory.as_ref() else {
+                inside_source_workspace = false;
+                continue;
+            };
+            let target_path = Path::new(target);
+            let next_directory = if target_path.is_absolute() {
+                normalize_lexical_path(target_path)
+            } else {
+                normalize_lexical_path(&current.join(target_path))
+            };
+            inside_source_workspace = source_root
+                .as_ref()
+                .is_some_and(|root| next_directory == *root);
+            effective_directory = Some(next_directory);
+            continue;
+        }
+        if executable == "export"
+            && lower_tokens[start + 1..]
+                .iter()
+                .all(|token| is_environment_assignment(token))
+        {
+            continue;
+        }
+
+        let python_module_index = if executable.starts_with("python") {
+            Some(start + 1)
+        } else if matches!(executable, "py" | "py.exe") {
+            Some(
+                start
+                    + if lower_tokens
+                        .get(start + 1)
+                        .is_some_and(|token| is_py_version_selector(token))
+                    {
+                        2
+                    } else {
+                        1
+                    },
+            )
+        } else {
+            None
+        };
+        let install_index = if matches!(executable, "pip" | "pip3" | "pip.exe" | "pip3.exe")
+            && lower_tokens
+                .get(start + 1)
+                .is_some_and(|token| token == "install")
+        {
+            Some(start + 1)
+        } else if python_module_index.is_some_and(|module_index| {
+            lower_tokens
+                .get(module_index)
+                .is_some_and(|token| token == "-m")
+                && lower_tokens
+                    .get(module_index + 1)
+                    .is_some_and(|token| matches!(token.as_str(), "pip" | "pip3"))
+                && lower_tokens
+                    .get(module_index + 2)
+                    .is_some_and(|token| token == "install")
+        }) {
+            Some(python_module_index.expect("checked above") + 2)
+        } else if executable == "uv"
+            && lower_tokens
+                .get(start + 1)
+                .is_some_and(|token| token == "pip")
+            && lower_tokens
+                .get(start + 2)
+                .is_some_and(|token| token == "install")
+        {
+            Some(start + 2)
+        } else {
+            None
+        };
+        if let Some(install_index) = install_index {
+            if inside_source_workspace
+                && pip_installs_current_source(&lower_tokens[install_index + 1..])
+            {
+                return true;
+            }
+            return false;
+        }
+
+        let command_args = &lower_tokens[start + 1..];
+        let path_targets_current_setup = |path: &str| {
+            if matches!(path, "setup.py" | "./setup.py") {
+                return inside_source_workspace;
+            }
+            let (Some(current), Some(root)) = (effective_directory.as_ref(), source_root.as_ref())
+            else {
+                return false;
+            };
+            let path = Path::new(path);
+            let resolved = if path.is_absolute() {
+                normalize_lexical_path(path)
+            } else {
+                normalize_lexical_path(&current.join(path))
+            };
+            resolved == root.join("setup.py")
+        };
+        let direct_setup = executable == "setup.py" && path_targets_current_setup(&tokens[start]);
+        let python_setup = executable.starts_with("python")
+            && tokens
+                .get(start + 1)
+                .is_some_and(|path| path_targets_current_setup(path));
+        let non_installing = command_args
+            .iter()
+            .any(|token| matches!(token.as_str(), "-h" | "--help" | "--dry-run"));
+        if !non_installing
+            && (direct_setup || python_setup)
+            && command_args.iter().any(|token| token == "install")
+        {
+            return inside_source_workspace;
+        }
+        if executable == "cargo"
+            && command_args.first().is_some_and(|token| token == "install")
+            && !non_installing
+            && !command_args.iter().any(|token| token == "--list")
+            && command_args
+                .windows(2)
+                .any(|pair| pair[0] == "--path" && is_current_directory(pair[1].as_str()))
+        {
+            return inside_source_workspace;
+        }
+        if executable == "npm"
+            && command_args.first().is_some_and(|token| token == "install")
+            && !non_installing
+            && command_args.windows(2).any(|pair| {
+                matches!(pair[0].as_str(), "-g" | "--global")
+                    && is_current_directory(pair[1].as_str())
+            })
+        {
+            return inside_source_workspace;
+        }
+        // A successful overall shell command does not prove that an arbitrary
+        // earlier segment preserved the effective directory or install state.
+        return false;
+    }
+    false
+}
+
+fn is_source_build_or_install_command(command: &str) -> bool {
+    is_dependency_install_command(command)
+        || contains_any(
+            command,
+            &[
+                "setup.py build",
+                "build_ext",
+                "cargo build",
+                "npm run build",
+                "pnpm build",
+                "yarn build",
+                "bun run build",
+                "cmake --build",
+                "mvn package",
+                "gradle build",
+                "gradlew build",
+                "go build",
+                "docker build",
+                "podman build",
+                "dotnet build",
+                "swift build",
+                "xcodebuild",
+            ],
+        )
 }
 
 fn is_external_source_runtime_command(command: &str) -> bool {
@@ -1482,6 +2167,17 @@ fn is_repository_source_scan_command(
     command: &str,
     required_extensions: &BTreeSet<String>,
 ) -> bool {
+    if !is_repository_source_scan_attempt(command, required_extensions) {
+        return false;
+    }
+    let lower = command.to_ascii_lowercase();
+    source_scan_has_clean_exit_contract(&lower)
+}
+
+fn is_repository_source_scan_attempt(
+    command: &str,
+    required_extensions: &BTreeSet<String>,
+) -> bool {
     if required_extensions.is_empty() {
         return false;
     }
@@ -1491,7 +2187,7 @@ fn is_repository_source_scan_command(
         || lower.contains("grep --recursive")
         || lower.contains("find ")
         || lower.contains("os.walk(");
-    if !repository_wide || !source_scan_has_clean_exit_contract(&lower) {
+    if !repository_wide {
         return false;
     }
     let has_extension_filter = contains_any(
@@ -1506,9 +2202,32 @@ fn is_repository_source_scan_command(
         .all(|extension| lower.contains(extension))
 }
 
-fn is_repository_alias_discovery_command(command: &str) -> bool {
+fn source_scan_output_claims_clean(outcome: &ToolOutcome) -> bool {
+    let output = format!("{}\n{}", outcome.stdout, outcome.stderr).to_ascii_lowercase();
+    let claims_clean = contains_any(
+        &output,
+        &[
+            "0 unresolved",
+            "zero residual",
+            "no unresolved",
+            "scan clean",
+            "all clean",
+        ],
+    );
+    claims_clean
+        && !contains_any(
+            &output,
+            &["issues remain", "unresolved matches remain", "not clean"],
+        )
+}
+
+fn is_repository_alias_discovery_command(
+    command: &str,
+    required_extensions: &BTreeSet<String>,
+) -> bool {
     let lower = command.to_ascii_lowercase();
     let repository_wide = lower.contains("rg ")
+        || lower.starts_with("grep ")
         || lower.contains("grep -r")
         || lower.contains("grep --recursive")
         || lower.contains("find ")
@@ -1523,20 +2242,72 @@ fn is_repository_alias_discovery_command(command: &str) -> bool {
             "require(",
         ],
     );
-    repository_wide && alias_focused
+    let extension_scoped = contains_any(&lower, &["--include", "--glob", " -g ", " glob="])
+        && required_extensions
+            .iter()
+            .all(|extension| lower.contains(extension));
+    repository_wide && alias_focused && extension_scoped
+}
+
+fn is_bounded_source_evidence_read(
+    command: &str,
+    required_extensions: &BTreeSet<String>,
+    source_evidence_paths: &BTreeSet<String>,
+) -> bool {
+    let Some(path) = command.trim().strip_prefix("read_file ") else {
+        return false;
+    };
+    let path = path.trim_matches(['\'', '"']).replace('\\', "/");
+    let lower = path.to_ascii_lowercase();
+    if path.split_whitespace().count() != 1
+        || has_ignored_source_component(&lower)
+        || !required_extensions
+            .iter()
+            .any(|extension| lower.ends_with(extension))
+    {
+        return false;
+    }
+    source_evidence_paths.iter().any(|observed| {
+        let observed = observed.replace('\\', "/").to_ascii_lowercase();
+        lower == observed
+            || lower.ends_with(&format!("/{observed}"))
+            || observed.ends_with(&format!("/{lower}"))
+            || source_parent(&lower)
+                .zip(source_parent(&observed))
+                .is_some_and(|(candidate_parent, observed_parent)| {
+                    candidate_parent == observed_parent
+                        || candidate_parent.ends_with(&format!("/{observed_parent}"))
+                        || observed_parent.ends_with(&format!("/{candidate_parent}"))
+                })
+    })
+}
+
+fn source_parent(path: &str) -> Option<&str> {
+    path.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+fn has_ignored_source_component(path: &str) -> bool {
+    path.split(['/', '\\']).any(|component| {
+        matches!(
+            component,
+            ".git" | ".venv" | "venv" | "node_modules" | "target" | "__pycache__"
+        )
+    })
 }
 
 fn source_scan_has_clean_exit_contract(command: &str) -> bool {
-    contains_any(
-        command,
-        &[
-            "test ! -s",
-            "sys.exit(",
-            "raise systemexit",
-            "! grep ",
-            "! rg ",
-        ],
-    ) || (command.contains("exit 1") && command.contains("exit 0"))
+    let structured_exit =
+        command.contains("os.walk(") && contains_any(command, &["sys.exit(", "raise systemexit"]);
+    let robust_shell_exit = command.contains("test ! -s")
+        && contains_any(command, &["=$?", "=\"$?\""])
+        && contains_any(command, &["-gt 1", "-le 1", "> 1", ">1", "case "])
+        && contains_any(
+            command,
+            &[
+                "exit $", "exit \"$", "exit 1", "exit 2", "return 1", "return 2",
+            ],
+        );
+    structured_exit || robust_shell_exit
 }
 
 fn verification_scope_restriction_count(command: &str) -> usize {
@@ -1646,6 +2417,7 @@ mod tests {
         ToolOutcome {
             request_id: format!("tool-{sequence}"),
             command: "command".to_owned(),
+            working_directory: None,
             kind,
             sequence,
             started_at_ms: sequence * 10,
@@ -1673,6 +2445,14 @@ mod tests {
 
         let isolated = build_system_prompt(false);
         assert!(isolated.contains("Network access is denied by default"));
+    }
+
+    #[test]
+    fn product_prompt_names_the_workspace_write_boundary() {
+        let prompt = build_product_system_prompt(false);
+        assert!(prompt.contains("writable workspace"));
+        assert!(prompt.contains("$TMPDIR"));
+        assert!(!prompt.contains("hidden verifiers"));
     }
 
     #[test]
@@ -1705,6 +2485,18 @@ mod tests {
         assert!(policy
             .evaluate_command("pip install --no-index ./vendor/package.whl")
             .is_allowed());
+    }
+
+    #[test]
+    fn product_policy_allows_normal_project_test_and_solution_paths() {
+        let policy = ProductPolicy::default();
+        assert!(policy
+            .evaluate_command("pytest /Users/leo/project/tests/test_api.py")
+            .is_allowed());
+        assert!(policy
+            .evaluate_command("cat /Users/leo/project/solution/solver.py")
+            .is_allowed());
+        assert!(!policy.evaluate_command("printenv").is_allowed());
     }
 
     #[test]
@@ -2014,6 +2806,7 @@ mod tests {
     fn finalization_budget_blocks_scope_expansion_until_source_scan_is_complete() {
         let evidence = CompletionEvidence {
             required_source_scan_extensions: vec![".py".to_owned(), ".pyx".to_owned()],
+            source_evidence_paths: vec!["pkg/fast.pyx".to_owned(), "pkg/main.py".to_owned()],
             blockers: vec![
                 "source compatibility work requires a clean repository-wide residual scan"
                     .to_owned(),
@@ -2031,7 +2824,7 @@ mod tests {
         assert!(evaluate_budget_command(
             8,
             &evidence,
-            "grep -R 'np.int' --include='*.py' --include='*.pyx' . >/tmp/residuals && test ! -s /tmp/residuals",
+            "grep -R 'np.int' --include='*.py' --include='*.pyx' . >/tmp/residuals; scan_status=$?; if [ \"$scan_status\" -gt 1 ]; then exit \"$scan_status\"; fi; test ! -s /tmp/residuals",
             &ToolKind::ReadOnly,
         )
         .is_allowed());
@@ -2048,6 +2841,41 @@ mod tests {
             &evidence,
             "sed -i 's/np.int/np.int64/g' pkg/fast.pyx",
             &ToolKind::Mutation,
+        )
+        .is_allowed());
+        assert!(evaluate_budget_command(
+            8,
+            &evidence,
+            "read_file pkg/runtime.py",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+        assert!(!evaluate_budget_command(
+            8,
+            &evidence,
+            "read_file unrelated/other.py",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+        assert!(!evaluate_budget_command(
+            8,
+            &evidence,
+            "read_file .venv/lib/python/site-packages/other.py",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+        assert!(!evaluate_budget_command(
+            8,
+            &evidence,
+            "grep ^(import|from) pkg",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+        assert!(evaluate_budget_command(
+            8,
+            &evidence,
+            "rg '^(import|from) ' --glob '*.py' --glob '*.pyx' pkg",
+            &ToolKind::ReadOnly,
         )
         .is_allowed());
     }
@@ -2269,7 +3097,7 @@ mod tests {
             50,
             Some((430, 900)),
             &evidence,
-            "! grep -R deprecated --include='*.py' --include='*.pyx' .",
+            "grep -R deprecated --include='*.py' --include='*.pyx' . >/tmp/residuals; scan_status=$?; if [ \"$scan_status\" -gt 1 ]; then exit \"$scan_status\"; fi; test ! -s /tmp/residuals",
             &ToolKind::ReadOnly,
         )
         .is_allowed());
@@ -2312,6 +3140,118 @@ mod tests {
             &ToolKind::Verification,
         )
         .is_allowed());
+    }
+
+    #[test]
+    fn source_checkpoint_rejects_compound_delivery_stages() {
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 20,
+            source_delivery_required: true,
+            ..CompletionEvidence::default()
+        };
+        let command = "python3 -m pip install . && cd /tmp && python3 -c 'import package' && cd /workspace && python3 -m pytest";
+
+        let decision = evaluate_budget_command_with_time(
+            100,
+            Some((890, 900)),
+            &evidence,
+            command,
+            &ToolKind::Mutation,
+        );
+
+        assert!(!decision.is_allowed());
+        assert!(matches!(
+            decision,
+            PolicyDecision::Deny { reason, .. }
+                if reason.contains("one tool call per delivery stage")
+        ));
+    }
+
+    #[test]
+    fn source_install_detection_accepts_python_module_pip_with_options() {
+        assert!(is_source_install_command_in(
+            "cd /workspace && .venv/bin/python -m pip install --no-index --no-build-isolation --no-deps -e .",
+            Some("/workspace"),
+        ));
+        assert!(is_source_install_command(
+            ".venv/bin/pip3 install --no-deps --editable ./"
+        ));
+        assert!(!is_source_install_command(
+            ".venv/bin/python -m pip install --no-index pytest"
+        ));
+        assert!(!is_source_install_command(
+            "pip install --find-links . pytest"
+        ));
+        assert!(!is_source_install_command(
+            "pip install -e ../other-project"
+        ));
+        assert!(!is_source_install_command(
+            "rg --fixed-strings 'pip install .' docs"
+        ));
+        assert!(!is_source_install_command("printf 'x && pip install .'"));
+        assert!(!is_source_install_command(
+            "cd ../other-project && pip install ."
+        ));
+        assert!(!is_source_install_command_in(
+            "cd ../other-project && pip install .",
+            Some("/workspace"),
+        ));
+        assert!(!is_source_install_command_in(
+            "cd /other-project && pip install .",
+            Some("/workspace"),
+        ));
+        assert!(!is_source_install_command(
+            "pip install --cache-dir . --help"
+        ));
+        assert!(!is_source_install_command_in(
+            "../other-project/setup.py install",
+            Some("/workspace"),
+        ));
+        assert!(is_source_install_command_in(
+            "export PIP_NO_INDEX=1 && pip install .",
+            Some("/workspace"),
+        ));
+        assert!(!is_source_install_command_in(
+            "source .venv/bin/activate && pip install .",
+            Some("/workspace"),
+        ));
+        assert!(!is_source_install_command_in(
+            "cd /workspace/subproject && python -m pip install -q -e .",
+            Some("/workspace"),
+        ));
+        assert!(!is_source_install_command_in(
+            "cd /workspace/linked-project && pip install .",
+            Some("/workspace"),
+        ));
+        assert!(is_source_install_command("pip install -e."));
+        assert!(is_source_install_command("pip install -qq -e ."));
+        assert!(is_source_install_command(
+            "pip install --proxy http://127.0.0.1:8080 -e ."
+        ));
+        assert!(is_source_install_command(
+            "uv pip install --system --disable-pip-version-check ."
+        ));
+        assert!(!is_source_install_command_in(
+            "python setup.py install --help",
+            Some("/workspace"),
+        ));
+        assert!(!is_source_install_command_in(
+            "npm install -g . --dry-run",
+            Some("/workspace"),
+        ));
+        assert!(is_source_install_command(
+            r".venv\Scripts\python.exe -m pip install ."
+        ));
+        assert!(is_source_install_command(
+            r".venv\Scripts\pip.exe install ."
+        ));
+        assert!(is_source_install_command("py -m pip install ."));
+        assert!(is_source_install_command("py -3 -m pip install ."));
+        assert!(is_source_install_command("py -3.12 -m pip install ."));
+        assert!(is_source_install_command(
+            r#"& "C:\Program Files\Python\python.exe" -m pip install ."#
+        ));
     }
 
     #[test]
@@ -2458,14 +3398,12 @@ mod tests {
             .any(|blocker| blocker.contains(".pyx")));
 
         let mut incomplete_scan = outcome(4, ToolKind::ReadOnly, 0);
-        incomplete_scan.command =
-            "grep -R 'old' --include='*.py' pkg/ >/tmp/residuals && test ! -s /tmp/residuals"
-                .to_owned();
+        incomplete_scan.command = "grep -R 'old' --include='*.py' pkg/ >/tmp/residuals; scan_status=$?; if [ \"$scan_status\" -gt 1 ]; then exit \"$scan_status\"; fi; test ! -s /tmp/residuals".to_owned();
         gate.record(&incomplete_scan);
         assert!(!gate.evidence().completed);
 
         let mut complete_scan = outcome(5, ToolKind::ReadOnly, 0);
-        complete_scan.command = "grep -R 'old' --include='*.py' --include='*.pyx' pkg/ >/tmp/residuals && test ! -s /tmp/residuals".to_owned();
+        complete_scan.command = "grep -R 'old' --include='*.py' --include='*.pyx' pkg/ >/tmp/residuals; scan_status=$?; if [ \"$scan_status\" -gt 1 ]; then exit \"$scan_status\"; fi; test ! -s /tmp/residuals".to_owned();
         complete_scan.stdout = "PASSED: no unresolved compatibility matches".to_owned();
         gate.record(&complete_scan);
         assert!(gate.evidence().completed);
@@ -2595,10 +3533,161 @@ mod tests {
             20,
             Some((500, 900)),
             &evidence,
-            "rg '^(import|from) ' --glob '*.py' --glob '*.pyx' . >/tmp/import-aliases; rg 'legacy_api' --glob '*.py' --glob '*.pyx' . >/tmp/residuals; test ! -s /tmp/residuals",
+            "rg '^(import|from) ' --glob '*.py' --glob '*.pyx' . >/tmp/import-aliases; rg 'legacy_api' --glob '*.py' --glob '*.pyx' . >/tmp/residuals; scan_status=$?; if [ \"$scan_status\" -gt 1 ]; then exit \"$scan_status\"; fi; test ! -s /tmp/residuals",
             &ToolKind::ReadOnly,
         )
         .is_allowed());
+
+        assert!(!evaluate_budget_command_with_time(
+            20,
+            Some((500, 900)),
+            &evidence,
+            "sed -i 's/legacy_api/current_api/' src/module.py && python setup.py build_ext --inplace",
+            &ToolKind::Mutation,
+        )
+        .is_allowed());
+    }
+
+    #[test]
+    fn source_checkpoint_rejects_fragile_no_match_command_substitution() {
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 4,
+            last_mutation_sequence: Some(4),
+            required_source_scan_extensions: vec![".py".to_owned(), ".pyx".to_owned()],
+            source_delivery_required: true,
+            last_source_mutation_sequence: Some(4),
+            blockers: vec![
+                "source compatibility work requires a clean repository-wide residual scan"
+                    .to_owned(),
+            ],
+            ..CompletionEvidence::default()
+        };
+
+        let decision = evaluate_budget_command_with_time(
+            20,
+            Some((500, 900)),
+            &evidence,
+            "OUT=$(grep -R 'old_api' --include='*.py' --include='*.pyx' .) && if [ -z \"$OUT\" ]; then echo '0 unresolved'; exit 0; else exit 1; fi",
+            &ToolKind::ReadOnly,
+        );
+
+        assert!(!decision.is_allowed());
+        let PolicyDecision::Deny { reason, .. } = decision else {
+            panic!("fragile residual scan should be denied");
+        };
+        assert!(reason.contains("temporary results file"));
+        assert!(reason.contains("test ! -s"));
+    }
+
+    #[test]
+    fn source_checkpoint_accepts_literal_nonzero_search_error_exit() {
+        let extensions = BTreeSet::from([".py".to_owned()]);
+        let command = "grep -rn 'old_value' --include='*.py' compatdemo tests >/tmp/residuals; grep_rc=$?; if [ \"$grep_rc\" -gt 1 ]; then exit 2; fi; test ! -s /tmp/residuals";
+
+        assert!(is_repository_source_scan_command(command, &extensions));
+    }
+
+    #[test]
+    fn source_checkpoint_rejects_masked_search_errors_and_unreachable_empty_check() {
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 4,
+            required_source_scan_extensions: vec![".py".to_owned(), ".pyx".to_owned()],
+            source_delivery_required: true,
+            last_source_mutation_sequence: Some(4),
+            blockers: vec![
+                "source compatibility work requires a clean repository-wide residual scan"
+                    .to_owned(),
+            ],
+            ..CompletionEvidence::default()
+        };
+
+        for command in [
+            "OUT=$(command rg 'old_api' --glob '*.py' --glob '*.pyx' . || true); test ! -s /tmp/residuals",
+            "rg 'old_api' --glob '*.py' --glob '*.pyx' . >/tmp/residuals && test ! -s /tmp/residuals",
+            "rg 'old_api' --glob '*.py' --glob '*.pyx' . >/tmp/residuals; scan_status=$?; test ! -s /tmp/residuals",
+        ] {
+            assert!(
+                !evaluate_budget_command_with_time(
+                    20,
+                    Some((500, 900)),
+                    &evidence,
+                    command,
+                    &ToolKind::ReadOnly,
+                )
+                .is_allowed(),
+                "unsafe residual scan was allowed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_clean_residual_scan_records_shell_exit_recovery() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Repair this source package for runtime compatibility.",
+        );
+        let mut build_inputs = outcome(1, ToolKind::ReadOnly, 0);
+        build_inputs.command = "cat setup.py".to_owned();
+        build_inputs.stdout = "Extension('pkg.fast', ['pkg/fast.pyx'])".to_owned();
+        gate.record(&build_inputs);
+
+        let mut edit = outcome(2, ToolKind::Mutation, 0);
+        edit.command = "sed -i 's/old_api/new_api/' pkg/main.py".to_owned();
+        gate.record(&edit);
+
+        let mut failed_scan = outcome(3, ToolKind::ReadOnly, 1);
+        failed_scan.command = "OUT=$(grep -R 'old_api' --include='*.py' --include='*.pyx' .) && if [ -z \"$OUT\" ]; then echo 'SCAN CLEAN: 0 unresolved'; exit 0; else exit 1; fi".to_owned();
+        failed_scan.stdout = "SCAN CLEAN: 0 unresolved".to_owned();
+        gate.record(&failed_scan);
+
+        let evidence = gate.evidence();
+        assert!(evidence.blockers.iter().any(|blocker| {
+            blocker.contains("reported zero residual matches but exited nonzero")
+                && blocker.contains("test ! -s")
+        }));
+    }
+
+    #[test]
+    fn compound_edit_and_failed_clean_scan_records_shell_exit_recovery() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Repair this source package for runtime compatibility.",
+        );
+        let mut build_inputs = outcome(1, ToolKind::ReadOnly, 0);
+        build_inputs.command = "cat setup.py".to_owned();
+        build_inputs.stdout = "Extension('pkg.fast', ['pkg/fast.pyx'])".to_owned();
+        gate.record(&build_inputs);
+
+        let mut mixed = outcome(2, ToolKind::Mutation, 1);
+        mixed.command = "sed -i 's/old_api/new_api/' pkg/main.py; OUT=$(rg 'old_api' --glob '*.py' --glob '*.pyx' .); echo 'SCAN CLEAN: 0 unresolved'".to_owned();
+        mixed.stdout = "SCAN CLEAN: 0 unresolved".to_owned();
+        gate.record(&mixed);
+
+        assert!(gate.evidence().blockers.iter().any(|blocker| {
+            blocker.contains("reported zero residual matches but exited nonzero")
+        }));
+    }
+
+    #[test]
+    fn convergence_prompt_requires_evidence_derived_variants_and_robust_scan_exit() {
+        let evidence = CompletionEvidence {
+            blockers: vec![
+                "source compatibility work requires a clean repository-wide residual scan"
+                    .to_owned(),
+            ],
+            ..CompletionEvidence::default()
+        };
+
+        let prompt = build_time_convergence_prompt(300, &evidence);
+
+        assert!(prompt.contains("exact failing API member"));
+        assert!(prompt.contains("repository references or a language adapter"));
+        assert!(!prompt.contains("direct and underscored spellings"));
+        assert!(prompt.contains("temporary results file"));
+        assert!(prompt.contains("reject status greater than 1"));
+        assert!(prompt.contains("test ! -s"));
     }
 
     #[test]
@@ -2618,9 +3707,7 @@ mod tests {
         gate.record(&edit);
 
         let mut scan = outcome(3, ToolKind::ReadOnly, 0);
-        scan.command =
-            "grep -R old --include='*.pyx' . >/tmp/residuals && test ! -s /tmp/residuals"
-                .to_owned();
+        scan.command = "grep -R old --include='*.pyx' . >/tmp/residuals; scan_status=$?; if [ \"$scan_status\" -gt 1 ]; then exit \"$scan_status\"; fi; test ! -s /tmp/residuals".to_owned();
         scan.stdout = "PASSED: source scan clean".to_owned();
         gate.record(&scan);
 

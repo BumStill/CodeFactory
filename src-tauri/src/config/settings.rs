@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
-use std::fmt;
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 
 // ── Git remote types ──────────────────────────────────────────────────────────
@@ -447,7 +447,10 @@ mod reasoning_effort_tests {
     #[test]
     fn default_is_medium() {
         assert_eq!(ReasoningEffort::default(), ReasoningEffort::Medium);
-        assert_eq!(Settings::default().reasoning_effort, ReasoningEffort::Medium);
+        assert_eq!(
+            Settings::default().reasoning_effort,
+            ReasoningEffort::Medium
+        );
     }
 
     #[test]
@@ -460,7 +463,10 @@ mod reasoning_effort_tests {
         assert_eq!(parsed, ReasoningEffort::High);
         assert_eq!(ReasoningEffort::Low.as_str(), "low");
         assert_eq!(ReasoningEffort::parse("high"), Some(ReasoningEffort::High));
-        assert_eq!(ReasoningEffort::parse("minimal"), Some(ReasoningEffort::Minimal));
+        assert_eq!(
+            ReasoningEffort::parse("minimal"),
+            Some(ReasoningEffort::Minimal)
+        );
         assert_eq!(ReasoningEffort::parse("bogus"), None);
     }
 
@@ -518,12 +524,50 @@ mod reasoning_effort_tests {
             },
         );
 
-        let resolved = settings.resolve_model_for_endpoint(
-            "deepseek",
-            "anthropic/claude-opus-4-7",
-        );
+        let resolved = settings.resolve_model_for_endpoint("deepseek", "anthropic/claude-opus-4-7");
 
         assert_eq!(resolved.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn resolves_default_ai_helpers_to_the_active_endpoint_model() {
+        let mut settings = Settings::default();
+        settings.default_endpoint = "deepseek".into();
+        settings.default_model = "gpt-5.5".into();
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://api.deepseek.com".into(),
+                key_ref: Some("codefactory.endpoint.deepseek".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+
+        assert_eq!(
+            settings.resolved_default_model().as_deref(),
+            Some("deepseek-v4-pro")
+        );
+    }
+
+    #[test]
+    fn rejects_stale_provider_model_when_direct_endpoint_has_no_model_metadata() {
+        let mut settings = Settings::default();
+        settings.default_endpoint = "deepseek".into();
+        settings.default_model = "gpt-5.5".into();
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://api.deepseek.com".into(),
+                key_ref: Some("codefactory.endpoint.deepseek".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: None,
+            },
+        );
+
+        assert_eq!(settings.resolved_default_model(), None);
     }
 
     #[test]
@@ -533,10 +577,7 @@ mod reasoning_effort_tests {
         let endpoint = settings.endpoints.get_mut("openrouter").unwrap();
         endpoint.active_model = Some("anthropic/claude-sonnet-4".into());
 
-        let resolved = settings.resolve_model_for_endpoint(
-            "openrouter",
-            "deepseek-v4-pro",
-        );
+        let resolved = settings.resolve_model_for_endpoint("openrouter", "deepseek-v4-pro");
 
         assert_eq!(resolved.as_deref(), Some("anthropic/claude-sonnet-4"));
     }
@@ -548,10 +589,7 @@ mod reasoning_effort_tests {
         let endpoint = settings.endpoints.get_mut("openrouter").unwrap();
         endpoint.active_model = Some("anthropic/claude-sonnet-4".into());
 
-        let resolved = settings.resolve_model_for_endpoint(
-            "openrouter",
-            "google/gemini-2.5-pro",
-        );
+        let resolved = settings.resolve_model_for_endpoint("openrouter", "google/gemini-2.5-pro");
 
         assert_eq!(resolved.as_deref(), Some("google/gemini-2.5-pro"));
     }
@@ -787,8 +825,12 @@ impl Settings {
         let ep = self.endpoints.get(endpoint_name)?;
         let requested = requested_model.trim();
         let active = ep.active_model.as_deref().unwrap_or("").trim();
+        let active_is_compatible = !active.is_empty()
+            && !model_obviously_targets_another_provider(endpoint_name, ep, active);
+        let requested_is_compatible = !requested.is_empty()
+            && !model_obviously_targets_another_provider(endpoint_name, ep, requested);
 
-        if !requested.is_empty() && requested == active {
+        if !requested.is_empty() && requested == active && active_is_compatible {
             return Some(requested.to_string());
         }
 
@@ -805,7 +847,7 @@ impl Settings {
             return Some(requested.to_string());
         }
 
-        let has_endpoint_model = !active.is_empty() || !ep.custom_models.is_empty();
+        let has_endpoint_model = active_is_compatible || !ep.custom_models.is_empty();
         // A remaining model that is neither active nor explicitly compatible
         // is stale. ModelPicker persists a real selection as active before
         // session creation, so this repairs provider-switch races.
@@ -813,7 +855,7 @@ impl Settings {
             matches!(ep.api_style, ApiStyle::Chatgpt) || has_endpoint_model;
 
         if should_repair_to_endpoint_model {
-            if !active.is_empty() {
+            if active_is_compatible {
                 return Some(active.to_string());
             }
             if let Some(first) = ep.custom_models.first() {
@@ -821,16 +863,25 @@ impl Settings {
             }
         }
 
-        if !requested.is_empty() {
+        if requested_is_compatible {
             return Some(requested.to_string());
         }
 
         let fallback = self.active_model_for(endpoint_name);
-        if fallback.is_empty() {
+        if fallback.is_empty()
+            || model_obviously_targets_another_provider(endpoint_name, ep, &fallback)
+        {
             None
         } else {
             Some(fallback)
         }
+    }
+
+    /// Resolve the model for AI helpers that use the configured default
+    /// endpoint but are not attached to a session, such as task decomposition,
+    /// spec assistance, and post-session learning.
+    pub fn resolved_default_model(&self) -> Option<String> {
+        self.resolve_model_for_endpoint(&self.default_endpoint, &self.default_model)
     }
 
     /// Set the active model for an endpoint. Returns true if anything changed.
@@ -850,6 +901,66 @@ impl Settings {
     }
 }
 
+fn model_obviously_targets_another_provider(
+    endpoint_name: &str,
+    endpoint: &Endpoint,
+    model_id: &str,
+) -> bool {
+    let Some(endpoint_provider) = identifiable_endpoint_provider(endpoint_name, endpoint) else {
+        return false;
+    };
+    let Some(model_provider) = identifiable_model_provider(model_id) else {
+        return false;
+    };
+    endpoint_provider != model_provider
+}
+
+fn identifiable_endpoint_provider(
+    endpoint_name: &str,
+    endpoint: &Endpoint,
+) -> Option<&'static str> {
+    let identity = format!("{} {}", endpoint_name, endpoint.base_url).to_ascii_lowercase();
+    if identity.contains("openrouter.ai") {
+        return None;
+    }
+    match endpoint.api_style {
+        ApiStyle::Anthropic => return Some("anthropic"),
+        ApiStyle::Chatgpt => return Some("openai"),
+        ApiStyle::Openai => {}
+    }
+    if identity.contains("deepseek") {
+        Some("deepseek")
+    } else if identity.contains("anthropic") {
+        Some("anthropic")
+    } else if identity.contains("openai") || identity.contains("chatgpt") {
+        Some("openai")
+    } else if identity.contains("google") || identity.contains("gemini") {
+        Some("google")
+    } else {
+        None
+    }
+}
+
+fn identifiable_model_provider(model_id: &str) -> Option<&'static str> {
+    let model = model_id.to_ascii_lowercase();
+    if model.contains("deepseek") {
+        Some("deepseek")
+    } else if model.contains("claude") || model.contains("anthropic") {
+        Some("anthropic")
+    } else if model.starts_with("gpt-")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.starts_with("openai/")
+    {
+        Some("openai")
+    } else if model.contains("gemini") || model.starts_with("google/") {
+        Some("google")
+    } else {
+        None
+    }
+}
+
 /// Strip an OpenRouter-style `vendor/` prefix from a model id when the
 /// target endpoint isn't OpenRouter. Direct provider APIs (DeepSeek,
 /// Anthropic, OpenAI, etc.) reject ids like `deepseek/deepseek-v4-pro`
@@ -860,16 +971,28 @@ impl Settings {
 /// isn't openrouter.ai. Pass-through for everything else, including
 /// ids that legitimately contain slashes downstream of the vendor part.
 pub fn normalize_model_id(model_id: &str, base_url: &str) -> String {
-    if base_url.contains("openrouter.ai") {
+    let identity = base_url.to_ascii_lowercase();
+    if identity.contains("openrouter.ai") {
         return model_id.to_string();
     }
-    // Only strip the very first segment; preserve everything after.
-    if let Some((_, rest)) = model_id.split_once('/') {
-        if !rest.is_empty() {
-            return rest.to_string();
-        }
+    let Some((provider, rest)) = model_id.split_once('/') else {
+        return model_id.to_string();
+    };
+    if rest.is_empty() {
+        return model_id.to_string();
     }
-    model_id.to_string()
+    let aliases: &[&str] = match provider.to_ascii_lowercase().as_str() {
+        "deepseek" => &["deepseek"],
+        "anthropic" => &["anthropic", "claude"],
+        "openai" => &["openai", "chatgpt"],
+        "google" => &["google", "gemini"],
+        _ => return model_id.to_string(),
+    };
+    if aliases.iter().any(|alias| identity.contains(alias)) {
+        rest.to_string()
+    } else {
+        model_id.to_string()
+    }
 }
 
 /// Rewrite a chat body to the GPT-5 / o-series shape

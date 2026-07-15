@@ -13,12 +13,15 @@ enum SmokeError: LocalizedError {
     case processExited(pid_t)
     case windowServerUnavailable
     case windowTimeout(pid_t, [[String: Any]])
+    case screenCapturePermissionDenied
+    case screenshotUnavailable(Int)
+    case screenshotBlank(Int, String)
     case cleanupFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .invalidArguments:
-            return "usage: verify-macos-app-window.swift <CodeFactory.app> [timeout-seconds]"
+            return "usage: verify-macos-app-window.swift <CodeFactory.app> [timeout-seconds] [evidence-directory]"
         case let .invalidBundle(message), let .launchFailed(message):
             return message
         case let .launchedWrongBundle(actual, expected):
@@ -29,6 +32,12 @@ enum SmokeError: LocalizedError {
             return "WindowServer is unavailable; runner has no GUI security session"
         case let .windowTimeout(pid, windows):
             return "timed out waiting for a stable 800x600 onscreen layer-0 window for pid=\(pid); observed=\(json(windows))"
+        case .screenCapturePermissionDenied:
+            return "Screen Recording permission is unavailable in this macOS runner session"
+        case let .screenshotUnavailable(windowID):
+            return "could not capture the verified app window id=\(windowID)"
+        case let .screenshotBlank(windowID, reason):
+            return "captured app window id=\(windowID) does not prove rendered app content: \(reason)"
         case let .cleanupFailed(message):
             return message
         }
@@ -190,6 +199,169 @@ func waitForStableMainWindow(
     throw SmokeError.windowTimeout(pid, try windowRows(for: pid, options: [.optionAll]))
 }
 
+func writeEvidence(
+    window: [String: Any],
+    appURL: URL,
+    pid: pid_t,
+    evidenceDirectory: URL
+) throws {
+    try FileManager.default.createDirectory(
+        at: evidenceDirectory,
+        withIntermediateDirectories: true
+    )
+    guard let windowID = window["window_id"] as? Int else {
+        throw SmokeError.screenshotUnavailable(window["window_id"] as? Int ?? -1)
+    }
+    let screenshotURL = evidenceDirectory.appendingPathComponent("window.png")
+    guard CGPreflightScreenCaptureAccess() else {
+        throw SmokeError.screenCapturePermissionDenied
+    }
+    let logicalWindowWidth = (window["width"] as? Int).map(Double.init)
+        ?? (window["width"] as? Double)
+    let logicalWindowHeight = (window["height"] as? Int).map(Double.init)
+        ?? (window["height"] as? Double)
+    guard let logicalWindowWidth,
+          let logicalWindowHeight,
+          logicalWindowWidth > 0,
+          logicalWindowHeight > 0
+    else {
+        throw SmokeError.screenshotUnavailable(windowID)
+    }
+
+    var screenshotWidth = 0
+    var screenshotHeight = 0
+    var sampledPixels = 0
+    var colorBucketCount = 0
+    var variedPixels = 0
+    var renderedAttempt: Int?
+    var lastContentReason = "no screenshot captured"
+    let lastScreenshotURL = evidenceDirectory.appendingPathComponent("window-last.png")
+
+    // The native window can become stable before the WebView paints. Retry a
+    // bounded number of captures and validate only the interior of the actual
+    // window, excluding screenshot shadow, title bar, and outer border.
+    for attempt in 1...20 {
+        try? FileManager.default.removeItem(at: screenshotURL)
+        let capture = Process()
+        let captureError = Pipe()
+        capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        capture.arguments = ["-x", "-l", String(windowID), screenshotURL.path]
+        capture.standardError = captureError
+        try capture.run()
+        capture.waitUntilExit()
+        let captureErrorText = String(
+            data: captureError.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard capture.terminationStatus == 0,
+              let image = NSImage(contentsOf: screenshotURL),
+              let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff)
+        else {
+            lastContentReason = "capture attempt \(attempt) failed status=\(capture.terminationStatus) error=\(captureErrorText)"
+            if attempt < 20 {
+                Thread.sleep(forTimeInterval: 1)
+            }
+            continue
+        }
+        try? FileManager.default.removeItem(at: lastScreenshotURL)
+        try? FileManager.default.copyItem(at: screenshotURL, to: lastScreenshotURL)
+        screenshotWidth = bitmap.pixelsWide
+        screenshotHeight = bitmap.pixelsHigh
+        guard screenshotWidth >= 800, screenshotHeight >= 600 else {
+            throw SmokeError.screenshotBlank(
+                windowID,
+                "screenshot is only \(screenshotWidth)x\(screenshotHeight)"
+            )
+        }
+
+        let scale = max(
+            1,
+            Int(round(min(
+                Double(screenshotWidth) / logicalWindowWidth,
+                Double(screenshotHeight) / logicalWindowHeight
+            )))
+        )
+        let windowPixelWidth = Int(logicalWindowWidth) * scale
+        let windowPixelHeight = Int(logicalWindowHeight) * scale
+        let shadowX = max(0, (screenshotWidth - windowPixelWidth) / 2)
+        let shadowY = max(0, (screenshotHeight - windowPixelHeight) / 2)
+        let contentMinX = min(screenshotWidth - 1, shadowX + windowPixelWidth / 10)
+        let contentMaxX = max(contentMinX + 1, min(screenshotWidth, shadowX + windowPixelWidth * 9 / 10))
+        let contentMinY = min(screenshotHeight - 1, shadowY + windowPixelHeight * 15 / 100)
+        let contentMaxY = max(contentMinY + 1, min(screenshotHeight, shadowY + windowPixelHeight * 9 / 10))
+        let sampleStepX = max(1, (contentMaxX - contentMinX) / 24)
+        let sampleStepY = max(1, (contentMaxY - contentMinY) / 24)
+        var colorCounts: [String: Int] = [:]
+        sampledPixels = 0
+        for x in stride(from: contentMinX, to: contentMaxX, by: sampleStepX) {
+            for y in stride(from: contentMinY, to: contentMaxY, by: sampleStepY) {
+                if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) {
+                    let bucket = "\(Int(color.redComponent * 31))-\(Int(color.greenComponent * 31))-\(Int(color.blueComponent * 31))-\(Int(color.alphaComponent * 31))"
+                    colorCounts[bucket, default: 0] += 1
+                    sampledPixels += 1
+                }
+            }
+        }
+        let dominantPixels = colorCounts.values.max() ?? sampledPixels
+        colorBucketCount = colorCounts.count
+        variedPixels = sampledPixels - dominantPixels
+        if colorBucketCount >= 4,
+           sampledPixels > 0,
+           variedPixels >= max(4, sampledPixels / 50)
+        {
+            renderedAttempt = attempt
+            break
+        }
+        lastContentReason = "interior colors=\(colorBucketCount), varied=\(variedPixels)/\(sampledPixels)"
+        if attempt < 20 {
+            Thread.sleep(forTimeInterval: 1)
+        }
+    }
+
+    guard let renderedAttempt else {
+        let failureMetadata: [String: Any] = [
+            "status": "error",
+            "proof_tier": ProcessInfo.processInfo.environment["CODEFACTORY_GUI_PROOF_TIER"]
+                ?? "remote-real-app-gui",
+            "app": appURL.path,
+            "pid": Int(pid),
+            "reason": lastContentReason,
+            "window": window,
+        ]
+        let failureData = try JSONSerialization.data(
+            withJSONObject: failureMetadata,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        try failureData.write(to: evidenceDirectory.appendingPathComponent("failure.json"))
+        throw SmokeError.screenshotBlank(windowID, lastContentReason)
+    }
+
+    // Write status=ok only after capture and rendered-content checks pass.
+    let metadata: [String: Any] = [
+        "status": "ok",
+        "proof_tier": ProcessInfo.processInfo.environment["CODEFACTORY_GUI_PROOF_TIER"]
+            ?? "remote-real-app-gui",
+        "app": appURL.path,
+        "pid": Int(pid),
+        "stable_seconds": 2,
+        "screenshot": [
+            "width": screenshotWidth,
+            "height": screenshotHeight,
+            "content_sample_count": sampledPixels,
+            "content_color_buckets": colorBucketCount,
+            "content_varied_samples": variedPixels,
+            "render_attempt": renderedAttempt,
+        ],
+        "window": window,
+    ]
+    let metadataData = try JSONSerialization.data(
+        withJSONObject: metadata,
+        options: [.prettyPrinted, .sortedKeys]
+    )
+    try metadataData.write(to: evidenceDirectory.appendingPathComponent("window.json"))
+}
+
 func verify() throws {
     guard CommandLine.arguments.count >= 2 else {
         throw SmokeError.invalidArguments
@@ -199,6 +371,9 @@ func verify() throws {
     let timeout = CommandLine.arguments.count >= 3
         ? Double(CommandLine.arguments[2]) ?? 30
         : 30
+    let evidenceDirectory = CommandLine.arguments.count >= 4
+        ? URL(fileURLWithPath: CommandLine.arguments[3]).standardizedFileURL
+        : nil
     guard timeout > 0 else {
         throw SmokeError.invalidArguments
     }
@@ -221,7 +396,16 @@ func verify() throws {
     let app = try launch(appURL, isolatedHome: isolatedHome)
     let windowResult: Result<[String: Any], Error>
     do {
-        windowResult = .success(try waitForStableMainWindow(app: app, timeout: timeout))
+        let window = try waitForStableMainWindow(app: app, timeout: timeout)
+        if let evidenceDirectory {
+            try writeEvidence(
+                window: window,
+                appURL: appURL,
+                pid: app.processIdentifier,
+                evidenceDirectory: evidenceDirectory
+            )
+        }
+        windowResult = .success(window)
     } catch {
         windowResult = .failure(error)
     }

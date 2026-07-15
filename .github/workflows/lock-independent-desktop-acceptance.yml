@@ -1,0 +1,66 @@
+name: Lock-independent Desktop Acceptance
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lock-independent-desktop-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  remote-real-app-gui:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build exact desktop candidate
+        run: >-
+          pnpm tauri build --debug --bundles app
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Verify exact app in remote visible session
+        shell: bash
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/codefactory-desktop-evidence
+        run: |
+          APP_PATH="src-tauri/target/debug/bundle/macos/CodeFactory.app"
+          test -d "$APP_PATH"
+          swift scripts/verify-macos-app-window.swift "$APP_PATH" 45 "$EVIDENCE_DIR"
+          test -s "$EVIDENCE_DIR/window.json"
+          test -s "$EVIDENCE_DIR/window.png"
+
+      - name: Upload remote GUI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lock-independent-desktop-evidence
+          path: ${{ runner.temp }}/codefactory-desktop-evidence
+          if-no-files-found: error

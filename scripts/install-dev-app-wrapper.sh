@@ -103,8 +103,11 @@ if [ -n "$DEV_HOME" ]; then
 fi
 cd "$PROJECT_ROOT"
 
+# Keep the interactive desktop session awake for the lifetime of the dev App.
+# This prevents an unattended live-verification run from being interrupted by
+# idle display/system sleep. A user-initiated lock is still respected.
 # Log stdout/stderr so dev-app failures don't disappear silently.
-exec "$PNPM_PATH" tauri dev --config "$TAURI_CONFIG" >> "$LOG_PREFIX-\$(date +%Y%m%d).log" 2>&1
+exec /usr/bin/caffeinate -dimsu "$PNPM_PATH" tauri dev --config "$TAURI_CONFIG" >> "$LOG_PREFIX-\$(date +%Y%m%d).log" 2>&1
 EOF
 
 chmod +x "$APP_PATH/Contents/MacOS/$DISPLAY_NAME"

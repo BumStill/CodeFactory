@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Streaming client for the Anthropic Messages API.
 
+use codefactory_agent_core::sanitize_completion_summary;
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -48,15 +49,18 @@ pub async fn stream_anthropic(
     let model = crate::config::settings::normalize_model_id(model, base_url);
 
     let anthropic_tools = openai_tools_to_anthropic(tools);
+    let finalization_response = anthropic_tools.is_empty();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "max_tokens": 8096,
         "system": system_prompt,
         "messages": messages,
-        "tools": anthropic_tools,
         "stream": true,
     });
+    if !anthropic_tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(anthropic_tools);
+    }
 
     let response = http
         .post(&url)
@@ -154,14 +158,16 @@ pub async fn stream_anthropic(
                                 .unwrap_or("")
                                 .to_string();
                             if !text.is_empty() {
-                                app_handle
-                                    .emit(
-                                        event_name,
-                                        StreamEvent::TextDelta {
-                                            content: text.clone(),
-                                        },
-                                    )
-                                    .ok();
+                                if !finalization_response {
+                                    app_handle
+                                        .emit(
+                                            event_name,
+                                            StreamEvent::TextDelta {
+                                                content: text.clone(),
+                                            },
+                                        )
+                                        .ok();
+                                }
                                 text_buf.push_str(&text);
                             }
                         }
@@ -237,6 +243,18 @@ pub async fn stream_anthropic(
         })
         .collect();
     tool_calls.sort_by_key(|tc| tc.id.clone());
+    if finalization_response {
+        text_buf = sanitize_completion_summary(&text_buf);
+        tool_calls.clear();
+        app_handle
+            .emit(
+                event_name,
+                StreamEvent::TextDelta {
+                    content: text_buf.clone(),
+                },
+            )
+            .ok();
+    }
 
     Ok(AnthropicResponse {
         text: text_buf,

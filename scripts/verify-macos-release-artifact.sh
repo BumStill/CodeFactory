@@ -112,9 +112,15 @@ if [[ "$(/usr/bin/plutil -extract cleanup raw "$EVOLUTION_RECEIPT")" != "true" ]
 fi
 cat "$EVOLUTION_RECEIPT"
 
-swift "$SCRIPT_DIR/verify-macos-app-window.swift" \
-  "$INSTALLED_APP" \
+WINDOW_ARGS=(
+  "$SCRIPT_DIR/verify-macos-app-window.swift"
+  "$INSTALLED_APP"
   "${CODEFACTORY_RELEASE_WINDOW_TIMEOUT_SEC:-30}"
+)
+if [[ -n "${CODEFACTORY_RELEASE_EVIDENCE_DIR:-}" ]]; then
+  WINDOW_ARGS+=("$CODEFACTORY_RELEASE_EVIDENCE_DIR")
+fi
+swift "${WINDOW_ARGS[@]}"
 
 ISOLATED_DB="$INSTALL_DIR/smoke-home/Library/Application Support/com.codefactory.app/codefactory.db"
 if [[ ! -f "$ISOLATED_DB" ]]; then

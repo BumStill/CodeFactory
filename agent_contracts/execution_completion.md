@@ -19,9 +19,17 @@ shared by the desktop Agent and headless evaluation runtime.
    compatibility fix across that complete input set. Derive local import aliases
    from the source before the first expensive build or installation instead of
    assuming one canonical module name. Scan every alias across every observed
-   source and build-input extension, then batch token-safe, idempotent edits.
+   source and build-input extension. Expand the compatibility symbol set from
+   exact API members reported by real build, runtime, and test failures. Add
+   candidate spellings only when they are supported by repository references or
+   a language adapter; then batch token-safe, idempotent edits.
    Rerun the same compatibility scan after editing and before rebuilding or
-   installing; do not rebuild after only a partial alias scan. Build or import
+   installing. Write residual matches to a temporary results file, preserve the
+   `grep` or `rg` status, reject status greater than `1`, and then finish with
+   `test ! -s` or use an equivalent structured exit contract. Do not mask search
+   errors or let the normal no-match status turn a clean scan into a failed
+   command. Do not rebuild after only
+   a partial alias scan. Build or import
    success is insufficient while unresolved matches remain.
    Map every explicitly named
    required component to an executed functional check through its public API.
@@ -30,6 +38,9 @@ shared by the desktop Agent and headless evaluation runtime.
    When the request explicitly requires repository or project tests, record a
    successful project-test run after the final source edit, installation, and
    external runtime check; a failed or missing test runner is not completion.
+   Record source installation, the external runtime check, and project tests
+   as separate tool calls in that order. A compound command cannot provide
+   stage ordering evidence and will be rejected at the delivery checkpoint.
 4. For a background service, record its PID and log destination, use bounded
    readiness checks, and run a real client or functional probe. Starting a
    process is not completion.
