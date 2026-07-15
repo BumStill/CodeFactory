@@ -103,3 +103,5 @@
 - trajectory: `34` JSONL rows, `22690` bytes
 
 本地远端门禁脚本预演启动了精确 debug App，绑定实际 PID 观察到 `1200x800`、layer `0`、alpha `1` 的稳定窗口，并生成 `680 KB` 非空截图。候选随后合入最新 `v1.44.0` 主干并再次完成可追踪的 debug App 构建，进程退出码为 `0`，当前 App 可执行文件 SHA-256 为 `f216040c205acfc32fa5031456a0c4ff16f81a6d84189ba3c0acb85600426ecd`。本地预演证明脚本可执行；精确当前候选的 GitHub-hosted macOS 窗口与截图结果仍必须由 PR CI 给出。
+
+PR `#106` 的第一次 GitHub-hosted canary `29395835212` 在结构断言上返回成功，但下载并目视复核的 `window.png` 显示 WebView 为白屏。原因是窗口截图包含每边约 `56` 像素的黑色阴影区，旧内容采样仍被阴影颜色干扰。该次绿色 check 不作为 GUI 通过证据。门禁随后改为根据逻辑窗口尺寸推导 scale 与阴影，只采样真实窗口中央内容，并在最多 `20` 秒内等待 WebView 绘制。旧远端白屏按新算法为 `1` 个颜色桶、`0 / 625` 非主色采样，必定失败；本地真实 onboarding 截图为 `10` 个颜色桶、`208 / 576` 非主色采样。修复后的 hosted canary 才能决定 `remote-real-app-gui` 是否成立。

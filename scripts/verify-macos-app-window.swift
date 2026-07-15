@@ -216,54 +216,94 @@ func writeEvidence(
     guard CGPreflightScreenCaptureAccess() else {
         throw SmokeError.screenCapturePermissionDenied
     }
-    let capture = Process()
-    capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-    capture.arguments = ["-x", "-l", String(windowID), screenshotURL.path]
-    try capture.run()
-    capture.waitUntilExit()
-    guard capture.terminationStatus == 0,
-          let image = NSImage(contentsOf: screenshotURL),
-          let tiff = image.tiffRepresentation,
-          let bitmap = NSBitmapImageRep(data: tiff)
+    guard let logicalWindowWidth = window["width"] as? Double,
+          let logicalWindowHeight = window["height"] as? Double,
+          logicalWindowWidth > 0,
+          logicalWindowHeight > 0
     else {
         throw SmokeError.screenshotUnavailable(windowID)
     }
-    guard bitmap.pixelsWide >= 800, bitmap.pixelsHigh >= 600 else {
-        throw SmokeError.screenshotBlank(
-            windowID,
-            "screenshot is only \(bitmap.pixelsWide)x\(bitmap.pixelsHigh)"
-        )
-    }
 
-    // Ignore the title bar, border, and window shadow. Those can make a blank
-    // WebView look non-flat even though the actual product surface did not render.
-    let contentMinX = bitmap.pixelsWide / 20
-    let contentMaxX = bitmap.pixelsWide * 19 / 20
-    let contentMinY = bitmap.pixelsHigh / 8
-    let contentMaxY = bitmap.pixelsHigh * 19 / 20
-    let sampleStepX = max(1, (contentMaxX - contentMinX) / 24)
-    let sampleStepY = max(1, (contentMaxY - contentMinY) / 24)
-    var colorCounts: [String: Int] = [:]
+    var screenshotWidth = 0
+    var screenshotHeight = 0
     var sampledPixels = 0
-    for x in stride(from: contentMinX, to: contentMaxX, by: sampleStepX) {
-        for y in stride(from: contentMinY, to: contentMaxY, by: sampleStepY) {
-            if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) {
-                let bucket = "\(Int(color.redComponent * 31))-\(Int(color.greenComponent * 31))-\(Int(color.blueComponent * 31))-\(Int(color.alphaComponent * 31))"
-                colorCounts[bucket, default: 0] += 1
-                sampledPixels += 1
+    var colorBucketCount = 0
+    var variedPixels = 0
+    var renderedAttempt: Int?
+    var lastContentReason = "no screenshot captured"
+
+    // The native window can become stable before the WebView paints. Retry a
+    // bounded number of captures and validate only the interior of the actual
+    // window, excluding screenshot shadow, title bar, and outer border.
+    for attempt in 1...20 {
+        try? FileManager.default.removeItem(at: screenshotURL)
+        let capture = Process()
+        capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        capture.arguments = ["-x", "-l", String(windowID), screenshotURL.path]
+        try capture.run()
+        capture.waitUntilExit()
+        guard capture.terminationStatus == 0,
+              let image = NSImage(contentsOf: screenshotURL),
+              let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff)
+        else {
+            throw SmokeError.screenshotUnavailable(windowID)
+        }
+        screenshotWidth = bitmap.pixelsWide
+        screenshotHeight = bitmap.pixelsHigh
+        guard screenshotWidth >= 800, screenshotHeight >= 600 else {
+            throw SmokeError.screenshotBlank(
+                windowID,
+                "screenshot is only \(screenshotWidth)x\(screenshotHeight)"
+            )
+        }
+
+        let scale = max(
+            1,
+            Int(round(min(
+                Double(screenshotWidth) / logicalWindowWidth,
+                Double(screenshotHeight) / logicalWindowHeight
+            )))
+        )
+        let windowPixelWidth = Int(logicalWindowWidth) * scale
+        let windowPixelHeight = Int(logicalWindowHeight) * scale
+        let shadowX = max(0, (screenshotWidth - windowPixelWidth) / 2)
+        let shadowY = max(0, (screenshotHeight - windowPixelHeight) / 2)
+        let contentMinX = min(screenshotWidth - 1, shadowX + windowPixelWidth / 10)
+        let contentMaxX = max(contentMinX + 1, min(screenshotWidth, shadowX + windowPixelWidth * 9 / 10))
+        let contentMinY = min(screenshotHeight - 1, shadowY + windowPixelHeight * 15 / 100)
+        let contentMaxY = max(contentMinY + 1, min(screenshotHeight, shadowY + windowPixelHeight * 9 / 10))
+        let sampleStepX = max(1, (contentMaxX - contentMinX) / 24)
+        let sampleStepY = max(1, (contentMaxY - contentMinY) / 24)
+        var colorCounts: [String: Int] = [:]
+        sampledPixels = 0
+        for x in stride(from: contentMinX, to: contentMaxX, by: sampleStepX) {
+            for y in stride(from: contentMinY, to: contentMaxY, by: sampleStepY) {
+                if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) {
+                    let bucket = "\(Int(color.redComponent * 31))-\(Int(color.greenComponent * 31))-\(Int(color.blueComponent * 31))-\(Int(color.alphaComponent * 31))"
+                    colorCounts[bucket, default: 0] += 1
+                    sampledPixels += 1
+                }
             }
         }
+        let dominantPixels = colorCounts.values.max() ?? sampledPixels
+        colorBucketCount = colorCounts.count
+        variedPixels = sampledPixels - dominantPixels
+        if colorBucketCount >= 4,
+           sampledPixels > 0,
+           variedPixels >= max(4, sampledPixels / 50)
+        {
+            renderedAttempt = attempt
+            break
+        }
+        lastContentReason = "interior colors=\(colorBucketCount), varied=\(variedPixels)/\(sampledPixels)"
+        if attempt < 20 {
+            Thread.sleep(forTimeInterval: 1)
+        }
     }
-    let dominantPixels = colorCounts.values.max() ?? sampledPixels
-    let variedPixels = sampledPixels - dominantPixels
-    guard colorCounts.count >= 4,
-          sampledPixels > 0,
-          variedPixels >= max(4, sampledPixels / 50)
-    else {
-        throw SmokeError.screenshotBlank(
-            windowID,
-            "content samples colors=\(colorCounts.count), varied=\(variedPixels)/\(sampledPixels)"
-        )
+
+    guard let renderedAttempt else {
+        throw SmokeError.screenshotBlank(windowID, lastContentReason)
     }
 
     // Write status=ok only after capture and rendered-content checks pass.
@@ -275,11 +315,12 @@ func writeEvidence(
         "pid": Int(pid),
         "stable_seconds": 2,
         "screenshot": [
-            "width": bitmap.pixelsWide,
-            "height": bitmap.pixelsHigh,
+            "width": screenshotWidth,
+            "height": screenshotHeight,
             "content_sample_count": sampledPixels,
-            "content_color_buckets": colorCounts.count,
+            "content_color_buckets": colorBucketCount,
             "content_varied_samples": variedPixels,
+            "render_attempt": renderedAttempt,
         ],
         "window": window,
     ]
