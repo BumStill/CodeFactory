@@ -34,9 +34,16 @@ codefactory-agent-core
 ## 锁屏策略
 
 - Runtime driver 启动时记录 macOS 锁屏状态，但不要求屏幕解锁。
-- OS credential 查询设置有限超时；失败时返回明确 blocker，不等待不可见授权弹窗。
+- OS credential 查询设置有限超时；锁屏验收只使用环境显式密钥或已授权 credential。首次授权失败时返回明确 blocker，不等待不可见授权弹窗。
 - GUI 验收包装器使用 `caffeinate` 持有 display、idle 和 system sleep assertion，直到 dev App 退出。
-- 用户主动锁屏时不尝试解锁；Runtime 验收继续，GUI 证据标记为待解锁。
+- 用户主动锁屏时不尝试解锁；Runtime 验收继续。PR 和发布固定运行 GitHub macOS GUI check，二者不通过 Runtime 锁屏事件动态 dispatch，流程也不出现待解锁阻塞。
+
+## 远端可见会话
+
+- PR workflow 在 GitHub macOS runner 构建本次精确 debug App bundle，以隔离 HOME 启动，并绑定启动 PID 观察稳定主窗口。
+- 验收脚本保存窗口字段和窗口截图，验证截图尺寸、非空像素以及与本次启动 PID 的绑定；workflow 上传证据 artifact。
+- 发布 workflow 对本次 DMG 挂载、复制、卸载后启动精确临时副本并执行同一观察；已发布 tag 可再次手动复验。
+- provider/runtime、desktop payload、远端 GUI、发布产物四层证据组合构成交付门禁；任一适用层失败都不得宣称上线。
 
 ## 证据分级
 
@@ -44,7 +51,8 @@ codefactory-agent-core
 | --- | --- | --- |
 | `agent-runtime-no-gui` | provider/model 路由、共享 Agent 决策、真实 shell 工具、完成门禁 | Tauri 事件、SQLite UI 刷新、视觉布局 |
 | `desktop-integration` | Desktop 历史修复、持久化和 provider payload | 用户看到的最终界面 |
-| `real-app-gui` | 输入、点击、流式输出、状态刷新、布局 | 锁屏期间不可获得 |
+| `remote-real-app-gui` | 本次精确 App bundle 的启动、稳定窗口、可渲染截图和隔离数据目录 | 不单独证明真实 provider 结果 |
+| `released-artifact-gui` | 已发布 DMG 的安装副本、版本、架构、稳定窗口和截图 | 不单独证明 Agent 任务质量 |
 
 ## 安全与隐私
 

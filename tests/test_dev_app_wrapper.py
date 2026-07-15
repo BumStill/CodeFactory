@@ -15,7 +15,11 @@ class DevAppWrapperTests(unittest.TestCase):
         wrapper = (REPO_ROOT / "scripts" / "install-dev-app-wrapper.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn('--config "src-tauri/tauri.dev.conf.json"', wrapper)
+        self.assertIn(
+            'TAURI_CONFIG="${CODEFACTORY_DEV_TAURI_CONFIG:-src-tauri/tauri.dev.conf.json}"',
+            wrapper,
+        )
+        self.assertIn('--config "$TAURI_CONFIG"', wrapper)
 
 
 if __name__ == "__main__":

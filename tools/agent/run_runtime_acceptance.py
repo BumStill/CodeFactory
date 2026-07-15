@@ -217,7 +217,12 @@ def locate_sidecar(explicit: Path | None = None) -> Path:
     )
 
 
-def _truncate(value: str, limit: int = MAX_CAPTURE_CHARS) -> str:
+def _as_text(value: str | bytes) -> str:
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+
+
+def _truncate(value: str | bytes, limit: int = MAX_CAPTURE_CHARS) -> str:
+    value = _as_text(value)
     if len(value) <= limit:
         return value
     half = max(1, (limit - 80) // 2)
@@ -225,8 +230,8 @@ def _truncate(value: str, limit: int = MAX_CAPTURE_CHARS) -> str:
     return f"{value[:half]}\n...[{omitted} chars omitted]...\n{value[-half:]}"
 
 
-def _redact_text(value: str, secrets: tuple[str, ...]) -> str:
-    redacted = value
+def _redact_text(value: str | bytes, secrets: tuple[str, ...]) -> str:
+    redacted = _as_text(value)
     for secret in secrets:
         if secret:
             redacted = redacted.replace(secret, REDACTED)
@@ -552,11 +557,9 @@ def run_runtime_acceptance(
         "tool_calls": sum(item.get("type") == "tool_request" for item in trajectory),
         "started_at": started_at,
         "duration_ms": int((time.monotonic() - started_monotonic) * 1000),
-        "gui_status": (
-            "gui_pending_unlock"
-            if screen_locked or screen_locked_at_end
-            else "not_evaluated"
-        ),
+        # GUI proof is produced by the separate remote macOS harness. A local
+        # lock is recorded above but never becomes a delivery wait state.
+        "gui_status": "not_evaluated",
         "workspace_write_isolation": "macos-sandbox-exec",
         "host": {"os": platform.system(), "arch": platform.machine()},
     }

@@ -867,6 +867,22 @@ pub fn evaluate_budget_command_with_time(
         && wall_time.is_some_and(|(remaining, total)| {
             total > 0 && remaining <= total.saturating_mul(2) / 3
         });
+    if evidence.source_delivery_required {
+        let delivery_stage_count = [
+            is_source_install_command(command),
+            is_external_source_runtime_command(command),
+            is_project_test_command(command),
+        ]
+        .into_iter()
+        .filter(|stage_present| *stage_present)
+        .count();
+        if delivery_stage_count > 1 {
+            return deny(
+                "execution_budget",
+                "use one tool call per delivery stage so structured evidence can prove ordering: install from source, then run outside the source directory, then run project tests",
+            );
+        }
+    }
 
     let required_extensions = evidence
         .required_source_scan_extensions
@@ -1561,25 +1577,151 @@ fn detect_missing_test_runner(outcome: &ToolOutcome) -> Option<&'static str> {
 }
 
 fn is_source_install_command(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    contains_any(
-        &lower,
-        &[
-            "pip install -e .",
-            "pip3 install -e .",
-            "python -m pip install -e .",
-            "python3 -m pip install -e .",
-            "pip install .",
-            "pip3 install .",
-            "python -m pip install .",
-            "python3 -m pip install .",
-            "uv pip install -e .",
-            "uv pip install .",
-            "setup.py install",
-            "cargo install --path ",
-            "npm install -g .",
-        ],
-    )
+    fn is_current_directory(target: &str) -> bool {
+        matches!(target, "." | "./")
+    }
+
+    fn pip_installs_current_source(args: &[String]) -> bool {
+        const OPTIONS_WITH_VALUES: &[&str] = &[
+            "-c",
+            "--constraint",
+            "-f",
+            "--find-links",
+            "-i",
+            "--index-url",
+            "--extra-index-url",
+            "--trusted-host",
+            "-r",
+            "--requirement",
+            "--src",
+            "-t",
+            "--target",
+            "--root",
+            "--prefix",
+            "--python",
+            "--config-settings",
+        ];
+
+        let mut index = 0;
+        while index < args.len() {
+            let argument = args[index].as_str();
+            if matches!(argument, "-e" | "--editable") {
+                return args
+                    .get(index + 1)
+                    .is_some_and(|target| is_current_directory(target));
+            }
+            if let Some(target) = argument
+                .strip_prefix("--editable=")
+                .or_else(|| argument.strip_prefix("-e="))
+            {
+                return is_current_directory(target);
+            }
+            if OPTIONS_WITH_VALUES.contains(&argument) {
+                index += 2;
+                continue;
+            }
+            if argument.starts_with('-') {
+                index += 1;
+                continue;
+            }
+            if is_current_directory(argument) {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    fn is_environment_assignment(token: &str) -> bool {
+        token.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+    }
+
+    for segment in command
+        .split([';', '\n'])
+        .flat_map(|part| part.split("&&"))
+        .flat_map(|part| part.split("||"))
+    {
+        let tokens = segment
+            .split_whitespace()
+            .map(|token| {
+                token
+                    .trim_matches(|character: char| {
+                        matches!(character, '\'' | '"' | '(' | ')')
+                    })
+                    .to_ascii_lowercase()
+            })
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        let start = tokens
+            .iter()
+            .position(|token| !is_environment_assignment(token))
+            .unwrap_or(tokens.len());
+        let Some(executable) = tokens
+            .get(start)
+            .and_then(|token| token.rsplit('/').next())
+        else {
+            continue;
+        };
+
+        let install_index = if matches!(executable, "pip" | "pip3")
+            && tokens.get(start + 1).is_some_and(|token| token == "install")
+        {
+            Some(start + 1)
+        } else if executable.starts_with("python")
+            && tokens.get(start + 1).is_some_and(|token| token == "-m")
+            && tokens
+                .get(start + 2)
+                .is_some_and(|token| matches!(token.as_str(), "pip" | "pip3"))
+            && tokens.get(start + 3).is_some_and(|token| token == "install")
+        {
+            Some(start + 3)
+        } else if executable == "uv"
+            && tokens.get(start + 1).is_some_and(|token| token == "pip")
+            && tokens.get(start + 2).is_some_and(|token| token == "install")
+        {
+            Some(start + 2)
+        } else {
+            None
+        };
+        if let Some(install_index) = install_index {
+            if pip_installs_current_source(&tokens[install_index + 1..]) {
+                return true;
+            }
+            continue;
+        }
+
+        let command_args = &tokens[start + 1..];
+        if (executable == "setup.py"
+            || executable.starts_with("python")
+                && command_args.first().is_some_and(|token| token == "setup.py"))
+            && command_args.iter().any(|token| token == "install")
+        {
+            return true;
+        }
+        if executable == "cargo"
+            && command_args.first().is_some_and(|token| token == "install")
+            && command_args.windows(2).any(|pair| {
+                pair[0] == "--path" && is_current_directory(pair[1].as_str())
+            })
+        {
+            return true;
+        }
+        if executable == "npm"
+            && command_args.first().is_some_and(|token| token == "install")
+            && command_args.windows(2).any(|pair| {
+                matches!(pair[0].as_str(), "-g" | "--global")
+                    && is_current_directory(pair[1].as_str())
+            })
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_source_build_or_install_command(command: &str) -> bool {
@@ -2623,6 +2765,52 @@ mod tests {
             &ToolKind::Verification,
         )
         .is_allowed());
+    }
+
+    #[test]
+    fn source_checkpoint_rejects_compound_delivery_stages() {
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 20,
+            source_delivery_required: true,
+            ..CompletionEvidence::default()
+        };
+        let command = "python3 -m pip install . && cd /tmp && python3 -c 'import package' && cd /workspace && python3 -m pytest";
+
+        let decision = evaluate_budget_command_with_time(
+            100,
+            Some((890, 900)),
+            &evidence,
+            command,
+            &ToolKind::Mutation,
+        );
+
+        assert!(!decision.is_allowed());
+        assert!(matches!(
+            decision,
+            PolicyDecision::Deny { reason, .. }
+                if reason.contains("one tool call per delivery stage")
+        ));
+    }
+
+    #[test]
+    fn source_install_detection_accepts_python_module_pip_with_options() {
+        assert!(is_source_install_command(
+            "cd /workspace && .venv/bin/python -m pip install --no-index --no-build-isolation --no-deps -e ."
+        ));
+        assert!(is_source_install_command(
+            ".venv/bin/pip3 install --no-deps --editable ./"
+        ));
+        assert!(!is_source_install_command(
+            ".venv/bin/python -m pip install --no-index pytest"
+        ));
+        assert!(!is_source_install_command(
+            "pip install --find-links . pytest"
+        ));
+        assert!(!is_source_install_command("pip install -e ../other-project"));
+        assert!(!is_source_install_command(
+            "rg --fixed-strings 'pip install .' docs"
+        ));
     }
 
     #[test]

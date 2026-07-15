@@ -36,6 +36,10 @@ class RuntimeAcceptanceTests(unittest.TestCase):
                 ("must-not-leak",),
             ),
         )
+        self.assertEqual(
+            _redact_text(b"timeout output api_key=must-not-leak", ("must-not-leak",)),
+            "timeout output api_key=[REDACTED]",
+        )
 
     def test_dev_app_wrapper_holds_a_caffeinate_assertion(self) -> None:
         wrapper = (
@@ -138,6 +142,7 @@ class RuntimeAcceptanceTests(unittest.TestCase):
             self.assertEqual(result["status"], "passed")
             self.assertEqual(result["proof_tier"], "agent-runtime-no-gui")
             self.assertTrue(result["screen_locked"])
+            self.assertEqual(result["gui_status"], "not_evaluated")
             self.assertEqual(result["provider"], "deepseek")
             self.assertEqual(result["model"], "deepseek-v4-pro")
             self.assertEqual(result["tool_calls"], 1)

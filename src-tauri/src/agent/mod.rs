@@ -24,7 +24,7 @@ use codefactory_agent_core::{
 use futures_util::StreamExt;
 use reqwest::Client;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -579,7 +579,10 @@ impl AgentLoop {
                 system_prompt,
                 context_limit,
             );
-            messages = compression.messages;
+            // Storage repair is not enough: context compression can change the
+            // final provider payload. Enforce the OpenAI tool-call protocol at
+            // the last possible boundary before every model request.
+            messages = repair_openai_tool_protocol(compression.messages);
             if compression.compressed {
                 self.app
                     .emit(
@@ -2579,6 +2582,73 @@ fn repair_incomplete_tool_history(history: Vec<Message>) -> Vec<Message> {
     repaired
 }
 
+fn repair_openai_tool_protocol(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    fn synthetic_tool_message(tool_call_id: String) -> ChatMessage {
+        ChatMessage {
+            role: "tool".into(),
+            content: MessageContent::Text(
+                "Tool result unavailable in persisted history; continue from current workspace state."
+                    .into(),
+            ),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id),
+            name: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn append_missing_results(repaired: &mut Vec<ChatMessage>, pending: &mut Vec<String>) {
+        repaired.extend(pending.drain(..).map(synthetic_tool_message));
+    }
+
+    let mut repaired = Vec::with_capacity(messages.len());
+    let mut pending_tool_calls: Vec<String> = Vec::new();
+
+    for mut message in messages {
+        if message.role != "tool" && !pending_tool_calls.is_empty() {
+            append_missing_results(&mut repaired, &mut pending_tool_calls);
+        }
+
+        if message.role == "tool" {
+            let Some(tool_call_id) = message.tool_call_id.as_deref() else {
+                continue;
+            };
+            let Some(index) = pending_tool_calls
+                .iter()
+                .position(|pending| pending == tool_call_id)
+            else {
+                continue;
+            };
+            pending_tool_calls.remove(index);
+            repaired.push(message);
+            continue;
+        }
+
+        if message.role == "assistant" {
+            if let Some(tool_calls) = message.tool_calls.as_mut() {
+                let mut seen_ids = HashSet::new();
+                tool_calls.retain(|tool_call| {
+                    !tool_call.id.trim().is_empty() && seen_ids.insert(tool_call.id.clone())
+                });
+                if tool_calls.is_empty() {
+                    message.tool_calls = None;
+                }
+            }
+            pending_tool_calls = message
+                .tool_calls
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|tool_call| tool_call.id.clone())
+                .collect();
+        }
+        repaired.push(message);
+    }
+
+    append_missing_results(&mut repaired, &mut pending_tool_calls);
+    repaired
+}
+
 /// Read at most `max_chars` UTF-8 chars from a file, appending "…" if truncated.
 fn read_file_capped(path: &Path, max_chars: usize) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
@@ -2839,6 +2909,32 @@ mod tests {
             tool_calls,
             reasoning_content: None,
             created_at: 1,
+        }
+    }
+
+    fn provider_message(
+        role: &str,
+        tool_calls: Option<Vec<ToolCall>>,
+        tool_call_id: Option<&str>,
+    ) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: MessageContent::Text(String::new()),
+            tool_calls,
+            tool_call_id: tool_call_id.map(str::to_owned),
+            name: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn provider_tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: "{}".into(),
+            },
         }
     }
 
@@ -3206,6 +3302,83 @@ mod tests {
         assert_eq!(tool_call_id, "call-denied");
         assert!(content.contains("unavailable in persisted history"));
         assert_eq!(repaired[2].role, "user");
+    }
+
+    #[test]
+    fn provider_payload_repairs_missing_tool_result_before_user_message() {
+        let repaired = repair_openai_tool_protocol(vec![
+            provider_message(
+                "assistant",
+                Some(vec![provider_tool_call("call-missing")]),
+                None,
+            ),
+            provider_message("user", None, None),
+        ]);
+
+        assert_eq!(repaired.len(), 3);
+        assert_eq!(repaired[1].role, "tool");
+        assert_eq!(repaired[1].tool_call_id.as_deref(), Some("call-missing"));
+        assert_eq!(repaired[2].role, "user");
+    }
+
+    #[test]
+    fn provider_payload_repairs_only_missing_result_for_multi_tool_assistant() {
+        let repaired = repair_openai_tool_protocol(vec![
+            provider_message(
+                "assistant",
+                Some(vec![provider_tool_call("call-a"), provider_tool_call("call-b")]),
+                None,
+            ),
+            provider_message("tool", None, Some("call-a")),
+            provider_message("user", None, None),
+        ]);
+
+        let tool_ids: Vec<_> = repaired
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(tool_ids, vec!["call-a", "call-b"]);
+        assert_eq!(repaired.last().map(|message| message.role.as_str()), Some("user"));
+    }
+
+    #[test]
+    fn provider_payload_drops_orphan_tool_result() {
+        let repaired = repair_openai_tool_protocol(vec![
+            provider_message("system", None, None),
+            provider_message("tool", None, Some("call-orphan")),
+            provider_message("user", None, None),
+        ]);
+
+        assert_eq!(repaired.len(), 2);
+        assert!(repaired.iter().all(|message| message.role != "tool"));
+    }
+
+    #[test]
+    fn provider_payload_drops_empty_and_duplicate_tool_call_ids() {
+        let repaired = repair_openai_tool_protocol(vec![
+            provider_message(
+                "assistant",
+                Some(vec![
+                    provider_tool_call(""),
+                    provider_tool_call("call-a"),
+                    provider_tool_call("call-a"),
+                ]),
+                None,
+            ),
+            provider_message("user", None, None),
+        ]);
+
+        let assistant_calls = repaired[0].tool_calls.as_deref().unwrap();
+        assert_eq!(assistant_calls.len(), 1);
+        assert_eq!(assistant_calls[0].id, "call-a");
+        assert_eq!(
+            repaired
+                .iter()
+                .filter(|message| message.role == "tool")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

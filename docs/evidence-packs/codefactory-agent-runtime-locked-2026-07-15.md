@@ -10,7 +10,7 @@
 - fixture: `/private/tmp/codefactory-product-eval-member-scan-v1`
 - fixture type: 普通 Python 源码包，不是 benchmark task
 
-这次运行证明锁屏不会再阻断 CodeFactory 的真实 provider 请求、共享 Agent core、真实工作目录命令和完成门禁。它不证明 Tauri 视觉布局、点击、滚动或状态刷新；这些仍属于 `real-app-gui` 证据。
+这次运行证明锁屏不会再阻断 CodeFactory 的真实 provider 请求、共享 Agent core、真实工作目录命令和完成门禁。Tauri 可见性由独立的远端 macOS App 窗口/截图门禁证明，不再等待本机解锁。
 
 ## 闭环
 
@@ -48,7 +48,8 @@
 
 - OS credential 第一次授权仍可能要求用户在解锁状态确认；已授权的 credential 和运行中的 Runtime 不依赖屏幕。
 - 用户主动锁屏不会被绕过。
-- Desktop 同会话历史修复仍需解锁后的真实 App 补一次 `real-app-gui` 验证后才能发布。
+- 本地锁屏时不执行辅助功能点击；PR 的精确候选 App 和发布 DMG 改由 GitHub macOS 可见会话生成 PID 绑定的窗口元数据和非空截图。
+- 新远端门禁只有在 PR workflow 和 release workflow 实际通过后，才能作为 `remote-real-app-gui` / `released-artifact-gui` 证据；本地脚本通过不等于远端已通过。
 
 ## 当前候选锁屏复跑
 
@@ -73,3 +74,32 @@
 - trajectory: `20` JSONL rows，`12034` bytes
 
 本次 trajectory 中 `cd /home/user` 的失败原因是路径不存在，不能作为 sandbox 拒绝证据；sandbox 写边界只引用上面的独立真实命令测试。该结果仍是 `agent-runtime-no-gui`，不是 release artifact 或 `real-app-gui` 证据。
+
+## 最新锁屏收敛复跑
+
+同一天的真实 App 旧会话重试先暴露最终 provider payload 仍可能在上下文压缩后形成缺失工具结果。候选现在在每次模型请求前执行最终协议修复：补齐缺失结果、保留匹配结果、丢弃孤立结果；三类 provider payload 回归测试通过。
+
+随后锁屏 Runtime 复跑又依次暴露三个通用产品缺陷，并均以失败回归修复：
+
+- Python 3.14 的 `TimeoutExpired.stdout/stderr` 可能是 bytes，脱敏函数此前会抛 `TypeError`；现在先统一安全解码，超时作为工具失败回传。
+- 安装、外部运行和项目测试塞进同一命令时，结构化门禁无法证明阶段顺序；源码交付任务现在始终要求三个独立工具调用。
+- `.venv/bin/python -m pip install --no-index --no-build-isolation --no-deps -e .` 此类正常参数顺序此前不被识别为源码安装；现在按 pip 调用结构和本地目标识别，而不是依赖固定字面量。
+
+干净失败基线为 `4 failed`。修复后的真实 DeepSeek canary 在开始和结束时均为 `CGSSessionScreenIsLocked=Yes`，并得到：
+
+- status: `passed`
+- completion blockers: `[]`
+- source mutation / scan / install / external runtime / project tests sequence: `8 / 10 / 17 / 18 / 19`
+- tool calls: `17`
+- model requests: `20`
+- duration: `114922 ms`
+- independent residual scan: zero matches
+- independent source install: passed
+- independent outside-source result: `9`
+- independent project tests: `4 passed`
+- execution contract SHA-256: `43f85a2669c4abca93cb7a4e381b9be99250faed0b81b9d9d477f929f61a9686`
+- result SHA-256: `8ac43b40b7c5d134bc3b34e63cc3a85bfee51898077f1528b423d1d3a5a400da`
+- trajectory SHA-256: `8f8bad5161f0236be6cb483f44bf4cbd219d0fc46fd0ae6707cf79acbda11d49`
+- trajectory: `34` JSONL rows, `22690` bytes
+
+本地远端门禁脚本预演启动了精确 debug App，绑定实际 PID 观察到 `1200x800`、layer `0`、alpha `1` 的稳定窗口，并生成 `680 KB` 非空截图。候选随后合入最新 `v1.44.0` 主干并再次完成可追踪的 debug App 构建，进程退出码为 `0`，当前 App 可执行文件 SHA-256 为 `f216040c205acfc32fa5031456a0c4ff16f81a6d84189ba3c0acb85600426ecd`。本地预演证明脚本可执行；精确当前候选的 GitHub-hosted macOS 窗口与截图结果仍必须由 PR CI 给出。

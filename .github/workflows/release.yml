@@ -241,13 +241,25 @@ jobs:
 
       - name: Verify installed macOS release artifact
         shell: bash
+        env:
+          CODEFACTORY_RELEASE_EVIDENCE_DIR: ${{ runner.temp }}/codefactory-release-evidence
+          CODEFACTORY_GUI_PROOF_TIER: released-artifact-gui
         run: |
+          mkdir -p "$CODEFACTORY_RELEASE_EVIDENCE_DIR"
           DMG_PATH="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -type f -name '*.dmg' -print -quit)"
           if [ -z "$DMG_PATH" ]; then
             echo "::error::macOS DMG was not produced"
             exit 1
           fi
           scripts/verify-macos-release-artifact.sh "$DMG_PATH" "${GITHUB_REF_NAME#v}"
+
+      - name: Upload installed release GUI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release-gui-evidence
+          path: ${{ runner.temp }}/codefactory-release-evidence
+          if-no-files-found: error
 
   # ── Step 4: assemble the cross-platform updater manifest, then publish ────
   # Each build job uploaded its own latest.json, but neither carries the other

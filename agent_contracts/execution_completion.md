@@ -38,6 +38,9 @@ shared by the desktop Agent and headless evaluation runtime.
    When the request explicitly requires repository or project tests, record a
    successful project-test run after the final source edit, installation, and
    external runtime check; a failed or missing test runner is not completion.
+   Record source installation, the external runtime check, and project tests
+   as separate tool calls in that order. A compound command cannot provide
+   stage ordering evidence and will be rejected at the delivery checkpoint.
 4. For a background service, record its PID and log destination, use bounded
    readiness checks, and run a real client or functional probe. Starting a
    process is not completion.
