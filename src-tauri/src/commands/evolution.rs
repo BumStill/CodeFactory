@@ -1356,6 +1356,28 @@ pub async fn list_evolution_eval_case_results(
         .collect())
 }
 
+async fn remove_smoke_root(root: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: usize = 40;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+    for attempt in 0..ATTEMPTS {
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if attempt + 1 < ATTEMPTS
+                    && (error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(32)) =>
+            {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("cleanup retry loop returns on its final attempt")
+}
+
 /// Run the activation-safety closed loop without starting Tauri. Release CI
 /// invokes this entrypoint on the exact packaged executable so a green unit
 /// suite cannot hide a broken release binary or schema.
@@ -1514,7 +1536,7 @@ pub async fn run_release_smoke(output_path: &Path) -> Result<serde_json::Value, 
     }
     .await;
 
-    let cleanup = std::fs::remove_dir_all(&root);
+    let cleanup = remove_smoke_root(&root).await;
     let mut receipt = match result {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -1875,5 +1897,19 @@ mod tests {
         let written = std::fs::read_to_string(&output).unwrap();
         assert!(!written.contains("CF_EVO_RELEASE_SMOKE_SECRET"));
         std::fs::remove_file(output).unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_smoke_cleanup_is_exact_and_idempotent() {
+        let root = std::env::temp_dir().join(format!(
+            "codefactory-evolution-cleanup-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/state.db"), b"smoke").unwrap();
+
+        remove_smoke_root(&root).await.unwrap();
+        assert!(!root.exists());
+        remove_smoke_root(&root).await.unwrap();
     }
 }

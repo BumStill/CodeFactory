@@ -162,8 +162,14 @@ jobs:
           $exe = Get-ChildItem "src-tauri/target/release" -Filter "codefactory.exe" -File | Select-Object -First 1
           if (-not $exe) { throw "Windows release executable was not produced" }
           $receipt = Join-Path $env:RUNNER_TEMP "evolution-release-smoke.json"
-          & $exe.FullName --evolution-smoke $receipt
-          if ($LASTEXITCODE -ne 0) { throw "Evolution release smoke exited $LASTEXITCODE" }
+          # Tauri's Windows binary uses the GUI subsystem. Invoking it with `&`
+          # returns before PowerShell receives an exit code, leaving
+          # `$LASTEXITCODE` empty even when the executable writes a passing
+          # receipt. Start-Process gives us a real process handle and waits for
+          # the exact release binary to finish.
+          $process = Start-Process -FilePath $exe.FullName `
+            -ArgumentList @("--evolution-smoke", $receipt) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Evolution release smoke exited $($process.ExitCode)" }
           $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
           if ($smoke.status -ne "pass") { throw "Evolution smoke status was not pass" }
           if ($smoke.build_git_sha -ne "${{ github.sha }}") { throw "Evolution smoke was not built from the release commit" }
