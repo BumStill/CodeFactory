@@ -367,6 +367,10 @@ mod tests {
         g(&["init", "-q", "-b", "main"]);
         g(&["config", "user.name", "t"]);
         g(&["config", "user.email", "t@t"]);
+        // Windows runners default core.autocrlf=true, which rewrites LF to
+        // CRLF on checkout/apply and breaks byte-for-byte assertions. The
+        // tests assert merge-back semantics, not newline policy.
+        g(&["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("a.txt"), "line1\n").unwrap();
         g(&["add", "-A"]);
         g(&["commit", "-q", "-m", "init"]);
