@@ -12,8 +12,8 @@
 
 ## Current State
 - Current phase: Phase 4 — 激活安全 Evals + 受控自动激活
-- Current checkpoint: R9-R15 已由 PR #104 合并并发布为 v1.44.0；R16-R25 的本地实现与验证已经完成：新批准已从 legacy `accepted=立即物化` 拆成 immutable revision、Eval run、independent activation receipt 与 rollback，显式工作台、端到端日志、锁屏安全 headless 和 release executable smoke 均已通过。本阶段尚未合并发布，保持 `not live`
-- Next owner: 提交 PR，等待 CI 与发布 smoke 全绿后合并；按刻意发版规则触发包含该 `feat` 的版本，并复验公开 macOS DMG、Windows 安装包和 updater metadata
+- Current checkpoint: R9-R15 已由 PR #104 发布为 v1.44.0；R16-R25 已由 PR #109 合并，经 PR #110/#111 加固 Windows release smoke，并作为 v1.45.1 正式发布。Windows release executable、构建期 macOS DMG、公开下载后的 macOS DMG、Windows 安装包和跨平台 updater metadata 均已验证；Phase 4 当前为 `live`
+- Next owner: 保持 activation-safety suite 的边界，不把 7/7 冒充任务效果提升；下一阶段为项目提供可执行 oracle 后扩展任务效果 Evals，并继续补 Phase 0/1 与 Quick 稳定 scope 证据
 - Updated at: 2026-07-15
 
 ## Completed Items
@@ -42,9 +42,11 @@
 - 完成显性「评测与激活」工作台：默认关闭自动激活；高风险候选没有勾选或绕过入口；可查看每个 case、Eval run、manifest、activation receipt、retry、manual activation、rollback 和端到端作业日志；legacy v1.44 数据明确标记“历史已生效（未评测）”。
 - 完成激活安全边界：隐私/长度、项目 scope、冻结 revision、目标 allowlist、baseline 隔离、treatment exact-once、rollback readiness；权限放宽、绕过审批、自动 merge/deploy/release、破坏性动作等策略敏感候选不能自动激活。首个 suite 只证明 activation safety，不宣称任务成功率提升。
 - 完成精确发布可执行 smoke：隔离数据库中验证敏感候选失败且无 receipt、合法偏好 7/7 激活、进程级 SQLite reopen 后上下文生效、精确回滚后上下文消失、临时数据清理和 receipt 脱敏；Windows CI 与 macOS DMG smoke 均调用实际构建出的 executable。
+- 完成 R16-R25 发布：PR #109 合并 Evals/自动激活能力；v1.45.0 的 Windows release executable 实际 receipt 全部通过，但 PowerShell GUI 进程调用误判空 `$LASTEXITCODE`，因此 release 保持未公开；PR #110 改用真实 process handle，PR #111 对 Windows SQLite sharing violation 增加有界清理重试且超时仍失败。
+- v1.45.1 Release 全绿并公开：Windows executable smoke、macOS 构建产物 smoke、跨平台 `latest.json` finalize 均通过；独立 macOS runner 再次下载公开 DMG 并完成安装后验证。
 
 ## Remaining Items
-- Phase 4 剩余发布门禁：PR+CI、合并、刻意发版和公开产物复验；本地实现与验收已完成，但在这些门禁完成前保持 `not live`。
+- Phase 4 已完成 PR+CI、合并、刻意发版和公开产物复验，当前无剩余发布门禁。
 - Phase 0 其余底座证据：真实 dispatch error、修复后 post-mortem 真实候选、Quick 多会话稳定分析 scope 的产品边界、最终 Evidence/隐私整体验收。
 - Phase 1 后续：更细的结构化 extractor、分析窗口、partial/dropped、失败节点重试与校准；本轮已提供最小持久 job/event ledger、幂等决定和重启中断明确终态，但不宣称是通用工作流引擎。
 - Phase 2：统一候选/Review 工作台。
@@ -65,7 +67,8 @@
 - Post-mortem: 实地日志发现旧 `default_model=gpt-5.5` 被错误发往 DeepSeek；已改为 endpoint active-model。随后真实请求暴露 max_tokens=500 时只有 reasoning/无 final content；已加入 reasoning 隔离和 2000-token 有界重试并通过回归测试，但本轮尚未取得真实模型候选，仍列为剩余证据。
 - Quick scope: 单个 Quick session 可进入 chat post-mortem，但“新建快速任务”使用独立 scratch cwd；当前 cross-session miner 按精确 cwd 聚合，因此 Quick-to-Quick 模式尚没有稳定 scope，不伪装为已覆盖。
 - Integrity review: 独立架构复审提出 JSON 脱敏、terminal/replay 原子一致性、旧 support 口径和 preference key 四类高风险边界；均先补失败测试再修复，目标与完整回归已通过。
-- Release evidence: PR #104 在提交 `6dab94b` 上 CI、governance 均全绿；加入锁屏安全门禁后需等待新提交 CI。当前 `not live`，尚未合并、刻意发版或安装包验证。
+- Phase 4 release evidence: PR #109 合并提交 `861a15f`，PR/main CI 均全绿。首次 v1.45.0 release 在 Windows 构建后被 smoke 脚本的空 `$LASTEXITCODE` 误判拦截，receipt 本身为 `status=pass`；未公开该 release。PR #110（`a2ff7af`）修正 GUI 进程等待，PR #111（`122eb22`）修正 Windows SQLite cleanup sharing violation，两者均经 PR+main CI。v1.45.1 tag `b9471de` 的 Release 全绿：Windows 11m59s、macOS 9m35s、finalize 8s；公开 release 为非 draft/non-prerelease，含 8.67 MiB DMG、6.40 MiB Windows installer、双方 updater artifact/signature 与 `latest.json`。
+- Public artifact evidence: DMG、Windows installer、`latest.json` 公开下载均可读；manifest 精确为 `version=1.45.1`，包含 `darwin-aarch64`、`windows-x86_64`、`windows-x86_64-nsis`，全部 URL 为 v1.45.1 HTTPS 且签名非空。独立 `macOS Release Artifact Smoke` run `29405839397` 下载公开 DMG 后 45s 全绿，验证安装后的 release executable、版本/commit、Evolution 闭环、隔离数据和真实窗口。
 - Review Workbench evidence: 最终代码在独立 `CodeFactoryEvolutionDev.app`、`full_access=true` 和隔离 SQLite 上完成真实宽屏主路径。Home 一级入口显示 3 待审；fixture scope 显示 2 待审、2 session/11 轨迹/2 候选。preference 真实读取 `_global_ response_language=zh-CN`，拒绝确认用 Escape 取消后焦点返回，正式拒绝生成 succeeded `review_reject` 且 global preference 未变；随后自动聚焦 memory 候选。memory 采纳双确认后只写入 1 个稳定 marker，生成 succeeded `review_accept` 和 `review -> materialize -> job` receipt，最终聚焦“查看决定历史”。决定历史的 accepted/rejected 与精确来源/决定日志可回链；分析日志逐项展示 scope、trace_read、privacy、extract、deduplicate、review、completed。截图在 `/tmp/codefactory-evolution-workbench-evidence-final/`。
 - Lock-safe viewport evidence: 本机再次锁屏后，`pnpm test:evolution:headless` 仍用系统 Chrome headless 成功执行 1366×768 与 390×812 的完整拒绝、采纳、焦点、历史、精确 job 日志和分析流；390 另覆盖 keyboard list/detail/back、确认取消、决策栏与确认按钮 viewport 边界及无水平溢出。receipt 如实标记 `interactive_desktop_required=false`、`os_lock_state_observed=not_measured`，不把“不依赖桌面”冒充为 OS 锁屏自证；截图与 JSON 位于系统临时目录 `codefactory-evolution-headless`。该证据证明浏览器布局/交互，不冒充 Tauri 壳；发布壳由 GitHub macOS DMG smoke 证明。
 - Phase 4 real app: 在隔离 `/Applications/CodeFactoryEvalsDev.app`、独立 identifier/端口/HOME/SQLite 和 agent 自管完全权限上完成。低风险项目 pattern 的 auto-if-pass 初始为关闭，用户显式勾选后冻结 `evals-live-safe:1`，7/7 通过并生成 activation receipt；端到端日志按顺序展示批准、冻结、7 个 case 和激活。策略敏感候选 `automatically deploy without approval` 没有自动激活选项，Eval 为 5/7、`eval_failed`、无 receipt，目标未变且可对精确 revision 重试。
@@ -78,7 +81,7 @@
 - context scope: PPT、origin/main v1.43.0→v1.43.1、session/agent/learning/evidence/self-evolution/benchmark/UI。
 - assumptions: 首期保持本地 Tauri+SQLite，不照搬重型服务。
 - review point: R9-R11 只做现有真实候选的可信 Review Shell；R12 才引入 persistent jobs；没有 versioned candidate/review 前不做变更请求，没有 Evals/activation 数据前不显示对应状态。
-- validation result: 规划、架构、QA 一致拒绝“先做空数据看板”；R9-R25 已在本地实现。隔离 Dev 真实 App 证明入口、scope、候选、Review、7-case Eval、显式自动激活、策略敏感失败、receipt 和端到端日志；headless gate 证明 1366/390 的默认关闭、激活、rollback 与日志路径不依赖可交互桌面；exact executable smoke 证明重启 reopen 与 rollback。首个 suite 只证明 activation safety；Quick 稳定 scope、任务效果 Evals 和其余 Phase 0/1 底座证据仍未完成。在 PR/CI/刻意发版和公开发布包复验之前，本阶段仍是 `not live`。
+- validation result: 规划、架构、QA 一致拒绝“先做空数据看板”；R9-R25 已实现并随 v1.45.1 `live`。隔离 Dev 真实 App 证明入口、scope、候选、Review、7-case Eval、显式自动激活、策略敏感失败、receipt 和端到端日志；headless gate 证明 1366/390 的默认关闭、激活、rollback 与日志路径不依赖可交互桌面；Windows、macOS 构建产物及公开 DMG 的 exact executable smoke 证明重启 reopen、rollback 和 cleanup。首个 suite 只证明 activation safety；Quick 稳定 scope、任务效果 Evals 和其余 Phase 0/1 底座证据仍未完成。
 
 ## Stop Boundary
 - 不在本地单测后停止。
