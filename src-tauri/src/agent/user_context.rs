@@ -108,16 +108,32 @@ async fn build_preferences_section(pool: &SqlitePool, cwd: &str) -> Option<Strin
 }
 
 async fn build_learnings_section(pool: &SqlitePool, cwd: &str) -> Option<String> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT suggestion FROM learning_events \
-         WHERE cwd = ? AND status = 'accepted' \
-         ORDER BY decided_at DESC LIMIT ?",
+    // New Phase 4 memory is inert until an exact Eval-passed activation
+    // receipt exists. Active versioned memory takes precedence within the
+    // bounded prompt budget; rolled-back rows remain auditable but inert.
+    let mut rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT content FROM evolution_active_memory
+         WHERE cwd=? AND active=1 ORDER BY activated_at DESC LIMIT ?",
     )
     .bind(cwd)
     .bind(LEARNING_EVENTS_LIMIT)
     .fetch_all(pool)
     .await
     .ok()?;
+    let remaining = LEARNING_EVENTS_LIMIT.saturating_sub(rows.len() as i64);
+    if remaining > 0 {
+        let legacy: Vec<(String,)> = sqlx::query_as(
+            "SELECT suggestion FROM learning_events \
+             WHERE cwd = ? AND status = 'accepted' \
+             ORDER BY decided_at DESC LIMIT ?",
+        )
+        .bind(cwd)
+        .bind(remaining)
+        .fetch_all(pool)
+        .await
+        .ok()?;
+        rows.extend(legacy);
+    }
     if rows.is_empty() {
         return None;
     }
@@ -174,6 +190,16 @@ mod tests {
                 id TEXT PRIMARY KEY, session_id TEXT, cwd TEXT,
                 observation TEXT, suggestion TEXT, status TEXT,
                 created_at TEXT, decided_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE evolution_active_memory (
+                candidate_id TEXT PRIMARY KEY, cwd TEXT, revision INTEGER,
+                activation_id TEXT, content TEXT, content_hash TEXT,
+                active INTEGER, activated_at TEXT, rolled_back_at TEXT
             )",
         )
         .execute(&pool)
@@ -313,5 +339,58 @@ mod tests {
         let pool = fresh_pool().await;
         let s = build_prefs_and_learnings(&pool, "/nonexistent/proj").await;
         assert_eq!(s, "");
+    }
+
+    #[tokio::test]
+    async fn only_active_phase4_memory_is_injected_and_rollback_removes_it() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO evolution_active_memory
+             (candidate_id,cwd,revision,activation_id,content,content_hash,active,activated_at)
+             VALUES ('c1','/proj',1,'a1','active evolution memory','hash',1,'2026-07-15'),
+                    ('c2','/proj',1,'a2','rolled back memory','hash2',0,'2026-07-15')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let context = build_prefs_and_learnings(&pool, "/proj").await;
+        assert!(context.contains("active evolution memory"));
+        assert!(!context.contains("rolled back memory"));
+        sqlx::query("UPDATE evolution_active_memory SET active=0 WHERE candidate_id='c1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let after = build_prefs_and_learnings(&pool, "/proj").await;
+        assert!(!after.contains("active evolution memory"));
+    }
+
+    #[tokio::test]
+    async fn active_versioned_memory_is_not_starved_by_legacy_prompt_limit() {
+        let pool = fresh_pool().await;
+        for index in 0..LEARNING_EVENTS_LIMIT {
+            sqlx::query(
+                 "INSERT INTO learning_events
+                 (id,session_id,cwd,observation,suggestion,status,created_at,decided_at)
+                 VALUES (?, 's1', '/proj', 'obs', ?, 'accepted', ?, ?)",
+            )
+            .bind(format!("legacy-{index}"))
+            .bind(format!("legacy memory {index}"))
+            .bind(format!("2026-07-{:02}", index + 1))
+            .bind(format!("2026-07-{:02}", index + 1))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO evolution_active_memory
+             (candidate_id,cwd,revision,activation_id,content,content_hash,active,activated_at)
+             VALUES ('active-priority','/proj',1,'a-priority','priority active memory','hash',1,'2026-08-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let context = build_prefs_and_learnings(&pool, "/proj").await;
+        assert!(context.contains("priority active memory"));
+        assert_eq!(context.matches("- legacy memory").count(), 19);
     }
 }

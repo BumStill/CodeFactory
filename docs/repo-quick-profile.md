@@ -3,7 +3,7 @@
 ## Task Entry
 - Repository: `CodeFactory`
 - 产品类型：Windows AI 编程 Agent 桌面客户端。
-- 当前状态：`v1.43.1` 基线已包含桌面聊天、受控工具、知识、学习/自进化框架、Control Plane 与 Terminal-Bench 2.1 评估面；Evolution Agent 正按 `docs/long-tasks/evolution-agent-closed-loop.md` 修复真实轨迹底座。
+- 当前状态：`v1.44.0` 已发布一级「进化审查」、人工裁决和持久作业日志；Evolution Agent 正按 `docs/long-tasks/evolution-agent-closed-loop.md` 实现版本化候选、激活安全 Evals、受控自动激活与回滚。
 - 日常任务先加载本文件、任务说明和 quick gate 结果。
 - quick gate 标记 release、compatibility、observation、payload、viewport 或 governance-change 时，再加载 `docs/repo-governance-profile.md`。
 
@@ -44,5 +44,5 @@
 - 长任务记录：`python tools/governance/validate_long_task_record.py --task-record-path <path>`
 
 ## 当前阻塞
-- Evolution Agent 的统一候选/Review/materializer/通用 Evals 尚未完成；Phase 0 先补真实规范化工具轨迹与脱敏证据。
+- Evolution Agent 的任务效果 Eval case 仍缺少跨项目统一可执行 oracle；Phase 4 首版只把确定性的激活安全回归作为自动激活硬门禁，不把它包装成任务成功率提升证明。
 - release-facing 完成仍需 PR+CI、安装包以及真实 CodeFactoryDev/发布版本的主路径证据；浏览器和 mock 不能替代桌面工具执行。

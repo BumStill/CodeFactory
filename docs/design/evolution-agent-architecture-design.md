@@ -175,11 +175,22 @@ job.completed|failed
 - 新代码读取不到 job/event 时必须降级到旧候选展示；旧版本代码可忽略新增表和可空列。
 - migration 必须幂等；应用重复启动、部分升级后重启以及空数据库初始化得到相同 schema。
 
-### Evals 与 Activation 禁用边界
+### Phase 4：版本化候选、Evals 与 Activation
 
-本轮不新增 `eval_cases/eval_runs`、activation 状态或部署动作，也不把现有 Terminal-Bench benchmark 当作通用 Eval 门禁。工作台可以展示禁用的 `Evals`、`Activation` 阶段说明，但不得暴露可调用命令、自动触发评测、修改 tool gate、生成或启用 Skill、改写 harness/code，或把 `accepted` 宣称为 `eval_passed/active`。
+新链路不扩展 `learning_events.status` 的含义。旧 `accepted` 永远是 legacy active-unassessed；新批准由 `improvement_candidates`、immutable `candidate_revisions` 与 append-only `candidate_reviews` 承载。pending learning event 仅在首次批准时 lazy-adopt，保留稳定来源 id。
 
-本轮 `accepted` 只表示当前目标已按现有本地语义物化；是否经过评测、是否适合发布或推广到其他项目均未知。后续引入 Eval/Activation 时必须单独设计兼容迁移和显式状态，不能追溯性地给旧记录补写“评测通过”。
+首版新增：
+
+- `improvement_candidates`：scope、kind、current revision/state/state_version 与 legacy 来源。
+- `candidate_revisions`：冻结 payload/evidence 及 hash；创建后不可更新。
+- `candidate_reviews`：批准/拒绝与 `auto_activate` 选择；只追加。
+- `evolution_eval_runs` / `evolution_eval_case_results`：exact revision、manifest/runner、baseline/treatment hash、verdict 与 required case 结果。
+- `evolution_activation_receipts`：target、before/after hash、状态、激活/回滚时间与私有 before snapshot。
+- `evolution_active_memory`：新 memory 的唯一 active source；staged/eval-passed revision 永不进入 prompt。
+
+`user_context` 继续读取旧 accepted learning 与 memory.md 以兼容历史，同时只读取 `evolution_active_memory.active=1` 的新记录。preference 激活在同一 SQLite 事务更新 `user_preferences.activation_id`、receipt 与 candidate state；用户手工编辑会清空 activation id。回滚仅在 current activation/value hash 仍匹配时恢复 before snapshot，否则 `rollback_conflict`。
+
+状态转换通过 `candidate_id + revision + current_state` CAS 和 target fingerprint 检查，`state_version` 每次递增用于审计。批准只冻结数据；Eval 只读 staged payload；activation 才能写 live source。所有 Eval 幂等 key 包含 candidate、revision、manifest 与 target fingerprint。自动激活默认关闭且只在本次人工批准显式选择、target 属于 project low-risk 白名单、exact Eval passed 时触发。Terminal-Bench 与静态非空检查不能冒充该门禁。
 
 ### 锁屏不阻断验证
 
@@ -187,11 +198,12 @@ job.completed|failed
 - 验收入口只由独立 HTML 加载，使用 Tauri 官方 mock IPC 和有界 fixture，不进入 production `index.html` bundle，不读取用户数据库或凭据。
 - headless receipt 证明 DOM、CSS layout、键盘与状态流不依赖交互桌面，在锁屏时替代不可用的桌面控制接口；它不检测或证明 OS 当时确实锁屏，也不证明 Tauri 壳或安装包。receipt 必须写 `interactive_desktop_required=false` 与 `os_lock_state_observed=not_measured`，不得硬编码伪造锁屏观测。
 - `.github/workflows/release.yml` 的 macOS job 继续从 DMG 复制精确 app、启动隔离 HOME、检查稳定窗口和数据库；该远端 runner 证明真实发布壳与产物，不依赖本机是否锁屏。
+- macOS DMG 内 executable 与 Windows release executable 都必须运行 `--evolution-smoke <receipt.json>`：隔离临时库完成 Eval 失败不激活、Eval 全过后激活、数据库重开后上下文生效、精确回滚与清理，并校验 build commit；JSON 回执不得包含隐私 fixture。
 - CI 同时运行 unit/integration、headless viewport 和 Rust tests。任何一层失败都保持 PR/Release blocked；不得因为本机锁屏静默跳过。
 
 ## 8. 后续目标架构
 
-在上述最小合同稳定并有真实使用证据后，再评估 `agent_runs`、`agent_events`、独立 `improvement_candidates`、`candidate_evidence`、`candidate_reviews`、`candidate_change_receipts` 和通用 `eval_cases/eval_runs`。只有届时才引入 `draft -> pending_review -> approved/rejected -> materialized -> eval_passed/eval_failed -> pending_activation -> active` 等完整状态机及 `expected_revision`；不得为了未来模型提前复制现有数据。
+在上述最小合同稳定并有真实使用证据后，再扩展任务效果 Evals、`candidate_evidence` 的类型化关联、`changes_requested -> revision N+1`、Harness/Skill materializer 与显式授权的 draft PR。后续扩展必须复用当前 candidate/review/eval/activation 对象，不能另建一套表复制现有事实，也不能用安全 Eval 冒充任务成功率提升。
 
 ## 9. 风险
 

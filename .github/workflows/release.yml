@@ -130,6 +130,7 @@ jobs:
           # crates.io downloads occasionally drop mid-transfer on CI runners
           # (schannel "server closed abruptly"); give cargo more retries.
           CARGO_NET_RETRY: "10"
+          CODEFACTORY_BUILD_GIT_SHA: ${{ github.sha }}
           # Override `release` profile to optimise for CI build time instead
           # of binary size. We can't use `tauri build --profile release-ci`
           # because tauri 2's CLI doesn't expose --profile at the top level
@@ -154,6 +155,24 @@ jobs:
           # there is intentionally no publish step here anymore.
           releaseDraft: true
           prerelease: false
+
+      - name: Verify Windows release executable Evolution closed loop
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem "src-tauri/target/release" -Filter "codefactory.exe" -File | Select-Object -First 1
+          if (-not $exe) { throw "Windows release executable was not produced" }
+          $receipt = Join-Path $env:RUNNER_TEMP "evolution-release-smoke.json"
+          & $exe.FullName --evolution-smoke $receipt
+          if ($LASTEXITCODE -ne 0) { throw "Evolution release smoke exited $LASTEXITCODE" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if ($smoke.status -ne "pass") { throw "Evolution smoke status was not pass" }
+          if ($smoke.build_git_sha -ne "${{ github.sha }}") { throw "Evolution smoke was not built from the release commit" }
+          if (-not $smoke.failed_eval_blocked_activation) { throw "Failed Eval did not block activation" }
+          if ($smoke.eval_passed_count -ne $smoke.eval_required_count) { throw "Required Evals did not all pass" }
+          if (-not $smoke.restart_reopen_observed) { throw "Evolution state was not verified after reopen" }
+          if ($smoke.rollback_status -ne "rolled_back") { throw "Activation did not roll back" }
+          if (-not $smoke.cleanup) { throw "Evolution smoke did not clean isolated state" }
+          Get-Content $receipt
 
   # ── Step 3: build the unsigned macOS (Apple Silicon) app + dmg ────────────
   # Runs AFTER build-windows so the draft release already exists; tauri-action
@@ -223,6 +242,7 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
           CARGO_INCREMENTAL: "0"
           CARGO_NET_RETRY: "10"
+          CODEFACTORY_BUILD_GIT_SHA: ${{ github.sha }}
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           CARGO_PROFILE_RELEASE_LTO: "false"
           # Same updater key as Windows — signs the .app.tar.gz so the macOS

@@ -157,9 +157,7 @@ pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
     // ensure_schema pass below can still run; the row-level damage from
     // a half-applied migration is what we're working around here.
     if let Err(e) = sqlx::migrate!("../migrations").run(&pool).await {
-        tracing::warn!(
-            "sqlx::migrate reported {e}; falling back to idempotent ensure_schema"
-        );
+        tracing::warn!("sqlx::migrate reported {e}; falling back to idempotent ensure_schema");
     }
 
     // Idempotent schema sync — see ensure_schema doc-comment for the why.
@@ -337,14 +335,32 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     //    'memory' (their original semantics). For 'preference' rows,
     //    pref_key / pref_value carry the structured payload — the
     //    suggestion column still holds a human-readable rendering for UI.
-    ensure_column(pool, "learning_events", "kind", "TEXT NOT NULL DEFAULT 'memory'").await?;
+    ensure_column(
+        pool,
+        "learning_events",
+        "kind",
+        "TEXT NOT NULL DEFAULT 'memory'",
+    )
+    .await?;
     ensure_column(pool, "learning_events", "pref_key", "TEXT").await?;
     ensure_column(pool, "learning_events", "pref_value", "TEXT").await?;
     // ── Self-evolution P1: cross-session mined insights carry an evidence
     //    count (how many sessions back the pattern) + the raw metrics.
     //    Per-session post-mortem rows leave support_count = 0.
-    ensure_column(pool, "learning_events", "support_count", "INTEGER NOT NULL DEFAULT 0").await?;
-    ensure_column(pool, "learning_events", "evidence_json", "TEXT NOT NULL DEFAULT '{}'").await?;
+    ensure_column(
+        pool,
+        "learning_events",
+        "support_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "learning_events",
+        "evidence_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )
+    .await?;
     // Evolution workbench: keep learning_events as the backward-compatible
     // candidate source of truth and attach newly mined candidates to the job
     // that produced them. Legacy rows intentionally remain NULL.
@@ -414,6 +430,168 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_evolution_job_events_cwd_job_created \
          ON evolution_job_events(cwd, job_id, created_at)",
+    )
+    .execute(pool)
+    .await?;
+
+    // Evolution Phase 4 keeps approval, evaluation and activation separate
+    // from legacy learning_events.status. Existing accepted rows stay exactly
+    // as they are and never receive fabricated Eval/activation records.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS improvement_candidates (
+            id                       TEXT PRIMARY KEY,
+            cwd                      TEXT NOT NULL,
+            kind                     TEXT NOT NULL,
+            source_learning_event_id TEXT UNIQUE,
+            current_revision         INTEGER NOT NULL,
+            current_state            TEXT NOT NULL,
+            state_version            INTEGER NOT NULL DEFAULT 1,
+            created_at               TEXT NOT NULL,
+            updated_at               TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_improvement_candidates_cwd_updated
+         ON improvement_candidates(cwd, updated_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS candidate_revisions (
+            candidate_id TEXT NOT NULL,
+            revision     INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            risk_class   TEXT NOT NULL DEFAULT 'low',
+            created_at   TEXT NOT NULL,
+            PRIMARY KEY (candidate_id, revision)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS candidate_reviews (
+            id            TEXT PRIMARY KEY,
+            candidate_id  TEXT NOT NULL,
+            revision      INTEGER NOT NULL,
+            decision      TEXT NOT NULL,
+            actor         TEXT NOT NULL,
+            auto_activate INTEGER NOT NULL DEFAULT 0,
+            reason        TEXT,
+            created_at    TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_candidate_reviews_candidate_created
+         ON candidate_reviews(candidate_id, revision, created_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_eval_runs (
+            id                 TEXT PRIMARY KEY,
+            job_id             TEXT NOT NULL,
+            cwd                TEXT NOT NULL,
+            candidate_id       TEXT NOT NULL,
+            revision           INTEGER NOT NULL,
+            status             TEXT NOT NULL,
+            manifest_hash      TEXT NOT NULL,
+            runner_version     TEXT NOT NULL,
+            baseline_hash      TEXT NOT NULL,
+            treatment_hash     TEXT NOT NULL,
+            target_fingerprint TEXT NOT NULL,
+            required_count     INTEGER NOT NULL DEFAULT 0,
+            passed_count       INTEGER NOT NULL DEFAULT 0,
+            failed_count       INTEGER NOT NULL DEFAULT 0,
+            idempotency_key    TEXT NOT NULL UNIQUE,
+            owner_pid          INTEGER,
+            owner_start_token  TEXT,
+            started_at         TEXT NOT NULL,
+            completed_at       TEXT,
+            error              TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_evolution_eval_runs_cwd_started
+         ON evolution_eval_runs(cwd, started_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_evolution_eval_running_candidate
+         ON evolution_eval_runs(candidate_id, revision) WHERE status='running'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_eval_case_results (
+            id            TEXT PRIMARY KEY,
+            run_id        TEXT NOT NULL,
+            case_id       TEXT NOT NULL,
+            title         TEXT NOT NULL,
+            status        TEXT NOT NULL,
+            hard_gate     INTEGER NOT NULL DEFAULT 1,
+            detail_json   TEXT NOT NULL DEFAULT '{}',
+            created_at    TEXT NOT NULL,
+            UNIQUE (run_id, case_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_activation_receipts (
+            id              TEXT PRIMARY KEY,
+            job_id          TEXT NOT NULL,
+            cwd             TEXT NOT NULL,
+            candidate_id    TEXT NOT NULL,
+            revision        INTEGER NOT NULL,
+            eval_run_id     TEXT NOT NULL,
+            target_kind     TEXT NOT NULL,
+            target_key      TEXT,
+            status          TEXT NOT NULL,
+            payload_hash    TEXT NOT NULL,
+            before_hash     TEXT NOT NULL,
+            after_hash      TEXT NOT NULL,
+            before_json     TEXT NOT NULL DEFAULT '{}',
+            idempotency_key TEXT NOT NULL UNIQUE,
+            activated_at    TEXT,
+            rolled_back_at  TEXT,
+            error           TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_evolution_activation_cwd_activated
+         ON evolution_activation_receipts(cwd, activated_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_active_memory (
+            candidate_id  TEXT PRIMARY KEY,
+            cwd           TEXT NOT NULL,
+            revision      INTEGER NOT NULL,
+            activation_id TEXT NOT NULL UNIQUE,
+            content       TEXT NOT NULL,
+            content_hash  TEXT NOT NULL,
+            active        INTEGER NOT NULL DEFAULT 1,
+            activated_at  TEXT NOT NULL,
+            rolled_back_at TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_evolution_active_memory_cwd_active
+         ON evolution_active_memory(cwd, active, activated_at DESC)",
     )
     .execute(pool)
     .await?;
@@ -523,6 +701,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     )
     .execute(pool)
     .await?;
+    ensure_column(pool, "user_preferences", "activation_id", "TEXT").await?;
 
     crate::knowledge::ensure_schema(pool).await?;
     crate::benchmark::ensure_schema(pool).await?;
@@ -553,9 +732,11 @@ async fn ensure_column(
     });
     if !exists {
         tracing::info!("schema sync: adding column {table}.{column} {col_type}");
-        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
-            .execute(pool)
-            .await?;
+        sqlx::query(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {col_type}"
+        ))
+        .execute(pool)
+        .await?;
     }
     Ok(())
 }
@@ -605,14 +786,19 @@ mod tests {
         // The repaired schema must expose both the columns the app code
         // requires today — otherwise SELECT * → struct FromRow blows up
         // exactly like in production.
-        let cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('messages')")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        assert!(cols.contains(&"tool_calls".to_string()),
-            "ensure_schema must add tool_calls column. Got: {cols:?}");
-        assert!(cols.contains(&"reasoning_content".to_string()),
-            "ensure_schema must add reasoning_content column. Got: {cols:?}");
+        let cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('messages')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            cols.contains(&"tool_calls".to_string()),
+            "ensure_schema must add tool_calls column. Got: {cols:?}"
+        );
+        assert!(
+            cols.contains(&"reasoning_content".to_string()),
+            "ensure_schema must add reasoning_content column. Got: {cols:?}"
+        );
 
         // The seeded row's data must survive the ALTER TABLE.
         let role: String = sqlx::query_scalar("SELECT role FROM messages WHERE id='m1'")
@@ -630,21 +816,22 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE messages (id TEXT)").execute(&pool).await.unwrap();
-
-        ensure_schema(&pool).await.unwrap();
-        ensure_schema(&pool).await.unwrap();
-        ensure_schema(&pool).await.unwrap();
-
-        let cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('messages')")
-            .fetch_all(&pool)
+        sqlx::query("CREATE TABLE messages (id TEXT)")
+            .execute(&pool)
             .await
             .unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+
+        let cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('messages')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         // No duplicate columns (sqlite would have errored if we double-added).
-        assert_eq!(
-            cols.iter().filter(|c| *c == "reasoning_content").count(),
-            1
-        );
+        assert_eq!(cols.iter().filter(|c| *c == "reasoning_content").count(), 1);
     }
 
     /// Fresh-install path: ensure_schema must also create the satellite
@@ -658,7 +845,10 @@ mod tests {
             .unwrap();
         // No tables at all — pretend this is a brand-new DB created after
         // 0001_init.sql ran.
-        sqlx::query("CREATE TABLE messages (id TEXT)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE messages (id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         ensure_schema(&pool).await.unwrap();
 
@@ -938,5 +1128,63 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(status, "failed");
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_adds_phase4_evals_activation_without_backfilling_legacy_accepts() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE messages (id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        ensure_schema(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO learning_events
+             (id, session_id, cwd, observation, suggestion, status, created_at)
+             VALUES ('legacy-phase4', 's1', '/proj', 'obs', 'legacy active', 'accepted', '2026-07-15')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+
+        for table in [
+            "improvement_candidates",
+            "candidate_revisions",
+            "candidate_reviews",
+            "evolution_eval_runs",
+            "evolution_eval_case_results",
+            "evolution_activation_receipts",
+            "evolution_active_memory",
+        ] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(exists, 1, "Phase 4 schema must create {table}");
+        }
+        let legacy_state: String =
+            sqlx::query_scalar("SELECT status FROM learning_events WHERE id='legacy-phase4'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(legacy_state, "accepted");
+        let fake_candidates: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM improvement_candidates")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            fake_candidates, 0,
+            "legacy accepts must not receive fabricated Eval state"
+        );
     }
 }

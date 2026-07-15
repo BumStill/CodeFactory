@@ -67,3 +67,17 @@ jobs:
       # reports it.
       - name: Cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml --quiet
+
+      - name: Evolution executable closed-loop smoke
+        shell: pwsh
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP "evolution-smoke.json"
+          cargo run --manifest-path src-tauri/Cargo.toml -- --evolution-smoke $receipt
+          if ($LASTEXITCODE -ne 0) { throw "Evolution executable smoke exited $LASTEXITCODE" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if ($smoke.status -ne "pass") { throw "Evolution smoke status was not pass" }
+          if (-not $smoke.failed_eval_blocked_activation) { throw "Failed Eval did not block activation" }
+          if ($smoke.eval_passed_count -ne $smoke.eval_required_count) { throw "Required Evals did not all pass" }
+          if (-not $smoke.restart_reopen_observed) { throw "Evolution state was not verified after reopen" }
+          if ($smoke.rollback_status -ne "rolled_back") { throw "Activation did not roll back" }
+          if (-not $smoke.cleanup) { throw "Evolution smoke did not clean isolated state" }

@@ -2,7 +2,7 @@
 
 ## 1. 核心用户路径
 
-Phase 0 不先新增大而全的看板，而是在真实轨迹闭合后增加一个薄的一级「进化审查」工作面，复用现有 Profile 学习日志、工具门控和自我改进能力。主路径：
+Phase 0 不先新增大而全的看板，而是在真实轨迹闭合后增加一个薄的一级「进化审查」工作面，复用现有 Profile 学习日志、工具门控和自我改进能力。下列是 v1.44.0 的历史主路径；Phase 4 在第 5 步前插入冻结 revision、Evals 与独立 activation：
 
 1. 用户在真实项目中完成一次包含工具调用的 session。
 2. 系统在后台记录成功/失败/拒绝、耗时和脱敏参数摘要。
@@ -15,7 +15,7 @@ Phase 0 不先新增大而全的看板，而是在真实轨迹闭合后增加一
 - Home 一级能力区提供「进化审查」卡片和待审 badge；入口文字必须描述“审核真实轨迹产生的改进”，不能用含混的“AI 学习”。
 - Workspace 的「X 待审」是 project scope 深链，目标页必须显示当前项目路径并保留筛选，不得跳到最近使用项目。
 - 页面顶栏包含：返回、标题、scope selector、最后分析时间、待审数量和「运行分析」。scope 显式区分项目、快速任务、全局。
-- 一级 tab 只有「待我审核」「作业与日志」「决定历史」。Profile 继续承载偏好/记忆编辑；迁移期从 Profile 跳转到进化审查，不提供第二套可写审核按钮。
+- v1.44.0 一级 tab 为「待我审核」「作业与日志」「决定历史」；Phase 4 新增「评测与激活」。Profile 继续承载偏好/记忆编辑；迁移期从 Profile 跳转到进化审查，不提供第二套可写审核按钮。
 - 「待我审核」采用主从布局：左侧候选队列和筛选，右侧固定详情。窄窗口改为列表 -> 详情的单列导航，不能把右侧压到不可读。
 
 候选详情顺序固定为：结论；建议去向和 scope；当前值 -> 建议值；脱敏证据摘要；来源 session/时间；风险与可逆性；人工动作。工具参数、错误和长路径默认摘要并可折叠，reasoning 永不展示。
@@ -57,7 +57,11 @@ Phase 0 不先新增大而全的看板，而是在真实轨迹闭合后增加一
 
 分析或人工决定失败后，工作台必须刷新持久 job/event ledger 并进入“作业与日志”，不能只弹临时错误；采纳失败还要重读 current value。ledger 读取失败使用独立错误态，不能同时渲染“还没有分析作业”。精确来源刷新失败继续保留原 job id 并显示“来源作业不可用”；打开旧来源时仍补拉最新分析事件，保证顶层阶段卡不被旧作业操作清空。
 
-分析作业不显示假的 materialization 进度；只有真实人工采纳 job 才显示 `review -> materialize` 事件。Evals 与 activation 仍显示“未接入”；以后接入时必须把 `approved`、`materialized`、`eval_passed`、`active` 分开。
+分析作业不显示假的 materialization 进度。Phase 4 的批准作业按真实顺序显示 `review -> stage -> eval -> activation`；各节点失败时保留 exact run/receipt，不把 `approved`、`eval_passed`、`pending_activation`、`active` 合并成一个绿色状态。
+
+新增「评测与激活」tab：列出每个 exact revision、Eval verdict、required case、baseline/treatment hash、自动激活选择、activation receipt 与回滚状态。顶部 Evals 卡显示运行中/通过/失败/证据不足真实数量，自动激活卡显示待激活/已激活/已回滚，删除“未接入”告警。旧 accepted 单独标记“历史已生效（未评测）”。
+
+待审动作改为「批准并运行 Evals」。确认区明确“批准不会立即写入”，提供默认关闭的「通过后自动激活此低风险候选」选择；不满足 scope/type 白名单时不显示可用开关。Eval 通过但未自动激活时可手动激活；active 条目始终提供二次确认的回滚。失败/inconclusive 可重跑 exact revision，但 hard safety failure 不提供 override。
 
 ## 6. 空态与错误态
 

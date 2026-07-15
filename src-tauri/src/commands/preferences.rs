@@ -160,7 +160,8 @@ pub async fn upsert_user_preference(
          ON CONFLICT(cwd, key) DO UPDATE SET \
            value = excluded.value, \
            source = excluded.source, \
-           updated_at = excluded.updated_at",
+           updated_at = excluded.updated_at, \
+           activation_id = NULL",
     )
     .bind(&cwd)
     .bind(key)

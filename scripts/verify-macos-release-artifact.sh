@@ -82,6 +82,36 @@ if [[ " $ARCHS " != *" arm64 "* ]]; then
   exit 1
 fi
 
+EVOLUTION_RECEIPT="$INSTALL_DIR/evolution-release-smoke.json"
+"$EXECUTABLE_PATH" --evolution-smoke "$EVOLUTION_RECEIPT"
+if [[ "$(/usr/bin/plutil -extract status raw "$EVOLUTION_RECEIPT")" != "pass" ]]; then
+  echo "macOS release artifact smoke failed: Evolution smoke status was not pass" >&2
+  exit 1
+fi
+if [[ "$(/usr/bin/plutil -extract failed_eval_blocked_activation raw "$EVOLUTION_RECEIPT")" != "true" ]]; then
+  echo "macOS release artifact smoke failed: failed Eval did not block activation" >&2
+  exit 1
+fi
+EVAL_REQUIRED_COUNT="$(/usr/bin/plutil -extract eval_required_count raw "$EVOLUTION_RECEIPT")"
+EVAL_PASSED_COUNT="$(/usr/bin/plutil -extract eval_passed_count raw "$EVOLUTION_RECEIPT")"
+if [[ "$EVAL_REQUIRED_COUNT" -ne "$EVAL_PASSED_COUNT" ]]; then
+  echo "macOS release artifact smoke failed: required Evals did not all pass" >&2
+  exit 1
+fi
+if [[ "$(/usr/bin/plutil -extract restart_reopen_observed raw "$EVOLUTION_RECEIPT")" != "true" ]]; then
+  echo "macOS release artifact smoke failed: Evolution state was not verified after reopen" >&2
+  exit 1
+fi
+if [[ "$(/usr/bin/plutil -extract rollback_status raw "$EVOLUTION_RECEIPT")" != "rolled_back" ]]; then
+  echo "macOS release artifact smoke failed: activation did not roll back" >&2
+  exit 1
+fi
+if [[ "$(/usr/bin/plutil -extract cleanup raw "$EVOLUTION_RECEIPT")" != "true" ]]; then
+  echo "macOS release artifact smoke failed: isolated Evolution state was not cleaned" >&2
+  exit 1
+fi
+cat "$EVOLUTION_RECEIPT"
+
 swift "$SCRIPT_DIR/verify-macos-app-window.swift" \
   "$INSTALLED_APP" \
   "${CODEFACTORY_RELEASE_WINDOW_TIMEOUT_SEC:-30}"
