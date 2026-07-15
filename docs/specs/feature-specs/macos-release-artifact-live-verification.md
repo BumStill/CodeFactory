@@ -18,12 +18,13 @@
 | CF-MAC-REL-R6 | 复制后必须先卸载 DMG再启动临时副本；启动时注入隔离 HOME 并确认数据库写入隔离目录；smoke 完成后必须终止测试进程，不污染 runner、本机已有安装或用户数据 | runtime cleanup | process, mount and temporary-home cleanup assertions | release |
 | CF-MAC-REL-R7 | 支持对指定已发布 tag 手动运行同一 smoke，用于验证 GitHub 托管 macOS runner 或复查历史产物，不必切出新版本 | observation workflow | workflow_dispatch run | release |
 | CF-MAC-REL-R8 | PR 阶段必须在 GitHub macOS 可见会话构建并启动本次精确 debug App；本机锁屏不得把 GUI 证据变成待解锁 blocker | pull request candidate | lock-independent desktop workflow | QA |
+| CF-MAC-REL-R9 | 每次正式发布后必须在新的托管 macOS 环境通过不携带仓库凭据的公开 URL 重新下载 DMG，并重复安装、版本、架构、数据库初始化和真实窗口验收；不得依赖本机解锁状态或复用构建目录产物 | published release | anonymous download + release workflow post-publish job + evidence artifact | release |
 
 ## Primary Release Path
 
-`PR -> remote debug App window/screenshot -> merge -> tag -> macOS build -> DMG -> mount -> copy to temporary install directory -> detach -> assert bundle metadata/arm64 -> LaunchServices launch exact app with isolated HOME -> observe stable onscreen main window + screenshot -> terminate -> upload evidence -> finalize release`
+`PR -> remote debug App window/screenshot -> merge -> tag -> macOS build -> pre-publish install/window smoke -> publish -> fresh hosted macOS runner -> download public DMG -> install/window/database smoke -> upload evidence`
 
-只有上述链路通过，macOS build job 才能成功，后续 `finalize` 才允许把 draft release 公开。
+预发布 smoke 失败时 `finalize` 不得公开 draft；公开后复验失败时整个 Release workflow 必须标红并保留证据，不能把该版本报告为完整验收通过。
 
 ## Applicable Harnesses
 
@@ -46,6 +47,7 @@
 | app 创建正常主窗口 | 输出 PID、window id/title/bounds 后成功 | Quartz observation log |
 | smoke 结束 | 测试进程已终止，DMG 已卸载，临时目录已删除 | cleanup completion |
 | 指定历史 release tag 手动复查 | 下载该 tag 唯一 arm64 DMG 并执行同一脚本 | `macOS Release Artifact Smoke` run |
+| 正式发布完成 | 新 macOS runner 自动下载公开 DMG 并执行同一脚本，失败时 Release workflow 标红 | `verify-published-macos` job + GUI evidence artifact |
 
 ## Product Boundary
 

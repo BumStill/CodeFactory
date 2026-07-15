@@ -125,3 +125,16 @@ PR `#106` 的第一次 GitHub-hosted canary `29395835212` 在结构断言上返�
 同一候选的 CI、两项 governance baseline 和 `remote-real-app-gui` 均为绿色。该证据只证明 PR 精确候选 App 在远程真实 GUI 会话可启动并渲染；候选仍是 `not live`，必须继续完成合并、刻意发版、发布 DMG smoke、published-tag smoke 和已发布版本锁屏 canary。
 
 最终独立复核还发现源码安装证据解析会把引号中的 `pip install .` 文本、未知 pip 参数的值或其他项目的安装误记为当前项目安装。失败回归先复现误判，随后产品共享 Agent core 改为引号感知的保守 shell 解析，并在桌面主路径把真实项目工作目录写入工具结果；headless 的前置门禁和结果记录同样使用真实项目根。Terminal-Bench 薄适配器先读取容器物理目录，再通过标准 `pyproject.toml`、`setup.py`、`package.json`、`Cargo.toml`、`go.mod` 等 manifest 做有界项目根发现：默认根有 manifest 时优先使用，只有一个嵌套项目时选择该根，多个候选时保守留在默认根。若源码在任务运行后才被克隆，适配器会在成功工具调用后重新发现根目录，通过向后兼容的协议字段让下一次工具执行、前置策略和完成证据同步切换；当前工具仍按它实际执行的旧目录记账。现在只有有效目录仍等于该项目根时，`.` / `./` 安装才记入完成证据；相对和绝对其他项目、嵌套无关仓库、其他路径的 `setup.py`、未知参数及 `--help` / `--dry-run` 均被拒绝。合法的 pip/uv 常用参数与 Windows `pip.exe`、`py -3/-3.12 -m pip`、PowerShell 调用保持支持；只含环境赋值的 `export ... && pip install .` 保持通过，可能改变目录的 `source` 脚本保守拒绝。合入 `v1.45.1` 主干后的验证为 Rust 主 crate `293 passed / 6 ignored`、shared core `57 passed`、headless `13 passed`、Python `68 / 68`、frontend `172 / 172`，并再次完成双视口 Evolution headless gate、production frontend build 和 debug App bundle。最终独立审查未发现 P0/P1。
+
+## v1.45.2 正式发布证据
+
+- PR `#106` merge commit: `501350b0b93821b5adc80c39f6b173f2437b4f95`
+- release tag commit: `38b753c514a2755efffc815ae834792a9f3098fc`
+- release workflow: `29408648719`，Windows executable closed loop、macOS installed artifact、GUI evidence 和 finalize 全部通过
+- public release: `v1.45.2`，draft `false`，prerelease `false`
+- public DMG SHA-256: `7784157879a6b8c0fec4539385cc30f2f04dcf959fd5cc9a2775c81b63832c0e`
+- mounted metadata: bundle id `com.codefactory.app`，version/build `1.45.2`，architecture `arm64`
+- published-asset smoke: run `29409951223` 从公开 Release 重新下载 DMG 后通过安装、隔离数据库初始化和真实窗口检查
+- published screenshot: `1024x674` logical window，layer `0`，alpha `1`，`27` color buckets，`308 / 625` varied samples，status `ok`
+
+以上发布与 GUI 验收均在 GitHub 托管环境完成，不依赖用户本机解锁。发布版 `build-cython-ext` canary run `3e4f1729-08f9-420e-aa3f-b68fc30c312c` 仍为 `0 / 1`：基础设施与结果导入成功，但 Agent 在 `900s` 内重复安装/扫描并消耗 `538819` tokens，最终因 DeepSeek transport failure 且完成证据不齐停止。因此锁屏发布目标已经有真实证据，Terminal-Bench 能力目标尚未完成。
