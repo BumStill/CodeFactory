@@ -345,3 +345,61 @@ jobs:
           # Re-assert the notes (the macOS build job may touch the release) and
           # publish — the single point where the draft flag is flipped off.
           gh release edit   "$TAG" --repo "$REPO" --draft=false --notes "$NOTES"
+
+  # Step 5: verify the asset users actually download after publication. This
+  # runs on a fresh hosted macOS machine, so local screen lock/sleep state is
+  # irrelevant and build-directory artifacts cannot satisfy the gate.
+  verify-published-macos:
+    runs-on: macos-latest
+    needs: finalize
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download published macOS DMG
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="$RUNNER_TEMP/codefactory-published-release"
+          mkdir -p "$RELEASE_DIR"
+          VERSION="${TAG#v}"
+          DMG_PATH="$RELEASE_DIR/CodeFactory_${VERSION}_aarch64.dmg"
+          PUBLIC_URL="https://github.com/$REPO/releases/download/$TAG/CodeFactory_${VERSION}_aarch64.dmg"
+          # Remove any inherited token so this proves the asset is available
+          # through the same anonymous URL an end user receives.
+          env -u GH_TOKEN curl \
+            --fail --location --silent --show-error \
+            --retry 4 --retry-all-errors --retry-delay 3 \
+            --output "$DMG_PATH" \
+            "$PUBLIC_URL"
+
+      - name: Verify published macOS release artifact
+        shell: bash
+        env:
+          CODEFACTORY_RELEASE_EVIDENCE_DIR: ${{ runner.temp }}/codefactory-published-release-evidence
+          CODEFACTORY_GUI_PROOF_TIER: published-release-artifact-gui
+        run: |
+          set -euo pipefail
+          DMG_DIR="$RUNNER_TEMP/codefactory-published-release"
+          mkdir -p "$CODEFACTORY_RELEASE_EVIDENCE_DIR"
+          {
+            DMG_COUNT="$(find "$DMG_DIR" -type f -name '*.dmg' | wc -l | tr -d ' ')"
+            if [ "$DMG_COUNT" != "1" ]; then
+              echo "::error::expected exactly one published arm64 DMG, found $DMG_COUNT"
+              exit 1
+            fi
+            DMG_PATH="$(find "$DMG_DIR" -type f -name '*.dmg' -print -quit)"
+            scripts/verify-macos-release-artifact.sh "$DMG_PATH" "${GITHUB_REF_NAME#v}"
+          } 2>&1 | tee "$CODEFACTORY_RELEASE_EVIDENCE_DIR/verification.log"
+
+      - name: Upload published release GUI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-published-release-gui-evidence-${{ github.ref_name }}
+          path: ${{ runner.temp }}/codefactory-published-release-evidence
+          if-no-files-found: error

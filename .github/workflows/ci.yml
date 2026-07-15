@@ -45,6 +45,9 @@ jobs:
       - name: Vitest
         run: pnpm test
 
+      - name: Release workflow contract tests
+        run: python -m unittest tests.test_release_workflow
+
       - name: Evolution workbench headless viewport gate
         run: pnpm test:evolution:headless
         env:

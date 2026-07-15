@@ -41,6 +41,14 @@
 - Next owner: development / QA
 - Updated at: 2026-07-15
 
+### 2026-07-15 v1.45.2 锁屏无关发布与发布版 canary
+
+- PR `#106` 已合并，`v1.45.2` 已公开发布，tag commit 为 `38b753c514a2755efffc815ae834792a9f3098fc`。
+- Release run `29408648719` 通过：Windows 已构建可执行程序闭环、macOS 构建产物安装/窗口/数据库验证和 finalize 均成功。
+- 公开 DMG `CodeFactory_1.45.2_aarch64.dmg` SHA-256 为 `7784157879a6b8c0fec4539385cc30f2f04dcf959fd5cc9a2775c81b63832c0e`；本地只读挂载确认 bundle id `com.codefactory.app`、version/build `1.45.2`、arch `arm64`。
+- 发布后独立 run `29409951223` 从公开 Release 重新下载 DMG，并在托管 macOS 环境完成精确 App 启动、隔离数据库初始化和真实窗口验证；proof tier `released-artifact-gui`，窗口 `1024x674`、alpha `1`、layer `0`，截图状态 `ok`。该路径不依赖用户 Mac 的锁屏状态。
+- 发布版 source-build canary run `3e4f1729-08f9-420e-aa3f-b68fc30c312c` 为 `0 / 1`，不能计为能力提升。锁屏无关基础设施、无交互凭据读取、Docker、Harbor、headless Agent 和结果导入均完成；Agent 在 `900s` 内发出 `65` 次模型请求、使用 `538819` tokens、执行 `43` 次工具调用，最终因 DeepSeek transport failure 且缺少最后的源码安装、项目外运行和项目测试证据而停止。下一轮必须先减少重复安装/扫描并强化最终时间预算，不应直接用完整 18 题放大浪费。
+
 ## Completed Items
 - Verified current external Terminal-Bench 2.1 run surface from official sources.
 - Confirmed Terminal-Bench 2.1 uses Harbor dataset `terminal-bench/terminal-bench-2-1`.
