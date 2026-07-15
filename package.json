@@ -8,6 +8,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
+    "test:evolution:headless": "node scripts/verify-evolution-workbench-headless.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {
@@ -46,6 +47,7 @@
     "@vitest/ui": "^2.1.9",
     "autoprefixer": "^10.4.0",
     "jsdom": "^29.1.1",
+    "playwright-core": "^1.61.1",
     "postcss": "^8.4.0",
     "tailwindcss": "^3.4.0",
     "typescript": "^5.6.0",

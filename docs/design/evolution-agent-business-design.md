@@ -84,4 +84,6 @@ Review Shell 完成还必须满足：Home 一级入口可见；Workspace 能深�
 
 Release-facing 完成必须再经过 PR+CI、刻意发版、安装包启动和真实用户路径验证。PR、CI 或 Dev app 通过仍是 `not live`，不能替代发布版本证据。
 
+本机锁屏不得成为合并或上线 blocker，也不得通过绕过 macOS 锁屏安全来解决。工作台 UX 门禁采用三层证据：解锁时取得的真实 Dev App 路径；可在锁屏状态运行的 headless Chromium 宽/窄视口交互验收；GitHub macOS runner 对真实 DMG、精确 app bundle、稳定窗口和隔离数据库的发布验收。三层分别证明桌面集成、布局交互与发布产物，不能互相冒充；锁屏时允许 headless + CI 继续推进，发布版仍必须由远端 macOS artifact smoke 通过后才能声明 live。
+
 任何“工具卡可见但规范化轨迹为 0”、真实执行与状态/耗时不一致、匿名会话产生记录或敏感值泄露，均直接拒绝验收。

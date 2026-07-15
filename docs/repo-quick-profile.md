@@ -36,6 +36,7 @@
 - 只有验收目标本身是权限询问、拒绝、hook cancel 或权限绕过防护时，才临时切换到 ask/deny；该场景结束后恢复完全权限，并在证据中写明切换范围。
 - 完全权限只用于当前已授权任务内的产品工具调用，不扩大部署、外发消息、账号、支付、交易、数据删除等外部或高风险操作权限。
 - 并行任务存在时优先使用独立 identifier、数据目录和 app wrapper，避免改动或抢占其他任务的 Dev 环境。
+- 本机锁屏后不得要求用户解锁或绕过 macOS 安全。UI 变更用 `pnpm test:evolution:headless` 继续执行真实浏览器布局/键盘门禁；PR、合并、刻意发版和安装包验证使用 CLI 与 GitHub runner。headless 不能替代发布 DMG smoke，DMG smoke 也不能替代功能断言。
 
 ## 快速命令
 - 治理基线：`python tools/governance/validate_repo_governance_baseline.py`

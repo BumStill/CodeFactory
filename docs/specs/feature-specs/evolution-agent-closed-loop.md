@@ -18,6 +18,7 @@
 | CF-EVO-R12 | 用户补充 | 分析、审核与有限物化作业及节点日志持久化；人工决定幂等；进程重启后死亡 owner 的旧运行中作业必须有明确失败终态且可重新运行，存活 owner 不得被误杀 | evolution jobs + sqlite + review UI | storage integration + liveness/restart path | architecture + development + QA |
 | CF-EVO-R13 | 用户补充 | 页面如实区分 proposed/approved/materialized/eval/active；Phase 0/1 不得假装已接 Evals 或 activation | review UI + governance | state contract review + negative UI assertion | planning + QA |
 | CF-EVO-R14 | 仓库规则 | 工作台完成声明同时满足成功、边界、重启、viewport 与 release 分层验收 | desktop-ui + sqlite + release | real app matrix + PR/CI + installer evidence | QA + release |
+| CF-EVO-R15 | 用户补充 | 本机锁屏不能阻断验证、合并或上线；不得绕过锁屏，改由不依赖交互桌面的 headless 浏览器 viewport/keyboard gate 与远端 macOS DMG smoke 继续执行；receipt 不得伪造 OS 锁屏观测 | browser harness + CI + release | 1366/390 headless receipt + PR checks + macOS artifact smoke | QA + release |
 
 ## 2. Primary User Path
 
@@ -30,6 +31,7 @@
 - Observation Harness：真实工具 route、状态、耗时、错误与 dropped 边界。
 - Payload Harness：arguments/result/error 截断、脱敏、Evidence 导出。
 - Viewport Harness：进化审查的队列/详情在 1366×768 和窄窗口可操作。
+- Lock-safe Harness：本机锁屏时继续执行系统 Chrome/Edge headless viewport/keyboard 验收；发布壳由 GitHub macOS runner 的 DMG smoke 独立证明。
 - Observation / Compatibility Harness 的 job lifecycle 验收维度：scope、结构化节点状态、人工决定幂等、失败记录与进程重启后的明确终态。分析窗口幂等、partial/dropped 和失败节点续跑是后续扩展，不纳入本轮已有能力声明。
 - AI Collaboration Harness：规划、架构、QA 独立审查；明确当前实现与建议。
 
@@ -70,6 +72,7 @@
 | Scope | project/quick/global | scope 不串；anonymous 排除；Quick 在稳定 scope 前不宣称跨会话 | query tests + real scoped paths |
 | State boundary | Phase 0/1 candidate | UI 只显示真实 pending/accepted/rejected/job 状态，不出现未接入的 eval_passed/active | negative UI assertion |
 | Viewport | 审核队列和详情 | 1366×768 主从同屏；窄窗口单列 list/detail，主动作可达且无水平溢出 | screenshots/video + keyboard path |
+| Lock screen | 本机在验收或交付期间锁屏 | 不请求解锁、不绕过系统安全；headless 1366/390 完整决定、历史、日志与键盘交互继续，390 决策栏位于 viewport 内；PR/CI/合并/发版通过 CLI 与远端 runner 完成 | JSON receipt（`interactive_desktop_required=false`、`os_lock_state_observed=not_measured`）+ screenshots + CI log + macOS DMG smoke |
 | Release | Dev 通过后的发布声明 | PR+CI、安装包/build metadata、发布版重跑主路径；此前保持 not live | PR checks + installer + live evidence |
 
 ## 5. 完成边界

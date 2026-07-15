@@ -832,7 +832,7 @@ function ReviewPanel({
           </div>
           <h2 className="break-words text-base font-semibold leading-relaxed">{selected.observation}</h2>
         </div>
-        <div className="space-y-4 p-4">
+        <div className="space-y-4 p-4 pb-24 lg:pb-4">
           <DetailBlock title="建议变更">
             <p className="break-words text-sm leading-relaxed text-gray-300">{selected.suggestion}</p>
           </DetailBlock>
@@ -883,7 +883,7 @@ function ReviewPanel({
               onKeyDown={(event) => {
                 if (event.key === "Escape" && !busy) onCancelConfirm();
               }}
-              className="rounded-lg border border-amber-700/50 bg-amber-950/20 p-3"
+              className="fixed inset-x-3 bottom-3 z-30 max-h-[calc(100dvh-1.5rem)] overflow-y-auto rounded-lg border border-amber-700/50 bg-surface-1 p-3 shadow-2xl lg:static lg:inset-auto lg:z-auto lg:max-h-none lg:overflow-visible lg:bg-amber-950/20 lg:shadow-none"
             >
               <p id="evolution-decision-title" className="text-xs font-medium text-amber-700 dark:text-amber-200">
                 {confirmation === "accept" ? `确认${acceptLabel(selected)}` : "确认拒绝这个候选"}
@@ -912,7 +912,7 @@ function ReviewPanel({
               </div>
             </div>
           ) : (
-            <div className="flex flex-wrap gap-2 border-t border-border pt-4">
+            <div className="fixed inset-x-3 bottom-3 z-20 flex flex-wrap gap-2 rounded-lg border border-border bg-surface-1 p-3 shadow-2xl lg:static lg:inset-auto lg:z-auto lg:rounded-none lg:border-x-0 lg:border-b-0 lg:bg-transparent lg:p-0 lg:pt-4 lg:shadow-none">
               <button ref={acceptTriggerRef} onClick={onAskAccept} disabled={busy || currentValueLoading || currentValueError != null} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover disabled:cursor-wait disabled:opacity-50">
                 <Check size={12} /> {acceptLabel(selected)}
               </button>

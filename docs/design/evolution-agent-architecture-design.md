@@ -181,6 +181,14 @@ job.completed|failed
 
 本轮 `accepted` 只表示当前目标已按现有本地语义物化；是否经过评测、是否适合发布或推广到其他项目均未知。后续引入 Eval/Activation 时必须单独设计兼容迁移和显式状态，不能追溯性地给旧记录补写“评测通过”。
 
+### 锁屏不阻断验证
+
+- `scripts/verify-evolution-workbench-headless.mjs` 启动本地 Vite、使用系统 Chrome/Edge 的 headless 模式加载专用验收入口，并在 1366×768 与 390×812 两个真实浏览器布局引擎视口执行候选选择、确认取消、拒绝、采纳、焦点、历史和精确日志断言；390 视口还要求固定决策栏与确认按钮完整落在 viewport 内。
+- 验收入口只由独立 HTML 加载，使用 Tauri 官方 mock IPC 和有界 fixture，不进入 production `index.html` bundle，不读取用户数据库或凭据。
+- headless receipt 证明 DOM、CSS layout、键盘与状态流不依赖交互桌面，在锁屏时替代不可用的桌面控制接口；它不检测或证明 OS 当时确实锁屏，也不证明 Tauri 壳或安装包。receipt 必须写 `interactive_desktop_required=false` 与 `os_lock_state_observed=not_measured`，不得硬编码伪造锁屏观测。
+- `.github/workflows/release.yml` 的 macOS job 继续从 DMG 复制精确 app、启动隔离 HOME、检查稳定窗口和数据库；该远端 runner 证明真实发布壳与产物，不依赖本机是否锁屏。
+- CI 同时运行 unit/integration、headless viewport 和 Rust tests。任何一层失败都保持 PR/Release blocked；不得因为本机锁屏静默跳过。
+
 ## 8. 后续目标架构
 
 在上述最小合同稳定并有真实使用证据后，再评估 `agent_runs`、`agent_events`、独立 `improvement_candidates`、`candidate_evidence`、`candidate_reviews`、`candidate_change_receipts` 和通用 `eval_cases/eval_runs`。只有届时才引入 `draft -> pending_review -> approved/rejected -> materialized -> eval_passed/eval_failed -> pending_activation -> active` 等完整状态机及 `expected_revision`；不得为了未来模型提前复制现有数据。

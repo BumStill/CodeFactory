@@ -48,7 +48,7 @@
 - Phase 5：显式授权的 draft PR 流程。
 
 ## Blockers
-- 共享 `/Applications/CodeFactoryDev.app` 仍由另一条任务占用，但本任务已用独立 identifier、1421 端口和临时 HOME 绕开，不再阻塞本轮桌面验收。最后一次 post-mortem 定向会话准备时桌面控制因检测到物理输入暂停；这只留下该项真实候选证据，不阻塞代码、自动化或已完成的主路径证据。
+- 当前无实现 blocker。共享 `/Applications/CodeFactoryDev.app` 由另一条任务占用时，本任务使用独立 identifier、端口和临时 HOME；本机锁屏时不绕过 macOS 安全，也不要求用户解锁，改由系统 Chrome/Edge headless viewport gate、CLI 和 GitHub runner 继续验证与交付。
 
 ## Evidence
 - Local evidence: frontend `35 files / 164 tests`、Rust `247 passed / 6 ignored`；`pnpm build`、governance baseline、long-task validator 与 `git diff --check` 通过。本轮新增回归覆盖准确 badge、project scope、A→B 请求竞态与立即清旧数据、远程复盘默认关闭/显式开启、候选详情与双确认、真实 current value/读取失败门禁、有效偏好全局回退、来源 job 精确直达与不可用不回退、旧来源打开同时保留最新阶段流、超出最近作业窗口的决定日志回链、日志读取失败非空态、来源作业读取失败非假空态、失败动作自动刷新 ledger/current value、决定完成后等待 busy 解除再聚焦下一候选、最后候选完成后的焦点去向、单 job 最新 500 条终态、作业/事件顺序、分析最终事务回滚、failure event/job terminal 双向半失败事务回滚、同项目分析并发门禁、采纳幂等、拒绝无物化、跨进程决定占用、偏好原子回滚、失败脱敏、真实死亡子进程恢复、PID 重用识别和存活 owner 保留。仓库没有独立 `pnpm typecheck` 命令，production build 实际执行 `tsc`；构建的既有 chunk-size warning、既有 Workspace 测试 act warning 与 Rust benchmark dead-code warning 单独保留，不伪装成新失败。
@@ -60,8 +60,9 @@
 - Post-mortem: 实地日志发现旧 `default_model=gpt-5.5` 被错误发往 DeepSeek；已改为 endpoint active-model。随后真实请求暴露 max_tokens=500 时只有 reasoning/无 final content；已加入 reasoning 隔离和 2000-token 有界重试并通过回归测试，但本轮尚未取得真实模型候选，仍列为剩余证据。
 - Quick scope: 单个 Quick session 可进入 chat post-mortem，但“新建快速任务”使用独立 scratch cwd；当前 cross-session miner 按精确 cwd 聚合，因此 Quick-to-Quick 模式尚没有稳定 scope，不伪装为已覆盖。
 - Integrity review: 独立架构复审提出 JSON 脱敏、terminal/replay 原子一致性、旧 support 口径和 preference key 四类高风险边界；均先补失败测试再修复，目标与完整回归已通过。
-- Release evidence: PR #104 仍为 draft；旧提交 `e0acbd5` 的 CI/check 已全绿，但本轮工作台变更尚待新 CI。当前 `not live`，尚未合并、刻意发版或安装包验证。
-- Review Workbench evidence: 隔离验收库用 2 个真实 project session 加入有界轨迹 fixture（8 次 `bash`、2 次 error）后，从工作台真实运行本地 miner；UI/SQLite 一致得到 1 个候选、25% error。采纳后只增加 1 个稳定 memory marker；另一个跨 2 session/3 task retry 候选拒绝后 marker 仍为 1。第三次分析保留 1 条待审用于 viewport 验收。结构化日志显示 2 session、11 条轨迹、1 个候选及完整阶段；完整进程重启后历史仍在，人工注入的 legacy `running` 验收 job 被 schema 恢复逻辑明确关闭为 `failed` 并追加 `process_restart` 事件。既有截图保存在隔离验收目录 `/tmp/codefactory-evolution-workbench-evidence/`，但生成时间早于最终双确认、current value、精确 job 直达和焦点加固，不能替代最终版本复验。
+- Release evidence: PR #104 在提交 `6dab94b` 上 CI、governance 均全绿；加入锁屏安全门禁后需等待新提交 CI。当前 `not live`，尚未合并、刻意发版或安装包验证。
+- Review Workbench evidence: 最终代码在独立 `CodeFactoryEvolutionDev.app`、`full_access=true` 和隔离 SQLite 上完成真实宽屏主路径。Home 一级入口显示 3 待审；fixture scope 显示 2 待审、2 session/11 轨迹/2 候选。preference 真实读取 `_global_ response_language=zh-CN`，拒绝确认用 Escape 取消后焦点返回，正式拒绝生成 succeeded `review_reject` 且 global preference 未变；随后自动聚焦 memory 候选。memory 采纳双确认后只写入 1 个稳定 marker，生成 succeeded `review_accept` 和 `review -> materialize -> job` receipt，最终聚焦“查看决定历史”。决定历史的 accepted/rejected 与精确来源/决定日志可回链；分析日志逐项展示 scope、trace_read、privacy、extract、deduplicate、review、completed。截图在 `/tmp/codefactory-evolution-workbench-evidence-final/`。
+- Lock-safe viewport evidence: 本机再次锁屏后，`pnpm test:evolution:headless` 仍用系统 Chrome headless 成功执行 1366×768 与 390×812 的完整拒绝、采纳、焦点、历史、精确 job 日志和分析流；390 另覆盖 keyboard list/detail/back、确认取消、决策栏与确认按钮 viewport 边界及无水平溢出。receipt 如实标记 `interactive_desktop_required=false`、`os_lock_state_observed=not_measured`，不把“不依赖桌面”冒充为 OS 锁屏自证；截图与 JSON 位于系统临时目录 `codefactory-evolution-headless`。该证据证明浏览器布局/交互，不冒充 Tauri 壳；发布壳由 GitHub macOS DMG smoke 证明。
 - Privacy/permission: 验收 HOME 的设置确认 `permissions.full_access=true` 且 `remote_postmortem_enabled=false`；普通 Dev 路径无用户授权弹窗。本地 miner/job 日志只展示聚合计数和白名单字段，raw prompt/reasoning 不进入事件详情。
 - Blocking evidence: 当前 main 的 self-evolution 查询读空已由代码审计确认。
 
@@ -69,7 +70,7 @@
 - context scope: PPT、origin/main v1.43.0→v1.43.1、session/agent/learning/evidence/self-evolution/benchmark/UI。
 - assumptions: 首期保持本地 Tauri+SQLite，不照搬重型服务。
 - review point: R9-R11 只做现有真实候选的可信 Review Shell；R12 才引入 persistent jobs；没有 versioned candidate/review 前不做变更请求，没有 Evals/activation 数据前不显示对应状态。
-- validation result: 规划、架构、QA 一致拒绝“先做空数据看板”；R9-R14 已实现并在隔离 Dev 真实 App 证明入口、scope、候选、Review、物化、日志、重启和 viewport 路径。通用 Evals/activation、versioned review、Quick 稳定 scope 和其余 Phase 0/1 底座证据仍未完成；在 PR/CI/刻意发版和发布包复验之前，本轮工作台也仍是 `not live`。
+- validation result: 规划、架构、QA 一致拒绝“先做空数据看板”；R9-R15 已实现。隔离 Dev 真实 App 证明入口、scope、候选、Review、物化、日志和重启；headless gate 证明 1366/390 完整决定、历史、日志与键盘路径不依赖可交互桌面，且不自行声称测得 OS 锁屏状态。通用 Evals/activation、versioned review、Quick 稳定 scope 和其余 Phase 0/1 底座证据仍未完成；在 PR/CI/刻意发版和发布包复验之前，本轮工作台也仍是 `not live`。
 
 ## Stop Boundary
 - 不在本地单测后停止。
