@@ -513,7 +513,10 @@ export function LearningLogSection({ selectedCwd }: { selectedCwd: string | null
     setBusyId(id);
     setError(null);
     try {
-      await accept(id, selectedCwd);
+      // Profile is a compatibility surface; approval never opts into
+      // automatic activation here. The full Eval/activation controls live in
+      // the explicit Evolution workbench.
+      await accept(id, selectedCwd, false);
     } catch (e) {
       setError(String(e));
     } finally {

@@ -50,17 +50,16 @@ describe("learning store", () => {
     expect(useLearningStore.getState().loading["/proj"]).toBe(false);
   });
 
-  it("accept calls accept_learning_event and patches local state optimistically", async () => {
+  it("approval calls the versioned Eval command and removes the legacy pending row", async () => {
     invokeMock.mockResolvedValueOnce([mkEvent("a")]); // load
     await useLearningStore.getState().load("/proj");
     invokeMock.mockResolvedValueOnce(undefined); // accept
 
-    await useLearningStore.getState().accept("a", "/proj");
+    await useLearningStore.getState().accept("a", "/proj", false);
 
-    expect(invokeMock).toHaveBeenCalledWith("accept_learning_event", { eventId: "a" });
+    expect(invokeMock).toHaveBeenCalledWith("approve_learning_event", { eventId: "a", autoActivate: false });
     const a = useLearningStore.getState().events["/proj"].find((e) => e.id === "a");
-    expect(a?.status).toBe("accepted");
-    expect(a?.decided_at).toBeTruthy();
+    expect(a).toBeUndefined();
   });
 
   it("reject calls reject_learning_event and patches local state optimistically", async () => {

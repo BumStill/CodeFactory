@@ -197,20 +197,34 @@ async function run() {
     await memoryQueueButton.waitFor();
     await waitForFocusedText(page, "工具读取文件", "next candidate was not focused after reject");
 
-    await page.getByRole("button", { name: "采纳并写入项目记忆" }).click();
-    await page.getByRole("button", { name: "确认采纳并写入项目记忆" }).click();
+    await page.getByRole("button", { name: "批准并运行 Evals" }).click();
+    const wideAuto = page.getByRole("checkbox", { name: /通过后自动激活/ });
+    assert(!await wideAuto.isChecked(), "auto activation must default off");
+    await wideAuto.check();
+    await page.getByRole("button", { name: "确认批准并运行 Evals" }).click();
     const historyAction = page.getByRole("button", { name: "查看决定历史" });
     await historyAction.waitFor();
     await waitForFocusedText(page, "查看决定历史", "history action was not focused after final decision");
     await historyAction.click();
-    assert(await page.getByText("已采纳到项目记忆").isVisible(), "accepted decision missing from history");
     assert(await page.getByText("已拒绝", { exact: false }).first().isVisible(), "rejected decision missing from history");
     await page.screenshot({ path: path.join(artifactDir, "wide-history.png"), fullPage: true });
 
-    await page.getByRole("button", { name: "查看审核与物化日志" }).click();
-    await page.getByText("headless-accept").waitFor();
-    assert(await page.getByText("候选已物化并生效").isVisible(), "materialization receipt missing");
-    await page.screenshot({ path: path.join(artifactDir, "wide-materialize-log.png"), fullPage: true });
+    await page.getByRole("tab", { name: /评测与激活 1/ }).click();
+    assert(await page.getByText("7/7 required cases 通过").isVisible(), "Eval case summary missing");
+    assert(await page.getByText("回滚准备度").isVisible(), "required rollback Eval case missing");
+    assert(await page.getByText(/receipt headless-activation/).isVisible(), "activation receipt missing");
+    await page.screenshot({ path: path.join(artifactDir, "wide-eval-active.png"), fullPage: true });
+    await page.getByRole("button", { name: "回滚" }).click();
+    await page.getByRole("button", { name: "确认回滚" }).click();
+    await page.getByText(/已按 exact receipt 回滚/).waitFor();
+    await page.screenshot({ path: path.join(artifactDir, "wide-rollback.png"), fullPage: true });
+
+    await page.getByRole("tab", { name: "作业与日志" }).click();
+    await page.getByRole("button", { name: /人工批准与评测 已完成/ }).click();
+    await page.getByText("headless-approve").waitFor();
+    assert(await page.getByText("激活安全 Evals 全部通过").isVisible(), "Eval job log missing");
+    assert(await page.getByText("Eval 通过后已激活，下一次 Agent 调用生效").isVisible(), "activation job log missing");
+    await page.screenshot({ path: path.join(artifactDir, "wide-eval-activation-log.png"), fullPage: true });
     await page.getByRole("button", { name: /跨会话分析 已完成/ }).click();
     for (const stage of ["分析范围已确定", "轨迹读取完成", "隐私处理完成", "候选提取完成", "候选去重完成", "分析完成"]) {
       assert(await page.getByText(stage).first().isVisible(), `analysis stage missing: ${stage}`);
@@ -222,12 +236,12 @@ async function run() {
     await page.getByRole("heading", { name: "进化审查" }).waitFor();
     const narrowCandidate = page.getByRole("button", { name: /多次人工决定/ });
     assert(await narrowCandidate.isVisible(), "narrow candidate list missing");
-    assert(!await page.getByRole("button", { name: "采纳并更新偏好" }).isVisible(), "narrow detail should be hidden before selection");
+    assert(!await page.getByRole("button", { name: "批准并运行 Evals" }).isVisible(), "narrow detail should be hidden before selection");
     await narrowCandidate.focus();
     await page.keyboard.press("Enter");
     const backButton = page.getByRole("button", { name: "返回候选队列" });
     await backButton.waitFor();
-    const narrowAccept = page.getByRole("button", { name: "采纳并更新偏好" });
+    const narrowAccept = page.getByRole("button", { name: "批准并运行 Evals" });
     const narrowReject = page.getByRole("button", { name: "拒绝" });
     assert(await narrowAccept.isVisible(), "narrow detail action missing");
     await assertWithinViewport(narrowAccept, { width: 390, height: 812 }, "narrow accept action is outside the viewport");
@@ -243,11 +257,11 @@ async function run() {
     await narrowAccept.click({ trial: true });
     await narrowAccept.focus();
     await page.keyboard.press("Enter");
-    const narrowConfirmAccept = page.getByRole("button", { name: "确认采纳并更新偏好" });
+    const narrowConfirmAccept = page.getByRole("button", { name: "确认批准并运行 Evals" });
     await narrowConfirmAccept.waitFor();
     await assertWithinViewport(narrowConfirmAccept, { width: 390, height: 812 }, "narrow accept confirmation is outside the viewport");
     await page.keyboard.press("Escape");
-    await waitForFocusedText(page, "采纳并更新偏好", "narrow cancel did not restore accept focus");
+    await waitForFocusedText(page, "批准并运行 Evals", "narrow cancel did not restore accept focus");
 
     await narrowReject.focus();
     await page.keyboard.press("Enter");
@@ -261,30 +275,50 @@ async function run() {
     await narrowMemoryCandidate.waitFor();
     await waitForFocusedText(page, "工具读取文件", "narrow reject did not focus the next candidate");
     await page.keyboard.press("Enter");
-    const narrowMemoryAccept = page.getByRole("button", { name: "采纳并写入项目记忆" });
+    const narrowMemoryAccept = page.getByRole("button", { name: "批准并运行 Evals" });
     await narrowMemoryAccept.click({ trial: true });
     await assertWithinViewport(narrowMemoryAccept, { width: 390, height: 812 }, "narrow memory accept action is outside the viewport");
     await narrowMemoryAccept.focus();
     await page.keyboard.press("Enter");
-    const narrowConfirmMemory = page.getByRole("button", { name: "确认采纳并写入项目记忆" });
+    const narrowAuto = page.getByRole("checkbox", { name: /通过后自动激活/ });
+    assert(!await narrowAuto.isChecked(), "narrow auto activation must default off");
+    await narrowAuto.focus();
+    await page.keyboard.press("Space");
+    const narrowConfirmMemory = page.getByRole("button", { name: "确认批准并运行 Evals" });
     await narrowConfirmMemory.waitFor();
     await assertWithinViewport(narrowConfirmMemory, { width: 390, height: 812 }, "narrow memory confirmation is outside the viewport");
-    await waitForFocusedText(page, "确认采纳并写入项目记忆", "narrow memory confirmation did not receive focus");
+    await narrowConfirmMemory.focus();
+    await waitForFocusedText(page, "确认批准并运行 Evals", "narrow memory confirmation did not receive focus");
     await page.keyboard.press("Enter");
 
     const narrowHistoryAction = page.getByRole("button", { name: "查看决定历史" });
     await narrowHistoryAction.waitFor();
     await waitForFocusedText(page, "查看决定历史", "narrow final decision did not focus history");
     await page.keyboard.press("Enter");
-    assert(await page.getByText("已采纳到项目记忆").isVisible(), "narrow accepted decision missing from history");
     assert(await page.getByText("已拒绝", { exact: false }).first().isVisible(), "narrow rejected decision missing from history");
     await page.screenshot({ path: path.join(artifactDir, "narrow-history.png"), fullPage: true });
 
-    const narrowMaterializeLog = page.getByRole("button", { name: "查看审核与物化日志" });
-    await narrowMaterializeLog.focus();
+    const narrowEvalTab = page.getByRole("tab", { name: /评测与激活 1/ });
+    await narrowEvalTab.focus();
     await page.keyboard.press("Enter");
-    await page.getByText("headless-accept").waitFor();
-    assert(await page.getByText("候选已物化并生效").isVisible(), "narrow materialization receipt missing");
+    assert(await page.getByText("7/7 required cases 通过").isVisible(), "narrow Eval summary missing");
+    const narrowRollback = page.getByRole("button", { name: "回滚" });
+    await assertWithinViewport(narrowRollback, { width: 390, height: 812 }, "narrow rollback is outside the viewport");
+    await narrowRollback.focus();
+    await page.keyboard.press("Enter");
+    const narrowConfirmRollback = page.getByRole("button", { name: "确认回滚" });
+    await assertWithinViewport(narrowConfirmRollback, { width: 390, height: 812 }, "narrow rollback confirmation is outside the viewport");
+    await page.keyboard.press("Enter");
+    await page.getByText(/已按 exact receipt 回滚/).waitFor();
+    await page.screenshot({ path: path.join(artifactDir, "narrow-eval-rollback.png"), fullPage: true });
+
+    const narrowJobsTab = page.getByRole("tab", { name: "作业与日志" });
+    await narrowJobsTab.focus();
+    await page.keyboard.press("Enter");
+    const narrowEvalJob = page.getByRole("button", { name: /人工批准与评测 已完成/ });
+    await narrowEvalJob.focus();
+    await page.keyboard.press("Enter");
+    assert(await page.getByText("激活安全 Evals 全部通过").isVisible(), "narrow Eval job log missing");
     const narrowAnalysisJob = page.getByRole("button", { name: /跨会话分析 已完成/ });
     await narrowAnalysisJob.focus();
     await page.keyboard.press("Enter");
@@ -301,11 +335,15 @@ async function run() {
       status: "pass",
       browser: executablePath,
       surfaces: [
-        "wide-review-decision-history-log",
+        "wide-review-eval-activation-rollback-log",
         "narrow-list-detail-back",
-        "narrow-keyboard-decision-history-log",
+        "narrow-keyboard-eval-activation-rollback-log",
       ],
       viewports: ["1366x768", "390x812"],
+      candidate_revision: "headless-memory:1",
+      eval_run_id: "headless-eval-run",
+      activation_receipt_id: "headless-activation",
+      rollback_status: "rolled_back",
       artifact_dir: artifactDir,
       interactive_desktop_required: false,
       os_lock_state_observed: "not_measured",

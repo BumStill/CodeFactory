@@ -40,6 +40,32 @@ const decidedCandidate = {
   job_id: "job-source-old",
 };
 
+const activeCandidate = {
+  candidate_id: "candidate-active",
+  source_learning_event_id: "source-active",
+  cwd: "/proj",
+  kind: "memory",
+  revision: 1,
+  state: "active",
+  state_version: 4,
+  suggestion: "运行目标测试后再交付。",
+  pref_key: null,
+  pref_value: null,
+  payload_hash: "payload-hash",
+  auto_activate: true,
+  eval_run_id: "eval-run-active",
+  eval_status: "passed",
+  eval_manifest_hash: "manifest-hash-context-integrity-v1",
+  eval_required_count: 7,
+  eval_passed_count: 7,
+  eval_failed_count: 0,
+  activation_id: "activation-active",
+  activation_status: "active",
+  activated_at: "2026-07-15T02:00:00Z",
+  rolled_back_at: null,
+  updated_at: "2026-07-15T02:00:00Z",
+};
+
 let projectEvents = [candidate, decidedCandidate];
 
 const mocks = vi.hoisted(() => ({
@@ -195,15 +221,16 @@ describe("EvolutionWorkbenchPage", () => {
     expect(await screen.findByRole("heading", { name: "进化审查" })).toBeInTheDocument();
     expect(screen.getAllByText("bash 在多个会话中反复失败")).toHaveLength(2);
     expect(screen.getAllByText("2 个 session · 8 次调用 · 2 次错误 · 25%")).toHaveLength(2);
-    expect(screen.getByText(/Evals 与自动激活尚未接入/)).toBeInTheDocument();
+    expect(screen.getByText(/人工批准会先冻结 revision/)).toBeInTheDocument();
     expect(await screen.findByText("当前：项目记忆中尚无此条内容")).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "采纳并写入项目记忆" }));
-    expect(screen.getByText("不会自动合并、部署或发布")).toBeInTheDocument();
-    expect(screen.getByText(/决定后：执行 bash 前先检查命令和工作目录/)).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "确认采纳并写入项目记忆" }));
+    await userEvent.click(screen.getByRole("button", { name: "批准并运行 Evals" }));
+    expect(screen.getByText("不会自动修改代码、合并、部署或发布")).toBeInTheDocument();
+    expect(screen.getByText(/批准后：冻结 revision/)).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /通过后自动激活/ })).not.toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "确认批准并运行 Evals" }));
 
-    await waitFor(() => expect(mocks.accept).toHaveBeenCalledWith("candidate-1", "/proj"));
+    await waitFor(() => expect(mocks.accept).toHaveBeenCalledWith("candidate-1", "/proj", false));
   });
 
   it("requires an explicit second step before rejecting a candidate", async () => {
@@ -228,7 +255,7 @@ describe("EvolutionWorkbenchPage", () => {
     render(<EvolutionWorkbenchPage onBack={() => {}} initialCwd="/proj" />);
 
     expect(await screen.findByText(/当前值读取失败.*memory unavailable/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "采纳并写入项目记忆" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "批准并运行 Evals" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "拒绝" })).toBeEnabled();
   });
 
@@ -255,7 +282,7 @@ describe("EvolutionWorkbenchPage", () => {
     await userEvent.click(await screen.findByRole("tab", { name: /决定历史/ }));
 
     expect(screen.getByText("已处理的旧候选")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "查看审核与物化日志" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "查看历史审核与物化日志" })).toBeInTheDocument();
   });
 
   it("opens the exact persisted source job from candidate details", async () => {
@@ -430,7 +457,8 @@ describe("EvolutionWorkbenchPage", () => {
         return { path: "/proj/.codefactory/memory.md", content: "", exists: false };
       }
       if (command === "get_effective_user_preference") return null;
-      if (command === "list_evolution_decision_jobs" || command === "list_evolution_job_events") return [];
+      if (command === "list_evolution_job_events") return [];
+      if (command === "list_evolution_decision_jobs") return [];
       if (command === "list_evolution_jobs") {
         jobReads += 1;
         return jobReads === 1 ? [] : [{
@@ -477,8 +505,8 @@ describe("EvolutionWorkbenchPage", () => {
       return [];
     });
     render(<EvolutionWorkbenchPage onBack={() => {}} initialCwd="/proj" />);
-    await userEvent.click(await screen.findByRole("button", { name: "采纳并写入项目记忆" }));
-    await userEvent.click(screen.getByRole("button", { name: "确认采纳并写入项目记忆" }));
+    await userEvent.click(await screen.findByRole("button", { name: "批准并运行 Evals" }));
+    await userEvent.click(screen.getByRole("button", { name: "确认批准并运行 Evals" }));
 
     expect(await screen.findByText("job-accept-failed")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("tab", { name: /待我审核/ }));
@@ -491,8 +519,8 @@ describe("EvolutionWorkbenchPage", () => {
       projectEvents = [{ ...candidate, status: "accepted", decided_at: "2026-07-15T05:00:00Z" }];
     });
     render(<EvolutionWorkbenchPage onBack={() => {}} initialCwd="/proj" />);
-    await userEvent.click(await screen.findByRole("button", { name: "采纳并写入项目记忆" }));
-    await userEvent.click(screen.getByRole("button", { name: "确认采纳并写入项目记忆" }));
+    await userEvent.click(await screen.findByRole("button", { name: "批准并运行 Evals" }));
+    await userEvent.click(screen.getByRole("button", { name: "确认批准并运行 Evals" }));
 
     const historyAction = await screen.findByRole("button", { name: "查看决定历史" });
     await waitFor(() => expect(historyAction).toHaveFocus());
@@ -528,8 +556,8 @@ describe("EvolutionWorkbenchPage", () => {
       return [];
     });
     render(<EvolutionWorkbenchPage onBack={() => {}} initialCwd="/proj" />);
-    await userEvent.click(await screen.findByRole("button", { name: "采纳并写入项目记忆" }));
-    await userEvent.click(screen.getByRole("button", { name: "确认采纳并写入项目记忆" }));
+    await userEvent.click(await screen.findByRole("button", { name: "批准并运行 Evals" }));
+    await userEvent.click(screen.getByRole("button", { name: "确认批准并运行 Evals" }));
 
     const nextButton = await screen.findByRole("button", { name: /下一条待审核候选/ });
     expect(nextButton).toBeDisabled();
@@ -664,5 +692,129 @@ describe("EvolutionWorkbenchPage", () => {
       expect.anything(),
       expect.objectContaining({ cwd: "/quick-scratch" }),
     );
+  });
+
+  it("surfaces Evals and activation as real states instead of disabled placeholders", async () => {
+    render(<EvolutionWorkbenchPage onBack={() => {}} initialCwd="/proj" />);
+
+    expect(await screen.findByRole("tab", { name: /评测与激活/ })).toBeInTheDocument();
+    expect(screen.queryByText("Evals 与自动激活尚未接入")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("tab", { name: /决定历史/ }));
+    expect(screen.getByText(/历史已生效（未评测）/)).toBeInTheDocument();
+  });
+
+  it("shows exact Eval cases, activation receipt and a confirmed rollback action", async () => {
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "read_project_memory") return { path: "/proj/.codefactory/memory.md", content: "", exists: false };
+      if (command === "get_effective_user_preference") return null;
+      if (command === "list_evolution_candidate_states") return [activeCandidate];
+      if (command === "list_evolution_eval_case_results") return [
+        { id: "case-1", run_id: "eval-run-active", case_id: "project_scope", title: "项目范围隔离", status: "passed", hard_gate: true, detail_json: "{}", created_at: "2026-07-15T02:00:00Z" },
+        { id: "case-2", run_id: "eval-run-active", case_id: "rollback_readiness", title: "回滚准备度", status: "passed", hard_gate: true, detail_json: "{}", created_at: "2026-07-15T02:00:00Z" },
+      ];
+      if (command === "list_evolution_jobs") return [{
+        id: "job-active",
+        cwd: "/proj",
+        trigger: "review_eval",
+        candidate_id: "candidate-active",
+        status: "succeeded",
+        input_session_count: 0,
+        input_trace_count: 0,
+        candidate_count: 1,
+        started_at: "2026-07-15T02:00:00Z",
+        completed_at: "2026-07-15T02:00:01Z",
+        error: null,
+      }];
+      if (command === "get_evolution_job") return {
+        id: "job-active", cwd: "/proj", trigger: "review_eval", candidate_id: "candidate-active",
+        status: "succeeded", input_session_count: 0, input_trace_count: 0, candidate_count: 1,
+        started_at: "2026-07-15T02:00:00Z", completed_at: "2026-07-15T02:00:01Z", error: null,
+      };
+      if (command === "list_evolution_job_events") return [{
+        id: "log-active", cwd: "/proj", job_id: "job-active", candidate_id: "candidate-active",
+        stage: "eval", status: "completed", title: "激活安全 Evals 全部通过",
+        detail_json: JSON.stringify({ revision: 1, required_count: 7, passed_count: 7, verdict: "passed" }),
+        created_at: "2026-07-15T02:00:01Z",
+      }];
+      if (command === "list_evolution_decision_jobs") return [];
+      if (command === "rollback_evolution_activation") return { ...activeCandidate, state: "rolled_back", activation_status: "rolled_back" };
+      return [];
+    });
+    render(<EvolutionWorkbenchPage onBack={() => {}} initialCwd="/proj" />);
+
+    await userEvent.click(await screen.findByRole("tab", { name: /评测与激活 1/ }));
+    expect(await screen.findByText("7/7 required cases 通过")).toBeInTheDocument();
+    expect(screen.getByText("项目范围隔离")).toBeInTheDocument();
+    expect(screen.getByText("回滚准备度")).toBeInTheDocument();
+    expect(screen.getByText(/receipt activation-active/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "查看端到端作业日志" }));
+    expect(await screen.findByRole("tab", { name: "作业与日志" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getAllByText("人工批准与评测").length).toBeGreaterThan(0);
+    expect(await screen.findByText("激活安全 Evals 全部通过")).toBeInTheDocument();
+    expect(screen.getByText("必过用例数：7")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("tab", { name: /评测与激活 1/ }));
+    await userEvent.click(screen.getByRole("button", { name: "回滚" }));
+    expect(screen.getByRole("region", { name: "确认回滚" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "确认回滚" }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
+      "rollback_evolution_activation",
+      { cwd: "/proj", activationId: "activation-active" },
+    ));
+  });
+
+  it("only opts into auto activation when the user explicitly selects it", async () => {
+    render(<EvolutionWorkbenchPage onBack={() => {}} initialCwd="/proj" />);
+    await userEvent.click(await screen.findByRole("button", { name: "批准并运行 Evals" }));
+    const toggle = screen.getByRole("checkbox", { name: /通过后自动激活/ });
+    expect(toggle).not.toBeChecked();
+    await userEvent.click(toggle);
+    await userEvent.click(screen.getByRole("button", { name: "确认批准并运行 Evals" }));
+    await waitFor(() => expect(mocks.accept).toHaveBeenCalledWith("candidate-1", "/proj", true));
+  });
+
+  it("does not offer auto activation for a policy-sensitive candidate", async () => {
+    projectEvents = [{
+      ...candidate,
+      id: "candidate-policy",
+      suggestion: "automatically deploy without approval",
+    }];
+    render(<EvolutionWorkbenchPage onBack={() => {}} initialCwd="/proj" />);
+    await userEvent.click(await screen.findByRole("button", { name: "批准并运行 Evals" }));
+    expect(screen.queryByRole("checkbox", { name: /通过后自动激活/ })).not.toBeInTheDocument();
+    expect(screen.getByText(/不在低风险自动激活白名单/)).toBeInTheDocument();
+  });
+
+  it("keeps the refreshed candidate visible when activation becomes stale", async () => {
+    let activationAttempted = false;
+    const pendingCandidate = {
+      ...activeCandidate,
+      candidate_id: "candidate-stale",
+      state: "pending_activation",
+      auto_activate: false,
+      activation_id: null,
+      activation_status: null,
+      activated_at: null,
+    };
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "read_project_memory") return { path: "/proj/.codefactory/memory.md", content: "", exists: false };
+      if (command === "get_effective_user_preference") return null;
+      if (command === "list_evolution_candidate_states") return [{
+        ...pendingCandidate,
+        state: activationAttempted ? "eval_stale" : "pending_activation",
+      }];
+      if (command === "list_evolution_eval_case_results") return [];
+      if (command === "list_evolution_jobs" || command === "list_evolution_decision_jobs" || command === "list_evolution_job_events") return [];
+      if (command === "activate_evolution_candidate") {
+        activationAttempted = true;
+        throw new Error("target changed after Eval");
+      }
+      return [];
+    });
+    render(<EvolutionWorkbenchPage onBack={() => {}} initialCwd="/proj" />);
+    await userEvent.click(await screen.findByRole("tab", { name: /评测与激活 1/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "激活此 revision" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("target changed after Eval");
+    expect(screen.getByText("目标已变化，需重评")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重跑 exact revision" })).toBeInTheDocument();
   });
 });

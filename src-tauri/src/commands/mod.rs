@@ -6,6 +6,7 @@ pub mod checkpoints;
 pub mod control_plane;
 pub mod costs;
 pub mod evidence;
+pub mod evolution;
 pub mod files;
 pub mod git;
 pub mod git_remote;

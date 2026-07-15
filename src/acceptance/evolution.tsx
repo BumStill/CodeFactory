@@ -8,7 +8,7 @@ import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 
 import "../styles/globals.css";
 import type { LearningEvent } from "../stores/learning";
-import type { EvolutionJob, EvolutionJobEvent } from "../stores/evolution";
+import type { EvolutionCandidateState, EvolutionEvalCaseResult, EvolutionJob, EvolutionJobEvent } from "../stores/evolution";
 import type { Session } from "../lib/tauri";
 
 const cwd = "/lock-safe-evolution-fixture";
@@ -60,6 +60,20 @@ const memoryCandidate: LearningEvent = {
 };
 
 let candidates: LearningEvent[] = [preferenceCandidate, memoryCandidate];
+let candidateStates: EvolutionCandidateState[] = [];
+const evalCases: EvolutionEvalCaseResult[] = [
+  "冻结版本完整性", "项目范围隔离", "隐私与长度合同", "低风险目标白名单",
+  "Baseline 未提前生效", "Treatment 精确注入一次", "回滚准备度",
+].map((title, index) => ({
+  id: `headless-eval-case-${index}`,
+  run_id: "headless-eval-run",
+  case_id: `case-${index}`,
+  title,
+  status: "passed",
+  hard_gate: true,
+  detail_json: JSON.stringify({ reason: "ok" }),
+  created_at: `2026-07-15T04:32:0${index}Z`,
+}));
 
 const analysisJob: EvolutionJob = {
   id: "headless-analysis",
@@ -98,35 +112,82 @@ const eventsByJob = new Map<string, EvolutionJobEvent[]>([
   }))],
 ]);
 
-function decide(eventId: string, status: "accepted" | "rejected") {
+function reject(eventId: string) {
   candidates = candidates.map((candidate) => candidate.id === eventId
-    ? { ...candidate, status, decided_at: new Date().toISOString() }
+    ? { ...candidate, status: "rejected", decided_at: new Date().toISOString() }
     : candidate);
-  const accepted = status === "accepted";
-  const id = accepted ? "headless-accept" : "headless-reject";
+  const id = "headless-reject";
   const job: EvolutionJob = {
     id,
     cwd,
-    trigger: accepted ? "review_accept" : "review_reject",
+    trigger: "review_reject",
     candidate_id: eventId,
     status: "succeeded",
     input_session_count: 0,
     input_trace_count: 0,
-    candidate_count: accepted ? 1 : 0,
-    started_at: accepted ? "2026-07-15T04:32:00Z" : "2026-07-15T04:31:00Z",
-    completed_at: accepted ? "2026-07-15T04:32:01Z" : "2026-07-15T04:31:01Z",
+    candidate_count: 0,
+    started_at: "2026-07-15T04:31:00Z",
+    completed_at: "2026-07-15T04:31:01Z",
     error: null,
   };
   decisionJobs = [job, ...decisionJobs.filter((existing) => existing.id !== id)];
-  eventsByJob.set(id, accepted ? [
-    eventFor(id, "review", "completed", "人工审核通过，准备物化", 0),
-    eventFor(id, "materialize", "started", "开始应用候选", 1),
-    eventFor(id, "materialize", "completed", "候选已物化并生效", 2),
-    eventFor(id, "job", "completed", "审核与物化完成", 3),
-  ] : [
+  eventsByJob.set(id, [
     eventFor(id, "review", "completed", "人工已拒绝候选", 0),
     eventFor(id, "job", "completed", "拒绝决定已保存", 1),
   ]);
+}
+
+function approve(eventId: string, autoActivate: boolean) {
+  const source = candidates.find((candidate) => candidate.id === eventId);
+  if (!source) throw new Error("candidate not found");
+  candidates = candidates.filter((candidate) => candidate.id !== eventId);
+  const state: EvolutionCandidateState = {
+    candidate_id: source.id,
+    source_learning_event_id: source.id,
+    cwd,
+    kind: source.kind,
+    revision: 1,
+    state: autoActivate ? "active" : "pending_activation",
+    state_version: autoActivate ? 4 : 3,
+    suggestion: source.suggestion,
+    pref_key: source.pref_key,
+    pref_value: source.pref_value,
+    payload_hash: "headless-payload-hash",
+    auto_activate: autoActivate,
+    eval_run_id: "headless-eval-run",
+    eval_status: "passed",
+    eval_manifest_hash: "headless-context-integrity-manifest",
+    eval_required_count: 7,
+    eval_passed_count: 7,
+    eval_failed_count: 0,
+    activation_id: autoActivate ? "headless-activation" : null,
+    activation_status: autoActivate ? "active" : null,
+    activated_at: autoActivate ? "2026-07-15T04:32:09Z" : null,
+    rolled_back_at: null,
+    updated_at: "2026-07-15T04:32:09Z",
+  };
+  candidateStates = [state, ...candidateStates];
+  const job: EvolutionJob = {
+    id: "headless-approve",
+    cwd,
+    trigger: "review_eval",
+    candidate_id: eventId,
+    status: "succeeded",
+    input_session_count: 0,
+    input_trace_count: 0,
+    candidate_count: 1,
+    started_at: "2026-07-15T04:32:00Z",
+    completed_at: "2026-07-15T04:32:09Z",
+    error: null,
+  };
+  decisionJobs = [job, ...decisionJobs.filter((existing) => existing.id !== job.id)];
+  eventsByJob.set(job.id, [
+    eventFor(job.id, "review", "completed", "人工批准完成", 0),
+    eventFor(job.id, "stage", "completed", "候选 revision 已冻结，live target 未改变", 1),
+    eventFor(job.id, "eval", "completed", "激活安全 Evals 全部通过", 2),
+    ...(autoActivate ? [eventFor(job.id, "activation", "completed", "Eval 通过后已激活，下一次 Agent 调用生效", 3)] : []),
+  ]);
+  return state;
 }
 
 function eventFor(jobId: string, stage: string, status: string, title: string, index: number): EvolutionJobEvent {
@@ -134,12 +195,12 @@ function eventFor(jobId: string, stage: string, status: string, title: string, i
     id: `${jobId}-${index}`,
     cwd,
     job_id: jobId,
-    candidate_id: jobId === "headless-accept" ? memoryCandidate.id : preferenceCandidate.id,
+    candidate_id: jobId === "headless-approve" ? memoryCandidate.id : preferenceCandidate.id,
     stage,
     status,
     title,
-    detail_json: JSON.stringify({ schema_version: 1, target: stage === "materialize" ? "memory" : undefined }),
-    created_at: `2026-07-15T04:3${jobId === "headless-accept" ? 2 : 1}:0${index}.000Z`,
+    detail_json: JSON.stringify({ schema_version: 1, target: stage === "activation" ? "memory" : undefined }),
+    created_at: `2026-07-15T04:3${jobId === "headless-approve" ? 2 : 1}:0${index}.000Z`,
   };
 }
 
@@ -174,11 +235,20 @@ mockIPC((command, args) => {
     }
     case "list_evolution_job_events":
       return eventsByJob.get(String(payload.jobId)) ?? [];
-    case "accept_learning_event":
-      decide(String(payload.eventId), "accepted");
-      return {};
+    case "list_evolution_candidate_states":
+      return candidateStates.map((candidate) => ({ ...candidate }));
+    case "list_evolution_eval_case_results":
+      return String(payload.runId) === "headless-eval-run" ? evalCases : [];
+    case "approve_learning_event":
+      return approve(String(payload.eventId), Boolean(payload.autoActivate));
+    case "rollback_evolution_activation": {
+      candidateStates = candidateStates.map((candidate) => candidate.activation_id === payload.activationId
+        ? { ...candidate, state: "rolled_back", activation_status: "rolled_back", rolled_back_at: "2026-07-15T04:33:00Z" }
+        : candidate);
+      return candidateStates.find((candidate) => candidate.activation_id === payload.activationId) ?? null;
+    }
     case "reject_learning_event":
-      decide(String(payload.eventId), "rejected");
+      reject(String(payload.eventId));
       return {};
     case "mine_cross_session_patterns":
       return [];

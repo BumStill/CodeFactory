@@ -12,10 +12,14 @@ import {
   Clock3,
   Database,
   FileCheck2,
+  FlaskConical,
   Loader2,
+  Play,
   RefreshCw,
+  RotateCcw,
   Search,
   ShieldCheck,
+  Zap,
   X,
   XCircle,
 } from "lucide-react";
@@ -25,9 +29,16 @@ import { useLearningStore, type LearningEvent } from "../../stores/learning";
 import { invoke, type Session } from "../../lib/tauri";
 import {
   getEvolutionJob,
+  activateEvolutionCandidate,
   listEvolutionDecisionJobs,
+  listEvolutionCandidateStates,
+  listEvolutionEvalCaseResults,
   listEvolutionJobEvents,
   listEvolutionJobs,
+  rerunEvolutionEval,
+  rollbackEvolutionActivation,
+  type EvolutionCandidateState,
+  type EvolutionEvalCaseResult,
   type EvolutionJob,
   type EvolutionJobEvent,
 } from "../../stores/evolution";
@@ -37,7 +48,7 @@ interface EvolutionWorkbenchPageProps {
   initialCwd?: string | null;
 }
 
-type Tab = "review" | "jobs" | "history";
+type Tab = "review" | "activation" | "jobs" | "history";
 
 const EMPTY_EVENTS: LearningEvent[] = [];
 
@@ -106,8 +117,29 @@ function targetLabel(event: LearningEvent) {
   return event.kind === "preference" ? "项目偏好" : "项目记忆";
 }
 
-function acceptLabel(event: LearningEvent) {
-  return event.kind === "preference" ? "采纳并更新偏好" : "采纳并写入项目记忆";
+const AUTO_PREFERENCE_KEYS = new Set([
+  "communication_style", "testing_habit", "code_style", "response_language",
+]);
+
+const AUTO_MEMORY_DENYLIST = [
+  "rm -rf", "git reset --hard", "--no-verify", "bypass approval", "skip approval",
+  "without approval", "auto-approve", "auto approve", "auto-merge", "auto merge",
+  "automatically deploy", "automatically release", "automatically publish", "full access",
+  "autonomous execution", "绕过审批", "跳过审批", "无需审批", "不需审批", "自动批准",
+  "自动合并", "自动部署", "自动发布", "自动上线", "完全权限", "绕过权限", "自动执行",
+];
+
+function canOfferAutoActivation(event: LearningEvent) {
+  if (event.kind === "preference") {
+    const value = event.pref_value?.trim() ?? "";
+    return AUTO_PREFERENCE_KEYS.has(event.pref_key ?? "")
+      && value.length > 0
+      && [...value].length <= 300;
+  }
+  const normalized = event.suggestion.trim().toLowerCase();
+  return normalized.length > 0
+    && [...normalized].length <= 1_200
+    && !AUTO_MEMORY_DENYLIST.some((needle) => normalized.includes(needle));
 }
 
 function statusLabel(status: string) {
@@ -123,8 +155,31 @@ function statusLabel(status: string) {
     completed: "完成",
     waiting: "等待",
     skipped: "已跳过",
+    passed: "通过",
+    inconclusive: "证据不足",
+    error: "运行错误",
+    active: "已激活",
+    rolled_back: "已回滚",
+    rollback_conflict: "回滚冲突",
+    pending_activation: "待激活",
+    eval_failed: "评测失败",
+    eval_error: "评测错误",
+    eval_stale: "目标已变化，需重评",
+    approved: "已批准",
   };
   return labels[status] ?? status;
+}
+
+function triggerLabel(trigger: string) {
+  return ({
+    cross_session: "跨会话分析",
+    review_accept: "人工采纳",
+    review_reject: "人工拒绝",
+    review_eval: "人工批准与评测",
+    eval_retry: "重新评测",
+    activation: "人工激活",
+    rollback: "精确回滚",
+  } as Record<string, string>)[trigger] ?? trigger;
 }
 
 function shortTime(value: string | null | undefined) {
@@ -149,6 +204,7 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
   const [tab, setTab] = useState<Tab>("review");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState<"accept" | "reject" | null>(null);
+  const [autoActivate, setAutoActivate] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [mining, setMining] = useState(false);
   const [jobs, setJobs] = useState<EvolutionJob[]>([]);
@@ -157,6 +213,11 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
   const [mobileDetail, setMobileDetail] = useState(false);
   const [logsLoading, setLogsLoading] = useState(false);
   const [logsError, setLogsError] = useState<string | null>(null);
+  const [candidateStates, setCandidateStates] = useState<EvolutionCandidateState[]>([]);
+  const [evalCases, setEvalCases] = useState<Record<string, EvolutionEvalCaseResult[]>>({});
+  const [candidateStatesLoading, setCandidateStatesLoading] = useState(false);
+  const [candidateStatesError, setCandidateStatesError] = useState<string | null>(null);
+  const [candidateActionId, setCandidateActionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [learningError, setLearningError] = useState<string | null>(null);
   const [currentValue, setCurrentValue] = useState<string | null>(null);
@@ -179,6 +240,26 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
   const accept = useLearningStore((state) => state.accept);
   const reject = useLearningStore((state) => state.reject);
   const mine = useLearningStore((state) => state.mine);
+
+  const refreshCandidateStates = async (scope: string) => {
+    setCandidateStatesLoading(true);
+    setCandidateStatesError(null);
+    try {
+      const states = await listEvolutionCandidateStates(scope);
+      const cases = await Promise.all(states.map(async (candidate) => [
+        candidate.eval_run_id,
+        candidate.eval_run_id
+          ? await listEvolutionEvalCaseResults(scope, candidate.eval_run_id)
+          : [],
+      ] as const));
+      setCandidateStates(states);
+      setEvalCases(Object.fromEntries(cases.filter(([runId]) => runId != null)));
+    } catch (reason) {
+      setCandidateStatesError(String(reason));
+    } finally {
+      setCandidateStatesLoading(false);
+    }
+  };
 
   useEffect(() => {
     void loadSessions();
@@ -244,6 +325,7 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
     setError(null);
     setLearningError(null);
     setConfirmation(null);
+    setAutoActivate(false);
     setSelectedId(null);
     setMobileDetail(false);
     setJobs([]);
@@ -251,6 +333,9 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
     setSelectedJobId(null);
     setLogsLoading(true);
     setLogsError(null);
+    setCandidateStates([]);
+    setEvalCases({});
+    setCandidateStatesError(null);
     setCurrentValue(null);
     setCurrentValueError(null);
     setCurrentValueLoading(false);
@@ -260,6 +345,7 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
       if (requestId === learningRequestId.current) setLearningError(String(reason));
     });
     void refreshLogs(cwd);
+    void refreshCandidateStates(cwd);
     let off: (() => void) | undefined;
     let cancelled = false;
     void subscribe(cwd).then((unlisten) => {
@@ -358,11 +444,12 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
     setBusyId(selected.id);
     setError(null);
     try {
-      await accept(selected.id, cwd);
+      await accept(selected.id, cwd, autoActivate);
       setConfirmation(null);
+      setAutoActivate(false);
       setMobileDetail(false);
       setDecisionFocusRevision((value) => value + 1);
-      await refreshLogs(cwd, true);
+      await Promise.all([refreshLogs(cwd, true), refreshCandidateStates(cwd)]);
     } catch (reason) {
       setError(String(reason));
       setCurrentValueRevision((value) => value + 1);
@@ -455,6 +542,7 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
   );
   const tabs: [Tab, string][] = [
     ["review", `待我审核 ${pending.length}`],
+    ["activation", `评测与激活 ${candidateStates.length}`],
     ["jobs", "作业与日志"],
     ["history", `决定历史 ${decided.length}`],
   ];
@@ -486,6 +574,9 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
                 setSelectedJobId(null);
                 setLogsLoading(true);
                 setLogsError(null);
+                setCandidateStates([]);
+                setEvalCases({});
+                setCandidateStatesError(null);
                 setCurrentValue(null);
                 setCurrentValueError(null);
                 setConfirmation(null);
@@ -523,13 +614,13 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
             <StageCard icon={Database} title="轨迹采集" detail={mining ? "运行中" : traceStage ? statusLabel(traceStage.status) : "等待运行"} active={mining || traceStage?.status === "completed"} />
             <StageCard icon={Search} title="提取与去重" detail={mining ? "等待轨迹读取" : extractStage ? `${statusLabel(extractStage.status)} · ${latestAnalysisJob?.candidate_count ?? 0} 个新候选` : "尚无作业"} active={extractStage?.status === "completed"} />
             <StageCard icon={ShieldCheck} title="人工审核" detail={`${pending.length} 条待审`} active={pending.length > 0} />
-            <StageCard icon={FileCheck2} title="采纳决定" detail={`${events.filter((event) => event.status === "accepted").length} 条已采纳`} active={events.some((event) => event.status === "accepted")} />
-            <StageCard icon={Circle} title="Evals" detail="未接入" disabled />
-            <StageCard icon={Circle} title="自动激活" detail="未接入" disabled />
+            <StageCard icon={FileCheck2} title="批准决定" detail={`${candidateStates.length} 条版本化候选`} active={candidateStates.length > 0} />
+            <StageCard icon={FlaskConical} title="Evals" detail={`${candidateStates.filter((candidate) => candidate.eval_status === "passed").length} 通过 · ${candidateStates.filter((candidate) => candidate.eval_status === "failed" || candidate.eval_status === "error").length} 未通过`} active={candidateStates.some((candidate) => candidate.eval_status === "passed")} />
+            <StageCard icon={Zap} title="自动激活" detail={`${candidateStates.filter((candidate) => candidate.state === "active").length} 已激活 · ${candidateStates.filter((candidate) => candidate.state === "pending_activation").length} 待激活`} active={candidateStates.some((candidate) => candidate.state === "active")} />
           </section>
 
-          <div className="rounded-lg border border-amber-800/50 bg-amber-950/20 px-3 py-2 text-xs text-amber-700 dark:text-amber-200">
-            Evals 与自动激活尚未接入。人工采纳只会执行按钮写明的项目记忆或偏好变更，不会自动合并、部署或发布。
+          <div className="rounded-lg border border-accent/30 bg-accent/5 px-3 py-2 text-xs text-gray-400">
+            人工批准会先冻结 revision 并运行激活安全 Evals；只有 exact revision 全部通过且本次显式选择自动激活时才影响下一次 Agent 调用。不会自动修改代码、合并、部署或发布。
           </div>
 
           <nav className="flex gap-1 overflow-x-auto rounded-lg border border-border bg-surface-1 p-1" aria-label="进化审查视图" role="tablist">
@@ -592,7 +683,7 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
               onOpenMobileDetail={() => setMobileDetail(true)}
               onCloseMobileDetail={() => setMobileDetail(false)}
               confirmation={confirmation}
-              onAskAccept={() => setConfirmation("accept")}
+              onAskAccept={() => { setAutoActivate(false); setConfirmation("accept"); }}
               onAskReject={() => setConfirmation("reject")}
               onCancelConfirm={() => setConfirmation(null)}
               onAccept={() => void confirmAccept()}
@@ -604,9 +695,65 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
               currentValueError={currentValueError}
               decisionFocusRevision={decisionFocusRevision}
               onOpenHistory={() => setTab("history")}
+              autoActivate={autoActivate}
+              onAutoActivateChange={setAutoActivate}
             />
           )}
 
+          </div>
+          <div id="evolution-panel-activation" role="tabpanel" aria-labelledby="evolution-tab-activation" hidden={tab !== "activation"}>
+          {tab === "activation" && (
+            <EvaluationActivationPanel
+              candidates={candidateStates}
+              casesByRun={evalCases}
+              jobIdsByCandidate={Object.fromEntries([...jobs].reverse()
+                .filter((job) => job.candidate_id != null)
+                .map((job) => [job.candidate_id as string, job.id]))}
+              loading={candidateStatesLoading}
+              error={candidateStatesError}
+              busyId={candidateActionId}
+              onOpenJob={(jobId) => void openJob(jobId)}
+              onRetry={async (candidate) => {
+                if (!cwd) return;
+                setCandidateActionId(candidate.candidate_id);
+                setCandidateStatesError(null);
+                try {
+                  await rerunEvolutionEval(cwd, candidate.candidate_id);
+                  await Promise.all([refreshCandidateStates(cwd), refreshLogs(cwd, true)]);
+                } catch (reason) {
+                  const message = String(reason);
+                  await Promise.all([refreshCandidateStates(cwd), refreshLogs(cwd, true)]);
+                  setCandidateStatesError(message);
+                } finally { setCandidateActionId(null); }
+              }}
+              onActivate={async (candidate) => {
+                if (!cwd) return;
+                setCandidateActionId(candidate.candidate_id);
+                setCandidateStatesError(null);
+                try {
+                  await activateEvolutionCandidate(cwd, candidate.candidate_id);
+                  await Promise.all([refreshCandidateStates(cwd), refreshLogs(cwd, true)]);
+                } catch (reason) {
+                  const message = String(reason);
+                  await Promise.all([refreshCandidateStates(cwd), refreshLogs(cwd, true)]);
+                  setCandidateStatesError(message);
+                } finally { setCandidateActionId(null); }
+              }}
+              onRollback={async (candidate) => {
+                if (!cwd || !candidate.activation_id) return;
+                setCandidateActionId(candidate.candidate_id);
+                setCandidateStatesError(null);
+                try {
+                  await rollbackEvolutionActivation(cwd, candidate.activation_id);
+                  await Promise.all([refreshCandidateStates(cwd), refreshLogs(cwd, true)]);
+                } catch (reason) {
+                  const message = String(reason);
+                  await Promise.all([refreshCandidateStates(cwd), refreshLogs(cwd, true)]);
+                  setCandidateStatesError(message);
+                } finally { setCandidateActionId(null); }
+              }}
+            />
+          )}
           </div>
           <div id="evolution-panel-jobs" role="tabpanel" aria-labelledby="evolution-tab-jobs" hidden={tab !== "jobs"}>
           {tab === "jobs" && (
@@ -687,6 +834,8 @@ function ReviewPanel({
   currentValueError,
   decisionFocusRevision,
   onOpenHistory,
+  autoActivate,
+  onAutoActivateChange,
 }: {
   cwd: string | null;
   sessions: Session[];
@@ -711,6 +860,8 @@ function ReviewPanel({
   currentValueError: string | null;
   decisionFocusRevision: number;
   onOpenHistory: () => void;
+  autoActivate: boolean;
+  onAutoActivateChange: (value: boolean) => void;
 }) {
   const listRef = useRef<HTMLDivElement>(null);
   const backButtonRef = useRef<HTMLButtonElement>(null);
@@ -790,6 +941,7 @@ function ReviewPanel({
   const proposedValue = selected.kind === "preference"
     ? `${selected.pref_key ?? "偏好"} = ${selected.pref_value ?? ""}`
     : selected.suggestion;
+  const autoActivationEligible = canOfferAutoActivation(selected);
 
   return (
     <section className="grid min-w-0 grid-cols-1 gap-3 lg:grid-cols-[minmax(240px,0.8fr)_minmax(0,1.5fr)]">
@@ -827,7 +979,7 @@ function ReviewPanel({
             <ArrowLeft size={11} /> 返回候选队列
           </button>
           <div className="mb-2 flex flex-wrap items-center gap-2 text-[10px]">
-            <span className="rounded bg-accent/10 px-2 py-0.5 text-accent">待人工审核</span>
+            <span className="rounded bg-accent/10 px-2 py-0.5 text-accent">待人工批准</span>
             <span className="text-gray-600">{shortTime(selected.created_at)}</span>
           </div>
           <h2 className="break-words text-base font-semibold leading-relaxed">{selected.observation}</h2>
@@ -860,12 +1012,12 @@ function ReviewPanel({
               <p className="text-xs leading-relaxed text-gray-400">只影响当前项目后续会话；项目记忆和偏好可在“我的画像”中查看并撤销。</p>
             </DetailBlock>
           </div>
-          <DetailBlock title="当前值 → 采纳后">
+          <DetailBlock title="当前值 → 候选 revision">
             <div className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
               <div className="rounded border border-border bg-surface-2 p-2 text-gray-500">
                 当前：{currentValueLoading ? "正在读取…" : currentValue ?? "无法确认"}
               </div>
-              <div className="break-words rounded border border-accent/30 bg-accent/5 p-2 text-gray-300">采纳后：{proposedValue}</div>
+              <div className="break-words rounded border border-accent/30 bg-accent/5 p-2 text-gray-300">候选：{proposedValue}</div>
             </div>
             {currentValueError && <p role="alert" className="mt-2 text-[11px] text-red-700 dark:text-red-300">{currentValueError}；在确认真实当前值前不能采纳。</p>}
           </DetailBlock>
@@ -886,17 +1038,33 @@ function ReviewPanel({
               className="fixed inset-x-3 bottom-3 z-30 max-h-[calc(100dvh-1.5rem)] overflow-y-auto rounded-lg border border-amber-700/50 bg-surface-1 p-3 shadow-2xl lg:static lg:inset-auto lg:z-auto lg:max-h-none lg:overflow-visible lg:bg-amber-950/20 lg:shadow-none"
             >
               <p id="evolution-decision-title" className="text-xs font-medium text-amber-700 dark:text-amber-200">
-                {confirmation === "accept" ? `确认${acceptLabel(selected)}` : "确认拒绝这个候选"}
+                {confirmation === "accept" ? "确认批准并运行 Evals" : "确认拒绝这个候选"}
               </p>
               <div id="evolution-decision-description" className="mt-2 space-y-1.5 text-[11px] text-gray-400">
                 <p className="break-all">范围：{cwd} · 目标：{targetLabel(selected)}</p>
                 <p>当前：{currentValueLoading ? "正在读取…" : currentValue ?? "无法确认"}</p>
                 <p className="break-words">
                   {confirmation === "accept"
-                    ? `决定后：${proposedValue}`
+                    ? `批准后：冻结 revision，运行 7 项激活安全回归；此时不会立即写入。候选：${proposedValue}`
                     : "决定后：候选进入决定历史，不写入项目记忆或偏好；当前版本不支持撤销拒绝。"}
                 </p>
-                <p>不会自动合并、部署或发布</p>
+                {confirmation === "accept" && autoActivationEligible && (
+                  <label className="flex items-start gap-2 rounded border border-border bg-surface-2 p-2 text-gray-300">
+                    <input
+                      type="checkbox"
+                      checked={autoActivate}
+                      onChange={(event) => onAutoActivateChange(event.target.checked)}
+                      className="mt-0.5"
+                    />
+                    <span>通过后自动激活此低风险候选（默认关闭；仅影响当前项目下一次 Agent 调用）</span>
+                  </label>
+                )}
+                {confirmation === "accept" && !autoActivationEligible && (
+                  <p className="rounded border border-border bg-surface-2 p-2 text-gray-500">
+                    此候选不在低风险自动激活白名单内；Evals 会拒绝激活，且不会提供绕过入口。
+                  </p>
+                )}
+                <p>不会自动修改代码、合并、部署或发布</p>
               </div>
               <div className="mt-3 flex flex-wrap gap-2">
                 <button
@@ -906,7 +1074,7 @@ function ReviewPanel({
                   className={`flex items-center gap-1.5 rounded px-3 py-1.5 text-xs text-white disabled:opacity-50 ${confirmation === "accept" ? "bg-accent" : "bg-red-700"}`}
                 >
                   {busy ? <Loader2 size={12} className="animate-spin" /> : confirmation === "accept" ? <Check size={12} /> : <X size={12} />}
-                  {confirmation === "accept" ? `确认${acceptLabel(selected)}` : "确认拒绝"}
+                  {confirmation === "accept" ? "确认批准并运行 Evals" : "确认拒绝"}
                 </button>
                 <button onClick={onCancelConfirm} disabled={busy} className="rounded border border-border px-3 py-1.5 text-xs text-gray-400 hover:bg-surface-3">取消</button>
               </div>
@@ -914,7 +1082,7 @@ function ReviewPanel({
           ) : (
             <div className="fixed inset-x-3 bottom-3 z-20 flex flex-wrap gap-2 rounded-lg border border-border bg-surface-1 p-3 shadow-2xl lg:static lg:inset-auto lg:z-auto lg:rounded-none lg:border-x-0 lg:border-b-0 lg:bg-transparent lg:p-0 lg:pt-4 lg:shadow-none">
               <button ref={acceptTriggerRef} onClick={onAskAccept} disabled={busy || currentValueLoading || currentValueError != null} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover disabled:cursor-wait disabled:opacity-50">
-                <Check size={12} /> {acceptLabel(selected)}
+                <Check size={12} /> 批准并运行 Evals
               </button>
               <button ref={rejectTriggerRef} onClick={onAskReject} disabled={busy} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-xs text-gray-400 hover:bg-surface-3 disabled:opacity-50">
                 <X size={12} /> 拒绝
@@ -923,6 +1091,131 @@ function ReviewPanel({
           )}
         </div>
       </article>
+    </section>
+  );
+}
+
+function EvaluationActivationPanel({ candidates, casesByRun, jobIdsByCandidate, loading, error, busyId, onOpenJob, onRetry, onActivate, onRollback }: {
+  candidates: EvolutionCandidateState[];
+  casesByRun: Record<string, EvolutionEvalCaseResult[]>;
+  jobIdsByCandidate: Record<string, string>;
+  loading: boolean;
+  error: string | null;
+  busyId: string | null;
+  onOpenJob: (jobId: string) => void;
+  onRetry: (candidate: EvolutionCandidateState) => Promise<void>;
+  onActivate: (candidate: EvolutionCandidateState) => Promise<void>;
+  onRollback: (candidate: EvolutionCandidateState) => Promise<void>;
+}) {
+  const [confirming, setConfirming] = useState<string | null>(null);
+  if (error && candidates.length === 0) return <EmptyState title="评测与激活读取失败" detail={error} />;
+  if (loading && candidates.length === 0) return <EmptyState title="正在加载评测与激活" detail="读取 exact revision、Eval case 和 activation receipt。" loading />;
+  if (candidates.length === 0) return <EmptyState title="还没有版本化候选" detail="批准候选后，系统会先冻结 revision、运行激活安全 Evals，再根据你的选择进入待激活或自动激活。" />;
+  return (
+    <section className="space-y-3" aria-label="评测与激活记录">
+      {error && (
+        <p role="alert" className="rounded border border-red-900/50 bg-red-950/20 p-3 text-xs text-red-700 dark:text-red-300">
+          操作未完成：{error}。候选状态与作业日志已刷新。
+        </p>
+      )}
+      {candidates.map((candidate) => {
+        const cases = candidate.eval_run_id ? casesByRun[candidate.eval_run_id] ?? [] : [];
+        const busy = busyId === candidate.candidate_id;
+        return (
+          <article key={candidate.candidate_id} className="rounded-lg border border-border bg-surface-1 p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2 text-[10px]">
+                  <span className="rounded bg-accent/10 px-2 py-0.5 text-accent">revision {candidate.revision}</span>
+                  <span className="rounded bg-surface-3 px-2 py-0.5 text-gray-400">{statusLabel(candidate.state)}</span>
+                  <span className="text-gray-600">{candidate.kind === "preference" ? "项目偏好" : "项目记忆"}</span>
+                </div>
+                <h2 className="mt-2 break-words text-sm font-medium text-gray-200">{candidate.suggestion}</h2>
+                <p className="mt-1 break-all font-mono text-[10px] text-gray-600">candidate {candidate.candidate_id}</p>
+              </div>
+              <div className="text-right text-[10px] text-gray-500">
+                <p>{candidate.auto_activate ? "已选择 auto-if-pass" : "人工激活"}</p>
+                <p>{shortTime(candidate.updated_at)}</p>
+              </div>
+            </div>
+
+            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <div className="rounded border border-border bg-surface-2 p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-xs font-medium text-gray-300">激活安全 Evals</h3>
+                  <span className={`text-[10px] ${candidate.eval_status === "passed" ? "text-green-500" : candidate.eval_status === "failed" || candidate.eval_status === "error" ? "text-red-500" : "text-gray-500"}`}>
+                    {candidate.eval_status ? statusLabel(candidate.eval_status) : "等待运行"}
+                  </span>
+                </div>
+                <p className="mt-2 text-xs text-gray-400">{candidate.eval_passed_count}/{candidate.eval_required_count} required cases 通过</p>
+                <p className="mt-1 break-all font-mono text-[10px] text-gray-600">run {candidate.eval_run_id ?? "—"}</p>
+                <p className="mt-1 break-all font-mono text-[10px] text-gray-600">manifest {candidate.eval_manifest_hash?.slice(0, 16) ?? "—"}</p>
+                <ul className="mt-3 grid grid-cols-1 gap-1 sm:grid-cols-2">
+                  {cases.map((testCase) => (
+                    <li key={testCase.id} className="flex min-w-0 items-center gap-1.5 text-[10px] text-gray-400">
+                      {testCase.status === "passed" ? <CheckCircle2 size={11} className="shrink-0 text-green-500" /> : <XCircle size={11} className="shrink-0 text-red-500" />}
+                      <span className="break-words">{testCase.title}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+              <div className="rounded border border-border bg-surface-2 p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-xs font-medium text-gray-300">Activation receipt</h3>
+                  <span className="text-[10px] text-gray-500">{candidate.activation_status ? statusLabel(candidate.activation_status) : "尚未激活"}</span>
+                </div>
+                <p className="mt-2 text-xs leading-relaxed text-gray-400">
+                  {candidate.state === "active"
+                    ? "已对 exact revision 生效；下一次 Agent 调用读取该 active source。"
+                    : candidate.state === "rolled_back"
+                      ? "已按 exact receipt 回滚，后续 Agent 调用不再读取该变更。"
+                      : candidate.state === "rollback_conflict"
+                        ? "目标后来被用户修改，系统没有覆盖新值。"
+                        : candidate.state === "eval_stale"
+                          ? "目标在 Eval 后发生变化，旧通过结果已失效；重评前不会激活。"
+                        : candidate.state === "pending_activation"
+                          ? "Evals 已通过，等待人工激活。"
+                          : "未生成成功 activation receipt，live target 保持不变。"}
+                </p>
+                <p className="mt-2 break-all font-mono text-[10px] text-gray-600">receipt {candidate.activation_id ?? "—"}</p>
+                <p className="mt-1 text-[10px] text-gray-600">激活 {shortTime(candidate.activated_at)} · 回滚 {shortTime(candidate.rolled_back_at)}</p>
+              </div>
+            </div>
+
+            <div className="sticky bottom-3 z-10 mt-3 flex flex-wrap gap-2 rounded-lg border border-border bg-surface-1/95 p-2 shadow-lg backdrop-blur lg:static lg:border-0 lg:bg-transparent lg:p-0 lg:shadow-none">
+              {jobIdsByCandidate[candidate.candidate_id] && (
+                <button onClick={() => onOpenJob(jobIdsByCandidate[candidate.candidate_id])} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-3">
+                  <FileCheck2 size={12} /> 查看端到端作业日志
+                </button>
+              )}
+              {(candidate.state === "eval_failed" || candidate.state === "eval_error" || candidate.state === "eval_stale") && (
+                <button onClick={() => void onRetry(candidate)} disabled={busy} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-3 disabled:opacity-50">
+                  {busy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} 重跑 exact revision
+                </button>
+              )}
+              {candidate.state === "pending_activation" && (
+                <button onClick={() => void onActivate(candidate)} disabled={busy} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover disabled:opacity-50">
+                  {busy ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} 激活此 revision
+                </button>
+              )}
+              {candidate.state === "active" && candidate.activation_id && (
+                confirming === candidate.candidate_id ? (
+                  <div role="region" aria-label="确认回滚" className="flex flex-wrap items-center gap-2 rounded border border-amber-700/50 bg-amber-950/20 p-2">
+                    <span className="text-[11px] text-amber-700 dark:text-amber-200">只回滚 receipt {candidate.activation_id.slice(0, 8)}，确认？</span>
+                    <button autoFocus onClick={() => { setConfirming(null); void onRollback(candidate); }} disabled={busy} className="rounded bg-red-700 px-2 py-1 text-[11px] text-white">确认回滚</button>
+                    <button onClick={() => setConfirming(null)} disabled={busy} className="rounded border border-border px-2 py-1 text-[11px] text-gray-400">取消</button>
+                  </div>
+                ) : (
+                  <button onClick={() => setConfirming(candidate.candidate_id)} disabled={busy} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-3 disabled:opacity-50">
+                    <RotateCcw size={12} /> 回滚
+                  </button>
+                )
+              )}
+            </div>
+          </article>
+        );
+      })}
     </section>
   );
 }
@@ -954,7 +1247,7 @@ function JobsPanel({ jobs, selectedJob, selectedJobId, onSelectJob, events, load
               aria-pressed={item.id === job.id}
               className={`w-full rounded border p-2 text-left ${item.id === job.id ? "border-accent/40 bg-accent/5" : "border-border bg-surface-2 hover:border-gray-500"}`}
             >
-              <span className="block text-xs text-gray-300">{{ cross_session: "跨会话分析", review_accept: "人工采纳", review_reject: "人工拒绝" }[item.trigger] ?? item.trigger}</span>
+              <span className="block text-xs text-gray-300">{triggerLabel(item.trigger)}</span>
               <span className="mt-1 block text-[10px] text-gray-600">{statusLabel(item.status)} · {shortTime(item.started_at)}</span>
             </button>
           ))}
@@ -962,11 +1255,7 @@ function JobsPanel({ jobs, selectedJob, selectedJobId, onSelectJob, events, load
         <div className="mt-3 border-t border-border p-2">
         <div className="mb-3 flex items-start justify-between gap-3">
           <div>
-            <h2 className="text-sm font-semibold">{{
-              cross_session: "跨会话分析",
-              review_accept: "人工采纳",
-              review_reject: "人工拒绝",
-            }[job.trigger] ?? job.trigger}</h2>
+            <h2 className="text-sm font-semibold">{triggerLabel(job.trigger)}</h2>
             <p className="mt-1 font-mono text-[10px] text-gray-600 break-all">{job.id}</p>
           </div>
           <div className="flex items-center gap-2">
@@ -1034,6 +1323,9 @@ function EventDetails({ value }: { value: string }) {
     "support_count", "status", "terminal_status", "candidate_status", "candidate_kind", "decision", "target", "trigger", "reason", "error",
     "aggregate_only", "redactor", "reasoning_included", "raw_prompt_included",
     "already_present", "candidate_marker_present", "value_persisted", "materialization_started",
+    "candidate_id", "revision", "auto_activate", "run_id", "manifest_hash",
+    "required_count", "passed_count", "failed_count", "verdict", "activation_id",
+    "before_hash", "after_hash",
   ]);
   const entries = Object.entries(details).filter(([key]) => allowed.has(key));
   if (entries.length === 0) return null;
@@ -1066,11 +1358,27 @@ function EventDetails({ value }: { value: string }) {
     candidate_marker_present: "候选标记已写入",
     value_persisted: "值已持久化",
     materialization_started: "已开始物化",
+    candidate_id: "候选 ID",
+    revision: "候选版本",
+    auto_activate: "通过后自动激活",
+    run_id: "Eval run",
+    manifest_hash: "Eval 清单哈希",
+    required_count: "必过用例数",
+    passed_count: "通过用例数",
+    failed_count: "失败用例数",
+    verdict: "Eval 结论",
+    activation_id: "Activation receipt",
+    before_hash: "激活前指纹",
+    after_hash: "激活后指纹",
   };
   const namedValues: Record<string, string> = {
     cross_session: "跨会话分析",
     review_accept: "人工采纳",
     review_reject: "人工拒绝",
+    review_eval: "人工批准与 Evals",
+    eval_retry: "重跑 Evals",
+    activation: "人工激活",
+    rollback: "精确回滚",
     process_restart: "应用重启",
     memory: "项目记忆",
     preference: "项目偏好",
@@ -1111,7 +1419,7 @@ function HistoryPanel({ events, jobs, onOpenJob }: {
             {event.status === "accepted" ? <CheckCircle2 size={14} className="mt-0.5 shrink-0 text-green-500" /> : <XCircle size={14} className="mt-0.5 shrink-0 text-gray-600" />}
             <div className="min-w-0 flex-1">
               <p className="break-words text-xs text-gray-300">{event.observation}</p>
-              <p className="mt-1 text-[10px] text-gray-600">{event.status === "accepted" ? `已采纳到${targetLabel(event)}` : "已拒绝"} · {shortTime(event.decided_at)}</p>
+              <p className="mt-1 text-[10px] text-gray-600">{event.status === "accepted" ? `历史已生效（未评测） · ${targetLabel(event)}` : "已拒绝"} · {shortTime(event.decided_at)}</p>
               <p className="mt-2 break-words text-xs leading-relaxed text-gray-500">{event.suggestion}</p>
               <p className="mt-1 text-[10px] text-gray-600">{evidenceSummary(event)}</p>
               <div className="mt-2 flex flex-wrap gap-2">
@@ -1122,7 +1430,7 @@ function HistoryPanel({ events, jobs, onOpenJob }: {
                 )}
                 {decisionJob && (
                   <button onClick={() => onOpenJob(decisionJob.id)} className="rounded border border-border px-2 py-1 text-[10px] text-accent hover:bg-surface-3">
-                    {event.status === "accepted" ? "查看审核与物化日志" : "查看拒绝审核日志"}
+                    {event.status === "accepted" ? "查看历史审核与物化日志" : "查看拒绝审核日志"}
                   </button>
                 )}
                 {!event.job_id && !decisionJob && (

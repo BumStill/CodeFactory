@@ -50,7 +50,7 @@ interface LearningStore {
 
   load: (cwd: string) => Promise<LearningEvent[]>;
   subscribe: (cwd: string) => Promise<() => void>;
-  accept: (id: string, cwd: string) => Promise<void>;
+  accept: (id: string, cwd: string, autoActivate: boolean) => Promise<void>;
   reject: (id: string, cwd: string) => Promise<void>;
   /** P1: run the cross-session pattern miner; new insights arrive via the
    *  learning_events_updated event the subscriber already listens for. */
@@ -107,16 +107,14 @@ export const useLearningStore = create<LearningStore>((set, get) => ({
     };
   },
 
-  accept: async (id, cwd) => {
-    await invoke("accept_learning_event", { eventId: id });
-    // Backend emits learning_events_updated — subscribers refresh.
-    // For pages without an active subscription, also patch optimistically.
+  accept: async (id, cwd, autoActivate) => {
+    await invoke("approve_learning_event", { eventId: id, autoActivate });
+    // Approved candidates move to the versioned Eval/activation ledger. They
+    // must leave the legacy pending queue without pretending to be accepted.
     set((s) => ({
       events: {
         ...s.events,
-        [cwd]: (s.events[cwd] ?? []).map((e) =>
-          e.id === id ? { ...e, status: "accepted", decided_at: new Date().toISOString() } : e,
-        ),
+        [cwd]: (s.events[cwd] ?? []).filter((event) => event.id !== id),
       },
     }));
   },
