@@ -445,6 +445,8 @@ export function SettingsPage({ onBack }: Props) {
     auto_create_pr: boolean;
     remote_postmortem_enabled: boolean;
     reasoning_effort: Settings["reasoning_effort"];
+    max_parallel_tasks: number;
+    subagent_isolation: NonNullable<Settings["subagent_isolation"]>;
   } | null>(null);
   const [generalSaved, setGeneralSaved] = useState(false);
 
@@ -478,6 +480,8 @@ export function SettingsPage({ onBack }: Props) {
       auto_create_pr: (settings as Settings & { auto_create_pr?: boolean }).auto_create_pr ?? false,
       remote_postmortem_enabled: settings.remote_postmortem_enabled ?? false,
       reasoning_effort: settings.reasoning_effort ?? "medium",
+      max_parallel_tasks: settings.max_parallel_tasks ?? 3,
+      subagent_isolation: settings.subagent_isolation ?? "shared",
     });
   }, [settings]);
 
@@ -585,6 +589,8 @@ export function SettingsPage({ onBack }: Props) {
       auto_create_pr: generalDraft.auto_create_pr,
       remote_postmortem_enabled: generalDraft.remote_postmortem_enabled,
       reasoning_effort: generalDraft.reasoning_effort,
+      max_parallel_tasks: Math.min(8, Math.max(1, Math.round(generalDraft.max_parallel_tasks) || 3)),
+      subagent_isolation: generalDraft.subagent_isolation,
     } as Settings & { auto_create_pr: boolean });
 
     setGeneralSaved(true);
@@ -825,6 +831,49 @@ export function SettingsPage({ onBack }: Props) {
                     {label}
                   </option>
                 ))}
+              </select>
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-xs text-gray-500">并行任务上限</label>
+              <p className="text-[11px] leading-5 text-gray-600">
+                任务分解后同时运行的子代理数量(1–8)。
+              </p>
+              <input
+                type="number"
+                min={1}
+                max={8}
+                value={generalDraft.max_parallel_tasks}
+                onChange={(e) =>
+                  setGeneralDraft({
+                    ...generalDraft,
+                    max_parallel_tasks: Number(e.target.value),
+                  })
+                }
+                className="w-20 rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-xs text-gray-500">子代理磁盘隔离</label>
+              <p className="text-[11px] leading-5 text-gray-600">
+                worktree 模式下每个并行任务在独立的 git worktree
+                中工作,验证通过后才把改动合并回项目目录;冲突时项目目录保持原样,任务改动保留在分支上。非
+                git 项目自动回退到共享目录。
+              </p>
+              <select
+                value={generalDraft.subagent_isolation}
+                onChange={(e) =>
+                  setGeneralDraft({
+                    ...generalDraft,
+                    subagent_isolation: e.target
+                      .value as NonNullable<Settings["subagent_isolation"]>,
+                  })
+                }
+                className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+              >
+                <option value="shared">共享目录(默认)</option>
+                <option value="worktree">Git worktree 隔离</option>
               </select>
             </div>
 

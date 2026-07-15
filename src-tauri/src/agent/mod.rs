@@ -11,6 +11,7 @@ pub mod sse_buffer;
 pub mod subagent;
 pub mod user_context;
 pub mod verification;
+pub mod worktree;
 
 pub use dispatch::decide_chat_mode;
 

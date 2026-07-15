@@ -27,26 +27,6 @@ Open questions when scoping:
 - Interaction with file checkpoints: a cached "done" task whose file edits
   were rolled back must not replay as done.
 
-## Git-worktree isolation for parallel subagents (P0)
-
-Give each parallel subagent its own git worktree and merge back on
-verify-pass, instead of today's shared cwd guarded by per-file locks; make
-`MAX_PARALLEL` a setting while in there.
-
-Why: per-file locks (`tools/file_lock.rs`) prevent write collisions but not
-cross-file inconsistency between concurrent subagents, and `MAX_PARALLEL=3` is
-hardcoded in `agent/scheduler.rs`. Our own repo development already mandates
-sibling worktrees for risky slices (AGENTS.md) — the product should practice
-what the factory preaches. openJiuwen ships worktree member isolation as a
-standard part of its team runtime.
-
-Open questions when scoping:
-- Merge-back strategy on conflict: verify-then-merge, or fail the task and
-  surface the conflict?
-- Fallback for non-git project folders.
-- Do worktree subagents share the project `.codefactory/` data dir or get a
-  scoped copy?
-
 ## Exposure tracking + re-scoring for accepted memory and skills (P1)
 
 Record when `memory.md` entries and enabled skills are actually injected into

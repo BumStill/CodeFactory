@@ -86,6 +86,31 @@ pub struct Settings {
     /// Settings and via the chat header quick-control.
     #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
+    /// Max concurrent subagents for parallel task execution. The scheduler
+    /// clamps this to 1..=8 at run time, so out-of-range persisted values
+    /// never stall or overload a session.
+    #[serde(default = "default_max_parallel_tasks")]
+    pub max_parallel_tasks: u8,
+    /// Disk isolation mode for parallel subagents.
+    #[serde(default)]
+    pub subagent_isolation: SubagentIsolation,
+}
+
+/// How parallel subagents are isolated from each other on disk.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SubagentIsolation {
+    /// All subagents share the task cwd, guarded by per-file locks only.
+    #[default]
+    Shared,
+    /// Each subagent works in its own git worktree; its diff is applied back
+    /// to the shared cwd only after verification passes. Falls back to
+    /// `Shared` when the task cwd is not inside a git repository.
+    Worktree,
+}
+
+fn default_max_parallel_tasks() -> u8 {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -366,7 +391,47 @@ impl Default for Settings {
             font_size: default_font_size(),
             onboarded: false,
             reasoning_effort: ReasoningEffort::Medium,
+            max_parallel_tasks: default_max_parallel_tasks(),
+            subagent_isolation: SubagentIsolation::Shared,
         }
+    }
+}
+
+#[cfg(test)]
+mod subagent_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_shared_and_three_parallel() {
+        let s = Settings::default();
+        assert_eq!(s.subagent_isolation, SubagentIsolation::Shared);
+        assert_eq!(s.max_parallel_tasks, 3);
+    }
+
+    #[test]
+    fn legacy_settings_json_without_new_fields_deserializes_to_defaults() {
+        // A settings.json written before these fields existed must load with
+        // today's defaults instead of failing deserialization.
+        let legacy = serde_json::json!({
+            "endpoints": {},
+            "default_endpoint": "openrouter",
+            "default_model": "m",
+            "permissions": { "allow": [], "ask": [], "deny": [], "full_access": false },
+            "shell": { "shell": "bash" }
+        });
+        let s: Settings = serde_json::from_value(legacy).expect("legacy settings must parse");
+        assert_eq!(s.subagent_isolation, SubagentIsolation::Shared);
+        assert_eq!(s.max_parallel_tasks, 3);
+    }
+
+    #[test]
+    fn isolation_serde_is_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&SubagentIsolation::Worktree).unwrap(),
+            "\"worktree\""
+        );
+        let parsed: SubagentIsolation = serde_json::from_str("\"shared\"").unwrap();
+        assert_eq!(parsed, SubagentIsolation::Shared);
     }
 }
 
