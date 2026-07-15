@@ -109,6 +109,11 @@ Benchmarks
 | Official constraint risk | timeouts/resources 被修改时标红，禁止标记为 official-comparable |
 | Benchmark contamination | 显示命中的 task fingerprint/verifier access；run 标记为 diagnostic，禁止作为产品能力分数 |
 | Runtime mismatch | thin Python bridge + Rust sidecar 显示 `rust-core headless`；桌面 AgentLoop 显示 `rust-core desktop`；旧 Python solver 显示 `legacy contaminated` 且不可计分 |
+| Compatibility scan exit mismatch | 主聊天与 trial trajectory 显示“内容为 0 残留但命令非零”，并给出“临时结果文件 + 保留搜索状态 + 拒绝状态大于 1 + `test ! -s`”的一次性修复动作；在重扫成功前 build/install 保持阻止，不把它显示成源码仍有残留 |
+| Model route mismatch | 顶栏当前 endpoint/model 是规划、规范辅助、子任务、验收和学习的唯一用户可见选择；后台不得静默使用另一个模型，也不得用错误的 provider 请求协议；模型无法解析或该 helper 不支持当前 transport 时，在网络调用前显示选择受支持 endpoint/model 的可行动错误 |
+| Dependency-tree context expansion | 根级文件发现默认只展示项目文件；需要排查依赖时，显式进入 `.venv`、`node_modules` 或 `target` 后仍可搜索 |
+| Interactive completion denial | 普通聊天中的模型工具因完成约束被拒绝时，工具结果显示具体恢复动作，不弹出无意义权限确认，也不把它描述成自主预算耗尽；相关源码读取与 alias 搜索可继续，模型试图提前结束时会收到一次完成证据恢复提示 |
+| Replayed denied tool call | 用户继续一个曾出现策略/权限/hook 拒绝的会话时，系统自动恢复历史协议并继续当前工作区状态；不得显示 provider `tool_calls`/`tool_result` 配对错误，也不得把恢复占位显示成工具执行成功 |
 
 ## 用户可见术语
 
@@ -133,4 +138,5 @@ Benchmarks
 - 用户能启动或导入一次 run，并看到真实 job artifact path。
 - 用户能从失败 trial 进入 trajectory/verifier/evidence。
 - 用户能看到能力画像，而不只看到总分。
+- 普通源码迁移任务出现 clean-scan shell 退出歧义时，用户能看到明确恢复原因和下一动作，而不是多轮重复扫描或误报完成。
 - UI 明确区分 official-comparable run 和本地实验 run。

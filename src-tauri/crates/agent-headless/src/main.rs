@@ -1,10 +1,11 @@
 use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
-    build_completion_recovery_prompt, build_system_prompt, build_time_convergence_prompt,
-    classify_command, effective_command_timeout_sec, evaluate_budget_command_with_time,
-    execution_contract_sha256, sanitize_completion_summary, should_prompt_budget_convergence,
-    should_prompt_time_convergence, BenchmarkPolicy, CompletionEvidence, CompletionGate,
-    PolicyDecision, ProgressTracker, ToolOutcome,
+    build_completion_recovery_prompt, build_product_system_prompt, build_system_prompt,
+    build_time_convergence_prompt, classify_command, effective_command_timeout_sec,
+    evaluate_budget_command_with_time, execution_contract_sha256, sanitize_completion_summary,
+    should_prompt_budget_convergence, should_prompt_time_convergence, BenchmarkPolicy,
+    CompletionEvidence, CompletionGate, PolicyDecision, ProductPolicy, ProgressTracker,
+    ToolOutcome,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,8 @@ enum InputMessage {
         #[serde(default)]
         wall_time_budget_sec: Option<u64>,
         allow_network: bool,
+        #[serde(default)]
+        policy_profile: RuntimePolicyProfile,
         execution_contract_sha256: String,
     },
     #[serde(rename = "tool_result")]
@@ -103,6 +106,36 @@ struct StartConfig {
     shell_timeout_sec: u64,
     wall_time_budget_sec: Option<u64>,
     allow_network: bool,
+    policy_profile: RuntimePolicyProfile,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RuntimePolicyProfile {
+    Product,
+    #[default]
+    Benchmark,
+}
+
+enum RuntimePolicy {
+    Product(ProductPolicy),
+    Benchmark(BenchmarkPolicy),
+}
+
+impl RuntimePolicy {
+    fn new(profile: RuntimePolicyProfile, allow_network: bool) -> Self {
+        match profile {
+            RuntimePolicyProfile::Product => Self::Product(ProductPolicy::new(allow_network)),
+            RuntimePolicyProfile::Benchmark => Self::Benchmark(BenchmarkPolicy::new(allow_network)),
+        }
+    }
+
+    fn evaluate_command(&self, command: &str) -> PolicyDecision {
+        match self {
+            Self::Product(policy) => policy.evaluate_command(command),
+            Self::Benchmark(policy) => policy.evaluate_command(command),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,9 +216,13 @@ where
         .timeout(Duration::from_secs(config.model_timeout_sec.max(1)))
         .build()?;
     let endpoint = chat_completions_endpoint(&config.base_url);
-    let policy = BenchmarkPolicy::new(config.allow_network);
+    let policy = RuntimePolicy::new(config.policy_profile, config.allow_network);
+    let system_prompt = match config.policy_profile {
+        RuntimePolicyProfile::Product => build_product_system_prompt(config.allow_network),
+        RuntimePolicyProfile::Benchmark => build_system_prompt(config.allow_network),
+    };
     let mut messages = vec![
-        json!({"role": "system", "content": build_system_prompt(config.allow_network)}),
+        json!({"role": "system", "content": system_prompt}),
         json!({"role": "user", "content": config.instruction}),
     ];
     let mut gate = CompletionGate::new_for_instruction(true, &config.instruction);
@@ -212,12 +249,13 @@ where
                 clamp_timeout_to_wall_reserve(config.model_timeout_sec, remaining, 30)
             })
             .unwrap_or(config.model_timeout_sec);
+        let finalization_response = finalization_pending;
         let response = match request_model(
             &client,
             &endpoint,
             &config,
             &messages,
-            true,
+            !finalization_response,
             request_timeout_sec,
         )
         .await
@@ -244,10 +282,14 @@ where
             .cloned()
             .ok_or(HeadlessError::MissingChoice)?;
         let final_text = message_content(&message);
-        let tool_calls = parse_tool_calls(&message, config.shell_timeout_sec)?;
+        let mut tool_calls = parse_tool_calls(&message, config.shell_timeout_sec)?;
+        if finalization_response {
+            finalization_pending = false;
+            tool_calls.clear();
+        }
 
         if tool_calls.is_empty() {
-            last_final_text = if finalization_pending {
+            last_final_text = if finalization_response {
                 sanitize_completion_summary(&final_text)
             } else {
                 final_text
@@ -274,7 +316,6 @@ where
             continue;
         }
 
-        let acceptance_audit_round = finalization_pending;
         finalization_pending = false;
         messages.push(message);
         let mut progress_prompt = None;
@@ -299,7 +340,7 @@ where
                         reason: "initial inspection is exhausted; batch any remaining reads with the first implementation or begin the smallest candidate implementation now".to_owned(),
                     }
                 }
-                PolicyDecision::Allow if !acceptance_audit_round => {
+                PolicyDecision::Allow => {
                     evaluate_budget_command_with_time(
                         remaining,
                         wall_time,
@@ -308,7 +349,6 @@ where
                         &kind,
                     )
                 }
-                PolicyDecision::Allow => PolicyDecision::Allow,
                 denied => denied,
             };
             let (return_code, stdout, stderr, error) = match policy_decision {
@@ -436,6 +476,7 @@ where
             shell_timeout_sec,
             wall_time_budget_sec,
             allow_network,
+            policy_profile,
             execution_contract_sha256: bridge_hash,
         } => {
             let sidecar_hash = execution_contract_sha256();
@@ -455,6 +496,7 @@ where
                 shell_timeout_sec,
                 wall_time_budget_sec,
                 allow_network,
+                policy_profile,
             })
         }
         InputMessage::ToolResult { .. } => Err(HeadlessError::ExpectedStart),
@@ -892,6 +934,34 @@ mod tests {
         assert_eq!(config.model, "test-model");
         assert!(!config.allow_network);
         assert_eq!(config.wall_time_budget_sec, Some(900));
+        assert_eq!(config.policy_profile, RuntimePolicyProfile::Benchmark);
+    }
+
+    #[tokio::test]
+    async fn product_start_selects_product_policy() {
+        let line = format!(
+            "{}\n",
+            json!({
+                "type": "start",
+                "instruction": "run the project tests",
+                "model": "test-model",
+                "api_key": "secret",
+                "base_url": "http://localhost:1234/v1",
+                "max_steps": 4,
+                "model_timeout_sec": 10,
+                "shell_timeout_sec": 30,
+                "allow_network": false,
+                "policy_profile": "product",
+                "execution_contract_sha256": execution_contract_sha256()
+            })
+        );
+        let mut input = BufReader::new(line.as_bytes());
+        let config = read_start(&mut input).await.unwrap();
+        assert_eq!(config.policy_profile, RuntimePolicyProfile::Product);
+        let policy = RuntimePolicy::new(config.policy_profile, false);
+        assert!(policy
+            .evaluate_command("pytest /Users/leo/project/tests/test_api.py")
+            .is_allowed());
     }
 
     #[tokio::test]
@@ -1009,7 +1079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_loop_runs_acceptance_audit_with_tools_before_finished() {
+    async fn model_loop_finalizes_without_tools_after_completion_evidence() {
         let (base_url, server) = fake_openai_server(vec![
             json!({
                 "choices": [{
@@ -1049,27 +1119,10 @@ mod tests {
                 "choices": [{
                     "message": {
                         "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": "acceptance-check-1",
-                            "type": "function",
-                            "function": {
-                                "name": "run_shell",
-                                "arguments": "{\"command\":\"python -c 'print(42)'\",\"timeout_sec\":5}"
-                            }
-                        }]
-                    }
-                }],
-                "usage": {"prompt_tokens": 30, "completion_tokens": 4, "total_tokens": 34}
-            }),
-            json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
                         "content": "Verified and complete."
                     }
                 }],
-                "usage": {"prompt_tokens": 40, "completion_tokens": 5, "total_tokens": 45}
+                "usage": {"prompt_tokens": 30, "completion_tokens": 4, "total_tokens": 34}
             }),
         ]);
 
@@ -1132,22 +1185,6 @@ mod tests {
         )
         .await;
 
-        let acceptance_check = read_test_output(&mut output).await;
-        assert_eq!(acceptance_check["type"], "tool_request");
-        assert_eq!(acceptance_check["id"], "acceptance-check-1");
-        write_test_line(
-            &mut input,
-            &json!({
-                "type": "tool_result",
-                "id": "acceptance-check-1",
-                "return_code": 0,
-                "stdout": "42",
-                "stderr": "",
-                "error": null
-            }),
-        )
-        .await;
-
         let finished = read_test_output(&mut output).await;
         assert_eq!(finished["type"], "finished");
         assert_eq!(finished["final_text"], "Verified and complete.");
@@ -1156,19 +1193,13 @@ mod tests {
             finished["execution_contract_sha256"],
             execution_contract_sha256()
         );
-        assert_eq!(finished["usage"]["model_requests"], 4);
+        assert_eq!(finished["usage"]["model_requests"], 3);
 
         runner.await.unwrap().unwrap();
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[2]["tool_choice"], "auto");
-        assert!(requests[2]
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|tools| !tools.is_empty()));
-        assert!(requests[2]["tools"][0]["function"]["description"]
-            .as_str()
-            .is_some_and(|description| description.contains("Batch related reads")));
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2]["tool_choice"], "none");
+        assert!(requests[2].get("tools").is_none());
     }
 
     async fn write_test_line<W>(writer: &mut W, value: &Value)
@@ -1287,6 +1318,7 @@ mod tests {
             shell_timeout_sec: 30,
             wall_time_budget_sec: None,
             allow_network: false,
+            policy_profile: RuntimePolicyProfile::Benchmark,
         };
         let client = Client::builder()
             .timeout(Duration::from_secs(5))

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauri::State;
 
+use crate::config::settings::ApiStyle;
 use crate::AppState;
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -49,8 +50,16 @@ fn split_frontmatter(content: &str) -> (&str, &str) {
     // Find the closing "---"
     if let Some(end) = rest.find("\n---\n").or_else(|| rest.find("\n---\r\n")) {
         let fm = &rest[..end];
-        let body_start = end + if rest[end..].starts_with("\n---\r\n") { 6 } else { 5 };
-        let body = rest.get(body_start..).unwrap_or("").trim_start_matches('\n');
+        let body_start = end
+            + if rest[end..].starts_with("\n---\r\n") {
+                6
+            } else {
+                5
+            };
+        let body = rest
+            .get(body_start..)
+            .unwrap_or("")
+            .trim_start_matches('\n');
         (fm, body)
     } else {
         ("", content)
@@ -82,9 +91,7 @@ fn parse_frontmatter(fm: &str, file_path: &str, rel_path: &str) -> SpecMeta {
         if let Some(item) = line.trim_start().strip_prefix("- ") {
             match current_block {
                 Block::Tags => tags.push(item.trim().to_string()),
-                Block::AcceptanceCriteria => {
-                    acceptance_criteria.push(item.trim().to_string())
-                }
+                Block::AcceptanceCriteria => acceptance_criteria.push(item.trim().to_string()),
                 Block::None => {}
             }
             continue;
@@ -272,8 +279,7 @@ pub async fn list_specs(cwd: String) -> Result<Vec<SpecMeta>, String> {
 /// Read a single spec file; parse frontmatter + body.
 #[tauri::command]
 pub async fn get_spec(path: String) -> Result<SpecFile, String> {
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("Cannot read spec: {e}"))?;
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("Cannot read spec: {e}"))?;
     let (fm_str, body_str) = {
         let (fm, body) = split_frontmatter(&content);
         (fm.to_string(), body.to_string())
@@ -308,7 +314,11 @@ pub async fn create_spec(cwd: String, title: String) -> Result<SpecFile, String>
     // Count existing specs to generate next id.
     let count = if dir.exists() {
         std::fs::read_dir(&dir)
-            .map(|e| e.flatten().filter(|x| x.path().extension().and_then(|ext| ext.to_str()) == Some("md")).count())
+            .map(|e| {
+                e.flatten()
+                    .filter(|x| x.path().extension().and_then(|ext| ext.to_str()) == Some("md"))
+                    .count()
+            })
             .unwrap_or(0)
     } else {
         0
@@ -349,8 +359,7 @@ pub async fn delete_spec(path: String) -> Result<(), String> {
 /// Set status to "approved" and save.
 #[tauri::command]
 pub async fn approve_spec(path: String) -> Result<SpecMeta, String> {
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("Cannot read spec: {e}"))?;
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("Cannot read spec: {e}"))?;
     let now = Utc::now().to_rfc3339();
     let updated = update_frontmatter_key(&content, "status", "approved");
     let updated = update_frontmatter_key(&updated, "updated_at", &now);
@@ -362,34 +371,128 @@ pub async fn approve_spec(path: String) -> Result<SpecMeta, String> {
 
 // ── AI assist (non-streaming) ────────────────────────────────────────────────
 
-#[derive(Serialize)]
-struct AiMessage {
-    role: String,
-    content: String,
+#[derive(Clone, Serialize)]
+pub(crate) struct AiMessage {
+    pub(crate) role: String,
+    pub(crate) content: String,
 }
 
-#[derive(Serialize)]
-struct AiRequest {
-    model: String,
+#[derive(Debug)]
+pub(crate) struct OneShotRequest {
+    pub(crate) url: String,
+    pub(crate) body: serde_json::Value,
+}
+
+pub(crate) fn build_one_shot_request(
+    base_url: &str,
+    model: &str,
+    api_style: &ApiStyle,
     messages: Vec<AiMessage>,
-    stream: bool,
-    temperature: f32,
     max_tokens: u32,
+    temperature: f32,
+) -> Result<OneShotRequest, String> {
+    let model = crate::config::settings::normalize_model_id(model, base_url);
+    let base_url = base_url.trim_end_matches('/');
+    match api_style {
+        ApiStyle::Openai => Ok(OneShotRequest {
+            url: format!("{base_url}/chat/completions"),
+            body: serde_json::json!({
+                "model": model,
+                "messages": messages,
+                "stream": false,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }),
+        }),
+        ApiStyle::Anthropic => {
+            let mut system = Vec::new();
+            let mut conversation = Vec::new();
+            for message in messages {
+                if message.role == "system" {
+                    system.push(message.content);
+                } else {
+                    conversation.push(serde_json::json!({
+                        "role": message.role,
+                        "content": message.content,
+                    }));
+                }
+            }
+            let mut body = serde_json::json!({
+                "model": model,
+                "messages": conversation,
+                "stream": false,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            });
+            if !system.is_empty() {
+                body["system"] = serde_json::Value::String(system.join("\n\n"));
+            }
+            Ok(OneShotRequest {
+                url: format!("{base_url}/v1/messages"),
+                body,
+            })
+        }
+        ApiStyle::Chatgpt => Err(
+            "One-shot AI helpers do not support ChatGPT endpoints yet. Choose an OpenAI-compatible or Anthropic endpoint."
+                .into(),
+        ),
+    }
 }
 
-#[derive(Deserialize)]
-struct AiResponse {
-    choices: Vec<AiChoice>,
-}
-
-#[derive(Deserialize)]
-struct AiChoice {
-    message: AiChoiceMessage,
-}
-
-#[derive(Deserialize)]
-struct AiChoiceMessage {
-    content: Option<String>,
+pub(crate) async fn run_one_shot_text(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    api_style: &ApiStyle,
+    messages: Vec<AiMessage>,
+    max_tokens: u32,
+    temperature: f32,
+) -> Result<String, String> {
+    let mut request = build_one_shot_request(
+        base_url,
+        model,
+        api_style,
+        messages,
+        max_tokens,
+        temperature,
+    )?;
+    let client = Client::new();
+    let response = match api_style {
+        ApiStyle::Openai => crate::http_util::post_chat_completions(
+            &client,
+            &request.url,
+            api_key,
+            &mut request.body,
+        )
+        .await
+        .map_err(|error| error.to_string())?,
+        ApiStyle::Anthropic => {
+            let response = crate::http_util::send_with_retry("Anthropic messages request", || {
+                client
+                    .post(&request.url)
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&request.body)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            crate::http_util::check_status(response)
+                .await
+                .map_err(|error| error.to_string())?
+        }
+        ApiStyle::Chatgpt => unreachable!("ChatGPT is rejected while building the request"),
+    };
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("JSON parse error: {error}"))?;
+    Ok(value
+        .pointer("/choices/0/message/content")
+        .or_else(|| value.pointer("/content/0/text"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned())
 }
 
 /// Make a single non-streaming AI call with `instruction` + `spec_content`
@@ -402,7 +505,12 @@ pub async fn spec_ai_assist(
 ) -> Result<String, String> {
     let settings = state.settings.read().await.clone();
     let ep_name = &settings.default_endpoint;
-    let model = settings.default_model.clone();
+    let model = settings.resolved_default_model().ok_or_else(|| {
+        format!(
+            "No model configured for endpoint '{}'. Please choose a model in the picker.",
+            ep_name
+        )
+    })?;
 
     let endpoint = settings
         .endpoints
@@ -417,9 +525,6 @@ pub async fn spec_ai_assist(
         String::new()
     };
 
-    let base_url = endpoint.base_url.trim_end_matches('/');
-    let url = format!("{base_url}/chat/completions");
-
     let system = "You are an expert software engineer and technical writer. \
                    You help write clear, structured software specification documents. \
                    Output only the requested content — no commentary, no markdown fences wrapping the whole output.";
@@ -427,14 +532,15 @@ pub async fn spec_ai_assist(
     let user_content = if spec_content.is_empty() {
         instruction.clone()
     } else {
-        format!(
-            "{instruction}\n\n---\nCurrent spec content:\n{spec_content}"
-        )
+        format!("{instruction}\n\n---\nCurrent spec content:\n{spec_content}")
     };
 
-    let request = AiRequest {
-        model,
-        messages: vec![
+    run_one_shot_text(
+        &endpoint.base_url,
+        &api_key,
+        &model,
+        &endpoint.api_style,
+        vec![
             AiMessage {
                 role: "system".into(),
                 content: system.into(),
@@ -444,33 +550,10 @@ pub async fn spec_ai_assist(
                 content: user_content,
             },
         ],
-        stream: false,
-        temperature: 0.3,
-        max_tokens: 2048,
-    };
-
-    // Send as-is; post_chat_completions reactively switches to
-    // max_completion_tokens only if the server rejects max_tokens (GPT-5 /
-    // o-series), leaving endpoints that accept the legacy fields untouched.
-    let mut body = serde_json::to_value(&request)
-        .map_err(|e| format!("Failed to serialize request: {e}"))?;
-    let client = Client::new();
-    let response = crate::http_util::post_chat_completions(&client, &url, &api_key, &mut body)
-        .await
-        .map_err(|e| e.to_string())?;
-    let resp: AiResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("JSON parse error: {e}"))?;
-
-    let text = resp
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
-
-    Ok(text)
+        2048,
+        0.3,
+    )
+    .await
 }
 
 // ── AI task decomposition ────────────────────────────────────────────────────
@@ -500,7 +583,12 @@ pub async fn decompose_spec_to_tasks(
 ) -> Result<Vec<DecomposedTask>, String> {
     let settings = state.settings.read().await.clone();
     let ep_name = &settings.default_endpoint;
-    let model = settings.default_model.clone();
+    let model = settings.resolved_default_model().ok_or_else(|| {
+        format!(
+            "No model configured for endpoint '{}'. Please choose a model in the picker.",
+            ep_name
+        )
+    })?;
 
     let endpoint = settings
         .endpoints
@@ -514,9 +602,6 @@ pub async fn decompose_spec_to_tasks(
     } else {
         String::new()
     };
-
-    let base_url = endpoint.base_url.trim_end_matches('/');
-    let url = format!("{base_url}/chat/completions");
 
     // Inject user-context block (preferences + learnings + memory) when cwd is
     // available — same contract as decompose_request_to_tasks. Spec-based
@@ -555,37 +640,19 @@ Spec:\n\
 {spec_content}"
     );
 
-    let request = AiRequest {
-        model,
-        messages: vec![AiMessage {
+    let text = run_one_shot_text(
+        &endpoint.base_url,
+        &api_key,
+        &model,
+        &endpoint.api_style,
+        vec![AiMessage {
             role: "user".into(),
             content: prompt,
         }],
-        stream: false,
-        temperature: 0.3,
-        max_tokens: 1024,
-    };
-
-    // Send as-is; post_chat_completions reactively switches to
-    // max_completion_tokens only if the server rejects max_tokens (GPT-5 /
-    // o-series), leaving endpoints that accept the legacy fields untouched.
-    let mut body = serde_json::to_value(&request)
-        .map_err(|e| format!("Failed to serialize request: {e}"))?;
-    let client = Client::new();
-    let response = crate::http_util::post_chat_completions(&client, &url, &api_key, &mut body)
-        .await
-        .map_err(|e| e.to_string())?;
-    let resp: AiResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("JSON parse error: {e}"))?;
-
-    let text = resp
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
+        1024,
+        0.3,
+    )
+    .await?;
 
     // Strip markdown fences if present
     let json_str = {
@@ -638,7 +705,13 @@ Spec:\n\
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(DecomposedTask { tmp_id, title, description, dependencies, acceptance_criteria })
+            Some(DecomposedTask {
+                tmp_id,
+                title,
+                description,
+                dependencies,
+                acceptance_criteria,
+            })
         })
         .collect();
 
@@ -664,7 +737,12 @@ pub async fn decompose_request_to_tasks(
 ) -> Result<Vec<DecomposedTask>, String> {
     let settings = state.settings.read().await.clone();
     let ep_name = &settings.default_endpoint;
-    let model = settings.default_model.clone();
+    let model = settings.resolved_default_model().ok_or_else(|| {
+        format!(
+            "No model configured for endpoint '{}'. Please choose a model in the picker.",
+            ep_name
+        )
+    })?;
 
     let endpoint = settings
         .endpoints
@@ -678,9 +756,6 @@ pub async fn decompose_request_to_tasks(
     } else {
         String::new()
     };
-
-    let base_url = endpoint.base_url.trim_end_matches('/');
-    let url = format!("{base_url}/chat/completions");
 
     // Build user-context block once, prepend to the decomposition prompt
     // so tasks reflect this user's preferences / past learnings / memory.
@@ -719,37 +794,19 @@ User request:\n\
 {request}"
     );
 
-    let request_body = AiRequest {
-        model,
-        messages: vec![AiMessage {
+    let text = run_one_shot_text(
+        &endpoint.base_url,
+        &api_key,
+        &model,
+        &endpoint.api_style,
+        vec![AiMessage {
             role: "user".into(),
             content: prompt,
         }],
-        stream: false,
-        temperature: 0.3,
-        max_tokens: 1024,
-    };
-
-    // Send as-is; post_chat_completions reactively switches to
-    // max_completion_tokens only if the server rejects max_tokens (GPT-5 /
-    // o-series), leaving endpoints that accept the legacy fields untouched.
-    let mut body = serde_json::to_value(&request_body)
-        .map_err(|e| format!("Failed to serialize request: {e}"))?;
-    let client = Client::new();
-    let response = crate::http_util::post_chat_completions(&client, &url, &api_key, &mut body)
-        .await
-        .map_err(|e| e.to_string())?;
-    let resp: AiResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("JSON parse error: {e}"))?;
-
-    let text = resp
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
+        1024,
+        0.3,
+    )
+    .await?;
 
     // Strip markdown fences if present
     let json_str = {
@@ -802,7 +859,13 @@ User request:\n\
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(DecomposedTask { tmp_id, title, description, dependencies, acceptance_criteria })
+            Some(DecomposedTask {
+                tmp_id,
+                title,
+                description,
+                dependencies,
+                acceptance_criteria,
+            })
         })
         .collect();
 
@@ -813,3 +876,99 @@ User request:\n\
     }
 }
 
+#[cfg(test)]
+mod one_shot_transport_tests {
+    use super::*;
+
+    fn messages() -> Vec<AiMessage> {
+        vec![
+            AiMessage {
+                role: "system".into(),
+                content: "Follow the instructions exactly.".into(),
+            },
+            AiMessage {
+                role: "user".into(),
+                content: "Return JSON.".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn openai_one_shot_uses_chat_completions_transport() {
+        let request = build_one_shot_request(
+            "https://api.deepseek.com",
+            "deepseek-v4-pro",
+            &ApiStyle::Openai,
+            messages(),
+            512,
+            0.3,
+        )
+        .unwrap();
+
+        assert_eq!(request.url, "https://api.deepseek.com/chat/completions");
+        assert_eq!(request.body["model"], "deepseek-v4-pro");
+        assert_eq!(request.body["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn direct_provider_one_shot_normalizes_openrouter_model_prefix() {
+        let request = build_one_shot_request(
+            "https://api.deepseek.com",
+            "deepseek/deepseek-v4-pro",
+            &ApiStyle::Openai,
+            messages(),
+            512,
+            0.3,
+        )
+        .unwrap();
+
+        assert_eq!(request.body["model"], "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn custom_endpoint_preserves_slash_qualified_model_id() {
+        let request = build_one_shot_request(
+            "https://inference.example.com/v1",
+            "meta-llama/Llama-3.1-70B-Instruct",
+            &ApiStyle::Openai,
+            messages(),
+            512,
+            0.3,
+        )
+        .unwrap();
+
+        assert_eq!(request.body["model"], "meta-llama/Llama-3.1-70B-Instruct");
+    }
+
+    #[test]
+    fn anthropic_one_shot_uses_messages_transport_and_top_level_system() {
+        let request = build_one_shot_request(
+            "https://api.anthropic.com",
+            "claude-sonnet-4-5",
+            &ApiStyle::Anthropic,
+            messages(),
+            512,
+            0.3,
+        )
+        .unwrap();
+
+        assert_eq!(request.url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(request.body["system"], "Follow the instructions exactly.");
+        assert_eq!(request.body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn chatgpt_one_shot_is_rejected_before_an_invalid_request() {
+        let error = build_one_shot_request(
+            "https://chatgpt.com/backend-api/codex",
+            "gpt-5.5",
+            &ApiStyle::Chatgpt,
+            messages(),
+            512,
+            0.3,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("do not support ChatGPT endpoints"));
+    }
+}

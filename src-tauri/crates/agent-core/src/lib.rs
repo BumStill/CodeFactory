@@ -14,15 +14,34 @@ pub fn execution_contract_sha256() -> String {
 }
 
 pub fn build_system_prompt(allow_external_network: bool) -> String {
+    build_scoped_system_prompt(allow_external_network, true)
+}
+
+pub fn build_product_system_prompt(allow_external_network: bool) -> String {
+    format!(
+        "{}\n\nThe selected project is the writable workspace. Use $TMPDIR for temporary files; writes outside the workspace and $TMPDIR are denied.",
+        build_scoped_system_prompt(allow_external_network, false)
+    )
+}
+
+fn build_scoped_system_prompt(
+    allow_external_network: bool,
+    include_benchmark_boundaries: bool,
+) -> String {
     let network_capability = if allow_external_network {
         "External network access is available under the active environment policy. Use it only \
 for task-required dependency or source retrieval; the environment remains the enforcement point."
     } else {
         "Network access is denied by default except for loopback functional probes."
     };
+    let benchmark_boundary = if include_benchmark_boundaries {
+        "Never inspect hidden verifiers or benchmark solutions. "
+    } else {
+        ""
+    };
     format!(
         "You are CodeFactory's autonomous coding agent. Work only through the provided tools. \
-Never inspect hidden verifiers, benchmark solutions, or secret stores. {network_capability} Do not \
+{benchmark_boundary}Never inspect secret stores. {network_capability} Do not \
 claim completion until the shared completion gate accepts structured execution evidence.\n\n{}",
         EXECUTION_CONTRACT.trim()
     )
@@ -94,8 +113,12 @@ finish build, install, run outside the source directory, named component behavio
 focused project tests in that order; inspect the build configuration plus generated and compiled \
 source inputs rather than scanning only one familiar file type. For compatibility migrations, \
 derive local import aliases from the source and scan every discovered alias with token-safe, \
-idempotent replacements; then rerun the same issue scan and \
-require no unresolved matches before finalizing. Once the current source revision installs, do not \
+idempotent replacements. Start from each exact failing API member reported by build, runtime, or \
+tests, then add candidate spellings only when repository references or a language adapter support \
+them. Write matches to a temporary results file, preserve the `grep` or `rg` status, reject status greater than 1, \
+and finish with `test ! -s`; do not mask search errors or let the normal no-match status turn a \
+clean scan into a failed command. Then rerun \
+the same issue scan and require no unresolved matches before finalizing. Once the current source revision installs, do not \
 keep installing speculative dependencies before the external runtime or focused tests expose a \
 concrete missing dependency. For a background service, finish \
 PID, logs, bounded readiness, and a real client probe. \
@@ -140,11 +163,24 @@ impl PolicyDecision {
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkPolicy {
+    product: ProductPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProductPolicy {
     allow_loopback_network: bool,
     allow_external_network: bool,
 }
 
 impl Default for BenchmarkPolicy {
+    fn default() -> Self {
+        Self {
+            product: ProductPolicy::default(),
+        }
+    }
+}
+
+impl Default for ProductPolicy {
     fn default() -> Self {
         Self {
             allow_loopback_network: true,
@@ -153,7 +189,7 @@ impl Default for BenchmarkPolicy {
     }
 }
 
-impl BenchmarkPolicy {
+impl ProductPolicy {
     pub fn new(allow_network: bool) -> Self {
         Self {
             allow_loopback_network: true,
@@ -174,45 +210,6 @@ impl BenchmarkPolicy {
 
     pub fn evaluate_command(&self, command: &str) -> PolicyDecision {
         let lower = command.to_ascii_lowercase();
-
-        if is_root_wide_hidden_artifact_discovery(&lower)
-            || contains_any(
-                &lower,
-                &[
-                    "/tests/",
-                    "/tests ",
-                    "/tests\"",
-                    "/tests'",
-                    "/tests/test.sh",
-                    "hidden_verifier",
-                    "hidden-verifier",
-                    "/grader/",
-                ],
-            )
-        {
-            return deny(
-                "hidden_verifier",
-                "access to hidden verifier or grader paths is prohibited",
-            );
-        }
-
-        if contains_any(
-            &lower,
-            &[
-                "/solution/",
-                "/solution.",
-                "/solution ",
-                "solution.sh",
-                "answer.sh",
-                "/answers/",
-            ],
-        ) {
-            return deny(
-                "benchmark_solution",
-                "access to benchmark solution artifacts is prohibited",
-            );
-        }
-
         if contains_any(
             &lower,
             &[
@@ -310,6 +307,68 @@ impl BenchmarkPolicy {
         }
 
         None
+    }
+}
+
+impl BenchmarkPolicy {
+    pub fn new(allow_network: bool) -> Self {
+        Self {
+            product: ProductPolicy::new(allow_network),
+        }
+    }
+
+    pub fn deny_all_network() -> Self {
+        Self {
+            product: ProductPolicy::deny_all_network(),
+        }
+    }
+
+    pub fn with_network_access(allow_external_network: bool) -> Self {
+        Self::new(allow_external_network)
+    }
+
+    pub fn evaluate_command(&self, command: &str) -> PolicyDecision {
+        let lower = command.to_ascii_lowercase();
+
+        if is_root_wide_hidden_artifact_discovery(&lower)
+            || contains_any(
+                &lower,
+                &[
+                    "/tests/",
+                    "/tests ",
+                    "/tests\"",
+                    "/tests'",
+                    "/tests/test.sh",
+                    "hidden_verifier",
+                    "hidden-verifier",
+                    "/grader/",
+                ],
+            )
+        {
+            return deny(
+                "hidden_verifier",
+                "access to hidden verifier or grader paths is prohibited",
+            );
+        }
+
+        if contains_any(
+            &lower,
+            &[
+                "/solution/",
+                "/solution.",
+                "/solution ",
+                "solution.sh",
+                "answer.sh",
+                "/answers/",
+            ],
+        ) {
+            return deny(
+                "benchmark_solution",
+                "access to benchmark solution artifacts is prohibited",
+            );
+        }
+
+        self.product.evaluate_command(command)
     }
 }
 
@@ -772,6 +831,7 @@ pub struct CompletionEvidence {
     pub last_service_log_evidence_sequence: Option<u64>,
     pub last_bounded_probe_sequence: Option<u64>,
     pub required_source_scan_extensions: Vec<String>,
+    pub source_evidence_paths: Vec<String>,
     pub last_source_scan_sequence: Option<u64>,
     pub source_delivery_required: bool,
     pub project_tests_required: bool,
@@ -813,6 +873,11 @@ pub fn evaluate_budget_command_with_time(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
+    let source_evidence_paths = evidence
+        .source_evidence_paths
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let source_scan_blocked = !required_extensions.is_empty()
         && evidence
             .blockers
@@ -820,16 +885,21 @@ pub fn evaluate_budget_command_with_time(
             .any(|blocker| blocker.contains("source compatibility"));
     if source_scan_blocked {
         let source_mutation = matches!(kind, ToolKind::Mutation)
-            && !is_dependency_install_command(&command.to_ascii_lowercase());
+            && !is_source_build_or_install_command(&command.to_ascii_lowercase());
         if source_mutation
-            || is_repository_alias_discovery_command(command)
+            || is_bounded_source_evidence_read(
+                command,
+                &required_extensions,
+                &source_evidence_paths,
+            )
+            || is_repository_alias_discovery_command(command, &required_extensions)
             || is_repository_source_scan_command(command, &required_extensions)
         {
             return PolicyDecision::Allow;
         }
         return deny(
             "execution_budget",
-            "before another build or install, derive every local import alias from the repository and complete the required clean residual scan across all observed source/build-input extensions; make the scan return 0 only when no unresolved matches remain",
+            "before another build or install, derive every local import alias from the repository and complete the required clean residual scan across all observed source/build-input extensions; derive candidate spellings from exact failures, repository references, or a language adapter, write matches to a temporary results file, preserve the grep/rg status, reject status greater than 1, and finish with `test ! -s`",
         );
     }
 
@@ -959,8 +1029,10 @@ pub struct CompletionGate {
     source_delivery_required: bool,
     project_tests_required: bool,
     required_source_scan_extensions: BTreeSet<String>,
+    source_evidence_paths: BTreeSet<String>,
     last_source_mutation_sequence: Option<u64>,
     last_source_scan_sequence: Option<u64>,
+    last_failed_clean_source_scan_sequence: Option<u64>,
     last_source_install_sequence: Option<u64>,
     last_external_source_runtime_sequence: Option<u64>,
     last_project_test_sequence: Option<u64>,
@@ -1060,8 +1132,10 @@ impl CompletionGate {
             source_delivery_required,
             project_tests_required,
             required_source_scan_extensions: BTreeSet::new(),
+            source_evidence_paths: BTreeSet::new(),
             last_source_mutation_sequence: None,
             last_source_scan_sequence: None,
+            last_failed_clean_source_scan_sequence: None,
             last_source_install_sequence: None,
             last_external_source_runtime_sequence: None,
             last_project_test_sequence: None,
@@ -1078,8 +1152,19 @@ impl CompletionGate {
         if self.source_compatibility_audit_required {
             self.required_source_scan_extensions
                 .extend(observed_build_input_extensions(outcome));
+            self.source_evidence_paths
+                .extend(observed_source_evidence_paths(outcome));
             if is_clean_repository_source_scan(outcome, &self.required_source_scan_extensions) {
                 self.last_source_scan_sequence = Some(outcome.sequence);
+                self.last_failed_clean_source_scan_sequence = None;
+            } else if !outcome.succeeded()
+                && is_repository_source_scan_attempt(
+                    &outcome.command,
+                    &self.required_source_scan_extensions,
+                )
+                && source_scan_output_claims_clean(outcome)
+            {
+                self.last_failed_clean_source_scan_sequence = Some(outcome.sequence);
             }
         }
         if self.source_delivery_required && outcome.succeeded() {
@@ -1230,6 +1315,15 @@ impl CompletionGate {
             && !self.required_source_scan_extensions.is_empty()
         {
             if let Some(source_mutation_sequence) = self.last_source_mutation_sequence {
+                if self
+                    .last_failed_clean_source_scan_sequence
+                    .is_some_and(|sequence| sequence >= source_mutation_sequence)
+                {
+                    blockers.push(
+                        "source compatibility residual scan reported zero residual matches but exited nonzero; rerun once by writing matches to a temporary results file, preserving the grep/rg status, rejecting status greater than 1, and finishing with `test ! -s`"
+                            .to_owned(),
+                    );
+                }
                 if !self
                     .last_source_scan_sequence
                     .is_some_and(|sequence| sequence > source_mutation_sequence)
@@ -1297,6 +1391,7 @@ impl CompletionGate {
                 .iter()
                 .cloned()
                 .collect(),
+            source_evidence_paths: self.source_evidence_paths.iter().cloned().collect(),
             last_source_scan_sequence: self.last_source_scan_sequence,
             source_delivery_required: self.source_delivery_required,
             project_tests_required: self.project_tests_required,
@@ -1346,6 +1441,54 @@ fn observed_build_input_extensions(outcome: &ToolOutcome) -> BTreeSet<String> {
         collect_source_extensions(&outcome.command, &mut extensions);
     }
     extensions
+}
+
+fn observed_source_evidence_paths(outcome: &ToolOutcome) -> BTreeSet<String> {
+    let lower_command = outcome.command.to_ascii_lowercase();
+    let inspects_build_config = contains_any(
+        &lower_command,
+        &[
+            "setup.py",
+            "pyproject.toml",
+            "cargo.toml",
+            "cmakelists.txt",
+            "meson.build",
+            "makefile",
+            "package.json",
+            "build.gradle",
+            "pom.xml",
+        ],
+    );
+    let mut paths = BTreeSet::new();
+    if is_source_mutation(outcome) {
+        collect_source_paths(&outcome.command, &mut paths);
+    }
+    if inspects_build_config {
+        collect_source_paths(&outcome.stdout, &mut paths);
+        collect_source_paths(&outcome.stderr, &mut paths);
+    }
+    paths
+}
+
+fn collect_source_paths(text: &str, paths: &mut BTreeSet<String>) {
+    for token in text.split_whitespace() {
+        let candidate = token
+            .trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+                )
+            })
+            .replace('\\', "/");
+        let lower = candidate.to_ascii_lowercase();
+        if SOURCE_INPUT_EXTENSIONS
+            .iter()
+            .any(|extension| lower.len() > extension.len() && lower.ends_with(extension))
+            && !has_ignored_source_component(&lower)
+        {
+            paths.insert(candidate);
+        }
+    }
 }
 
 fn collect_source_extensions(text: &str, extensions: &mut BTreeSet<String>) {
@@ -1439,6 +1582,32 @@ fn is_source_install_command(command: &str) -> bool {
     )
 }
 
+fn is_source_build_or_install_command(command: &str) -> bool {
+    is_dependency_install_command(command)
+        || contains_any(
+            command,
+            &[
+                "setup.py build",
+                "build_ext",
+                "cargo build",
+                "npm run build",
+                "pnpm build",
+                "yarn build",
+                "bun run build",
+                "cmake --build",
+                "mvn package",
+                "gradle build",
+                "gradlew build",
+                "go build",
+                "docker build",
+                "podman build",
+                "dotnet build",
+                "swift build",
+                "xcodebuild",
+            ],
+        )
+}
+
 fn is_external_source_runtime_command(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     let external_working_directory = contains_any(
@@ -1482,6 +1651,17 @@ fn is_repository_source_scan_command(
     command: &str,
     required_extensions: &BTreeSet<String>,
 ) -> bool {
+    if !is_repository_source_scan_attempt(command, required_extensions) {
+        return false;
+    }
+    let lower = command.to_ascii_lowercase();
+    source_scan_has_clean_exit_contract(&lower)
+}
+
+fn is_repository_source_scan_attempt(
+    command: &str,
+    required_extensions: &BTreeSet<String>,
+) -> bool {
     if required_extensions.is_empty() {
         return false;
     }
@@ -1491,7 +1671,7 @@ fn is_repository_source_scan_command(
         || lower.contains("grep --recursive")
         || lower.contains("find ")
         || lower.contains("os.walk(");
-    if !repository_wide || !source_scan_has_clean_exit_contract(&lower) {
+    if !repository_wide {
         return false;
     }
     let has_extension_filter = contains_any(
@@ -1506,9 +1686,32 @@ fn is_repository_source_scan_command(
         .all(|extension| lower.contains(extension))
 }
 
-fn is_repository_alias_discovery_command(command: &str) -> bool {
+fn source_scan_output_claims_clean(outcome: &ToolOutcome) -> bool {
+    let output = format!("{}\n{}", outcome.stdout, outcome.stderr).to_ascii_lowercase();
+    let claims_clean = contains_any(
+        &output,
+        &[
+            "0 unresolved",
+            "zero residual",
+            "no unresolved",
+            "scan clean",
+            "all clean",
+        ],
+    );
+    claims_clean
+        && !contains_any(
+            &output,
+            &["issues remain", "unresolved matches remain", "not clean"],
+        )
+}
+
+fn is_repository_alias_discovery_command(
+    command: &str,
+    required_extensions: &BTreeSet<String>,
+) -> bool {
     let lower = command.to_ascii_lowercase();
     let repository_wide = lower.contains("rg ")
+        || lower.starts_with("grep ")
         || lower.contains("grep -r")
         || lower.contains("grep --recursive")
         || lower.contains("find ")
@@ -1523,20 +1726,72 @@ fn is_repository_alias_discovery_command(command: &str) -> bool {
             "require(",
         ],
     );
-    repository_wide && alias_focused
+    let extension_scoped = contains_any(&lower, &["--include", "--glob", " -g ", " glob="])
+        && required_extensions
+            .iter()
+            .all(|extension| lower.contains(extension));
+    repository_wide && alias_focused && extension_scoped
+}
+
+fn is_bounded_source_evidence_read(
+    command: &str,
+    required_extensions: &BTreeSet<String>,
+    source_evidence_paths: &BTreeSet<String>,
+) -> bool {
+    let Some(path) = command.trim().strip_prefix("read_file ") else {
+        return false;
+    };
+    let path = path.trim_matches(['\'', '"']).replace('\\', "/");
+    let lower = path.to_ascii_lowercase();
+    if path.split_whitespace().count() != 1
+        || has_ignored_source_component(&lower)
+        || !required_extensions
+            .iter()
+            .any(|extension| lower.ends_with(extension))
+    {
+        return false;
+    }
+    source_evidence_paths.iter().any(|observed| {
+        let observed = observed.replace('\\', "/").to_ascii_lowercase();
+        lower == observed
+            || lower.ends_with(&format!("/{observed}"))
+            || observed.ends_with(&format!("/{lower}"))
+            || source_parent(&lower)
+                .zip(source_parent(&observed))
+                .is_some_and(|(candidate_parent, observed_parent)| {
+                    candidate_parent == observed_parent
+                        || candidate_parent.ends_with(&format!("/{observed_parent}"))
+                        || observed_parent.ends_with(&format!("/{candidate_parent}"))
+                })
+    })
+}
+
+fn source_parent(path: &str) -> Option<&str> {
+    path.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+fn has_ignored_source_component(path: &str) -> bool {
+    path.split(['/', '\\']).any(|component| {
+        matches!(
+            component,
+            ".git" | ".venv" | "venv" | "node_modules" | "target" | "__pycache__"
+        )
+    })
 }
 
 fn source_scan_has_clean_exit_contract(command: &str) -> bool {
-    contains_any(
-        command,
-        &[
-            "test ! -s",
-            "sys.exit(",
-            "raise systemexit",
-            "! grep ",
-            "! rg ",
-        ],
-    ) || (command.contains("exit 1") && command.contains("exit 0"))
+    let structured_exit =
+        command.contains("os.walk(") && contains_any(command, &["sys.exit(", "raise systemexit"]);
+    let robust_shell_exit = command.contains("test ! -s")
+        && contains_any(command, &["=$?", "=\"$?\""])
+        && contains_any(command, &["-gt 1", "-le 1", "> 1", ">1", "case "])
+        && contains_any(
+            command,
+            &[
+                "exit $", "exit \"$", "exit 1", "exit 2", "return 1", "return 2",
+            ],
+        );
+    structured_exit || robust_shell_exit
 }
 
 fn verification_scope_restriction_count(command: &str) -> usize {
@@ -1676,6 +1931,14 @@ mod tests {
     }
 
     #[test]
+    fn product_prompt_names_the_workspace_write_boundary() {
+        let prompt = build_product_system_prompt(false);
+        assert!(prompt.contains("writable workspace"));
+        assert!(prompt.contains("$TMPDIR"));
+        assert!(!prompt.contains("hidden verifiers"));
+    }
+
+    #[test]
     fn benchmark_policy_denies_hidden_verifier_solution_and_secrets() {
         let policy = BenchmarkPolicy::default();
         for command in [
@@ -1705,6 +1968,18 @@ mod tests {
         assert!(policy
             .evaluate_command("pip install --no-index ./vendor/package.whl")
             .is_allowed());
+    }
+
+    #[test]
+    fn product_policy_allows_normal_project_test_and_solution_paths() {
+        let policy = ProductPolicy::default();
+        assert!(policy
+            .evaluate_command("pytest /Users/leo/project/tests/test_api.py")
+            .is_allowed());
+        assert!(policy
+            .evaluate_command("cat /Users/leo/project/solution/solver.py")
+            .is_allowed());
+        assert!(!policy.evaluate_command("printenv").is_allowed());
     }
 
     #[test]
@@ -2014,6 +2289,7 @@ mod tests {
     fn finalization_budget_blocks_scope_expansion_until_source_scan_is_complete() {
         let evidence = CompletionEvidence {
             required_source_scan_extensions: vec![".py".to_owned(), ".pyx".to_owned()],
+            source_evidence_paths: vec!["pkg/fast.pyx".to_owned(), "pkg/main.py".to_owned()],
             blockers: vec![
                 "source compatibility work requires a clean repository-wide residual scan"
                     .to_owned(),
@@ -2031,7 +2307,7 @@ mod tests {
         assert!(evaluate_budget_command(
             8,
             &evidence,
-            "grep -R 'np.int' --include='*.py' --include='*.pyx' . >/tmp/residuals && test ! -s /tmp/residuals",
+            "grep -R 'np.int' --include='*.py' --include='*.pyx' . >/tmp/residuals; scan_status=$?; if [ \"$scan_status\" -gt 1 ]; then exit \"$scan_status\"; fi; test ! -s /tmp/residuals",
             &ToolKind::ReadOnly,
         )
         .is_allowed());
@@ -2048,6 +2324,41 @@ mod tests {
             &evidence,
             "sed -i 's/np.int/np.int64/g' pkg/fast.pyx",
             &ToolKind::Mutation,
+        )
+        .is_allowed());
+        assert!(evaluate_budget_command(
+            8,
+            &evidence,
+            "read_file pkg/runtime.py",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+        assert!(!evaluate_budget_command(
+            8,
+            &evidence,
+            "read_file unrelated/other.py",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+        assert!(!evaluate_budget_command(
+            8,
+            &evidence,
+            "read_file .venv/lib/python/site-packages/other.py",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+        assert!(!evaluate_budget_command(
+            8,
+            &evidence,
+            "grep ^(import|from) pkg",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+        assert!(evaluate_budget_command(
+            8,
+            &evidence,
+            "rg '^(import|from) ' --glob '*.py' --glob '*.pyx' pkg",
+            &ToolKind::ReadOnly,
         )
         .is_allowed());
     }
@@ -2269,7 +2580,7 @@ mod tests {
             50,
             Some((430, 900)),
             &evidence,
-            "! grep -R deprecated --include='*.py' --include='*.pyx' .",
+            "grep -R deprecated --include='*.py' --include='*.pyx' . >/tmp/residuals; scan_status=$?; if [ \"$scan_status\" -gt 1 ]; then exit \"$scan_status\"; fi; test ! -s /tmp/residuals",
             &ToolKind::ReadOnly,
         )
         .is_allowed());
@@ -2458,14 +2769,12 @@ mod tests {
             .any(|blocker| blocker.contains(".pyx")));
 
         let mut incomplete_scan = outcome(4, ToolKind::ReadOnly, 0);
-        incomplete_scan.command =
-            "grep -R 'old' --include='*.py' pkg/ >/tmp/residuals && test ! -s /tmp/residuals"
-                .to_owned();
+        incomplete_scan.command = "grep -R 'old' --include='*.py' pkg/ >/tmp/residuals; scan_status=$?; if [ \"$scan_status\" -gt 1 ]; then exit \"$scan_status\"; fi; test ! -s /tmp/residuals".to_owned();
         gate.record(&incomplete_scan);
         assert!(!gate.evidence().completed);
 
         let mut complete_scan = outcome(5, ToolKind::ReadOnly, 0);
-        complete_scan.command = "grep -R 'old' --include='*.py' --include='*.pyx' pkg/ >/tmp/residuals && test ! -s /tmp/residuals".to_owned();
+        complete_scan.command = "grep -R 'old' --include='*.py' --include='*.pyx' pkg/ >/tmp/residuals; scan_status=$?; if [ \"$scan_status\" -gt 1 ]; then exit \"$scan_status\"; fi; test ! -s /tmp/residuals".to_owned();
         complete_scan.stdout = "PASSED: no unresolved compatibility matches".to_owned();
         gate.record(&complete_scan);
         assert!(gate.evidence().completed);
@@ -2595,10 +2904,161 @@ mod tests {
             20,
             Some((500, 900)),
             &evidence,
-            "rg '^(import|from) ' --glob '*.py' --glob '*.pyx' . >/tmp/import-aliases; rg 'legacy_api' --glob '*.py' --glob '*.pyx' . >/tmp/residuals; test ! -s /tmp/residuals",
+            "rg '^(import|from) ' --glob '*.py' --glob '*.pyx' . >/tmp/import-aliases; rg 'legacy_api' --glob '*.py' --glob '*.pyx' . >/tmp/residuals; scan_status=$?; if [ \"$scan_status\" -gt 1 ]; then exit \"$scan_status\"; fi; test ! -s /tmp/residuals",
             &ToolKind::ReadOnly,
         )
         .is_allowed());
+
+        assert!(!evaluate_budget_command_with_time(
+            20,
+            Some((500, 900)),
+            &evidence,
+            "sed -i 's/legacy_api/current_api/' src/module.py && python setup.py build_ext --inplace",
+            &ToolKind::Mutation,
+        )
+        .is_allowed());
+    }
+
+    #[test]
+    fn source_checkpoint_rejects_fragile_no_match_command_substitution() {
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 4,
+            last_mutation_sequence: Some(4),
+            required_source_scan_extensions: vec![".py".to_owned(), ".pyx".to_owned()],
+            source_delivery_required: true,
+            last_source_mutation_sequence: Some(4),
+            blockers: vec![
+                "source compatibility work requires a clean repository-wide residual scan"
+                    .to_owned(),
+            ],
+            ..CompletionEvidence::default()
+        };
+
+        let decision = evaluate_budget_command_with_time(
+            20,
+            Some((500, 900)),
+            &evidence,
+            "OUT=$(grep -R 'old_api' --include='*.py' --include='*.pyx' .) && if [ -z \"$OUT\" ]; then echo '0 unresolved'; exit 0; else exit 1; fi",
+            &ToolKind::ReadOnly,
+        );
+
+        assert!(!decision.is_allowed());
+        let PolicyDecision::Deny { reason, .. } = decision else {
+            panic!("fragile residual scan should be denied");
+        };
+        assert!(reason.contains("temporary results file"));
+        assert!(reason.contains("test ! -s"));
+    }
+
+    #[test]
+    fn source_checkpoint_accepts_literal_nonzero_search_error_exit() {
+        let extensions = BTreeSet::from([".py".to_owned()]);
+        let command = "grep -rn 'old_value' --include='*.py' compatdemo tests >/tmp/residuals; grep_rc=$?; if [ \"$grep_rc\" -gt 1 ]; then exit 2; fi; test ! -s /tmp/residuals";
+
+        assert!(is_repository_source_scan_command(command, &extensions));
+    }
+
+    #[test]
+    fn source_checkpoint_rejects_masked_search_errors_and_unreachable_empty_check() {
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 4,
+            required_source_scan_extensions: vec![".py".to_owned(), ".pyx".to_owned()],
+            source_delivery_required: true,
+            last_source_mutation_sequence: Some(4),
+            blockers: vec![
+                "source compatibility work requires a clean repository-wide residual scan"
+                    .to_owned(),
+            ],
+            ..CompletionEvidence::default()
+        };
+
+        for command in [
+            "OUT=$(command rg 'old_api' --glob '*.py' --glob '*.pyx' . || true); test ! -s /tmp/residuals",
+            "rg 'old_api' --glob '*.py' --glob '*.pyx' . >/tmp/residuals && test ! -s /tmp/residuals",
+            "rg 'old_api' --glob '*.py' --glob '*.pyx' . >/tmp/residuals; scan_status=$?; test ! -s /tmp/residuals",
+        ] {
+            assert!(
+                !evaluate_budget_command_with_time(
+                    20,
+                    Some((500, 900)),
+                    &evidence,
+                    command,
+                    &ToolKind::ReadOnly,
+                )
+                .is_allowed(),
+                "unsafe residual scan was allowed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_clean_residual_scan_records_shell_exit_recovery() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Repair this source package for runtime compatibility.",
+        );
+        let mut build_inputs = outcome(1, ToolKind::ReadOnly, 0);
+        build_inputs.command = "cat setup.py".to_owned();
+        build_inputs.stdout = "Extension('pkg.fast', ['pkg/fast.pyx'])".to_owned();
+        gate.record(&build_inputs);
+
+        let mut edit = outcome(2, ToolKind::Mutation, 0);
+        edit.command = "sed -i 's/old_api/new_api/' pkg/main.py".to_owned();
+        gate.record(&edit);
+
+        let mut failed_scan = outcome(3, ToolKind::ReadOnly, 1);
+        failed_scan.command = "OUT=$(grep -R 'old_api' --include='*.py' --include='*.pyx' .) && if [ -z \"$OUT\" ]; then echo 'SCAN CLEAN: 0 unresolved'; exit 0; else exit 1; fi".to_owned();
+        failed_scan.stdout = "SCAN CLEAN: 0 unresolved".to_owned();
+        gate.record(&failed_scan);
+
+        let evidence = gate.evidence();
+        assert!(evidence.blockers.iter().any(|blocker| {
+            blocker.contains("reported zero residual matches but exited nonzero")
+                && blocker.contains("test ! -s")
+        }));
+    }
+
+    #[test]
+    fn compound_edit_and_failed_clean_scan_records_shell_exit_recovery() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Repair this source package for runtime compatibility.",
+        );
+        let mut build_inputs = outcome(1, ToolKind::ReadOnly, 0);
+        build_inputs.command = "cat setup.py".to_owned();
+        build_inputs.stdout = "Extension('pkg.fast', ['pkg/fast.pyx'])".to_owned();
+        gate.record(&build_inputs);
+
+        let mut mixed = outcome(2, ToolKind::Mutation, 1);
+        mixed.command = "sed -i 's/old_api/new_api/' pkg/main.py; OUT=$(rg 'old_api' --glob '*.py' --glob '*.pyx' .); echo 'SCAN CLEAN: 0 unresolved'".to_owned();
+        mixed.stdout = "SCAN CLEAN: 0 unresolved".to_owned();
+        gate.record(&mixed);
+
+        assert!(gate.evidence().blockers.iter().any(|blocker| {
+            blocker.contains("reported zero residual matches but exited nonzero")
+        }));
+    }
+
+    #[test]
+    fn convergence_prompt_requires_evidence_derived_variants_and_robust_scan_exit() {
+        let evidence = CompletionEvidence {
+            blockers: vec![
+                "source compatibility work requires a clean repository-wide residual scan"
+                    .to_owned(),
+            ],
+            ..CompletionEvidence::default()
+        };
+
+        let prompt = build_time_convergence_prompt(300, &evidence);
+
+        assert!(prompt.contains("exact failing API member"));
+        assert!(prompt.contains("repository references or a language adapter"));
+        assert!(!prompt.contains("direct and underscored spellings"));
+        assert!(prompt.contains("temporary results file"));
+        assert!(prompt.contains("reject status greater than 1"));
+        assert!(prompt.contains("test ! -s"));
     }
 
     #[test]
@@ -2618,9 +3078,7 @@ mod tests {
         gate.record(&edit);
 
         let mut scan = outcome(3, ToolKind::ReadOnly, 0);
-        scan.command =
-            "grep -R old --include='*.pyx' . >/tmp/residuals && test ! -s /tmp/residuals"
-                .to_owned();
+        scan.command = "grep -R old --include='*.pyx' . >/tmp/residuals; scan_status=$?; if [ \"$scan_status\" -gt 1 ]; then exit \"$scan_status\"; fi; test ! -s /tmp/residuals".to_owned();
         scan.stdout = "PASSED: source scan clean".to_owned();
         gate.record(&scan);
 

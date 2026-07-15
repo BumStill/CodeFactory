@@ -16,7 +16,6 @@
 //! capped at 500 tokens. Uses the user's default model — no new config.
 
 use chrono::Utc;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use sqlx::SqlitePool;
@@ -24,6 +23,7 @@ use tauri::{command, AppHandle, Emitter, State};
 use uuid::Uuid;
 
 use crate::commands::memory::{append_project_memory, ProjectMemory};
+use crate::commands::specs::{run_one_shot_text, AiMessage};
 use crate::errors::AppError;
 use crate::AppState;
 
@@ -57,8 +57,12 @@ pub struct LearningEvent {
     pub evidence_json: String,
 }
 
-fn default_kind() -> String { "memory".into() }
-fn default_evidence() -> String { "{}".into() }
+fn default_kind() -> String {
+    "memory".into()
+}
+fn default_evidence() -> String {
+    "{}".into()
+}
 
 // ── Queries ───────────────────────────────────────────────────────────────────
 
@@ -68,7 +72,24 @@ pub async fn list_learning_events(
     state: State<'_, AppState>,
 ) -> Result<Vec<LearningEvent>, AppError> {
     let pool = state.db.read().await;
-    let rows = sqlx::query_as::<_, (String, String, String, String, String, String, String, Option<String>, String, Option<String>, Option<String>, i64, String)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            String,
+        ),
+    >(
         "SELECT id, session_id, cwd, observation, suggestion, status, created_at, decided_at, \
                 kind, pref_key, pref_value, support_count, evidence_json \
          FROM learning_events WHERE cwd = ? ORDER BY support_count DESC, created_at DESC LIMIT 50",
@@ -78,12 +99,39 @@ pub async fn list_learning_events(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, session_id, cwd, observation, suggestion, status, created_at, decided_at, kind, pref_key, pref_value, support_count, evidence_json)| {
-            LearningEvent {
-                id, session_id, cwd, observation, suggestion, status,
-                created_at, decided_at, kind, pref_key, pref_value, support_count, evidence_json,
-            }
-        })
+        .map(
+            |(
+                id,
+                session_id,
+                cwd,
+                observation,
+                suggestion,
+                status,
+                created_at,
+                decided_at,
+                kind,
+                pref_key,
+                pref_value,
+                support_count,
+                evidence_json,
+            )| {
+                LearningEvent {
+                    id,
+                    session_id,
+                    cwd,
+                    observation,
+                    suggestion,
+                    status,
+                    created_at,
+                    decided_at,
+                    kind,
+                    pref_key,
+                    pref_value,
+                    support_count,
+                    evidence_json,
+                }
+            },
+        )
         .collect())
 }
 
@@ -99,7 +147,14 @@ pub async fn accept_learning_event(
     state: State<'_, AppState>,
 ) -> Result<ProjectMemory, AppError> {
     let pool = state.db.read().await;
-    let row: (String, String, String, String, Option<String>, Option<String>) = sqlx::query_as(
+    let row: (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
         "SELECT cwd, suggestion, status, kind, pref_key, pref_value \
          FROM learning_events WHERE id = ?",
     )
@@ -116,9 +171,9 @@ pub async fn accept_learning_event(
 
     let memory = match kind.as_str() {
         "preference" => {
-            let key = pref_key.ok_or_else(|| AppError::Other(
-                "preference learning event missing pref_key".into(),
-            ))?;
+            let key = pref_key.ok_or_else(|| {
+                AppError::Other("preference learning event missing pref_key".into())
+            })?;
             let value = pref_value.unwrap_or_default();
             let now = Utc::now().to_rfc3339();
             sqlx::query(
@@ -134,7 +189,11 @@ pub async fn accept_learning_event(
             .execute(&*pool)
             .await?;
             // Return an empty memory blob — caller distinguishes by kind on UI side.
-            ProjectMemory { path: String::new(), content: String::new(), exists: false }
+            ProjectMemory {
+                path: String::new(),
+                content: String::new(),
+                exists: false,
+            }
         }
         _ => {
             // Drop the pool lock before re-acquiring inside append_project_memory.
@@ -144,13 +203,11 @@ pub async fn accept_learning_event(
     };
 
     let pool = state.db.read().await;
-    sqlx::query(
-        "UPDATE learning_events SET status = 'accepted', decided_at = ? WHERE id = ?",
-    )
-    .bind(Utc::now().to_rfc3339())
-    .bind(&event_id)
-    .execute(&*pool)
-    .await?;
+    sqlx::query("UPDATE learning_events SET status = 'accepted', decided_at = ? WHERE id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(&event_id)
+        .execute(&*pool)
+        .await?;
     // Tell other open panels (Workspace right rail, second Profile window)
     // to refresh — the row they're holding is now stale.
     let event = format!("learning_events_updated:{}", cwd);
@@ -171,13 +228,11 @@ pub async fn reject_learning_event(
         .fetch_one(&*pool)
         .await
         .unwrap_or_default();
-    sqlx::query(
-        "UPDATE learning_events SET status = 'rejected', decided_at = ? WHERE id = ?",
-    )
-    .bind(Utc::now().to_rfc3339())
-    .bind(&event_id)
-    .execute(&*pool)
-    .await?;
+    sqlx::query("UPDATE learning_events SET status = 'rejected', decided_at = ? WHERE id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(&event_id)
+        .execute(&*pool)
+        .await?;
     if !cwd.is_empty() {
         let event = format!("learning_events_updated:{}", cwd);
         let _ = app.emit(&event, ());
@@ -186,36 +241,6 @@ pub async fn reject_learning_event(
 }
 
 // ── Post-mortem (after-session AI pass) ──────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-struct AiMessage<'a> {
-    role: &'a str,
-    content: String,
-}
-
-#[derive(Debug, Serialize)]
-struct AiRequest<'a> {
-    model: String,
-    messages: Vec<AiMessage<'a>>,
-    stream: bool,
-    temperature: f32,
-    max_tokens: u32,
-}
-
-#[derive(Debug, Deserialize)]
-struct AiResponseChoice {
-    message: AiResponseMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct AiResponseMessage {
-    content: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AiResponse {
-    choices: Vec<AiResponseChoice>,
-}
 
 #[derive(Debug, Deserialize)]
 struct PostmortemEntry {
@@ -340,8 +365,21 @@ pub async fn run_postmortem(
         .enumerate()
         .map(|(i, (title, status, result, error))| {
             let outcome = match status.as_str() {
-                "completed" => result.as_deref().unwrap_or("").chars().take(80).collect::<String>(),
-                "failed" => format!("FAIL: {}", error.as_deref().unwrap_or("").chars().take(80).collect::<String>()),
+                "completed" => result
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect::<String>(),
+                "failed" => format!(
+                    "FAIL: {}",
+                    error
+                        .as_deref()
+                        .unwrap_or("")
+                        .chars()
+                        .take(80)
+                        .collect::<String>()
+                ),
                 other => other.into(),
             };
             format!("{}. [{}] {} — {}", i + 1, status, title, outcome)
@@ -356,8 +394,10 @@ pub async fn run_postmortem(
         .map(|(s,)| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    let mut seen: std::collections::HashSet<String> =
-        known_suggestions.iter().map(|s| norm_suggestion(s)).collect();
+    let mut seen: std::collections::HashSet<String> = known_suggestions
+        .iter()
+        .map(|s| norm_suggestion(s))
+        .collect();
     let known_block = if known_suggestions.is_empty() {
         String::new()
     } else {
@@ -377,7 +417,12 @@ observation CONTRADICTS one, still report it but prefix its suggestion with \
     // ── Build prompt
     let settings = state.settings.read().await.clone();
     let ep_name = &settings.default_endpoint;
-    let model = settings.default_model.clone();
+    let model = settings.resolved_default_model().ok_or_else(|| {
+        AppError::Other(format!(
+            "No model configured for endpoint '{}'. Please choose a model in the picker.",
+            ep_name
+        ))
+    })?;
     let endpoint = settings
         .endpoints
         .get(ep_name)
@@ -389,9 +434,6 @@ observation CONTRADICTS one, still report it but prefix its suggestion with \
     } else {
         String::new()
     };
-    let base_url = endpoint.base_url.trim_end_matches('/');
-    let url = format!("{base_url}/chat/completions");
-
     let prompt = format!(
         "You just finished a session for a user. Reflect on the task outcomes below and \
 identify 0-3 NON-OBVIOUS observations about how this user works that would help future sessions. \
@@ -421,50 +463,26 @@ Examples:\n\
 {calibration}{known_block}Tasks from this session:\n{summary}"
     );
 
-    let req = AiRequest {
-        model,
-        messages: vec![AiMessage {
-            role: "user",
+    let text = match run_one_shot_text(
+        &endpoint.base_url,
+        &api_key,
+        &model,
+        &endpoint.api_style,
+        vec![AiMessage {
+            role: "user".into(),
             content: prompt,
         }],
-        stream: false,
-        temperature: 0.3,
-        max_tokens: 500, // hard cap — see module-level doc on token economy
-    };
-
-    let mut body = match serde_json::to_value(&req) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!("postmortem serialize failed: {e}");
+        500, // hard cap — see module-level doc on token economy
+        0.3,
+    )
+    .await
+    {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::warn!("postmortem request failed: {error}");
             return Ok(vec![]);
         }
     };
-
-    let client = Client::new();
-    // Send as-is; post_chat_completions reactively switches to
-    // max_completion_tokens only if the server rejects max_tokens. Best-effort:
-    // any failure just yields no learnings.
-    let response = match crate::http_util::post_chat_completions(&client, &url, &api_key, &mut body).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("postmortem request failed: {e}");
-            return Ok(vec![]);
-        }
-    };
-    let resp: AiResponse = match response.json().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("postmortem JSON parse failed: {e}");
-            return Ok(vec![]);
-        }
-    };
-
-    let text = resp
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
     let trimmed = text.trim();
     let json_str = trimmed
         .strip_prefix("```json")
@@ -503,14 +521,19 @@ Examples:\n\
         // This protects against the model returning kind="preference" with
         // a missing pref_key — the row would otherwise be unactionable.
         let raw_kind = e.kind.as_deref().unwrap_or("memory");
-        let (kind, pref_key, pref_value): (&str, Option<String>, Option<String>) =
-            if raw_kind == "preference" && e.pref_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
-                let key = e.pref_key.as_ref().unwrap().trim().to_string();
-                let val = e.pref_value.unwrap_or_default().trim().to_string();
-                ("preference", Some(key), Some(val))
-            } else {
-                ("memory", None, None)
-            };
+        let (kind, pref_key, pref_value): (&str, Option<String>, Option<String>) = if raw_kind
+            == "preference"
+            && e.pref_key
+                .as_ref()
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false)
+        {
+            let key = e.pref_key.as_ref().unwrap().trim().to_string();
+            let val = e.pref_value.unwrap_or_default().trim().to_string();
+            ("preference", Some(key), Some(val))
+        } else {
+            ("memory", None, None)
+        };
 
         let id = Uuid::new_v4().to_string();
         sqlx::query(
@@ -601,7 +624,11 @@ pub struct LearningDecisionRow {
 }
 
 fn pct(n: i64, d: i64) -> i64 {
-    if d == 0 { 0 } else { (n * 100) / d }
+    if d == 0 {
+        0
+    } else {
+        (n * 100) / d
+    }
 }
 
 /// Tools whose recent failure rate is high enough to warn about.
@@ -627,7 +654,11 @@ fn detect_tool_reliability(rows: &[ToolCallRow]) -> Vec<PatternInsight> {
         let rate = pct(e, t);
         if t >= 8 && rate >= 25 {
             let ex = sample.get(tool).cloned().unwrap_or_default();
-            let tail = if ex.is_empty() { String::new() } else { format!("，最常见：{ex}") };
+            let tail = if ex.is_empty() {
+                String::new()
+            } else {
+                format!("，最常见：{ex}")
+            };
             out.push(PatternInsight {
                 observation: format!("工具 `{tool}` 最近 {t} 次调用失败 {e} 次（{rate}%）{tail}。"),
                 suggestion: format!(
@@ -665,7 +696,9 @@ fn detect_retry_prone(rows: &[TaskRow]) -> Vec<PatternInsight> {
         .filter(|(_, (count, _))| *count >= 3)
         .map(|(_, (count, sample))| PatternInsight {
             observation: format!("有 {count} 个任务因「{sample}」反复重试。"),
-            suggestion: format!("反复踩坑：「{sample}」导致多次重试——值得加一道前置检查或固定解法。"),
+            suggestion: format!(
+                "反复踩坑：「{sample}」导致多次重试——值得加一道前置检查或固定解法。"
+            ),
             support_count: count,
             evidence: serde_json::json!({"detector":"retry_prone","count":count,"sample":sample}),
         })
@@ -758,7 +791,11 @@ pub async fn mine_cross_session_patterns(
     .await
     .unwrap_or_default()
     .into_iter()
-    .map(|(tool_name, status, error)| ToolCallRow { tool_name, status, error })
+    .map(|(tool_name, status, error)| ToolCallRow {
+        tool_name,
+        status,
+        error,
+    })
     .collect();
 
     // Task runs in this project (task_runs → sessions.cwd).
@@ -772,7 +809,11 @@ pub async fn mine_cross_session_patterns(
     .await
     .unwrap_or_default()
     .into_iter()
-    .map(|(status, attempt_count, error)| TaskRow { status, attempt_count, error })
+    .map(|(status, attempt_count, error)| TaskRow {
+        status,
+        attempt_count,
+        error,
+    })
     .collect();
 
     // Decided learnings (accept/reject calibration).
@@ -913,7 +954,11 @@ pub async fn self_improvement_proposal(state: State<'_, AppState>) -> Result<Str
     .await
     .unwrap_or_default()
     .into_iter()
-    .map(|(tool_name, status, error)| ToolCallRow { tool_name, status, error })
+    .map(|(tool_name, status, error)| ToolCallRow {
+        tool_name,
+        status,
+        error,
+    })
     .collect();
     let tasks: Vec<TaskRow> = sqlx::query_as::<_, (String, i64, Option<String>)>(
         "SELECT status, attempt_count, error FROM task_runs ORDER BY created_at DESC LIMIT 4000",
@@ -922,7 +967,11 @@ pub async fn self_improvement_proposal(state: State<'_, AppState>) -> Result<Str
     .await
     .unwrap_or_default()
     .into_iter()
-    .map(|(status, attempt_count, error)| TaskRow { status, attempt_count, error })
+    .map(|(status, attempt_count, error)| TaskRow {
+        status,
+        attempt_count,
+        error,
+    })
     .collect();
     drop(pool);
 
@@ -971,7 +1020,12 @@ fn tool_gate_proposals(insights: &[PatternInsight], allow: &[String]) -> Vec<Too
         if !allowed.contains(tool) {
             continue; // already gated — nothing to propose
         }
-        let g = |k: &str| ins.evidence.get(k).and_then(serde_json::Value::as_i64).unwrap_or(0);
+        let g = |k: &str| {
+            ins.evidence
+                .get(k)
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+        };
         out.push(ToolGateProposal {
             tool: tool.to_string(),
             total: g("total"),
@@ -997,11 +1051,18 @@ pub async fn propose_tool_gates(
     .await
     .unwrap_or_default()
     .into_iter()
-    .map(|(tool_name, status, error)| ToolCallRow { tool_name, status, error })
+    .map(|(tool_name, status, error)| ToolCallRow {
+        tool_name,
+        status,
+        error,
+    })
     .collect();
     drop(pool);
     let allow = state.settings.read().await.permissions.allow.clone();
-    Ok(tool_gate_proposals(&detect_tool_reliability(&tools), &allow))
+    Ok(tool_gate_proposals(
+        &detect_tool_reliability(&tools),
+        &allow,
+    ))
 }
 
 /// P3 tool-policy v1: the human-gated enable. Moves `tool` from the permission
@@ -1039,7 +1100,10 @@ mod tests {
     fn improvement_proposal_is_read_only_and_lists_friction() {
         // Empty → states no friction, still carries the no-mutation header.
         let empty = build_improvement_proposal(&[], &[]);
-        assert!(empty.contains("不修改任何代码"), "must state it changes nothing");
+        assert!(
+            empty.contains("不修改任何代码"),
+            "must state it changes nothing"
+        );
         assert!(empty.contains("暂未发现"));
         // With friction → lists it + keeps the human-gate footer.
         let tool = PatternInsight {
@@ -1073,12 +1137,20 @@ mod tests {
             rows.push(tc("bash", "error", Some("e")));
         }
         let insights = detect_tool_reliability(&rows);
-        let allow = vec!["edit_file".to_string(), "bash".to_string(), "read_file".to_string()];
+        let allow = vec![
+            "edit_file".to_string(),
+            "bash".to_string(),
+            "read_file".to_string(),
+        ];
 
         let proposals = tool_gate_proposals(&insights, &allow);
 
         // Only edit_file: flaky AND currently allowed AND not special-cased.
-        assert_eq!(proposals.len(), 1, "only currently-allowed, non-special flaky tools");
+        assert_eq!(
+            proposals.len(),
+            1,
+            "only currently-allowed, non-special flaky tools"
+        );
         let p = &proposals[0];
         assert_eq!(p.tool, "edit_file");
         assert_eq!(p.total, 10);
@@ -1093,8 +1165,14 @@ mod tests {
     #[test]
     fn norm_suggestion_folds_case_and_whitespace_for_dedup() {
         // Trivial rewordings normalize to the same key…
-        assert_eq!(norm_suggestion("  Use  pnpm  "), norm_suggestion("use pnpm"));
-        assert_eq!(norm_suggestion("Use TDD by default."), "use tdd by default.");
+        assert_eq!(
+            norm_suggestion("  Use  pnpm  "),
+            norm_suggestion("use pnpm")
+        );
+        assert_eq!(
+            norm_suggestion("Use TDD by default."),
+            "use tdd by default."
+        );
         // …but genuinely different facts do not collide.
         assert_ne!(norm_suggestion("use pnpm"), norm_suggestion("use npm"));
     }
@@ -1112,53 +1190,87 @@ mod tests {
     }
 
     fn decs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, s)| (k.to_string(), s.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, s)| (k.to_string(), s.to_string()))
+            .collect()
     }
 
     #[test]
     fn calibration_hint_fires_only_at_extremes() {
         let d = decs(&[
             // preference 1/5 = 20% → reject hint
-            ("preference", "rejected"), ("preference", "rejected"), ("preference", "rejected"),
-            ("preference", "rejected"), ("preference", "accepted"),
+            ("preference", "rejected"),
+            ("preference", "rejected"),
+            ("preference", "rejected"),
+            ("preference", "rejected"),
+            ("preference", "accepted"),
             // memory 5/6 = 83% → welcome hint
-            ("memory", "accepted"), ("memory", "accepted"), ("memory", "accepted"),
-            ("memory", "accepted"), ("memory", "accepted"), ("memory", "rejected"),
+            ("memory", "accepted"),
+            ("memory", "accepted"),
+            ("memory", "accepted"),
+            ("memory", "accepted"),
+            ("memory", "accepted"),
+            ("memory", "rejected"),
             // pattern 2/3 → below 4-decision threshold → silent
-            ("pattern", "accepted"), ("pattern", "accepted"), ("pattern", "rejected"),
+            ("pattern", "accepted"),
+            ("pattern", "accepted"),
+            ("pattern", "rejected"),
         ]);
         let hint = calibration_hint(&d);
         assert!(hint.contains("rejected most \"preference\""), "got: {hint}");
         assert!(hint.contains("accepts most \"memory\""), "got: {hint}");
-        assert!(!hint.contains("pattern"), "below-threshold kind stays silent: {hint}");
+        assert!(
+            !hint.contains("pattern"),
+            "below-threshold kind stays silent: {hint}"
+        );
     }
 
     #[test]
     fn calibration_hint_empty_when_no_extreme_or_too_few() {
-        assert_eq!(calibration_hint(&decs(&[("memory", "accepted"), ("memory", "rejected")])), "");
+        assert_eq!(
+            calibration_hint(&decs(&[("memory", "accepted"), ("memory", "rejected")])),
+            ""
+        );
         // 50/50 with enough decisions is not an extreme → still empty.
         assert_eq!(
             calibration_hint(&decs(&[
-                ("memory", "accepted"), ("memory", "rejected"),
-                ("memory", "accepted"), ("memory", "rejected"),
+                ("memory", "accepted"),
+                ("memory", "rejected"),
+                ("memory", "accepted"),
+                ("memory", "rejected"),
             ])),
             ""
         );
     }
 
     fn tc(name: &str, status: &str, err: Option<&str>) -> ToolCallRow {
-        ToolCallRow { tool_name: name.into(), status: status.into(), error: err.map(Into::into) }
+        ToolCallRow {
+            tool_name: name.into(),
+            status: status.into(),
+            error: err.map(Into::into),
+        }
     }
 
     #[test]
     fn tool_reliability_flags_only_high_volume_high_error_tools() {
         let mut rows = Vec::new();
         // flaky: 10 calls, 4 errors (40%) → flagged.
-        for i in 0..10 { rows.push(tc("bash", if i < 4 { "error" } else { "done" }, Some("pwsh not found"))); }
+        for i in 0..10 {
+            rows.push(tc(
+                "bash",
+                if i < 4 { "error" } else { "done" },
+                Some("pwsh not found"),
+            ));
+        }
         // reliable: 12 calls, 1 error (8%) → not flagged.
-        for i in 0..12 { rows.push(tc("read_file", if i < 1 { "error" } else { "done" }, None)); }
+        for i in 0..12 {
+            rows.push(tc("read_file", if i < 1 { "error" } else { "done" }, None));
+        }
         // flaky but low-volume: 5 calls, 3 errors → not flagged (< 8 calls).
-        for i in 0..5 { rows.push(tc("write_xlsx", if i < 3 { "error" } else { "done" }, None)); }
+        for i in 0..5 {
+            rows.push(tc("write_xlsx", if i < 3 { "error" } else { "done" }, None));
+        }
 
         let out = detect_tool_reliability(&rows);
         assert_eq!(out.len(), 1, "only the high-volume flaky tool is flagged");
@@ -1171,16 +1283,40 @@ mod tests {
     fn retry_prone_groups_by_error_and_needs_three() {
         let rows = vec![
             // Same recurring failure (case/whitespace fold to one key) on retries.
-            TaskRow { status: "completed".into(), attempt_count: 3, error: Some("schannel: server closed abruptly".into()) },
-            TaskRow { status: "completed".into(), attempt_count: 2, error: Some("schannel: server closed abruptly".into()) },
-            TaskRow { status: "failed".into(), attempt_count: 4, error: Some("Schannel:  server  closed  abruptly".into()) },
+            TaskRow {
+                status: "completed".into(),
+                attempt_count: 3,
+                error: Some("schannel: server closed abruptly".into()),
+            },
+            TaskRow {
+                status: "completed".into(),
+                attempt_count: 2,
+                error: Some("schannel: server closed abruptly".into()),
+            },
+            TaskRow {
+                status: "failed".into(),
+                attempt_count: 4,
+                error: Some("Schannel:  server  closed  abruptly".into()),
+            },
             // single-attempt → ignored even though same error.
-            TaskRow { status: "completed".into(), attempt_count: 1, error: Some("schannel: server closed abruptly".into()) },
+            TaskRow {
+                status: "completed".into(),
+                attempt_count: 1,
+                error: Some("schannel: server closed abruptly".into()),
+            },
             // a different one-off retry error → its own group, below threshold.
-            TaskRow { status: "failed".into(), attempt_count: 2, error: Some("totally different".into()) },
+            TaskRow {
+                status: "failed".into(),
+                attempt_count: 2,
+                error: Some("totally different".into()),
+            },
         ];
         let out = detect_retry_prone(&rows);
-        assert_eq!(out.len(), 1, "only the 3x recurring retry error is surfaced");
+        assert_eq!(
+            out.len(),
+            1,
+            "only the 3x recurring retry error is surfaced"
+        );
         assert_eq!(out[0].support_count, 3);
     }
 
@@ -1188,16 +1324,35 @@ mod tests {
     fn learning_calibration_emits_at_extremes_only() {
         let mut rows = Vec::new();
         // memory: 6 decided, 5 accepted (83%) → "propose more".
-        for i in 0..6 { rows.push(LearningDecisionRow { kind: "memory".into(), status: if i < 5 { "accepted" } else { "rejected" }.into() }); }
+        for i in 0..6 {
+            rows.push(LearningDecisionRow {
+                kind: "memory".into(),
+                status: if i < 5 { "accepted" } else { "rejected" }.into(),
+            });
+        }
         // preference: 6 decided, 1 accepted (17%) → "propose less".
-        for i in 0..6 { rows.push(LearningDecisionRow { kind: "preference".into(), status: if i < 1 { "accepted" } else { "rejected" }.into() }); }
+        for i in 0..6 {
+            rows.push(LearningDecisionRow {
+                kind: "preference".into(),
+                status: if i < 1 { "accepted" } else { "rejected" }.into(),
+            });
+        }
         // pattern: only 4 decided → below threshold, no insight.
-        for _ in 0..4 { rows.push(LearningDecisionRow { kind: "pattern".into(), status: "accepted".into() }); }
+        for _ in 0..4 {
+            rows.push(LearningDecisionRow {
+                kind: "pattern".into(),
+                status: "accepted".into(),
+            });
+        }
 
         let out = detect_learning_calibration(&rows);
         assert_eq!(out.len(), 2);
-        assert!(out.iter().any(|p| p.suggestion.contains("memory") && p.suggestion.contains("可以多提")));
-        assert!(out.iter().any(|p| p.suggestion.contains("preference") && p.suggestion.contains("少提")));
+        assert!(out
+            .iter()
+            .any(|p| p.suggestion.contains("memory") && p.suggestion.contains("可以多提")));
+        assert!(out
+            .iter()
+            .any(|p| p.suggestion.contains("preference") && p.suggestion.contains("少提")));
     }
 
     async fn fresh_pool() -> SqlitePool {

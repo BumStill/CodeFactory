@@ -48,7 +48,19 @@ Harbor 的有效 Agent wall timeout 由 thin bridge 原样传给 Rust sidecar。
 
 当原始需求明确要求项目测试时，`CompletionGate` 额外记录最后一次成功项目测试，并要求其 sequence 晚于最后源码修改、安装和外部运行。已获准的复合工具调用只要包含明确文件修改，即使后续 build/install/runtime 失败，也必须推进最后源码修改 sequence 并使旧交付证据失效；纯依赖安装或 policy deny 不得误记为修改。
 
-源码兼容迁移必须在首次昂贵 build/install 前从仓库 import 语句推导全部本地 alias，覆盖构建配置已观察到的源码、生成和编译输入扩展。扫描与替换使用 token boundary 和幂等规则，相关修改应批量完成；最后一次修改后的 clean residual scan 是下一次 build/install 的前置门禁，避免只覆盖常见别名、产生二次替换或在部分扫描后反复重建。门禁激活后仍允许仓库级 alias discovery、纠正性源码修改和带干净退出契约的最终 residual scan，使 Agent 能从不完整别名盘点中恢复；其他探索及 build/install 继续拒绝。
+源码兼容迁移必须在首次昂贵 build/install 前从仓库 import 语句推导全部本地 alias，覆盖构建配置已观察到的源码、生成和编译输入扩展。扫描与替换使用 token boundary 和幂等规则，相关修改应批量完成；最后一次修改后的 clean residual scan 是下一次 build/install 的前置门禁，避免只覆盖常见别名、产生二次替换或在部分扫描后反复重建。门禁激活后仍允许读取所需扩展的相关源码、仓库级 alias discovery、纠正性源码修改和带干净退出契约的最终 residual scan，使 Agent 能从不完整别名盘点中恢复；其他探索及 build/install 继续拒绝。
+
+兼容扫描的 symbol set 必须由当前源码和真实 build/runtime/test failure 共同生成：从错误中提取 exact failing API member，针对每个已发现 alias 扫描源码中实际存在的引用，并只通过仓库证据或语言适配器扩展候选拼写。`CompletionGate` 只接受明确的 clean-scan 契约：标准 shell 路径把匹配写入临时结果文件，保留搜索状态，只接受 `0/1`、拒绝 `>1`，最后用 `test ! -s` 决定是否仍有残留；结构化脚本可用 `os.walk` 与 `sys.exit` 表达相同语义。未保护 command substitution、`search && test ! -s`、用 `|| true` 掩盖搜索错误等形式均不得解锁。输出声明 zero residual 但命令仍非零时，evidence 记录 shell-exit recovery blocker，要求一次确定性重扫；任何同时包含修改与 build/install 的复合命令仍受扫描门禁约束。
+
+桌面执行前策略分为两层：compatibility scan 等确定性 completion invariant 对 `Interactive` 与 `Autonomous` 都生效；剩余轮次、时间窗口和收敛预算只约束 `Autonomous`。桌面层不得因普通聊天模式而整体跳过 shared-core policy，也不得把自主预算误施加到没有 blocker 的普通聊天。模型返回无工具调用的最终答复时，两种模式都必须复核 `CompletionEvidence`；一旦已有 mutation、失败或后台服务证据且仍有 blocker，继续注入恢复提示而不是结束会话。
+
+桌面工具进入 `CompletionGate` 时必须保留足以判断源码类型和搜索意图的实际证据。`bash` 使用完整 command；`edit_file`、`write_file`、`read_file` 等没有 command 字段的文件工具至少记录“工具名 + path”，`grep` 同时记录 `pattern` 与默认或显式搜索根。只记录工具名会丢失 `.py`、`.pyx`、`.rs` 等扩展名和 alias 搜索意图，使真实源码修改无法激活 residual-scan blocker，或使门禁拒绝自身要求的恢复动作。
+
+任何模型发出的 `tool_call` 都必须在持久化历史中有一条配对结果，包括执行成功、执行失败、completion policy 拒绝、权限拒绝和 hook 取消。拒绝结果不能只发到 UI 和当前内存轮次。历史重放在进入 provider transport 前执行结构修复：为旧数据库中缺失结果的 call 补充明确的 unavailable 协议占位，并丢弃没有对应 call 的孤立 result；该占位不进入 `CompletionGate`，不作为成功或验证证据，只用于恢复 provider 消息协议。
+
+所有不依附既有 session 的 AI helper 通过 `Settings::resolved_default_model` 按当前 `default_endpoint` 解析 `active_model`。子任务创建时只解析一次，同一值必须用于子会话记录、AgentLoop 和 acceptance check，防止 UI 显示 DeepSeek 而后台规划或子任务实际调用另一 provider 的模型。模型解析与 transport 解析是同一个路由契约：helper 必须按 `api_style` 构造 provider 对应 URL、认证头、body 和响应提取；不支持的 style 在发请求前返回可行动错误，不允许仅替换 model slug 后仍发送 OpenAI `chat/completions`。
+
+根级文件发现通过 `glob` 默认剪枝常见依赖与构建目录，减少无关文件和 token 放大；当忽略目录本身是显式搜索根时取消该剪枝，保留依赖诊断能力。该规则属于通用上下文治理，不依赖 benchmark 仓库或任务指纹。
 
 `CompletionGate::new_for_instruction` 的任务意图识别覆盖产品支持的中英文表达。中文“兼容/已移除/弃用/迁移”“从源码安装/源码构建/编译扩展”“项目测试/测试套件”必须映射到与英文 `compatibility`、`install from source`、`project tests` 相同的 gate，任务语言不得改变完成证据强度。
 

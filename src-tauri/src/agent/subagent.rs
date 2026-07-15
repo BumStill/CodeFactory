@@ -12,7 +12,6 @@
 //! chat would.
 
 use chrono::Utc;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -23,6 +22,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::agent::{AgentExecutionContext, AgentLoop};
+use crate::commands::specs::{run_one_shot_text, AiMessage};
 use crate::config::settings::{ApiStyle, Settings};
 use crate::errors::{AppError, Result};
 use crate::mcp::McpManager;
@@ -84,6 +84,15 @@ impl Default for SubagentResult {
     }
 }
 
+fn resolved_subagent_model(settings: &Settings) -> Result<String> {
+    settings.resolved_default_model().ok_or_else(|| {
+        AppError::Other(format!(
+            "No model configured for endpoint '{}'. Please choose a model in the picker.",
+            settings.default_endpoint
+        ))
+    })
+}
+
 /// Run a single subagent end-to-end.
 ///
 /// 1. Creates a child session row (`parent_session_id` set so it stays out of
@@ -99,6 +108,8 @@ pub async fn run_subagent(
     app_handle: &AppHandle,
     pending_perms: &PendingPermissionMap,
 ) -> std::result::Result<SubagentResult, AppError> {
+    let model = resolved_subagent_model(settings)?;
+
     // 1. Create the sub-session.
     let sub_session_id = Uuid::new_v4().to_string();
     let sub_title = format!("Subtask: {}", truncate(&brief.title, 60));
@@ -112,7 +123,7 @@ pub async fn run_subagent(
     .bind(&sub_session_id)
     .bind(&sub_title)
     .bind(&brief.cwd)
-    .bind(&settings.default_model)
+    .bind(&model)
     .bind(now)
     .bind(now)
     .bind(parent_session_id)
@@ -183,7 +194,7 @@ pub async fn run_subagent(
         app_handle.clone(),
         pool.clone(),
         sub_session_id.clone(),
-        settings.default_model.clone(),
+        model.clone(),
         endpoint.base_url.clone(),
         api_key.clone(),
         endpoint.api_style.clone(),
@@ -241,7 +252,7 @@ pub async fn run_subagent(
                 &result.summary,
                 &endpoint.base_url,
                 &api_key,
-                &settings.default_model,
+                &model,
                 &endpoint.api_style,
             )
             .await,
@@ -258,6 +269,50 @@ pub async fn run_subagent(
         sub_session_id,
         acceptance_check,
     })
+}
+
+#[cfg(test)]
+mod model_routing_tests {
+    use super::*;
+    use crate::config::settings::Endpoint;
+
+    #[test]
+    fn subagent_uses_active_model_for_the_default_endpoint() {
+        let mut settings = Settings::default();
+        settings.default_endpoint = "deepseek".into();
+        settings.default_model = "gpt-5.5".into();
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://api.deepseek.com".into(),
+                key_ref: Some("codefactory.endpoint.deepseek".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+
+        assert_eq!(
+            resolved_subagent_model(&settings).unwrap(),
+            "deepseek-v4-pro"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_check_rejects_unsupported_chatgpt_transport() {
+        let result = run_acceptance_check(
+            "cargo test passes",
+            "Implemented the requested change.",
+            "not-a-valid-url",
+            "",
+            "gpt-5.5",
+            &ApiStyle::Chatgpt,
+        )
+        .await;
+
+        assert!(!result.passed);
+        assert!(result.reason.contains("do not support ChatGPT endpoints"));
+    }
 }
 
 struct RunSummary {
@@ -423,6 +478,13 @@ pub(crate) async fn run_acceptance_check(
     model_id: &str,
     api_style: &ApiStyle,
 ) -> AcceptanceCheck {
+    if matches!(api_style, ApiStyle::Chatgpt) {
+        return AcceptanceCheck {
+            passed: false,
+            reason: "Acceptance checks do not support ChatGPT endpoints yet. Choose an OpenAI-compatible or Anthropic endpoint."
+                .into(),
+        };
+    }
     let prompt = format!(
         "Review the work done. Do the following acceptance criteria pass?\n\n\
          {criteria}\n\n\
@@ -430,58 +492,28 @@ pub(crate) async fn run_acceptance_check(
          Reply with JSON only (no markdown): {{ \"passed\": bool, \"reason\": string }}"
     );
 
-    let mut body = match api_style {
-        ApiStyle::Anthropic => serde_json::json!({
-            "model": model_id,
-            "max_tokens": 256,
-            "messages": [{"role": "user", "content": prompt}]
-        }),
-        // NOTE: ChatGPT endpoints would need the Responses API + OAuth token
-        // here. This one-shot acceptance check (autonomous-task mode only) does
-        // not yet support that — it falls through to the chat/completions shape,
-        // which the ChatGPT backend will reject. Interactive chat is unaffected
-        // (that path uses AgentLoop::call_chatgpt_model). TODO: route this
-        // through the Responses path for ChatGPT endpoints.
-        ApiStyle::Openai | ApiStyle::Chatgpt => serde_json::json!({
-            "model": model_id,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 256,
-            "stream": false
-        }),
-    };
-
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let client = Client::new();
-    // Send as-is; post_chat_completions reactively switches to
-    // max_completion_tokens only if the server rejects max_tokens (no-op for the
-    // Anthropic shape above, and for endpoints happy with the legacy fields).
-    let response =
-        match crate::http_util::post_chat_completions(&client, &url, api_key, &mut body).await {
-            Ok(r) => r,
-            Err(e) => {
-                return AcceptanceCheck {
-                    passed: false,
-                    reason: format!("HTTP error during acceptance check: {e}"),
-                };
-            }
-        };
-
-    let raw_json: serde_json::Value = match response.json().await {
-        Ok(v) => v,
-        Err(e) => {
+    let text = match run_one_shot_text(
+        base_url,
+        api_key,
+        model_id,
+        api_style,
+        vec![AiMessage {
+            role: "user".into(),
+            content: prompt,
+        }],
+        256,
+        0.0,
+    )
+    .await
+    {
+        Ok(text) => text,
+        Err(error) => {
             return AcceptanceCheck {
                 passed: false,
-                reason: format!("Failed to parse acceptance check response: {e}"),
+                reason: format!("HTTP error during acceptance check: {error}"),
             };
         }
     };
-
-    // Extract the text content from the response (handles both Anthropic and OpenAI shapes).
-    let text = raw_json
-        .pointer("/choices/0/message/content")
-        .or_else(|| raw_json.pointer("/content/0/text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
 
     // Strip potential markdown fences.
     let clean = text

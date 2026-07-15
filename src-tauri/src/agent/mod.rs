@@ -540,6 +540,7 @@ impl AgentLoop {
         let mut completion_sequence = 0_u64;
         let mut last_completion_nudge_sequence = None;
         let mut progress_tracker = ProgressTracker::new(8);
+        let mut finalization_pending = false;
         let max_iterations = self.mode.max_iterations();
         for iteration in 0..max_iterations {
             // Cooperative cancellation: if the user hit "stop" for this chat
@@ -589,7 +590,7 @@ impl AgentLoop {
                     .ok();
             }
 
-            let active_tool_defs = tool_defs;
+            let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
             let (text, tool_calls, usage, reasoning) = match self.api_style {
                 ApiStyle::Chatgpt => {
                     self.call_chatgpt_model(&messages, active_tool_defs, event_name)
@@ -600,6 +601,7 @@ impl AgentLoop {
                         .await?
                 }
             };
+            finalization_pending = false;
 
             // Emit real (provider-reported) context-usage right after each
             // round-trip so the UI bar tracks actual usage, not just our
@@ -635,21 +637,17 @@ impl AgentLoop {
             }
 
             if tool_calls.is_empty() {
-                if self.mode != AgentMode::Interactive {
-                    let evidence = completion_gate.evidence();
-                    if !evidence.completed {
-                        messages.push(ChatMessage {
-                            role: "user".into(),
-                            content: MessageContent::Text(build_completion_recovery_prompt(
-                                &evidence,
-                            )),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                            reasoning_content: None,
-                        });
-                        continue;
-                    }
+                let evidence = completion_gate.evidence();
+                if let Some(prompt) = completion_recovery_prompt(&evidence) {
+                    messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: MessageContent::Text(prompt),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                    });
+                    continue;
                 }
                 // Always emit a terminal Done so the frontend's `streaming`
                 // flag clears — even when the provider omitted usage on the
@@ -736,16 +734,9 @@ impl AgentLoop {
 
                 let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
                 let completion_evidence = completion_gate.evidence();
-                let acceptance_audit_round = completion_evidence.completed
-                    && completion_evidence
-                        .last_successful_verification_sequence
-                        .is_some()
-                    && completion_evidence.last_successful_verification_sequence
-                        == last_completion_nudge_sequence;
                 let denial_content = if let Some(content) = autonomous_budget_denial(
                     self.mode,
                     remaining,
-                    acceptance_audit_round,
                     &completion_evidence,
                     &tc.function.name,
                     &args,
@@ -784,6 +775,14 @@ impl AgentLoop {
                             },
                         )
                         .ok();
+                    persist_tool_result_message(
+                        &self.db,
+                        &self.session_id,
+                        self.anonymous,
+                        &tc.id,
+                        &content,
+                    )
+                    .await?;
                     result_messages.push(ChatMessage {
                         role: "tool".into(),
                         content: MessageContent::Text(content),
@@ -814,6 +813,14 @@ impl AgentLoop {
                             },
                         )
                         .ok();
+                    persist_tool_result_message(
+                        &self.db,
+                        &self.session_id,
+                        self.anonymous,
+                        &tc.id,
+                        &content,
+                    )
+                    .await?;
                     result_messages.push(ChatMessage {
                         role: "tool".into(),
                         content: MessageContent::Text(content),
@@ -888,29 +895,14 @@ impl AgentLoop {
                     )
                     .ok();
 
-                // Persist the tool result — skipped entirely for anonymous runs.
-                // The in-memory `result_messages` push below still carries it
-                // through this turn so the model sees the tool output.
-                if !self.anonymous {
-                    let now = Utc::now().timestamp_millis();
-                    let msg_id = Uuid::new_v4().to_string();
-                    let tool_content = serde_json::json!({
-                        "tool_call_id": tc.id,
-                        "content": output.content
-                    })
-                    .to_string();
-
-                    sqlx::query(
-                        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-                    )
-                    .bind(&msg_id)
-                    .bind(&self.session_id)
-                    .bind("tool")
-                    .bind(&tool_content)
-                    .bind(now)
-                    .execute(&self.db)
-                    .await?;
-                }
+                persist_tool_result_message(
+                    &self.db,
+                    &self.session_id,
+                    self.anonymous,
+                    &tc.id,
+                    &output.content,
+                )
+                .await?;
 
                 result_messages.push(ChatMessage {
                     role: "tool".into(),
@@ -941,36 +933,34 @@ impl AgentLoop {
                     reasoning_content: None,
                 });
             }
-            if self.mode != AgentMode::Interactive {
-                let evidence = completion_gate.evidence();
-                if evidence.completed
-                    && evidence.last_successful_verification_sequence
-                        != last_completion_nudge_sequence
-                {
-                    last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
+            let evidence = completion_gate.evidence();
+            if evidence.completed
+                && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
+            {
+                last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
+                finalization_pending = true;
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: MessageContent::Text(build_completion_ready_prompt().to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                });
+            } else if self.mode != AgentMode::Interactive {
+                let remaining = max_iterations.saturating_sub(iteration + 1);
+                if should_prompt_budget_convergence(remaining as u32) {
                     messages.push(ChatMessage {
                         role: "user".into(),
-                        content: MessageContent::Text(build_completion_ready_prompt().to_string()),
+                        content: MessageContent::Text(build_budget_convergence_prompt(
+                            remaining as u32,
+                            &evidence,
+                        )),
                         tool_calls: None,
                         tool_call_id: None,
                         name: None,
                         reasoning_content: None,
                     });
-                } else {
-                    let remaining = max_iterations.saturating_sub(iteration + 1);
-                    if should_prompt_budget_convergence(remaining as u32) {
-                        messages.push(ChatMessage {
-                            role: "user".into(),
-                            content: MessageContent::Text(build_budget_convergence_prompt(
-                                remaining as u32,
-                                &evidence,
-                            )),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                            reasoning_content: None,
-                        });
-                    }
                 }
             }
         }
@@ -1596,7 +1586,7 @@ impl AgentLoop {
             reasoning_content: None,
         }];
 
-        for m in history {
+        for m in repair_incomplete_tool_history(history) {
             match m.role.as_str() {
                 "tool" => {
                     // Content stored as: {"tool_call_id": "…", "content": "…"}
@@ -1660,7 +1650,7 @@ impl AgentLoop {
     fn build_anthropic_messages(&self, history: Vec<Message>) -> Vec<serde_json::Value> {
         let mut msgs: Vec<serde_json::Value> = Vec::new();
 
-        for m in history {
+        for m in repair_incomplete_tool_history(history) {
             match m.role.as_str() {
                 "tool" => {
                     let (tool_call_id, content) = parse_tool_message_content(&m.content);
@@ -1755,6 +1745,7 @@ impl AgentLoop {
         let mut completion_sequence = 0_u64;
         let mut last_completion_nudge_sequence = None;
         let mut progress_tracker = ProgressTracker::new(8);
+        let mut finalization_pending = false;
         let max_iterations = self.mode.max_iterations();
         for iteration in 0..max_iterations {
             // Cooperative cancellation: if the user hit "stop" for this chat
@@ -1790,7 +1781,7 @@ impl AgentLoop {
                 context::resolve_context_length(&settings, &endpoint, &self.model_id, None)
             };
 
-            let active_tool_defs = tool_defs;
+            let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
             let resp = anthropic_client::stream_anthropic(
                 &self.http,
                 &self.base_url,
@@ -1803,6 +1794,7 @@ impl AgentLoop {
                 event_name,
             )
             .await?;
+            finalization_pending = false;
 
             // Emit context usage if Anthropic reported it (it sets 0 when missing)
             if resp.input_tokens > 0 {
@@ -1839,18 +1831,16 @@ impl AgentLoop {
             }
 
             if tool_calls.is_empty() {
-                if self.mode != AgentMode::Interactive {
-                    let evidence = completion_gate.evidence();
-                    if !evidence.completed {
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": [{
-                                "type": "text",
-                                "text": build_completion_recovery_prompt(&evidence),
-                            }],
-                        }));
-                        continue;
-                    }
+                let evidence = completion_gate.evidence();
+                if let Some(prompt) = completion_recovery_prompt(&evidence) {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": prompt,
+                        }],
+                    }));
+                    continue;
                 }
                 emitted_terminal = true;
                 let inp = resp.input_tokens;
@@ -1934,16 +1924,9 @@ impl AgentLoop {
 
                 let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
                 let completion_evidence = completion_gate.evidence();
-                let acceptance_audit_round = completion_evidence.completed
-                    && completion_evidence
-                        .last_successful_verification_sequence
-                        .is_some()
-                    && completion_evidence.last_successful_verification_sequence
-                        == last_completion_nudge_sequence;
                 let denial_content = if let Some(content) = autonomous_budget_denial(
                     self.mode,
                     remaining,
-                    acceptance_audit_round,
                     &completion_evidence,
                     &tc.function.name,
                     &args,
@@ -1982,6 +1965,14 @@ impl AgentLoop {
                             },
                         )
                         .ok();
+                    persist_tool_result_message(
+                        &self.db,
+                        &self.session_id,
+                        self.anonymous,
+                        &tc.id,
+                        &content,
+                    )
+                    .await?;
                     tool_result_blocks.push(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": tc.id,
@@ -2009,6 +2000,14 @@ impl AgentLoop {
                             },
                         )
                         .ok();
+                    persist_tool_result_message(
+                        &self.db,
+                        &self.session_id,
+                        self.anonymous,
+                        &tc.id,
+                        &content,
+                    )
+                    .await?;
                     tool_result_blocks.push(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": tc.id,
@@ -2080,28 +2079,14 @@ impl AgentLoop {
                     )
                     .ok();
 
-                // Persist tool result to DB — skipped for anonymous runs; the
-                // in-memory `tool_result_blocks` below still feeds it back to
-                // the model this turn.
-                if !self.anonymous {
-                    let now = Utc::now().timestamp_millis();
-                    let msg_id = Uuid::new_v4().to_string();
-                    let tool_content = serde_json::json!({
-                        "tool_call_id": tc.id,
-                        "content": output.content
-                    })
-                    .to_string();
-                    sqlx::query(
-                        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-                    )
-                    .bind(&msg_id)
-                    .bind(&self.session_id)
-                    .bind("tool")
-                    .bind(&tool_content)
-                    .bind(now)
-                    .execute(&self.db)
-                    .await?;
-                }
+                persist_tool_result_message(
+                    &self.db,
+                    &self.session_id,
+                    self.anonymous,
+                    &tc.id,
+                    &output.content,
+                )
+                .await?;
 
                 tool_result_blocks.push(serde_json::json!({
                     "type": "tool_result",
@@ -2123,31 +2108,29 @@ impl AgentLoop {
                     "content": [{"type": "text", "text": prompt}],
                 }));
             }
-            if self.mode != AgentMode::Interactive {
-                let evidence = completion_gate.evidence();
-                if evidence.completed
-                    && evidence.last_successful_verification_sequence
-                        != last_completion_nudge_sequence
-                {
-                    last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
+            let evidence = completion_gate.evidence();
+            if evidence.completed
+                && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
+            {
+                last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
+                finalization_pending = true;
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": build_completion_ready_prompt(),
+                    }],
+                }));
+            } else if self.mode != AgentMode::Interactive {
+                let remaining = max_iterations.saturating_sub(iteration + 1);
+                if should_prompt_budget_convergence(remaining as u32) {
                     messages.push(serde_json::json!({
                         "role": "user",
                         "content": [{
                             "type": "text",
-                            "text": build_completion_ready_prompt(),
+                            "text": build_budget_convergence_prompt(remaining as u32, &evidence),
                         }],
                     }));
-                } else {
-                    let remaining = max_iterations.saturating_sub(iteration + 1);
-                    if should_prompt_budget_convergence(remaining as u32) {
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": [{
-                                "type": "text",
-                                "text": build_budget_convergence_prompt(remaining as u32, &evidence),
-                            }],
-                        }));
-                    }
                 }
             }
         }
@@ -2185,6 +2168,17 @@ fn openai_tool_controls(
     }
 }
 
+fn active_tool_definitions(
+    tool_defs: &[ToolDefinition],
+    finalization_pending: bool,
+) -> &[ToolDefinition] {
+    if finalization_pending {
+        &[]
+    } else {
+        tool_defs
+    }
+}
+
 fn validate_openai_sse_completion(
     saw_terminal_marker: bool,
     pending_bytes: usize,
@@ -2210,8 +2204,32 @@ fn completion_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (St
     let command = args
         .get("command")
         .and_then(|value| value.as_str())
-        .unwrap_or(tool_name)
-        .to_string();
+        .map(str::to_owned)
+        .or_else(|| {
+            let pattern = args
+                .get("pattern")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let path = args
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let base = match (pattern.is_empty(), path.is_empty()) {
+                (false, false) => Some(format!("{tool_name} {pattern} {path}")),
+                (false, true) => Some(format!("{tool_name} {pattern} .")),
+                (true, false) => Some(format!("{tool_name} {path}")),
+                (true, true) => None,
+            }?;
+            let glob = args
+                .get("glob")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty());
+            Some(match glob {
+                Some(glob) => format!("{base} --glob {glob}"),
+                None => base,
+            })
+        })
+        .unwrap_or_else(|| tool_name.to_owned());
     let kind = if tool_name == "bash" {
         classify_command(&command, 300_000)
     } else if tool_name.starts_with("write_")
@@ -2225,27 +2243,34 @@ fn completion_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (St
     (command, kind)
 }
 
+fn completion_recovery_prompt(evidence: &CompletionEvidence) -> Option<String> {
+    (!evidence.completed).then(|| build_completion_recovery_prompt(evidence))
+}
+
 fn autonomous_budget_denial(
     mode: AgentMode,
     remaining_model_rounds: u32,
-    acceptance_audit_round: bool,
     evidence: &CompletionEvidence,
     tool_name: &str,
     args: &serde_json::Value,
 ) -> Option<String> {
-    if mode == AgentMode::Interactive || acceptance_audit_round {
-        return None;
-    }
     let (command, kind) = completion_command_and_kind(tool_name, args);
+    // Interactive chat is not constrained by the autonomous round budget, but
+    // deterministic completion invariants still apply to model-generated tools.
+    let effective_remaining = if mode == AgentMode::Interactive {
+        u32::MAX
+    } else {
+        remaining_model_rounds
+    };
     match evaluate_budget_command(
-        remaining_model_rounds,
+        effective_remaining,
         evidence,
         &command,
         &kind,
     ) {
         PolicyDecision::Allow => None,
         PolicyDecision::Deny { reason, .. } => Some(format!(
-            "Tool call denied by execution budget: {reason}. Resolve the current completion blocker or finalize."
+            "Tool call denied by completion policy: {reason}. Resolve the current completion blocker or finalize."
         )),
     }
 }
@@ -2307,6 +2332,107 @@ fn parse_tool_message_content(raw: &str) -> (String, String) {
         return (id, content);
     }
     (String::new(), raw.to_string())
+}
+
+async fn persist_tool_result_message(
+    db: &SqlitePool,
+    session_id: &str,
+    anonymous: bool,
+    tool_call_id: &str,
+    content: &str,
+) -> Result<()> {
+    if anonymous {
+        return Ok(());
+    }
+    let tool_content = serde_json::json!({
+        "tool_call_id": tool_call_id,
+        "content": content,
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(session_id)
+    .bind("tool")
+    .bind(tool_content)
+    .bind(Utc::now().timestamp_millis())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+fn repair_incomplete_tool_history(history: Vec<Message>) -> Vec<Message> {
+    fn synthetic_tool_message(session_id: &str, tool_call_id: &str, created_at: i64) -> Message {
+        Message {
+            id: format!("recovered-tool-{tool_call_id}"),
+            session_id: session_id.to_owned(),
+            role: "tool".into(),
+            content: serde_json::json!({
+                "tool_call_id": tool_call_id,
+                "content": "Tool result unavailable in persisted history; continue from current workspace state.",
+            })
+            .to_string(),
+            model_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            tool_calls: None,
+            reasoning_content: None,
+            created_at,
+        }
+    }
+
+    let mut repaired = Vec::with_capacity(history.len());
+    let mut pending_tool_calls: Vec<String> = Vec::new();
+    let mut last_session_id = String::new();
+    let mut last_created_at = 0;
+
+    for message in history {
+        last_session_id = message.session_id.clone();
+        last_created_at = message.created_at;
+        if message.role != "tool" && !pending_tool_calls.is_empty() {
+            for tool_call_id in pending_tool_calls.drain(..) {
+                repaired.push(synthetic_tool_message(
+                    &message.session_id,
+                    &tool_call_id,
+                    message.created_at.saturating_sub(1),
+                ));
+            }
+        }
+
+        if message.role == "tool" {
+            let (tool_call_id, _) = parse_tool_message_content(&message.content);
+            if let Some(index) = pending_tool_calls
+                .iter()
+                .position(|pending| pending == &tool_call_id)
+            {
+                pending_tool_calls.remove(index);
+                repaired.push(message);
+            }
+            continue;
+        }
+
+        if message.role == "assistant" {
+            pending_tool_calls = message
+                .tool_calls
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<ToolCall>>(raw).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tool_call| tool_call.id)
+                .collect();
+        }
+        repaired.push(message);
+    }
+
+    for tool_call_id in pending_tool_calls {
+        repaired.push(synthetic_tool_message(
+            &last_session_id,
+            &tool_call_id,
+            last_created_at.saturating_add(1),
+        ));
+    }
+    repaired
 }
 
 /// Read at most `max_chars` UTF-8 chars from a file, appending "…" if truncated.
@@ -2557,6 +2683,21 @@ fn glob_match(pattern: &str, input: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn stored_message(role: &str, content: &str, tool_calls: Option<String>) -> Message {
+        Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: "session-1".into(),
+            role: role.into(),
+            content: content.into(),
+            model_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            tool_calls,
+            reasoning_content: None,
+            created_at: 1,
+        }
+    }
+
     // ── AgentMode contract tests ─────────────────────────────────────────
     //
     // The whole reason AgentMode exists is to flip two switches:
@@ -2799,9 +2940,9 @@ mod tests {
     }
 
     #[test]
-    fn autonomous_desktop_budget_converges_without_affecting_interactive_chat() {
+    fn desktop_compatibility_invariants_apply_to_interactive_and_autonomous_modes() {
         let evidence = CompletionEvidence {
-            required_source_scan_extensions: vec![".py".to_owned(), ".pyx".to_owned()],
+            required_source_scan_extensions: vec![".py".to_owned()],
             blockers: vec![
                 "source compatibility work requires a clean repository-wide residual scan"
                     .to_owned(),
@@ -2809,22 +2950,29 @@ mod tests {
             ..CompletionEvidence::default()
         };
         let unrelated = serde_json::json!({"command": "pytest tests/test_unrelated.py"});
-        assert!(autonomous_budget_denial(
-            AgentMode::Autonomous,
-            8,
-            false,
-            &evidence,
-            "bash",
-            &unrelated,
-        )
-        .is_some());
+        assert!(
+            autonomous_budget_denial(AgentMode::Autonomous, 8, &evidence, "bash", &unrelated,)
+                .is_some()
+        );
+
+        let fragile_scan = serde_json::json!({
+            "command": "cd /workspace && result=$(grep -r --include='*.py' 'old_value' pkg/ tests/ 2>&1); rc=$?; if [ $rc -gt 1 ]; then exit $rc; elif [ $rc -eq 0 ]; then exit 1; else echo 'CLEAN: no old_value references'; fi"
+        });
+        let denial =
+            autonomous_budget_denial(AgentMode::Interactive, 64, &evidence, "bash", &fragile_scan)
+                .expect("interactive mode must reject a fragile compatibility scan");
+        assert!(denial.contains("temporary results file"));
+        assert!(denial.contains("test ! -s"));
+
+        let robust_scan = serde_json::json!({
+            "command": "cd /workspace && results=$(mktemp); errors=$(mktemp); grep -r --include='*.py' 'old_value' pkg/ tests/ >\"$results\" 2>\"$errors\"; rc=$?; if [ \"$rc\" -gt 1 ]; then cat \"$errors\" >&2; exit \"$rc\"; fi; test ! -s \"$results\""
+        });
         assert!(autonomous_budget_denial(
             AgentMode::Interactive,
-            8,
-            false,
+            64,
             &evidence,
             "bash",
-            &unrelated,
+            &robust_scan,
         )
         .is_none());
 
@@ -2836,12 +2984,160 @@ mod tests {
         assert!(autonomous_budget_denial(
             AgentMode::Autonomous,
             8,
-            false,
             &evidence,
             "edit_file",
             &source_edit,
         )
         .is_none());
+
+        assert!(autonomous_budget_denial(
+            AgentMode::Interactive,
+            0,
+            &CompletionEvidence::default(),
+            "bash",
+            &unrelated,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn interactive_finalization_recovers_when_completion_evidence_is_incomplete() {
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 1,
+            blockers: vec![
+                "source compatibility work requires a clean repository-wide residual scan"
+                    .to_owned(),
+            ],
+            ..CompletionEvidence::default()
+        };
+
+        let prompt = completion_recovery_prompt(&evidence)
+            .expect("interactive finalization must continue after a mutation with blockers");
+        assert!(prompt.contains("source compatibility"));
+        assert!(completion_recovery_prompt(&CompletionEvidence {
+            completed: true,
+            ..CompletionEvidence::default()
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn completion_tool_evidence_preserves_grep_pattern_and_path() {
+        let (command, kind) = completion_command_and_kind(
+            "grep",
+            &serde_json::json!({
+                "pattern": "^(import|from)",
+                "path": "src",
+                "glob": "*.py"
+            }),
+        );
+
+        assert_eq!(kind, ToolKind::ReadOnly);
+        assert!(command.contains("^(import|from)"));
+        assert!(command.contains("src"));
+        assert!(command.contains("--glob *.py"));
+
+        let (root_command, _) =
+            completion_command_and_kind("grep", &serde_json::json!({"pattern": "^(import|from)"}));
+        assert_eq!(root_command, "grep ^(import|from) .");
+    }
+
+    #[test]
+    fn persisted_history_repairs_missing_tool_results_before_the_next_user_turn() {
+        let tool_calls = serde_json::json!([{
+            "id": "call-denied",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}
+        }])
+        .to_string();
+        let repaired = repair_incomplete_tool_history(vec![
+            stored_message("assistant", "", Some(tool_calls)),
+            stored_message("user", "continue", None),
+        ]);
+
+        assert_eq!(repaired.len(), 3);
+        assert_eq!(repaired[1].role, "tool");
+        let (tool_call_id, content) = parse_tool_message_content(&repaired[1].content);
+        assert_eq!(tool_call_id, "call-denied");
+        assert!(content.contains("unavailable in persisted history"));
+        assert_eq!(repaired[2].role, "user");
+    }
+
+    #[tokio::test]
+    async fn denied_tool_results_are_persisted_for_future_provider_replay() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at INTEGER)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        persist_tool_result_message(
+            &pool,
+            "session-1",
+            false,
+            "call-denied",
+            "Tool call denied by completion policy",
+        )
+        .await
+        .unwrap();
+
+        let (role, content): (String, String) =
+            sqlx::query_as("SELECT role, content FROM messages LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(role, "tool");
+        let (tool_call_id, persisted_content) = parse_tool_message_content(&content);
+        assert_eq!(tool_call_id, "call-denied");
+        assert_eq!(persisted_content, "Tool call denied by completion policy");
+    }
+
+    #[test]
+    fn desktop_edit_path_activates_interactive_compatibility_scan_gate() {
+        let mut gate = CompletionGate::new_for_instruction(
+            false,
+            "修复 runtime 升级后已移除 API 的源码兼容问题。",
+        );
+        let mut progress = ProgressTracker::new(8);
+        let mut sequence = 0;
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            "edit_file",
+            &serde_json::json!({
+                "path": "/workspace/compatdemo/service.py",
+                "old_string": "rt.old_value(value)",
+                "new_string": "rt.new_value(value)"
+            }),
+            &tools::ToolOutput::ok("Edited /workspace/compatdemo/service.py"),
+        );
+
+        let evidence = gate.evidence();
+        assert_eq!(evidence.required_source_scan_extensions, vec![".py"]);
+        assert!(evidence
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("clean repository-wide residual scan")));
+
+        let fragile_scan = serde_json::json!({
+            "command": "cd /workspace && result=$(grep -r --include='*.py' 'old_value' compatdemo/ tests/ 2>&1); rc=$?; if [ $rc -gt 1 ]; then exit $rc; elif [ $rc -eq 0 ]; then exit 1; else echo 'CLEAN: no old_value references'; fi"
+        });
+        assert!(autonomous_budget_denial(
+            AgentMode::Interactive,
+            64,
+            &evidence,
+            "bash",
+            &fragile_scan,
+        )
+        .is_some());
     }
 
     #[test]
@@ -2850,6 +3146,17 @@ mod tests {
 
         assert!(tools.is_none());
         assert_eq!(tool_choice, serde_json::json!("none"));
+    }
+
+    #[test]
+    fn completion_finalization_selects_an_empty_tool_surface() {
+        let definitions = tools::all_definitions();
+
+        assert!(active_tool_definitions(&definitions, true).is_empty());
+        assert_eq!(
+            active_tool_definitions(&definitions, false).len(),
+            definitions.len()
+        );
     }
 
     #[test]
