@@ -13,10 +13,12 @@ import {
   Clock,
   ShieldCheck,
   Gauge,
+  GitPullRequestArrow,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../../stores/chat";
 import { useSettingsStore } from "../../stores/settings";
+import { useLearningStore } from "../../stores/learning";
 import {
   createQuickSession,
   listQuickSessions,
@@ -31,6 +33,7 @@ interface HomePageProps {
   onOpenBenchmarks: () => void;
   onOpenSettings: () => void;
   onOpenProfile: () => void;
+  onOpenEvolution: () => void;
 }
 
 /**
@@ -65,10 +68,15 @@ export function HomePage({
   onOpenBenchmarks,
   onOpenSettings,
   onOpenProfile,
+  onOpenEvolution,
 }: HomePageProps) {
   const { sessions, loadSessions, createSession, activeModel } = useChatStore();
   const { settings, setTheme } = useSettingsStore();
+  const learningEvents = useLearningStore((state) => state.events);
+  const loadLearning = useLearningStore((state) => state.load);
   const [quickSessions, setQuickSessions] = useState<Session[]>([]);
+  const [evolutionBadgeReady, setEvolutionBadgeReady] = useState(false);
+  const [evolutionBadgeIncomplete, setEvolutionBadgeIncomplete] = useState(false);
 
   const refreshQuickSessions = () => {
     listQuickSessions()
@@ -82,6 +90,24 @@ export function HomePage({
     loadSessions();
     refreshQuickSessions();
   }, []);
+
+  useEffect(() => {
+    const scopes = [...new Set(sessions.filter((session) => session.kind !== "quick" && session.kind !== "anonymous").map((session) => session.cwd))];
+    let cancelled = false;
+    setEvolutionBadgeReady(scopes.length === 0);
+    setEvolutionBadgeIncomplete(false);
+    void Promise.all(scopes.map((cwd) => loadLearning(cwd)))
+      .then(() => {
+        if (!cancelled) setEvolutionBadgeReady(true);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setEvolutionBadgeReady(true);
+          setEvolutionBadgeIncomplete(true);
+        }
+      });
+    return () => { cancelled = true; };
+  }, [sessions, loadLearning]);
 
   const handleNewProject = async () => {
     const dir = await openDialog({ directory: true, title: "选择项目目录" });
@@ -123,6 +149,10 @@ export function HomePage({
   const recent = [...sessions]
     .sort((a, b) => b.updated_at - a.updated_at)
     .slice(0, 6);
+  const projectScopes = new Set(sessions.filter((session) => session.kind !== "quick" && session.kind !== "anonymous").map((session) => session.cwd));
+  const evolutionPendingCount = [...projectScopes]
+    .flatMap((scope) => learningEvents[scope] ?? [])
+    .filter((event) => event.status === "pending").length;
 
   return (
     <div className="h-full flex flex-col bg-surface-0">
@@ -183,7 +213,7 @@ export function HomePage({
           {/* ── Three primary entries ─────────────────────────────────── */}
           <section>
             <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-3">开始</h2>
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
               <EntryCard
                 Icon={Plus}
                 title="新建项目"
@@ -211,6 +241,14 @@ export function HomePage({
                 desc="Terminal-Bench 2.1 基线、子集回归和失败归因"
                 tone="muted"
                 onClick={onOpenBenchmarks}
+              />
+              <EntryCard
+                Icon={GitPullRequestArrow}
+                title="进化审查"
+                desc="人工采纳改进，查看分析、审核与物化日志"
+                tone="muted"
+                onClick={onOpenEvolution}
+                badge={evolutionBadgeIncomplete ? "数据不完整" : !evolutionBadgeReady ? "待刷新" : evolutionPendingCount > 0 ? `${evolutionPendingCount} 待审` : undefined}
               />
             </div>
           </section>
@@ -302,9 +340,10 @@ interface EntryCardProps {
   desc: string;
   tone: "primary" | "muted";
   onClick: () => void;
+  badge?: string;
 }
 
-function EntryCard({ Icon, title, desc, tone, onClick }: EntryCardProps) {
+function EntryCard({ Icon, title, desc, tone, onClick, badge }: EntryCardProps) {
   const primary = tone === "primary";
   return (
     <button
@@ -315,10 +354,10 @@ function EntryCard({ Icon, title, desc, tone, onClick }: EntryCardProps) {
           : "border-border bg-surface-1 hover:bg-surface-2 hover:border-gray-500"
       }`}
     >
-      <Icon
-        size={18}
-        className={primary ? "text-accent mb-3" : "text-gray-400 mb-3"}
-      />
+      <div className="mb-3 flex items-start justify-between gap-2">
+        <Icon size={18} className={primary ? "text-accent" : "text-gray-400"} />
+        {badge && <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent">{badge}</span>}
+      </div>
       <h3 className={`text-sm font-medium mb-1 ${primary ? "text-gray-200" : "text-gray-300"}`}>
         {title}
       </h3>

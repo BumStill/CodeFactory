@@ -6,11 +6,13 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   markPermissionResponse,
   reduceChatStreamEvent,
+  formatToolArgs,
   type ChatEventState,
   type PendingPermission,
   type ToolCallState,
   type UIMessage,
 } from "./chatEvents";
+import { useSettingsStore } from "./settings";
 
 export type { PendingPermission, ToolCallState, UIMessage };
 
@@ -174,7 +176,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     set((s) => ({
       activeSession: session,
       activeModel: session.model_id,
-      runtime: { ...s.runtime, [id]: freshRuntime(msgs.map(dbToUI)) },
+      runtime: { ...s.runtime, [id]: freshRuntime(dbMessagesToUI(msgs)) },
     }));
   },
 
@@ -581,6 +583,7 @@ function handleStreamEvent(
       session &&
       session.kind !== "anonymous" &&
       event.type === "done" &&
+      useSettingsStore.getState().settings?.remote_postmortem_enabled === true &&
       (get().runtime[sessionId]?.messages.length ?? 0) >= POSTMORTEM_MIN_MESSAGES
     ) {
       const last = _lastPostmortemAt[session.id] ?? 0;
@@ -597,6 +600,113 @@ function handleStreamEvent(
       }
     }
   }
+}
+
+interface PersistedToolCall {
+  id?: unknown;
+  function?: {
+    name?: unknown;
+    arguments?: unknown;
+  };
+}
+
+interface PersistedToolReplay {
+  tool_call_id?: unknown;
+  content?: unknown;
+  status?: unknown;
+}
+
+function parsePersistedToolCalls(raw: string | null | undefined): ToolCallState[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((value) => {
+      const call = value as PersistedToolCall;
+      if (typeof call.id !== "string" || typeof call.function?.name !== "string") return [];
+      const rawArgs = call.function.arguments;
+      let args: unknown = rawArgs ?? {};
+      if (typeof rawArgs === "string") {
+        try {
+          args = JSON.parse(rawArgs);
+        } catch {
+          args = rawArgs;
+        }
+      }
+      return [
+        {
+          id: call.id,
+          name: call.function.name,
+          args: formatToolArgs(args),
+          status: "running" as const,
+        },
+      ];
+    });
+  } catch {
+    return [];
+  }
+}
+
+function parsePersistedToolReplay(raw: string): {
+  toolCallId: string;
+  content: string;
+  status: "done" | "error" | "denied";
+} | null {
+  try {
+    const replay = JSON.parse(raw) as PersistedToolReplay;
+    if (typeof replay.tool_call_id !== "string" || typeof replay.content !== "string") {
+      return null;
+    }
+    const status =
+      replay.status === "error" || replay.status === "denied" || replay.status === "done"
+        ? replay.status
+        : "done";
+    return { toolCallId: replay.tool_call_id, content: replay.content, status };
+  } catch {
+    return null;
+  }
+}
+
+/** Rebuild persisted tool cards and fold role=tool replay rows into the
+ * assistant declaration that owns them. Provider replay rows are transport
+ * history, not standalone chat bubbles. */
+export function dbMessagesToUI(messages: Message[]): UIMessage[] {
+  const hydrated: UIMessage[] = [];
+  const toolOwners = new Map<string, number>();
+
+  for (const message of messages) {
+    if (message.role === "tool") {
+      const replay = parsePersistedToolReplay(message.content);
+      const ownerIndex = replay ? toolOwners.get(replay.toolCallId) : undefined;
+      if (replay && ownerIndex != null) {
+        const owner = hydrated[ownerIndex];
+        owner.toolCalls = owner.toolCalls?.map((call) =>
+          call.id === replay.toolCallId
+            ? {
+                ...call,
+                result: replay.content,
+                status: replay.status,
+                isError: replay.status !== "done",
+              }
+            : call,
+        );
+      }
+      continue;
+    }
+
+    const uiMessage = dbToUI(message);
+    if (message.role === "assistant") {
+      const toolCalls = parsePersistedToolCalls(message.tool_calls);
+      if (toolCalls.length > 0) {
+        uiMessage.toolCalls = toolCalls;
+        const ownerIndex = hydrated.length;
+        for (const call of toolCalls) toolOwners.set(call.id, ownerIndex);
+      }
+    }
+    hydrated.push(uiMessage);
+  }
+
+  return hydrated;
 }
 
 function dbToUI(m: Message): UIMessage {

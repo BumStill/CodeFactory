@@ -66,6 +66,11 @@ pub struct Settings {
     pub git_remotes: Vec<GitRemoteConfig>,
     #[serde(default)]
     pub auto_create_pr: bool,
+    /// Explicit privacy opt-in for sending a bounded, redacted post-mortem
+    /// summary to the currently configured model. Local deterministic
+    /// cross-session mining does not require this flag.
+    #[serde(default)]
+    pub remote_postmortem_enabled: bool,
     #[serde(default)]
     pub theme: Theme,
     #[serde(default = "default_font_family")]
@@ -355,6 +360,7 @@ impl Default for Settings {
             mcp_servers: vec![],
             git_remotes: vec![],
             auto_create_pr: false,
+            remote_postmortem_enabled: false,
             theme: Theme::Dark,
             font_family: default_font_family(),
             font_size: default_font_size(),
@@ -367,6 +373,11 @@ impl Default for Settings {
 #[cfg(test)]
 mod reasoning_effort_tests {
     use super::*;
+
+    #[test]
+    fn remote_postmortem_is_opt_in_by_default() {
+        assert!(!Settings::default().remote_postmortem_enabled);
+    }
 
     #[test]
     fn default_is_medium() {

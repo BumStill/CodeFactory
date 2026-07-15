@@ -38,6 +38,19 @@ def default_branch(remote: str) -> str:
     return "main"
 
 
+def includes_base(base_ref: str) -> bool:
+    if git("merge-base", "--is-ancestor", base_ref, "HEAD", check=False).returncode == 0:
+        return True
+
+    merge_head = git("rev-parse", "--verify", "--quiet", "MERGE_HEAD", check=False)
+    if merge_head.returncode != 0:
+        return False
+    return (
+        git("merge-base", "--is-ancestor", base_ref, "MERGE_HEAD", check=False).returncode
+        == 0
+    )
+
+
 def main() -> int:
     if os.environ.get("CODEFACTORY_SKIP_SYNC_GATE") == "1":
         print("sync-gate: skipped via CODEFACTORY_SKIP_SYNC_GATE=1", file=sys.stderr)
@@ -70,8 +83,7 @@ def main() -> int:
     if not out("rev-parse", "--verify", "--quiet", base_ref, check=False):
         return fail(f"{base_ref} does not exist after fetch")
 
-    contains_base = git("merge-base", "--is-ancestor", base_ref, "HEAD", check=False)
-    if contains_base.returncode == 0:
+    if includes_base(base_ref):
         print(f"sync-gate: OK; {branch} includes latest {base_ref}")
         return 0
 

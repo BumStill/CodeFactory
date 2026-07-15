@@ -14,6 +14,7 @@
 - `mvp-agent-client.md`: CodeFactory MVP AI 编程 Agent 主路径规格。
 - `personal-knowledge-office-assistant.md`: 个人知识库、PowerPoint 插件和通用助手化规格。
 - `terminal-bench-21-evaluation.md`: Terminal-Bench 2.1 能力评估、Harbor 接入、失败分类和回归闭环规格。
+- `evolution-agent-closed-loop.md`: Session 真实轨迹、信号提取、人工审核、受控改进与 Evals 门禁规格。
 - `task-failure-attribution-repair-loop.md`: Workspace 任务失败归因、修复建议和主产品闭环规格。
 
 ## 模板

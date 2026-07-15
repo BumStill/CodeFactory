@@ -6,6 +6,7 @@ import { WorkspacePage } from "./pages/Workspace/WorkspacePage";
 import { SkillsPage } from "./pages/Skills/SkillsPage";
 import { ControlPlanePage } from "./pages/ControlPlane/ControlPlanePage";
 import { BenchmarksPage } from "./pages/Benchmarks/BenchmarksPage";
+import { EvolutionWorkbenchPage } from "./pages/Evolution/EvolutionWorkbenchPage";
 import { SettingsPage } from "./pages/Settings/SettingsPage";
 import { ProfilePage } from "./pages/Profile/ProfilePage";
 import { ToastContainer } from "./components/Toast";
@@ -17,11 +18,12 @@ import { useChatStore } from "./stores/chat";
 import { invoke } from "./lib/tauri";
 import type { Session } from "./lib/tauri";
 
-export type AppView = "home" | "workspace" | "specs" | "skills" | "settings" | "profile" | "control-plane" | "benchmarks";
+export type AppView = "home" | "workspace" | "specs" | "skills" | "settings" | "profile" | "control-plane" | "benchmarks" | "evolution";
 
 export default function App() {
   const [view, setView] = useState<AppView>("home");
   const [activeProject, setActiveProject] = useState<string | null>(null);
+  const [evolutionCwd, setEvolutionCwd] = useState<string | null>(null);
   const [evidenceViewerPath, setEvidenceViewerPath] = useState<string | null>(null);
   const loadSettings = useSettingsStore((s) => s.load);
   const settings = useSettingsStore((s) => s.settings);
@@ -39,6 +41,11 @@ export default function App() {
 
   const backToHome = () => {
     setView("home");
+  };
+
+  const openEvolution = (cwd?: string) => {
+    setEvolutionCwd(cwd ?? null);
+    setView("evolution");
   };
 
   // Onboarding gate: show overlay when settings loaded AND user hasn't
@@ -84,6 +91,7 @@ export default function App() {
           onOpenBenchmarks={() => setView("benchmarks")}
           onOpenSettings={() => setView("settings")}
           onOpenProfile={() => setView("profile")}
+          onOpenEvolution={() => openEvolution()}
         />
       )}
 
@@ -94,13 +102,15 @@ export default function App() {
           onOpenSkills={() => setView("skills")}
           onOpenSettings={() => setView("settings")}
           onOpenSession={openProject}
+          onOpenEvolution={openEvolution}
         />
       )}
 
       {view === "skills"   && <SkillsPage   onBack={backToHome} />}
       {view === "control-plane" && <ControlPlanePage onBack={backToHome} />}
       {view === "benchmarks" && <BenchmarksPage onBack={backToHome} />}
-      {view === "profile"  && <ProfilePage  onBack={backToHome} />}
+      {view === "evolution" && <EvolutionWorkbenchPage onBack={backToHome} initialCwd={evolutionCwd} />}
+      {view === "profile"  && <ProfilePage onBack={backToHome} onOpenEvolution={openEvolution} />}
       {view === "settings" && <SettingsPage onBack={() => setView(activeProject ? "workspace" : "home")} />}
 
       {/* First-run onboarding overlay — gates the app behind a 3-step setup

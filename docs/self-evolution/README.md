@@ -1,5 +1,16 @@
 # Self-Evolution — overview & roadmap
 
+> **2026-07-14 implementation truth audit:** P0–P4 的部分逻辑和 UI 已存在，但
+> v1.43.0 的真实 Agent 路径没有写入规范化 `tool_calls`，普通聊天 post-mortem
+> 也只读取 `task_runs`。因此 P1/P3/P4 暂时只能视为“实现框架已存在、真实观察层
+> 未闭合”，不能以 shipped 文案作为产品完成证据。修复顺序与验收见
+> `docs/specs/feature-specs/evolution-agent-closed-loop.md`。
+> `codex/evolution-agent-loop` 已完成本地 Trace Truth 首个切片，以及一级「进化审查」
+> 工作台、人工采纳/拒绝、持久 job/event 日志和重启中断终态的真实 Dev App 证据。
+> 但在本轮 PR+CI、合并、刻意发版与发布包主路径验证前仍是 `not live`；通用
+> Evals/activation、versioned review、Quick 稳定 scope 和其余底座证据仍未完成，
+> 不能提前恢复完整 shipped 声明。
+
 > CodeFactory's tagline is **软件工厂 · 本地助手 · 自进化**. "Self-evolution" is
 > the system by which the product gets better from its own use — the factory
 > improving the factory. This document is the durable north star: it defines
@@ -39,10 +50,10 @@ memory → behavior. Everything below widens the "Adapt" scope.
 | Phase | Adapts | Gist | Risk |
 |---|---|---|---|
 | **P0 — substrate** ✅ | memory/preferences | Memory system A1–A3 (done) | low |
-| **P1 — cross-session pattern mining** ✅ | memory quality | **Shipped** (`mine_cross_session_patterns`). Aggregate across many sessions (not one) to surface evidence-backed patterns: "tool X fails often", "decompositions shaped like Y verify-pass", "user always rejects learnings of kind Z". Feeds higher-quality learnings + signals for P2–P3. See `P1-cross-session-pattern-mining.md`. | low |
+| **P1 — cross-session pattern mining** ⚠️ | memory quality | Command/UI 已存在；在 Phase 0 真实写入规范化轨迹并完成 live verification 前，不视为 shipped。See `P1-cross-session-pattern-mining.md`. | low |
 | **P2 — skill auto-evolution** ✅ | agent capability | **Shipped** (`propose_skills_from_patterns` — writes *disabled* proposal skills the user previews + enables; never auto-enables). A recurring task pattern → auto-propose/refine a skill. Reuses the existing skill system. See `P2-skill-auto-evolution.md`. | medium |
-| **P3 — self-tuning** ✅ | routing/policies | **Shipped** (proposer self-calibration: accept/reject history per learning kind feeds back into the post-mortem). Later slices (dispatch routing, tool policy) are designed; security-relevant ones stay human-enabled. See `P3-self-tuning.md`. | medium |
-| **P4 — self-modification** | **its own code** | **Foundation shipped** (`self_improvement_proposal` — read-only friction → markdown proposal for a human; writes no code, opens no PR, ships nothing). The autonomous implement→verify→PR loop is **deliberately gated** behind human opt-in + branch-protection, not auto-built. See `P4-self-modification.md`. | high |
+| **P3 — self-tuning** ⚠️ | routing/policies | 自校准逻辑存在；工具可靠性/门控依赖 Phase 0 真实轨迹，验证前不视为完整 shipped。See `P3-self-tuning.md`. | medium |
+| **P4 — self-modification** | **its own code** | 只读提案 UI/命令存在；摩擦数据同样依赖 Phase 0。自主 implement→verify→PR 仍明确未实现。See `P4-self-modification.md`. | high |
 
 ## Safety model (non-negotiable for every phase)
 

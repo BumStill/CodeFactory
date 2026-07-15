@@ -82,7 +82,7 @@ pub async fn collect_evidence_pack(
     let messages: Vec<(String, String, String, Option<String>, Option<i64>, Option<i64>, i64)> =
         sqlx::query_as(
             "SELECT id, role, content, tool_calls, input_tokens, output_tokens, created_at \
-             FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+             FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
         )
         .bind(session_id)
         .fetch_all(pool)
@@ -125,6 +125,7 @@ pub async fn collect_evidence_pack(
                                         })
                                 })
                                 .unwrap_or(serde_json::Value::Null);
+                            let args = crate::trajectory::redact_json(&args);
 
                             tool_calls_out.push(serde_json::json!({
                                 "tool_name": tool_name,
@@ -141,32 +142,56 @@ pub async fn collect_evidence_pack(
         }
     }
 
-    // Also pull from tool_call_records table if it exists
-    let tc_records: Vec<(String, String, String, Option<String>, Option<i64>)> =
-        sqlx::query_as(
-            "SELECT tool_name, arguments, COALESCE(result, ''), created_at, duration_ms \
-             FROM tool_call_records tcr \
-             JOIN messages m ON m.id = tcr.message_id \
-             WHERE m.session_id = ? ORDER BY tcr.created_at ASC",
-        )
-        .bind(session_id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+    // Prefer the normalized lifecycle table when available. It is populated by
+    // the real AgentLoop and already contains bounded, redacted payloads.
+    let tc_records: Vec<(
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<i64>,
+        Option<String>,
+        String,
+        i64,
+    )> = sqlx::query_as(
+        "SELECT tc.tool_name, tc.arguments, tc.result, tc.status, tc.duration_ms, \
+                    tc.error, tc.message_id, tc.created_at \
+             FROM tool_calls tc \
+             JOIN messages m ON m.id = tc.message_id \
+             WHERE m.session_id = ? ORDER BY tc.created_at ASC",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
 
     if !tc_records.is_empty() {
-        // Prefer richer tool_call_records if available
+        // Prefer richer normalized records if available.
         tool_calls_out.clear();
-        for (tool_name, arguments, result, created_at_str, duration_ms) in &tc_records {
-            let args: serde_json::Value =
-                serde_json::from_str(arguments).unwrap_or(serde_json::Value::String(arguments.clone()));
-            let result_preview: String = result.chars().take(200).collect();
+        for (tool_name, arguments, result, status, duration_ms, error, message_id, created_at) in
+            &tc_records
+        {
+            let args = serde_json::from_str(arguments)
+                .unwrap_or(serde_json::Value::String(arguments.clone()));
+            let args = crate::trajectory::redact_json(&args);
+            let result_preview =
+                crate::trajectory::redact_text(result.as_deref().unwrap_or(""), 200);
+            let error_preview = error
+                .as_deref()
+                .map(|value| crate::trajectory::redact_text(value, 200));
+            let timestamp = chrono::DateTime::<Utc>::from_timestamp_millis(*created_at)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default();
             tool_calls_out.push(serde_json::json!({
                 "tool_name": tool_name,
                 "args": args,
                 "result_preview": result_preview,
-                "timestamp": created_at_str,
+                "status": status,
+                "error": error_preview,
+                "timestamp": timestamp,
                 "duration_ms": duration_ms,
+                "message_id": message_id,
+                "task_id": null,
             }));
         }
     }
@@ -804,6 +829,93 @@ pub async fn auto_collect_and_emit(
         }
         Err(e) => {
             tracing::error!("auto_collect_evidence_pack failed: {}", e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn evidence_pack_prefers_normalized_redacted_tool_lifecycle() {
+        let root = std::env::temp_dir().join(format!(
+            "codefactory-evidence-normalized-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("test.db");
+        let db_url = format!("sqlite:{}", db_path.display());
+        let pool = crate::storage::db::connect(&db_url).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at) \
+             VALUES ('session-1', 'Evidence test', ?, 'test-model', 1, 1)",
+        )
+        .bind(root.to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, tool_calls, created_at) \
+             VALUES ('message-1', 'session-1', 'assistant', '', '[]', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_calls \
+             (id, message_id, tool_name, arguments, result, status, duration_ms, created_at) \
+             VALUES ('tool-1', 'message-1', 'bash', ?, ?, 'done', 42, 1)",
+        )
+        .bind(r#"{"command":"printf token=CF_EVO_EVIDENCE_SECRET"}"#)
+        .bind(r#"{"token":"CF_EVO_EVIDENCE_SECRET","safe":"visible"}"#)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pack_path = collect_evidence_pack(
+            root.to_string_lossy().as_ref(),
+            "CF-EVO-R5",
+            "normalized evidence",
+            "session-1",
+            &[],
+            &pool,
+        )
+        .await
+        .unwrap();
+        let tool_calls =
+            std::fs::read_to_string(format!("{pack_path}/tool_calls.jsonl")).unwrap();
+
+        assert!(tool_calls.contains(r#""status":"done""#));
+        assert!(tool_calls.contains(r#""duration_ms":42"#));
+        assert!(tool_calls.contains("<redacted>"));
+        assert!(tool_calls.contains("visible"));
+        assert!(!tool_calls.contains("CF_EVO_EVIDENCE_SECRET"));
+
+        pool.close().await;
+        drop(pool);
+
+        // Windows can briefly retain the SQLite file handle after the pool is
+        // closed. Retry only the test-fixture cleanup so a transient lock does
+        // not turn a successful evidence assertion into a CI failure.
+        let mut last_error = None;
+        for attempt in 0..10 {
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 9 {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            panic!("failed to remove evidence test directory: {error}");
         }
     }
 }

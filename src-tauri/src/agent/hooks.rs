@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use tauri::{AppHandle, Emitter};
 
-use crate::commands::hooks::{HookAction, HookConfig};
+use crate::commands::hooks::{run_hook_command, HookAction, HookConfig};
 use crate::config::settings::Settings;
 use crate::util::no_window::NoWindow;
 
@@ -71,6 +71,13 @@ pub struct HookRunner {
     app_handle: AppHandle,
 }
 
+fn pre_tool_command_cancelled(result: &std::io::Result<std::process::Output>) -> bool {
+    match result {
+        Ok(output) => !output.status.success(),
+        Err(_) => true,
+    }
+}
+
 impl HookRunner {
     pub fn from_settings(settings: &Settings, app_handle: AppHandle) -> Self {
         Self {
@@ -80,6 +87,16 @@ impl HookRunner {
                 .filter(|h| h.enabled)
                 .cloned()
                 .collect(),
+            app_handle,
+        }
+    }
+
+    /// Anonymous sessions promise no persistent learning/audit residue. Hooks
+    /// may write files or run external commands, so they are disabled entirely
+    /// for that mode instead of trying to classify individual hook actions.
+    pub fn disabled(app_handle: AppHandle) -> Self {
+        Self {
+            configs: Vec::new(),
             app_handle,
         }
     }
@@ -144,18 +161,19 @@ impl HookRunner {
 
             HookAction::RunCommand { command, cwd } => {
                 let is_pre_tool = matches!(event, HookEvent::PreTool { .. });
-                let result = std::process::Command::new("powershell")
-                    .no_window()
-                    .args(["-NonInteractive", "-Command", command])
-                    .current_dir(cwd.as_deref().unwrap_or("."))
-                    .output();
+                let result = run_hook_command(
+                    command,
+                    cwd.as_deref().map(std::path::Path::new),
+                );
 
                 if is_pre_tool {
-                    // Non-zero exit = cancel
-                    match result {
-                        Ok(out) => !out.status.success(),
-                        Err(_) => false,
+                    // Non-zero exit = cancel. A configured pre-tool guard that
+                    // cannot start must fail closed; silently allowing the
+                    // underlying tool would defeat the hook's safety purpose.
+                    if let Err(error) = &result {
+                        tracing::warn!("pre-tool hook command failed to start: {error}");
                     }
+                    pre_tool_command_cancelled(&result)
                 } else {
                     // Fire-and-forget style: just spawn
                     let _ = result;
@@ -190,5 +208,32 @@ impl HookRunner {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_tool_command_is_fail_closed_for_nonzero_and_runner_failure() {
+        let cwd = std::env::temp_dir().join(format!(
+            "codefactory-pre-tool-hook-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let success = run_hook_command("exit 0", Some(&cwd));
+        assert!(!pre_tool_command_cancelled(&success));
+
+        let nonzero = run_hook_command("exit 9", Some(&cwd));
+        assert!(pre_tool_command_cancelled(&nonzero));
+
+        let missing_cwd = cwd.join("missing");
+        let runner_failure = run_hook_command("exit 0", Some(&missing_cwd));
+        assert!(runner_failure.is_err());
+        assert!(pre_tool_command_cancelled(&runner_failure));
+
+        std::fs::remove_dir_all(cwd).unwrap();
     }
 }
