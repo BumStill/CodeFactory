@@ -66,6 +66,8 @@ export interface Message {
   model_id?: string;
   input_tokens?: number;
   output_tokens?: number;
+  /** Serialized provider tool declarations on assistant messages. */
+  tool_calls?: string | null;
   created_at: number;
 }
 
@@ -373,6 +375,9 @@ export interface Settings {
     shell: string;
   };
   auto_create_pr: boolean;
+  /** Opt-in for sending a bounded, redacted post-mortem summary to the
+   * configured model after a session. Local deterministic mining is unaffected. */
+  remote_postmortem_enabled?: boolean;
   theme: Theme;
   font_family: string;
   font_size: number;

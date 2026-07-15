@@ -443,6 +443,7 @@ export function SettingsPage({ onBack }: Props) {
     default_model: string;
     shell: string;
     auto_create_pr: boolean;
+    remote_postmortem_enabled: boolean;
     reasoning_effort: Settings["reasoning_effort"];
   } | null>(null);
   const [generalSaved, setGeneralSaved] = useState(false);
@@ -475,6 +476,7 @@ export function SettingsPage({ onBack }: Props) {
       default_model: settings.default_model,
       shell: settings.shell.shell,
       auto_create_pr: (settings as Settings & { auto_create_pr?: boolean }).auto_create_pr ?? false,
+      remote_postmortem_enabled: settings.remote_postmortem_enabled ?? false,
       reasoning_effort: settings.reasoning_effort ?? "medium",
     });
   }, [settings]);
@@ -581,6 +583,7 @@ export function SettingsPage({ onBack }: Props) {
       ...settings,
       shell: { shell: generalDraft.shell },
       auto_create_pr: generalDraft.auto_create_pr,
+      remote_postmortem_enabled: generalDraft.remote_postmortem_enabled,
       reasoning_effort: generalDraft.reasoning_effort,
     } as Settings & { auto_create_pr: boolean });
 
@@ -776,6 +779,23 @@ export function SettingsPage({ onBack }: Props) {
                 <span className="block text-xs font-medium text-gray-200">实现完成后自动创建 PR</span>
                 <span className="block text-xs leading-5 text-gray-500">
                   当规格实现成功完成时自动创建一个拉取请求。
+                </span>
+              </span>
+            </label>
+
+            <label className="flex items-start gap-3 rounded-lg border border-border bg-surface-1 px-3 py-2.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={generalDraft.remote_postmortem_enabled}
+                onChange={(e) =>
+                  setGeneralDraft({ ...generalDraft, remote_postmortem_enabled: e.target.checked })
+                }
+                className="mt-0.5"
+              />
+              <span>
+                <span className="block text-xs font-medium text-gray-200">允许远程会话复盘</span>
+                <span className="block text-xs leading-5 text-gray-500">
+                  会话结束后，把有限、脱敏的摘要发送到当前配置的模型以生成候选。默认关闭；本地跨会话分析和进化审查不受影响。
                 </span>
               </span>
             </label>

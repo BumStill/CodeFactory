@@ -11,6 +11,7 @@ mod knowledge;
 mod mcp;
 mod openrouter;
 mod secrets;
+mod trajectory;
 mod storage;
 mod tools;
 mod util;
@@ -176,6 +177,10 @@ pub fn run() {
             commands::memory::write_project_memory,
             commands::memory::append_project_memory,
             commands::learning::list_learning_events,
+            commands::learning::list_evolution_jobs,
+            commands::learning::list_evolution_decision_jobs,
+            commands::learning::get_evolution_job,
+            commands::learning::list_evolution_job_events,
             commands::learning::accept_learning_event,
             commands::learning::reject_learning_event,
             commands::learning::run_postmortem,
@@ -184,6 +189,7 @@ pub fn run() {
             commands::learning::propose_tool_gates,
             commands::learning::apply_tool_gate,
             commands::preferences::list_user_preferences,
+            commands::preferences::get_effective_user_preference,
             commands::preferences::upsert_user_preference,
             commands::preferences::delete_user_preference,
             commands::interjections::queue_interjection,

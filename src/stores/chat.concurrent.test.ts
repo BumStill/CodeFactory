@@ -8,6 +8,7 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { useChatStore, activeRuntime, freshRuntime } from "./chat";
+import { useSettingsStore } from "./settings";
 import type { StreamEvent } from "../lib/tauri";
 
 // Capture each session's stream callback so we can simulate backend events
@@ -64,6 +65,7 @@ beforeEach(() => {
     _unlistenSessionUpdated: {},
     _streamingMsgId: {},
   });
+  useSettingsStore.setState({ settings: null });
 });
 
 describe("per-session streaming concurrency", () => {
@@ -111,5 +113,47 @@ describe("per-session streaming concurrency", () => {
     expect(activeRuntime(useChatStore.getState()).streaming).toBe(true); // A: active + streaming
     useChatStore.setState({ activeSession: B as never });
     expect(activeRuntime(useChatStore.getState()).streaming).toBe(false); // B: idle
+  });
+
+  it("keeps remote post-mortem off until the user explicitly opts in", async () => {
+    useChatStore.setState({
+      activeSession: A as never,
+      runtime: {
+        A: {
+          ...freshRuntime(),
+          messages: [{ id: "old", role: "user", content: "earlier", createdAt: 0 }],
+        },
+        B: freshRuntime(),
+      },
+    });
+
+    await useChatStore.getState().sendMessage("finish this", "A");
+    streamHandlers.A({ type: "done", input_tokens: 1, output_tokens: 2 });
+
+    expect(invokeMock).not.toHaveBeenCalledWith("run_postmortem", expect.anything());
+  });
+
+  it("runs the bounded remote post-mortem only after explicit opt-in", async () => {
+    useSettingsStore.setState({
+      settings: { remote_postmortem_enabled: true } as never,
+    });
+    useChatStore.setState({
+      activeSession: B as never,
+      runtime: {
+        A: freshRuntime(),
+        B: {
+          ...freshRuntime(),
+          messages: [{ id: "old", role: "user", content: "earlier", createdAt: 0 }],
+        },
+      },
+    });
+
+    await useChatStore.getState().sendMessage("finish this", "B");
+    streamHandlers.B({ type: "done", input_tokens: 1, output_tokens: 2 });
+
+    expect(invokeMock).toHaveBeenCalledWith("run_postmortem", {
+      sessionId: "B",
+      cwd: "/p/B",
+    });
   });
 });

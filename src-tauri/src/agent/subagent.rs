@@ -271,7 +271,7 @@ struct RunSummary {
 /// `path` arguments out of write/edit tool calls to compute `files_changed`.
 async fn summarize_run(pool: &SqlitePool, sub_session_id: &str) -> Result<RunSummary> {
     let messages = sqlx::query_as::<_, Message>(
-        "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+        "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
     )
     .bind(sub_session_id)
     .fetch_all(pool)

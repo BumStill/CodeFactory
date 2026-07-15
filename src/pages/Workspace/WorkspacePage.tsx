@@ -86,6 +86,8 @@ interface WorkspacePageProps {
   onOpenSettings: () => void;
   /** Switch the workspace to another session in-place (from the sidebar). */
   onOpenSession: (id: string) => void;
+  /** Open the human evolution review workbench, scoped to this project. */
+  onOpenEvolution?: (cwd: string) => void;
 }
 
 /**
@@ -98,7 +100,7 @@ interface WorkspacePageProps {
  *   Center — Execution stream (AI work in progress + chat input)
  *   Right  — Active skills + memory increments (transparency surface)
  */
-export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSettings, onOpenSession }: WorkspacePageProps) {
+export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSettings, onOpenSession, onOpenEvolution }: WorkspacePageProps) {
   const {
     activeSession,
     selectSession, sendOrQueue, cancelStream, removeFromQueue,
@@ -397,7 +399,15 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSetti
               onOpenHistory={() => setGitPanel("history")}
               onOpenRemote={() => setGitPanel("remote")}
             />
-            <ConnectorsColumn cwd={activeSession?.cwd ?? null} onOpenSkills={onOpenSkills} />
+            <ConnectorsColumn
+              cwd={activeSession?.cwd ?? null}
+              onOpenSkills={onOpenSkills}
+              onOpenEvolution={
+                activeSession?.kind !== "quick" && activeSession?.kind !== "anonymous"
+                  ? onOpenEvolution
+                  : undefined
+              }
+            />
             {/* ②-4 审核面:每次自主执行(及每条消息)前的检查点都在这里,
                 点「恢复」先看文件级 diff 再决定撤销;不撤即采纳。 */}
             <CheckpointsPanel sessionId={sessionId} />
@@ -1241,15 +1251,17 @@ const EMPTY_LEARNING: LearningEventForSelector[] = [];
 
 type LearningEventForSelector = ReturnType<typeof useLearningStore.getState>["events"][string][number];
 
-function ConnectorsColumn({ cwd, onOpenSkills }: { cwd: string | null; onOpenSkills: () => void }) {
+function ConnectorsColumn({ cwd, onOpenSkills, onOpenEvolution }: {
+  cwd: string | null;
+  onOpenSkills: () => void;
+  onOpenEvolution?: (cwd: string) => void;
+}) {
   const { skills, loadSkills } = useSkillsStore();
   const learningEvents = useLearningStore(
     (s) => (cwd ? s.events[cwd] ?? EMPTY_LEARNING : EMPTY_LEARNING),
   );
   const loadLearning = useLearningStore((s) => s.load);
   const subscribeLearning = useLearningStore((s) => s.subscribe);
-  const acceptLearning = useLearningStore((s) => s.accept);
-  const rejectLearning = useLearningStore((s) => s.reject);
 
   // Subscribe to learning events for the current cwd. The store dedups
   // multiple subscribe() calls per cwd so this is safe to remount.
@@ -1481,19 +1493,6 @@ function ConnectorsColumn({ cwd, onOpenSkills }: { cwd: string | null; onOpenSki
                     {e.observation}
                   </p>
                   <div className="flex items-center gap-1">
-                    <button
-                      onClick={() => cwd && void acceptLearning(e.id, cwd)}
-                      className="text-[9px] px-1.5 py-0.5 rounded bg-accent text-white hover:bg-accent-hover"
-                      title={e.kind === "preference" ? `更新偏好：${e.pref_key} = ${e.pref_value}` : "写入 memory.md"}
-                    >
-                      ✓ 采纳
-                    </button>
-                    <button
-                      onClick={() => cwd && void rejectLearning(e.id, cwd)}
-                      className="text-[9px] px-1.5 py-0.5 rounded text-gray-500 hover:bg-surface-3"
-                    >
-                      拒绝
-                    </button>
                     <span className="ml-auto text-[8px] text-gray-600">
                       {e.kind === "preference" ? "偏好" : "记忆"}
                     </span>
@@ -1502,8 +1501,7 @@ function ConnectorsColumn({ cwd, onOpenSkills }: { cwd: string | null; onOpenSki
               ))}
             {learningEvents.filter((e) => e.status === "pending").length > 5 && (
               <li className="text-[9px] text-gray-600 text-center pt-1">
-                还有 {learningEvents.filter((e) => e.status === "pending").length - 5} 条，
-                到「我的画像 → 学习日志」全部审批
+                还有 {learningEvents.filter((e) => e.status === "pending").length - 5} 条待审
               </li>
             )}
             {learningEvents.filter((e) => e.status === "pending").length === 0 && (
@@ -1513,6 +1511,15 @@ function ConnectorsColumn({ cwd, onOpenSkills }: { cwd: string | null; onOpenSki
               </li>
             )}
           </ul>
+        )}
+        {cwd && learningEvents.some((e) => e.status === "pending") && (
+          <button
+            onClick={() => onOpenEvolution?.(cwd)}
+            disabled={!onOpenEvolution}
+            className="mt-2 w-full rounded border border-accent/40 bg-accent/5 px-2 py-1.5 text-[10px] text-accent transition-colors hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            打开当前项目的进化审查
+          </button>
         )}
       </div>
     </>

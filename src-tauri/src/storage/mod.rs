@@ -49,11 +49,9 @@ pub struct Message {
     pub created_at: i64,
 }
 
-// Scaffolding: typed `FromRow` model for the `tool_calls` table
-// (migrations/0001_init.sql, fields match 1:1). Tool calls are presently stored
-// as a JSON blob on `Message` and read back via ad-hoc tuples in
-// commands/evidence.rs; this typed row is kept for when persistence moves to the
-// normalized table.
+// Typed `FromRow` model for the normalized tool lifecycle truth source.
+// `messages.tool_calls` remains as a redacted provider-history representation;
+// extraction, evidence, and cross-session analysis read this table instead.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ToolCallRecord {

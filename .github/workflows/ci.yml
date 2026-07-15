@@ -45,6 +45,19 @@ jobs:
       - name: Vitest
         run: pnpm test
 
+      - name: Evolution workbench headless viewport gate
+        run: pnpm test:evolution:headless
+        env:
+          CODEFACTORY_EVOLUTION_ARTIFACT_DIR: ${{ runner.temp }}/codefactory-evolution-headless
+
+      - name: Upload evolution viewport evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evolution-workbench-headless-${{ runner.os }}
+          path: ${{ runner.temp }}/codefactory-evolution-headless
+          if-no-files-found: error
+
       - name: Cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml
 

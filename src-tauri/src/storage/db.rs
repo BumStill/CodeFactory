@@ -1,5 +1,143 @@
 // SPDX-License-Identifier: Apache-2.0
+use chrono::Utc;
 use sqlx::{migrate::MigrateDatabase, sqlite::SqlitePoolOptions, Row, SqlitePool};
+
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    // Signal 0 performs a liveness/permission check without delivering a
+    // signal. EPERM still proves that the process exists.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return match GetLastError() {
+                ERROR_INVALID_PARAMETER => false,
+                ERROR_ACCESS_DENIED => true,
+                // Unknown inspection failures must not cause a live owner to
+                // be killed. A later startup can retry the liveness check.
+                _ => true,
+            };
+        }
+        let mut exit_code = 0;
+        let alive = GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE;
+        CloseHandle(handle);
+        alive
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_process_alive(_pid: u32) -> bool {
+    // Conservative fallback: never close an owner we cannot inspect.
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_token(pid: u32) -> Option<String> {
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (read == size).then(|| format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_token(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = stat.rsplit_once(')')?.1.trim();
+    // /proc/<pid>/stat field 22 is the process start time. `after_name`
+    // begins at field 3 (state), so the zero-based offset is 19.
+    after_name.split_whitespace().nth(19).map(str::to_string)
+}
+
+#[cfg(windows)]
+fn process_start_token(pid: u32) -> Option<String> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn GetProcessTimes(
+            process: *mut c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = FileTime { low: 0, high: 0 };
+        let mut exit = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0;
+        CloseHandle(handle);
+        ok.then(|| (((creation.high as u64) << 32) | creation.low as u64).to_string())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn process_start_token(_pid: u32) -> Option<String> {
+    None
+}
+
+pub(crate) fn current_process_start_token() -> Option<String> {
+    process_start_token(std::process::id())
+}
+
+fn process_identity_is_live(pid: u32, expected_start_token: Option<&str>) -> bool {
+    if !is_process_alive(pid) {
+        return false;
+    }
+    match expected_start_token {
+        Some(expected) => process_start_token(pid)
+            .map(|actual| actual == expected)
+            // Inspection failure is not proof that an owner is dead.
+            .unwrap_or(true),
+        // Legacy jobs predate process identity tokens. Preserve their original
+        // conservative PID-only behavior instead of killing a possibly live job.
+        None => true,
+    }
+}
 
 pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
     if !sqlx::Sqlite::database_exists(db_path)
@@ -104,6 +242,31 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         .execute(pool)
         .await?;
 
+    // CF-EVO-R1: normalized tool lifecycle is the observation truth source.
+    // Historic databases may only have messages.tool_calls JSON, so create
+    // the table idempotently instead of trusting a migration version slot.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS tool_calls (
+            id          TEXT PRIMARY KEY,
+            message_id  TEXT NOT NULL,
+            tool_name   TEXT NOT NULL,
+            arguments   TEXT NOT NULL DEFAULT '{}',
+            result      TEXT,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            error       TEXT,
+            duration_ms INTEGER,
+            created_at  INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_tool_calls_status ON tool_calls(status)")
+        .execute(pool)
+        .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS task_dependencies (
             task_id            TEXT NOT NULL,
@@ -182,6 +345,147 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     //    Per-session post-mortem rows leave support_count = 0.
     ensure_column(pool, "learning_events", "support_count", "INTEGER NOT NULL DEFAULT 0").await?;
     ensure_column(pool, "learning_events", "evidence_json", "TEXT NOT NULL DEFAULT '{}'").await?;
+    // Evolution workbench: keep learning_events as the backward-compatible
+    // candidate source of truth and attach newly mined candidates to the job
+    // that produced them. Legacy rows intentionally remain NULL.
+    ensure_column(pool, "learning_events", "job_id", "TEXT").await?;
+
+    // A deliberately small local job ledger. It records real analysis and
+    // review/materialization executions without introducing a workflow engine.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_jobs (
+            id                  TEXT PRIMARY KEY,
+            cwd                 TEXT NOT NULL,
+            trigger             TEXT NOT NULL,
+            candidate_id        TEXT,
+            status              TEXT NOT NULL,
+            idempotency_key     TEXT,
+            input_session_count INTEGER NOT NULL DEFAULT 0,
+            input_trace_count   INTEGER NOT NULL DEFAULT 0,
+            candidate_count     INTEGER NOT NULL DEFAULT 0,
+            started_at          TEXT NOT NULL,
+            completed_at        TEXT,
+            error               TEXT,
+            owner_pid           INTEGER,
+            owner_start_token   TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    ensure_column(pool, "evolution_jobs", "owner_pid", "INTEGER").await?;
+    ensure_column(pool, "evolution_jobs", "owner_start_token", "TEXT").await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_evolution_jobs_cwd_started \
+         ON evolution_jobs(cwd, started_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_evolution_jobs_candidate_started \
+         ON evolution_jobs(candidate_id, started_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_evolution_jobs_idempotency \
+         ON evolution_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
+
+    // Append-only structured nodes. detail_json is constrained by command code
+    // to redacted aggregate metadata; raw prompts, reasoning and traces do not
+    // belong in this table.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS evolution_job_events (
+            id           TEXT PRIMARY KEY,
+            cwd          TEXT NOT NULL,
+            job_id       TEXT NOT NULL,
+            candidate_id TEXT,
+            stage        TEXT NOT NULL,
+            status       TEXT NOT NULL,
+            title        TEXT NOT NULL,
+            detail_json  TEXT NOT NULL DEFAULT '{}',
+            created_at   TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_evolution_job_events_cwd_job_created \
+         ON evolution_job_events(cwd, job_id, created_at)",
+    )
+    .execute(pool)
+    .await?;
+
+    // Jobs execute in-process today. PID plus process-start token is the owner
+    // identity: the token prevents PID reuse from making an interrupted job
+    // look live. Another CodeFactory process may share this SQLite database.
+    let running_jobs: Vec<(String, String, Option<String>, Option<i64>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, cwd, candidate_id, owner_pid, owner_start_token FROM evolution_jobs
+         WHERE status IN ('queued', 'running')",
+        )
+        .fetch_all(pool)
+        .await?;
+    let interrupted_jobs: Vec<_> = running_jobs
+        .into_iter()
+        .filter(|(_, _, _, owner_pid, owner_start_token)| {
+            match owner_pid.and_then(|pid| u32::try_from(pid).ok()) {
+                Some(pid) => !process_identity_is_live(pid, owner_start_token.as_deref()),
+                None => true,
+            }
+        })
+        .collect();
+    let interrupted_at = Utc::now().to_rfc3339();
+    let mut recovery = pool.begin().await?;
+    for (job_id, cwd, candidate_id, _, _) in interrupted_jobs {
+        sqlx::query(
+            "INSERT INTO evolution_job_events
+             (id, cwd, job_id, candidate_id, stage, status, title, detail_json, created_at)
+             VALUES (?, ?, ?, ?, 'job', 'failed', '应用重启，作业未完成',
+                     '{\"schema_version\":1,\"reason\":\"process_restart\"}', ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&cwd)
+        .bind(&job_id)
+        .bind(candidate_id)
+        .bind(&interrupted_at)
+        .execute(&mut *recovery)
+        .await?;
+        sqlx::query(
+            "UPDATE evolution_jobs
+             SET status='failed', completed_at=?, error='应用在作业完成前中断，请重新运行'
+             WHERE id=? AND status IN ('queued', 'running')",
+        )
+        .bind(&interrupted_at)
+        .bind(&job_id)
+        .execute(&mut *recovery)
+        .await?;
+    }
+    recovery.commit().await?;
+    // Only one accept/reject command may own a candidate at a time, including
+    // across two desktop processes sharing the same local SQLite database.
+    // Recovery runs first so stale owners from a previous process do not block
+    // creation of the partial unique index.
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_evolution_jobs_candidate_running \
+         ON evolution_jobs(candidate_id) \
+         WHERE candidate_id IS NOT NULL AND status = 'running'",
+    )
+    .execute(pool)
+    .await?;
+    // A project may have one active local analysis at a time. This prevents
+    // two app processes from mining the same evolving scope concurrently;
+    // it is not a claim of analysis-window idempotency.
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_evolution_jobs_scope_analysis_running \
+         ON evolution_jobs(cwd) \
+         WHERE trigger = 'cross_session' AND status = 'running'",
+    )
+    .execute(pool)
+    .await?;
+
     // 'project' (default) for full software-factory sessions, 'quick' for
     // ephemeral one-off chats launched from the home page's Quick Task entry.
     // List-sessions excludes 'quick' from the Recent Projects card.
@@ -366,8 +670,12 @@ mod tests {
             "knowledge_documents",
             "knowledge_chunks",
             "retrieval_events",
+            "tool_calls",
             "benchmark_runs",
             "benchmark_trials",
+            "learning_events",
+            "evolution_jobs",
+            "evolution_job_events",
         ] {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
@@ -388,5 +696,247 @@ mod tests {
             task_cols.contains(&"task_context_json".to_string()),
             "task_runs must persist connector context for task execution evidence. Got: {task_cols:?}"
         );
+
+        let tool_cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('tool_calls')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        for expected in ["arguments", "result", "status", "error", "duration_ms"] {
+            assert!(
+                tool_cols.contains(&expected.to_string()),
+                "tool_calls must expose {expected}. Got: {tool_cols:?}"
+            );
+        }
+        let learning_cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('learning_events')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(learning_cols.contains(&"job_id".to_string()));
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_adds_evolution_jobs_without_rewriting_legacy_learnings() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE messages (id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE learning_events (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, cwd TEXT NOT NULL,
+                observation TEXT NOT NULL, suggestion TEXT NOT NULL, status TEXT NOT NULL,
+                created_at TEXT NOT NULL, decided_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO learning_events
+             (id, session_id, cwd, observation, suggestion, status, created_at)
+             VALUES ('legacy', 's1', '/proj', 'obs', 'sug', 'accepted', '2026-07-15')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+
+        let learning_cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('learning_events')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            learning_cols.contains(&"job_id".to_string()),
+            "legacy learning_events must gain nullable job_id: {learning_cols:?}"
+        );
+        for table in ["evolution_jobs", "evolution_job_events"] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(exists, 1, "ensure_schema must create {table}");
+        }
+        let legacy: (String, Option<String>) =
+            sqlx::query_as("SELECT status, job_id FROM learning_events WHERE id='legacy'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(legacy, ("accepted".into(), None));
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_closes_in_process_jobs_interrupted_by_restart() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE messages (id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        ensure_schema(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO evolution_jobs (id, cwd, trigger, status, started_at)
+             VALUES ('interrupted', '/proj', 'cross_session', 'running', '2026-07-15')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+
+        let job: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, completed_at, error FROM evolution_jobs WHERE id='interrupted'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(job.0, "failed");
+        assert!(job.1.is_some());
+        assert_eq!(job.2.as_deref(), Some("应用在作业完成前中断，请重新运行"));
+        let event: (String, String, String) = sqlx::query_as(
+            "SELECT stage, status, detail_json FROM evolution_job_events
+             WHERE job_id='interrupted' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((event.0.as_str(), event.1.as_str()), ("job", "failed"));
+        assert!(event.2.contains("process_restart"));
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_does_not_interrupt_a_job_owned_by_this_live_process() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE messages (id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        ensure_schema(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO evolution_jobs
+             (id, cwd, trigger, status, owner_pid, owner_start_token, started_at)
+             VALUES ('live-owner', '/proj', 'cross_session', 'running', ?, ?, '2026-07-15')",
+        )
+        .bind(std::process::id() as i64)
+        .bind(current_process_start_token())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM evolution_jobs WHERE id='live-owner'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "running");
+        let recovery_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM evolution_job_events
+             WHERE job_id='live-owner' AND detail_json LIKE '%process_restart%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recovery_events, 0);
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_closes_a_job_when_pid_was_reused() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE messages (id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        ensure_schema(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO evolution_jobs
+             (id, cwd, trigger, status, owner_pid, owner_start_token, started_at)
+             VALUES ('reused-pid', '/proj', 'cross_session', 'running', ?, 'not-the-current-process', '2026-07-15')",
+        )
+        .bind(std::process::id() as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM evolution_jobs WHERE id='reused-pid'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn ensure_schema_closes_a_job_owned_by_a_real_dead_process() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE messages (id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        ensure_schema(&pool).await.unwrap();
+
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 0.1"])
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 2 127.0.0.1 >NUL"])
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let child_start_token = process_start_token(child_pid)
+            .expect("supported platforms must expose a process start token");
+        child.wait().unwrap();
+
+        sqlx::query(
+            "INSERT INTO evolution_jobs
+             (id, cwd, trigger, status, owner_pid, owner_start_token, started_at)
+             VALUES ('dead-owner', '/proj', 'cross_session', 'running', ?, ?, '2026-07-15')",
+        )
+        .bind(child_pid as i64)
+        .bind(child_start_token)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM evolution_jobs WHERE id='dead-owner'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
     }
 }

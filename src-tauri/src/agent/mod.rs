@@ -527,7 +527,9 @@ impl AgentLoop {
             .map(|message| message.content.clone())
             .unwrap_or_default();
         let mut messages = self.build_openai_messages(history, system_prompt);
-        let hook_runner = {
+        let hook_runner = if self.anonymous {
+            hooks::HookRunner::disabled(self.app.clone())
+        } else {
             let settings = self.settings.read().await;
             hooks::HookRunner::from_settings(&settings, self.app.clone())
         };
@@ -619,19 +621,36 @@ impl AgentLoop {
             // Persist assistant turn — include tool_calls AND reasoning_content
             // so history reconstructs faithfully. Reasoning replay is required
             // by DeepSeek's reasoner family.
-            if !text.is_empty() || !tool_calls.is_empty() || reasoning.is_some() {
-                self.persist_message(
-                    "assistant",
-                    &text,
-                    usage.as_ref(),
-                    if tool_calls.is_empty() {
-                        None
-                    } else {
-                        Some(&tool_calls)
-                    },
-                    reasoning.as_deref(),
-                )
-                .await?;
+            let assistant_message_id =
+                if !text.is_empty() || !tool_calls.is_empty() || reasoning.is_some() {
+                    self.persist_message(
+                        "assistant",
+                        &text,
+                        usage.as_ref(),
+                        if tool_calls.is_empty() {
+                            None
+                        } else {
+                            Some(&tool_calls)
+                        },
+                        reasoning.as_deref(),
+                    )
+                    .await?
+                } else {
+                    None
+                };
+            if let Some(message_id) = assistant_message_id.as_deref() {
+                for tc in &tool_calls {
+                    let args = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                    crate::trajectory::record_tool_call_started(
+                        &self.db,
+                        &self.session_id,
+                        message_id,
+                        &tc.id,
+                        &tc.function.name,
+                        &args,
+                    )
+                    .await?;
+                }
             }
 
             if tool_calls.is_empty() {
@@ -774,6 +793,8 @@ impl AgentLoop {
                 };
 
                 if let Some(content) = denial_content {
+                    self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
+                        .await?;
                     self.app
                         .emit(
                             &event_name,
@@ -804,6 +825,8 @@ impl AgentLoop {
                     .await;
                 if !pre_allowed {
                     let content = "Tool call cancelled by hook.".to_string();
+                    self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
+                        .await?;
                     self.app
                         .emit(
                             &event_name,
@@ -843,19 +866,50 @@ impl AgentLoop {
                 let tool_start = std::time::Instant::now();
                 // Check if this is an MCP tool
                 let mcp_server = self.mcp_manager.find_tool_server(&tc.function.name).await;
-                let output = if let Some(server_id) = mcp_server {
+                let output_result = if let Some(server_id) = mcp_server {
                     match self
                         .mcp_manager
                         .call_tool(&server_id, &tc.function.name, args)
                         .await
                     {
-                        Ok(text) => tools::ToolOutput::ok(text),
-                        Err(e) => tools::ToolOutput::err(format!("MCP error: {e}")),
+                        Ok(text) => Ok(tools::ToolOutput::ok(text)),
+                        Err(e) => Ok(tools::ToolOutput::err(format!("MCP error: {e}"))),
                     }
                 } else {
-                    tools::dispatch(&tc.function.name, args, &ctx).await?
+                    tools::dispatch(&tc.function.name, args, &ctx).await
                 };
                 let duration_ms = tool_start.elapsed().as_millis() as u64;
+                let output = match output_result {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        self.record_tool_call_outcome(
+                            tc,
+                            "error",
+                            None,
+                            Some(&error_text),
+                            duration_ms,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
+                self.record_tool_call_outcome(
+                    tc,
+                    if output.is_error { "error" } else { "done" },
+                    if output.is_error {
+                        None
+                    } else {
+                        Some(&output.content)
+                    },
+                    if output.is_error {
+                        Some(&output.content)
+                    } else {
+                        None
+                    },
+                    duration_ms,
+                )
+                .await?;
 
                 if let Some(prompt) = record_completion_outcome(
                     &mut completion_gate,
@@ -887,30 +941,6 @@ impl AgentLoop {
                         },
                     )
                     .ok();
-
-                // Persist the tool result — skipped entirely for anonymous runs.
-                // The in-memory `result_messages` push below still carries it
-                // through this turn so the model sees the tool output.
-                if !self.anonymous {
-                    let now = Utc::now().timestamp_millis();
-                    let msg_id = Uuid::new_v4().to_string();
-                    let tool_content = serde_json::json!({
-                        "tool_call_id": tc.id,
-                        "content": output.content
-                    })
-                    .to_string();
-
-                    sqlx::query(
-                        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-                    )
-                    .bind(&msg_id)
-                    .bind(&self.session_id)
-                    .bind("tool")
-                    .bind(&tool_content)
-                    .bind(now)
-                    .execute(&self.db)
-                    .await?;
-                }
 
                 result_messages.push(ChatMessage {
                     role: "tool".into(),
@@ -1550,19 +1580,22 @@ impl AgentLoop {
         usage: Option<&Usage>,
         tool_calls: Option<&[ToolCall]>,
         reasoning_content: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         // Anonymous runs never touch the DB — the assistant turn lives only in
         // the in-memory `messages` vec for the rest of this run.
         if self.anonymous {
-            return Ok(());
+            return Ok(None);
         }
         let msg_id = Uuid::new_v4().to_string();
         let now = Utc::now().timestamp_millis();
         let input_tok = usage.map(|u| u.prompt_tokens as i64);
         let output_tok = usage.map(|u| u.completion_tokens as i64);
+        let persisted_content = crate::trajectory::redact_derived_message_for_storage(content);
+        let persisted_reasoning =
+            reasoning_content.map(crate::trajectory::redact_derived_message_for_storage);
         let tool_calls_json = tool_calls
             .filter(|tcs| !tcs.is_empty())
-            .map(|tcs| serde_json::to_string(tcs).unwrap_or_default());
+            .map(|tcs| crate::trajectory::redact_tool_calls_for_storage(tcs).unwrap_or_default());
 
         sqlx::query(
             "INSERT INTO messages (id, session_id, role, content, input_tokens, output_tokens, tool_calls, reasoning_content, created_at) \
@@ -1571,15 +1604,38 @@ impl AgentLoop {
         .bind(&msg_id)
         .bind(&self.session_id)
         .bind(role)
-        .bind(content)
+        .bind(persisted_content)
         .bind(input_tok)
         .bind(output_tok)
         .bind(tool_calls_json)
-        .bind(reasoning_content)
+        .bind(persisted_reasoning)
         .bind(now)
         .execute(&self.db)
         .await?;
-        Ok(())
+        Ok(Some(msg_id))
+    }
+
+    async fn record_tool_call_outcome(
+        &self,
+        tool_call: &ToolCall,
+        status: &str,
+        result: Option<&str>,
+        error: Option<&str>,
+        duration_ms: u64,
+    ) -> Result<()> {
+        if self.anonymous {
+            return Ok(());
+        }
+        crate::trajectory::record_terminal_tool_outcome(
+            &self.db,
+            &self.session_id,
+            &tool_call.id,
+            status,
+            result,
+            error,
+            duration_ms.min(i64::MAX as u64) as i64,
+        )
+        .await
     }
 
     fn build_openai_messages(
@@ -1742,7 +1798,9 @@ impl AgentLoop {
             .map(|message| message.content.clone())
             .unwrap_or_default();
         let mut messages = self.build_anthropic_messages(history);
-        let hook_runner = {
+        let hook_runner = if self.anonymous {
+            hooks::HookRunner::disabled(self.app.clone())
+        } else {
             let settings = self.settings.read().await;
             hooks::HookRunner::from_settings(&settings, self.app.clone())
         };
@@ -1823,7 +1881,7 @@ impl AgentLoop {
             // Persist assistant turn (Anthropic path — no separate reasoning
             // stream; Claude's extended thinking goes via the same `content`
             // for tool use turns)
-            if !text.is_empty() || !tool_calls.is_empty() {
+            let assistant_message_id = if !text.is_empty() || !tool_calls.is_empty() {
                 self.persist_message(
                     "assistant",
                     &text,
@@ -1835,7 +1893,23 @@ impl AgentLoop {
                     },
                     None,
                 )
-                .await?;
+                .await?
+            } else {
+                None
+            };
+            if let Some(message_id) = assistant_message_id.as_deref() {
+                for tc in &tool_calls {
+                    let args = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                    crate::trajectory::record_tool_call_started(
+                        &self.db,
+                        &self.session_id,
+                        message_id,
+                        &tc.id,
+                        &tc.function.name,
+                        &args,
+                    )
+                    .await?;
+                }
             }
 
             if tool_calls.is_empty() {
@@ -1917,6 +1991,17 @@ impl AgentLoop {
                     serde_json::from_str(&tc.function.arguments).unwrap_or_default();
                 let completion_args = args.clone();
 
+                self.app
+                    .emit(
+                        event_name,
+                        StreamEvent::ToolCallStart {
+                            id: tc.id.clone(),
+                            name: tc.function.name.clone(),
+                            args: args.clone(),
+                        },
+                    )
+                    .ok();
+
                 let bash_cmd = if tc.function.name == "bash" {
                     args.get("command")
                         .and_then(|v| v.as_str())
@@ -1972,6 +2057,8 @@ impl AgentLoop {
                 };
 
                 if let Some(content) = denial_content {
+                    self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
+                        .await?;
                     self.app
                         .emit(
                             event_name,
@@ -1999,6 +2086,8 @@ impl AgentLoop {
                     .await;
                 if !pre_allowed {
                     let content = "Tool call cancelled by hook.".to_string();
+                    self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
+                        .await?;
                     self.app
                         .emit(
                             event_name,
@@ -2035,19 +2124,50 @@ impl AgentLoop {
                 let tool_start = std::time::Instant::now();
                 // Check if this is an MCP tool
                 let mcp_server = self.mcp_manager.find_tool_server(&tc.function.name).await;
-                let output = if let Some(server_id) = mcp_server {
+                let output_result = if let Some(server_id) = mcp_server {
                     match self
                         .mcp_manager
                         .call_tool(&server_id, &tc.function.name, args)
                         .await
                     {
-                        Ok(text) => tools::ToolOutput::ok(text),
-                        Err(e) => tools::ToolOutput::err(format!("MCP error: {e}")),
+                        Ok(text) => Ok(tools::ToolOutput::ok(text)),
+                        Err(e) => Ok(tools::ToolOutput::err(format!("MCP error: {e}"))),
                     }
                 } else {
-                    tools::dispatch(&tc.function.name, args, &ctx).await?
+                    tools::dispatch(&tc.function.name, args, &ctx).await
                 };
                 let duration_ms = tool_start.elapsed().as_millis() as u64;
+                let output = match output_result {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        self.record_tool_call_outcome(
+                            tc,
+                            "error",
+                            None,
+                            Some(&error_text),
+                            duration_ms,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
+                self.record_tool_call_outcome(
+                    tc,
+                    if output.is_error { "error" } else { "done" },
+                    if output.is_error {
+                        None
+                    } else {
+                        Some(&output.content)
+                    },
+                    if output.is_error {
+                        Some(&output.content)
+                    } else {
+                        None
+                    },
+                    duration_ms,
+                )
+                .await?;
 
                 if let Some(prompt) = record_completion_outcome(
                     &mut completion_gate,
@@ -2079,29 +2199,6 @@ impl AgentLoop {
                         },
                     )
                     .ok();
-
-                // Persist tool result to DB — skipped for anonymous runs; the
-                // in-memory `tool_result_blocks` below still feeds it back to
-                // the model this turn.
-                if !self.anonymous {
-                    let now = Utc::now().timestamp_millis();
-                    let msg_id = Uuid::new_v4().to_string();
-                    let tool_content = serde_json::json!({
-                        "tool_call_id": tc.id,
-                        "content": output.content
-                    })
-                    .to_string();
-                    sqlx::query(
-                        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-                    )
-                    .bind(&msg_id)
-                    .bind(&self.session_id)
-                    .bind("tool")
-                    .bind(&tool_content)
-                    .bind(now)
-                    .execute(&self.db)
-                    .await?;
-                }
 
                 tool_result_blocks.push(serde_json::json!({
                     "type": "tool_result",

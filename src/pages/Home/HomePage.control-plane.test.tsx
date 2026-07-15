@@ -10,11 +10,22 @@ const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
   listQuickSessions: vi.fn(),
   createQuickSession: vi.fn(),
+  loadLearning: vi.fn(async () => {}),
 }));
 
 vi.mock("../../stores/chat", () => ({
   useChatStore: () => ({
-    sessions: [],
+    sessions: [{
+      id: "project-1",
+      title: "Project",
+      cwd: "/proj",
+      model_id: "test",
+      created_at: 1,
+      updated_at: 2,
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      kind: "project",
+    }],
     loadSessions: mocks.loadSessions,
     createSession: mocks.createSession,
     activeModel: "anthropic/claude-opus-4-7",
@@ -25,6 +36,15 @@ vi.mock("../../stores/settings", () => ({
   useSettingsStore: () => ({
     settings: { theme: "dark" },
     setTheme: mocks.setTheme,
+  }),
+}));
+
+vi.mock("../../stores/learning", () => ({
+  useLearningStore: (selector: (state: unknown) => unknown) => selector({
+    events: {
+      "/proj": [{ id: "candidate-1", status: "pending" }],
+    },
+    load: mocks.loadLearning,
   }),
 }));
 
@@ -49,6 +69,7 @@ describe("HomePage AI Coding OS entry", () => {
     mocks.listQuickSessions.mockReset();
     mocks.listQuickSessions.mockResolvedValue([]);
     mocks.createQuickSession.mockReset();
+    mocks.loadLearning.mockClear();
   });
 
   it("opens the control plane from the top bar", async () => {
@@ -62,6 +83,7 @@ describe("HomePage AI Coding OS entry", () => {
         onOpenBenchmarks={() => {}}
         onOpenSettings={() => {}}
         onOpenProfile={() => {}}
+        onOpenEvolution={() => {}}
       />,
     );
 
@@ -81,11 +103,33 @@ describe("HomePage AI Coding OS entry", () => {
         onOpenBenchmarks={onOpenBenchmarks}
         onOpenSettings={() => {}}
         onOpenProfile={() => {}}
+        onOpenEvolution={() => {}}
       />,
     );
 
     await userEvent.click(screen.getByRole("button", { name: /能力评测/ }));
 
     expect(onOpenBenchmarks).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the explicit evolution review workbench from the primary entries", async () => {
+    const onOpenEvolution = vi.fn();
+
+    render(
+      <HomePage
+        onOpenProject={() => {}}
+        onOpenSkills={() => {}}
+        onOpenControlPlane={() => {}}
+        onOpenBenchmarks={() => {}}
+        onOpenSettings={() => {}}
+        onOpenProfile={() => {}}
+        onOpenEvolution={onOpenEvolution}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /进化审查/ }));
+
+    expect(onOpenEvolution).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("1 待审")).toBeInTheDocument();
   });
 });

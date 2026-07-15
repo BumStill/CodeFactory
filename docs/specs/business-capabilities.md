@@ -57,3 +57,10 @@
 - Git timeout、Git unavailable、非 Git 目录和普通 probe failure 必须分开归因。
 - 单个 Git probe 失败时继续返回 Authority、Memory、Capabilities、filesystem delivery fields 和其他可用 Git 字段。
 - 用户能看到 partial risk，并在 Git 恢复后通过刷新回到完整快照。
+
+## C11 Session 驱动的持续改进
+- 持久 session 的真实工具生命周期必须进入规范化、脱敏的本地轨迹；anonymous session 不进入 DB、学习或 hooks。
+- 普通聊天、Quick Task 和任务调度都要有与各自 route 匹配的 post-mortem 输入，不能用空 `task_runs` 冒充“没有信号”。
+- Session 信号先形成待审候选；知识、Skill、工具策略、Evals 和产品代码使用不同人工门禁。
+- 首期复用 Tauri + SQLite，不引入独立遥测平台；完整状态机见 `feature-specs/evolution-agent-closed-loop.md`。
+- Evals 只能降低已覆盖场景的回归风险，不承诺“只进不退”，也不能自动放行发布。
