@@ -469,6 +469,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // it stops between rounds, never mid tool-call. Scoped to THIS chat session
     // only; it never affects the task scheduler / long task runs.
     void invoke("cancel_chat", { sessionId: id });
+    drainNextQueuedMessage(id, set, get);
   },
 
   respondPermission: async (allow) => {
@@ -536,6 +537,30 @@ const POSTMORTEM_THROTTLE_MS = 5 * 60 * 1000;
 const POSTMORTEM_MIN_MESSAGES = 3;
 const _lastPostmortemAt: Record<string, number> = {};
 
+function drainNextQueuedMessage(
+  sessionId: string,
+  set: (fn: (s: ChatStore) => Partial<ChatStore>) => void,
+  get: () => ChatStore,
+): boolean {
+  const next = get().runtime[sessionId]?.queue[0];
+  if (!next) return false;
+
+  set((s) => {
+    const prev = s.runtime[sessionId];
+    if (!prev) return {};
+    return {
+      runtime: {
+        ...s.runtime,
+        [sessionId]: { ...prev, queue: prev.queue.filter((q) => q.id !== next.id) },
+      },
+    };
+  });
+  setTimeout(() => {
+    void get().sendMessage(next.content, sessionId);
+  }, 0);
+  return true;
+}
+
 function handleStreamEvent(
   event: StreamEvent,
   sessionId: string,
@@ -556,21 +581,7 @@ function handleStreamEvent(
   // just-completed send's React state settles before we re-enter.
   const nowStreaming = get().runtime[sessionId]?.streaming ?? false;
   if (wasStreaming && !nowStreaming) {
-    const next = get().runtime[sessionId]?.queue[0];
-    if (next) {
-      set((s) => {
-        const prev = s.runtime[sessionId];
-        if (!prev) return {};
-        return {
-          runtime: {
-            ...s.runtime,
-            [sessionId]: { ...prev, queue: prev.queue.filter((q) => q.id !== next.id) },
-          },
-        };
-      });
-      setTimeout(() => {
-        void get().sendMessage(next.content, sessionId);
-      }, 0);
+    if (drainNextQueuedMessage(sessionId, set, get)) {
       return; // more conversation coming — defer post-mortem
     }
 

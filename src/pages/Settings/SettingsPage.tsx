@@ -986,6 +986,7 @@ function HooksTab() {
         <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">钩子</h2>
         <button
           onClick={() => setAddOpen(true)}
+          aria-label="打开添加钩子表单"
           className="flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 border border-border transition-colors"
         >
           <Plus size={11} /> 添加钩子
@@ -1001,6 +1002,7 @@ function HooksTab() {
             <span className="text-[10px] bg-surface-3 text-gray-500 px-1.5 py-0.5 rounded">{hook.event}</span>
             <button
               onClick={() => handleToggle(hook)}
+              aria-label={`${hook.enabled ? "禁用" : "启用"}钩子 ${hook.name}`}
               className={`text-[10px] px-1.5 py-0.5 rounded transition-colors ${
                 hook.enabled ? "bg-accent/20 text-accent" : "bg-surface-3 text-gray-600"
               }`}
@@ -1009,12 +1011,14 @@ function HooksTab() {
             </button>
             <button
               onClick={() => handleTest(hook.id)}
+              aria-label={`测试钩子 ${hook.name}`}
               className="text-[10px] text-gray-600 hover:text-gray-300 px-1.5 py-0.5 rounded hover:bg-surface-3 transition-colors"
             >
               测试
             </button>
             <button
               onClick={() => handleDelete(hook.id)}
+              aria-label={`删除钩子 ${hook.name}`}
               className="text-[10px] text-red-700 hover:text-red-400 px-1.5 py-0.5 rounded transition-colors"
             >
               <Trash2 size={10} />
@@ -1083,31 +1087,31 @@ function AddHookForm({ onAdded, onCancel }: { onAdded: () => void; onCancel: () 
       <div className="grid grid-cols-2 gap-2">
         <div>
           <label className="block text-[10px] text-gray-500 mb-0.5">名称</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="我的钩子"
+          <input aria-label="名称" value={name} onChange={(e) => setName(e.target.value)} placeholder="我的钩子"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
         <div>
           <label className="block text-[10px] text-gray-500 mb-0.5">事件</label>
-          <select value={event} onChange={(e) => setEvent(e.target.value)}
+          <select aria-label="事件" value={event} onChange={(e) => setEvent(e.target.value)}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none">
             {HOOK_EVENTS.map((ev) => <option key={ev} value={ev}>{ev}</option>)}
           </select>
         </div>
         <div>
           <label className="block text-[10px] text-gray-500 mb-0.5">动作类型</label>
-          <select value={actionType} onChange={(e) => setActionType(e.target.value as HookActionType)}
+          <select aria-label="动作类型" value={actionType} onChange={(e) => setActionType(e.target.value as HookActionType)}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none">
             {HOOK_ACTIONS.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
           </select>
         </div>
         <div>
           <label className="block text-[10px] text-gray-500 mb-0.5">过滤器(可选)</label>
-          <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="例如 bash"
+          <input aria-label="过滤器(可选)" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="例如 bash"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
         <div className="col-span-2">
           <label className="block text-[10px] text-gray-500 mb-0.5">{currentAction?.label ?? "参数"}</label>
-          <input value={actionParam} onChange={(e) => setActionParam(e.target.value)}
+          <input aria-label={currentAction?.label ?? "参数"} value={actionParam} onChange={(e) => setActionParam(e.target.value)}
             placeholder={currentAction?.placeholder ?? ""}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
@@ -1154,6 +1158,7 @@ function RemotesTab() {
         </h2>
         <button
           onClick={() => setAddOpen(true)}
+          aria-label="打开添加远程仓库表单"
           className="flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 border border-border transition-colors"
         >
           <Plus size={11} /> 添加远程仓库
@@ -1179,12 +1184,14 @@ function RemotesTab() {
             <button
               onClick={() => handleTest(remote.id)}
               disabled={testing === remote.id}
+              aria-label={`测试远程仓库 ${remote.name}`}
               className="text-[10px] text-gray-600 hover:text-gray-300 px-1.5 py-0.5 rounded hover:bg-surface-3 transition-colors disabled:opacity-50"
             >
               {testing === remote.id ? "…" : "测试"}
             </button>
             <button
               onClick={() => deleteRemote(remote.id)}
+              aria-label={`删除远程仓库 ${remote.name}`}
               className="text-[10px] text-red-700 hover:text-red-400 px-1.5 py-0.5 rounded transition-colors"
             >
               <Trash2 size={10} />
@@ -1253,12 +1260,12 @@ function AddRemoteForm({
       <div className="grid grid-cols-2 gap-2">
         <div>
           <label className="block text-[10px] text-gray-500 mb-0.5">名称</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="我的 GitHub"
+          <input aria-label="名称" value={name} onChange={(e) => setName(e.target.value)} placeholder="我的 GitHub"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
         <div>
           <label className="block text-[10px] text-gray-500 mb-0.5">提供商</label>
-          <select value={provider} onChange={(e) => handleProviderChange(e.target.value as GitProvider)}
+          <select aria-label="提供商" value={provider} onChange={(e) => handleProviderChange(e.target.value as GitProvider)}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none">
             <option value="github">GitHub</option>
             <option value="gitlab">GitLab</option>
@@ -1266,13 +1273,13 @@ function AddRemoteForm({
         </div>
         <div className="col-span-2">
           <label className="block text-[10px] text-gray-500 mb-0.5">基础 URL</label>
-          <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
+          <input aria-label="基础 URL" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none focus:border-accent/40" />
         </div>
         <div className="col-span-2">
           <label className="block text-[10px] text-gray-500 mb-0.5">个人访问令牌</label>
           <div className="flex gap-1">
-            <input type={showToken ? "text" : "password"} value={token} onChange={(e) => setToken(e.target.value)}
+            <input aria-label="个人访问令牌" type={showToken ? "text" : "password"} value={token} onChange={(e) => setToken(e.target.value)}
               placeholder="ghp_…"
               className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
             <button onClick={() => setShowToken((v) => !v)}
@@ -1283,7 +1290,7 @@ function AddRemoteForm({
         </div>
         <div className="col-span-2">
           <label className="block text-[10px] text-gray-500 mb-0.5">默认仓库(可选)</label>
-          <input value={defaultRepo} onChange={(e) => setDefaultRepo(e.target.value)} placeholder="owner/repo"
+          <input aria-label="默认仓库(可选)" value={defaultRepo} onChange={(e) => setDefaultRepo(e.target.value)} placeholder="owner/repo"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
       </div>
