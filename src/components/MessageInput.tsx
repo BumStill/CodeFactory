@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useRef, useState, useEffect, ChangeEvent, KeyboardEvent, ClipboardEvent, DragEvent } from "react";
 import { recallHistory, pushHistory } from "./messageHistory";
-import { Send, Square, Paperclip, X, Loader2 } from "lucide-react";
+import { Send, Square, Paperclip, X, Loader2, Check } from "lucide-react";
 import {
   filterSlashCommandSuggestions,
   parseSlashCommand,
@@ -42,7 +42,7 @@ function isImageAttachment(name: string): boolean {
 interface Props {
   onSend: (text: string) => void;
   /** Route the primary input as an autonomous-run interjection instead of a chat turn. */
-  onGuide?: (text: string) => void | Promise<void>;
+  onGuide?: (text: string) => Promise<void>;
   onCommand?: (command: ParsedSlashCommand) => void | Promise<void>;
   onCancel: () => void;
   streaming: boolean;
@@ -71,6 +71,9 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
+  const [guidanceState, setGuidanceState] = useState<
+    { kind: "idle" } | { kind: "pending" } | { kind: "success" } | { kind: "error"; message: string }
+  >({ kind: "idle" });
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Shell-style input history: sent messages this session + where we are in it.
   // Seeded from the session's prior user messages (the component is keyed by
@@ -187,7 +190,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
   ];
   const commandCandidate = parseSlashCommand(value.trim());
 
-  const submit = () => {
+  const submit = async () => {
     const text = value.trim();
     // Allow submission with attachments but no text — the markdown links
     // appended below count as content for the model.
@@ -205,11 +208,17 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
       return;
     }
     if (guidanceActive && text && onGuide) {
-      setValue("");
-      setAttachments([]);
-      setAttachError(null);
-      ref.current!.style.height = "auto";
-      void onGuide(text);
+      setGuidanceState({ kind: "pending" });
+      try {
+        await onGuide(text);
+        setValue("");
+        setAttachments([]);
+        setAttachError(null);
+        if (ref.current) ref.current.style.height = "auto";
+        setGuidanceState({ kind: "success" });
+      } catch (error) {
+        setGuidanceState({ kind: "error", message: String(error) });
+      }
       return;
     }
     if (disabled) return;
@@ -255,7 +264,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      submit();
+      void submit();
       return;
     }
     // Shell-style history recall. ↑ enters history only when the caret is at
@@ -292,7 +301,9 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
 
   // canSubmit recomputes with attachments too — a chip-only message is valid.
   const hasContent = Boolean(value.trim()) || attachments.length > 0;
-  const submitReady = hasContent && (!disabled || Boolean(commandCandidate));
+  const submitReady = guidanceActive
+    ? Boolean(value.trim()) && guidanceState.kind !== "pending"
+    : hasContent && (!disabled || Boolean(commandCandidate));
 
   return (
     <div
@@ -375,7 +386,12 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
         <textarea
           ref={ref}
           value={value}
-          onChange={(e) => { setValue(e.target.value); setHistPos(0); autoResize(); }}
+          onChange={(e) => {
+            setValue(e.target.value);
+            setHistPos(0);
+            if (guidanceState.kind !== "idle") setGuidanceState({ kind: "idle" });
+            autoResize();
+          }}
           onKeyDown={onKey}
           onPaste={onPaste}
           rows={1}
@@ -395,7 +411,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
             it's just the regular send. */}
         {streaming && submitReady && (
           <button
-            onClick={submit}
+            onClick={() => void submit()}
             disabled={!submitReady}
             className="shrink-0 rounded-lg p-1.5 transition-colors enabled:hover:bg-surface-4 text-accent"
             title="排队（流式结束后自动发送）"
@@ -404,21 +420,39 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
           </button>
         )}
         <button
-          onClick={streaming ? onCancel : submit}
+          onClick={streaming ? onCancel : () => void submit()}
           disabled={!streaming && !submitReady}
           className="shrink-0 rounded-lg p-1.5 transition-colors disabled:opacity-30
             enabled:hover:bg-surface-4 text-accent disabled:text-gray-600"
           title={streaming ? "取消生成" : "发送(Enter)"}
         >
-          {streaming ? <Square size={16} /> : <Send size={16} />}
+          {streaming ? (
+            <Square size={16} />
+          ) : guidanceState.kind === "pending" ? (
+            <Loader2 size={16} className="animate-spin" />
+          ) : (
+            <Send size={16} />
+          )}
         </button>
       </div>
-      <div className="mt-1 text-xs text-gray-700 text-right select-none">
-        {guidanceActive
-          ? "Enter 引导下一步 · Shift+Enter 换行"
-          : streaming
-          ? "Enter 排队 · Shift+Enter 换行"
-          : "Enter 发送 · Shift+Enter 换行"}
+      <div className="mt-1 flex min-h-4 items-center gap-2 text-xs text-gray-700 select-none">
+        {guidanceState.kind === "success" && (
+          <span aria-live="polite" className="flex items-center gap-1 text-green-700 dark:text-green-400">
+            <Check size={11} /> 已加入下一任务
+          </span>
+        )}
+        {guidanceState.kind === "error" && (
+          <span role="alert" className="truncate text-red-700 dark:text-red-300">
+            引导发送失败：{guidanceState.message}
+          </span>
+        )}
+        <span className="ml-auto">
+          {guidanceActive
+            ? "Enter 引导下一步 · Shift+Enter 换行"
+            : streaming
+            ? "Enter 排队 · Shift+Enter 换行"
+            : "Enter 发送 · Shift+Enter 换行"}
+        </span>
       </div>
     </div>
   );

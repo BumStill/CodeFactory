@@ -10,6 +10,8 @@ import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
 import { useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
 import type { Settings, Endpoint, ApiStyle, CustomModel, AddGitRemoteRequest, GitRemoteConfig, GitProvider, CodexAccount } from "../../lib/tauri";
+import { CHATGPT_DEFAULT_MODEL, CHATGPT_ENDPOINT_KEY } from "../../lib/chatgptModels";
+import { syncChatGptCatalog } from "../../stores/chatgptCatalog";
 
 interface Props {
   onBack: () => void;
@@ -829,6 +831,8 @@ export function SettingsPage({ onBack }: Props) {
                   ["low", "低"],
                   ["medium", "中"],
                   ["high", "高"],
+                  ["xhigh", "超高"],
+                  ["max", "最大"],
                 ] as const).map(([v, label]) => (
                   <option key={v} value={v}>
                     {label}
@@ -1408,67 +1412,6 @@ function AppearanceTab() {
 // Stage-1/3 surface: runs the OAuth login and shows the signed-in account.
 // Wiring the signed-in session into model requests (subscription Responses API)
 // is handled separately by the request layer.
-const CHATGPT_ENDPOINT_KEY = "chatgpt";
-const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
-// Codex model slugs the ChatGPT backend accepts. These get renamed over time
-// (gpt-5-codex → gpt-5.3-codex, etc.), so ensureChatGptEndpoint refreshes an
-// existing endpoint's list whenever this changes.
-const CHATGPT_MODELS: CustomModel[] = [
-  // 272K input window per codex's published model metadata — without this the
-  // context meter falls back to a wrong/conservative 128K for these models.
-  { id: "gpt-5.5", name: "GPT-5.5", context_length: 272000 },
-  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", context_length: 272000 },
-  { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini", context_length: 272000 },
-];
-const CHATGPT_DEFAULT_MODEL = "gpt-5.5";
-
-// Create the ChatGPT endpoint on sign-in (and keep its model list current) so
-// requests route to the subscription Responses path (api_style "chatgpt").
-async function ensureChatGptEndpoint() {
-  const { settings, save } = useSettingsStore.getState();
-  if (!settings) return;
-  const existing = settings.endpoints[CHATGPT_ENDPOINT_KEY];
-  // Up to date already? Nothing to do.
-  if (existing && JSON.stringify(existing.custom_models ?? []) === JSON.stringify(CHATGPT_MODELS)) {
-    return;
-  }
-  const validIds = CHATGPT_MODELS.map((m) => m.id);
-  const active =
-    existing?.active_model && validIds.includes(existing.active_model)
-      ? existing.active_model
-      : CHATGPT_DEFAULT_MODEL;
-  await save({
-    ...settings,
-    endpoints: {
-      ...settings.endpoints,
-      [CHATGPT_ENDPOINT_KEY]: {
-        base_url: CHATGPT_BASE_URL,
-        api_style: "chatgpt",
-        custom_models: CHATGPT_MODELS,
-        active_model: active,
-      },
-    },
-    // Only seize default/model on first creation; respect the user afterwards.
-    default_endpoint: existing ? settings.default_endpoint : CHATGPT_ENDPOINT_KEY,
-    default_model: existing ? settings.default_model : CHATGPT_DEFAULT_MODEL,
-  });
-}
-
-// Drop the ChatGPT endpoint on sign-out so it can't linger as a broken default.
-async function removeChatGptEndpoint() {
-  const { settings, save } = useSettingsStore.getState();
-  if (!settings || !settings.endpoints[CHATGPT_ENDPOINT_KEY]) return;
-  const { [CHATGPT_ENDPOINT_KEY]: _removed, ...rest } = settings.endpoints;
-  await save({
-    ...settings,
-    endpoints: rest,
-    default_endpoint:
-      settings.default_endpoint === CHATGPT_ENDPOINT_KEY
-        ? (Object.keys(rest)[0] ?? "")
-        : settings.default_endpoint,
-  });
-}
-
 function ChatGptLoginCard() {
   // undefined = still checking; null = signed out; object = signed in.
   const [account, setAccount] = useState<CodexAccount | null | undefined>(undefined);
@@ -1485,7 +1428,7 @@ function ChatGptLoginCard() {
         setAccount(a);
         // Already signed in (e.g. from a prior session)? Make sure the ChatGPT
         // endpoint exists so the account is actually usable. Idempotent.
-        if (a) await ensureChatGptEndpoint();
+        if (a) await syncChatGptCatalog(true);
       })
       .catch(() => setAccount(null));
   }, []);
@@ -1496,7 +1439,7 @@ function ChatGptLoginCard() {
     try {
       const acct = await codexLogin();
       setAccount(acct);
-      await ensureChatGptEndpoint();
+      await syncChatGptCatalog(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1510,7 +1453,7 @@ function ChatGptLoginCard() {
     try {
       await codexLogout();
       setAccount(null);
-      await removeChatGptEndpoint();
+      await useSettingsStore.getState().load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

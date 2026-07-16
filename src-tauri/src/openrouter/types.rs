@@ -205,6 +205,7 @@ pub enum StreamEvent {
         tool_call_id: String,
         content: String,
         is_error: bool,
+        status: String,
     },
     PermissionRequest {
         tool_call_id: String,
@@ -221,6 +222,7 @@ pub enum StreamEvent {
     ContextUsage {
         used_tokens: u32,
         limit_tokens: u32,
+        max_limit_tokens: u32,
     },
     /// Notification that the older half of the conversation was compressed
     /// to fit the window. Frontend can toast this so the user knows why a

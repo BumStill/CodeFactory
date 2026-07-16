@@ -1450,7 +1450,7 @@ pub async fn run_postmortem(
     let tools: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT tc.tool_name, tc.status, tc.error FROM tool_calls tc \
          JOIN messages m ON m.id = tc.message_id \
-         WHERE m.session_id = ? AND tc.status IN ('done','error','denied') \
+         WHERE m.session_id = ? AND tc.status IN ('done','error','denied','cancelled') \
          ORDER BY tc.created_at ASC LIMIT 100",
     )
     .bind(&session_id)

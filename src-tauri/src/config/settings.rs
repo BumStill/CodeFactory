@@ -2,7 +2,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 // ── Git remote types ──────────────────────────────────────────────────────────
 
@@ -212,8 +213,9 @@ impl Default for Theme {
     }
 }
 
-/// Reasoning effort for reasoning-capable models (currently the ChatGPT/Codex
-/// Responses path). Maps directly to `reasoning.effort` in the request body.
+/// Reasoning selection for the ChatGPT/Codex path. Values through `Max` map to
+/// `reasoning.effort`; `Ultra` is a client orchestration mode and must be
+/// translated to `Max` at the Responses transport boundary.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
@@ -221,6 +223,9 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    XHigh,
+    Max,
+    Ultra,
 }
 
 impl Default for ReasoningEffort {
@@ -236,6 +241,9 @@ impl ReasoningEffort {
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Max => "max",
+            ReasoningEffort::Ultra => "ultra",
         }
     }
 
@@ -247,6 +255,9 @@ impl ReasoningEffort {
             "low" => Some(ReasoningEffort::Low),
             "medium" => Some(ReasoningEffort::Medium),
             "high" => Some(ReasoningEffort::High),
+            "xhigh" => Some(ReasoningEffort::XHigh),
+            "max" => Some(ReasoningEffort::Max),
+            "ultra" => Some(ReasoningEffort::Ultra),
             _ => None,
         }
     }
@@ -382,7 +393,7 @@ pub struct Endpoint {
     pub active_model: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CustomModel {
     /// The exact string passed as `model` in chat completion requests.
     pub id: String,
@@ -391,6 +402,20 @@ pub struct CustomModel {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u32>,
+    /// Default context window advertised for the active provider route.
+    /// `max_context_length` may be larger when the provider permits clients
+    /// to expand long-running sessions beyond this normal operating budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_length: Option<u32>,
+    /// Percentage of the advertised window considered usable for input after
+    /// reserving provider/client headroom. Missing means 100% for compatibility
+    /// with existing custom endpoints that only supplied `context_length`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_context_window_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_reasoning_efforts: Option<Vec<ReasoningEffort>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -621,6 +646,50 @@ mod reasoning_effort_tests {
     }
 
     #[test]
+    fn extended_reasoning_efforts_are_lowercase_and_parseable() {
+        for (effort, serialized) in [
+            (ReasoningEffort::XHigh, "\"xhigh\""),
+            (ReasoningEffort::Max, "\"max\""),
+            (ReasoningEffort::Ultra, "\"ultra\""),
+        ] {
+            assert_eq!(serde_json::to_string(&effort).unwrap(), serialized);
+            assert_eq!(ReasoningEffort::parse(effort.as_str()), Some(effort));
+        }
+    }
+
+    #[test]
+    fn custom_model_capabilities_are_optional_for_old_configs() {
+        let legacy: CustomModel = serde_json::from_value(serde_json::json!({
+            "id": "legacy-codex",
+            "name": "Legacy Codex",
+            "context_length": 272000
+        }))
+        .expect("legacy custom model should deserialize");
+
+        assert_eq!(legacy.default_reasoning_effort, None);
+        assert_eq!(legacy.supported_reasoning_efforts, None);
+
+        let current: CustomModel = serde_json::from_value(serde_json::json!({
+            "id": "gpt-5.6-sol",
+            "default_reasoning_effort": "low",
+            "supported_reasoning_efforts": ["low", "medium", "xhigh", "max", "ultra"]
+        }))
+        .expect("current custom model should deserialize");
+
+        assert_eq!(current.default_reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(
+            current.supported_reasoning_efforts,
+            Some(vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Max,
+                ReasoningEffort::Ultra,
+            ])
+        );
+    }
+
+    #[test]
     fn old_settings_without_field_default_to_medium() {
         // Configs that predate this field must still load.
         let s: Settings = serde_json::from_value(serde_json::json!({
@@ -649,6 +718,10 @@ mod reasoning_effort_tests {
                     id: "gpt-5.5".into(),
                     name: Some("GPT-5.5".into()),
                     context_length: Some(272000),
+                    max_context_length: Some(272000),
+                    effective_context_window_percent: Some(95),
+                    default_reasoning_effort: None,
+                    supported_reasoning_efforts: None,
                 }],
                 active_model: Some("gpt-5.5".into()),
             },
@@ -749,12 +822,30 @@ mod reasoning_effort_tests {
 /// identifier-based app data directory so a single folder covers all user
 /// state — survives upgrades and uninstalls cleanly.
 ///
-/// Windows: `%APPDATA%\com.codefactory.app\settings.json`
-pub fn config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("com.codefactory.app")
+/// Windows release: `%APPDATA%\com.codefactory.app\settings.json`
+/// Windows dev: `%APPDATA%\com.codefactory.dev\settings.json`
+fn config_path_for(config_root: &Path, is_debug: bool) -> PathBuf {
+    config_root
+        .join(if is_debug {
+            "com.codefactory.dev"
+        } else {
+            "com.codefactory.app"
+        })
         .join("settings.json")
+}
+
+pub fn config_path() -> PathBuf {
+    config_path_for(
+        &dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")),
+        cfg!(debug_assertions),
+    )
+}
+
+fn release_config_path() -> PathBuf {
+    config_path_for(
+        &dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")),
+        false,
+    )
 }
 
 /// Legacy path used by versions ≤ 0.3.3 (productName-based folder, separate
@@ -767,22 +858,37 @@ fn legacy_config_path() -> PathBuf {
         .join("settings.json")
 }
 
+fn migrate_settings_file(
+    source: &Path,
+    target: &Path,
+    archive_source: bool,
+) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(source, target)?;
+    if archive_source {
+        std::fs::rename(source, source.with_extension("json.migrated-backup"))?;
+    }
+    Ok(())
+}
+
 pub fn load() -> Settings {
     let new_path = config_path();
 
-    // One-shot migration: if there's a settings.json in the legacy location
-    // but none at the new one, copy it across and rename the original to
-    // .migrated-backup so the user can tell what happened (and we never
-    // accidentally re-migrate over fresher data).
-    let legacy = legacy_config_path();
-    if legacy.exists() && !new_path.exists() {
-        if let Some(parent) = new_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match std::fs::copy(&legacy, &new_path) {
-            Ok(_) => {
-                let backup = legacy.with_extension("json.migrated-backup");
-                let _ = std::fs::rename(&legacy, &backup);
+    // Dev builds copy the release settings once into their own identifier-based
+    // directory. The release file stays in place, so the two apps never share a
+    // writable catalog/settings file after migration.
+    let migration_source = if cfg!(debug_assertions) && release_config_path().exists() {
+        Some((release_config_path(), false))
+    } else if legacy_config_path().exists() {
+        Some((legacy_config_path(), true))
+    } else {
+        None
+    };
+    if let Some((legacy, archive_source)) = migration_source.filter(|_| !new_path.exists()) {
+        match migrate_settings_file(&legacy, &new_path, archive_source) {
+            Ok(()) => {
                 tracing::info!(
                     "settings: migrated {} -> {}",
                     legacy.display(),
@@ -1165,11 +1271,20 @@ pub fn force_max_completion_tokens(body: &mut serde_json::Value) {
     }
 }
 
-pub fn save(settings: &Settings) -> crate::errors::Result<()> {
-    let path = config_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(path, serde_json::to_string_pretty(settings)?)?;
+fn save_to_path(path: &Path, settings: &Settings) -> crate::errors::Result<()> {
+    let parent = path.parent().unwrap();
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".settings.json.tmp.")
+        .tempfile_in(parent)?;
+    temporary.write_all(&serde_json::to_vec_pretty(settings)?)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
+}
+
+pub fn save(settings: &Settings) -> crate::errors::Result<()> {
+    save_to_path(&config_path(), settings)
 }
 
 #[cfg(test)]
@@ -1187,5 +1302,67 @@ mod reasoning_model_adaptation_tests {
         assert!(!obj.contains_key("max_tokens"));
         assert!(!obj.contains_key("temperature"));
         assert_eq!(obj["max_completion_tokens"], json!(8192)); // floored
+    }
+}
+
+#[cfg(test)]
+mod settings_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn debug_and_release_settings_use_distinct_identifier_directories() {
+        let root = PathBuf::from("/config-root");
+
+        assert_eq!(
+            config_path_for(&root, true),
+            root.join("com.codefactory.dev").join("settings.json")
+        );
+        assert_eq!(
+            config_path_for(&root, false),
+            root.join("com.codefactory.app").join("settings.json")
+        );
+    }
+
+    #[test]
+    fn settings_save_replaces_existing_json_without_leaving_partial_file() {
+        let root = std::env::temp_dir().join(format!(
+            "codefactory-settings-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("settings.json");
+        let mut first = Settings::default();
+        first.default_model = "first".into();
+        let mut second = first.clone();
+        second.default_model = "second".into();
+
+        save_to_path(&path, &first).unwrap();
+        save_to_path(&path, &second).unwrap();
+
+        let stored: Settings =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(stored.default_model, "second");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dev_settings_migration_copies_release_file_without_removing_it() {
+        let root = std::env::temp_dir().join(format!(
+            "codefactory-settings-migration-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let release = config_path_for(&root, false);
+        let dev = config_path_for(&root, true);
+        std::fs::create_dir_all(release.parent().unwrap()).unwrap();
+        std::fs::write(&release, br#"{"default_model":"gpt-5.6-sol"}"#).unwrap();
+
+        migrate_settings_file(&release, &dev, false).unwrap();
+
+        assert!(release.exists());
+        assert_eq!(
+            std::fs::read(&release).unwrap(),
+            std::fs::read(&dev).unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

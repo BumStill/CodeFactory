@@ -9,12 +9,15 @@ import { useSettingsStore } from "../stores/settings";
 import { useChatStore } from "../stores/chat";
 import type { Settings, ReasoningEffort } from "../lib/tauri";
 
-const EFFORTS: ReasoningEffort[] = ["minimal", "low", "medium", "high"];
+const LEGACY_EFFORTS: ReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
 const LABELS: Record<ReasoningEffort, string> = {
   minimal: "最简",
   low: "低",
   medium: "中",
   high: "高",
+  xhigh: "超高",
+  max: "最大",
+  ultra: "极致",
 };
 
 /** Whether the reasoning control is relevant for the current settings — only
@@ -25,6 +28,31 @@ export function reasoningPickerVisible(settings: Settings | null): boolean {
   return ep?.api_style === "chatgpt";
 }
 
+export function reasoningEffortsForModel(
+  settings: Settings | null,
+  modelId: string,
+): ReasoningEffort[] {
+  const endpoint = settings?.endpoints?.[settings.default_endpoint];
+  const model = endpoint?.custom_models?.find((candidate) => candidate.id === modelId);
+  return model?.supported_reasoning_efforts?.length
+    ? model.supported_reasoning_efforts
+    : LEGACY_EFFORTS;
+}
+
+function effectiveEffort(
+  requested: ReasoningEffort,
+  supported: ReasoningEffort[],
+  fallback?: ReasoningEffort,
+): ReasoningEffort {
+  // v1.46.0 could persist the catalog-only `ultra` label even though the
+  // ChatGPT Responses transport accepts `max` as its highest request value.
+  if (requested === "ultra" && supported.includes("max")) return "max";
+  if (supported.includes(requested)) return requested;
+  if (fallback && supported.includes(fallback)) return fallback;
+  if (supported.includes("medium")) return "medium";
+  return supported[0] ?? requested;
+}
+
 export function ReasoningEffortPicker() {
   const settings = useSettingsStore((s) => s.settings);
   const activeSession = useChatStore((s) => s.activeSession);
@@ -32,8 +60,12 @@ export function ReasoningEffortPicker() {
   if (!settings || !reasoningPickerVisible(settings) || !activeSession) return null;
   // Per-session override; falls back to the global default for display.
   const globalDefault: ReasoningEffort = settings.reasoning_effort ?? "medium";
-  const effort: ReasoningEffort =
+  const requested: ReasoningEffort =
     (activeSession.reasoning_effort as ReasoningEffort | null | undefined) ?? globalDefault;
+  const endpoint = settings.endpoints[settings.default_endpoint];
+  const model = endpoint?.custom_models?.find((candidate) => candidate.id === activeSession.model_id);
+  const efforts = reasoningEffortsForModel(settings, activeSession.model_id);
+  const effort = effectiveEffort(requested, efforts, model?.default_reasoning_effort);
   return (
     <select
       value={effort}
@@ -41,7 +73,7 @@ export function ReasoningEffortPicker() {
       title="思考强度 (reasoning effort) — 仅作用于当前会话，立即对后续请求生效"
       className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300 transition-colors hover:bg-surface-3"
     >
-      {EFFORTS.map((v) => (
+      {efforts.map((v) => (
         <option key={v} value={v}>
           思考·{LABELS[v]}
         </option>

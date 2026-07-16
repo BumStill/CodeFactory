@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   codexLogin: vi.fn(),
   codexLogout: vi.fn(),
   codexAccount: vi.fn(),
+  codexModels: vi.fn(),
+  applyCodexModels: vi.fn(),
   invoke: vi.fn(),
   loadRemotes: vi.fn(),
   addRemote: vi.fn(),
@@ -106,6 +108,8 @@ vi.mock("../../lib/tauri", () => ({
   codexLogin: mocks.codexLogin,
   codexLogout: mocks.codexLogout,
   codexAccount: mocks.codexAccount,
+  codexModels: mocks.codexModels,
+  applyCodexModels: mocks.applyCodexModels,
 }));
 
 async function openGeneralTab() {
@@ -136,6 +140,14 @@ describe("SettingsPage parallel-task controls", () => {
     // Delivery ceiling: a legacy settings.json (no delivery_ceiling) hydrates to
     // the PrOnly default, not blank.
     expect(screen.getByDisplayValue("提交 + 推送 + 开 PR(默认)")).toBeInTheDocument();
+  });
+
+  it("does not expose the unsupported Ultra orchestration label as a global effort", async () => {
+    await openGeneralTab();
+
+    const effort = screen.getByDisplayValue("中");
+    expect(effort).toHaveTextContent("最大");
+    expect(effort).not.toHaveTextContent("极致");
   });
 
   it("saves the selected delivery ceiling", async () => {

@@ -14,10 +14,14 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { useChatStore, QUEUE_MAX, freshRuntime, type SessionRuntime } from "./chat";
 import { reduceChatStreamEvent } from "./chatEvents";
 
+const streamMock = vi.hoisted(() => ({
+  handler: undefined as ((event: unknown) => void) | undefined,
+  onStream: vi.fn(),
+}));
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("../lib/tauri", () => ({
   invoke: invokeMock,
-  onStream: vi.fn(async () => () => {}),
+  onStream: streamMock.onStream,
   onSessionUpdated: vi.fn(async () => () => {}),
   sendMessageAnonymous: vi.fn(async () => {}),
 }));
@@ -61,6 +65,12 @@ describe("chat message queue (per-session)", () => {
     resetStore();
     invokeMock.mockReset();
     invokeMock.mockResolvedValue(undefined);
+    streamMock.handler = undefined;
+    streamMock.onStream.mockReset();
+    streamMock.onStream.mockImplementation(async (_sessionId, handler) => {
+      streamMock.handler = handler;
+      return () => {};
+    });
   });
 
   it("sendOrQueue fires immediately when idle", async () => {
@@ -113,8 +123,8 @@ describe("chat message queue (per-session)", () => {
   });
 
 
-  it("drains the next queued message after a manual interruption", async () => {
-    seed({ streaming: true });
+  it("drains the next queued message only after an interrupted turn reaches terminal state", async () => {
+    await useChatStore.getState().sendMessage("first turn", SID);
     await useChatStore.getState().sendOrQueue("queued after stop");
     expect(q().map((x) => x.content)).toEqual(["queued after stop"]);
 
@@ -122,8 +132,14 @@ describe("chat message queue (per-session)", () => {
     useChatStore.getState().cancelStream();
 
     expect(invokeMock).toHaveBeenCalledWith("cancel_chat", { sessionId: SID });
-    expect(q()).toHaveLength(0);
+    expect(q()).toHaveLength(1);
+    expect(useChatStore.getState().runtime[SID]?.streaming).toBe(true);
 
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
+
+    streamMock.handler?.({ type: "done", input_tokens: 0, output_tokens: 0 });
+    expect(q()).toHaveLength(0);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(invokeMock).toHaveBeenCalledWith(
       "send_message",

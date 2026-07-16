@@ -104,4 +104,38 @@ describe("persisted chat hydration", () => {
       expect.objectContaining({ status: "done", result: "ok", isError: false }),
     );
   });
+
+  it("restores cancelled tool calls as cancelled rather than failed", () => {
+    const rows: Message[] = [
+      {
+        id: "assistant-tools",
+        session_id: "session-1",
+        role: "assistant",
+        content: "",
+        tool_calls: JSON.stringify([
+          {
+            id: "call-cancelled",
+            type: "function",
+            function: { name: "bash", arguments: "{}" },
+          },
+        ]),
+        created_at: 300,
+      },
+      {
+        id: "session-1:call-cancelled:result",
+        session_id: "session-1",
+        role: "tool",
+        content: JSON.stringify({
+          tool_call_id: "call-cancelled",
+          content: "Tool call cancelled by user.",
+          status: "cancelled",
+        }),
+        created_at: 301,
+      },
+    ];
+
+    expect(dbMessagesToUI(rows)[0].toolCalls?.[0]).toEqual(
+      expect.objectContaining({ status: "cancelled", isError: true }),
+    );
+  });
 });

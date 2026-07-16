@@ -26,8 +26,8 @@
 | 三栏工作区 | 任务栏(左)+ 对话(中)+ 连接器/知识库/技能/记忆(右)常驻;空时仍占位 | `src/pages/Workspace/WorkspacePage.tsx` |
 | 任务栏 | 由 agent 自动拆解填充,但**常驻**;空态文案"还没有任务…" | 同上 |
 | context 长度 | `FALLBACK_CONTEXT_LENGTH = 128_000`;解析序:自定义模型 `context_length` > /models 缓存 > 按名猜 > 兜底 128K | `src-tauri/src/agent/context.rs` |
-| ChatGPT 模型 | `gpt-5.5 / gpt-5.3-codex / gpt-5.1-codex-mini` **未填 `context_length`** → 全落 128K 兜底 | `src/pages/Settings/SettingsPage.tsx`（`CHATGPT_MODELS`) |
-| 思考强度 | **硬编码 `reasoning.effort="medium"`**,无 UI/设置 | `src-tauri/src/agent/mod.rs`（`call_chatgpt_model`) |
+| ChatGPT 模型 | 登录后读取官方 Codex 模型目录；离线使用版本化快照，模型记录 `context_length` 与支持的思考档位 | `src-tauri/src/codex_auth.rs` + `src/lib/chatgptModels.ts` |
+| 思考强度 | 会话级选择器按当前模型能力显示，后端请求前二次校验；旧档位不兼容时回退模型默认值 | `ReasoningEffortPicker.tsx` + `config/settings.rs` + `agent/mod.rs` |
 | 输入历史 | 输入框有 `onKeyDown`,**无上/下键调历史** | `src/components/MessageInput.tsx` |
 | 排队 | **已有**:流式中"排队发送"、`queue_interjection`、`QueueBadge`;均为"排到下一轮",非真·流中注入 | `MessageInput.tsx` / `ExecutionStream.tsx` / `QueueBadge.tsx` / `src-tauri/src/commands/interjections.rs` |
 | Quick 会话 | **单例**:`get_or_create_quick_session` 永远取/建最近一条 `kind='quick'`;会话列表 `WHERE kind != 'quick'` 排除 | `src-tauri/src/commands/session.rs` |
@@ -80,8 +80,8 @@
 ### ③ 真实 context_length(修 Stage 2 口子)
 - **现状**:ChatGPT 模型未填 `context_length` → 128K 兜底(§1)。
 - **目标**:显示真实上限;成本/压缩判断不再失真。
-- **改动点**:`SettingsPage.tsx` `CHATGPT_MODELS` 补 `context_length`(gpt-5.5 等真实值);`agent/context.rs` `context_length_from_id` 增补新模型名识别。
-- **验收**:切到 gpt-5.5 时状态条上限为真实值(非 128K);openrouter 模型不回归。
+- **改动点**:ChatGPT 登录后动态刷新官方 Codex 模型目录，并保留离线快照；`agent/context.rs` 继续提供未知模型兼容兜底。
+- **验收**:切到 GPT-5.6 / GPT-5.5 时状态条上限采用模型目录值；OpenRouter 模型不回归。
 
 ### ④ 排队 / 真·流中引导
 - **现状**:有"排到下一轮"(§1),无真·流中注入。
@@ -91,7 +91,7 @@
 
 ### ⑤ codex 思考强度(修 Stage 2 口子)
 - **现状**:硬编码 `effort="medium"`,无配置(§1)。
-- **目标**:① 会话级快捷档(模型选择器旁 minimal/low/medium/high 切换);② 设置默认(全局或每端点)。
+- **目标**:① 会话级快捷档按当前模型目录显示（含 `xhigh/max/ultra` 等新档位）；② 设置默认(全局或每端点)；③ 请求前按当前模型能力校验。
 - **改动点**:`config/settings.rs`(默认 effort 字段)、会话模型记忆(`session.reasoning_effort`)、`agent/mod.rs` `call_chatgpt_model` 改为读会话/设置;前端模型选择器旁加控件 + 设置项。
 - **验收**:切 high 后请求体 `reasoning.effort=high`;不设时用设置默认;非 codex 端点不受影响(reasoning 仅对 chatgpt 路径)。
 

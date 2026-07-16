@@ -194,6 +194,7 @@ pub async fn run_subagent(
         app_handle.clone(),
         pool.clone(),
         sub_session_id.clone(),
+        settings.default_endpoint.clone(),
         model.clone(),
         endpoint.base_url.clone(),
         api_key.clone(),

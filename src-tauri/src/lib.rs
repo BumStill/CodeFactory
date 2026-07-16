@@ -203,6 +203,8 @@ pub fn run() {
             codex_auth::codex_login,
             codex_auth::codex_logout,
             codex_auth::codex_account,
+            codex_auth::codex_models,
+            codex_auth::apply_codex_models,
             commands::backup::export_user_data,
             commands::backup::import_user_data,
             commands::backup::get_data_dir,

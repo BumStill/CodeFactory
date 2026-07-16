@@ -5,15 +5,14 @@
 // scheduler interjection ("引导下一步") instead of becoming a normal chat turn.
 
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MessageInput } from "./MessageInput";
 
 vi.mock("../lib/tauri", () => ({ invoke: vi.fn() }));
 
-function setup() {
+function setup(onGuide = vi.fn()) {
   const onSend = vi.fn();
-  const onGuide = vi.fn();
   render(
     <MessageInput
       onSend={onSend}
@@ -40,6 +39,34 @@ describe("MessageInput guidance mode", () => {
     expect(onSend).not.toHaveBeenCalled();
     expect(textarea).toHaveValue("");
     expect(screen.getByText("Enter 引导下一步 · Shift+Enter 换行")).toBeInTheDocument();
+  });
+
+  it("keeps the draft and reports an error when guidance cannot be queued", async () => {
+    const onGuide = vi.fn().mockRejectedValue(new Error("scheduler unavailable"));
+    const user = userEvent.setup();
+    setup(onGuide);
+    const textarea = screen.getByRole("textbox");
+
+    await user.type(textarea, "保留这条引导{Enter}");
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("scheduler unavailable"));
+    expect(textarea).toHaveValue("保留这条引导");
+  });
+
+  it("shows a queued confirmation only after guidance succeeds", async () => {
+    let resolveGuide: (() => void) | undefined;
+    const onGuide = vi.fn(() => new Promise<void>((resolve) => { resolveGuide = resolve; }));
+    const user = userEvent.setup();
+    setup(onGuide);
+    const textarea = screen.getByRole("textbox");
+
+    await user.type(textarea, "先修失败测试{Enter}");
+    expect(screen.queryByText("已加入下一任务")).not.toBeInTheDocument();
+    expect(textarea).toHaveValue("先修失败测试");
+
+    resolveGuide?.();
+    await waitFor(() => expect(screen.getByText("已加入下一任务")).toBeInTheDocument());
+    expect(textarea).toHaveValue("");
   });
 
   it("keeps slash commands local and does not send them as guidance", () => {

@@ -456,20 +456,21 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   cancelStream: (sessionId) => {
     const id = sessionId ?? get().activeSession?.id;
     if (!id) return;
-    get()._unlisten[id]?.();
     set((s) => {
       const prev = s.runtime[id];
       const runtime = prev
-        ? { ...s.runtime, [id]: { ...prev, streaming: false, pendingPermission: null } }
+        ? { ...s.runtime, [id]: { ...prev, pendingPermission: null } }
         : s.runtime;
-      return { runtime, _unlisten: { ...s._unlisten, [id]: undefined } };
+      return { runtime };
     });
     // Tell the backend to stop the in-flight turn — otherwise the agent keeps
     // looping (burning tokens) after the UI already says "stopped". Cooperative:
     // it stops between rounds, never mid tool-call. Scoped to THIS chat session
     // only; it never affects the task scheduler / long task runs.
+    // Keep the listener and streaming state until the backend emits Done. That
+    // terminal event is the only safe point to drain a queued message; sending
+    // it immediately would race the still-running tool call in the old turn.
     void invoke("cancel_chat", { sessionId: id });
-    drainNextQueuedMessage(id, set, get);
   },
 
   respondPermission: async (allow) => {
@@ -661,7 +662,7 @@ function parsePersistedToolCalls(raw: string | null | undefined): ToolCallState[
 function parsePersistedToolReplay(raw: string): {
   toolCallId: string;
   content: string;
-  status: "done" | "error" | "denied";
+  status: "done" | "error" | "denied" | "cancelled";
 } | null {
   try {
     const replay = JSON.parse(raw) as PersistedToolReplay;
@@ -669,7 +670,10 @@ function parsePersistedToolReplay(raw: string): {
       return null;
     }
     const status =
-      replay.status === "error" || replay.status === "denied" || replay.status === "done"
+      replay.status === "error" ||
+      replay.status === "denied" ||
+      replay.status === "cancelled" ||
+      replay.status === "done"
         ? replay.status
         : "done";
     return { toolCallId: replay.tool_call_id, content: replay.content, status };

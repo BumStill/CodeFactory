@@ -16,8 +16,12 @@ interface CostSummary {
   cost_usd: number;
 }
 
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+export function formatContextTokens(n: number): string {
+  if (n >= 1_000_000) {
+    const millions = n / 1_000_000;
+    const decimals = Number.isInteger(millions * 10) ? 1 : 2;
+    return `${millions.toFixed(decimals)}M`;
+  }
   if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
   return String(n);
 }
@@ -107,13 +111,13 @@ export function ContextUsageBar({ sessionId }: Props) {
           {sessionTok > 0 && (
             <span title="当前会话">
               <span className="text-gray-600 mr-1">会话</span>
-              {fmtTokens(sessionTok)}
+              {formatContextTokens(sessionTok)}
             </span>
           )}
           {todayTok > 0 && (
             <span title="今日合计">
               <span className="text-gray-600 mr-1">今日</span>
-              {fmtTokens(todayTok)}
+              {formatContextTokens(todayTok)}
             </span>
           )}
           {monthCost > 0.0001 && (
@@ -129,7 +133,7 @@ export function ContextUsageBar({ sessionId }: Props) {
       {showToast && toast && (
         <span
           className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-800 dark:text-amber-300 text-[10px]"
-          title={`释放约 ${fmtTokens(toast.tokensFreed)} tokens`}
+          title={`释放约 ${formatContextTokens(toast.tokensFreed)} tokens`}
         >
           已压缩 {toast.elidedCount} 条旧结果
         </span>
@@ -137,10 +141,17 @@ export function ContextUsageBar({ sessionId }: Props) {
 
       {/* Context window usage — right-aligned */}
       {hasUsage && (
-        <div className="flex items-center gap-2 ml-auto tabular-nums">
+        <div
+          className="flex items-center gap-2 ml-auto tabular-nums"
+          title={
+            usage!.maxLimit > usage!.limit
+              ? `当前预算 ${formatContextTokens(usage!.limit)}，内容增长后自动扩展至 ${formatContextTokens(usage!.maxLimit)}`
+              : `当前上下文预算 ${formatContextTokens(usage!.limit)}`
+          }
+        >
           <span className="text-gray-600">上下文</span>
           <span className={toneText}>
-            {fmtTokens(usage!.used)} / {fmtTokens(usage!.limit)}
+            {formatContextTokens(usage!.used)} / {formatContextTokens(usage!.limit)}
           </span>
           <div className="h-1 w-24 rounded-full bg-surface-3 overflow-hidden">
             <div

@@ -16,8 +16,6 @@ import {
   RefreshCw,
   ShieldCheck,
   Activity,
-  MessageSquarePlus,
-  Check,
   FileDiff,
 } from "lucide-react";
 import { useTasksStore, type ExecutionEvent } from "../stores/tasks";
@@ -72,81 +70,6 @@ export function ExecutionStream({ sessionId, hideWhenEmpty = true }: Props) {
         ))}
       </ol>
       <div ref={tailRef} />
-      {running && <InterjectionBar sessionId={sessionId} />}
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// InterjectionBar — type a redirection while the scheduler runs. The note
-// is queued server-side and picked up before the NEXT task starts (we
-// can't safely surgery into a sub-agent mid-tool-call, see backend doc).
-// Sticky at the bottom of the stream so it's always reachable.
-// ─────────────────────────────────────────────────────────────────────────────
-
-function InterjectionBar({ sessionId }: { sessionId: string }) {
-  const [text, setText] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [sentAt, setSentAt] = useState(0);
-  const [error, setError] = useState<string | null>(null);
-
-  const send = async () => {
-    const msg = text.trim();
-    if (!msg) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await invoke("queue_interjection", { sessionId, message: msg });
-      setText("");
-      setSentAt(Date.now());
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const justSent = sentAt > 0 && Date.now() - sentAt < 3000;
-
-  return (
-    <div
-      className="sticky bottom-0 z-10 border-t border-border bg-surface-2 px-3 py-2 flex items-center gap-2"
-      title="执行期间可随时在这里插话，引导 AI 的下一步（在下一个任务开始前生效）"
-    >
-      <MessageSquarePlus size={11} className="text-accent shrink-0" />
-      <span className="shrink-0 text-[10px] font-medium text-gray-400">引导下一步</span>
-      <input
-        type="text"
-        aria-label="引导下一步"
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            void send();
-          }
-        }}
-        placeholder="例如：先跳过登录，专注做 UI…"
-        disabled={busy}
-        className="flex-1 bg-surface-1 border border-border rounded px-2 py-1 text-[11px] text-gray-200 outline-none focus:border-accent disabled:opacity-50"
-      />
-      {justSent && (
-        <span className="flex items-center gap-1 text-[10px] text-green-700 dark:text-green-400">
-          <Check size={10} /> 已加入下一任务
-        </span>
-      )}
-      <button
-        onClick={() => void send()}
-        disabled={busy || !text.trim()}
-        className="px-2 py-1 rounded bg-accent hover:bg-accent-hover text-white text-[10px] disabled:opacity-40"
-      >
-        发送
-      </button>
-      {error && (
-        <span className="text-[10px] text-red-700 dark:text-red-300 ml-2 truncate max-w-[180px]">
-          {error}
-        </span>
-      )}
     </div>
   );
 }

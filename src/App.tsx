@@ -14,6 +14,7 @@ import { EvidenceViewer } from "./components/EvidenceViewer";
 import { UpdaterBanner } from "./components/UpdaterBanner";
 import { OnboardingOverlay } from "./components/OnboardingOverlay";
 import { useSettingsStore } from "./stores/settings";
+import { syncChatGptCatalog } from "./stores/chatgptCatalog";
 import { useChatStore } from "./stores/chat";
 import { invoke } from "./lib/tauri";
 import type { Session } from "./lib/tauri";
@@ -33,6 +34,11 @@ export default function App() {
   // Load settings once at app start so the theme + font apply before first
   // paint of any page (otherwise pages flash dark before switching to light).
   useEffect(() => { loadSettings(); }, []);
+
+  const settingsLoaded = settings != null;
+  useEffect(() => {
+    if (settingsLoaded) void syncChatGptCatalog();
+  }, [settingsLoaded]);
 
   const openProject = (sessionId: string) => {
     setActiveProject(sessionId);

@@ -7,7 +7,7 @@ export interface ToolCallState {
   args: string;
   result?: string;
   isError?: boolean;
-  status: "waiting_permission" | "running" | "done" | "error" | "denied";
+  status: "waiting_permission" | "running" | "done" | "error" | "denied" | "cancelled";
 }
 
 export interface PendingPermission {
@@ -42,6 +42,7 @@ export interface TransportRetryState {
 export interface ContextUsage {
   used: number;
   limit: number;
+  maxLimit: number;
 }
 
 export interface CompressionToast {
@@ -105,7 +106,7 @@ export function reduceChatStreamEvent(
       };
 
     case "tool_result": {
-      const nextStatus = event.is_error ? "error" : "done";
+      const nextStatus = event.status;
       return {
         ...state,
         pendingPermission:
@@ -152,6 +153,7 @@ export function reduceChatStreamEvent(
       return {
         ...state,
         streaming: false,
+        pendingPermission: null,
         messages: state.messages.map((m) =>
           m.id === msgId
             ? {
@@ -170,6 +172,7 @@ export function reduceChatStreamEvent(
         contextUsage: {
           used: event.used_tokens,
           limit: event.limit_tokens,
+          maxLimit: event.max_limit_tokens ?? event.limit_tokens,
         },
       };
 

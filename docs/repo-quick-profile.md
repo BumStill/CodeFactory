@@ -39,6 +39,8 @@
 - 本机锁屏后不得要求用户解锁或绕过 macOS 安全。UI 变更用 `pnpm test:evolution:headless` 继续执行真实浏览器布局/键盘门禁；PR、合并、刻意发版和安装包验证使用 CLI 与 GitHub runner。headless 不能替代发布 DMG smoke，DMG smoke 也不能替代功能断言。
 
 ## 快速命令
+- 跨 worktree 共享 Cargo 缓存：`pnpm cargo:shared -- <cargo arguments>`
+- Rust 快速回归：`pnpm test:rust:fast -- <test filter>`
 - 治理基线：`python tools/governance/validate_repo_governance_baseline.py`
 - PowerShell 包装：`powershell -ExecutionPolicy Bypass -File tools/governance/check_repo_governance.ps1`
 - 长任务记录：`python tools/governance/validate_long_task_record.py --task-record-path <path>`

@@ -43,24 +43,73 @@ pub const COMPRESSION_TRIGGER: f32 = 0.75;
 /// short results saves nothing and hurts the model's ability to use them.
 pub const MIN_ELIDE_TOKENS: u32 = 200;
 
-/// Resolve the active context window for `(endpoint, model_id)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedContextWindow {
+    /// Normal effective input budget for ordinary turns.
+    pub default_limit: u32,
+    /// Largest effective input budget explicitly allowed by this route.
+    pub max_limit: u32,
+}
+
+impl ResolvedContextWindow {
+    /// Expand only when the estimated prompt would otherwise trigger
+    /// compression. This keeps normal turns on the provider's default budget
+    /// and pays the long-context cost only when the conversation needs it.
+    pub fn select_limit(self, estimated_prompt_tokens: u32) -> u32 {
+        let expansion_threshold = (self.default_limit as f32 * COMPRESSION_TRIGGER) as u32;
+        if self.max_limit > self.default_limit && estimated_prompt_tokens > expansion_threshold {
+            self.max_limit
+        } else {
+            self.default_limit
+        }
+    }
+}
+
+fn apply_effective_percent(limit: u32, percent: Option<u8>) -> u32 {
+    let percent = percent.unwrap_or(100).clamp(1, 100) as u64;
+    (((limit as u64) * percent) / 100).max(1) as u32
+}
+
+/// Resolve both the default and maximum context budgets for
+/// `(endpoint, model_id)`.
 ///
-/// Order: user-provided custom_models[].context_length > cached /models
-/// entry > pattern-match against well-known model families > fallback.
-pub fn resolve_context_length(
+/// Order: user-provided custom model metadata > cached `/models` entry >
+/// model-family fallback. Route metadata wins over public model-card capacity.
+pub fn resolve_context_window(
     settings: &Settings,
     endpoint_name: &str,
     model_id: &str,
     remote_models: Option<&[crate::openrouter::types::ModelInfo]>,
-) -> u32 {
-    // 1. User-defined custom model with explicit context_length wins
+) -> ResolvedContextWindow {
+    // 1. User-defined or catalog-backed model metadata wins.
     if let Some(ep) = settings.endpoints.get(endpoint_name) {
         for cm in &ep.custom_models {
             if cm.id == model_id {
                 if let Some(n) = cm.context_length {
                     if n > 0 {
-                        return n;
+                        let max = cm
+                            .max_context_length
+                            .filter(|value| *value > 0)
+                            .unwrap_or(n);
+                        return ResolvedContextWindow {
+                            default_limit: apply_effective_percent(
+                                n,
+                                cm.effective_context_window_percent,
+                            ),
+                            max_limit: apply_effective_percent(
+                                max.max(n),
+                                cm.effective_context_window_percent,
+                            ),
+                        };
                     }
+                }
+                if let Some(max) = cm.max_context_length.filter(|value| *value > 0) {
+                    let effective =
+                        apply_effective_percent(max, cm.effective_context_window_percent);
+                    return ResolvedContextWindow {
+                        default_limit: effective,
+                        max_limit: effective,
+                    };
                 }
                 break;
             }
@@ -71,7 +120,10 @@ pub fn resolve_context_length(
     if let Some(list) = remote_models {
         for m in list {
             if m.id == model_id && m.context_length > 0 {
-                return m.context_length;
+                return ResolvedContextWindow {
+                    default_limit: m.context_length,
+                    max_limit: m.context_length,
+                };
             }
         }
     }
@@ -80,10 +132,16 @@ pub fn resolve_context_length(
     //    expose /models or return context_length, so without this the UI bar
     //    shows nonsense like "60K / 16K = 375 %" for a real 128K-context call.
     if let Some(n) = guess_context_from_name(model_id) {
-        return n;
+        return ResolvedContextWindow {
+            default_limit: n,
+            max_limit: n,
+        };
     }
 
-    FALLBACK_CONTEXT_LENGTH
+    ResolvedContextWindow {
+        default_limit: FALLBACK_CONTEXT_LENGTH,
+        max_limit: FALLBACK_CONTEXT_LENGTH,
+    }
 }
 
 /// Best-effort context-length lookup from a model id string. Tuned for the
@@ -116,11 +174,22 @@ fn guess_context_from_name(model_id: &str) -> Option<u32> {
         return Some(65_536);
     }
 
-    // OpenAI GPT-5 / Codex subscription family (gpt-5.5, gpt-5.3-codex,
-    // gpt-5.1-codex-mini …) — 272K input window, per codex's published model
-    // metadata. Match the gpt-5 prefix only: a bare "codex" substring would
-    // wrongly catch the legacy small-window codex-* completion models. Must
-    // come before the gpt-4 branch.
+    // Current OpenAI API models expose a 1.05M context window. A provider or
+    // ChatGPT subscription catalog can still advertise a smaller route-specific
+    // cap; explicit endpoint metadata wins before this name-based fallback.
+    if id == "gpt-5.4"
+        || id.starts_with("gpt-5.4-")
+        || id == "gpt-5.5"
+        || id.starts_with("gpt-5.5-")
+        || id == "gpt-5.6"
+        || id.starts_with("gpt-5.6-")
+    {
+        return Some(1_050_000);
+    }
+
+    // Older OpenAI GPT-5 / Codex subscription family — 272K input window, per
+    // Codex model metadata. Match the gpt-5 prefix only: a bare "codex"
+    // substring would wrongly catch legacy small-window completion models.
     if id.starts_with("gpt-5") {
         return Some(272_000);
     }
@@ -268,14 +337,30 @@ pub fn compress_if_needed(
 
 #[cfg(test)]
 mod tests {
-    use super::guess_context_from_name as guess;
+    use super::{guess_context_from_name as guess, resolve_context_window};
+    use crate::config::settings::{ApiStyle, CustomModel, Endpoint, Settings};
+
+    fn settings_with_model(model: CustomModel) -> Settings {
+        let mut settings = Settings::default();
+        settings.endpoints.insert(
+            "chatgpt".into(),
+            Endpoint {
+                base_url: "https://chatgpt.com/backend-api/codex".into(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                custom_models: vec![model],
+                active_model: Some("gpt-5.6-sol".into()),
+            },
+        );
+        settings
+    }
 
     #[test]
     fn gpt5_and_codex_families_resolve_to_real_window() {
         // Regression: the ChatGPT-subscription models (gpt-5.x / *-codex) were
         // falling through to the 128K fallback. Codex publishes 272K for the
         // gpt-5 / codex family — that's what the context meter should show.
-        assert_eq!(guess("gpt-5.5"), Some(272_000));
+        assert_eq!(guess("gpt-5.5"), Some(1_050_000));
         assert_eq!(guess("gpt-5.3-codex"), Some(272_000));
         assert_eq!(guess("gpt-5.1-codex-mini"), Some(272_000));
         assert_eq!(guess("gpt-5"), Some(272_000));
@@ -283,6 +368,50 @@ mod tests {
         // Narrowed to the gpt-5 prefix: a bare legacy "codex-*" id is NOT
         // assumed to be 272K (those were small-window completion models).
         assert_eq!(guess("codex-mini-latest"), None);
+    }
+
+    #[test]
+    fn current_gpt55_and_gpt56_api_models_use_the_official_one_million_window() {
+        assert_eq!(guess("gpt-5.5"), Some(1_050_000));
+        assert_eq!(guess("gpt-5.6-sol"), Some(1_050_000));
+        assert_eq!(guess("gpt-5.6-terra"), Some(1_050_000));
+        assert_eq!(guess("gpt-5.6-luna"), Some(1_050_000));
+    }
+
+    #[test]
+    fn catalog_context_adapts_from_default_to_advertised_maximum() {
+        let settings = settings_with_model(CustomModel {
+            id: "gpt-5.6-sol".into(),
+            name: None,
+            context_length: Some(272_000),
+            max_context_length: Some(1_050_000),
+            effective_context_window_percent: Some(95),
+            default_reasoning_effort: None,
+            supported_reasoning_efforts: None,
+        });
+
+        let window = resolve_context_window(&settings, "chatgpt", "gpt-5.6-sol", None);
+        assert_eq!(window.default_limit, 258_400);
+        assert_eq!(window.max_limit, 997_500);
+        assert_eq!(window.select_limit(190_000), 258_400);
+        assert_eq!(window.select_limit(200_000), 997_500);
+    }
+
+    #[test]
+    fn route_catalog_cap_wins_over_the_public_api_model_capacity() {
+        let settings = settings_with_model(CustomModel {
+            id: "gpt-5.6-sol".into(),
+            name: None,
+            context_length: Some(272_000),
+            max_context_length: Some(272_000),
+            effective_context_window_percent: Some(95),
+            default_reasoning_effort: None,
+            supported_reasoning_efforts: None,
+        });
+
+        let window = resolve_context_window(&settings, "chatgpt", "gpt-5.6-sol", None);
+        assert_eq!(window.default_limit, 258_400);
+        assert_eq!(window.max_limit, 258_400);
     }
 
     #[test]

@@ -74,6 +74,7 @@ function baseState(): ChatEventState {
       tool_call_id: "tool-2",
       content: "Written 5 bytes",
       is_error: false,
+      status: "done",
     },
     "assistant-1",
   );
@@ -83,4 +84,31 @@ function baseState(): ChatEventState {
   assertEqual(toolCall.status, "done", "tool result status");
   assertEqual(toolCall.result, "Written 5 bytes", "tool result content");
   assertEqual(done.pendingPermission, null, "tool result clears pending permission");
+}
+
+{
+  const waiting = reduceChatStreamEvent(
+    baseState(),
+    {
+      type: "permission_request",
+      tool_call_id: "tool-cancelled",
+      tool_name: "bash",
+      args: { command: "sleep 10" },
+    },
+    "assistant-1",
+  );
+  const cancelled = reduceChatStreamEvent(
+    waiting,
+    {
+      type: "tool_result",
+      tool_call_id: "tool-cancelled",
+      content: "Tool call cancelled by user.",
+      is_error: true,
+      status: "cancelled",
+    },
+    "assistant-1",
+  );
+
+  assertEqual(cancelled.messages[0].toolCalls?.[0].status, "cancelled", "cancel status");
+  assertEqual(cancelled.pendingPermission, null, "cancel clears pending permission");
 }

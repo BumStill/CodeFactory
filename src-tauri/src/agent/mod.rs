@@ -24,7 +24,7 @@ use codefactory_agent_core::{
     sanitize_completion_summary, should_prompt_budget_convergence, CompletionEvidence,
     CompletionGate, PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
@@ -44,6 +44,65 @@ use crate::openrouter::types::*;
 use crate::storage::Message;
 use crate::tools::{self, ExecCtx};
 use crate::PendingPermissionMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionResponse {
+    Allow,
+    Deny,
+    Cancelled,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StreamPoll<T> {
+    Item(Option<T>),
+    Cancelled,
+}
+
+async fn wait_for_cancellation(cancel: Option<&Arc<AtomicBool>>) {
+    loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn next_stream_item<S>(
+    stream: &mut S,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> StreamPoll<S::Item>
+where
+    S: Stream + Unpin,
+{
+    tokio::select! {
+        item = stream.next() => StreamPoll::Item(item),
+        _ = wait_for_cancellation(cancel), if cancel.is_some() => StreamPoll::Cancelled,
+    }
+}
+
+async fn await_permission_response(
+    receiver: tokio::sync::oneshot::Receiver<bool>,
+    cancel: Option<&Arc<AtomicBool>>,
+    max_wait: Duration,
+) -> PermissionResponse {
+    tokio::select! {
+        response = timeout(max_wait, receiver) => match response {
+            Ok(Ok(true)) => PermissionResponse::Allow,
+            _ => PermissionResponse::Deny,
+        },
+        _ = wait_for_cancellation(cancel), if cancel.is_some() => PermissionResponse::Cancelled,
+    }
+}
+
+fn cancelled_tool_suffix<'a>(
+    cancel: Option<&Arc<AtomicBool>>,
+    tool_calls: &'a [ToolCall],
+    start: usize,
+) -> Option<&'a [ToolCall]> {
+    cancel
+        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        .then(|| &tool_calls[start..])
+}
 
 /// Tool-call iteration ceiling for INTERACTIVE chat. Conservative
 /// because every iteration is a user-visible turn — letting it run too
@@ -317,6 +376,7 @@ pub struct AgentLoop {
     app: AppHandle,
     db: SqlitePool,
     session_id: String,
+    endpoint_name: String,
     model_id: String,
     base_url: String,
     api_key: String,
@@ -341,6 +401,55 @@ pub struct AgentLoop {
     /// polls it between rounds and stops cleanly — it never interrupts an
     /// in-flight tool call, and never touches the task scheduler.
     cancel: Option<Arc<AtomicBool>>,
+}
+
+fn resolve_chatgpt_reasoning_effort(
+    settings: &Settings,
+    endpoint_name: &str,
+    model_id: &str,
+    session_effort: Option<&str>,
+) -> crate::config::settings::ReasoningEffort {
+    use crate::config::settings::ReasoningEffort;
+
+    let requested = session_effort
+        .and_then(ReasoningEffort::parse)
+        .unwrap_or(settings.reasoning_effort);
+    let requested = match requested {
+        ReasoningEffort::Ultra => ReasoningEffort::Max,
+        effort => effort,
+    };
+    let model = settings
+        .endpoints
+        .get(endpoint_name)
+        .filter(|endpoint| matches!(endpoint.api_style, ApiStyle::Chatgpt))
+        .and_then(|endpoint| {
+            endpoint
+                .custom_models
+                .iter()
+                .find(|model| model.id == model_id)
+        });
+    let Some(model) = model else {
+        return requested;
+    };
+    let Some(supported) = model.supported_reasoning_efforts.as_deref() else {
+        return requested;
+    };
+
+    if supported.contains(&requested) {
+        return requested;
+    }
+    if let Some(default) = model.default_reasoning_effort {
+        if supported.is_empty() || supported.contains(&default) {
+            return default;
+        }
+    }
+    if supported.contains(&ReasoningEffort::Medium) {
+        return ReasoningEffort::Medium;
+    }
+    supported
+        .first()
+        .copied()
+        .unwrap_or(ReasoningEffort::Medium)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -373,6 +482,7 @@ impl AgentLoop {
         app: AppHandle,
         db: SqlitePool,
         session_id: String,
+        endpoint_name: String,
         model_id: String,
         base_url: String,
         api_key: String,
@@ -390,6 +500,7 @@ impl AgentLoop {
             app,
             db,
             session_id,
+            endpoint_name,
             model_id,
             base_url,
             api_key,
@@ -411,6 +522,7 @@ impl AgentLoop {
         app: AppHandle,
         db: SqlitePool,
         session_id: String,
+        endpoint_name: String,
         model_id: String,
         base_url: String,
         api_key: String,
@@ -426,6 +538,7 @@ impl AgentLoop {
             app,
             db,
             session_id,
+            endpoint_name,
             model_id,
             base_url,
             api_key,
@@ -457,6 +570,25 @@ impl AgentLoop {
     pub fn with_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
         self.cancel = Some(flag);
         self
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    fn emit_cancelled_done(&self, event_name: &str) {
+        tracing::info!("chat turn cancelled by user (session {})", self.session_id);
+        self.app
+            .emit(
+                event_name,
+                StreamEvent::Done {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                },
+            )
+            .ok();
     }
 
     pub async fn run(&mut self, history: Vec<Message>) -> Result<()> {
@@ -565,30 +697,25 @@ impl AgentLoop {
             // turn, end the stream cleanly between rounds. Checked here (not
             // mid tool-call) so in-flight work isn't hard-killed. No-op unless
             // a cancel flag was attached (chat only) and has actually tripped.
-            if let Some(c) = &self.cancel {
-                if c.load(Ordering::SeqCst) {
-                    tracing::info!("chat turn cancelled by user (session {})", self.session_id);
-                    self.app
-                        .emit(
-                            &event_name,
-                            StreamEvent::Done {
-                                input_tokens: 0,
-                                output_tokens: 0,
-                            },
-                        )
-                        .ok();
-                    emitted_terminal = true;
-                    break;
-                }
+            if self.is_cancelled() {
+                self.emit_cancelled_done(event_name);
+                emitted_terminal = true;
+                break;
             }
             // ── Context-window management ────────────────────────────────────
             // Estimate prompt tokens before sending. If we're over 75% of the
             // model's window, elide oversized tool results from the older
             // half. Notify the UI so the user knows what happened.
-            let context_limit = {
+            let (context_limit, max_context_limit) = {
                 let settings = self.settings.read().await;
-                let endpoint = settings.default_endpoint.clone();
-                context::resolve_context_length(&settings, &endpoint, &self.model_id, None)
+                let window = context::resolve_context_window(
+                    &settings,
+                    &self.endpoint_name,
+                    &self.model_id,
+                    None,
+                );
+                let estimated = context::estimate_prompt_tokens(&messages, system_prompt);
+                (window.select_limit(estimated), window.max_limit)
             };
             let compression = context::compress_if_needed(
                 std::mem::take(&mut messages),
@@ -624,6 +751,12 @@ impl AgentLoop {
             };
             finalization_pending = false;
 
+            if self.is_cancelled() {
+                self.emit_cancelled_done(event_name);
+                emitted_terminal = true;
+                break;
+            }
+
             // Emit real (provider-reported) context-usage right after each
             // round-trip so the UI bar tracks actual usage, not just our
             // estimate. The estimate is only used to *trigger* compression.
@@ -634,6 +767,7 @@ impl AgentLoop {
                         StreamEvent::ContextUsage {
                             used_tokens: u.prompt_tokens,
                             limit_tokens: context_limit,
+                            max_limit_tokens: max_context_limit,
                         },
                     )
                     .ok();
@@ -712,14 +846,11 @@ impl AgentLoop {
                     if !self.anonymous {
                         let inp = u.prompt_tokens as i64;
                         let out = u.completion_tokens as i64;
-                        let settings = self.settings.read().await;
-                        let endpoint = settings.default_endpoint.clone();
-                        drop(settings);
                         if let Err(e) = crate::commands::costs::record_cost_entry(
                             &self.db,
                             &self.session_id,
                             &self.model_id,
-                            &endpoint,
+                            &self.endpoint_name,
                             inp,
                             out,
                         )
@@ -737,7 +868,14 @@ impl AgentLoop {
             let mut result_messages = Vec::new();
             let mut progress_prompt = None;
 
-            for tc in &tool_calls {
+            for (tool_index, tc) in tool_calls.iter().enumerate() {
+                if let Some(remaining) =
+                    cancelled_tool_suffix(self.cancel.as_ref(), &tool_calls, tool_index)
+                {
+                    return self
+                        .finish_cancelled_tool_batch(event_name, remaining)
+                        .await;
+                }
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.function.arguments).unwrap_or_default();
                 let completion_args = args.clone();
@@ -785,13 +923,20 @@ impl AgentLoop {
                     match decision {
                         PermissionDecision::Allow => None,
                         PermissionDecision::Ask => {
-                            if self.request_permission(&event_name, tc, args.clone()).await {
-                                None
-                            } else {
-                                Some(
+                            match self.request_permission(&event_name, tc, args.clone()).await {
+                                PermissionResponse::Allow => None,
+                                PermissionResponse::Deny => Some(
                                     "Tool call denied by user. Please try a different approach."
                                         .to_string(),
-                                )
+                                ),
+                                PermissionResponse::Cancelled => {
+                                    return self
+                                        .finish_cancelled_tool_batch(
+                                            &event_name,
+                                            &tool_calls[tool_index..],
+                                        )
+                                        .await;
+                                }
                             }
                         }
                         PermissionDecision::Deny(reason) => {
@@ -813,17 +958,10 @@ impl AgentLoop {
                                 tool_call_id: tc.id.clone(),
                                 content: content.clone(),
                                 is_error: true,
+                                status: "denied".into(),
                             },
                         )
                         .ok();
-                    persist_tool_result_message(
-                        &self.db,
-                        &self.session_id,
-                        self.anonymous,
-                        &tc.id,
-                        &content,
-                    )
-                    .await?;
                     result_messages.push(ChatMessage {
                         role: "tool".into(),
                         content: MessageContent::Text(content),
@@ -853,17 +991,10 @@ impl AgentLoop {
                                 tool_call_id: tc.id.clone(),
                                 content: content.clone(),
                                 is_error: true,
+                                status: "denied".into(),
                             },
                         )
                         .ok();
-                    persist_tool_result_message(
-                        &self.db,
-                        &self.session_id,
-                        self.anonymous,
-                        &tc.id,
-                        &content,
-                    )
-                    .await?;
                     result_messages.push(ChatMessage {
                         role: "tool".into(),
                         content: MessageContent::Text(content),
@@ -967,18 +1098,14 @@ impl AgentLoop {
                             tool_call_id: tc.id.clone(),
                             content: output.content.clone(),
                             is_error: output.is_error,
+                            status: if output.is_error {
+                                "error".into()
+                            } else {
+                                "done".into()
+                            },
                         },
                     )
                     .ok();
-
-                persist_tool_result_message(
-                    &self.db,
-                    &self.session_id,
-                    self.anonymous,
-                    &tc.id,
-                    &output.content,
-                )
-                .await?;
 
                 result_messages.push(ChatMessage {
                     role: "tool".into(),
@@ -1070,7 +1197,7 @@ impl AgentLoop {
         event_name: &str,
         tc: &ToolCall,
         args: serde_json::Value,
-    ) -> bool {
+    ) -> PermissionResponse {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         self.pending_permissions
             .lock()
@@ -1088,14 +1215,57 @@ impl AgentLoop {
             )
             .ok();
 
-        match timeout(Duration::from_secs(600), receiver).await {
-            Ok(Ok(allow)) => allow,
-            Ok(Err(_)) => false,
-            Err(_) => {
-                self.pending_permissions.lock().await.remove(&tc.id);
-                false
+        let allow =
+            await_permission_response(receiver, self.cancel.as_ref(), Duration::from_secs(600))
+                .await;
+        self.pending_permissions.lock().await.remove(&tc.id);
+        allow
+    }
+
+    async fn finish_cancelled_tool_batch(
+        &self,
+        event_name: &str,
+        remaining: &[ToolCall],
+    ) -> Result<()> {
+        let contents =
+            persist_cancelled_tool_batch(&self.db, &self.session_id, self.anonymous, remaining)
+                .await?;
+        for (index, (tc, content)) in remaining.iter().zip(contents).enumerate() {
+            if index > 0 {
+                let args = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                self.app
+                    .emit(
+                        event_name,
+                        StreamEvent::ToolCallStart {
+                            id: tc.id.clone(),
+                            name: tc.function.name.clone(),
+                            args,
+                        },
+                    )
+                    .ok();
             }
+            self.app
+                .emit(
+                    event_name,
+                    StreamEvent::ToolResult {
+                        tool_call_id: tc.id.clone(),
+                        content: content.clone(),
+                        is_error: true,
+                        status: "cancelled".into(),
+                    },
+                )
+                .ok();
         }
+        self.app
+            .emit(
+                event_name,
+                StreamEvent::Done {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                },
+            )
+            .ok();
+        Ok(())
     }
 
     /// Flatten a message body to plain text. Text passes through; Parts keep
@@ -1130,7 +1300,6 @@ impl AgentLoop {
         tool_defs: &[ToolDefinition],
         event_name: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
-        use futures_util::StreamExt;
         let finalization_response = tool_defs.is_empty();
 
         let (access_token, account_id) = crate::codex_auth::valid_access_token().await?;
@@ -1201,12 +1370,16 @@ impl AgentLoop {
         .await
         .ok()
         .flatten();
-        let global = self.settings.read().await.reasoning_effort;
-        let effort = session_effort
-            .as_deref()
-            .and_then(crate::config::settings::ReasoningEffort::parse)
-            .unwrap_or(global)
-            .as_str();
+        let effort = {
+            let settings = self.settings.read().await;
+            resolve_chatgpt_reasoning_effort(
+                &settings,
+                &self.endpoint_name,
+                &self.model_id,
+                session_effort.as_deref(),
+            )
+            .as_str()
+        };
 
         let mut body = serde_json::json!({
             "model": self.model_id,
@@ -1260,7 +1433,11 @@ impl AgentLoop {
         let mut saw_terminal_marker = false;
         let mut malformed_data_lines = 0_usize;
 
-        'sse: while let Some(chunk) = byte_stream.next().await {
+        'sse: loop {
+            let chunk = match next_stream_item(&mut byte_stream, self.cancel.as_ref()).await {
+                StreamPoll::Item(Some(chunk)) => chunk,
+                StreamPoll::Item(None) | StreamPoll::Cancelled => break,
+            };
             let bytes = chunk?;
             byte_buffer.extend_from_slice(&bytes);
             while let Some(nl) = byte_buffer.iter().position(|&b| b == b'\n') {
@@ -1359,6 +1536,11 @@ impl AgentLoop {
                     _ => {}
                 }
             }
+        }
+
+        if self.is_cancelled() {
+            let reasoning = (!reasoning_buf.is_empty()).then_some(reasoning_buf);
+            return Ok((text_buf, Vec::new(), usage, reasoning));
         }
 
         validate_openai_sse_completion(
@@ -1501,7 +1683,11 @@ impl AgentLoop {
         // never sees an incomplete codepoint.
         let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
 
-        'sse: while let Some(chunk) = byte_stream.next().await {
+        'sse: loop {
+            let chunk = match next_stream_item(&mut byte_stream, self.cancel.as_ref()).await {
+                StreamPoll::Item(Some(chunk)) => chunk,
+                StreamPoll::Item(None) | StreamPoll::Cancelled => break,
+            };
             let bytes = chunk?;
             byte_buffer.extend_from_slice(&bytes);
 
@@ -1565,6 +1751,11 @@ impl AgentLoop {
                     }
                 }
             }
+        }
+
+        if self.is_cancelled() {
+            let reasoning = (!reasoning_buf.is_empty()).then_some(reasoning_buf);
+            return Ok((text_buf, Vec::new(), usage, reasoning));
         }
 
         validate_openai_sse_completion(
@@ -1856,21 +2047,10 @@ impl AgentLoop {
             // turn, end the stream cleanly between rounds. Checked here (not
             // mid tool-call) so in-flight work isn't hard-killed. No-op unless
             // a cancel flag was attached (chat only) and has actually tripped.
-            if let Some(c) = &self.cancel {
-                if c.load(Ordering::SeqCst) {
-                    tracing::info!("chat turn cancelled by user (session {})", self.session_id);
-                    self.app
-                        .emit(
-                            event_name,
-                            StreamEvent::Done {
-                                input_tokens: 0,
-                                output_tokens: 0,
-                            },
-                        )
-                        .ok();
-                    emitted_terminal = true;
-                    break;
-                }
+            if self.is_cancelled() {
+                self.emit_cancelled_done(event_name);
+                emitted_terminal = true;
+                break;
             }
             // We don't run elision compression on the Anthropic path because
             // its messages are serde_json::Value-shaped, not ChatMessage.
@@ -1879,10 +2059,15 @@ impl AgentLoop {
             // when Anthropic returns input_tokens, so the UI bar stays
             // accurate. TODO: port elision to work on Value-shaped messages
             // for Anthropic users.
-            let context_limit = {
+            let (context_limit, max_context_limit) = {
                 let settings = self.settings.read().await;
-                let endpoint = settings.default_endpoint.clone();
-                context::resolve_context_length(&settings, &endpoint, &self.model_id, None)
+                let window = context::resolve_context_window(
+                    &settings,
+                    &self.endpoint_name,
+                    &self.model_id,
+                    None,
+                );
+                (window.default_limit, window.max_limit)
             };
 
             let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
@@ -1894,11 +2079,18 @@ impl AgentLoop {
                 system_prompt,
                 messages.clone(),
                 active_tool_defs,
+                self.cancel.as_ref(),
                 &self.app,
                 event_name,
             )
             .await?;
             finalization_pending = false;
+
+            if resp.cancelled || self.is_cancelled() {
+                self.emit_cancelled_done(event_name);
+                emitted_terminal = true;
+                break;
+            }
 
             // Emit context usage if Anthropic reported it (it sets 0 when missing)
             if resp.input_tokens > 0 {
@@ -1908,6 +2100,7 @@ impl AgentLoop {
                         StreamEvent::ContextUsage {
                             used_tokens: resp.input_tokens.max(0) as u32,
                             limit_tokens: context_limit,
+                            max_limit_tokens: max_context_limit,
                         },
                     )
                     .ok();
@@ -1977,14 +2170,11 @@ impl AgentLoop {
                 // Persist cost entry — NEVER for anonymous runs (no billing,
                 // no usage-stats trace). Mirrors the OpenAI-path guard.
                 if !self.anonymous {
-                    let settings = self.settings.read().await;
-                    let endpoint = settings.default_endpoint.clone();
-                    drop(settings);
                     if let Err(e) = crate::commands::costs::record_cost_entry(
                         &self.db,
                         &self.session_id,
                         &self.model_id,
-                        &endpoint,
+                        &self.endpoint_name,
                         inp,
                         out,
                     )
@@ -2022,7 +2212,14 @@ impl AgentLoop {
             let mut tool_result_blocks: Vec<serde_json::Value> = Vec::new();
             let mut progress_prompt = None;
 
-            for tc in &tool_calls {
+            for (tool_index, tc) in tool_calls.iter().enumerate() {
+                if let Some(remaining) =
+                    cancelled_tool_suffix(self.cancel.as_ref(), &tool_calls, tool_index)
+                {
+                    return self
+                        .finish_cancelled_tool_batch(event_name, remaining)
+                        .await;
+                }
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.function.arguments).unwrap_or_default();
                 let completion_args = args.clone();
@@ -2068,13 +2265,20 @@ impl AgentLoop {
                     match decision {
                         PermissionDecision::Allow => None,
                         PermissionDecision::Ask => {
-                            if self.request_permission(event_name, tc, args.clone()).await {
-                                None
-                            } else {
-                                Some(
+                            match self.request_permission(event_name, tc, args.clone()).await {
+                                PermissionResponse::Allow => None,
+                                PermissionResponse::Deny => Some(
                                     "Tool call denied by user. Please try a different approach."
                                         .to_string(),
-                                )
+                                ),
+                                PermissionResponse::Cancelled => {
+                                    return self
+                                        .finish_cancelled_tool_batch(
+                                            event_name,
+                                            &tool_calls[tool_index..],
+                                        )
+                                        .await;
+                                }
                             }
                         }
                         PermissionDecision::Deny(reason) => {
@@ -2096,17 +2300,10 @@ impl AgentLoop {
                                 tool_call_id: tc.id.clone(),
                                 content: content.clone(),
                                 is_error: true,
+                                status: "denied".into(),
                             },
                         )
                         .ok();
-                    persist_tool_result_message(
-                        &self.db,
-                        &self.session_id,
-                        self.anonymous,
-                        &tc.id,
-                        &content,
-                    )
-                    .await?;
                     tool_result_blocks.push(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": tc.id,
@@ -2133,17 +2330,10 @@ impl AgentLoop {
                                 tool_call_id: tc.id.clone(),
                                 content: content.clone(),
                                 is_error: true,
+                                status: "denied".into(),
                             },
                         )
                         .ok();
-                    persist_tool_result_message(
-                        &self.db,
-                        &self.session_id,
-                        self.anonymous,
-                        &tc.id,
-                        &content,
-                    )
-                    .await?;
                     tool_result_blocks.push(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": tc.id,
@@ -2244,18 +2434,14 @@ impl AgentLoop {
                             tool_call_id: tc.id.clone(),
                             content: output.content.clone(),
                             is_error: output.is_error,
+                            status: if output.is_error {
+                                "error".into()
+                            } else {
+                                "done".into()
+                            },
                         },
                     )
                     .ok();
-
-                persist_tool_result_message(
-                    &self.db,
-                    &self.session_id,
-                    self.anonymous,
-                    &tc.id,
-                    &output.content,
-                )
-                .await?;
 
                 tool_result_blocks.push(serde_json::json!({
                     "type": "tool_result",
@@ -2507,32 +2693,35 @@ fn parse_tool_message_content(raw: &str) -> (String, String) {
     (String::new(), raw.to_string())
 }
 
-async fn persist_tool_result_message(
+async fn persist_cancelled_tool_batch(
     db: &SqlitePool,
     session_id: &str,
     anonymous: bool,
-    tool_call_id: &str,
-    content: &str,
-) -> Result<()> {
-    if anonymous {
-        return Ok(());
+    remaining: &[ToolCall],
+) -> Result<Vec<String>> {
+    let mut contents = Vec::with_capacity(remaining.len());
+    for (index, tool_call) in remaining.iter().enumerate() {
+        let content = if index == 0 {
+            "Tool call cancelled by user."
+        } else {
+            "Tool call skipped because the batch was cancelled by user."
+        }
+        .to_string();
+        if !anonymous {
+            crate::trajectory::record_terminal_tool_outcome(
+                db,
+                session_id,
+                &tool_call.id,
+                "cancelled",
+                None,
+                Some(&content),
+                0,
+            )
+            .await?;
+        }
+        contents.push(content);
     }
-    let tool_content = serde_json::json!({
-        "tool_call_id": tool_call_id,
-        "content": content,
-    })
-    .to_string();
-    sqlx::query(
-        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-    )
-    .bind(Uuid::new_v4().to_string())
-    .bind(session_id)
-    .bind("tool")
-    .bind(tool_content)
-    .bind(Utc::now().timestamp_millis())
-    .execute(db)
-    .await?;
-    Ok(())
+    Ok(contents)
 }
 
 fn repair_incomplete_tool_history(history: Vec<Message>) -> Vec<Message> {
@@ -2922,6 +3111,309 @@ fn glob_match(pattern: &str, input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_permission_is_released_by_chat_cancellation() {
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        assert_eq!(
+            await_permission_response(receiver, Some(&cancel), Duration::from_secs(1)).await,
+            PermissionResponse::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_stream_is_released_by_chat_cancellation() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut stream = futures_util::stream::pending::<u8>();
+
+        assert!(matches!(
+            next_stream_item(&mut stream, Some(&cancel)).await,
+            StreamPoll::Cancelled
+        ));
+    }
+
+    #[test]
+    fn cancellation_selects_only_the_unstarted_tool_suffix() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let calls = vec![
+            ToolCall {
+                id: "call-finished".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            ToolCall {
+                id: "call-unstarted".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "write_file".into(),
+                    arguments: "{}".into(),
+                },
+            },
+        ];
+
+        let remaining = cancelled_tool_suffix(Some(&cancel), &calls, 1).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "call-unstarted");
+    }
+
+    #[tokio::test]
+    async fn cancellation_terminalizes_every_remaining_tool_call() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE tool_calls (
+                id TEXT PRIMARY KEY, message_id TEXT NOT NULL, tool_name TEXT NOT NULL,
+                arguments TEXT NOT NULL DEFAULT '{}', result TEXT, status TEXT NOT NULL,
+                error TEXT, duration_ms INTEGER, created_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+                content TEXT NOT NULL, created_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let calls = vec![
+            ToolCall {
+                id: "call-current".into(),
+                r#type: "function".into(),
+                function: crate::openrouter::types::FunctionCall {
+                    name: "bash".into(),
+                    arguments: r#"{"command":"sleep 10"}"#.into(),
+                },
+            },
+            ToolCall {
+                id: "call-later".into(),
+                r#type: "function".into(),
+                function: crate::openrouter::types::FunctionCall {
+                    name: "write_file".into(),
+                    arguments: "{}".into(),
+                },
+            },
+        ];
+        for call in &calls {
+            crate::trajectory::record_tool_call_started(
+                &pool,
+                "session-1",
+                "message-1",
+                &call.id,
+                &call.function.name,
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        }
+
+        let contents = persist_cancelled_tool_batch(&pool, "session-1", false, &calls)
+            .await
+            .unwrap();
+
+        let cancelled: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM tool_calls WHERE status = 'cancelled'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let replayed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE role = 'tool' AND content LIKE '%cancelled%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cancelled, 2);
+        assert_eq!(replayed, 2);
+        assert!(contents[1].contains("batch"));
+    }
+
+    fn settings_with_chatgpt_model(
+        model: crate::config::settings::CustomModel,
+        global: crate::config::settings::ReasoningEffort,
+    ) -> Settings {
+        let mut settings = Settings::default();
+        settings.default_endpoint = "chatgpt".into();
+        settings.default_model = model.id.clone();
+        settings.reasoning_effort = global;
+        settings.endpoints.insert(
+            "chatgpt".into(),
+            crate::config::settings::Endpoint {
+                base_url: crate::codex_auth::CHATGPT_BASE_URL.into(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                active_model: Some(model.id.clone()),
+                custom_models: vec![model],
+            },
+        );
+        settings
+    }
+
+    #[test]
+    fn chatgpt_effort_maps_legacy_ultra_override_to_transport_max() {
+        use crate::config::settings::{CustomModel, ReasoningEffort};
+
+        let settings = settings_with_chatgpt_model(
+            CustomModel {
+                id: "gpt-5.6-sol".into(),
+                name: None,
+                context_length: Some(272000),
+                max_context_length: Some(272000),
+                effective_context_window_percent: Some(95),
+                default_reasoning_effort: Some(ReasoningEffort::Low),
+                supported_reasoning_efforts: Some(vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::Max,
+                ]),
+            },
+            ReasoningEffort::High,
+        );
+
+        assert_eq!(
+            resolve_chatgpt_reasoning_effort(&settings, "chatgpt", "gpt-5.6-sol", Some("ultra")),
+            ReasoningEffort::Max
+        );
+    }
+
+    #[test]
+    fn chatgpt_effort_maps_legacy_ultra_without_capability_metadata() {
+        use crate::config::settings::{CustomModel, ReasoningEffort};
+
+        let settings = settings_with_chatgpt_model(
+            CustomModel {
+                id: "legacy-model".into(),
+                name: None,
+                context_length: None,
+                max_context_length: None,
+                effective_context_window_percent: None,
+                default_reasoning_effort: None,
+                supported_reasoning_efforts: None,
+            },
+            ReasoningEffort::High,
+        );
+
+        assert_eq!(
+            resolve_chatgpt_reasoning_effort(&settings, "chatgpt", "legacy-model", Some("ultra")),
+            ReasoningEffort::Max
+        );
+    }
+
+    #[test]
+    fn chatgpt_effort_falls_back_to_model_default_when_requested_is_unsupported() {
+        use crate::config::settings::{CustomModel, ReasoningEffort};
+
+        let settings = settings_with_chatgpt_model(
+            CustomModel {
+                id: "gpt-5.5".into(),
+                name: None,
+                context_length: Some(272000),
+                max_context_length: Some(272000),
+                effective_context_window_percent: Some(95),
+                default_reasoning_effort: Some(ReasoningEffort::Low),
+                supported_reasoning_efforts: Some(vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::XHigh,
+                ]),
+            },
+            ReasoningEffort::Ultra,
+        );
+
+        assert_eq!(
+            resolve_chatgpt_reasoning_effort(&settings, "chatgpt", "gpt-5.5", None),
+            ReasoningEffort::Low
+        );
+    }
+
+    #[test]
+    fn chatgpt_effort_falls_back_to_medium_without_model_default() {
+        use crate::config::settings::{CustomModel, ReasoningEffort};
+
+        let settings = settings_with_chatgpt_model(
+            CustomModel {
+                id: "future-model".into(),
+                name: None,
+                context_length: None,
+                max_context_length: None,
+                effective_context_window_percent: None,
+                default_reasoning_effort: None,
+                supported_reasoning_efforts: Some(vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ]),
+            },
+            ReasoningEffort::Max,
+        );
+
+        assert_eq!(
+            resolve_chatgpt_reasoning_effort(&settings, "chatgpt", "future-model", None),
+            ReasoningEffort::Medium
+        );
+    }
+
+    #[test]
+    fn chatgpt_effort_preserves_legacy_behavior_without_capability_metadata() {
+        use crate::config::settings::{CustomModel, ReasoningEffort};
+
+        let settings = settings_with_chatgpt_model(
+            CustomModel {
+                id: "legacy-model".into(),
+                name: None,
+                context_length: None,
+                max_context_length: None,
+                effective_context_window_percent: None,
+                default_reasoning_effort: None,
+                supported_reasoning_efforts: None,
+            },
+            ReasoningEffort::High,
+        );
+
+        assert_eq!(
+            resolve_chatgpt_reasoning_effort(&settings, "chatgpt", "legacy-model", Some("xhigh")),
+            ReasoningEffort::XHigh
+        );
+    }
+
+    #[test]
+    fn chatgpt_effort_finds_session_model_after_default_endpoint_switches() {
+        use crate::config::settings::{CustomModel, ReasoningEffort};
+
+        let mut settings = settings_with_chatgpt_model(
+            CustomModel {
+                id: "gpt-session-model".into(),
+                name: None,
+                context_length: None,
+                max_context_length: None,
+                effective_context_window_percent: None,
+                default_reasoning_effort: Some(ReasoningEffort::Low),
+                supported_reasoning_efforts: Some(vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ]),
+            },
+            ReasoningEffort::Ultra,
+        );
+        settings.default_endpoint = "openrouter".into();
+
+        assert_eq!(
+            resolve_chatgpt_reasoning_effort(&settings, "chatgpt", "gpt-session-model", None),
+            ReasoningEffort::Low
+        );
+    }
 
     fn stored_message(role: &str, content: &str, tool_calls: Option<String>) -> Message {
         Message {
@@ -3429,41 +3921,6 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    #[tokio::test]
-    async fn denied_tool_results_are_persisted_for_future_provider_replay() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at INTEGER)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        persist_tool_result_message(
-            &pool,
-            "session-1",
-            false,
-            "call-denied",
-            "Tool call denied by completion policy",
-        )
-        .await
-        .unwrap();
-
-        let (role, content): (String, String) =
-            sqlx::query_as("SELECT role, content FROM messages LIMIT 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(role, "tool");
-        let (tool_call_id, persisted_content) = parse_tool_message_content(&content);
-        assert_eq!(tool_call_id, "call-denied");
-        assert_eq!(persisted_content, "Tool call denied by completion policy");
     }
 
     #[test]

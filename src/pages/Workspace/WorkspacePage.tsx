@@ -115,8 +115,8 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSetti
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
   const guideNextStep = async (message: string) => {
     const trimmed = message.trim();
-    if (!trimmed || !activeSession) return;
-    await invoke("queue_interjection", { sessionId: activeSession.id, message: trimmed });
+    if (!trimmed) return;
+    await invoke("queue_interjection", { sessionId, message: trimmed });
   };
   // Double-click the session title (here or in the sidebar) to rename it inline.
   const [titleEditing, setTitleEditing] = useState(false);
@@ -385,7 +385,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSetti
             key={activeSession?.id ?? sessionId}
             initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
             onSend={(t) => void sendOrQueue(t)}
-            onGuide={(t) => void guideNextStep(t)}
+            onGuide={guideNextStep}
             onCancel={() => cancelStream()}
             streaming={streaming}
             guidanceActive={autonomousRunActive}
