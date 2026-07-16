@@ -2,11 +2,13 @@
 //! Streaming client for the Anthropic Messages API.
 
 use codefactory_agent_core::sanitize_completion_summary;
-use futures_util::StreamExt;
 use reqwest::Client;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 
+use super::{next_stream_item, StreamPoll};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionCall, StreamEvent, ToolCall, ToolDefinition};
 
@@ -29,6 +31,7 @@ pub struct AnthropicResponse {
     pub tool_calls: Vec<ToolCall>,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cancelled: bool,
 }
 
 pub async fn stream_anthropic(
@@ -39,6 +42,7 @@ pub async fn stream_anthropic(
     system_prompt: &str,
     messages: Vec<serde_json::Value>,
     tools: &[ToolDefinition],
+    cancel: Option<&Arc<AtomicBool>>,
     app_handle: &AppHandle,
     event_name: &str,
 ) -> Result<AnthropicResponse> {
@@ -83,13 +87,22 @@ pub async fn stream_anthropic(
     // token usage (populated from message_start / message_delta events)
     let mut input_tokens: i64 = 0;
     let mut output_tokens: i64 = 0;
+    let mut cancelled = false;
 
     // SSE line buffering — see agent/mod.rs for full rationale.
     // TL;DR: SSE events split across TCP chunks must be reassembled, or
     // every cross-chunk event gets silently dropped, corrupting tool args.
     let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
 
-    while let Some(chunk) = byte_stream.next().await {
+    loop {
+        let chunk = match next_stream_item(&mut byte_stream, cancel).await {
+            StreamPoll::Item(Some(chunk)) => chunk,
+            StreamPoll::Item(None) => break,
+            StreamPoll::Cancelled => {
+                cancelled = true;
+                break;
+            }
+        };
         let bytes = chunk?;
         byte_buffer.extend_from_slice(&bytes);
 
@@ -261,5 +274,6 @@ pub async fn stream_anthropic(
         tool_calls,
         input_tokens,
         output_tokens,
+        cancelled,
     })
 }

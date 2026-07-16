@@ -179,7 +179,7 @@ pub(crate) async fn record_tool_call_finished(
     error: Option<&str>,
     duration_ms: i64,
 ) -> Result<(), AppError> {
-    if !matches!(status, "done" | "error" | "denied") {
+    if !matches!(status, "done" | "error" | "denied" | "cancelled") {
         return Err(AppError::Other(format!(
             "unsupported normalized tool-call status: {status}"
         )));
@@ -215,7 +215,7 @@ pub(crate) async fn record_terminal_tool_outcome(
     error: Option<&str>,
     duration_ms: i64,
 ) -> Result<(), AppError> {
-    if !matches!(status, "done" | "error" | "denied") {
+    if !matches!(status, "done" | "error" | "denied" | "cancelled") {
         return Err(AppError::Other(format!(
             "unsupported normalized tool-call status: {status}"
         )));
@@ -439,6 +439,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_tool_is_terminal_and_replayable() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        record_tool_call_started(
+            &pool,
+            "session-1",
+            "message-1",
+            "call-cancelled",
+            "bash",
+            &json!({"command":"sleep 10"}),
+        )
+        .await
+        .unwrap();
+
+        record_terminal_tool_outcome(
+            &pool,
+            "session-1",
+            "call-cancelled",
+            "cancelled",
+            None,
+            Some("Tool call cancelled by user."),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM tool_calls WHERE id = 'session-1:call-cancelled'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let replay: String = sqlx::query_scalar(
+            "SELECT content FROM messages WHERE id = 'session-1:call-cancelled:result'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "cancelled");
+        assert_eq!(
+            serde_json::from_str::<Value>(&replay).unwrap()["status"],
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
     async fn normalized_tool_lifecycle_persists_error_and_is_idempotent() {
         let pool = test_pool().await;
         for _ in 0..2 {
@@ -566,15 +623,18 @@ mod tests {
         .await
         .unwrap();
 
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT role, content FROM messages ORDER BY created_at ASC",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT role, content FROM messages ORDER BY created_at ASC")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|(role, _)| role == "tool"));
-        let joined = rows.iter().map(|(_, content)| content.as_str()).collect::<Vec<_>>().join("\n");
+        let joined = rows
+            .iter()
+            .map(|(_, content)| content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(joined.contains("call-done"));
         assert!(joined.contains("call-error"));
         assert!(joined.contains("call-denied"));

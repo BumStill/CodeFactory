@@ -385,7 +385,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSetti
             key={activeSession?.id ?? sessionId}
             initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
             onSend={(t) => void sendOrQueue(t)}
-            onGuide={(t) => void guideNextStep(t)}
+            onGuide={guideNextStep}
             onCancel={() => cancelStream()}
             streaming={streaming}
             guidanceActive={autonomousRunActive}

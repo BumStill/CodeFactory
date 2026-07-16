@@ -51,7 +51,7 @@ describe("reasoningPickerVisible", () => {
         custom_models: [
           {
             id: "gpt-5.6-sol",
-            supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+            supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
           },
           {
             id: "gpt-5.5",
@@ -67,7 +67,6 @@ describe("reasoningPickerVisible", () => {
       "high",
       "xhigh",
       "max",
-      "ultra",
     ]);
     expect(reasoningEffortsForModel(chatgpt, "gpt-5.5")).toEqual([
       "low",

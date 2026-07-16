@@ -42,7 +42,7 @@ function isImageAttachment(name: string): boolean {
 interface Props {
   onSend: (text: string) => void;
   /** Route the primary input as an autonomous-run interjection instead of a chat turn. */
-  onGuide?: (text: string) => void | Promise<void>;
+  onGuide?: (text: string) => Promise<void>;
   onCommand?: (command: ParsedSlashCommand) => void | Promise<void>;
   onCancel: () => void;
   streaming: boolean;

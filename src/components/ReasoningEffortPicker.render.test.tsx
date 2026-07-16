@@ -20,7 +20,7 @@ vi.mock("../stores/settings", () => ({
           custom_models: [{
             id: "gpt-5.6-sol",
             default_reasoning_effort: "low",
-            supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+            supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
           }],
         },
       },
@@ -30,29 +30,28 @@ vi.mock("../stores/settings", () => ({
 
 vi.mock("../stores/chat", () => ({
   useChatStore: (selector: (state: unknown) => unknown) => selector({
-    activeSession: { id: "s1", model_id: "gpt-5.6-sol", reasoning_effort: "high" },
+    activeSession: { id: "s1", model_id: "gpt-5.6-sol", reasoning_effort: "ultra" },
     updateActiveSessionReasoningEffort: setEffort,
   }),
 }));
 
 describe("ReasoningEffortPicker model capabilities", () => {
-  it("renders every supported GPT-5.6 Sol effort and persists ultra", async () => {
+  it("renders transport-supported efforts and maps a legacy ultra selection to max", async () => {
     setEffort.mockReset();
     const user = userEvent.setup();
     render(<ReasoningEffortPicker />);
 
     const picker = screen.getByRole("combobox");
-    expect(picker).toHaveValue("high");
+    expect(picker).toHaveValue("max");
     expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
       "思考·低",
       "思考·中",
       "思考·高",
       "思考·超高",
       "思考·最大",
-      "思考·极致",
     ]);
 
-    await user.selectOptions(picker, "ultra");
-    expect(setEffort).toHaveBeenCalledWith("ultra");
+    await user.selectOptions(picker, "high");
+    expect(setEffort).toHaveBeenCalledWith("high");
   });
 });

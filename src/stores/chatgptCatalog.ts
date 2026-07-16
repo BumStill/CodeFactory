@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-import { codexAccount, codexModels } from "../lib/tauri";
+import { applyCodexModels, codexAccount, codexModels } from "../lib/tauri";
 import {
-  CHATGPT_BASE_URL,
   CHATGPT_ENDPOINT_KEY,
   selectChatGptCatalog,
-  selectChatGptDefaultModel,
 } from "../lib/chatgptModels";
 import { useSettingsStore } from "./settings";
 
@@ -19,9 +17,7 @@ export async function syncChatGptCatalog(knownSignedIn = false): Promise<void> {
   const fetched = await codexModels().catch(() => null);
   const liveModels = fetched?.length ? fetched : null;
 
-  // Read settings after the network request so a concurrent user save is not
-  // overwritten by the snapshot that existed when the refresh started.
-  const { settings, save } = useSettingsStore.getState();
+  const { settings, load } = useSettingsStore.getState();
   if (!settings) return;
 
   const existing = settings.endpoints[CHATGPT_ENDPOINT_KEY];
@@ -31,30 +27,22 @@ export async function syncChatGptCatalog(knownSignedIn = false): Promise<void> {
   if (!liveModels && hasLastKnownCapabilities) return;
 
   const models = selectChatGptCatalog(liveModels);
-  if (existing && JSON.stringify(existing.custom_models ?? []) === JSON.stringify(models)) return;
+  const validModelIds = new Set(models.map((model) => model.id));
+  const selectionsAreValid =
+    !!existing?.active_model &&
+    validModelIds.has(existing.active_model) &&
+    (settings.default_endpoint !== CHATGPT_ENDPOINT_KEY || validModelIds.has(settings.default_model));
+  if (
+    existing &&
+    selectionsAreValid &&
+    JSON.stringify(existing.custom_models ?? []) === JSON.stringify(models)
+  ) {
+    return;
+  }
 
-  const validIds = models.map((model) => model.id);
-  const active =
-    existing?.active_model && validIds.includes(existing.active_model)
-      ? existing.active_model
-      : selectChatGptDefaultModel(models);
-
-  await save({
-    ...settings,
-    endpoints: {
-      ...settings.endpoints,
-      [CHATGPT_ENDPOINT_KEY]: {
-        base_url: CHATGPT_BASE_URL,
-        api_style: "chatgpt",
-        custom_models: models,
-        active_model: active,
-      },
-    },
-    default_endpoint: existing ? settings.default_endpoint : CHATGPT_ENDPOINT_KEY,
-    default_model:
-      existing &&
-      (settings.default_endpoint !== CHATGPT_ENDPOINT_KEY || validIds.includes(settings.default_model))
-        ? settings.default_model
-        : active,
-  });
+  // The backend applies an endpoint-scoped patch under the same settings lock
+  // used by logout, so this refresh cannot overwrite unrelated concurrent saves
+  // or resurrect the endpoint after the user signs out.
+  await applyCodexModels(models);
+  await load();
 }

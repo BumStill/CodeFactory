@@ -25,10 +25,21 @@ export type StreamEvent =
   | { type: "tool_call_start"; id: string; name: string; args: unknown }
   | { type: "tool_call_args_delta"; index: number; chunk: string }
   | { type: "tool_call_end"; index: number }
-  | { type: "tool_result"; tool_call_id: string; content: string; is_error: boolean }
+  | {
+      type: "tool_result";
+      tool_call_id: string;
+      content: string;
+      is_error: boolean;
+      status: "done" | "error" | "denied" | "cancelled";
+    }
   | { type: "permission_request"; tool_call_id: string; tool_name: string; args: unknown }
   | { type: "done"; input_tokens: number; output_tokens: number }
-  | { type: "context_usage"; used_tokens: number; limit_tokens: number }
+  | {
+      type: "context_usage";
+      used_tokens: number;
+      limit_tokens: number;
+      max_limit_tokens?: number;
+    }
   | { type: "context_compressed"; elided_count: number; tokens_freed: number }
   | {
       type: "transport_retry";
@@ -88,6 +99,8 @@ export interface CustomModel {
   id: string;
   name?: string;
   context_length?: number;
+  max_context_length?: number;
+  effective_context_window_percent?: number;
   default_reasoning_effort?: ReasoningEffort;
   supported_reasoning_efforts?: ReasoningEffort[];
 }
@@ -132,6 +145,10 @@ export function codexAccount(): Promise<CodexAccount | null> {
 
 export function codexModels(): Promise<CustomModel[]> {
   return invoke<CustomModel[]>("codex_models");
+}
+
+export function applyCodexModels(models: CustomModel[]): Promise<void> {
+  return invoke<void>("apply_codex_models", { models });
 }
 
 // ── Benchmarks ─────────────────────────────────────────────────────────────

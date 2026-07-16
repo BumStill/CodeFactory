@@ -14,11 +14,13 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<Settings, AppErr
 pub async fn save_settings(
     mut new_settings: Settings,
     state: State<'_, AppState>,
-) -> Result<(), AppError> {
+) -> Result<Settings, AppError> {
+    let mut current = state.settings.write().await;
+    crate::codex_auth::reconcile_chatgpt_settings(&current, &mut new_settings);
     settings::persist_git_remote_inline_tokens(&mut new_settings)?;
     settings::save(&new_settings)?;
-    *state.settings.write().await = new_settings;
-    Ok(())
+    *current = new_settings.clone();
+    Ok(new_settings)
 }
 
 #[tauri::command]

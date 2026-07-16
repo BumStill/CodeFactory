@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   codexLogout: vi.fn(),
   codexAccount: vi.fn(),
   codexModels: vi.fn(),
+  applyCodexModels: vi.fn(),
   invoke: vi.fn(),
   loadRemotes: vi.fn(),
   addRemote: vi.fn(),
@@ -116,6 +117,7 @@ vi.mock("../../lib/tauri", () => ({
   codexLogout: mocks.codexLogout,
   codexAccount: mocks.codexAccount,
   codexModels: mocks.codexModels,
+  applyCodexModels: mocks.applyCodexModels,
 }));
 
 const existingHook = {

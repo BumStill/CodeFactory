@@ -833,7 +833,6 @@ export function SettingsPage({ onBack }: Props) {
                   ["high", "高"],
                   ["xhigh", "超高"],
                   ["max", "最大"],
-                  ["ultra", "极致"],
                 ] as const).map(([v, label]) => (
                   <option key={v} value={v}>
                     {label}
@@ -1413,21 +1412,6 @@ function AppearanceTab() {
 // Stage-1/3 surface: runs the OAuth login and shows the signed-in account.
 // Wiring the signed-in session into model requests (subscription Responses API)
 // is handled separately by the request layer.
-// Drop the ChatGPT endpoint on sign-out so it can't linger as a broken default.
-async function removeChatGptEndpoint() {
-  const { settings, save } = useSettingsStore.getState();
-  if (!settings || !settings.endpoints[CHATGPT_ENDPOINT_KEY]) return;
-  const { [CHATGPT_ENDPOINT_KEY]: _removed, ...rest } = settings.endpoints;
-  await save({
-    ...settings,
-    endpoints: rest,
-    default_endpoint:
-      settings.default_endpoint === CHATGPT_ENDPOINT_KEY
-        ? (Object.keys(rest)[0] ?? "")
-        : settings.default_endpoint,
-  });
-}
-
 function ChatGptLoginCard() {
   // undefined = still checking; null = signed out; object = signed in.
   const [account, setAccount] = useState<CodexAccount | null | undefined>(undefined);
@@ -1469,7 +1453,7 @@ function ChatGptLoginCard() {
     try {
       await codexLogout();
       setAccount(null);
-      await removeChatGptEndpoint();
+      await useSettingsStore.getState().load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

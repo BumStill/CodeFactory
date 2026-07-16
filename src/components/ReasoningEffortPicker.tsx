@@ -44,6 +44,9 @@ function effectiveEffort(
   supported: ReasoningEffort[],
   fallback?: ReasoningEffort,
 ): ReasoningEffort {
+  // v1.46.0 could persist the catalog-only `ultra` label even though the
+  // ChatGPT Responses transport accepts `max` as its highest request value.
+  if (requested === "ultra" && supported.includes("max")) return "max";
   if (supported.includes(requested)) return requested;
   if (fallback && supported.includes(fallback)) return fallback;
   if (supported.includes("medium")) return "medium";

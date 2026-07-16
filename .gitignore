@@ -1,5 +1,6 @@
 # Rust / Cargo build artifacts
 target/
+.codefactory-cache/
 **/*.rs.bk
 
 # Node / pnpm

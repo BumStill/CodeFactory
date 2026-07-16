@@ -2,7 +2,7 @@
 import { useState } from "react";
 import {
   ChevronDown, ChevronRight,
-  AlertCircle, CheckCircle, ShieldQuestion,
+  AlertCircle, Ban, CheckCircle, ShieldQuestion,
   FileText, Edit3, Save, TerminalSquare, Search, FolderTree,
   Globe, Wrench, Bot, BookOpen, ExternalLink,
 } from "lucide-react";
@@ -267,6 +267,8 @@ export function ToolCallCard({ tc }: Props) {
       <ShieldQuestion size={12} className="text-amber-400 shrink-0" />
     ) : tc.status === "done" && !tc.isError ? (
       <CheckCircle size={12} className="text-green-500 shrink-0" />
+    ) : tc.status === "cancelled" ? (
+      <Ban size={12} className="text-gray-500 shrink-0" aria-label="已取消" />
     ) : tc.status === "error" || tc.status === "denied" || tc.isError ? (
       <AlertCircle size={12} className="text-red-400 shrink-0" />
     ) : (

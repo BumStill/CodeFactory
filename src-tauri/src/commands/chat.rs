@@ -12,6 +12,29 @@ use crate::mcp::McpManager;
 use crate::openrouter::types::StreamEvent;
 use crate::AppState;
 
+fn endpoint_requires_api_key(api_style: &crate::config::settings::ApiStyle) -> bool {
+    !matches!(api_style, crate::config::settings::ApiStyle::Chatgpt)
+}
+
+fn load_endpoint_api_key(
+    endpoint_name: &str,
+    endpoint: &crate::config::settings::Endpoint,
+) -> Result<(Option<String>, String), AppError> {
+    // ChatGPT subscription requests resolve their OAuth access token inside
+    // AgentLoop::call_chatgpt_model. Touching a synthetic endpoint key here can
+    // fail on an unavailable keychain before OAuth gets a chance to run.
+    if !endpoint_requires_api_key(&endpoint.api_style) {
+        return Ok((None, String::new()));
+    }
+
+    let key_ref = endpoint
+        .key_ref
+        .clone()
+        .unwrap_or_else(|| format!("codefactory.endpoint.{endpoint_name}"));
+    let api_key = crate::secrets::get_key(&key_ref)?.unwrap_or_default();
+    Ok((Some(key_ref), api_key))
+}
+
 #[tauri::command]
 pub async fn respond_to_permission(
     tool_call_id: String,
@@ -79,12 +102,10 @@ pub async fn send_message(
         .await?;
 
         // Check if this is the first message in the session
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-        )
-        .bind(&session_id)
-        .fetch_one(&*pool)
-        .await?;
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(&*pool)
+            .await?;
         count.0 == 1
     };
 
@@ -149,15 +170,14 @@ pub async fn send_message(
         if !new_title.is_empty() {
             let pool = state.db.read().await;
             let now = Utc::now().timestamp_millis();
-            if let Ok(()) = sqlx::query(
-                "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
-            )
-            .bind(&new_title)
-            .bind(now)
-            .bind(&session_id)
-            .execute(&*pool)
-            .await
-            .map(|_| ())
+            if let Ok(()) =
+                sqlx::query("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?")
+                    .bind(&new_title)
+                    .bind(now)
+                    .bind(&session_id)
+                    .execute(&*pool)
+                    .await
+                    .map(|_| ())
             {
                 if let Ok(updated_session) = sqlx::query_as::<_, crate::storage::Session>(
                     "SELECT * FROM sessions WHERE id = ?",
@@ -174,22 +194,19 @@ pub async fn send_message(
     }
 
     // Resolve endpoint + key
+    let endpoint_name = settings.default_endpoint.clone();
     let endpoint = settings
         .endpoints
-        .get(&settings.default_endpoint)
+        .get(&endpoint_name)
         .ok_or_else(|| AppError::Other("No default endpoint configured".into()))?
         .clone();
 
     let api_style = endpoint.api_style.clone();
 
-    let key_ref = endpoint
-        .key_ref
-        .clone()
-        .unwrap_or_else(|| format!("codefactory.endpoint.{}", settings.default_endpoint));
-    let api_key = crate::secrets::get_key(&key_ref)?.unwrap_or_default();
+    let (key_ref, api_key) = load_endpoint_api_key(&endpoint_name, &endpoint)?;
 
     let resolved_model = settings
-        .resolve_model_for_endpoint(&settings.default_endpoint, &session.model_id)
+        .resolve_model_for_endpoint(&endpoint_name, &session.model_id)
         .ok_or_else(|| {
             AppError::Other(format!(
                 "No model configured for endpoint '{}'. Please choose a model in the picker.",
@@ -212,12 +229,11 @@ pub async fn send_message(
             .bind(&session_id)
             .execute(&*pool)
             .await?;
-        if let Ok(updated_session) = sqlx::query_as::<_, crate::storage::Session>(
-            "SELECT * FROM sessions WHERE id = ?",
-        )
-        .bind(&session_id)
-        .fetch_one(&*pool)
-        .await
+        if let Ok(updated_session) =
+            sqlx::query_as::<_, crate::storage::Session>("SELECT * FROM sessions WHERE id = ?")
+                .bind(&session_id)
+                .fetch_one(&*pool)
+                .await
         {
             let event_name = format!("session_updated:{}", session_id);
             app.emit(&event_name, &updated_session).ok();
@@ -228,16 +244,14 @@ pub async fn send_message(
         "send_message: endpoint={} model={} key_ref={} key_len={}",
         endpoint.base_url,
         resolved_model,
-        key_ref,
+        key_ref.as_deref().unwrap_or("chatgpt-oauth"),
         api_key.len(),
     );
 
-    // ChatGPT endpoints authenticate with the OAuth access token resolved
-    // inside the agent (codex_auth), so an empty API key is expected there.
-    if api_key.is_empty() && !matches!(api_style, crate::config::settings::ApiStyle::Chatgpt) {
+    if api_key.is_empty() && endpoint_requires_api_key(&api_style) {
         return Err(AppError::Other(format!(
             "API key not found for key_ref '{}'. Please configure it in Settings.",
-            key_ref
+            key_ref.as_deref().unwrap_or("unknown")
         )));
     }
 
@@ -288,6 +302,7 @@ pub async fn send_message(
             app,
             db,
             session_id_clone,
+            endpoint_name,
             resolved_model,
             endpoint.base_url,
             api_key,
@@ -373,14 +388,15 @@ pub async fn send_message_anonymous(
     let settings = state.settings.read().await.clone();
 
     // Resolve endpoint + key (identical to send_message).
+    let endpoint_name = settings.default_endpoint.clone();
     let endpoint = settings
         .endpoints
-        .get(&settings.default_endpoint)
+        .get(&endpoint_name)
         .ok_or_else(|| AppError::Other("No default endpoint configured".into()))?
         .clone();
     let api_style = endpoint.api_style.clone();
     let resolved_model = settings
-        .resolve_model_for_endpoint(&settings.default_endpoint, &model_id)
+        .resolve_model_for_endpoint(&endpoint_name, &model_id)
         .ok_or_else(|| {
             AppError::Other(format!(
                 "No model configured for endpoint '{}'. Please choose a model in the picker.",
@@ -388,15 +404,11 @@ pub async fn send_message_anonymous(
             ))
         })?;
 
-    let key_ref = endpoint
-        .key_ref
-        .clone()
-        .unwrap_or_else(|| format!("codefactory.endpoint.{}", settings.default_endpoint));
-    let api_key = crate::secrets::get_key(&key_ref)?.unwrap_or_default();
-    if api_key.is_empty() && !matches!(api_style, crate::config::settings::ApiStyle::Chatgpt) {
+    let (key_ref, api_key) = load_endpoint_api_key(&endpoint_name, &endpoint)?;
+    if api_key.is_empty() && endpoint_requires_api_key(&api_style) {
         return Err(AppError::Other(format!(
             "API key not found for key_ref '{}'. Please configure it in Settings.",
-            key_ref
+            key_ref.as_deref().unwrap_or("unknown")
         )));
     }
 
@@ -433,6 +445,7 @@ pub async fn send_message_anonymous(
             app,
             db,
             session_id_clone,
+            endpoint_name,
             resolved_model,
             endpoint.base_url,
             api_key,
@@ -459,4 +472,17 @@ pub async fn send_message_anonymous(
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::ApiStyle;
+
+    #[test]
+    fn chatgpt_endpoint_never_looks_up_an_endpoint_api_key() {
+        assert!(!endpoint_requires_api_key(&ApiStyle::Chatgpt));
+        assert!(endpoint_requires_api_key(&ApiStyle::Openai));
+        assert!(endpoint_requires_api_key(&ApiStyle::Anthropic));
+    }
 }

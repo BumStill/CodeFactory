@@ -124,9 +124,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   save: async (s) => {
-    await invoke("save_settings", { newSettings: s });
-    applyTheme(s);
-    set({ settings: s });
+    const authoritative = await invoke<Settings>("save_settings", { newSettings: s });
+    applyTheme(authoritative);
+    set({ settings: authoritative });
   },
 
   setTheme: async (theme) => {

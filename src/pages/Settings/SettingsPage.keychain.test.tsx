@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   codexLogout: vi.fn(),
   codexAccount: vi.fn(),
   codexModels: vi.fn(),
+  applyCodexModels: vi.fn(),
   invoke: vi.fn(),
   loadRemotes: vi.fn(),
   addRemote: vi.fn(),
@@ -106,6 +107,7 @@ vi.mock("../../lib/tauri", () => ({
   codexLogout: mocks.codexLogout,
   codexAccount: mocks.codexAccount,
   codexModels: mocks.codexModels,
+  applyCodexModels: mocks.applyCodexModels,
 }));
 
 describe("SettingsPage keychain handling", () => {
@@ -118,6 +120,7 @@ describe("SettingsPage keychain handling", () => {
     mocks.saveApiKey.mockResolvedValue(undefined);
     mocks.getApiKey.mockRejectedValue(new Error("settings page must not read saved API keys"));
     mocks.codexAccount.mockResolvedValue(null);
+    mocks.applyCodexModels.mockResolvedValue(undefined);
     delete (settingsState.settings.endpoints as Record<string, unknown>).chatgpt;
     settingsState.settings.default_endpoint = "deepseek";
     settingsState.settings.default_model = "deepseek-chat";
@@ -149,9 +152,9 @@ describe("SettingsPage keychain handling", () => {
 
     render(<SettingsPage onBack={() => {}} />);
 
-    await waitFor(() => expect(mocks.save).toHaveBeenCalled());
-    const saved = mocks.save.mock.calls[mocks.save.mock.calls.length - 1]?.[0];
-    expect(saved.endpoints.chatgpt.custom_models[0]).toMatchObject({
+    await waitFor(() => expect(mocks.applyCodexModels).toHaveBeenCalled());
+    const models = mocks.applyCodexModels.mock.calls[0]?.[0];
+    expect(models[0]).toMatchObject({
       id: "gpt-5.6-sol",
       supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
     });
@@ -163,9 +166,8 @@ describe("SettingsPage keychain handling", () => {
 
     render(<SettingsPage onBack={() => {}} />);
 
-    await waitFor(() => expect(mocks.save).toHaveBeenCalled());
-    const saved = mocks.save.mock.calls[mocks.save.mock.calls.length - 1]?.[0];
-    expect(saved.endpoints.chatgpt.custom_models[0].id).toBe("gpt-5.6-sol");
+    await waitFor(() => expect(mocks.applyCodexModels).toHaveBeenCalled());
+    expect(mocks.applyCodexModels.mock.calls[0]?.[0]?.[0]?.id).toBe("gpt-5.6-sol");
   });
 
   it("preserves the last successful catalog and model selection while offline", async () => {
@@ -189,10 +191,34 @@ describe("SettingsPage keychain handling", () => {
     render(<SettingsPage onBack={() => {}} />);
 
     await waitFor(() => expect(mocks.codexModels).toHaveBeenCalled());
-    expect(mocks.save).not.toHaveBeenCalled();
+    expect(mocks.applyCodexModels).not.toHaveBeenCalled();
   });
 
-  it("merges a delayed catalog response into the latest settings snapshot", async () => {
+  it("repairs retired selections even when the catalog itself is unchanged", async () => {
+    const catalog = [
+      {
+        id: "gpt-5.6-sol",
+        default_reasoning_effort: "low",
+        supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      },
+    ];
+    (settingsState.settings.endpoints as Record<string, unknown>).chatgpt = {
+      base_url: "https://chatgpt.com/backend-api/codex",
+      api_style: "chatgpt",
+      active_model: "retired-model",
+      custom_models: catalog,
+    };
+    settingsState.settings.default_endpoint = "chatgpt";
+    settingsState.settings.default_model = "retired-model";
+    mocks.codexAccount.mockResolvedValue({ email: "user@example.test", plan: "pro" });
+    mocks.codexModels.mockResolvedValue(catalog);
+
+    render(<SettingsPage onBack={() => {}} />);
+
+    await waitFor(() => expect(mocks.applyCodexModels).toHaveBeenCalledWith(catalog));
+  });
+
+  it("applies a delayed catalog without saving a whole settings snapshot", async () => {
     let resolveCatalog: (models: unknown[]) => void = () => {};
     mocks.codexAccount.mockResolvedValue({ email: "user@example.test", plan: "pro" });
     mocks.codexModels.mockReturnValue(
@@ -203,12 +229,13 @@ describe("SettingsPage keychain handling", () => {
 
     render(<SettingsPage onBack={() => {}} />);
     await waitFor(() => expect(mocks.codexModels).toHaveBeenCalled());
-    (settingsState.settings as { theme: "dark" | "light" }).theme = "light";
     resolveCatalog([{ id: "future-model", supported_reasoning_efforts: ["high"] }]);
 
-    await waitFor(() => expect(mocks.save).toHaveBeenCalled());
-    const saved = mocks.save.mock.calls[mocks.save.mock.calls.length - 1]?.[0];
-    expect(saved.theme).toBe("light");
-    expect(saved.endpoints.chatgpt.active_model).toBe("future-model");
+    await waitFor(() =>
+      expect(mocks.applyCodexModels).toHaveBeenCalledWith([
+        { id: "future-model", supported_reasoning_efforts: ["high"] },
+      ]),
+    );
+    expect(mocks.save).not.toHaveBeenCalled();
   });
 });

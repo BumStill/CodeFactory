@@ -12,8 +12,10 @@ describe("ChatGPT model capability catalog", () => {
     expect(CHATGPT_FALLBACK_MODELS[0]).toMatchObject({
       id: "gpt-5.6-sol",
       context_length: 272000,
+      max_context_length: 272000,
+      effective_context_window_percent: 95,
       default_reasoning_effort: "low",
-      supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
     });
     expect(CHATGPT_FALLBACK_MODELS.find((model) => model.id === "gpt-5.5"))
       .toMatchObject({ supported_reasoning_efforts: ["low", "medium", "high", "xhigh"] });

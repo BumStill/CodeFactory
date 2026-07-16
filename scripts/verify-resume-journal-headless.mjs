@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
 const port = Number(process.env.CODEFACTORY_RESUME_HEADLESS_PORT ?? 1439);
 const baseUrl = `http://127.0.0.1:${port}/resume-journal-acceptance.html`;
 const artifactDir = process.env.CODEFACTORY_RESUME_ARTIFACT_DIR
@@ -157,12 +158,11 @@ async function assertResumeSurface(page, viewport, tag) {
 async function run() {
   await rm(artifactDir, { recursive: true, force: true });
   await mkdir(artifactDir, { recursive: true });
-  const vite = spawn("pnpm", ["exec", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
+  const vite = spawn(process.execPath, [viteCli, "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: root,
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, NO_COLOR: "1" },
     detached: process.platform !== "win32",
-    shell: process.platform === "win32",
   });
   activeServer = vite;
   vite.spawnError = null;
