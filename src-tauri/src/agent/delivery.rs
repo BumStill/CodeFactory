@@ -678,13 +678,20 @@ mod tests {
     use super::*;
 
     fn make_repo(tag: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
+        // The repo lives one level under a unique per-test parent, so
+        // `root.parent()` is that isolated parent — cleanup via
+        // `remove_dir_all(root.parent())` removes only this test's artifacts
+        // (repo + its sibling bare origin), NEVER the shared temp dir. A prior
+        // version cleaned up `root.parent()` == temp_dir(), which nuked
+        // concurrently-running tests on Windows.
+        let parent = std::env::temp_dir().join(format!(
             "cf-delivery-{tag}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
+        let base = parent.join("repo");
         std::fs::create_dir_all(&base).unwrap();
         let g = |args: &[&str]| git(&base, args).unwrap();
         g(&["init", "-q", "-b", "main"]);
@@ -736,7 +743,7 @@ mod tests {
             !staged.iter().any(|p| p.starts_with("codex-worktrees/")),
             "no sibling worktree"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
     #[test]
@@ -747,7 +754,7 @@ mod tests {
         let staged = stage_scoped(&root, &["scratch.tmp".to_string()]).unwrap();
         assert!(staged.contains(&"keep.rs".to_string()));
         assert!(!staged.contains(&"scratch.tmp".to_string()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
     #[test]
@@ -817,21 +824,15 @@ mod tests {
 
     fn feature_branch_repo(tag: &str) -> PathBuf {
         let root = make_repo(tag);
-        // Fake an origin so push targets somewhere writable (a bare repo).
-        let origin = root.parent().unwrap().join(format!("{tag}-origin.git"));
-        git(&root, &["init", "--bare", "-q", origin.to_str().unwrap()]).ok();
-        // Use a bare init at that path:
-        std::fs::remove_dir_all(&origin).ok();
+        // A bare origin under the same per-test parent so push targets a real
+        // writable repo. `root.parent()` is the isolated per-test dir.
+        let origin = root.parent().unwrap().join("origin.git");
         Command::new("git")
             .no_window()
             .args(["init", "--bare", "-q", origin.to_str().unwrap()])
             .status()
             .unwrap();
-        git(
-            &root,
-            &["remote", "add", "origin", origin.to_str().unwrap()],
-        )
-        .unwrap();
+        git(&root, &["remote", "add", "origin", origin.to_str().unwrap()]).unwrap();
         git(&root, &["push", "-q", "origin", "main"]).unwrap();
         git(&root, &["checkout", "-q", "-b", "feat/x"]).unwrap();
         std::fs::write(root.join("feature.rs"), "pub fn f() {}\n").unwrap();
@@ -993,6 +994,6 @@ mod tests {
             .steps
             .iter()
             .any(|s| s.step == "repo" && s.status == "blocked"));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }
