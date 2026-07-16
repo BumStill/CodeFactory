@@ -447,6 +447,7 @@ export function SettingsPage({ onBack }: Props) {
     reasoning_effort: Settings["reasoning_effort"];
     max_parallel_tasks: number;
     subagent_isolation: NonNullable<Settings["subagent_isolation"]>;
+    delivery_ceiling: NonNullable<Settings["delivery_ceiling"]>;
   } | null>(null);
   const [generalSaved, setGeneralSaved] = useState(false);
 
@@ -482,6 +483,7 @@ export function SettingsPage({ onBack }: Props) {
       reasoning_effort: settings.reasoning_effort ?? "medium",
       max_parallel_tasks: settings.max_parallel_tasks ?? 3,
       subagent_isolation: settings.subagent_isolation ?? "shared",
+      delivery_ceiling: settings.delivery_ceiling ?? "pr_only",
     });
   }, [settings]);
 
@@ -591,6 +593,7 @@ export function SettingsPage({ onBack }: Props) {
       reasoning_effort: generalDraft.reasoning_effort,
       max_parallel_tasks: Math.min(8, Math.max(1, Math.round(generalDraft.max_parallel_tasks) || 3)),
       subagent_isolation: generalDraft.subagent_isolation,
+      delivery_ceiling: generalDraft.delivery_ceiling,
     } as Settings & { auto_create_pr: boolean });
 
     setGeneralSaved(true);
@@ -874,6 +877,32 @@ export function SettingsPage({ onBack }: Props) {
               >
                 <option value="shared">共享目录(默认)</option>
                 <option value="worktree">Git worktree 隔离</option>
+              </select>
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-xs text-gray-500">自动交付上限</label>
+              <p className="text-[11px] leading-5 text-gray-600">
+                代码改动测试通过后,AI 自动把工作推进到哪一步为止。由你决定边界:从只开 PR
+                到一路合并、发布上线。合并/发布受远端分支保护与令牌权限约束;需在「远程仓库」里配置访问令牌才能开
+                PR。
+              </p>
+              <select
+                value={generalDraft.delivery_ceiling}
+                onChange={(e) =>
+                  setGeneralDraft({
+                    ...generalDraft,
+                    delivery_ceiling: e.target
+                      .value as NonNullable<Settings["delivery_ceiling"]>,
+                  })
+                }
+                className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+              >
+                <option value="off">关闭(不自动交付)</option>
+                <option value="pr_only">提交 + 推送 + 开 PR(默认)</option>
+                <option value="through_ci_green">…并等 CI 通过</option>
+                <option value="through_merge">…并合并</option>
+                <option value="through_release">…并发布上线</option>
               </select>
             </div>
 

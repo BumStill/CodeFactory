@@ -55,7 +55,8 @@ pub fn get_chunk_definition() -> ToolDefinition {
         r#type: "function".into(),
         function: FunctionDefinition {
             name: "kb_get_chunk".into(),
-            description: "Read a full indexed knowledge chunk by chunk id, including source metadata.".into(),
+            description:
+                "Read a full indexed knowledge chunk by chunk id, including source metadata.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -72,7 +73,9 @@ pub async fn execute_search(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         return Ok(ToolOutput::err("Invalid arguments"));
     };
     let Some(pool) = &ctx.db else {
-        return Ok(ToolOutput::err("Knowledge search is unavailable: database is not attached"));
+        return Ok(ToolOutput::err(
+            "Knowledge search is unavailable: database is not attached",
+        ));
     };
     let (library_id, library_ids) = match scoped_library_filter(
         args.library_id,
@@ -103,7 +106,9 @@ pub async fn execute_get_chunk(args: Value, ctx: &ExecCtx) -> Result<ToolOutput>
         return Ok(ToolOutput::err("Invalid arguments"));
     };
     let Some(pool) = &ctx.db else {
-        return Ok(ToolOutput::err("Knowledge chunk read is unavailable: database is not attached"));
+        return Ok(ToolOutput::err(
+            "Knowledge chunk read is unavailable: database is not attached",
+        ));
     };
     if let Some(scope) = ctx.knowledge_library_ids.as_deref() {
         if scope.is_empty() {
@@ -127,7 +132,11 @@ fn scoped_library_filter(
     scope: Option<&[String]>,
 ) -> Result<(Option<String>, Option<Vec<String>>)> {
     let Some(scope) = scope else {
-        let ids = if library_ids.is_empty() { None } else { Some(library_ids) };
+        let ids = if library_ids.is_empty() {
+            None
+        } else {
+            Some(library_ids)
+        };
         return Ok((library_id, ids));
     };
     if scope.is_empty() {
@@ -221,6 +230,7 @@ mod tests {
                 session_id: Some("parent-session".into()),
                 task_id: Some("task-1".into()),
                 knowledge_library_ids: Some(vec![library_id.clone()]),
+                settings: None,
             },
         )
         .await
@@ -232,12 +242,11 @@ mod tests {
         assert!(output.content.contains("deck.pptx"));
         assert!(output.content.contains("\"slide\": 3"));
 
-        let event: (Option<String>, Option<String>, String) = sqlx::query_as(
-            "SELECT session_id, task_id, filters_json FROM retrieval_events",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("retrieval event");
+        let event: (Option<String>, Option<String>, String) =
+            sqlx::query_as("SELECT session_id, task_id, filters_json FROM retrieval_events")
+                .fetch_one(&pool)
+                .await
+                .expect("retrieval event");
         assert_eq!(event.0.as_deref(), Some("parent-session"));
         assert_eq!(event.1.as_deref(), Some("task-1"));
         assert!(

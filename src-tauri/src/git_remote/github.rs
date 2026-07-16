@@ -160,6 +160,56 @@ pub async fn create_pr(
     Ok(parse_pr(&v))
 }
 
+/// Merge a PR. `method` is one of "squash" | "merge" | "rebase". A 405 from a
+/// protected branch / required review surfaces as the REST error verbatim.
+pub async fn merge_pr(
+    client: &RemoteGitClient,
+    repo: &str,
+    number: u64,
+    method: &str,
+) -> Result<(), String> {
+    let path = format!("/repos/{}/pulls/{}/merge", repo, number);
+    client
+        .put(&path, json!({ "merge_method": method }))
+        .await
+        .map(|_| ())
+}
+
+/// CI conclusion for a commit, from the GitHub Actions check-runs API.
+///   - any queued/in_progress            → "pending"
+///   - any failure/cancelled/timed_out   → "failure"
+///   - all success/neutral/skipped       → "success"
+///   - zero check runs                    → "none" (no CI configured)
+pub async fn ci_status(client: &RemoteGitClient, repo: &str, sha: &str) -> Result<String, String> {
+    let path = format!("/repos/{}/commits/{}/check-runs", repo, sha);
+    let v = client.get(&path).await?;
+    let runs = v
+        .get("check_runs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if runs.is_empty() {
+        return Ok("none".into());
+    }
+    let mut any_pending = false;
+    for run in &runs {
+        let status = str_val(run, "status"); // queued | in_progress | completed
+        if status != "completed" {
+            any_pending = true;
+            continue;
+        }
+        match str_val(run, "conclusion").as_str() {
+            "success" | "neutral" | "skipped" => {}
+            other => return Ok(format!("failure:{other}")),
+        }
+    }
+    Ok(if any_pending {
+        "pending".into()
+    } else {
+        "success".into()
+    })
+}
+
 pub async fn list_repos(client: &RemoteGitClient) -> Result<Vec<RemoteRepo>, String> {
     let v = client.get("/user/repos?per_page=100&sort=updated").await?;
     let arr = v.as_array().ok_or("Expected array")?;

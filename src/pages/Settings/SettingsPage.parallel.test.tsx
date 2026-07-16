@@ -133,6 +133,23 @@ describe("SettingsPage parallel-task controls", () => {
 
     expect(screen.getByRole("spinbutton")).toHaveValue(3);
     expect(screen.getByDisplayValue("共享目录(默认)")).toBeInTheDocument();
+    // Delivery ceiling: a legacy settings.json (no delivery_ceiling) hydrates to
+    // the PrOnly default, not blank.
+    expect(screen.getByDisplayValue("提交 + 推送 + 开 PR(默认)")).toBeInTheDocument();
+  });
+
+  it("saves the selected delivery ceiling", async () => {
+    await openGeneralTab();
+
+    fireEvent.change(screen.getByDisplayValue("提交 + 推送 + 开 PR(默认)"), {
+      target: { value: "through_release" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => {
+      expect(mocks.save).toHaveBeenCalledTimes(1);
+    });
+    expect(mocks.save.mock.calls[0][0].delivery_ceiling).toBe("through_release");
   });
 
   it("saves the edited parallelism cap and isolation mode", async () => {

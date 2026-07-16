@@ -394,6 +394,15 @@ export interface Settings {
    *  missing → "shared". "worktree" runs each task in its own git worktree
    *  and merges verified diffs back; non-git cwds fall back to shared. */
   subagent_isolation?: 'shared' | 'worktree';
+  /** How far the agent auto-delivers code changes. The user owns this ceiling.
+   *  Optional for backward compat — missing → "pr_only". */
+  delivery_ceiling?: 'off' | 'pr_only' | 'through_ci_green' | 'through_merge' | 'through_release';
+  /** Merge strategy for delivery at ThroughMerge+. Missing → "squash". */
+  delivery_merge_method?: 'squash' | 'merge' | 'rebase';
+  /** Extra repo-relative path prefixes excluded from delivery commits. */
+  delivery_exclude_globs?: string[];
+  /** Max seconds delivery polls CI before reporting it still pending. Missing → 1800. */
+  delivery_ci_timeout_secs?: number;
 }
 
 // ── Git ─────────────────────────────────────────────────────────────────────
