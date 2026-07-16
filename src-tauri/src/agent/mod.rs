@@ -44,6 +44,26 @@ use crate::storage::Message;
 use crate::tools::{self, ExecCtx};
 use crate::PendingPermissionMap;
 
+async fn await_permission_response(
+    receiver: tokio::sync::oneshot::Receiver<bool>,
+    cancel: Option<&Arc<AtomicBool>>,
+    max_wait: Duration,
+) -> bool {
+    let cancelled = async {
+        loop {
+            if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    tokio::select! {
+        response = timeout(max_wait, receiver) => matches!(response, Ok(Ok(true))),
+        _ = cancelled, if cancel.is_some() => false,
+    }
+}
+
 /// Tool-call iteration ceiling for INTERACTIVE chat. Conservative
 /// because every iteration is a user-visible turn — letting it run too
 /// long makes the chat feel stuck.
@@ -340,6 +360,62 @@ pub struct AgentLoop {
     /// polls it between rounds and stops cleanly — it never interrupts an
     /// in-flight tool call, and never touches the task scheduler.
     cancel: Option<Arc<AtomicBool>>,
+}
+
+fn resolve_chatgpt_reasoning_effort(
+    settings: &Settings,
+    model_id: &str,
+    session_effort: Option<&str>,
+) -> crate::config::settings::ReasoningEffort {
+    use crate::config::settings::ReasoningEffort;
+
+    let requested = session_effort
+        .and_then(ReasoningEffort::parse)
+        .unwrap_or(settings.reasoning_effort);
+    let model_from_default_endpoint = settings
+        .endpoints
+        .get(&settings.default_endpoint)
+        .filter(|endpoint| matches!(endpoint.api_style, ApiStyle::Chatgpt))
+        .and_then(|endpoint| {
+            endpoint
+                .custom_models
+                .iter()
+                .find(|model| model.id == model_id)
+        });
+    let model = model_from_default_endpoint.or_else(|| {
+        settings
+            .endpoints
+            .values()
+            .filter(|endpoint| matches!(endpoint.api_style, ApiStyle::Chatgpt))
+            .find_map(|endpoint| {
+                endpoint
+                    .custom_models
+                    .iter()
+                    .find(|model| model.id == model_id)
+            })
+    });
+    let Some(model) = model else {
+        return requested;
+    };
+    let Some(supported) = model.supported_reasoning_efforts.as_deref() else {
+        return requested;
+    };
+
+    if supported.contains(&requested) {
+        return requested;
+    }
+    if let Some(default) = model.default_reasoning_effort {
+        if supported.is_empty() || supported.contains(&default) {
+            return default;
+        }
+    }
+    if supported.contains(&ReasoningEffort::Medium) {
+        return ReasoningEffort::Medium;
+    }
+    supported
+        .first()
+        .copied()
+        .unwrap_or(ReasoningEffort::Medium)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1087,14 +1163,11 @@ impl AgentLoop {
             )
             .ok();
 
-        match timeout(Duration::from_secs(600), receiver).await {
-            Ok(Ok(allow)) => allow,
-            Ok(Err(_)) => false,
-            Err(_) => {
-                self.pending_permissions.lock().await.remove(&tc.id);
-                false
-            }
-        }
+        let allow =
+            await_permission_response(receiver, self.cancel.as_ref(), Duration::from_secs(600))
+                .await;
+        self.pending_permissions.lock().await.remove(&tc.id);
+        allow
     }
 
     /// Flatten a message body to plain text. Text passes through; Parts keep
@@ -1200,12 +1273,11 @@ impl AgentLoop {
         .await
         .ok()
         .flatten();
-        let global = self.settings.read().await.reasoning_effort;
-        let effort = session_effort
-            .as_deref()
-            .and_then(crate::config::settings::ReasoningEffort::parse)
-            .unwrap_or(global)
-            .as_str();
+        let effort = {
+            let settings = self.settings.read().await;
+            resolve_chatgpt_reasoning_effort(&settings, &self.model_id, session_effort.as_deref())
+                .as_str()
+        };
 
         let mut body = serde_json::json!({
             "model": self.model_id,
@@ -2921,6 +2993,158 @@ fn glob_match(pattern: &str, input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_permission_is_released_by_chat_cancellation() {
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        assert!(!await_permission_response(receiver, Some(&cancel), Duration::from_secs(1),).await);
+    }
+
+    fn settings_with_chatgpt_model(
+        model: crate::config::settings::CustomModel,
+        global: crate::config::settings::ReasoningEffort,
+    ) -> Settings {
+        let mut settings = Settings::default();
+        settings.default_endpoint = "chatgpt".into();
+        settings.default_model = model.id.clone();
+        settings.reasoning_effort = global;
+        settings.endpoints.insert(
+            "chatgpt".into(),
+            crate::config::settings::Endpoint {
+                base_url: crate::codex_auth::CHATGPT_BASE_URL.into(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                active_model: Some(model.id.clone()),
+                custom_models: vec![model],
+            },
+        );
+        settings
+    }
+
+    #[test]
+    fn chatgpt_effort_uses_session_override_when_model_supports_it() {
+        use crate::config::settings::{CustomModel, ReasoningEffort};
+
+        let settings = settings_with_chatgpt_model(
+            CustomModel {
+                id: "gpt-5.6-sol".into(),
+                name: None,
+                context_length: Some(272000),
+                default_reasoning_effort: Some(ReasoningEffort::Low),
+                supported_reasoning_efforts: Some(vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::Ultra,
+                ]),
+            },
+            ReasoningEffort::High,
+        );
+
+        assert_eq!(
+            resolve_chatgpt_reasoning_effort(&settings, "gpt-5.6-sol", Some("ultra")),
+            ReasoningEffort::Ultra
+        );
+    }
+
+    #[test]
+    fn chatgpt_effort_falls_back_to_model_default_when_requested_is_unsupported() {
+        use crate::config::settings::{CustomModel, ReasoningEffort};
+
+        let settings = settings_with_chatgpt_model(
+            CustomModel {
+                id: "gpt-5.5".into(),
+                name: None,
+                context_length: Some(272000),
+                default_reasoning_effort: Some(ReasoningEffort::Low),
+                supported_reasoning_efforts: Some(vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::XHigh,
+                ]),
+            },
+            ReasoningEffort::Ultra,
+        );
+
+        assert_eq!(
+            resolve_chatgpt_reasoning_effort(&settings, "gpt-5.5", None),
+            ReasoningEffort::Low
+        );
+    }
+
+    #[test]
+    fn chatgpt_effort_falls_back_to_medium_without_model_default() {
+        use crate::config::settings::{CustomModel, ReasoningEffort};
+
+        let settings = settings_with_chatgpt_model(
+            CustomModel {
+                id: "future-model".into(),
+                name: None,
+                context_length: None,
+                default_reasoning_effort: None,
+                supported_reasoning_efforts: Some(vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ]),
+            },
+            ReasoningEffort::Max,
+        );
+
+        assert_eq!(
+            resolve_chatgpt_reasoning_effort(&settings, "future-model", None),
+            ReasoningEffort::Medium
+        );
+    }
+
+    #[test]
+    fn chatgpt_effort_preserves_legacy_behavior_without_capability_metadata() {
+        use crate::config::settings::{CustomModel, ReasoningEffort};
+
+        let settings = settings_with_chatgpt_model(
+            CustomModel {
+                id: "legacy-model".into(),
+                name: None,
+                context_length: None,
+                default_reasoning_effort: None,
+                supported_reasoning_efforts: None,
+            },
+            ReasoningEffort::High,
+        );
+
+        assert_eq!(
+            resolve_chatgpt_reasoning_effort(&settings, "legacy-model", Some("xhigh")),
+            ReasoningEffort::XHigh
+        );
+    }
+
+    #[test]
+    fn chatgpt_effort_finds_session_model_after_default_endpoint_switches() {
+        use crate::config::settings::{CustomModel, ReasoningEffort};
+
+        let mut settings = settings_with_chatgpt_model(
+            CustomModel {
+                id: "gpt-session-model".into(),
+                name: None,
+                context_length: None,
+                default_reasoning_effort: Some(ReasoningEffort::Low),
+                supported_reasoning_efforts: Some(vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ]),
+            },
+            ReasoningEffort::Ultra,
+        );
+        settings.default_endpoint = "openrouter".into();
+
+        assert_eq!(
+            resolve_chatgpt_reasoning_effort(&settings, "gpt-session-model", None),
+            ReasoningEffort::Low
+        );
+    }
 
     fn stored_message(role: &str, content: &str, tool_calls: Option<String>) -> Message {
         Message {

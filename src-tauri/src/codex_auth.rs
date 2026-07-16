@@ -18,6 +18,7 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use crate::config::settings::{CustomModel, ReasoningEffort};
 use crate::errors::{AppError, Result};
 
 // ── Published OAuth client parameters (from openai/codex) ────────────────────
@@ -25,8 +26,7 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
 /// Fixed because the redirect URI must match OpenAI's allow-list.
 const REDIRECT_PORT: u16 = 1455;
-const SCOPE: &str =
-    "openid profile email offline_access api.connectors.read api.connectors.invoke";
+const SCOPE: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 
 /// ChatGPT backend the access token is spent against (Responses API), used by
 /// the request layer. Public so the agent can build the endpoint URL.
@@ -77,8 +77,7 @@ struct Pkce {
 
 fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     let mut buf = [0u8; N];
-    getrandom::getrandom(&mut buf)
-        .map_err(|e| AppError::Other(format!("无法获取随机数：{e}")))?;
+    getrandom::getrandom(&mut buf).map_err(|e| AppError::Other(format!("无法获取随机数：{e}")))?;
     Ok(buf)
 }
 
@@ -320,8 +319,7 @@ pub fn current_account() -> Result<Option<CodexAccount>> {
 /// ChatGPT account id to send as the `chatgpt-account-id` header. Used by the
 /// request layer when an endpoint is backed by ChatGPT login.
 pub async fn valid_access_token() -> Result<(String, Option<String>)> {
-    let tokens = load_tokens()?
-        .ok_or_else(|| AppError::Other("尚未登录 ChatGPT".into()))?;
+    let tokens = load_tokens()?.ok_or_else(|| AppError::Other("尚未登录 ChatGPT".into()))?;
     let needs_refresh = match jwt_exp(&tokens.access_token) {
         Some(exp) => now_secs() + REFRESH_SKEW_SECS >= exp,
         // Unknown expiry → refresh if it's been a while since the last grant.
@@ -333,6 +331,101 @@ pub async fn valid_access_token() -> Result<(String, Option<String>)> {
         tokens
     };
     Ok((tokens.access_token, tokens.account_id))
+}
+
+#[derive(Deserialize)]
+struct CodexModelsResponse {
+    #[serde(default)]
+    models: Vec<CodexModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct CodexModelEntry {
+    slug: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    context_window: Option<i64>,
+    #[serde(default)]
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    supported_reasoning_levels: Option<Vec<CodexReasoningLevel>>,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default)]
+    supported_in_api: bool,
+}
+
+#[derive(Deserialize)]
+struct CodexReasoningLevel {
+    effort: String,
+}
+
+fn parse_codex_models(body: &str) -> Result<Vec<CustomModel>> {
+    let catalog: CodexModelsResponse = serde_json::from_str(body)?;
+    Ok(catalog
+        .models
+        .into_iter()
+        .filter(|model| model.visibility.as_deref() == Some("list") && model.supported_in_api)
+        .map(|model| CustomModel {
+            id: model.slug,
+            name: model.display_name.filter(|name| !name.trim().is_empty()),
+            context_length: model
+                .context_window
+                .and_then(|length| u32::try_from(length).ok()),
+            default_reasoning_effort: model
+                .default_reasoning_level
+                .as_deref()
+                .and_then(ReasoningEffort::parse),
+            supported_reasoning_efforts: model.supported_reasoning_levels.and_then(|levels| {
+                let efforts: Vec<_> = levels
+                    .into_iter()
+                    .filter_map(|level| ReasoningEffort::parse(&level.effort))
+                    .collect();
+                (!efforts.is_empty()).then_some(efforts)
+            }),
+        })
+        .collect())
+}
+
+fn build_codex_models_request(
+    client: &reqwest::Client,
+    base_url: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let url = format!(
+        "{}/models?client_version={}",
+        base_url.trim_end_matches('/'),
+        env!("CARGO_PKG_VERSION")
+    );
+    let mut request = client
+        .get(url)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .header("originator", "codex_cli_rs");
+    if let Some(account_id) = account_id {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+    request
+}
+
+async fn fetch_codex_models(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<Vec<CustomModel>> {
+    let response = build_codex_models_request(client, CHATGPT_BASE_URL, access_token, account_id)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(AppError::Other(format!(
+            "ChatGPT 模型目录请求失败（{status}）：{body}"
+        )));
+    }
+    parse_codex_models(&body)
 }
 
 // ── Loopback authorization-code flow ─────────────────────────────────────────
@@ -361,10 +454,7 @@ fn wait_for_callback(listener: std::net::TcpListener, expected_state: &str) -> R
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query(query);
         if let Some(err) = params.get("error") {
-            let desc = params
-                .get("error_description")
-                .cloned()
-                .unwrap_or_default();
+            let desc = params.get("error_description").cloned().unwrap_or_default();
             let _ = stream
                 .write_all(simple_http(200, "登录失败，可关闭此页并返回 CodeFactory。").as_bytes());
             return Err(AppError::Other(format!("OAuth 授权被拒绝：{err} {desc}")));
@@ -377,8 +467,7 @@ fn wait_for_callback(listener: std::net::TcpListener, expected_state: &str) -> R
                 return Ok(code.clone());
             }
             (_, Some(state)) if state != expected_state => {
-                let _ = stream
-                    .write_all(simple_http(400, "状态校验失败，请重试登录。").as_bytes());
+                let _ = stream.write_all(simple_http(400, "状态校验失败，请重试登录。").as_bytes());
                 return Err(AppError::Other(
                     "OAuth state 校验失败（可能的 CSRF）".into(),
                 ));
@@ -505,4 +594,143 @@ pub async fn codex_logout() -> Result<()> {
 #[tauri::command]
 pub async fn codex_account() -> Result<Option<CodexAccount>> {
     current_account()
+}
+
+#[tauri::command]
+pub async fn codex_models() -> Result<Vec<CustomModel>> {
+    let (access_token, account_id) = valid_access_token().await?;
+    fetch_codex_models(
+        &reqwest::Client::new(),
+        &access_token,
+        account_id.as_deref(),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::ReasoningEffort;
+
+    #[test]
+    fn catalog_filters_unlisted_or_non_api_models_and_maps_capabilities() {
+        let models = parse_codex_models(
+            r#"{
+                "models": [
+                    {
+                        "slug": "gpt-5.6-sol",
+                        "display_name": "GPT-5.6 Sol",
+                        "context_window": 272000,
+                        "default_reasoning_level": "low",
+                        "supported_reasoning_levels": [
+                            {"effort": "low", "description": "fast"},
+                            {"effort": "medium", "description": "balanced"},
+                            {"effort": "xhigh", "description": "deep"},
+                            {"effort": "max", "description": "deeper"},
+                            {"effort": "ultra", "description": "deepest"}
+                        ],
+                        "visibility": "list",
+                        "supported_in_api": true
+                    },
+                    {
+                        "slug": "hidden",
+                        "visibility": "hide",
+                        "supported_in_api": true
+                    },
+                    {
+                        "slug": "not-in-api",
+                        "visibility": "list",
+                        "supported_in_api": false
+                    }
+                ]
+            }"#,
+        )
+        .expect("catalog should parse");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-5.6-sol");
+        assert_eq!(models[0].name.as_deref(), Some("GPT-5.6 Sol"));
+        assert_eq!(models[0].context_length, Some(272000));
+        assert_eq!(
+            models[0].default_reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            models[0].supported_reasoning_efforts,
+            Some(vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Max,
+                ReasoningEffort::Ultra,
+            ])
+        );
+    }
+
+    #[test]
+    fn catalog_request_uses_package_version_and_oauth_account_headers() {
+        let client = reqwest::Client::new();
+        let request = build_codex_models_request(
+            &client,
+            "https://chatgpt.com/backend-api/codex",
+            "access-token",
+            Some("account-123"),
+        )
+        .build()
+        .expect("request should build");
+
+        assert_eq!(request.url().path(), "/backend-api/codex/models");
+        assert_eq!(
+            request
+                .url()
+                .query_pairs()
+                .find(|(key, _)| key == "client_version")
+                .map(|(_, value)| value.into_owned()),
+            Some(env!("CARGO_PKG_VERSION").to_string())
+        );
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer access-token"
+        );
+        assert_eq!(
+            request.headers().get("chatgpt-account-id").unwrap(),
+            "account-123"
+        );
+    }
+
+    #[test]
+    fn catalog_empty_efforts_become_none_without_reordering_server_priority() {
+        let models = parse_codex_models(
+            r#"{
+                "models": [
+                    {
+                        "slug": "server-first",
+                        "display_name": "Server First",
+                        "supported_reasoning_levels": [],
+                        "visibility": "list",
+                        "supported_in_api": true,
+                        "priority": 20
+                    },
+                    {
+                        "slug": "server-second",
+                        "display_name": "Server Second",
+                        "supported_reasoning_levels": [{"effort": "medium"}],
+                        "visibility": "list",
+                        "supported_in_api": true,
+                        "priority": 0
+                    }
+                ]
+            }"#,
+        )
+        .expect("catalog should parse");
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["server-first", "server-second"]
+        );
+        assert_eq!(models[0].supported_reasoning_efforts, None);
+    }
 }

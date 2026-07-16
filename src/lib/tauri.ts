@@ -82,12 +82,14 @@ export interface ModelInfo {
 
 export type ApiStyle = "openai" | "anthropic" | "chatgpt";
 
-export type ReasoningEffort = "minimal" | "low" | "medium" | "high";
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export interface CustomModel {
   id: string;
   name?: string;
   context_length?: number;
+  default_reasoning_effort?: ReasoningEffort;
+  supported_reasoning_efforts?: ReasoningEffort[];
 }
 
 export interface Endpoint {
@@ -126,6 +128,10 @@ export function codexLogout(): Promise<void> {
 /** The currently signed-in ChatGPT account, or null if not signed in. */
 export function codexAccount(): Promise<CodexAccount | null> {
   return invoke<CodexAccount | null>("codex_account");
+}
+
+export function codexModels(): Promise<CustomModel[]> {
+  return invoke<CustomModel[]>("codex_models");
 }
 
 // ── Benchmarks ─────────────────────────────────────────────────────────────

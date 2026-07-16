@@ -10,6 +10,8 @@ import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
 import { useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
 import type { Settings, Endpoint, ApiStyle, CustomModel, AddGitRemoteRequest, GitRemoteConfig, GitProvider, CodexAccount } from "../../lib/tauri";
+import { CHATGPT_DEFAULT_MODEL, CHATGPT_ENDPOINT_KEY } from "../../lib/chatgptModels";
+import { syncChatGptCatalog } from "../../stores/chatgptCatalog";
 
 interface Props {
   onBack: () => void;
@@ -829,6 +831,9 @@ export function SettingsPage({ onBack }: Props) {
                   ["low", "低"],
                   ["medium", "中"],
                   ["high", "高"],
+                  ["xhigh", "超高"],
+                  ["max", "最大"],
+                  ["ultra", "极致"],
                 ] as const).map(([v, label]) => (
                   <option key={v} value={v}>
                     {label}
@@ -986,6 +991,7 @@ function HooksTab() {
         <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">钩子</h2>
         <button
           onClick={() => setAddOpen(true)}
+          aria-label="打开添加钩子表单"
           className="flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 border border-border transition-colors"
         >
           <Plus size={11} /> 添加钩子
@@ -1001,6 +1007,7 @@ function HooksTab() {
             <span className="text-[10px] bg-surface-3 text-gray-500 px-1.5 py-0.5 rounded">{hook.event}</span>
             <button
               onClick={() => handleToggle(hook)}
+              aria-label={`${hook.enabled ? "禁用" : "启用"}钩子 ${hook.name}`}
               className={`text-[10px] px-1.5 py-0.5 rounded transition-colors ${
                 hook.enabled ? "bg-accent/20 text-accent" : "bg-surface-3 text-gray-600"
               }`}
@@ -1009,12 +1016,14 @@ function HooksTab() {
             </button>
             <button
               onClick={() => handleTest(hook.id)}
+              aria-label={`测试钩子 ${hook.name}`}
               className="text-[10px] text-gray-600 hover:text-gray-300 px-1.5 py-0.5 rounded hover:bg-surface-3 transition-colors"
             >
               测试
             </button>
             <button
               onClick={() => handleDelete(hook.id)}
+              aria-label={`删除钩子 ${hook.name}`}
               className="text-[10px] text-red-700 hover:text-red-400 px-1.5 py-0.5 rounded transition-colors"
             >
               <Trash2 size={10} />
@@ -1083,31 +1092,31 @@ function AddHookForm({ onAdded, onCancel }: { onAdded: () => void; onCancel: () 
       <div className="grid grid-cols-2 gap-2">
         <div>
           <label className="block text-[10px] text-gray-500 mb-0.5">名称</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="我的钩子"
+          <input aria-label="名称" value={name} onChange={(e) => setName(e.target.value)} placeholder="我的钩子"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
         <div>
           <label className="block text-[10px] text-gray-500 mb-0.5">事件</label>
-          <select value={event} onChange={(e) => setEvent(e.target.value)}
+          <select aria-label="事件" value={event} onChange={(e) => setEvent(e.target.value)}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none">
             {HOOK_EVENTS.map((ev) => <option key={ev} value={ev}>{ev}</option>)}
           </select>
         </div>
         <div>
           <label className="block text-[10px] text-gray-500 mb-0.5">动作类型</label>
-          <select value={actionType} onChange={(e) => setActionType(e.target.value as HookActionType)}
+          <select aria-label="动作类型" value={actionType} onChange={(e) => setActionType(e.target.value as HookActionType)}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none">
             {HOOK_ACTIONS.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
           </select>
         </div>
         <div>
           <label className="block text-[10px] text-gray-500 mb-0.5">过滤器(可选)</label>
-          <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="例如 bash"
+          <input aria-label="过滤器(可选)" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="例如 bash"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
         <div className="col-span-2">
           <label className="block text-[10px] text-gray-500 mb-0.5">{currentAction?.label ?? "参数"}</label>
-          <input value={actionParam} onChange={(e) => setActionParam(e.target.value)}
+          <input aria-label={currentAction?.label ?? "参数"} value={actionParam} onChange={(e) => setActionParam(e.target.value)}
             placeholder={currentAction?.placeholder ?? ""}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
@@ -1154,6 +1163,7 @@ function RemotesTab() {
         </h2>
         <button
           onClick={() => setAddOpen(true)}
+          aria-label="打开添加远程仓库表单"
           className="flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 border border-border transition-colors"
         >
           <Plus size={11} /> 添加远程仓库
@@ -1179,12 +1189,14 @@ function RemotesTab() {
             <button
               onClick={() => handleTest(remote.id)}
               disabled={testing === remote.id}
+              aria-label={`测试远程仓库 ${remote.name}`}
               className="text-[10px] text-gray-600 hover:text-gray-300 px-1.5 py-0.5 rounded hover:bg-surface-3 transition-colors disabled:opacity-50"
             >
               {testing === remote.id ? "…" : "测试"}
             </button>
             <button
               onClick={() => deleteRemote(remote.id)}
+              aria-label={`删除远程仓库 ${remote.name}`}
               className="text-[10px] text-red-700 hover:text-red-400 px-1.5 py-0.5 rounded transition-colors"
             >
               <Trash2 size={10} />
@@ -1253,12 +1265,12 @@ function AddRemoteForm({
       <div className="grid grid-cols-2 gap-2">
         <div>
           <label className="block text-[10px] text-gray-500 mb-0.5">名称</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="我的 GitHub"
+          <input aria-label="名称" value={name} onChange={(e) => setName(e.target.value)} placeholder="我的 GitHub"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
         <div>
           <label className="block text-[10px] text-gray-500 mb-0.5">提供商</label>
-          <select value={provider} onChange={(e) => handleProviderChange(e.target.value as GitProvider)}
+          <select aria-label="提供商" value={provider} onChange={(e) => handleProviderChange(e.target.value as GitProvider)}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none">
             <option value="github">GitHub</option>
             <option value="gitlab">GitLab</option>
@@ -1266,13 +1278,13 @@ function AddRemoteForm({
         </div>
         <div className="col-span-2">
           <label className="block text-[10px] text-gray-500 mb-0.5">基础 URL</label>
-          <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
+          <input aria-label="基础 URL" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none focus:border-accent/40" />
         </div>
         <div className="col-span-2">
           <label className="block text-[10px] text-gray-500 mb-0.5">个人访问令牌</label>
           <div className="flex gap-1">
-            <input type={showToken ? "text" : "password"} value={token} onChange={(e) => setToken(e.target.value)}
+            <input aria-label="个人访问令牌" type={showToken ? "text" : "password"} value={token} onChange={(e) => setToken(e.target.value)}
               placeholder="ghp_…"
               className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
             <button onClick={() => setShowToken((v) => !v)}
@@ -1283,7 +1295,7 @@ function AddRemoteForm({
         </div>
         <div className="col-span-2">
           <label className="block text-[10px] text-gray-500 mb-0.5">默认仓库(可选)</label>
-          <input value={defaultRepo} onChange={(e) => setDefaultRepo(e.target.value)} placeholder="owner/repo"
+          <input aria-label="默认仓库(可选)" value={defaultRepo} onChange={(e) => setDefaultRepo(e.target.value)} placeholder="owner/repo"
             className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
       </div>
@@ -1401,52 +1413,6 @@ function AppearanceTab() {
 // Stage-1/3 surface: runs the OAuth login and shows the signed-in account.
 // Wiring the signed-in session into model requests (subscription Responses API)
 // is handled separately by the request layer.
-const CHATGPT_ENDPOINT_KEY = "chatgpt";
-const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
-// Codex model slugs the ChatGPT backend accepts. These get renamed over time
-// (gpt-5-codex → gpt-5.3-codex, etc.), so ensureChatGptEndpoint refreshes an
-// existing endpoint's list whenever this changes.
-const CHATGPT_MODELS: CustomModel[] = [
-  // 272K input window per codex's published model metadata — without this the
-  // context meter falls back to a wrong/conservative 128K for these models.
-  { id: "gpt-5.5", name: "GPT-5.5", context_length: 272000 },
-  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", context_length: 272000 },
-  { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini", context_length: 272000 },
-];
-const CHATGPT_DEFAULT_MODEL = "gpt-5.5";
-
-// Create the ChatGPT endpoint on sign-in (and keep its model list current) so
-// requests route to the subscription Responses path (api_style "chatgpt").
-async function ensureChatGptEndpoint() {
-  const { settings, save } = useSettingsStore.getState();
-  if (!settings) return;
-  const existing = settings.endpoints[CHATGPT_ENDPOINT_KEY];
-  // Up to date already? Nothing to do.
-  if (existing && JSON.stringify(existing.custom_models ?? []) === JSON.stringify(CHATGPT_MODELS)) {
-    return;
-  }
-  const validIds = CHATGPT_MODELS.map((m) => m.id);
-  const active =
-    existing?.active_model && validIds.includes(existing.active_model)
-      ? existing.active_model
-      : CHATGPT_DEFAULT_MODEL;
-  await save({
-    ...settings,
-    endpoints: {
-      ...settings.endpoints,
-      [CHATGPT_ENDPOINT_KEY]: {
-        base_url: CHATGPT_BASE_URL,
-        api_style: "chatgpt",
-        custom_models: CHATGPT_MODELS,
-        active_model: active,
-      },
-    },
-    // Only seize default/model on first creation; respect the user afterwards.
-    default_endpoint: existing ? settings.default_endpoint : CHATGPT_ENDPOINT_KEY,
-    default_model: existing ? settings.default_model : CHATGPT_DEFAULT_MODEL,
-  });
-}
-
 // Drop the ChatGPT endpoint on sign-out so it can't linger as a broken default.
 async function removeChatGptEndpoint() {
   const { settings, save } = useSettingsStore.getState();
@@ -1478,7 +1444,7 @@ function ChatGptLoginCard() {
         setAccount(a);
         // Already signed in (e.g. from a prior session)? Make sure the ChatGPT
         // endpoint exists so the account is actually usable. Idempotent.
-        if (a) await ensureChatGptEndpoint();
+        if (a) await syncChatGptCatalog(true);
       })
       .catch(() => setAccount(null));
   }, []);
@@ -1489,7 +1455,7 @@ function ChatGptLoginCard() {
     try {
       const acct = await codexLogin();
       setAccount(acct);
-      await ensureChatGptEndpoint();
+      await syncChatGptCatalog(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

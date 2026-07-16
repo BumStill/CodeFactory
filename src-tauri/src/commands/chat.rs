@@ -51,6 +51,15 @@ pub async fn send_message(
     state: State<'_, AppState>,
     mcp: State<'_, Arc<McpManager>>,
 ) -> Result<(), AppError> {
+    // Register cancellation before any database, model, or credential work so
+    // a stop click cannot race the command's setup phase.
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    state
+        .chat_cancels
+        .lock()
+        .await
+        .insert(session_id.clone(), cancel_flag.clone());
+
     let settings = state.settings.read().await.clone();
 
     // Persist user message
@@ -270,16 +279,6 @@ pub async fn send_message(
     let pending_permissions = state.pending_permissions.clone();
     let mcp_manager: Arc<McpManager> = Arc::clone(&mcp);
 
-    // Fresh per-turn cancel flag (false). The chat "stop" button flips it via
-    // `cancel_chat`; the agent loop polls it between rounds. Overwriting any
-    // prior entry guarantees a new turn never inherits a stale cancel.
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    state
-        .chat_cancels
-        .lock()
-        .await
-        .insert(session_id.clone(), cancel_flag.clone());
-
     // Spawn agent loop (non-blocking); emit Error event to frontend if it fails
     let app_clone = app.clone();
     let event_name = format!("stream:{}", session_id);
@@ -363,6 +362,14 @@ pub async fn send_message_anonymous(
     state: State<'_, AppState>,
     mcp: State<'_, Arc<McpManager>>,
 ) -> Result<(), AppError> {
+    // Match persisted chats: expose the cancellation flag before setup work.
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    state
+        .chat_cancels
+        .lock()
+        .await
+        .insert(session_id.clone(), cancel_flag.clone());
+
     let settings = state.settings.read().await.clone();
 
     // Resolve endpoint + key (identical to send_message).
@@ -416,15 +423,6 @@ pub async fn send_message_anonymous(
     let settings_state = state.settings.clone();
     let pending_permissions = state.pending_permissions.clone();
     let mcp_manager: Arc<McpManager> = Arc::clone(&mcp);
-
-    // Same per-turn cancel wiring as send_message, so "stop" works for
-    // anonymous chats too. (Anonymous = no DB/cost; cancel just ends the turn.)
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    state
-        .chat_cancels
-        .lock()
-        .await
-        .insert(session_id.clone(), cancel_flag.clone());
 
     let app_clone = app.clone();
     let event_name = format!("stream:{}", session_id);

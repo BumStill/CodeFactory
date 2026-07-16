@@ -111,7 +111,13 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSetti
   const { messages, streaming, queue, pendingPermission } = useChatStore(activeRuntime);
   const isAnonymous = activeSession?.kind === "anonymous";
   const { settings, setTheme } = useSettingsStore();
+  const autonomousRunActive = useTasksStore((state) => state.running[sessionId] ?? false);
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
+  const guideNextStep = async (message: string) => {
+    const trimmed = message.trim();
+    if (!trimmed) return;
+    await invoke("queue_interjection", { sessionId, message: trimmed });
+  };
   // Double-click the session title (here or in the sidebar) to rename it inline.
   const [titleEditing, setTitleEditing] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
@@ -379,8 +385,10 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSetti
             key={activeSession?.id ?? sessionId}
             initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
             onSend={(t) => void sendOrQueue(t)}
+            onGuide={(t) => void guideNextStep(t)}
             onCancel={() => cancelStream()}
             streaming={streaming}
+            guidanceActive={autonomousRunActive}
             disabled={!activeSession}
             pendingInsert={pendingInsert}
             onInsertConsumed={() => setPendingInsert(undefined)}

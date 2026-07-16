@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   codexLogin: vi.fn(),
   codexLogout: vi.fn(),
   codexAccount: vi.fn(),
+  codexModels: vi.fn(),
   invoke: vi.fn(),
   loadRemotes: vi.fn(),
   addRemote: vi.fn(),
@@ -106,6 +107,7 @@ vi.mock("../../lib/tauri", () => ({
   codexLogin: mocks.codexLogin,
   codexLogout: mocks.codexLogout,
   codexAccount: mocks.codexAccount,
+  codexModels: mocks.codexModels,
 }));
 
 async function openGeneralTab() {

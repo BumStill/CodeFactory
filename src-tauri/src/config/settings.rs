@@ -221,6 +221,9 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    XHigh,
+    Max,
+    Ultra,
 }
 
 impl Default for ReasoningEffort {
@@ -236,6 +239,9 @@ impl ReasoningEffort {
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Max => "max",
+            ReasoningEffort::Ultra => "ultra",
         }
     }
 
@@ -247,6 +253,9 @@ impl ReasoningEffort {
             "low" => Some(ReasoningEffort::Low),
             "medium" => Some(ReasoningEffort::Medium),
             "high" => Some(ReasoningEffort::High),
+            "xhigh" => Some(ReasoningEffort::XHigh),
+            "max" => Some(ReasoningEffort::Max),
+            "ultra" => Some(ReasoningEffort::Ultra),
             _ => None,
         }
     }
@@ -391,6 +400,10 @@ pub struct CustomModel {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_reasoning_efforts: Option<Vec<ReasoningEffort>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -621,6 +634,50 @@ mod reasoning_effort_tests {
     }
 
     #[test]
+    fn extended_reasoning_efforts_are_lowercase_and_parseable() {
+        for (effort, serialized) in [
+            (ReasoningEffort::XHigh, "\"xhigh\""),
+            (ReasoningEffort::Max, "\"max\""),
+            (ReasoningEffort::Ultra, "\"ultra\""),
+        ] {
+            assert_eq!(serde_json::to_string(&effort).unwrap(), serialized);
+            assert_eq!(ReasoningEffort::parse(effort.as_str()), Some(effort));
+        }
+    }
+
+    #[test]
+    fn custom_model_capabilities_are_optional_for_old_configs() {
+        let legacy: CustomModel = serde_json::from_value(serde_json::json!({
+            "id": "legacy-codex",
+            "name": "Legacy Codex",
+            "context_length": 272000
+        }))
+        .expect("legacy custom model should deserialize");
+
+        assert_eq!(legacy.default_reasoning_effort, None);
+        assert_eq!(legacy.supported_reasoning_efforts, None);
+
+        let current: CustomModel = serde_json::from_value(serde_json::json!({
+            "id": "gpt-5.6-sol",
+            "default_reasoning_effort": "low",
+            "supported_reasoning_efforts": ["low", "medium", "xhigh", "max", "ultra"]
+        }))
+        .expect("current custom model should deserialize");
+
+        assert_eq!(current.default_reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(
+            current.supported_reasoning_efforts,
+            Some(vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Max,
+                ReasoningEffort::Ultra,
+            ])
+        );
+    }
+
+    #[test]
     fn old_settings_without_field_default_to_medium() {
         // Configs that predate this field must still load.
         let s: Settings = serde_json::from_value(serde_json::json!({
@@ -649,6 +706,8 @@ mod reasoning_effort_tests {
                     id: "gpt-5.5".into(),
                     name: Some("GPT-5.5".into()),
                     context_length: Some(272000),
+                    default_reasoning_effort: None,
+                    supported_reasoning_efforts: None,
                 }],
                 active_model: Some("gpt-5.5".into()),
             },
