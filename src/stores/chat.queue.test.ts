@@ -112,6 +112,25 @@ describe("chat message queue (per-session)", () => {
     expect(q()).toHaveLength(0);
   });
 
+
+  it("drains the next queued message after a manual interruption", async () => {
+    seed({ streaming: true });
+    await useChatStore.getState().sendOrQueue("queued after stop");
+    expect(q().map((x) => x.content)).toEqual(["queued after stop"]);
+
+    invokeMock.mockClear();
+    useChatStore.getState().cancelStream();
+
+    expect(invokeMock).toHaveBeenCalledWith("cancel_chat", { sessionId: SID });
+    expect(q()).toHaveLength(0);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(invokeMock).toHaveBeenCalledWith(
+      "send_message",
+      expect.objectContaining({ sessionId: SID, content: "queued after stop" }),
+    );
+  });
+
   it("reducer's done event flips streaming to false (drain trigger contract)", () => {
     // The drain itself lives in chat.ts's handleStreamEvent — it inspects the
     // session's runtime before/after the reducer. Here we just verify the

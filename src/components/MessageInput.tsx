@@ -41,9 +41,13 @@ function isImageAttachment(name: string): boolean {
 
 interface Props {
   onSend: (text: string) => void;
+  /** Route the primary input as an autonomous-run interjection instead of a chat turn. */
+  onGuide?: (text: string) => void | Promise<void>;
   onCommand?: (command: ParsedSlashCommand) => void | Promise<void>;
   onCancel: () => void;
   streaming: boolean;
+  /** True while an autonomous task run is active; Enter submits guidance for the next task. */
+  guidanceActive?: boolean;
   disabled: boolean;
   /** When set, this text will be appended to the current input value. */
   pendingInsert?: string;
@@ -60,7 +64,7 @@ interface Props {
   initialHistory?: string[];
 }
 
-export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd, initialHistory }: Props) {
+export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, guidanceActive = false, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd, initialHistory }: Props) {
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
   const [attachments, setAttachments] = useState<AttachmentChip[]>([]);
@@ -198,6 +202,14 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
       setAttachments([]);
       ref.current!.style.height = "auto";
       void onCommand(command);
+      return;
+    }
+    if (guidanceActive && text && onGuide) {
+      setValue("");
+      setAttachments([]);
+      setAttachError(null);
+      ref.current!.style.height = "auto";
+      void onGuide(text);
       return;
     }
     if (disabled) return;
@@ -370,6 +382,8 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
           placeholder={
             dragOver
               ? "松开以附加文件"
+              : guidanceActive
+              ? "执行中…输入对下一步的引导"
               : disabled
               ? "发送消息，或用 /cwd <path> 切换目录"
               : "发送消息 · 粘贴/拖拽/回形针附加文件（图片 · pptx · docx · pdf · xlsx）"
@@ -400,7 +414,11 @@ export function MessageInput({ onSend, onCommand, onCancel, streaming, disabled,
         </button>
       </div>
       <div className="mt-1 text-xs text-gray-700 text-right select-none">
-        {streaming ? "Enter 排队 · Shift+Enter 换行" : "Enter 发送 · Shift+Enter 换行"}
+        {guidanceActive
+          ? "Enter 引导下一步 · Shift+Enter 换行"
+          : streaming
+          ? "Enter 排队 · Shift+Enter 换行"
+          : "Enter 发送 · Shift+Enter 换行"}
       </div>
     </div>
   );
