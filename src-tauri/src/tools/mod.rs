@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod bash;
+pub mod delivery;
 pub mod docx;
 pub mod edit;
 pub mod file_lock;
@@ -50,6 +51,10 @@ pub struct ExecCtx {
     pub session_id: Option<String>,
     pub task_id: Option<String>,
     pub knowledge_library_ids: Option<Vec<String>>,
+    /// A snapshot of settings for tools that need policy/config (the delivery
+    /// tool reads the configured delivery ceiling + git remote tokens). None
+    /// in contexts that don't supply it.
+    pub settings: Option<crate::config::settings::Settings>,
 }
 
 #[cfg(test)]
@@ -61,6 +66,7 @@ impl ExecCtx {
             session_id: None,
             task_id: None,
             knowledge_library_ids: None,
+            settings: None,
         }
     }
 }
@@ -88,6 +94,7 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         skill_mgmt::fetch_definition(),
         xlsx::read_definition(),
         xlsx::edit_definition(),
+        delivery::definition(),
     ]
 }
 
@@ -114,6 +121,7 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "skill_fetch" => skill_mgmt::execute_fetch(args, ctx).await,
         "read_xlsx" => xlsx::execute_read(args, ctx).await,
         "edit_xlsx" => xlsx::execute_edit(args, ctx).await,
+        "deliver_changes" => delivery::execute(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),
     }
 }

@@ -94,6 +94,91 @@ pub struct Settings {
     /// Disk isolation mode for parallel subagents.
     #[serde(default)]
     pub subagent_isolation: SubagentIsolation,
+    /// How far the agent auto-delivers code changes (commit → push → PR → CI →
+    /// merge → release). The USER owns this ceiling; the app never hardcodes a
+    /// policy. Default `PrOnly` opens a PR and stops — reviewable, PR-first, and
+    /// enough to break the "green build but no PR" stall.
+    #[serde(default)]
+    pub delivery_ceiling: DeliveryCeiling,
+    /// Merge strategy used when the ceiling reaches `ThroughMerge`+.
+    #[serde(default)]
+    pub delivery_merge_method: MergeMethod,
+    /// Extra path prefixes/globs excluded from delivery commits, on top of the
+    /// built-in noise denylist. Repo-relative, `/`-separated.
+    #[serde(default)]
+    pub delivery_exclude_globs: Vec<String>,
+    /// Max seconds to poll CI for a conclusion before reporting it still
+    /// pending (bounded so a delivery never hangs a turn forever).
+    #[serde(default = "default_delivery_ci_timeout_secs")]
+    pub delivery_ci_timeout_secs: u32,
+}
+
+/// How far the agent carries a code change toward production, unattended. The
+/// user selects the ceiling; a per-call request may only LOWER it, never raise
+/// it above what the user configured.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryCeiling {
+    /// Never auto-deliver. The `deliver_changes` tool still exists for explicit
+    /// use, but delivery is not part of the agent's definition of "done".
+    Off,
+    /// Commit the real changed source files, push, and open a PR, then stop.
+    #[default]
+    PrOnly,
+    /// …then poll CI to a conclusion; stop before merging.
+    ThroughCiGreen,
+    /// …then merge the PR (per `delivery_merge_method`); stop before release.
+    ThroughMerge,
+    /// …then trigger a release. Deliberate by design — only reached when the
+    /// user explicitly raises the ceiling this far.
+    ThroughRelease,
+}
+
+impl DeliveryCeiling {
+    /// 0..=4, so a per-call override can be clamped to `min(request, configured)`.
+    pub fn rank(self) -> u8 {
+        match self {
+            DeliveryCeiling::Off => 0,
+            DeliveryCeiling::PrOnly => 1,
+            DeliveryCeiling::ThroughCiGreen => 2,
+            DeliveryCeiling::ThroughMerge => 3,
+            DeliveryCeiling::ThroughRelease => 4,
+        }
+    }
+
+    /// The effective ceiling for a call that requested `requested`: never above
+    /// what the user configured (`self`).
+    pub fn clamp_request(self, requested: DeliveryCeiling) -> DeliveryCeiling {
+        if requested.rank() <= self.rank() {
+            requested
+        } else {
+            self
+        }
+    }
+}
+
+/// Merge strategy for `ThroughMerge`+.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeMethod {
+    #[default]
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl MergeMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeMethod::Squash => "squash",
+            MergeMethod::Merge => "merge",
+            MergeMethod::Rebase => "rebase",
+        }
+    }
+}
+
+fn default_delivery_ci_timeout_secs() -> u32 {
+    1800
 }
 
 /// How parallel subagents are isolated from each other on disk.
@@ -393,6 +478,10 @@ impl Default for Settings {
             reasoning_effort: ReasoningEffort::Medium,
             max_parallel_tasks: default_max_parallel_tasks(),
             subagent_isolation: SubagentIsolation::Shared,
+            delivery_ceiling: DeliveryCeiling::PrOnly,
+            delivery_merge_method: MergeMethod::Squash,
+            delivery_exclude_globs: Vec::new(),
+            delivery_ci_timeout_secs: default_delivery_ci_timeout_secs(),
         }
     }
 }
@@ -432,6 +521,67 @@ mod subagent_isolation_tests {
         );
         let parsed: SubagentIsolation = serde_json::from_str("\"shared\"").unwrap();
         assert_eq!(parsed, SubagentIsolation::Shared);
+    }
+}
+
+#[cfg(test)]
+mod delivery_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn default_ceiling_is_pr_only() {
+        let s = Settings::default();
+        assert_eq!(s.delivery_ceiling, DeliveryCeiling::PrOnly);
+        assert_eq!(s.delivery_merge_method, MergeMethod::Squash);
+        assert_eq!(s.delivery_ci_timeout_secs, 1800);
+        assert!(s.delivery_exclude_globs.is_empty());
+    }
+
+    #[test]
+    fn legacy_settings_without_delivery_fields_default_to_pr_only() {
+        // A settings.json written before delivery existed must load with the
+        // PrOnly default, not fail to deserialize.
+        let legacy = serde_json::json!({
+            "endpoints": {},
+            "default_endpoint": "openrouter",
+            "default_model": "m",
+            "permissions": { "allow": [], "ask": [], "deny": [], "full_access": false },
+            "shell": { "shell": "bash" }
+        });
+        let s: Settings = serde_json::from_value(legacy).expect("legacy settings must parse");
+        assert_eq!(s.delivery_ceiling, DeliveryCeiling::PrOnly);
+        assert_eq!(s.delivery_ci_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn ceiling_serde_is_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&DeliveryCeiling::ThroughCiGreen).unwrap(),
+            "\"through_ci_green\""
+        );
+        let parsed: DeliveryCeiling = serde_json::from_str("\"through_release\"").unwrap();
+        assert_eq!(parsed, DeliveryCeiling::ThroughRelease);
+    }
+
+    #[test]
+    fn clamp_request_never_raises_above_configured() {
+        // A per-call request may lower the ceiling but never exceed the user's.
+        let configured = DeliveryCeiling::ThroughCiGreen;
+        assert_eq!(
+            configured.clamp_request(DeliveryCeiling::ThroughRelease),
+            DeliveryCeiling::ThroughCiGreen,
+            "request above configured is clamped down"
+        );
+        assert_eq!(
+            configured.clamp_request(DeliveryCeiling::PrOnly),
+            DeliveryCeiling::PrOnly,
+            "request below configured is honored"
+        );
+        assert_eq!(
+            DeliveryCeiling::Off.clamp_request(DeliveryCeiling::ThroughMerge),
+            DeliveryCeiling::Off,
+            "Off disables delivery regardless of request"
+        );
     }
 }
 

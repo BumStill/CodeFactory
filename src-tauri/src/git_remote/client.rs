@@ -45,7 +45,8 @@ impl RemoteGitClient {
         if !status.is_success() {
             return Err(format!("HTTP {}: {}", status, text.trim()));
         }
-        serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {}: {}", e, &text[..text.len().min(200)]))
+        serde_json::from_str(&text)
+            .map_err(|e| format!("JSON parse error: {}: {}", e, &text[..text.len().min(200)]))
     }
 
     pub async fn post(&self, path: &str, body: Value) -> Result<Value, String> {
@@ -71,6 +72,22 @@ impl RemoteGitClient {
         let text = resp.text().await.map_err(|e| e.to_string())?;
         if !status.is_success() {
             return Err(format!("HTTP {}: {}", status, text.trim()));
+        }
+        serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {}", e))
+    }
+
+    pub async fn put(&self, path: &str, body: Value) -> Result<Value, String> {
+        let url = format!("{}{}", self.base_url, path);
+        let req = self.apply_auth(self.inner.put(&url)).json(&body);
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!("HTTP {}: {}", status, text.trim()));
+        }
+        // Some PUT endpoints (e.g. an empty 200) return no JSON body.
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
         }
         serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {}", e))
     }

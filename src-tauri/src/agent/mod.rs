@@ -4,6 +4,7 @@ pub mod attachments;
 pub mod checkpoint;
 pub mod context;
 pub mod context_budget;
+pub mod delivery;
 pub mod dispatch;
 pub mod hooks;
 pub mod scheduler;
@@ -171,6 +172,13 @@ Once the user approves the plan, execute in this exact order:\n\
    section below.\n\
 5. Run the full test suite once more to catch regressions.\n\
 6. Report a summary using the analysis-first shape above.\n\
+7. **Deliver (code changes in a git repo).** After the suite is green, call\n\
+   the `deliver_changes` tool ONCE to carry the work through the user's\n\
+   configured delivery ceiling (commit -> push -> PR -> CI -> merge ->\n\
+   release). Do NOT hand-run git in bash, and do NOT stop at a green build to\n\
+   describe a missing PR — invoking the tool IS how code work reaches done.\n\
+   The tool stages only real source files (never local noise) and is\n\
+   idempotent, so it is safe to call again to resume after any interruption.\n\
 \n\
 # Test-modification discipline (NON-NEGOTIABLE)\n\
 A failing test is a *data point*, not a reason to edit the test. When\n\
@@ -296,7 +304,13 @@ of suggestions, and the user just APPROVED it. Carry it out NOW.\n\
 5. **Verify, then report.** Before declaring done, confirm the work actually\n\
    happened (run it, read it back). Then summarize engineer-style: what you\n\
    did, the outcome the user sees, and a short list of files/deliverables.\n\
-   Lead with the result, keep bookkeeping last.";
+   Lead with the result, keep bookkeeping last.\n\
+6. **Deliver code work.** For a code change in a git repo, once verified, call\n\
+   the `deliver_changes` tool to carry it through the configured delivery\n\
+   ceiling (commit -> push -> PR -> CI -> merge -> release). A green build\n\
+   without delivery is not done; narrating the missing PR instead of opening\n\
+   it is the exact failure this rule exists to prevent. The tool is idempotent\n\
+   and commits only real source files.";
 
 pub struct AgentLoop {
     app: AppHandle,
@@ -873,6 +887,7 @@ impl AgentLoop {
                         .as_ref()
                         .map(|ctx| ctx.knowledge_library_ids.clone())
                         .filter(|ids| !ids.is_empty()),
+                    settings: Some(self.settings.read().await.clone()),
                 };
 
                 let tool_start = std::time::Instant::now();
@@ -2149,6 +2164,7 @@ impl AgentLoop {
                         .as_ref()
                         .map(|ctx| ctx.knowledge_library_ids.clone())
                         .filter(|ids| !ids.is_empty()),
+                    settings: Some(self.settings.read().await.clone()),
                 };
 
                 let tool_start = std::time::Instant::now();
