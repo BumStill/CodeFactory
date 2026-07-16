@@ -3,29 +3,9 @@
 Things noted during work that aren't in the current PR. Sorted newest-first.
 When picking one up, move it to its own PR scope and remove from here.
 
-The five entries below came out of the 2026-07-15 openJiuwen deep-dive
+The entries below came out of the 2026-07-15 openJiuwen deep-dive
 (openJiuwen-ai/agent-core v0.1.16, jiuwenswarm v0.2.3 — Apache-2.0, so
 referenced mechanisms can be studied directly). Ordered by priority.
-
-## Content-addressed resume journal for parallel task dispatch (P0)
-
-Journal every subagent dispatch keyed by its position in the task tree plus a
-SHA-256 of the brief/model/tool config, so an interrupted spec→tasks run
-resumes from cached results instead of restarting from zero.
-
-Why: the scheduler retries within a run, but an app crash or restart loses all
-in-flight work — cancellation is cooperative-only and nothing re-enters a
-half-finished task tree. openJiuwen's SwarmFlow journal
-(`agent_teams/workflow/engine/journal.py`) shows content-addressing beats
-counters: upstream changes cascade-invalidate downstream cache entries
-automatically and replay stays deterministic — the same philosophy as our
-completion evidence gate ("verification later than last edit").
-
-Open questions when scoping:
-- Extend `task_runs` or add a dedicated journal table?
-- Exact cache key: brief hash alone, or brief + model + enabled-tools set?
-- Interaction with file checkpoints: a cached "done" task whose file edits
-  were rolled back must not replay as done.
 
 ## Exposure tracking + re-scoring for accepted memory and skills (P1)
 

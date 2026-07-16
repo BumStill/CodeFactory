@@ -142,13 +142,28 @@ pub async fn revert_checkpoint(
     .fetch_one(&*pool)
     .await?;
 
-    checkpoint::revert(Path::new(&row.cwd), &row.git_sha)
-        .map_err(|e| AppError::Other(e))?;
+    checkpoint::revert(Path::new(&row.cwd), &row.git_sha).map_err(|e| AppError::Other(e))?;
 
     sqlx::query("UPDATE checkpoints SET reverted = 1 WHERE id = ?")
         .bind(&checkpoint_id)
         .execute(&*pool)
         .await?;
+
+    // Point-in-time resume-journal invalidation: the whole-tree restore just
+    // wiped every edit made after this checkpoint, so every task completed
+    // at/after it must re-run instead of replaying from cache. Fires once,
+    // here — the downstream cascade falls out of the next resume pass.
+    match crate::agent::journal::invalidate_on_revert(&pool, &row.session_id, &row.created_at).await
+    {
+        Ok(n) if n > 0 => {
+            tracing::info!(
+                "checkpoint revert invalidated {n} completed task(s) in session {}",
+                row.session_id
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("journal invalidation on revert failed (non-fatal): {e}"),
+    }
     Ok(())
 }
 

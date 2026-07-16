@@ -61,6 +61,19 @@ jobs:
           path: ${{ runner.temp }}/codefactory-evolution-headless
           if-no-files-found: error
 
+      - name: Resume journal headless viewport gate
+        run: pnpm test:resume:headless
+        env:
+          CODEFACTORY_RESUME_ARTIFACT_DIR: ${{ runner.temp }}/codefactory-resume-headless
+
+      - name: Upload resume journal viewport evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resume-journal-headless-${{ runner.os }}
+          path: ${{ runner.temp }}/codefactory-resume-headless
+          if-no-files-found: error
+
       - name: Cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml
 

@@ -67,6 +67,44 @@ export interface ExecutionEvent {
   at: number;
 }
 
+/** What the content-addressed resume journal did at scheduler start. */
+export interface ResumeTaskView {
+  task_id: string;
+  title: string;
+  key_short: string;
+}
+export type ResumeInvalidationReason =
+  | "input_changed"
+  | "upstream_changed"
+  | "checkpoint_reverted"
+  | "diff_missing"
+  | "worktree_not_applied"
+  | "hash_version";
+export interface ResumeInvalidatedView {
+  task_id: string;
+  title: string;
+  reason: ResumeInvalidationReason;
+}
+export interface ResumeRecoveredView {
+  task_id: string;
+  title: string;
+  outcome: "finalized" | "reset";
+}
+export interface ResumeReport {
+  restored: ResumeTaskView[];
+  invalidated: ResumeInvalidatedView[];
+  recovered: ResumeRecoveredView[];
+}
+
+export const RESUME_REASON_LABELS: Record<ResumeInvalidationReason, string> = {
+  input_changed: "输入变化",
+  upstream_changed: "上游变化",
+  checkpoint_reverted: "检查点回滚",
+  diff_missing: "改动丢失",
+  worktree_not_applied: "改动未合并",
+  hash_version: "缓存版本升级",
+};
+
 interface TasksState {
   /** Tasks keyed by session_id. */
   tasks: Record<string, TaskRun[]>;
@@ -78,6 +116,8 @@ interface TasksState {
   error: Record<string, string | null>;
   /** Live execution event log keyed by session_id, append-only within a run. */
   executionLog: Record<string, ExecutionEvent[]>;
+  /** Latest resume-journal report per session (what was restored vs re-run). */
+  resumeReports: Record<string, ResumeReport>;
 
   loadTasks: (sessionId: string) => Promise<void>;
   createTaskTree: (
@@ -104,6 +144,7 @@ export const useTasksStore = create<TasksState>((set, get) => ({
   loading: {},
   error: {},
   executionLog: {},
+  resumeReports: {},
 
   clearExecutionLog: (sessionId) => {
     set((s) => ({ executionLog: { ...s.executionLog, [sessionId]: [] } }));
@@ -259,6 +300,18 @@ export const useTasksStore = create<TasksState>((set, get) => ({
       });
       unsubs.push(u);
     }
+
+    // Resume summary: emitted once at scheduler start when the content-
+    // addressed journal restored/invalidated/recovered anything. Pure data →
+    // banner state; restored tasks never re-emit task_started (no subagent,
+    // no cost), so this is the only signal the UI gets for them.
+    const uResume = await listen<ResumeReport>(`resume_summary:${sessionId}`, (event) => {
+      set((s) => ({
+        resumeReports: { ...s.resumeReports, [sessionId]: event.payload },
+      }));
+      refresh();
+    });
+    unsubs.push(uResume);
 
     // Polling fallback in case events miss.
     const interval = window.setInterval(() => {

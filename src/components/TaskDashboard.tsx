@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { invoke } from "../lib/tauri";
 import { useTasksStore } from "../stores/tasks";
+import { ResumeBanner, RestoredBadge } from "./ResumeBanner";
 import type { TaskInput, TaskRun, TaskStatus, TaskDep, VerificationResult } from "../lib/tauri";
 
 interface Props {
@@ -31,6 +32,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
     loading,
     error,
     running,
+    resumeReports,
     loadTasks,
     createTaskTree,
     start,
@@ -43,6 +45,13 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
   const isLoading = loading[sessionId] ?? false;
   const isRunning = running[sessionId] ?? false;
   const sessionError = error[sessionId];
+  const resumeReport = resumeReports[sessionId];
+  // task_id → key_short for restored tasks, so rows can badge 已缓存.
+  const restoredKeys = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const r of resumeReport?.restored ?? []) m.set(r.task_id, r.key_short);
+    return m;
+  }, [resumeReport]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [creatingDemo, setCreatingDemo] = useState(false);
   // Local cache of verification results so the dashboard updates immediately
@@ -189,6 +198,9 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
         </div>
       )}
 
+      {/* Resume-journal summary (restored-from-cache vs re-running) */}
+      <ResumeBanner report={resumeReport} />
+
       {/* Body */}
       <div className="flex-1 overflow-y-auto">
         {sessionTasks.length === 0 && !isLoading && (
@@ -220,6 +232,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
                       expanded={expanded.has(t.id)}
                       onToggle={() => toggleExpand(t.id)}
                       onVerificationRun={handleVerificationRun}
+                      restoredKey={restoredKeys.get(t.id)}
                     />
                   );
                 })}
@@ -260,9 +273,11 @@ interface RowProps {
   expanded: boolean;
   onToggle: () => void;
   onVerificationRun: (taskId: string, results: VerificationResult[]) => void;
+  /** key_short when this task was restored from the resume journal. */
+  restoredKey?: string;
 }
 
-function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun }: RowProps) {
+function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, restoredKey }: RowProps) {
   const dur = computeDuration(task);
   const result = parseResult(task.result);
   const verificationResults = parseVerification(task.verification_results);
@@ -313,6 +328,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun }: Row
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5">
             <span className="text-[12px] text-gray-200 truncate">{task.title}</span>
+            {restoredKey && <RestoredBadge keyShort={restoredKey} />}
             {verifBadge === "pass" && (
               <span title="全部验证检查通过"><CheckCircle2 size={11} className="text-green-400 shrink-0" /></span>
             )}
