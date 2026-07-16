@@ -471,6 +471,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // terminal event is the only safe point to drain a queued message; sending
     // it immediately would race the still-running tool call in the old turn.
     void invoke("cancel_chat", { sessionId: id });
+    drainNextQueuedMessage(id, set, get);
   },
 
   respondPermission: async (allow) => {
