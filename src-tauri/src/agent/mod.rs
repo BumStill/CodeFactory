@@ -7,6 +7,7 @@ pub mod context_budget;
 pub mod delivery;
 pub mod dispatch;
 pub mod hooks;
+pub mod journal;
 pub mod scheduler;
 pub mod sse_buffer;
 pub mod subagent;

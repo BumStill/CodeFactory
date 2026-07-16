@@ -18,9 +18,11 @@ use crate::agent::scheduler::TaskScheduler;
 use crate::agent::verification::{self, VerificationResult};
 use crate::commands::evidence;
 use crate::errors::AppError;
-use crate::storage::tasks::{self, classify_task_failure, TaskConnectorContext, TaskFailureAttribution, TaskRun};
-use crate::AppState;
+use crate::storage::tasks::{
+    self, classify_task_failure, TaskConnectorContext, TaskFailureAttribution, TaskRun,
+};
 use crate::util::no_window::NoWindow;
+use crate::AppState;
 
 /// Map of session_id -> cancel flag for the running scheduler. When the user
 /// hits Cancel we flip the flag and drop the entry. The actual scheduler task
@@ -206,6 +208,7 @@ pub async fn start_implementation(
     // as the per-message chat checkpoint, surfaced in the CheckpointsPanel.
     // Best-effort: a non-git cwd or a git hiccup just means no safety net this
     // run, never a blocked start.
+    let mut run_checkpoint_id: Option<String> = None;
     {
         use std::path::Path;
         let cwd: Option<String> = sqlx::query_scalar("SELECT cwd FROM sessions WHERE id = ?")
@@ -239,6 +242,9 @@ pub async fn start_implementation(
                         tracing::warn!("autonomous checkpoint INSERT failed: {e}");
                     } else {
                         app.emit("checkpoint-created", &session_id).ok();
+                        // The resume journal records which checkpoint's revert
+                        // would undo each task completed in this run.
+                        run_checkpoint_id = Some(cp_id.clone());
                     }
                 }
                 Ok(None) => {} // cwd not a git repo — skip
@@ -265,6 +271,7 @@ pub async fn start_implementation(
                 app.clone(),
                 pending_perms,
                 interjections,
+                run_checkpoint_id,
             )
             .await;
         if let Err(e) = result {
@@ -276,24 +283,24 @@ pub async fn start_implementation(
         // Auto-collect evidence pack if spec info was provided.
         if let (Some(ref req_id), Some(ref title)) = (&spec_req_id, &spec_title) {
             // Gather all task ids for this session.
-            let task_ids: Vec<String> = crate::storage::tasks::list_session_tasks(&pool, &session_id_clone)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| t.id)
-                .collect();
+            let task_ids: Vec<String> =
+                crate::storage::tasks::list_session_tasks(&pool, &session_id_clone)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| t.id)
+                    .collect();
 
             // Get cwd from the session.
-            let cwd: String = sqlx::query_as::<_, (String,)>(
-                "SELECT cwd FROM sessions WHERE id = ?",
-            )
-            .bind(&session_id_clone)
-            .fetch_optional(&pool)
-            .await
-            .ok()
-            .flatten()
-            .map(|(c,)| c)
-            .unwrap_or_default();
+            let cwd: String =
+                sqlx::query_as::<_, (String,)>("SELECT cwd FROM sessions WHERE id = ?")
+                    .bind(&session_id_clone)
+                    .fetch_optional(&pool)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|(c,)| c)
+                    .unwrap_or_default();
 
             if !cwd.is_empty() && !task_ids.is_empty() {
                 evidence::auto_collect_and_emit(
@@ -308,14 +315,7 @@ pub async fn start_implementation(
                 .await;
 
                 // Auto-create draft PR if configured.
-                auto_create_pr_if_configured(
-                    &app,
-                    &settings,
-                    &session_id_clone,
-                    &cwd,
-                    title,
-                )
-                .await;
+                auto_create_pr_if_configured(&app, &settings, &session_id_clone, &cwd, title).await;
             }
         }
     });
@@ -377,8 +377,7 @@ pub async fn run_verification_now(
         .ok_or_else(|| format!("Task '{}' not found", task_id))?;
 
     let plan = verification::detect_verification_plan(&task.cwd);
-    let results =
-        verification::run_verification(&plan, &app, &session_id, &task_id).await;
+    let results = verification::run_verification(&plan, &app, &session_id, &task_id).await;
 
     // Persist.
     let json = serde_json::to_string(&results).map_err(|e| e.to_string())?;
@@ -403,7 +402,11 @@ async fn auto_create_pr_if_configured(
     }
 
     // Find a remote with a default_repo set (use first match).
-    let remote = match settings.git_remotes.iter().find(|r| r.default_repo.is_some()) {
+    let remote = match settings
+        .git_remotes
+        .iter()
+        .find(|r| r.default_repo.is_some())
+    {
         Some(r) => r.clone(),
         None => return,
     };
@@ -413,15 +416,14 @@ async fn auto_create_pr_if_configured(
     }
 
     // Get current branch.
-    let branch_output = std::process::Command::new("git").no_window()
+    let branch_output = std::process::Command::new("git")
+        .no_window()
         .current_dir(cwd)
         .args(["branch", "--show-current"])
         .output();
 
     let current_branch = match branch_output {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => return,
     };
 
@@ -446,7 +448,11 @@ async fn auto_create_pr_if_configured(
     let default_branch = match &remote.provider {
         crate::config::settings::GitProvider::Github => {
             match client.get(&format!("/repos/{}", repo)).await {
-                Ok(v) => v.get("default_branch").and_then(|x| x.as_str()).unwrap_or("main").to_string(),
+                Ok(v) => v
+                    .get("default_branch")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("main")
+                    .to_string(),
                 Err(_) => "main".to_string(),
             }
         }
@@ -465,15 +471,27 @@ async fn auto_create_pr_if_configured(
     let pr_result = match &remote.provider {
         crate::config::settings::GitProvider::Github => {
             crate::git_remote::github::create_pr(
-                &client, &repo, spec_title, &pr_body,
-                &current_branch, &default_branch, true,
-            ).await
+                &client,
+                &repo,
+                spec_title,
+                &pr_body,
+                &current_branch,
+                &default_branch,
+                true,
+            )
+            .await
         }
         crate::config::settings::GitProvider::Gitlab => {
             crate::git_remote::gitlab::create_pr(
-                &client, &repo, spec_title, &pr_body,
-                &current_branch, &default_branch, true,
-            ).await
+                &client,
+                &repo,
+                spec_title,
+                &pr_body,
+                &current_branch,
+                &default_branch,
+                true,
+            )
+            .await
         }
     };
 

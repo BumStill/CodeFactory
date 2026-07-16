@@ -44,6 +44,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::agent::hooks::{HookEvent, HookRunner};
+use crate::agent::journal;
 use crate::agent::subagent::{self, SubagentBrief, SubagentResult};
 use crate::agent::verification;
 use crate::agent::worktree;
@@ -58,6 +59,35 @@ pub const MAX_PARALLEL: usize = 3;
 
 /// Max retry attempts per task (including the first attempt).
 const MAX_ATTEMPTS: u32 = 3;
+
+/// The tool allow-list every subagent brief advertises. Shared with the
+/// journal's dispatch-input hashing so the two can never drift.
+pub const SUBAGENT_ALLOWED_TOOLS: &[&str] = &[
+    "read_file",
+    "glob",
+    "grep",
+    "kb_search",
+    "kb_get_chunk",
+    "write_file",
+    "edit_file",
+    "bash",
+];
+
+/// The EFFECTIVE dispatch inputs for this session, resolved the same way at
+/// dispatch time and at resume so keys compare like-for-like.
+fn dispatch_inputs(settings: &Settings) -> journal::DispatchInputs {
+    journal::DispatchInputs {
+        resolved_model: settings.default_model.clone(),
+        resolved_tools: SUBAGENT_ALLOWED_TOOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        isolation: match settings.subagent_isolation {
+            SubagentIsolation::Shared => "shared".to_string(),
+            SubagentIsolation::Worktree => "worktree".to_string(),
+        },
+    }
+}
 
 /// Poll interval when no new tasks can be dispatched but some are still in flight.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -103,6 +133,41 @@ fn settle_result_after_verification(
     VerificationAttemptDecision::Finish(result)
 }
 
+/// RAII net under a dispatched task future: on drop without `settled`, the
+/// task row resets to `pending` (journal marked stale) and the in-memory
+/// running slot is freed — turning an intra-process panic from a permanent
+/// wedge into a normal re-dispatch on the next scheduler tick.
+struct DispatchGuard {
+    pool: SqlitePool,
+    running: Arc<Mutex<HashSet<String>>>,
+    task_id: String,
+    settled: bool,
+}
+
+impl Drop for DispatchGuard {
+    fn drop(&mut self) {
+        let id = self.task_id.clone();
+        let running = self.running.clone();
+        let pool = self.pool.clone();
+        let settled = self.settled;
+        // Drop is sync; hand the async cleanup to the runtime (present on
+        // every scheduler path — this future runs inside tokio::spawn).
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if !settled {
+                    let has_journal = journal::journal_get(&pool, &id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    let _ = journal::reset_to_pending(&pool, &id, has_journal).await;
+                }
+                running.lock().await.remove(&id);
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TaskScheduler {
     pub pool: SqlitePool,
@@ -142,9 +207,53 @@ impl TaskScheduler {
         app_handle: AppHandle,
         pending_perms: PendingPermissionMap,
         interjections: crate::commands::interjections::InterjectionQueue,
+        run_checkpoint_id: Option<String>,
     ) -> Result<(), AppError> {
         let max_parallel = usize::from(settings.max_parallel_tasks.clamp(1, 8));
         let semaphore = Arc::new(Semaphore::new(max_parallel));
+
+        // ── Resume (content-addressed journal) ─────────────────────────────
+        // Phase A: heal crash-orphaned 'running' rows for THIS session (boot
+        // recovery in ensure_schema already handled the session-agnostic
+        // sweep; this catches a peer-process crash without a restart).
+        // Phase B: revalidate completed tasks against their journal — restore
+        // matches, reset input-changed/output-lost tasks to pending so the
+        // unchanged pending/ready logic below re-runs exactly what's needed.
+        // Best-effort by design: a resume hiccup degrades to today's coarse
+        // "skip completed" behavior, never blocks the run.
+        {
+            let inputs = dispatch_inputs(&settings);
+            let mut report = journal::ResumeReport::default();
+            match journal::recover_orphaned_tasks(
+                &self.pool,
+                journal::OrphanScope::Session(session_id.clone()),
+            )
+            .await
+            {
+                Ok(recovered) => report.recovered = recovered,
+                Err(e) => tracing::warn!("scheduler: orphan recovery failed (non-fatal): {e}"),
+            }
+            match journal::plan_resume(&self.pool, &session_id, &inputs).await {
+                Ok(mut planned) => {
+                    planned.recovered = std::mem::take(&mut report.recovered);
+                    report = planned;
+                }
+                Err(e) => tracing::warn!("scheduler: plan_resume failed (non-fatal): {e}"),
+            }
+            if !report.restored.is_empty()
+                || !report.invalidated.is_empty()
+                || !report.recovered.is_empty()
+            {
+                let event = format!("resume_summary:{}", session_id);
+                if let Err(e) = app_handle.emit(&event, &report) {
+                    tracing::warn!("failed to emit {}: {}", event, e);
+                }
+                for restored in &report.restored {
+                    let event = format!("task_restored:{}", session_id);
+                    let _ = app_handle.emit(&event, restored);
+                }
+            }
+        }
 
         // Worktree isolation: resolve the container dir once. Worktrees live
         // under the app data dir — never inside the user's project — so
@@ -164,6 +273,14 @@ impl TaskScheduler {
         // Serializes merge-backs within this session: concurrent tasks must
         // not interleave `git apply` on the same user checkout.
         let merge_lock = Arc::new(Mutex::new(()));
+        // Durable home for worktree merge-back patches: worktree cleanup reaps
+        // the original after a successful merge, but the journal's presence
+        // gate needs the patch at every later resume.
+        let journal_patch_dir: PathBuf = app_handle
+            .path()
+            .app_data_dir()
+            .unwrap_or_else(|_| std::env::temp_dir().join("codefactory"))
+            .join("task-journal-patches");
 
         // Write shared brief listing all tasks for parallel subagents to read
         {
@@ -237,7 +354,22 @@ impl TaskScheduler {
                     Err(_) => break, // cap reached, try again next tick
                 };
 
-                tasks::mark_task_started(&self.pool, &task.id).await.ok();
+                // CAS claim: pending → running with THIS process's identity.
+                // Another scheduler (possibly another process sharing the DB)
+                // may have claimed it between the ready query and here — skip
+                // instead of double-dispatching.
+                match journal::claim_task(&self.pool, &task.id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        drop(permit);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("scheduler: claim_task({}) failed: {e}", task.id);
+                        drop(permit);
+                        continue;
+                    }
+                }
                 self.running.lock().await.insert(task.id.clone());
                 emit_task(
                     &app_handle,
@@ -265,6 +397,9 @@ impl TaskScheduler {
                 let running = self.running.clone();
                 let worktree_container = worktree_container.clone();
                 let merge_lock = merge_lock.clone();
+                let journal_patch_dir = journal_patch_dir.clone();
+                let run_checkpoint_id = run_checkpoint_id.clone();
+                let task_row = task.clone();
                 let task_id = task.id.clone();
                 let task_cwd = task.cwd.clone();
                 let task_title = task.title.clone();
@@ -287,6 +422,19 @@ impl TaskScheduler {
 
                 tokio::spawn(async move {
                     let _permit = permit; // released on drop
+
+                    // RAII guard: a panic anywhere in this future would
+                    // otherwise leak the in-memory running slot AND leave the
+                    // DB row 'running' under a live owner PID that orphan
+                    // recovery rightly refuses to reset. On unwind the guard
+                    // resets the row to pending so the next scheduler tick
+                    // simply re-dispatches it.
+                    let mut dispatch_guard = DispatchGuard {
+                        pool: pool.clone(),
+                        running: running.clone(),
+                        task_id: task_id.clone(),
+                        settled: false,
+                    };
 
                     // ── Pre-task hook ────────────────────────────────────────
                     let hook_runner = HookRunner::from_settings(&settings, app.clone());
@@ -405,16 +553,10 @@ impl TaskScheduler {
                             description,
                             cwd: effective_cwd.clone(),
                             parent_summary,
-                            allowed_tools: vec![
-                                "read_file".into(),
-                                "glob".into(),
-                                "grep".into(),
-                                "kb_search".into(),
-                                "kb_get_chunk".into(),
-                                "write_file".into(),
-                                "edit_file".into(),
-                                "bash".into(),
-                            ],
+                            allowed_tools: SUBAGENT_ALLOWED_TOOLS
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect(),
                             acceptance_criteria: task_acceptance.clone(),
                             connector_context: tasks::TaskConnectorContext::from_json(
                                 task.task_context_json.as_deref(),
@@ -587,22 +729,98 @@ impl TaskScheduler {
                     // all-or-nothing (user tree untouched) and downgrades the
                     // task to failed with the branch + patch preserved for
                     // manual recovery. Failed tasks keep their worktree.
+                    // Materialization evidence for the resume journal: how this
+                    // task's output landed on disk. Shared mode edits in place.
+                    let mut journal_material = journal::Materialization {
+                        kind: "shared_inplace",
+                        merge_applied: true,
+                        patch_path: None,
+                        repo_root: None,
+                        base_sha: None,
+                    };
+                    let journal_inputs = dispatch_inputs(&settings);
+                    let journal_dep_keys = journal::dep_keys_for(&pool, &task_id)
+                        .await
+                        .unwrap_or_default();
+
                     if let Some(ref wt) = task_worktree {
                         let completed_ok = final_outcome.as_ref().map_or(false, |r| r.completed);
                         if completed_ok {
                             let _merge_guard = merge_lock.lock().await;
+                            // Durable 'merging' intent BEFORE the side effect:
+                            // a crash between "diff applied" and "row completed"
+                            // is then resolved exactly-once by orphan recovery
+                            // (reverse-apply-check decides finalize vs reset).
+                            let intent_result_json = final_outcome
+                                .as_ref()
+                                .and_then(|r| serde_json::to_string(r).ok())
+                                .unwrap_or_else(|| "{}".into());
+                            let intent = journal::Materialization {
+                                kind: "applied",
+                                merge_applied: false,
+                                patch_path: Some(wt.patch_path.display().to_string()),
+                                repo_root: Some(wt.repo_root.display().to_string()),
+                                base_sha: Some(wt.base_sha.clone()),
+                            };
+                            if let Err(e) = journal::record_merging_intent(
+                                &pool,
+                                &task_row,
+                                &journal_inputs,
+                                &journal_dep_keys,
+                                run_checkpoint_id.as_deref(),
+                                &intent,
+                                &intent_result_json,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "scheduler: task {} merging intent write failed: {e}",
+                                    task_id
+                                );
+                            }
                             match worktree::merge_back(wt) {
-                                Ok(worktree::MergeOutcome::Applied)
-                                | Ok(worktree::MergeOutcome::NoChanges) => {
+                                Ok(worktree::MergeOutcome::Applied) => {
                                     if let Some(ref mut r) = final_outcome {
                                         r.files_changed = worktree::remap_paths(
                                             std::mem::take(&mut r.files_changed),
                                             wt,
                                         );
                                     }
+                                    // Copy the merge-back patch to its durable
+                                    // home BEFORE cleanup reaps the original —
+                                    // it is the presence-gate evidence at every
+                                    // later resume.
+                                    let durable =
+                                        journal_patch_dir.join(format!("task-{}.patch", task_id));
+                                    let _ = std::fs::create_dir_all(&journal_patch_dir);
+                                    let copied = std::fs::copy(&wt.patch_path, &durable).is_ok();
+                                    journal_material = journal::Materialization {
+                                        kind: "applied",
+                                        merge_applied: true,
+                                        patch_path: copied.then(|| durable.display().to_string()),
+                                        repo_root: Some(wt.repo_root.display().to_string()),
+                                        base_sha: Some(wt.base_sha.clone()),
+                                    };
+                                    worktree::cleanup(wt, true);
+                                }
+                                Ok(worktree::MergeOutcome::NoChanges) => {
+                                    if let Some(ref mut r) = final_outcome {
+                                        r.files_changed = worktree::remap_paths(
+                                            std::mem::take(&mut r.files_changed),
+                                            wt,
+                                        );
+                                    }
+                                    journal_material = journal::Materialization {
+                                        kind: "no_changes",
+                                        merge_applied: true,
+                                        patch_path: None,
+                                        repo_root: Some(wt.repo_root.display().to_string()),
+                                        base_sha: Some(wt.base_sha.clone()),
+                                    };
                                     worktree::cleanup(wt, true);
                                 }
                                 Ok(worktree::MergeOutcome::Conflict { message }) => {
+                                    let _ = journal::journal_mark_stale(&pool, &task_id).await;
                                     let note = format!(
                                         "Merge-back conflict: {message}. Work preserved on \
                                          branch '{}' with patch at {}.",
@@ -618,6 +836,7 @@ impl TaskScheduler {
                                     }
                                 }
                                 Err(e) => {
+                                    let _ = journal::journal_mark_stale(&pool, &task_id).await;
                                     let note = format!(
                                         "Merge-back failed: {e}. Work preserved on branch '{}' \
                                          at {}.",
@@ -648,9 +867,32 @@ impl TaskScheduler {
                         Some(result) if result.completed => {
                             let result_json =
                                 serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
-                            tasks::mark_task_completed(&pool, &task_id, &result_json)
-                                .await
-                                .ok();
+                            // Journal + task_runs completion in one write path:
+                            // records the content address (dispatch key), the
+                            // materialization evidence, and flips the row to
+                            // completed. Falls back to the plain status update
+                            // if the journal write fails — completion must
+                            // never be lost to journaling.
+                            if let Err(e) = journal::record_completion(
+                                &pool,
+                                &task_row,
+                                &journal_inputs,
+                                &journal_dep_keys,
+                                run_checkpoint_id.as_deref(),
+                                &journal_material,
+                                &result_json,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "scheduler: task {} journal completion failed ({e}); \
+                                     falling back to plain status update",
+                                    task_id
+                                );
+                                tasks::mark_task_completed(&pool, &task_id, &result_json)
+                                    .await
+                                    .ok();
+                            }
                             // Append result to shared brief
                             let brief_path = format!("{}/_codefactory_brief.md", task_cwd);
                             if std::path::Path::new(&brief_path).exists() {
@@ -772,7 +1014,8 @@ impl TaskScheduler {
                         })
                         .await;
 
-                    running.lock().await.remove(&task_id);
+                    dispatch_guard.settled = true;
+                    drop(dispatch_guard); // frees the running slot
                 });
             }
 

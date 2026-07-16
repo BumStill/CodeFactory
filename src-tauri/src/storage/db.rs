@@ -124,7 +124,7 @@ pub(crate) fn current_process_start_token() -> Option<String> {
     process_start_token(std::process::id())
 }
 
-fn process_identity_is_live(pid: u32, expected_start_token: Option<&str>) -> bool {
+pub(crate) fn process_identity_is_live(pid: u32, expected_start_token: Option<&str>) -> bool {
     if !is_process_alive(pid) {
         return false;
     }
@@ -702,6 +702,66 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     .execute(pool)
     .await?;
     ensure_column(pool, "user_preferences", "activation_id", "TEXT").await?;
+
+    // ── task_journal: durable last-known-good record of a completed task's
+    //    dispatch, kept SEPARATE from live task_runs state. task_runs.result is
+    //    NULLed by retry_failed_tasks + resume invalidation to re-run a row, so
+    //    it cannot be the durable cache; task_journal.result_json is. Keyed by
+    //    task_id (the task's stable position in the session tree). Powers the
+    //    content-addressed resume journal: a completed task is replayed from
+    //    cache only if its recomputed dispatch_key still matches AND its output
+    //    is still materialized on disk.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS task_journal (
+            task_id             TEXT PRIMARY KEY,
+            session_id          TEXT NOT NULL,
+            hash_version        INTEGER NOT NULL DEFAULT 1,
+            local_digest        TEXT NOT NULL,
+            dispatch_key        TEXT NOT NULL,
+            dep_keys_json       TEXT NOT NULL DEFAULT '[]',
+            resolved_model      TEXT NOT NULL,
+            resolved_tools_json TEXT NOT NULL DEFAULT '[]',
+            isolation_mode      TEXT NOT NULL,
+            state               TEXT NOT NULL,
+            merge_applied       INTEGER NOT NULL DEFAULT 0,
+            materialization     TEXT NOT NULL,
+            checkpoint_id       TEXT,
+            base_sha            TEXT,
+            patch_path          TEXT,
+            repo_root           TEXT,
+            result_json         TEXT,
+            completed_at        TEXT NOT NULL,
+            updated_at          TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_task_journal_session ON task_journal(session_id)")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_task_journal_checkpoint ON task_journal(checkpoint_id)",
+    )
+    .execute(pool)
+    .await?;
+
+    // Owner identity on task_runs, mirroring evolution_jobs: PID + process-start
+    // token so a crash-orphaned 'running' row can be distinguished from one a
+    // live sibling process still owns. Default NULL — TaskRun's SELECT * FromRow
+    // is untouched; these are read by targeted tuple queries in journal.rs.
+    ensure_column(pool, "task_runs", "owner_pid", "INTEGER").await?;
+    ensure_column(pool, "task_runs", "owner_start_token", "TEXT").await?;
+
+    // GAP 1 boot recovery: turn every crash-orphaned 'running' task (dead owner)
+    // into 'completed' (worktree merge that already applied) or 'pending', before
+    // any scheduler runs. Session-agnostic; mirrors the evolution_jobs recovery
+    // above. Best-effort: a recovery hiccup must never block app startup.
+    if let Err(e) =
+        crate::agent::journal::recover_orphaned_tasks(pool, crate::agent::journal::OrphanScope::All)
+            .await
+    {
+        tracing::warn!("task orphan recovery at boot failed (non-fatal): {e}");
+    }
 
     crate::knowledge::ensure_schema(pool).await?;
     crate::benchmark::ensure_schema(pool).await?;
