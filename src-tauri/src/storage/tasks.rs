@@ -236,7 +236,8 @@ pub async fn mark_task_completed(pool: &SqlitePool, id: &str, result: &str) -> R
 pub async fn mark_task_failed(pool: &SqlitePool, id: &str, error: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
-        "UPDATE task_runs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
+        "UPDATE task_runs SET status = 'failed', completed_at = ?, error = ?, \
+         owner_pid = NULL, owner_start_token = NULL WHERE id = ?",
     )
     .bind(&now)
     .bind(error)
@@ -249,7 +250,8 @@ pub async fn mark_task_failed(pool: &SqlitePool, id: &str, error: &str) -> Resul
 pub async fn mark_task_cancelled(pool: &SqlitePool, id: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
-        "UPDATE task_runs SET status = 'cancelled', completed_at = ? \
+        "UPDATE task_runs SET status = 'cancelled', completed_at = ?, \
+         owner_pid = NULL, owner_start_token = NULL \
          WHERE id = ? AND status IN ('pending', 'running')",
     )
     .bind(&now)

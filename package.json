@@ -9,6 +9,7 @@
     "tauri": "tauri",
     "test": "vitest run",
     "test:evolution:headless": "node scripts/verify-evolution-workbench-headless.mjs",
+    "test:resume:headless": "node scripts/verify-resume-journal-headless.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {
