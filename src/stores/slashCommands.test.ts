@@ -1,64 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
+import { describe, expect, it } from "vitest";
 import {
   filterSlashCommandSuggestions,
   formatCostFeedback,
   formatHelpFeedback,
   parseSlashCommand,
-} from "./slashCommands.js";
+} from "./slashCommands";
 
-function assertEqual<T>(actual: T, expected: T, label: string) {
-  if (actual !== expected) {
-    throw new Error(`${label}: expected ${String(expected)}, got ${String(actual)}`);
-  }
-}
+describe("slash commands", () => {
+  it("parses the model command and preserves the model id", () => {
+    const parsed = parseSlashCommand("/model anthropic/claude-sonnet-4");
+    expect(parsed).toBeTruthy();
+    expect(parsed?.name).toBe("model");
+    expect(parsed?.args).toBe("anthropic/claude-sonnet-4");
+  });
 
-function assertTruthy(value: unknown, label: string): asserts value {
-  if (!value) {
-    throw new Error(`${label}: expected truthy value`);
-  }
-}
+  it("does not treat plain messages containing slash text as commands", () => {
+    expect(parseSlashCommand("please run /clear")).toBeNull();
+  });
 
-function assertIncludes(actual: string, expected: string, label: string) {
-  if (!actual.includes(expected)) {
-    throw new Error(`${label}: expected ${JSON.stringify(actual)} to include ${JSON.stringify(expected)}`);
-  }
-}
+  it("opens all command suggestions on a bare slash", () => {
+    const suggestions = filterSlashCommandSuggestions("/");
+    expect(suggestions).toHaveLength(5);
+    expect(suggestions[0].name).toBe("clear");
+  });
 
-{
-  const parsed = parseSlashCommand("/model anthropic/claude-sonnet-4");
-  assertTruthy(parsed, "model command parses");
-  assertEqual(parsed.name, "model", "model command name");
-  assertEqual(parsed.args, "anthropic/claude-sonnet-4", "model command args preserve model id");
-}
+  it("filters suggestions for a partial command", () => {
+    const suggestions = filterSlashCommandSuggestions("/c");
+    expect(suggestions).toHaveLength(3);
+    expect(suggestions.map((command) => command.name).join(",")).toBe("clear,cwd,cost");
+  });
 
-{
-  const parsed = parseSlashCommand("please run /clear");
-  assertEqual(parsed, null, "plain messages with slash text are not commands");
-}
+  it("lists command usage in help feedback", () => {
+    const help = formatHelpFeedback();
+    expect(help).toContain("/clear");
+    expect(help).toContain("/model <id>");
+    expect(help).toContain("/cwd <path>");
+  });
 
-{
-  const suggestions = filterSlashCommandSuggestions("/");
-  assertEqual(suggestions.length, 5, "slash opens all command suggestions");
-  assertEqual(suggestions[0].name, "clear", "clear is the first lightweight command");
-}
-
-{
-  const suggestions = filterSlashCommandSuggestions("/c");
-  assertEqual(suggestions.length, 3, "partial command filters suggestions");
-  assertEqual(suggestions.map((command) => command.name).join(","), "clear,cwd,cost", "filtered command order");
-}
-
-{
-  const help = formatHelpFeedback();
-  assertIncludes(help, "/clear", "help lists clear");
-  assertIncludes(help, "/model <id>", "help lists model usage");
-  assertIncludes(help, "/cwd <path>", "help lists cwd usage");
-}
-
-{
-  const cost = formatCostFeedback("anthropic/claude-opus-4-7", 1_000, 2_000);
-  assertIncludes(cost, "anthropic/claude-opus-4-7", "cost includes active model");
-  assertIncludes(cost, "1,000", "cost includes input tokens");
-  assertIncludes(cost, "2,000", "cost includes output tokens");
-  assertIncludes(cost, "$0.0330", "cost includes estimated price");
-}
+  it("includes model, token counts, and estimated price in cost feedback", () => {
+    const cost = formatCostFeedback("anthropic/claude-opus-4-7", 1_000, 2_000);
+    expect(cost).toContain("anthropic/claude-opus-4-7");
+    expect(cost).toContain("1,000");
+    expect(cost).toContain("2,000");
+    expect(cost).toContain("$0.0330");
+  });
+});
