@@ -74,10 +74,15 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     )
     .await;
 
-    // Render a compact, model-readable report. Never `is_error` for a "blocked"
-    // terminal — blocked is an informative outcome (e.g. CI red / needs a token),
-    // not a tool crash; the content explains it so the model reports rather than
-    // blindly retries.
+    Ok(ToolOutput::ok(render_report(&outcome)))
+}
+
+/// Render a compact, model-readable report. Never `is_error` for a "blocked"
+/// terminal — blocked is an informative outcome (e.g. CI red / needs a token),
+/// not a tool crash; the content explains it so the model reports rather than
+/// blindly retries. Split from `execute` so the attribution contract on
+/// blocked outcomes stays unit-testable.
+fn render_report(outcome: &delivery::DeliveryOutcome) -> String {
     let mut out = String::new();
     out.push_str(&format!("交付结果: {}\n", outcome.final_state));
     if let Some(branch) = &outcome.branch {
@@ -96,8 +101,14 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         out.push_str(&format!("PR: {url}\n"));
     }
     out.push_str(&format!("\n{}", outcome.summary));
-
-    Ok(ToolOutput::ok(out))
+    if outcome.final_state == "blocked" {
+        out.push_str(
+            "\n\n注意:本次交付已在上述步骤被阻断,你在本轮没有完成后续的 PR/合并/发布。\
+即使之后查询发现仓库出现了新的合并或发布,那也是其他执行器(并行 agent 或自动化流水线)\
+完成的,不得归因为你本次的交付动作;如实报告阻断原因和已完成到哪一步即可。",
+        );
+    }
+    out
 }
 
 fn parse_ceiling(s: &str) -> Option<DeliveryCeiling> {
@@ -108,5 +119,43 @@ fn parse_ceiling(s: &str) -> Option<DeliveryCeiling> {
         "through_merge" => Some(DeliveryCeiling::ThroughMerge),
         "through_release" => Some(DeliveryCeiling::ThroughRelease),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::delivery::{DeliveryOutcome, StepResult};
+
+    fn outcome(final_state: &str) -> DeliveryOutcome {
+        DeliveryOutcome {
+            steps: vec![StepResult {
+                step: "ci".into(),
+                status: if final_state == "blocked" { "blocked" } else { "ok" }.into(),
+                detail: "detail".into(),
+            }],
+            branch: Some("feature/x".into()),
+            commit_sha: None,
+            pr_url: None,
+            pr_number: None,
+            final_state: final_state.into(),
+            summary: "summary".into(),
+        }
+    }
+
+    #[test]
+    fn blocked_report_bans_claiming_foreign_delivery() {
+        // A blocked delivery must tell the model that any PR/merge/release it
+        // later observes in the repo was produced by other executors — the
+        // 2026-07-16 session claimed Codex's release as its own.
+        let report = render_report(&outcome("blocked"));
+        assert!(report.contains("不得归因"));
+        assert!(report.contains("其他执行器"));
+    }
+
+    #[test]
+    fn delivered_report_carries_no_attribution_warning() {
+        let report = render_report(&outcome("delivered"));
+        assert!(!report.contains("不得归因"));
     }
 }

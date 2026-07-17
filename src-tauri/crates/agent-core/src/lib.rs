@@ -51,8 +51,10 @@ claim completion until the shared completion gate accepts structured execution e
 pub fn build_completion_recovery_prompt(evidence: &CompletionEvidence) -> String {
     format!(
         "The completion gate rejected the attempted final response. Continue using tools until \
-the following evidence blockers are resolved: {}. Do not repeat a final response before the \
-gate is satisfied.",
+the following evidence blockers are resolved: {}. Run only what resolves these blockers and \
+do not restate your previous summary — the user has already seen it. Once the blockers are \
+resolved, reply in the user's language with a brief final answer that adds only the new \
+verification outcome, and never mention internal mechanisms such as this gate.",
         evidence.blockers.join("; ")
     )
 }
@@ -66,8 +68,11 @@ lacks a functional check, use the available tools now to run the missing check a
 failure. For source compatibility work, rerun a repository-wide residual search after the last \
 source edit, cover every generated or compiled source suffix found in the build configuration, and \
 make the command succeed only when no unresolved matches remain. If coverage is complete, stop and \
-return the final response as a concise user-facing summary with the \
-verification evidence; do not emit tool protocol markup, commands, or XML."
+return the final response as a concise user-facing summary in the user's language with the \
+verification evidence; do not repeat analysis or summaries the user has already seen — reference \
+them and add only what is new. Never mention internal mechanisms (completion gate, coverage \
+audit, candidate delivery) in the user-facing text; do not emit tool protocol markup, commands, \
+or XML."
 }
 
 pub fn should_prompt_budget_convergence(remaining_model_rounds: u32) -> bool {
@@ -555,6 +560,12 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
             &[
                 "pytest",
                 "unittest",
+                "vitest",
+                "jest",
+                "playwright test",
+                "tsc --noemit",
+                "tsc -p",
+                "tsc -b",
                 "cargo check",
                 "cargo build",
                 "cargo test",
@@ -576,6 +587,9 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
     {
         return ToolKind::Verification;
     }
+    // NOTE: bare `printf`/`echo` (no redirect) is how investigation batches
+    // print section headers — that is not a mutation. A `printf … > file`
+    // still classifies as Mutation via the redirect check below.
     if contains_any(
         &lower,
         &[
@@ -585,7 +599,6 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
             "tee ",
             "cat >",
             "cat >>",
-            "printf ",
             "touch ",
             "mkdir ",
             "rm ",
@@ -668,6 +681,8 @@ fn is_project_test_command(command: &str) -> bool {
         &[
             "pytest",
             "unittest",
+            "vitest",
+            "jest",
             "cargo test",
             "npm test",
             "npm run test",
@@ -1303,7 +1318,11 @@ impl CompletionGate {
                 self.last_successful_verification_sequence = Some(outcome.sequence);
             }
         }
-        if !outcome.succeeded() {
+        // A failed read (grep with no matches, or output that merely contains
+        // an "error:"-looking string) changes no workspace state and must not
+        // force delivery-grade verification before a final answer — that is
+        // what turned pure-analysis turns into reject/re-answer loops.
+        if !outcome.succeeded() && !matches!(outcome.kind, ToolKind::ReadOnly) {
             self.last_failure_sequence = Some(outcome.sequence);
         }
     }
@@ -2568,6 +2587,105 @@ mod tests {
     }
 
     #[test]
+    fn printf_section_headers_stay_read_only() {
+        // Investigation batches print section headers with bare `printf` while
+        // reading code. That is not a workspace mutation; classifying it as one
+        // makes the completion gate demand delivery-grade verification for a
+        // pure analysis turn (2026-07-16 session: seven repeated replies).
+        for command in [
+            "printf '== TasksColumn state ==\\n'; sed -n '485,690p' src/pages/Workspace/WorkspacePage.tsx",
+            "set -e\nprintf '== enabled skills ==\\n'; grep -RIn 'enabled' src | head -20",
+            "printf 'VERIFICATION_OK\\n'",
+        ] {
+            assert_eq!(
+                classify_command(command, 300_000),
+                ToolKind::ReadOnly,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn printf_with_redirect_is_still_a_mutation() {
+        for command in ["printf 'x' > notes.txt", "printf 'line\\n' >> log.txt"] {
+            assert_eq!(
+                classify_command(command, 300_000),
+                ToolKind::Mutation,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn frontend_verification_commands_count_as_verification() {
+        // vitest / jest / tsc are the standard verification commands in a
+        // TypeScript repo; the gate must accept them, not only `pnpm test`.
+        for command in [
+            "pnpm exec vitest run src/pages/Workspace/TaskCreator.test.tsx",
+            "npx vitest run",
+            "pnpm exec jest src/foo.test.ts",
+            "pnpm exec tsc --noEmit",
+            "pnpm exec tsc --noEmit && printf 'VERIFICATION_OK\\n'",
+        ] {
+            assert_eq!(
+                classify_command(command, 300_000),
+                ToolKind::Verification,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_failure_alone_does_not_demand_verification() {
+        // Reading source that contains the literal string "error:" (semantic
+        // failure detection) or a grep with no matches (exit 1) changes no
+        // workspace state; the gate must not reject a final answer over it.
+        let mut gate = CompletionGate::new(false);
+        gate.record(&outcome(1, ToolKind::ReadOnly, 1));
+        let evidence = gate.evidence();
+        assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
+
+        let mut gate = CompletionGate::new(false);
+        let mut noisy_read = outcome(1, ToolKind::ReadOnly, 0);
+        noisy_read.semantic_failure = true;
+        gate.record(&noisy_read);
+        let evidence = gate.evidence();
+        assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
+    }
+
+    #[test]
+    fn mutation_and_verification_failures_still_demand_verification() {
+        let mut gate = CompletionGate::new(false);
+        gate.record(&outcome(1, ToolKind::Mutation, 1));
+        assert!(!gate.evidence().completed);
+        gate.record(&outcome(2, ToolKind::Verification, 0));
+        assert!(gate.evidence().completed);
+
+        let mut gate = CompletionGate::new(false);
+        gate.record(&outcome(1, ToolKind::Verification, 1));
+        assert!(!gate.evidence().completed);
+        gate.record(&outcome(2, ToolKind::Verification, 0));
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn recovery_prompt_forbids_restating_the_previous_summary() {
+        let gate = CompletionGate::new(true);
+        let prompt = build_completion_recovery_prompt(&gate.evidence());
+        assert!(prompt.contains("do not restate your previous summary"));
+        assert!(prompt.contains("in the user's language"));
+        assert!(prompt.contains("never mention internal mechanisms"));
+    }
+
+    #[test]
+    fn ready_prompt_requires_user_language_and_bans_internal_terminology() {
+        let prompt = build_completion_ready_prompt();
+        assert!(prompt.contains("in the user's language"));
+        assert!(prompt.contains("do not repeat analysis or summaries the user has already seen"));
+        assert!(prompt.contains("Never mention internal mechanisms"));
+    }
+
+    #[test]
     fn build_and_install_commands_receive_the_available_long_timeout() {
         assert_eq!(
             effective_command_timeout_sec("pip install -e .", 60, 300),
@@ -2601,10 +2719,14 @@ mod tests {
 
     #[test]
     fn failed_tool_relocks_gate_until_a_later_verification() {
+        // A failed *execution* (runtime probe, verification, mutation) after a
+        // green verification relocks the gate. A failed read must NOT — reads
+        // change no state, and relocking on them turned analysis turns into
+        // reject/re-answer loops (see read_only_failure_alone_...).
         let mut gate = CompletionGate::default();
         gate.record(&outcome(1, ToolKind::Mutation, 0));
         gate.record(&outcome(2, ToolKind::Verification, 0));
-        gate.record(&outcome(3, ToolKind::ReadOnly, 1));
+        gate.record(&outcome(3, ToolKind::RuntimeProbe, 1));
         assert!(!gate.evidence().completed);
 
         gate.record(&outcome(4, ToolKind::Verification, 0));
