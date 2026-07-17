@@ -691,6 +691,7 @@ impl AgentLoop {
         let mut last_completion_nudge_sequence = None;
         let mut progress_tracker = ProgressTracker::new(8);
         let mut finalization_pending = false;
+        let mut completion_recovery_attempts = 0_u32;
         let max_iterations = self.mode.max_iterations();
         for iteration in 0..max_iterations {
             // Cooperative cancellation: if the user hit "stop" for this chat
@@ -810,7 +811,12 @@ impl AgentLoop {
 
             if tool_calls.is_empty() {
                 let evidence = completion_gate.evidence();
-                if let Some(prompt) = completion_recovery_prompt(&evidence) {
+                if let Some(prompt) = completion_recovery_prompt(
+                    &evidence,
+                    completion_recovery_attempts,
+                    self.mode,
+                ) {
+                    completion_recovery_attempts += 1;
                     messages.push(ChatMessage {
                         role: "user".into(),
                         content: MessageContent::Text(prompt),
@@ -2041,6 +2047,7 @@ impl AgentLoop {
         let mut last_completion_nudge_sequence = None;
         let mut progress_tracker = ProgressTracker::new(8);
         let mut finalization_pending = false;
+        let mut completion_recovery_attempts = 0_u32;
         let max_iterations = self.mode.max_iterations();
         for iteration in 0..max_iterations {
             // Cooperative cancellation: if the user hit "stop" for this chat
@@ -2145,7 +2152,12 @@ impl AgentLoop {
 
             if tool_calls.is_empty() {
                 let evidence = completion_gate.evidence();
-                if let Some(prompt) = completion_recovery_prompt(&evidence) {
+                if let Some(prompt) = completion_recovery_prompt(
+                    &evidence,
+                    completion_recovery_attempts,
+                    self.mode,
+                ) {
+                    completion_recovery_attempts += 1;
                     messages.push(serde_json::json!({
                         "role": "user",
                         "content": [{
@@ -2598,7 +2610,27 @@ fn completion_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (St
     (command, kind)
 }
 
-fn completion_recovery_prompt(evidence: &CompletionEvidence) -> Option<String> {
+/// How many times one run may reject the model's tool-call-free final response
+/// and inject a completion-recovery prompt. Interactive chat gets exactly one
+/// nudge: the user is watching, and every rejected candidate is already
+/// rendered, so a rejection loop reads as the assistant repeating the same
+/// answer (2026-07-16 session: seven near-identical replies in 13 minutes).
+/// Execute/Autonomous runs get a few more attempts before the gate yields.
+fn completion_recovery_limit(mode: AgentMode) -> u32 {
+    match mode {
+        AgentMode::Interactive => 1,
+        AgentMode::Execute | AgentMode::Autonomous => 3,
+    }
+}
+
+fn completion_recovery_prompt(
+    evidence: &CompletionEvidence,
+    attempts: u32,
+    mode: AgentMode,
+) -> Option<String> {
+    if attempts >= completion_recovery_limit(mode) {
+        return None;
+    }
     (!evidence.completed).then(|| build_completion_recovery_prompt(evidence))
 }
 
@@ -3670,6 +3702,68 @@ mod tests {
     }
 
     #[test]
+    fn desktop_completion_gate_ignores_read_only_investigation_noise() {
+        // Regression for the 2026-07-16 session: printf section headers plus
+        // source output containing the literal "error:" tripped the gate and
+        // caused a reject/re-answer loop on a pure analysis request.
+        let mut gate = CompletionGate::default();
+        let mut progress = ProgressTracker::new(8);
+        let mut sequence = 0;
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "bash",
+            &serde_json::json!({
+                "command": "set -e\nprintf '== agent injection ==\\n'; sed -n '445,500p' src-tauri/src/agent/mod.rs"
+            }),
+            &tools::ToolOutput::ok(
+                "Err(e) => Ok(tools::ToolOutput::err(format!(\"MCP error: {e}\")))",
+            ),
+        );
+        let evidence = gate.evidence();
+        assert!(
+            evidence.completed,
+            "read-only investigation must not trip the gate: {:?}",
+            evidence.blockers
+        );
+
+        // And the standard frontend verification commands satisfy the gate.
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "bash",
+            &serde_json::json!({
+                "command": "pnpm exec vitest run src/pages/Workspace/TaskCreator.test.tsx"
+            }),
+            &tools::ToolOutput::ok("Test Files  2 passed (2)"),
+        );
+        let evidence = gate.evidence();
+        assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
+    }
+
+    #[test]
+    fn completion_recovery_prompt_respects_mode_rejection_limits() {
+        // Interactive chat gets exactly one recovery nudge; a rejection loop
+        // reads to the user as the assistant repeating the same answer.
+        let unsatisfied = CompletionGate::new(true).evidence();
+        assert!(!unsatisfied.completed);
+        assert!(completion_recovery_prompt(&unsatisfied, 0, AgentMode::Interactive).is_some());
+        assert!(completion_recovery_prompt(&unsatisfied, 1, AgentMode::Interactive).is_none());
+        assert!(completion_recovery_prompt(&unsatisfied, 2, AgentMode::Execute).is_some());
+        assert!(completion_recovery_prompt(&unsatisfied, 3, AgentMode::Execute).is_none());
+        assert!(completion_recovery_prompt(&unsatisfied, 2, AgentMode::Autonomous).is_some());
+        assert!(completion_recovery_prompt(&unsatisfied, 3, AgentMode::Autonomous).is_none());
+
+        let satisfied = CompletionGate::new(false).evidence();
+        assert!(satisfied.completed);
+        assert!(completion_recovery_prompt(&satisfied, 0, AgentMode::Interactive).is_none());
+    }
+
+    #[test]
     fn desktop_completion_gate_rejects_unprobed_background_service() {
         let mut gate = CompletionGate::default();
         let mut progress = ProgressTracker::new(8);
@@ -3788,13 +3882,17 @@ mod tests {
             ..CompletionEvidence::default()
         };
 
-        let prompt = completion_recovery_prompt(&evidence)
+        let prompt = completion_recovery_prompt(&evidence, 0, AgentMode::Interactive)
             .expect("interactive finalization must continue after a mutation with blockers");
         assert!(prompt.contains("source compatibility"));
-        assert!(completion_recovery_prompt(&CompletionEvidence {
-            completed: true,
-            ..CompletionEvidence::default()
-        })
+        assert!(completion_recovery_prompt(
+            &CompletionEvidence {
+                completed: true,
+                ..CompletionEvidence::default()
+            },
+            0,
+            AgentMode::Interactive,
+        )
         .is_none());
     }
 
