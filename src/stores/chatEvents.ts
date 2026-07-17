@@ -29,6 +29,16 @@ export interface UIMessage {
    *  state (done/error). Absent while still streaming (the UI ticks live off
    *  `createdAt` instead) and for plain user messages. */
   durationMs?: number;
+  /** Completion-gate provenance from the DB: "rejected_candidate" collapses
+   *  the reply, "gate_recovery"/"gate_ready" render as system notices. */
+  completionState?: string;
+  /** Live gate interventions on the streaming turn, in arrival order. */
+  gateActions?: GateActionState[];
+}
+
+export interface GateActionState {
+  kind: string;
+  detail: string;
 }
 
 export interface TransportRetryState {
@@ -202,6 +212,22 @@ export function reduceChatStreamEvent(
                     delayMs: event.delay_ms,
                     reason: event.reason,
                   },
+                ],
+              }
+            : m,
+        ),
+      };
+
+    case "completion_gate_action":
+      return {
+        ...state,
+        messages: state.messages.map((m) =>
+          m.id === msgId
+            ? {
+                ...m,
+                gateActions: [
+                  ...(m.gateActions ?? []),
+                  { kind: event.kind, detail: event.detail },
                 ],
               }
             : m,

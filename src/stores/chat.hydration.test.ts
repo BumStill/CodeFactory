@@ -138,4 +138,37 @@ describe("persisted chat hydration", () => {
       expect.objectContaining({ status: "cancelled", isError: true }),
     );
   });
+
+  it("carries completion_state through so gate artifacts render as such", () => {
+    const rows: Message[] = [
+      {
+        id: "candidate",
+        session_id: "session-1",
+        role: "assistant",
+        content: "full plan, first attempt",
+        created_at: 100,
+        completion_state: "rejected_candidate",
+      },
+      {
+        id: "gate-nudge",
+        session_id: "session-1",
+        role: "user",
+        content: "The completion gate rejected the attempted final response…",
+        created_at: 101,
+        completion_state: "gate_recovery",
+      },
+      {
+        id: "final",
+        session_id: "session-1",
+        role: "assistant",
+        content: "brief final answer",
+        created_at: 102,
+      },
+    ];
+
+    const hydrated = dbMessagesToUI(rows);
+    expect(hydrated[0].completionState).toBe("rejected_candidate");
+    expect(hydrated[1].completionState).toBe("gate_recovery");
+    expect(hydrated[2].completionState).toBeUndefined();
+  });
 });

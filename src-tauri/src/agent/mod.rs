@@ -817,6 +817,21 @@ impl AgentLoop {
                     self.mode,
                 ) {
                     completion_recovery_attempts += 1;
+                    // Make the rejection visible instead of silently looping:
+                    // collapse the rejected candidate in the UI, persist the
+                    // injected instruction so rebuilt history stays faithful.
+                    self.mark_rejected_candidate(assistant_message_id.as_deref())
+                        .await?;
+                    self.persist_gate_message(&prompt, "gate_recovery").await?;
+                    self.app
+                        .emit(
+                            event_name,
+                            StreamEvent::CompletionGateAction {
+                                kind: "recovery".into(),
+                                detail: evidence.blockers.join("; "),
+                            },
+                        )
+                        .ok();
                     messages.push(ChatMessage {
                         role: "user".into(),
                         content: MessageContent::Text(prompt),
@@ -1148,6 +1163,17 @@ impl AgentLoop {
             {
                 last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
                 finalization_pending = true;
+                self.persist_gate_message(build_completion_ready_prompt(), "gate_ready")
+                    .await?;
+                self.app
+                    .emit(
+                        event_name,
+                        StreamEvent::CompletionGateAction {
+                            kind: "ready".into(),
+                            detail: String::new(),
+                        },
+                    )
+                    .ok();
                 messages.push(ChatMessage {
                     role: "user".into(),
                     content: MessageContent::Text(build_completion_ready_prompt().to_string()),
@@ -1848,6 +1874,46 @@ impl AgentLoop {
         Ok(Some(msg_id))
     }
 
+    /// Persist an injected completion-gate instruction as a user-role turn so
+    /// rebuilt provider history matches what the model actually saw in this
+    /// run, tagged via `completion_state` ("gate_recovery" | "gate_ready") so
+    /// the UI renders it as a system notice instead of a user bubble.
+    async fn persist_gate_message(&self, content: &str, state: &str) -> Result<()> {
+        if self.anonymous {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, completion_state, created_at) \
+             VALUES (?,?,?,?,?,?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&self.session_id)
+        .bind("user")
+        .bind(content)
+        .bind(state)
+        .bind(Utc::now().timestamp_millis())
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// Tag a persisted assistant reply that the completion gate rejected so
+    /// the UI collapses it instead of rendering yet another full
+    /// near-duplicate answer (2026-07-16 session: seven of them).
+    async fn mark_rejected_candidate(&self, message_id: Option<&str>) -> Result<()> {
+        let Some(message_id) = message_id else {
+            return Ok(());
+        };
+        if self.anonymous {
+            return Ok(());
+        }
+        sqlx::query("UPDATE messages SET completion_state='rejected_candidate' WHERE id=?")
+            .bind(message_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
     async fn record_tool_call_outcome(
         &self,
         tool_call: &ToolCall,
@@ -2158,6 +2224,21 @@ impl AgentLoop {
                     self.mode,
                 ) {
                     completion_recovery_attempts += 1;
+                    // Make the rejection visible instead of silently looping:
+                    // collapse the rejected candidate in the UI, persist the
+                    // injected instruction so rebuilt history stays faithful.
+                    self.mark_rejected_candidate(assistant_message_id.as_deref())
+                        .await?;
+                    self.persist_gate_message(&prompt, "gate_recovery").await?;
+                    self.app
+                        .emit(
+                            event_name,
+                            StreamEvent::CompletionGateAction {
+                                kind: "recovery".into(),
+                                detail: evidence.blockers.join("; "),
+                            },
+                        )
+                        .ok();
                     messages.push(serde_json::json!({
                         "role": "user",
                         "content": [{
@@ -2481,6 +2562,17 @@ impl AgentLoop {
             {
                 last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
                 finalization_pending = true;
+                self.persist_gate_message(build_completion_ready_prompt(), "gate_ready")
+                    .await?;
+                self.app
+                    .emit(
+                        event_name,
+                        StreamEvent::CompletionGateAction {
+                            kind: "ready".into(),
+                            detail: String::new(),
+                        },
+                    )
+                    .ok();
                 messages.push(serde_json::json!({
                     "role": "user",
                     "content": [{
@@ -2772,6 +2864,7 @@ fn repair_incomplete_tool_history(history: Vec<Message>) -> Vec<Message> {
             output_tokens: None,
             tool_calls: None,
             reasoning_content: None,
+            completion_state: None,
             created_at,
         }
     }
@@ -3458,6 +3551,7 @@ mod tests {
             output_tokens: None,
             tool_calls,
             reasoning_content: None,
+            completion_state: None,
             created_at: 1,
         }
     }

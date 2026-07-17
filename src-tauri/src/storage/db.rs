@@ -301,6 +301,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     //    any prior divergence between code and old DBs.
     ensure_column(pool, "messages", "tool_calls", "TEXT").await?;
     ensure_column(pool, "messages", "reasoning_content", "TEXT").await?;
+    ensure_column(pool, "messages", "completion_state", "TEXT").await?;
 
     // ── task_runs has a verification_results JSON column referenced by
     //    the verification engine. Some older DBs and all fresh installs
@@ -858,6 +859,10 @@ mod tests {
         assert!(
             cols.contains(&"reasoning_content".to_string()),
             "ensure_schema must add reasoning_content column. Got: {cols:?}"
+        );
+        assert!(
+            cols.contains(&"completion_state".to_string()),
+            "ensure_schema must add completion_state column. Got: {cols:?}"
         );
 
         // The seeded row's data must survive the ALTER TABLE.

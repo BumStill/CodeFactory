@@ -240,6 +240,16 @@ pub enum StreamEvent {
         delay_ms: u64,
         reason: String,
     },
+    /// The completion gate acted on this turn: `kind: "recovery"` — it
+    /// rejected the model's tool-call-free final response and injected a
+    /// recovery instruction (the turn continues); `kind: "ready"` — evidence
+    /// is satisfied and a final coverage-audit instruction was injected.
+    /// Surfaced so the user can see WHY the assistant keeps going instead of
+    /// watching it silently repeat itself.
+    CompletionGateAction {
+        kind: String,
+        detail: String,
+    },
     Error {
         message: String,
     },
