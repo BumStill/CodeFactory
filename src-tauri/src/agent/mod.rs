@@ -1274,9 +1274,8 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Flatten a message body to plain text. Text passes through; Parts keep
-    /// their text fragments (image parts are dropped — the ChatGPT codex models
-    /// are text-first). Robust to ContentPart's exact shape via serde.
+    /// Flatten a message body to plain text for protocol fields that cannot
+    /// carry multimodal content (system instructions and tool output).
     fn content_to_text(content: &MessageContent) -> String {
         match content {
             MessageContent::Text(t) => t.clone(),
@@ -1291,6 +1290,48 @@ impl AgentLoop {
                     })
                 })
                 .unwrap_or_default(),
+        }
+    }
+
+    /// Convert a user message from the Chat Completions-compatible shape used
+    /// internally to ChatGPT Responses content items without dropping images.
+    fn content_to_chatgpt_user_parts(content: &MessageContent) -> Vec<serde_json::Value> {
+        match content {
+            MessageContent::Text(text) => vec![serde_json::json!({
+                "type": "input_text",
+                "text": text,
+            })],
+            MessageContent::Parts(parts) => {
+                let mut response_parts = Vec::with_capacity(parts.len());
+                for part in parts {
+                    if part.r#type == "image_url" {
+                        if let Some(image_url) = part
+                            .image_url
+                            .as_ref()
+                            .map(|image| image.url.as_str())
+                            .filter(|url| !url.is_empty())
+                        {
+                            response_parts.push(serde_json::json!({
+                                "type": "input_image",
+                                "image_url": image_url,
+                            }));
+                        }
+                    } else if let Some(text) = &part.text {
+                        response_parts.push(serde_json::json!({
+                            "type": "input_text",
+                            "text": text,
+                        }));
+                    }
+                }
+
+                if response_parts.is_empty() {
+                    response_parts.push(serde_json::json!({
+                        "type": "input_text",
+                        "text": Self::content_to_text(content),
+                    }));
+                }
+                response_parts
+            }
         }
     }
 
@@ -1347,7 +1388,7 @@ impl AgentLoop {
                 _ => input.push(serde_json::json!({
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": Self::content_to_text(&m.content)}],
+                    "content": Self::content_to_chatgpt_user_parts(&m.content),
                 })),
             }
         }
@@ -3289,6 +3330,91 @@ mod tests {
             },
         );
         settings
+    }
+
+    #[test]
+    fn chatgpt_responses_user_content_preserves_text_and_image_parts_in_order() {
+        let image_data_url = "data:image/png;base64,iVBORw0KGgo=";
+        let content = MessageContent::Parts(vec![
+            ContentPart {
+                r#type: "text".into(),
+                text: Some("先看截图".into()),
+                image_url: None,
+            },
+            ContentPart {
+                r#type: "image_url".into(),
+                text: None,
+                image_url: Some(ImageUrl {
+                    url: image_data_url.into(),
+                }),
+            },
+            ContentPart {
+                r#type: "text".into(),
+                text: Some("再回答问题".into()),
+                image_url: None,
+            },
+        ]);
+
+        assert_eq!(
+            AgentLoop::content_to_chatgpt_user_parts(&content),
+            vec![
+                serde_json::json!({"type": "input_text", "text": "先看截图"}),
+                serde_json::json!({"type": "input_image", "image_url": image_data_url}),
+                serde_json::json!({"type": "input_text", "text": "再回答问题"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn chatgpt_responses_user_content_keeps_plain_text_shape() {
+        assert_eq!(
+            AgentLoop::content_to_chatgpt_user_parts(&MessageContent::Text("只发文字".into())),
+            vec![serde_json::json!({"type": "input_text", "text": "只发文字"})]
+        );
+    }
+
+    #[test]
+    fn chatgpt_responses_user_content_does_not_emit_an_empty_image_url() {
+        let content = MessageContent::Parts(vec![ContentPart {
+            r#type: "image_url".into(),
+            text: None,
+            image_url: Some(ImageUrl { url: String::new() }),
+        }]);
+
+        assert_eq!(
+            AgentLoop::content_to_chatgpt_user_parts(&content),
+            vec![serde_json::json!({"type": "input_text", "text": ""})]
+        );
+    }
+
+    #[test]
+    fn chatgpt_responses_payload_contains_bytes_from_a_local_image_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("screen.png");
+        let png_bytes = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&image_path, png_bytes).unwrap();
+        let markdown = format!(
+            "识别这张图：\n![screen](file://{})\n只回答图中内容",
+            image_path.display()
+        );
+        let content = MessageContent::Parts(attachments::extract_openai_parts(&markdown));
+
+        let response_parts = AgentLoop::content_to_chatgpt_user_parts(&content);
+
+        assert_eq!(response_parts.len(), 3);
+        assert_eq!(response_parts[0]["type"], "input_text");
+        assert_eq!(response_parts[1]["type"], "input_image");
+        assert!(response_parts[1]["image_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,iVBORw0KGgo"));
+        assert_eq!(response_parts[2]["type"], "input_text");
     }
 
     #[test]
