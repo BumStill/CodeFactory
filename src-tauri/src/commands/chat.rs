@@ -352,6 +352,7 @@ fn anon_message(session_id: &str, role: String, content: String) -> crate::stora
         output_tokens: None,
         tool_calls: None,
         reasoning_content: None,
+        completion_state: None,
         created_at: 0,
     }
 }

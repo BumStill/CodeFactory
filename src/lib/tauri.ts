@@ -49,6 +49,7 @@ export type StreamEvent =
       delay_ms: number;
       reason: string;
     }
+  | { type: "completion_gate_action"; kind: string; detail: string }
   | { type: "error"; message: string };
 
 export interface Session {
@@ -79,6 +80,11 @@ export interface Message {
   output_tokens?: number;
   /** Serialized provider tool declarations on assistant messages. */
   tool_calls?: string | null;
+  /** Completion-gate provenance: "rejected_candidate" on assistant replies
+   *  the gate rejected (UI collapses them), "gate_recovery"/"gate_ready" on
+   *  injected gate instructions persisted as user-role turns (UI renders
+   *  them as system notices). */
+  completion_state?: string | null;
   created_at: number;
 }
 

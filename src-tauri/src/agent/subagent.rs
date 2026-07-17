@@ -173,6 +173,7 @@ pub async fn run_subagent(
         output_tokens: None,
         tool_calls: None,
         reasoning_content: None,
+        completion_state: None,
         created_at: now,
     }];
 

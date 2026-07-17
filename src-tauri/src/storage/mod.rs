@@ -46,6 +46,12 @@ pub struct Message {
     /// Must be replayed back to the API on subsequent turns or the provider
     /// rejects the request with HTTP 400.
     pub reasoning_content: Option<String>,
+    /// Completion-gate provenance. `rejected_candidate` marks an assistant
+    /// reply the gate rejected (UI collapses it); `gate_recovery`/`gate_ready`
+    /// mark the injected gate instructions persisted as user-role turns so
+    /// rebuilt provider history matches what the model actually saw. NULL for
+    /// ordinary messages.
+    pub completion_state: Option<String>,
     pub created_at: i64,
 }
 

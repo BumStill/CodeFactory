@@ -732,5 +732,6 @@ function dbToUI(m: Message): UIMessage {
     inputTokens: m.input_tokens,
     outputTokens: m.output_tokens,
     createdAt: m.created_at,
+    ...(m.completion_state ? { completionState: m.completion_state } : {}),
   };
 }
