@@ -1,42 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
-export {};
+import { describe, expect, it } from "vitest";
+import { parseUnifiedDiffResult } from "../components/DiffViewer";
 
-function assertEqual<T>(actual: T, expected: T, label: string) {
-  if (actual !== expected) {
-    throw new Error(`${label}: expected ${String(expected)}, got ${String(actual)}`);
-  }
-}
+describe("diff viewer unified diff parsing", () => {
+  it("splits the summary from the diff and classifies each line", () => {
+    const parsed = parseUnifiedDiffResult(
+      [
+        "Edited D:\\CodeFactory\\notes.txt",
+        "",
+        "--- a/notes.txt",
+        "+++ b/notes.txt",
+        "@@ -1,2 +1,2 @@",
+        " alpha",
+        "-old",
+        "+new",
+      ].join("\n"),
+    );
 
-function assertTruthy(value: unknown, label: string): asserts value {
-  if (!value) {
-    throw new Error(`${label}: expected truthy value`);
-  }
-}
+    expect(parsed.summary).toBe("Edited D:\\CodeFactory\\notes.txt");
+    expect(parsed.files).toHaveLength(1);
+    expect(parsed.files[0]?.oldPath).toBe("a/notes.txt");
+    expect(parsed.files[0]?.newPath).toBe("b/notes.txt");
 
-const { parseUnifiedDiffResult } = await import("../components/DiffViewer.js");
-
-const parsed = parseUnifiedDiffResult(
-  [
-    "Edited D:\\CodeFactory\\notes.txt",
-    "",
-    "--- a/notes.txt",
-    "+++ b/notes.txt",
-    "@@ -1,2 +1,2 @@",
-    " alpha",
-    "-old",
-    "+new",
-  ].join("\n"),
-);
-
-assertEqual(parsed.summary, "Edited D:\\CodeFactory\\notes.txt", "summary before diff");
-assertEqual(parsed.files.length, 1, "file count");
-assertEqual(parsed.files[0]?.oldPath, "a/notes.txt", "old path");
-assertEqual(parsed.files[0]?.newPath, "b/notes.txt", "new path");
-
-const lines = parsed.files[0]?.lines;
-assertTruthy(lines, "parsed lines");
-assertEqual(lines.length, 4, "diff line count");
-assertEqual(lines[0]?.kind, "hunk", "hunk line kind");
-assertEqual(lines[1]?.kind, "context", "context line kind");
-assertEqual(lines[2]?.kind, "removed", "removed line kind");
-assertEqual(lines[3]?.kind, "added", "added line kind");
+    const lines = parsed.files[0]?.lines;
+    expect(lines).toBeTruthy();
+    expect(lines).toHaveLength(4);
+    expect(lines?.[0]?.kind).toBe("hunk");
+    expect(lines?.[1]?.kind).toBe("context");
+    expect(lines?.[2]?.kind).toBe("removed");
+    expect(lines?.[3]?.kind).toBe("added");
+  });
+});

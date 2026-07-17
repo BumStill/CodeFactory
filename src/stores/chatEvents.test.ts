@@ -1,17 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { reduceChatStreamEvent, type ChatEventState } from "./chatEvents.js";
-
-function assertEqual<T>(actual: T, expected: T, label: string) {
-  if (actual !== expected) {
-    throw new Error(`${label}: expected ${String(expected)}, got ${String(actual)}`);
-  }
-}
-
-function assertTruthy(value: unknown, label: string): asserts value {
-  if (!value) {
-    throw new Error(`${label}: expected truthy value`);
-  }
-}
+import { describe, expect, it } from "vitest";
+import { reduceChatStreamEvent, type ChatEventState } from "./chatEvents";
 
 function baseState(): ChatEventState {
   return {
@@ -33,82 +22,84 @@ function baseState(): ChatEventState {
   };
 }
 
-{
-  const next = reduceChatStreamEvent(
-    baseState(),
-    {
-      type: "permission_request",
-      tool_call_id: "tool-1",
-      tool_name: "bash",
-      args: { command: "pnpm build" },
-    },
-    "assistant-1",
-  );
+describe("chat tool call stream events", () => {
+  it("creates a visible tool call card from a permission request", () => {
+    const next = reduceChatStreamEvent(
+      baseState(),
+      {
+        type: "permission_request",
+        tool_call_id: "tool-1",
+        tool_name: "bash",
+        args: { command: "pnpm build" },
+      },
+      "assistant-1",
+    );
 
-  const assistant = next.messages[0];
-  const toolCall = assistant.toolCalls?.[0];
-  assertTruthy(toolCall, "permission request creates a visible tool call card");
-  assertEqual(toolCall.id, "tool-1", "tool call id");
-  assertEqual(toolCall.name, "bash", "tool name");
-  assertEqual(toolCall.status, "waiting_permission", "tool status");
-  assertEqual(toolCall.args, JSON.stringify({ command: "pnpm build" }, null, 2), "formatted args");
-  assertEqual(next.pendingPermission?.toolCallId, "tool-1", "pending permission id");
-}
+    const assistant = next.messages[0];
+    const toolCall = assistant.toolCalls?.[0];
+    expect(toolCall).toBeTruthy();
+    expect(toolCall?.id).toBe("tool-1");
+    expect(toolCall?.name).toBe("bash");
+    expect(toolCall?.status).toBe("waiting_permission");
+    expect(toolCall?.args).toBe(JSON.stringify({ command: "pnpm build" }, null, 2));
+    expect(next.pendingPermission?.toolCallId).toBe("tool-1");
+  });
 
-{
-  const waiting = reduceChatStreamEvent(
-    baseState(),
-    {
-      type: "permission_request",
-      tool_call_id: "tool-2",
-      tool_name: "write_file",
-      args: { path: "README.md", content: "hello" },
-    },
-    "assistant-1",
-  );
+  it("keeps the tool card and clears pending permission on a tool result", () => {
+    const waiting = reduceChatStreamEvent(
+      baseState(),
+      {
+        type: "permission_request",
+        tool_call_id: "tool-2",
+        tool_name: "write_file",
+        args: { path: "README.md", content: "hello" },
+      },
+      "assistant-1",
+    );
 
-  const done = reduceChatStreamEvent(
-    waiting,
-    {
-      type: "tool_result",
-      tool_call_id: "tool-2",
-      content: "Written 5 bytes",
-      is_error: false,
-      status: "done",
-    },
-    "assistant-1",
-  );
+    const done = reduceChatStreamEvent(
+      waiting,
+      {
+        type: "tool_result",
+        tool_call_id: "tool-2",
+        content: "Written 5 bytes",
+        is_error: false,
+        status: "done",
+      },
+      "assistant-1",
+    );
 
-  const toolCall = done.messages[0].toolCalls?.[0];
-  assertTruthy(toolCall, "tool result keeps the tool card");
-  assertEqual(toolCall.status, "done", "tool result status");
-  assertEqual(toolCall.result, "Written 5 bytes", "tool result content");
-  assertEqual(done.pendingPermission, null, "tool result clears pending permission");
-}
+    const toolCall = done.messages[0].toolCalls?.[0];
+    expect(toolCall).toBeTruthy();
+    expect(toolCall?.status).toBe("done");
+    expect(toolCall?.result).toBe("Written 5 bytes");
+    expect(done.pendingPermission).toBeNull();
+  });
 
-{
-  const waiting = reduceChatStreamEvent(
-    baseState(),
-    {
-      type: "permission_request",
-      tool_call_id: "tool-cancelled",
-      tool_name: "bash",
-      args: { command: "sleep 10" },
-    },
-    "assistant-1",
-  );
-  const cancelled = reduceChatStreamEvent(
-    waiting,
-    {
-      type: "tool_result",
-      tool_call_id: "tool-cancelled",
-      content: "Tool call cancelled by user.",
-      is_error: true,
-      status: "cancelled",
-    },
-    "assistant-1",
-  );
+  it("marks the tool card cancelled and clears pending permission", () => {
+    const waiting = reduceChatStreamEvent(
+      baseState(),
+      {
+        type: "permission_request",
+        tool_call_id: "tool-cancelled",
+        tool_name: "bash",
+        args: { command: "sleep 10" },
+      },
+      "assistant-1",
+    );
+    const cancelled = reduceChatStreamEvent(
+      waiting,
+      {
+        type: "tool_result",
+        tool_call_id: "tool-cancelled",
+        content: "Tool call cancelled by user.",
+        is_error: true,
+        status: "cancelled",
+      },
+      "assistant-1",
+    );
 
-  assertEqual(cancelled.messages[0].toolCalls?.[0].status, "cancelled", "cancel status");
-  assertEqual(cancelled.pendingPermission, null, "cancel clears pending permission");
-}
+    expect(cancelled.messages[0].toolCalls?.[0].status).toBe("cancelled");
+    expect(cancelled.pendingPermission).toBeNull();
+  });
+});
