@@ -70,6 +70,21 @@ class FakeEnvironment:
 
 
 class CodeFactoryBenchAgentTest(unittest.TestCase):
+    @staticmethod
+    def _running_linux_process_group_members(pgid: int) -> list[tuple[int, str]]:
+        members: list[tuple[int, str]] = []
+        for stat_path in Path("/proc").glob("[0-9]*/stat"):
+            try:
+                stat = stat_path.read_text()
+                fields = stat[stat.rfind(")") + 2 :].split()
+                state = fields[0]
+                process_group = int(fields[2])
+            except (IndexError, OSError, ValueError):
+                continue
+            if process_group == pgid and state != "Z":
+                members.append((int(stat_path.parent.name), state))
+        return members
+
     def test_harbor_import_path_and_identity_are_stable(self) -> None:
         self.assertEqual(CodeFactoryAgent.import_path(), "codefactory_bench.agent:CodeFactoryAgent")
         self.assertEqual(CodeFactoryAgent.name(), "codefactory-headless")
@@ -196,13 +211,15 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
 
                 deadline = time.monotonic() + 3
                 while time.monotonic() < deadline:
-                    try:
-                        os.killpg(pgid, 0)
-                    except ProcessLookupError:
+                    launcher.poll()
+                    members = self._running_linux_process_group_members(pgid)
+                    if not members:
                         break
                     time.sleep(0.05)
                 else:
-                    self.fail(f"managed process group {pgid} survived cleanup")
+                    self.fail(
+                        f"managed process group {pgid} has running members: {members}"
+                    )
             finally:
                 if launcher.poll() is None:
                     launcher.kill()
