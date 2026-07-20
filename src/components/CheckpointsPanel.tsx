@@ -1,129 +1,277 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Per-session git checkpoints panel — surfaces every auto-snapshot the
-// backend captured before sending a user message, and offers one-click
-// revert with a pre-confirm file-list dialog so the user can see exactly
-// what will change before agreeing to it.
-//
-// This is the user-facing half of the "AI 放手干，错了便宜回滚" principle:
-// trusting the agent to act, with a cheap reversal path when it goes wrong.
+// Compact checkpoint trigger + on-demand drawer. The backend still captures
+// every snapshot; the UI deduplicates identical SHAs and prioritises snapshots
+// that would actually change files when restored.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
-  ChevronDown, ChevronRight, RotateCcw, GitBranch, Check, AlertCircle,
-  X, FileText, FileMinus, FilePlus, FileEdit,
+  AlertCircle,
+  Check,
+  FileEdit,
+  FileMinus,
+  FilePlus,
+  FileText,
+  GitBranch,
+  History,
+  RotateCcw,
+  X,
 } from "lucide-react";
 import { invoke } from "../lib/tauri";
-import type { CheckpointInfo, CheckpointFileChange } from "../lib/tauri";
+import type { CheckpointFileChange, CheckpointInfo } from "../lib/tauri";
 
 interface Props {
   sessionId: string | null;
 }
 
+const RECENT_LIMIT = 3;
+
 export function CheckpointsPanel({ sessionId }: Props) {
   const [checkpoints, setCheckpoints] = useState<CheckpointInfo[]>([]);
-  const [expanded, setExpanded] = useState(true);
+  const [changes, setChanges] = useState<Record<string, CheckpointFileChange[]>>({});
+  const [open, setOpen] = useState(false);
+  const [showAllChanged, setShowAllChanged] = useState(false);
+  const [showUnchanged, setShowUnchanged] = useState(false);
   const [confirming, setConfirming] = useState<CheckpointInfo | null>(null);
 
   const refresh = useCallback(async () => {
     if (!sessionId) {
       setCheckpoints([]);
+      setChanges({});
       return;
     }
     try {
       const list = await invoke<CheckpointInfo[]>("list_checkpoints", { sessionId });
-      setCheckpoints(list);
+      const unique = dedupeBySnapshot(list);
+      setCheckpoints(unique);
+      setChanges({});
     } catch {
       setCheckpoints([]);
+      setChanges({});
     }
   }, [sessionId]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
-  // The backend fires `checkpoint-created` after every successful auto-snapshot;
-  // refresh the list so the new entry appears without a manual reload.
   useEffect(() => {
-    let cancel = false;
-    let un: (() => void) | null = null;
-    listen<string>("checkpoint-created", (e) => {
-      if (!cancel && e.payload === sessionId) {
-        void refresh();
-      }
-    }).then((fn) => { if (cancel) fn(); else un = fn; });
-    return () => { cancel = true; un?.(); };
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    listen<string>("checkpoint-created", (event) => {
+      if (!cancelled && event.payload === sessionId) void refresh();
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, [sessionId, refresh]);
+
+  useEffect(() => {
+    if (!open || checkpoints.length === 0) return;
+    let cancelled = false;
+    Promise.all(
+      checkpoints.map(async (checkpoint) => {
+        try {
+          const files = await invoke<CheckpointFileChange[]>("checkpoint_changeset", {
+            checkpointId: checkpoint.id,
+          });
+          return [checkpoint.id, files] as const;
+        } catch {
+          // Unknown is safer to retain than incorrectly hiding a recoverable snapshot.
+          return [checkpoint.id, [{ path: "", status: "modified" } as CheckpointFileChange]] as const;
+        }
+      }),
+    ).then((results) => {
+      if (!cancelled) setChanges(Object.fromEntries(results));
+    });
+    return () => { cancelled = true; };
+  }, [open, checkpoints]);
+
+  const changed = useMemo(
+    () => checkpoints.filter((checkpoint) => (changes[checkpoint.id]?.length ?? 0) > 0),
+    [checkpoints, changes],
+  );
+  const unchanged = useMemo(
+    () => checkpoints.filter((checkpoint) => changes[checkpoint.id]?.length === 0),
+    [checkpoints, changes],
+  );
+  const visibleChanged = showAllChanged ? changed : changed.slice(0, RECENT_LIMIT);
 
   if (!sessionId) return null;
 
   return (
     <>
-      <div className="border-t border-border bg-surface-1">
-        <button
-          onClick={() => setExpanded(!expanded)}
-          className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-gray-500 hover:text-gray-300 transition-colors"
-        >
-          {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-          <GitBranch size={11} />
-          <span>检查点</span>
-          {checkpoints.length > 0 && (
-            <span className="ml-auto text-[10px] text-gray-600 tabular-nums">
-              {checkpoints.length}
-            </span>
-          )}
-        </button>
+      <button
+        onClick={() => setOpen(true)}
+        aria-label={`检查点 ${checkpoints.length}`}
+        title="查看自动检查点"
+        className="inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-2 py-1 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
+      >
+        <History size={11} />
+        <span>检查点</span>
+        <span className="tabular-nums text-gray-600">{checkpoints.length}</span>
+      </button>
 
-        {expanded && (
-          <div className="px-1 pb-2 max-h-[28vh] overflow-y-auto">
-            {checkpoints.length === 0 ? (
-              <div className="px-3 py-2 text-[11px] text-gray-600 italic">
-                暂无检查点。如果此文件夹是 git 仓库，发送下一条消息后会出现一个。
+      {open && (
+        <div className="fixed inset-0 z-40 bg-black/30" onClick={() => setOpen(false)}>
+          <aside
+            role="dialog"
+            aria-modal="true"
+            aria-label="检查点抽屉"
+            className="absolute inset-y-0 right-0 flex w-[min(420px,92vw)] flex-col border-l border-border bg-surface-1 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="flex items-start gap-3 border-b border-border px-4 py-3">
+              <GitBranch size={15} className="mt-0.5 text-accent" />
+              <div className="min-w-0 flex-1">
+                <h2 className="text-sm font-semibold text-gray-100">检查点</h2>
+                <p className="mt-0.5 text-[11px] text-gray-600">
+                  自动快照不会移动 HEAD；恢复结果会作为普通工作区修改供你审查。
+                </p>
               </div>
-            ) : (
-              <ul className="space-y-0.5">
-                {checkpoints.map((cp) => (
-                  <CheckpointRow key={cp.id} cp={cp} onRequestRevert={setConfirming} />
-                ))}
-              </ul>
-            )}
-          </div>
-        )}
-      </div>
+              <button
+                onClick={() => setOpen(false)}
+                aria-label="关闭检查点"
+                className="rounded p-1 text-gray-600 hover:bg-surface-3 hover:text-gray-200"
+              >
+                <X size={14} />
+              </button>
+            </header>
+
+            <div className="min-h-0 flex-1 overflow-y-auto p-3">
+              {checkpoints.length === 0 ? (
+                <p className="rounded border border-dashed border-border px-3 py-8 text-center text-xs text-gray-600">
+                  暂无检查点。Git 项目发送下一条消息前会自动创建。
+                </p>
+              ) : (
+                <>
+                  <section>
+                    <div className="mb-2 flex items-center gap-2 px-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">
+                      可恢复变更
+                      <span className="ml-auto tabular-nums text-gray-600">{changed.length}</span>
+                    </div>
+                    {changed.length === 0 ? (
+                      <p className="px-2 py-4 text-xs text-gray-600">当前检查点都与工作区一致。</p>
+                    ) : (
+                      <ul className="space-y-1">
+                        {visibleChanged.map((checkpoint) => (
+                          <CheckpointRow
+                            key={checkpoint.id}
+                            checkpoint={checkpoint}
+                            fileCount={changes[checkpoint.id]?.filter((file) => file.path).length ?? 0}
+                            onRequestRevert={setConfirming}
+                          />
+                        ))}
+                      </ul>
+                    )}
+                    {!showAllChanged && changed.length > RECENT_LIMIT && (
+                      <button
+                        onClick={() => setShowAllChanged(true)}
+                        aria-label={`查看全部 ${changed.length} 个有效检查点`}
+                        className="mt-2 w-full rounded px-2 py-1.5 text-[11px] text-gray-500 hover:bg-surface-2 hover:text-gray-200"
+                      >
+                        查看全部 {changed.length} 个有效检查点
+                      </button>
+                    )}
+                  </section>
+
+                  {unchanged.length > 0 && (
+                    <section className="mt-4 border-t border-border pt-3">
+                      <button
+                        onClick={() => setShowUnchanged((value) => !value)}
+                        aria-label={`${showUnchanged ? "收起" : "查看"} ${unchanged.length} 个无差异检查点`}
+                        className="flex w-full items-center gap-2 rounded px-1 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 hover:text-gray-300"
+                      >
+                        无文件差异
+                        <span className="ml-auto tabular-nums">{unchanged.length}</span>
+                      </button>
+                      {showUnchanged && (
+                        <ul className="mt-1 space-y-1 opacity-60">
+                          {unchanged.map((checkpoint) => (
+                            <CheckpointRow
+                              key={checkpoint.id}
+                              checkpoint={checkpoint}
+                              fileCount={0}
+                              onRequestRevert={setConfirming}
+                            />
+                          ))}
+                        </ul>
+                      )}
+                    </section>
+                  )}
+                </>
+              )}
+            </div>
+          </aside>
+        </div>
+      )}
 
       {confirming && (
         <RevertConfirmModal
-          cp={confirming}
+          checkpoint={confirming}
+          initialChanges={changes[confirming.id]}
           onCancel={() => setConfirming(null)}
-          onDone={() => { setConfirming(null); void refresh(); }}
+          onDone={() => {
+            setConfirming(null);
+            void refresh();
+          }}
         />
       )}
     </>
   );
 }
 
-function CheckpointRow({ cp, onRequestRevert }: { cp: CheckpointInfo; onRequestRevert: (c: CheckpointInfo) => void; }) {
-  const when = new Date(cp.created_at);
-  const label = cp.label.length > 50 ? cp.label.slice(0, 50) + "…" : cp.label;
+export function dedupeBySnapshot(checkpoints: CheckpointInfo[]): CheckpointInfo[] {
+  const seen = new Set<string>();
+  return checkpoints.filter((checkpoint) => {
+    if (seen.has(checkpoint.git_sha)) return false;
+    seen.add(checkpoint.git_sha);
+    return true;
+  });
+}
+
+function CheckpointRow({
+  checkpoint,
+  fileCount,
+  onRequestRevert,
+}: {
+  checkpoint: CheckpointInfo;
+  fileCount: number;
+  onRequestRevert: (checkpoint: CheckpointInfo) => void;
+}) {
+  const when = new Date(checkpoint.created_at);
+  const label = checkpoint.label.length > 70
+    ? `${checkpoint.label.slice(0, 70)}…`
+    : checkpoint.label || "(空消息)";
+
   return (
-    <li className="group flex items-center gap-1.5 px-2 py-1 rounded hover:bg-surface-2 text-[11px]">
-      <span className="font-mono text-gray-700 shrink-0 w-12 truncate" title={cp.git_sha}>
-        {cp.git_sha.slice(0, 7)}
+    <li className="group flex items-center gap-2 rounded border border-transparent px-2 py-2 text-[11px] hover:border-border hover:bg-surface-2">
+      <span className="w-12 shrink-0 truncate font-mono text-gray-700" title={checkpoint.git_sha}>
+        {checkpoint.git_sha.slice(0, 7)}
       </span>
-      <span className={`flex-1 min-w-0 truncate ${cp.reverted ? "text-gray-700 line-through" : "text-gray-400"}`} title={cp.label}>
-        {label || "(空消息)"}
-      </span>
-      <span className="text-[10px] text-gray-700 shrink-0" title={when.toLocaleString()}>
+      <div className="min-w-0 flex-1">
+        <div className={checkpoint.reverted ? "truncate text-gray-700 line-through" : "truncate text-gray-300"} title={checkpoint.label}>
+          {label}
+        </div>
+        <div className="mt-0.5 text-[9px] text-gray-700">
+          {fileCount > 0 ? `${fileCount} 个文件变化` : "无文件差异"}
+        </div>
+      </div>
+      <span className="shrink-0 text-[10px] text-gray-700" title={when.toLocaleString()}>
         {when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
       </span>
-      {cp.reverted ? (
-        <span className="text-[10px] text-emerald-500 shrink-0 flex items-center gap-0.5" title="已恢复">
+      {checkpoint.reverted ? (
+        <span className="inline-flex shrink-0 items-center gap-0.5 text-[10px] text-emerald-500">
           <Check size={10} /> 已恢复
         </span>
       ) : (
         <button
-          onClick={() => onRequestRevert(cp)}
-          className="opacity-0 group-hover:opacity-100 transition-opacity shrink-0 flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] text-gray-500 hover:text-amber-400 hover:bg-amber-500/10"
-          title="将工作区恢复到此检查点"
+          onClick={() => onRequestRevert(checkpoint)}
+          aria-label={`恢复检查点 ${checkpoint.label}`}
+          className="inline-flex shrink-0 items-center gap-0.5 rounded px-1.5 py-1 text-[10px] text-gray-500 opacity-0 transition-opacity hover:bg-amber-500/10 hover:text-amber-400 group-hover:opacity-100 focus:opacity-100"
         >
           <RotateCcw size={10} /> 恢复
         </button>
@@ -132,29 +280,36 @@ function CheckpointRow({ cp, onRequestRevert }: { cp: CheckpointInfo; onRequestR
   );
 }
 
-function RevertConfirmModal({ cp, onCancel, onDone }: {
-  cp: CheckpointInfo;
+function RevertConfirmModal({
+  checkpoint,
+  initialChanges,
+  onCancel,
+  onDone,
+}: {
+  checkpoint: CheckpointInfo;
+  initialChanges?: CheckpointFileChange[];
   onCancel: () => void;
   onDone: () => void;
 }) {
-  const [changes, setChanges] = useState<CheckpointFileChange[] | null>(null);
+  const [fileChanges, setFileChanges] = useState<CheckpointFileChange[] | null>(initialChanges ?? null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    invoke<CheckpointFileChange[]>("checkpoint_changeset", { checkpointId: cp.id })
-      .then(setChanges)
-      .catch((e) => setError(String(e)));
-  }, [cp.id]);
+    if (initialChanges) return;
+    invoke<CheckpointFileChange[]>("checkpoint_changeset", { checkpointId: checkpoint.id })
+      .then(setFileChanges)
+      .catch((cause) => setError(String(cause)));
+  }, [checkpoint.id, initialChanges]);
 
-  const handleRevert = async () => {
+  const restore = async () => {
     setBusy(true);
     setError(null);
     try {
-      await invoke("revert_checkpoint", { checkpointId: cp.id });
+      await invoke("revert_checkpoint", { checkpointId: checkpoint.id });
       onDone();
-    } catch (e) {
-      setError(String(e));
+    } catch (cause) {
+      setError(String(cause));
     } finally {
       setBusy(false);
     }
@@ -163,44 +318,45 @@ function RevertConfirmModal({ cp, onCancel, onDone }: {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onCancel}>
       <div
-        className="w-[min(560px,92vw)] max-h-[80vh] flex flex-col rounded-xl border border-border bg-surface-2 shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label="恢复检查点"
+        className="flex max-h-[80vh] w-[min(560px,92vw)] flex-col rounded-xl border border-border bg-surface-2 shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
       >
-        <div className="flex items-start justify-between gap-3 px-4 py-3 border-b border-border">
+        <header className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
           <div className="min-w-0">
-            <div className="text-sm font-semibold text-gray-100">恢复到检查点</div>
-            <div className="text-[11px] text-gray-500 mt-0.5 truncate" title={cp.label}>
-              {cp.git_sha.slice(0, 7)} · {cp.label || "(空)"}
-            </div>
+            <h2 className="text-sm font-semibold text-gray-100">恢复到检查点</h2>
+            <p className="mt-0.5 truncate text-[11px] text-gray-500" title={checkpoint.label}>
+              {checkpoint.git_sha.slice(0, 7)} · {checkpoint.label || "(空)"}
+            </p>
           </div>
-          <button onClick={onCancel} className="text-gray-600 hover:text-gray-300">
+          <button onClick={onCancel} aria-label="取消恢复" className="text-gray-600 hover:text-gray-300">
             <X size={14} />
           </button>
-        </div>
+        </header>
 
-        <div className="px-4 py-3 flex-1 overflow-y-auto">
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
           {error ? (
-            <div className="flex items-start gap-2 p-2 rounded bg-rose-500/10 border border-rose-500/40 text-xs text-rose-800 dark:text-rose-300">
-              <AlertCircle size={12} className="shrink-0 mt-0.5" />
+            <div className="flex items-start gap-2 rounded border border-rose-500/40 bg-rose-500/10 p-2 text-xs text-rose-800 dark:text-rose-300">
+              <AlertCircle size={12} className="mt-0.5 shrink-0" />
               <span className="flex-1 break-words">{error}</span>
             </div>
-          ) : changes === null ? (
+          ) : fileChanges === null ? (
             <div className="text-xs text-gray-500">正在计算差异…</div>
-          ) : changes.length === 0 ? (
-            <div className="text-xs text-gray-500 italic">
-              工作区已与此检查点一致 — 不会有任何更改。
-            </div>
+          ) : fileChanges.length === 0 ? (
+            <div className="text-xs italic text-gray-500">工作区已与此检查点一致，不会有任何更改。</div>
           ) : (
             <>
-              <div className="text-[11px] text-gray-500 mb-2">
-                这些文件将恢复到检查点时的状态（你对它们的当前修改会被覆盖）：
-              </div>
+              <p className="mb-2 text-[11px] text-gray-500">
+                以下文件将恢复到快照状态；当前修改会被覆盖：
+              </p>
               <ul className="space-y-0.5">
-                {changes.map((c) => (
-                  <li key={c.path} className="flex items-center gap-2 text-[11px] font-mono">
-                    <StatusIcon status={c.status} />
-                    <span className="text-gray-300 truncate flex-1" title={c.path}>{c.path}</span>
-                    <span className="text-[10px] text-gray-600 uppercase tracking-wide">{statusLabel(c.status)}</span>
+                {fileChanges.map((file) => (
+                  <li key={file.path} className="flex items-center gap-2 font-mono text-[11px]">
+                    <StatusIcon status={file.status} />
+                    <span className="min-w-0 flex-1 truncate text-gray-300" title={file.path}>{file.path}</span>
+                    <span className="text-[10px] uppercase tracking-wide text-gray-600">{statusLabel(file.status)}</span>
                   </li>
                 ))}
               </ul>
@@ -208,22 +364,20 @@ function RevertConfirmModal({ cp, onCancel, onDone }: {
           )}
         </div>
 
-        <div className="flex justify-end gap-2 px-4 py-3 border-t border-border">
-          <button
-            onClick={onCancel}
-            className="px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 rounded hover:bg-surface-3 transition-colors"
-          >
+        <footer className="flex justify-end gap-2 border-t border-border px-4 py-3">
+          <button onClick={onCancel} className="rounded px-3 py-1.5 text-xs text-gray-400 hover:bg-surface-3 hover:text-gray-200">
             取消
           </button>
           <button
-            onClick={handleRevert}
-            disabled={busy || changes === null || changes.length === 0}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-amber-500/20 text-amber-800 dark:text-amber-300 border border-amber-500/40 rounded hover:bg-amber-500/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            onClick={() => void restore()}
+            disabled={busy || fileChanges === null || fileChanges.length === 0}
+            aria-label="确认恢复"
+            className="inline-flex items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/20 px-3 py-1.5 text-xs text-amber-800 transition-colors hover:bg-amber-500/30 disabled:cursor-not-allowed disabled:opacity-40 dark:text-amber-300"
           >
             <RotateCcw size={11} />
             {busy ? "正在恢复…" : "恢复"}
           </button>
-        </div>
+        </footer>
       </div>
     </div>
   );
@@ -231,18 +385,19 @@ function RevertConfirmModal({ cp, onCancel, onDone }: {
 
 function StatusIcon({ status }: { status: CheckpointFileChange["status"] }) {
   switch (status) {
-    case "added":    return <FilePlus size={11} className="text-emerald-400 shrink-0" />;
-    case "deleted":  return <FileMinus size={11} className="text-rose-400 shrink-0" />;
-    case "modified": return <FileEdit size={11} className="text-amber-400 shrink-0" />;
-    default:         return <FileText size={11} className="text-gray-500 shrink-0" />;
+    case "added": return <FilePlus size={11} className="shrink-0 text-emerald-400" />;
+    case "deleted": return <FileMinus size={11} className="shrink-0 text-rose-400" />;
+    case "modified": return <FileEdit size={11} className="shrink-0 text-amber-400" />;
+    default: return <FileText size={11} className="shrink-0 text-gray-500" />;
   }
 }
 
 function statusLabel(status: CheckpointFileChange["status"]): string {
   switch (status) {
-    case "added":    return "新增";
-    case "deleted":  return "删除";
+    case "added": return "新增";
+    case "deleted": return "删除";
     case "modified": return "修改";
-    default:         return status;
+    case "renamed": return "重命名";
+    case "typechange": return "类型变化";
   }
 }

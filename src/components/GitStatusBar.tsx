@@ -79,7 +79,10 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
   };
 
   return (
-    <div className="flex items-center gap-2 px-2 py-1 border-t border-border bg-surface-1 text-xs text-gray-500 shrink-0 select-none relative">
+    <div
+      aria-label="Git 状态"
+      className="flex items-center gap-2 rounded border border-border bg-surface-2 px-2 py-1 text-[11px] text-gray-500 shrink-0 select-none relative"
+    >
       {/* Branch */}
       <div className="relative" ref={dropdownRef}>
         <button
@@ -91,7 +94,7 @@ export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }
           <span className="truncate max-w-[100px]">{status?.branch ?? "…"}</span>
         </button>
         {branchPickerOpen && (
-          <div className="absolute bottom-full mb-1 left-0 z-30 w-64 rounded border border-border bg-surface-2 shadow-2xl py-1 max-h-72 overflow-y-auto">
+          <div className="absolute top-full mt-1 right-0 z-30 w-64 rounded border border-border bg-surface-2 shadow-2xl py-1 max-h-72 overflow-y-auto">
             {switchError && (
               <div className="px-2 py-1 text-[11px] text-red-400 border-b border-border">
                 {switchError}
