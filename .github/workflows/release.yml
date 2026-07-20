@@ -1,9 +1,18 @@
 name: Release
 
+run-name: Release ${{ inputs.tag }}
+
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing vX.Y.Z tag to build and publish"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -20,6 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install git-cliff
@@ -44,19 +54,82 @@ jobs:
           echo "---- preview ----"
           cat RELEASE_NOTES.md
 
-  # ── Step 2: build Windows installer and publish release ───────────────────
-  build-windows:
-    runs-on: windows-latest
+  # Create or reuse one draft before either platform uploads assets. Keeping
+  # this separate lets Windows and macOS build in parallel without racing to
+  # create the release.
+  prepare-release:
+    runs-on: ubuntu-latest
     needs: changelog
-    # Belt-and-suspenders: GitHub sometimes drops the top-level `permissions:`
-    # for jobs with `needs:` dependencies, causing tauri-action's
-    # "create release" API call to fail with 403 ("Resource not accessible
-    # by integration"). Declaring it again per-job is harmless and guarantees
-    # the contents:write scope is in effect.
+    outputs:
+      tag_sha: ${{ steps.prepare.outputs.tag_sha }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Validate tag and prepare draft release
+        id: prepare
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          NOTES: ${{ needs.changelog.outputs.content }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tag must match vX.Y.Z, got '$TAG'"
+            exit 1
+          fi
+
+          TAG_SHA="$(git rev-parse "${TAG}^{commit}")"
+          if [ "$(git rev-parse HEAD)" != "$TAG_SHA" ]; then
+            echo "::error::checkout HEAD does not match $TAG"
+            exit 1
+          fi
+          echo "tag_sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
+
+          # GitHub's release-by-tag endpoint cannot find drafts, so inspect the
+          # authenticated release list instead. The tag format was validated
+          # above before interpolation into jq.
+          RELEASE_STATE="$(gh api --paginate \
+            "repos/$REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .draft")"
+          RELEASE_STATE="${RELEASE_STATE:-missing}"
+          case "$RELEASE_STATE" in
+            true)
+              echo "Reusing existing draft release $TAG"
+              ;;
+            false)
+              echo "::error::release $TAG is already published; refusing to overwrite it"
+              exit 1
+              ;;
+            missing)
+              printf '%s\n' "$NOTES" > release-notes.md
+              gh release create "$TAG" --repo "$REPO" --verify-tag --draft \
+                --title "CodeFactory $TAG" --notes-file release-notes.md
+              ;;
+            *)
+              echo "::error::unexpected release state '$RELEASE_STATE' for $TAG"
+              exit 1
+              ;;
+          esac
+
+  # ── Step 2: build Windows installer ───────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    needs: [changelog, prepare-release]
+    # tauri-action needs contents:write to upload assets to the prepared draft.
+    # Keep the permission explicit on each platform job.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -130,7 +203,7 @@ jobs:
           # crates.io downloads occasionally drop mid-transfer on CI runners
           # (schannel "server closed abruptly"); give cargo more retries.
           CARGO_NET_RETRY: "10"
-          CODEFACTORY_BUILD_GIT_SHA: ${{ github.sha }}
+          CODEFACTORY_BUILD_GIT_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
           # Override `release` profile to optimise for CI build time instead
           # of binary size. We can't use `tauri build --profile release-ci`
           # because tauri 2's CLI doesn't expose --profile at the top level
@@ -139,22 +212,19 @@ jobs:
           # for ~50% shorter compile time.
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           CARGO_PROFILE_RELEASE_LTO: "false"
-          # Sign the installer + emit latest.json so the in-app updater can
-          # verify and download the new version. Keys generated locally via
-          # `tauri signer generate`; private key stored as a repo secret.
+          # Sign updater artifacts so finalize can assemble the cross-platform
+          # latest.json. The private key is stored as a repo secret.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'CodeFactory ${{ github.ref_name }}'
-          releaseBody: ${{ needs.changelog.outputs.content }}
-          # Create as draft and KEEP it draft. The macOS job uploads to this
-          # same release afterward, and GitHub's "Immutable Releases" policy
-          # freezes a release's assets the moment it's published. The final
-          # `finalize` job flips the draft off once BOTH platforms are up — so
-          # there is intentionally no publish step here anymore.
+          tagName: ${{ inputs.tag }}
+          # Upload to the draft created by prepare-release and keep it draft.
+          # `finalize` is the only job allowed to publish the release.
           releaseDraft: true
           prerelease: false
+          # Both platforms would otherwise race to delete and re-upload the
+          # same latest.json. Finalize creates the authoritative merged file.
+          includeUpdaterJson: false
 
       - name: Verify Windows release executable Evolution closed loop
         shell: pwsh
@@ -172,7 +242,7 @@ jobs:
           if ($process.ExitCode -ne 0) { throw "Evolution release smoke exited $($process.ExitCode)" }
           $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
           if ($smoke.status -ne "pass") { throw "Evolution smoke status was not pass" }
-          if ($smoke.build_git_sha -ne "${{ github.sha }}") { throw "Evolution smoke was not built from the release commit" }
+          if ($smoke.build_git_sha -ne "${{ needs.prepare-release.outputs.tag_sha }}") { throw "Evolution smoke was not built from the release commit" }
           if (-not $smoke.failed_eval_blocked_activation) { throw "Failed Eval did not block activation" }
           if ($smoke.eval_passed_count -ne $smoke.eval_required_count) { throw "Required Evals did not all pass" }
           if (-not $smoke.restart_reopen_observed) { throw "Evolution state was not verified after reopen" }
@@ -181,19 +251,21 @@ jobs:
           Get-Content $receipt
 
   # ── Step 3: build the unsigned macOS (Apple Silicon) app + dmg ────────────
-  # Runs AFTER build-windows so the draft release already exists; tauri-action
-  # uploads the .app.tar.gz (+ .sig) and the .dmg into that same draft. The app
+  # Runs in parallel with Windows after prepare-release creates the draft;
+  # tauri-action uploads the .app.tar.gz (+ .sig) and the .dmg. The app
   # is unsigned — no Apple Developer ID / notarization — so Gatekeeper blocks it
   # on first launch; users right-click → Open (documented in the release notes).
   # The UPDATER artifacts are still Tauri-signed with the same key as Windows,
   # so in-app auto-updates work on macOS too.
   build-macos:
     runs-on: macos-latest          # macos-latest is Apple Silicon (arm64)
-    needs: build-windows
+    needs: [changelog, prepare-release]
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -248,7 +320,7 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
           CARGO_INCREMENTAL: "0"
           CARGO_NET_RETRY: "10"
-          CODEFACTORY_BUILD_GIT_SHA: ${{ github.sha }}
+          CODEFACTORY_BUILD_GIT_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           CARGO_PROFILE_RELEASE_LTO: "false"
           # Same updater key as Windows — signs the .app.tar.gz so the macOS
@@ -257,10 +329,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
+          tagName: ${{ inputs.tag }}
           # Upload into the existing draft; keep it draft for `finalize`.
           releaseDraft: true
           prerelease: false
+          # Avoid a cross-platform latest.json upload race; finalize owns it.
+          includeUpdaterJson: false
           # bundle.targets in tauri.conf.json is ["nsis"] (Windows); nsis is not
           # a macOS bundle, so override to the mac bundles for this build only.
           args: --target aarch64-apple-darwin --bundles app,dmg
@@ -270,6 +344,7 @@ jobs:
         env:
           CODEFACTORY_RELEASE_EVIDENCE_DIR: ${{ runner.temp }}/codefactory-release-evidence
           CODEFACTORY_GUI_PROOF_TIER: released-artifact-gui
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           mkdir -p "$CODEFACTORY_RELEASE_EVIDENCE_DIR"
           DMG_PATH="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -type f -name '*.dmg' -print -quit)"
@@ -277,7 +352,7 @@ jobs:
             echo "::error::macOS DMG was not produced"
             exit 1
           fi
-          scripts/verify-macos-release-artifact.sh "$DMG_PATH" "${GITHUB_REF_NAME#v}"
+          scripts/verify-macos-release-artifact.sh "$DMG_PATH" "${RELEASE_TAG#v}"
 
       - name: Upload installed release GUI evidence
         if: always()
@@ -288,13 +363,13 @@ jobs:
           if-no-files-found: error
 
   # ── Step 4: assemble the cross-platform updater manifest, then publish ────
-  # Each build job uploaded its own latest.json, but neither carries the other
-  # platform's entry. Rebuild ONE authoritative latest.json from the .sig assets
-  # already on the release (windows + darwin), overwrite it, then flip the draft
-  # off — the single publish point, after every asset is in place.
+  # Build jobs intentionally skip latest.json to avoid a concurrent same-name
+  # asset race. Build ONE authoritative manifest from the .sig assets already
+  # on the release (windows + darwin), then flip the draft off — the single
+  # publish point, after every asset is in place.
   finalize:
     runs-on: ubuntu-latest
-    needs: [changelog, build-macos]
+    needs: [changelog, build-windows, build-macos]
     permissions:
       contents: write
     steps:
@@ -302,7 +377,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag }}
           NOTES: ${{ needs.changelog.outputs.content }}
         run: |
           set -euo pipefail
@@ -356,12 +431,14 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Download published macOS DMG
         shell: bash
         env:
           REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           RELEASE_DIR="$RUNNER_TEMP/codefactory-published-release"
@@ -382,6 +459,7 @@ jobs:
         env:
           CODEFACTORY_RELEASE_EVIDENCE_DIR: ${{ runner.temp }}/codefactory-published-release-evidence
           CODEFACTORY_GUI_PROOF_TIER: published-release-artifact-gui
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           DMG_DIR="$RUNNER_TEMP/codefactory-published-release"
@@ -393,13 +471,13 @@ jobs:
               exit 1
             fi
             DMG_PATH="$(find "$DMG_DIR" -type f -name '*.dmg' -print -quit)"
-            scripts/verify-macos-release-artifact.sh "$DMG_PATH" "${GITHUB_REF_NAME#v}"
+            scripts/verify-macos-release-artifact.sh "$DMG_PATH" "${RELEASE_TAG#v}"
           } 2>&1 | tee "$CODEFACTORY_RELEASE_EVIDENCE_DIR/verification.log"
 
       - name: Upload published release GUI evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-published-release-gui-evidence-${{ github.ref_name }}
+          name: macos-published-release-gui-evidence-${{ inputs.tag }}
           path: ${{ runner.temp }}/codefactory-published-release-evidence
           if-no-files-found: error
