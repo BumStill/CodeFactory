@@ -19,7 +19,8 @@ use tokio::io::{
 
 const MAX_CONTEXT_CHARS: usize = 40_000;
 const MAX_TOOL_STREAM_CHARS: usize = 3_000;
-const MODEL_REQUEST_ATTEMPTS: usize = 3;
+const MODEL_REQUEST_INITIAL_ATTEMPTS: usize = 3;
+const MODEL_REQUEST_PROGRESS_ATTEMPTS: usize = 5;
 const MODEL_ERROR_BODY_CHARS: usize = 1_000;
 
 #[derive(Debug, Clone)]
@@ -90,7 +91,10 @@ enum OutputMessage {
         id: String,
         command: String,
         timeout_sec: u64,
+        usage: Usage,
     },
+    #[serde(rename = "event")]
+    UsageSnapshot { name: String, usage: Usage },
     #[serde(rename = "finished")]
     Finished {
         final_text: String,
@@ -259,6 +263,7 @@ where
             execution_started + Duration::from_secs(total.max(1).saturating_sub(30).max(1))
         });
         let finalization_response = finalization_pending;
+        let model_request_attempts = model_request_attempts(tool_history.len());
         let response = match request_model(
             &client,
             &endpoint,
@@ -266,6 +271,7 @@ where
             &messages,
             !finalization_response,
             request_timeout_sec,
+            model_request_attempts,
             model_wall_deadline,
         )
         .await
@@ -318,6 +324,14 @@ where
                 .await?;
                 return Ok(());
             }
+            write_output(
+                output,
+                &OutputMessage::UsageSnapshot {
+                    name: "usage_snapshot".to_owned(),
+                    usage: usage.clone(),
+                },
+            )
+            .await?;
             messages.push(message);
             messages.push(json!({
                 "role": "user",
@@ -375,6 +389,7 @@ where
                             id: tool_call.id.clone(),
                             command: tool_call.command.clone(),
                             timeout_sec: effective_tool_timeout_sec,
+                            usage: usage.clone(),
                         },
                     )
                     .await?;
@@ -591,6 +606,7 @@ async fn request_model(
     messages: &[Value],
     allow_tools: bool,
     attempt_timeout_sec: u64,
+    max_attempts: usize,
     wall_deadline: Option<Instant>,
 ) -> Result<Value, HeadlessError> {
     let mut payload = json!({
@@ -616,7 +632,8 @@ async fn request_model(
         }]);
     }
     let attempt_timeout = Duration::from_secs(attempt_timeout_sec.max(1));
-    for attempt in 1..=MODEL_REQUEST_ATTEMPTS {
+    let max_attempts = max_attempts.max(1);
+    for attempt in 1..=max_attempts {
         if wall_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(HeadlessError::ModelResponse {
                 attempts: attempt - 1,
@@ -631,6 +648,7 @@ async fn request_model(
         let mut request = client
             .post(endpoint)
             .timeout(effective_timeout)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .json(&payload);
         if !config.api_key.is_empty() {
             request = request.bearer_auth(&config.api_key);
@@ -638,7 +656,7 @@ async fn request_model(
 
         let response = match request.send().await {
             Ok(response) => response,
-            Err(error) if attempt < MODEL_REQUEST_ATTEMPTS && is_retryable_model_error(&error) => {
+            Err(error) if attempt < max_attempts && is_retryable_model_error(&error) => {
                 wait_before_model_retry(attempt, wall_deadline).await;
                 continue;
             }
@@ -647,7 +665,7 @@ async fn request_model(
         let status = response.status();
         let body = match response.bytes().await {
             Ok(body) => body,
-            Err(error) if attempt < MODEL_REQUEST_ATTEMPTS && is_retryable_model_error(&error) => {
+            Err(error) if attempt < max_attempts && is_retryable_model_error(&error) => {
                 wait_before_model_retry(attempt, wall_deadline).await;
                 continue;
             }
@@ -661,9 +679,7 @@ async fn request_model(
 
         if !status.is_success() {
             let body = response_body_preview(&body);
-            if attempt < MODEL_REQUEST_ATTEMPTS
-                && (status.as_u16() == 429 || status.is_server_error())
-            {
+            if attempt < max_attempts && (status.as_u16() == 429 || status.is_server_error()) {
                 wait_before_model_retry(attempt, wall_deadline).await;
                 continue;
             }
@@ -675,7 +691,7 @@ async fn request_model(
 
         match serde_json::from_slice(&body) {
             Ok(value) => return Ok(value),
-            Err(_error) if attempt < MODEL_REQUEST_ATTEMPTS => {
+            Err(_error) if attempt < max_attempts => {
                 wait_before_model_retry(attempt, wall_deadline).await;
                 continue;
             }
@@ -713,6 +729,14 @@ async fn wait_before_model_retry(attempt: usize, wall_deadline: Option<Instant>)
         .unwrap_or(delay);
     if !bounded_delay.is_zero() {
         tokio::time::sleep(bounded_delay).await;
+    }
+}
+
+fn model_request_attempts(tool_outcome_count: usize) -> usize {
+    if tool_outcome_count == 0 {
+        MODEL_REQUEST_INITIAL_ATTEMPTS
+    } else {
+        MODEL_REQUEST_PROGRESS_ATTEMPTS
     }
 }
 
@@ -908,6 +932,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::thread;
     use tokio::io::BufReader;
 
@@ -917,6 +942,12 @@ mod tests {
             id: "call-1".to_owned(),
             command: "cargo test".to_owned(),
             timeout_sec: 30,
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+                model_requests: 1,
+            },
         };
         assert_eq!(
             serde_json::to_value(request).unwrap(),
@@ -924,7 +955,36 @@ mod tests {
                 "type": "tool_request",
                 "id": "call-1",
                 "command": "cargo test",
-                "timeout_sec": 30
+                "timeout_sec": 30,
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                    "model_requests": 1
+                }
+            })
+        );
+
+        let event = OutputMessage::UsageSnapshot {
+            name: "usage_snapshot".to_owned(),
+            usage: Usage {
+                prompt_tokens: 20,
+                completion_tokens: 4,
+                total_tokens: 24,
+                model_requests: 2,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "type": "event",
+                "name": "usage_snapshot",
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 4,
+                    "total_tokens": 24,
+                    "model_requests": 2
+                }
             })
         );
     }
@@ -1069,6 +1129,8 @@ mod tests {
         assert!(should_finish_after_model_error(Some((45, 900)), 3));
         assert!(!should_finish_after_model_error(Some((450, 900)), 3));
         assert!(!should_finish_after_model_error(Some((45, 900)), 0));
+        assert_eq!(model_request_attempts(0), MODEL_REQUEST_INITIAL_ATTEMPTS);
+        assert_eq!(model_request_attempts(1), MODEL_REQUEST_PROGRESS_ATTEMPTS);
     }
 
     #[test]
@@ -1207,6 +1269,8 @@ mod tests {
         let first = read_test_output(&mut output).await;
         assert_eq!(first["type"], "tool_request");
         assert_eq!(first["id"], "mutation-1");
+        assert_eq!(first["usage"]["model_requests"], 1);
+        assert_eq!(first["usage"]["total_tokens"], 12);
         write_test_line(
             &mut input,
             &json!({
@@ -1223,6 +1287,8 @@ mod tests {
         let second = read_test_output(&mut output).await;
         assert_eq!(second["type"], "tool_request");
         assert_eq!(second["id"], "verify-1");
+        assert_eq!(second["usage"]["model_requests"], 2);
+        assert_eq!(second["usage"]["total_tokens"], 35);
         write_test_line(
             &mut input,
             &json!({
@@ -1324,6 +1390,11 @@ mod tests {
             )
             .await;
         }
+
+        let usage_snapshot = read_test_output(&mut output).await;
+        assert_eq!(usage_snapshot["type"], "event");
+        assert_eq!(usage_snapshot["name"], "usage_snapshot");
+        assert_eq!(usage_snapshot["usage"]["model_requests"], 3);
 
         let assertion = read_test_output(&mut output).await;
         assert_eq!(assertion["type"], "tool_request");
@@ -1640,6 +1711,7 @@ mod tests {
             &[json!({"role": "user", "content": "task"})],
             true,
             5,
+            MODEL_REQUEST_INITIAL_ATTEMPTS,
             None,
         )
         .await
@@ -1647,6 +1719,83 @@ mod tests {
 
         assert_eq!(response["choices"][0]["message"]["content"], "done");
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_request_recovers_after_four_truncated_response_bodies() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                request_tx
+                    .send(read_http_request_text(&mut stream))
+                    .unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 200\r\nConnection: close\r\n\r\n{\"choices\":",
+                    )
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+
+            let (mut stream, _) = listener.accept().unwrap();
+            request_tx
+                .send(read_http_request_text(&mut stream))
+                .unwrap();
+            let body = json!({
+                "choices": [{"message": {"role": "assistant", "content": "recovered"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })
+            .to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let config = StartConfig {
+            instruction: "task".to_owned(),
+            model: "fake-model".to_owned(),
+            api_key: "test-key".to_owned(),
+            base_url: format!("http://{address}/v1"),
+            max_steps: 1,
+            model_timeout_sec: 5,
+            shell_timeout_sec: 30,
+            wall_time_budget_sec: Some(30),
+            working_directory: Some("/workspace".to_owned()),
+            allow_network: false,
+            policy_profile: RuntimePolicyProfile::Product,
+        };
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let response = request_model(
+            &client,
+            &chat_completions_endpoint(&config.base_url),
+            &config,
+            &[json!({"role": "user", "content": "task"})],
+            true,
+            5,
+            MODEL_REQUEST_PROGRESS_ATTEMPTS,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["choices"][0]["message"]["content"], "recovered");
+        server.join().unwrap();
+        let requests = request_rx.into_iter().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 5);
+        assert!(requests.iter().all(|request| request
+            .to_ascii_lowercase()
+            .contains("accept-encoding: identity\r\n")));
     }
 
     #[tokio::test]
@@ -1700,6 +1849,7 @@ mod tests {
             &[json!({"role": "user", "content": "task"})],
             true,
             1,
+            MODEL_REQUEST_INITIAL_ATTEMPTS,
             None,
         )
         .await
@@ -1736,6 +1886,7 @@ mod tests {
             &[json!({"role": "user", "content": "task"})],
             true,
             5,
+            MODEL_REQUEST_INITIAL_ATTEMPTS,
             Some(Instant::now() - Duration::from_millis(1)),
         )
         .await
@@ -1751,6 +1902,10 @@ mod tests {
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) {
+        let _ = read_http_request_text(stream);
+    }
+
+    fn read_http_request_text(stream: &mut std::net::TcpStream) -> String {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 4096];
         loop {
@@ -1763,5 +1918,6 @@ mod tests {
                 break;
             }
         }
+        String::from_utf8_lossy(&request).into_owned()
     }
 }

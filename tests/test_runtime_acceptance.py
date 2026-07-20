@@ -101,6 +101,12 @@ class RuntimeAcceptanceTests(unittest.TestCase):
                         "id": "tool-1",
                         "command": "cat value.txt",
                         "timeout_sec": 10,
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 2,
+                            "total_tokens": 12,
+                            "model_requests": 2,
+                        },
                     }), flush=True)
                     result = json.loads(sys.stdin.readline())
                     assert result["id"] == "tool-1"
@@ -156,6 +162,7 @@ class RuntimeAcceptanceTests(unittest.TestCase):
             self.assertNotIn(secret, serialized)
             self.assertIn("cat value.txt", serialized)
             self.assertIn('"return_code": 0', serialized)
+            self.assertIn('"model_requests": 2', serialized)
 
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS workspace sandbox")
     def test_workspace_sandbox_denies_writes_outside_selected_directory(self) -> None:
@@ -214,6 +221,62 @@ class RuntimeAcceptanceTests(unittest.TestCase):
             self.assertFalse((root / "escaped.txt").exists())
             trajectory = (evidence_dir / "trajectory.jsonl").read_text(encoding="utf-8")
             self.assertIn("Operation not permitted", trajectory)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS workspace sandbox")
+    def test_runtime_failure_persists_latest_usage_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cwd = root / "project"
+            evidence_dir = root / "evidence"
+            cwd.mkdir()
+            sidecar = root / "fake-sidecar.py"
+            sidecar.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import json
+                    import sys
+
+                    json.loads(sys.stdin.readline())
+                    print(json.dumps({
+                        "type": "event",
+                        "name": "usage_snapshot",
+                        "usage": {
+                            "prompt_tokens": 200,
+                            "completion_tokens": 50,
+                            "total_tokens": 250,
+                            "model_requests": 3,
+                        },
+                    }), flush=True)
+                    print("provider response body truncated", file=sys.stderr, flush=True)
+                    raise SystemExit(1)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            sidecar.chmod(sidecar.stat().st_mode | stat.S_IXUSR)
+            contract = root / "execution_completion.md"
+            contract.write_text("shared acceptance contract\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "response body truncated"):
+                run_runtime_acceptance(
+                    instruction="Inspect the workspace.",
+                    cwd=cwd,
+                    evidence_dir=evidence_dir,
+                    sidecar_path=sidecar,
+                    config=RuntimeConfig("deepseek", "https://api.deepseek.com", "m", "k"),
+                    api_key="secret",
+                    contract_path=contract,
+                    screen_locked=True,
+                    max_steps=2,
+                    wall_time_budget_sec=30,
+                )
+
+            result = json.loads((evidence_dir / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["usage"]["model_requests"], 3)
+            self.assertEqual(result["usage"]["total_tokens"], 250)
+            self.assertEqual(result["failure"]["type"], "RuntimeError")
 
     def test_rejects_a_working_directory_that_is_not_a_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

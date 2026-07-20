@@ -389,6 +389,29 @@ def _write_evidence(
     )
 
 
+def _usage_snapshot(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        field: value[field]
+        for field in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "model_requests",
+        )
+        if type(value.get(field)) is int and value[field] >= 0
+    }
+
+
+def _latest_usage_snapshot(trajectory: list[dict[str, Any]]) -> dict[str, int]:
+    for item in reversed(trajectory):
+        usage = _usage_snapshot(item.get("usage"))
+        if usage:
+            return usage
+    return {}
+
+
 def run_runtime_acceptance(
     *,
     instruction: str,
@@ -462,6 +485,7 @@ def run_runtime_acceptance(
     ).start()
     trajectory: list[dict[str, Any]] = []
     finished: dict[str, Any] | None = None
+    protocol_error: BaseException | None = None
     deadline = started_monotonic + max(1, wall_time_budget_sec)
     try:
         process.stdin.write(json.dumps(start_message) + "\n")
@@ -496,6 +520,7 @@ def run_runtime_acceptance(
                         "id": request_id,
                         "command": command,
                         "timeout_sec": int(message.get("timeout_sec") or shell_timeout_sec),
+                        "usage": _usage_snapshot(message.get("usage")),
                     }
                 )
                 outcome = _execute_command(
@@ -515,9 +540,17 @@ def run_runtime_acceptance(
                 finished = message
                 break
             if message_type == "event":
-                trajectory.append(message)
+                trajectory.append(
+                    {
+                        "type": "event",
+                        "name": str(message.get("name") or ""),
+                        "usage": _usage_snapshot(message.get("usage")),
+                    }
+                )
                 continue
             raise RuntimeError(f"Agent runtime returned unknown message type: {message_type}")
+    except BaseException as exc:
+        protocol_error = exc
     finally:
         if process.stdin and not process.stdin.closed:
             process.stdin.close()
@@ -532,9 +565,47 @@ def run_runtime_acceptance(
         process.stderr.close()
         shutil.rmtree(runtime_root, ignore_errors=True)
 
+    if protocol_error is not None:
+        result = {
+            "status": "failed",
+            "proof_tier": "agent-runtime-no-gui",
+            "screen_locked": screen_locked,
+            "screen_locked_at_start": screen_locked,
+            "screen_locked_at_end": detect_macos_screen_locked(),
+            "provider": config.endpoint_id,
+            "model": config.model,
+            "working_directory": str(cwd),
+            "instruction_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+            "execution_contract_sha256": contract_sha,
+            "usage": _latest_usage_snapshot(trajectory),
+            "tool_calls": sum(item.get("type") == "tool_request" for item in trajectory),
+            "started_at": started_at,
+            "duration_ms": int((time.monotonic() - started_monotonic) * 1000),
+            "failure": {
+                "type": type(protocol_error).__name__,
+                "detail": _truncate(str(protocol_error), 2000),
+            },
+            "gui_status": "not_evaluated",
+            "workspace_write_isolation": "macos-sandbox-exec",
+            "host": {"os": platform.system(), "arch": platform.machine()},
+        }
+        _write_evidence(evidence_dir, trajectory, result, secrets=(api_key,))
+        raise protocol_error
+
     if process.returncode != 0:
         detail = _truncate("".join(stderr_chunks), 2000).strip()
-        raise RuntimeError(f"Agent runtime exited with {process.returncode}: {detail}")
+        error = RuntimeError(f"Agent runtime exited with {process.returncode}: {detail}")
+        result = {
+            "status": "failed",
+            "proof_tier": "agent-runtime-no-gui",
+            "provider": config.endpoint_id,
+            "model": config.model,
+            "usage": _latest_usage_snapshot(trajectory),
+            "tool_calls": sum(item.get("type") == "tool_request" for item in trajectory),
+            "failure": {"type": type(error).__name__, "detail": str(error)},
+        }
+        _write_evidence(evidence_dir, trajectory, result, secrets=(api_key,))
+        raise error
     assert finished is not None
     if finished.get("execution_contract_sha256") != contract_sha:
         raise RuntimeError("Agent runtime execution contract hash mismatch")
