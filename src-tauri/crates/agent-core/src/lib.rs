@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use url::Url;
 
@@ -505,7 +505,8 @@ pub fn effective_command_timeout_sec(command: &str, requested: u64, maximum: u64
 }
 
 pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
-    let lower = command.to_ascii_lowercase();
+    let shell_command = shell_control_text(command);
+    let lower = shell_command.to_ascii_lowercase();
     let starts_background_service = contains_any(
         &lower,
         &[
@@ -529,7 +530,7 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
         return ToolKind::Mutation;
     }
     let single_command_version_check = !contains_any(&lower, &["&&", ";", "\n"])
-        && (lower.contains("--version") || command.contains(" -V"))
+        && (lower.contains("--version") || shell_command.contains(" -V"))
         && first_command_word(&lower).is_some_and(|word| {
             matches!(
                 word,
@@ -670,6 +671,256 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
         return ToolKind::RuntimeProbe;
     }
     ToolKind::ReadOnly
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeredocDelimiter {
+    value: String,
+    strip_tabs: bool,
+    suppress_expansion: bool,
+}
+
+fn shell_control_text(command: &str) -> String {
+    let mut control = String::with_capacity(command.len());
+    let mut pending = VecDeque::<HeredocDelimiter>::new();
+    let raw_lines = command.split_inclusive('\n').collect::<Vec<_>>();
+
+    for (line_index, raw_line) in raw_lines.iter().copied().enumerate() {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(delimiter) = pending.front() {
+            let candidate = if delimiter.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if candidate == delimiter.value {
+                pending.pop_front();
+            }
+            continue;
+        }
+
+        let prior_control_len = control.len();
+        control.push_str(raw_line);
+        let Some(delimiters) = heredoc_delimiters(line) else {
+            return "malformed-heredoc &".to_owned();
+        };
+        if is_literal_data_heredoc(line, &control[..prior_control_len], &delimiters)
+            && heredoc_sequence_closes(&raw_lines, line_index + 1, &delimiters)
+        {
+            pending.extend(delimiters);
+        }
+    }
+
+    control
+}
+
+fn heredoc_delimiters(line: &str) -> Option<Vec<HeredocDelimiter>> {
+    let bytes = line.as_bytes();
+    let mut delimiters = Vec::new();
+    let mut index = 0;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if byte == b'\\' && !single_quoted {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' && !double_quoted {
+            single_quoted = !single_quoted;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !single_quoted {
+            double_quoted = !double_quoted;
+            index += 1;
+            continue;
+        }
+        if single_quoted || double_quoted {
+            index += 1;
+            continue;
+        }
+        if byte == b'#'
+            && (index == 0
+                || bytes[index - 1].is_ascii_whitespace()
+                || matches!(bytes[index - 1], b';' | b'|' | b'&' | b'(' | b')'))
+        {
+            break;
+        }
+        if byte != b'<'
+            || bytes.get(index + 1) != Some(&b'<')
+            || bytes.get(index + 2) == Some(&b'<')
+            || index
+                .checked_sub(1)
+                .is_some_and(|previous| bytes[previous] == b'<')
+        {
+            index += 1;
+            continue;
+        }
+
+        let mut cursor = index + 2;
+        let strip_tabs = bytes.get(cursor) == Some(&b'-');
+        if strip_tabs {
+            cursor += 1;
+        }
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            break;
+        }
+
+        let quote = match bytes[cursor] {
+            b'\'' | b'"' => Some(bytes[cursor]),
+            _ => None,
+        };
+        let mut suppress_expansion = quote.is_some();
+        if quote.is_some() {
+            cursor += 1;
+        }
+        let start = cursor;
+        let mut value = String::new();
+        if let Some(quote) = quote {
+            while bytes.get(cursor).is_some_and(|byte| *byte != quote) {
+                cursor += 1;
+            }
+            if bytes.get(cursor) != Some(&quote) {
+                return None;
+            }
+            value.push_str(&line[start..cursor]);
+        } else {
+            while bytes.get(cursor).is_some_and(|byte| {
+                !byte.is_ascii_whitespace()
+                    && !matches!(byte, b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>')
+            }) {
+                if bytes[cursor] == b'\\' && bytes.get(cursor + 1).is_some() {
+                    suppress_expansion = true;
+                    cursor += 1;
+                }
+                value.push(bytes[cursor] as char);
+                cursor += 1;
+            }
+        }
+        if !value.is_empty() {
+            delimiters.push(HeredocDelimiter {
+                value,
+                strip_tabs,
+                suppress_expansion,
+            });
+        }
+        index = cursor.saturating_add(usize::from(quote.is_some()));
+    }
+
+    Some(delimiters)
+}
+
+fn is_literal_data_heredoc(
+    line: &str,
+    prior_control: &str,
+    delimiters: &[HeredocDelimiter],
+) -> bool {
+    if delimiters.is_empty()
+        || delimiters
+            .iter()
+            .any(|delimiter| !delimiter.suppress_expansion)
+        || line.contains('|')
+        || line.contains(">(")
+        || line.contains("<(")
+    {
+        return false;
+    }
+
+    let Some(heredoc_start) = line.find("<<") else {
+        return false;
+    };
+    let prefix = &line[..heredoc_start];
+    let lower_prefix = prefix.to_ascii_lowercase();
+    if contains_any(
+        &lower_prefix,
+        &[
+            "alias cat=",
+            "alias tee=",
+            "function cat",
+            "function tee",
+            "cat()",
+            "cat ()",
+            "tee()",
+            "tee ()",
+        ],
+    ) {
+        return false;
+    }
+    let segment = prefix
+        .rsplit_once("&&")
+        .map_or(prefix, |(_, segment)| segment);
+    let segment = segment
+        .rsplit_once(';')
+        .map_or(segment, |(_, segment)| segment)
+        .trim();
+    let command = segment.split_whitespace().next().unwrap_or("");
+    matches!(
+        command,
+        "cat" | "/bin/cat" | "/usr/bin/cat" | "tee" | "/bin/tee" | "/usr/bin/tee"
+    ) && !control_redefines_data_command(prior_control, command)
+        && !control_redefines_data_command(prefix, command)
+}
+
+fn control_redefines_data_command(control: &str, command: &str) -> bool {
+    if command.contains('/') {
+        return false;
+    }
+
+    let function_compact = format!("{command}()");
+    let function_spaced = format!("{command} ()");
+    let function_keyword = format!("function {command}");
+    let alias = format!("alias {command}=");
+    let lower = control.to_ascii_lowercase();
+    lower.contains(&function_compact)
+        || lower.contains(&function_spaced)
+        || lower.contains(&function_keyword)
+        || lower.contains(&alias)
+        || lower.contains("path=")
+        || lower.contains("hash -p ")
+}
+
+fn heredoc_sequence_closes(
+    raw_lines: &[&str],
+    mut line_index: usize,
+    delimiters: &[HeredocDelimiter],
+) -> bool {
+    for delimiter in delimiters {
+        let mut found = false;
+        while let Some(raw_line) = raw_lines.get(line_index) {
+            line_index += 1;
+            let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let candidate = if delimiter.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if candidate == delimiter.value {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
 }
 
 fn has_unquoted_background_operator(command: &str) -> bool {
@@ -1073,6 +1324,10 @@ pub struct CompletionEvidence {
     pub last_project_test_sequence: Option<u64>,
     pub last_successful_project_test_sequence: Option<u64>,
     pub missing_test_runner: Option<String>,
+    #[serde(default)]
+    pub required_observable_states: Vec<String>,
+    #[serde(default)]
+    pub observed_observable_states: Vec<String>,
     pub completed: bool,
     pub blockers: Vec<String>,
 }
@@ -1340,6 +1595,8 @@ pub struct CompletionGate {
     last_project_test_sequence: Option<u64>,
     last_successful_project_test_sequence: Option<u64>,
     missing_test_runner: Option<String>,
+    required_observable_states: BTreeSet<String>,
+    observed_observable_states: BTreeMap<String, u64>,
 }
 
 impl Default for CompletionGate {
@@ -1430,6 +1687,7 @@ impl CompletionGate {
             project_tests_required,
         );
         gate.source_change_required = source_change_required;
+        gate.required_observable_states = extract_expected_state_markers(instruction);
         gate
     }
 
@@ -1465,6 +1723,8 @@ impl CompletionGate {
             last_project_test_sequence: None,
             last_successful_project_test_sequence: None,
             missing_test_runner: None,
+            required_observable_states: BTreeSet::new(),
+            observed_observable_states: BTreeMap::new(),
         }
     }
 
@@ -1573,6 +1833,20 @@ impl CompletionGate {
                 self.last_successful_verification_sequence = Some(outcome.sequence);
             }
         }
+        if outcome.succeeded() {
+            let observed = format!("{}\n{}", outcome.stdout, outcome.stderr);
+            if matches!(
+                outcome.kind,
+                ToolKind::RuntimeProbe | ToolKind::FunctionalProbe { bounded: true }
+            ) {
+                for state in &self.required_observable_states {
+                    if contains_observable_state(&observed, state) {
+                        self.observed_observable_states
+                            .insert(state.clone(), outcome.sequence);
+                    }
+                }
+            }
+        }
         // A failed read (grep with no matches, or output that merely contains
         // an "error:"-looking string) changes no workspace state and must not
         // force delivery-grade verification before a final answer — that is
@@ -1611,6 +1885,26 @@ impl CompletionGate {
                     blockers.push("at least one successful verification is required".to_owned())
                 }
             }
+        }
+
+        let observable_floor =
+            verification_floor.max(self.last_service_start_sequence.unwrap_or(0));
+        let missing_observable_states = self
+            .required_observable_states
+            .iter()
+            .filter(|state| {
+                !self
+                    .observed_observable_states
+                    .get(*state)
+                    .is_some_and(|sequence| *sequence > observable_floor)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_observable_states.is_empty() {
+            blockers.push(format!(
+                "a successful post-change runtime or bounded functional probe must observe each explicitly requested user-visible state: {}",
+                missing_observable_states.join(", ")
+            ));
         }
 
         if let Some(service_sequence) = self.last_service_start_sequence {
@@ -1735,10 +2029,191 @@ impl CompletionGate {
             last_project_test_sequence: self.last_project_test_sequence,
             last_successful_project_test_sequence: self.last_successful_project_test_sequence,
             missing_test_runner: self.missing_test_runner.clone(),
+            required_observable_states: self.required_observable_states.iter().cloned().collect(),
+            observed_observable_states: self
+                .required_observable_states
+                .iter()
+                .filter(|state| {
+                    self.observed_observable_states
+                        .get(*state)
+                        .is_some_and(|sequence| *sequence > observable_floor)
+                })
+                .cloned()
+                .collect(),
             completed: blockers.is_empty(),
             blockers,
         }
     }
+}
+
+fn extract_expected_state_markers(instruction: &str) -> BTreeSet<String> {
+    let lower = instruction.to_lowercase();
+    let mut markers = BTreeSet::new();
+    for anchor in ["expect to see", "wait until"] {
+        let mut remainder = lower.as_str();
+        while let Some(position) = remainder.find(anchor) {
+            let clause_prefix = remainder[..position]
+                .rsplit(['.', ';', '\n'])
+                .next()
+                .unwrap_or("");
+            let prefix_words = semantic_words(clause_prefix);
+            if prefix_words
+                .iter()
+                .rev()
+                .take(4)
+                .any(|word| is_state_negation(word))
+            {
+                remainder = &remainder[position + anchor.len()..];
+                continue;
+            }
+            let expected = &remainder[position + anchor.len()..];
+            let expected = expected.split(['.', ';', '\n']).next().unwrap_or(expected);
+            let tokens = semantic_words(expected);
+            let mut content = Vec::new();
+            let mut stopped_at_display_noun = false;
+            for token in tokens.iter().map(String::as_str) {
+                if matches!(token, "screen" | "page" | "prompt" | "message") && !content.is_empty()
+                {
+                    stopped_at_display_noun = true;
+                    break;
+                }
+                if matches!(
+                    token,
+                    "the" | "a" | "an" | "is" | "visible" | "appears" | "shown" | "this" | "that"
+                ) || token.len() < 4
+                {
+                    continue;
+                }
+                content.push(token);
+            }
+            let marker = if stopped_at_display_noun || content.len() == 1 {
+                content.last().copied()
+            } else {
+                content
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|token| matches!(*token, "ready" | "healthy" | "success"))
+            };
+            if let Some(marker) = marker {
+                let negated = expected.find(marker).is_some_and(|start| {
+                    observable_state_is_negated(expected, start, start + marker.len())
+                });
+                if !negated {
+                    markers.insert(marker.to_owned());
+                }
+            }
+            remainder = &remainder[position + anchor.len() + expected.len()..];
+        }
+    }
+    markers
+}
+
+fn semantic_words(text: &str) -> Vec<String> {
+    text.split(|character: char| {
+        !(character.is_alphanumeric() || matches!(character, '_' | '-' | '\'' | '’'))
+    })
+    .filter(|word| !word.is_empty())
+    .map(|word| word.replace('’', "'"))
+    .collect()
+}
+
+fn contains_observable_state(output: &str, state: &str) -> bool {
+    let lower = output.to_lowercase();
+    lower.match_indices(state).any(|(start, _)| {
+        let before = lower[..start].chars().next_back();
+        if before.is_some_and(is_observable_state_character) {
+            return false;
+        }
+        let suffix = &lower[start + state.len()..];
+        !suffix
+            .chars()
+            .next()
+            .is_some_and(is_observable_state_character)
+            && !observable_state_is_negated(&lower, start, start + state.len())
+    })
+}
+
+fn observable_state_is_negated(output: &str, start: usize, end: usize) -> bool {
+    let clause_start = output[..start]
+        .rfind(['.', ';', ',', '\n'])
+        .map_or(0, |position| position + 1);
+    let clause_end = output[end..]
+        .find(['.', ';', ',', '\n'])
+        .map_or(output.len(), |position| end + position);
+    let before = semantic_words(&output[clause_start..start]);
+    let after = semantic_words(&output[end..clause_end]);
+
+    has_effective_state_negation(before.iter().chain(&after).map(String::as_str))
+}
+
+fn has_effective_state_negation<'a>(words: impl Iterator<Item = &'a str>) -> bool {
+    let words = words.collect::<Vec<_>>();
+    let mut index = 0;
+    while index < words.len() {
+        let word = words[index];
+        if matches!(word, "no" | "without")
+            && words
+                .get(index + 1)
+                .is_some_and(|next| is_guardrail_result_word(next))
+        {
+            index += 2;
+            continue;
+        }
+        if is_state_negation(word) || is_negative_state_word(word) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+fn is_state_negation(word: &str) -> bool {
+    matches!(
+        word,
+        "no" | "not"
+            | "never"
+            | "without"
+            | "missing"
+            | "absent"
+            | "unavailable"
+            | "fail"
+            | "failed"
+            | "failure"
+            | "cannot"
+            | "can't"
+            | "didn't"
+    ) || word.ends_with("n't")
+}
+
+fn is_negative_state_word(word: &str) -> bool {
+    matches!(
+        word,
+        "gone"
+            | "hidden"
+            | "removed"
+            | "closed"
+            | "stopped"
+            | "down"
+            | "offline"
+            | "disappear"
+            | "disappears"
+            | "disappeared"
+            | "vanish"
+            | "vanishes"
+            | "vanished"
+    )
+}
+
+fn is_guardrail_result_word(word: &str) -> bool {
+    matches!(
+        word,
+        "error" | "errors" | "failure" | "failures" | "warning" | "warnings" | "issue" | "issues"
+    )
+}
+
+fn is_observable_state_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '-' | '_')
 }
 
 const SOURCE_INPUT_EXTENSIONS: &[&str] = &[
@@ -1875,7 +2350,7 @@ fn has_source_content_mutation(command: &str) -> bool {
             "git apply",
         ],
     ) || (contains_any(command, &["printf ", "echo "])
-        && has_non_transient_output_redirect(command))
+        && has_non_transient_output_redirect(&shell_control_text(command)))
 }
 
 fn command_mentions_source_input(command: &str) -> bool {
@@ -2876,6 +3351,88 @@ mod tests {
     }
 
     #[test]
+    fn heredoc_source_body_does_not_start_a_background_service() {
+        let command = concat!(
+            "cat > encode.c <<'EOF'\n",
+            "int encode(int *value) {\n",
+            "    int *pointer = &value[0];\n",
+            "    return *pointer > 0;\n",
+            "}\n",
+            "EOF\n",
+            "gcc -c encode.c 2>&1\n",
+        );
+
+        assert_eq!(classify_command(command, 30_000), ToolKind::Mutation);
+    }
+
+    #[test]
+    fn heredoc_payload_is_ignored_but_following_shell_backgrounding_is_preserved() {
+        let source_only = concat!(
+            "cat > worker.c <<-'EOF'\n",
+            "\t// nohup ./fake & curl http://invalid > fake.log\n",
+            "\tint *pointer = &value;\n",
+            "\tEOF\n",
+            "gcc -c worker.c\n",
+        );
+        assert_eq!(classify_command(source_only, 30_000), ToolKind::Mutation);
+
+        let real_background = concat!(
+            "cat > worker.c <<'EOF'\n",
+            "int *pointer = &value;\n",
+            "EOF\n",
+            "./worker > worker.log 2>&1 &\n",
+        );
+        assert_eq!(
+            classify_command(real_background, 30_000),
+            ToolKind::BackgroundServiceStart
+        );
+    }
+
+    #[test]
+    fn executable_or_unclosed_heredocs_are_scanned_conservatively() {
+        for command in [
+            "bash <<'EOF'\n./server > server.log 2>&1 &\nEOF\n",
+            "cat > source.c <<EOF\n$(./generator > generator.log 2>&1 &)\nEOF\n",
+            "cat > source.c <<'EOF'\nint *pointer = &value;\n./server &\n",
+            "cat > source.c <<'EOF\n./server > server.log 2>&1 &\nEOF\n",
+            "tee >(bash) <<'EOF'\n./server > server.log 2>&1 &\nEOF\n",
+            "cat <<'EOF' > >(bash)\n./server > server.log 2>&1 &\nEOF\n",
+        ] {
+            assert_eq!(
+                classify_command(command, 30_000),
+                ToolKind::BackgroundServiceStart,
+                "{command}"
+            );
+        }
+
+        assert_ne!(
+            classify_command("value=$((1 << 2)); printf '%s\\n' \"$value\"", 30_000),
+            ToolKind::BackgroundServiceStart
+        );
+    }
+
+    #[test]
+    fn custom_or_redefined_data_commands_do_not_hide_executable_heredocs() {
+        for command in [
+            "./cat <<'EOF'\n./server > server.log 2>&1 &\nEOF\n",
+            "/tmp/tee output.txt <<'EOF'\n./server > server.log 2>&1 &\nEOF\n",
+            "alias cat=bash; cat <<'EOF'\n./server > server.log 2>&1 &\nEOF\n",
+            "cat() { bash; }; cat <<'EOF'\n./server > server.log 2>&1 &\nEOF\n",
+            "cat() { bash; }\ncat <<'EOF'\n./server > server.log 2>&1 &\nEOF\n",
+            "alias tee=bash\ntee output.txt <<'EOF'\n./server > server.log 2>&1 &\nEOF\n",
+            "PATH=./bin:$PATH\ncat <<'EOF'\n./server > server.log 2>&1 &\nEOF\n",
+            "PATH=./bin:$PATH; cat <<'EOF'\n./server > server.log 2>&1 &\nEOF\n",
+            ":; cat() { bash; }\ncat <<'EOF'\n./server > server.log 2>&1 &\nEOF\n",
+        ] {
+            assert_eq!(
+                classify_command(command, 30_000),
+                ToolKind::BackgroundServiceStart,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn test_named_output_file_is_not_misclassified_as_a_test_command() {
         assert_eq!(
             classify_command(
@@ -2901,6 +3458,139 @@ mod tests {
         assert!(!gate.evidence().completed);
         gate.record(&outcome(3, ToolKind::Verification, 0));
         assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn explicit_user_visible_state_requires_semantic_probe_output() {
+        let instruction = concat!(
+            "Start the image so I can connect via telnet 127.0.0.1 6665. ",
+            "When I run telnet I will expect to see the login prompt; I'll log in. ",
+            "Start it in the background and block until it is ready."
+        );
+        let mut gate = CompletionGate::new_for_instruction(true, instruction);
+        assert_eq!(
+            gate.evidence().required_observable_states,
+            vec!["login".to_owned()]
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+
+        let mut connected = outcome(2, ToolKind::FunctionalProbe { bounded: true }, 0);
+        connected.stdout = "Connected to 127.0.0.1. Escape character is '^]'.".to_owned();
+        gate.record(&connected);
+        assert!(!gate.evidence().completed);
+
+        let mut login = outcome(3, ToolKind::FunctionalProbe { bounded: true }, 0);
+        login.stdout = "Welcome to Alpine Linux\nlocalhost login:".to_owned();
+        gate.record(&login);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn negated_probe_output_does_not_observe_the_requested_state() {
+        for output in [
+            "Connected, but no login prompt observed",
+            "login unavailable",
+            "not ready",
+            "failed to display login",
+            "can't find login prompt",
+            "didn't display login prompt",
+            "login prompt is ready but not visible",
+            "probe failed after three retries to display login prompt",
+        ] {
+            let mut gate = CompletionGate::new_for_instruction(
+                true,
+                "Start the console and wait until the login prompt is visible.",
+            );
+            gate.record(&outcome(1, ToolKind::Mutation, 0));
+            let mut probe = outcome(2, ToolKind::FunctionalProbe { bounded: true }, 0);
+            probe.stdout = output.to_owned();
+            gate.record(&probe);
+
+            assert!(!gate.evidence().completed, "{output}");
+        }
+    }
+
+    #[test]
+    fn affirmative_state_output_is_not_blocked_by_unrelated_negative_guardrails() {
+        for output in [
+            "login prompt is ready and no errors were reported",
+            "login prompt ready without errors",
+        ] {
+            let mut gate = CompletionGate::new_for_instruction(
+                true,
+                "Start the console and wait until the login prompt is visible.",
+            );
+            gate.record(&outcome(1, ToolKind::Mutation, 0));
+            let mut probe = outcome(2, ToolKind::FunctionalProbe { bounded: true }, 0);
+            probe.stdout = output.to_owned();
+            gate.record(&probe);
+
+            assert!(gate.evidence().completed, "{output}");
+        }
+    }
+
+    #[test]
+    fn state_extraction_is_limited_to_affirmative_expect_or_wait_language() {
+        for instruction in [
+            "The current output contains error; fix the service.",
+            "The response contains failure before the repair.",
+            "I do not expect to see an error after the repair.",
+            "The service should show the current error while diagnosing it.",
+            "Wait until no login prompt remains.",
+            "Wait until the login prompt is no longer visible.",
+            "Wait until the login prompt disappears.",
+            "Wait until the login prompt is gone.",
+        ] {
+            assert!(
+                CompletionGate::new_for_instruction(false, instruction)
+                    .evidence()
+                    .required_observable_states
+                    .is_empty(),
+                "{instruction}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_text_does_not_satisfy_a_requested_user_visible_state() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Start the console and wait until the login prompt is visible.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut source_text = outcome(2, ToolKind::ReadOnly, 0);
+        source_text.stdout = "documentation: login prompt".to_owned();
+        gate.record(&source_text);
+        gate.record(&outcome(3, ToolKind::Verification, 0));
+
+        assert!(!gate.evidence().completed);
+    }
+
+    #[test]
+    fn verification_test_names_do_not_satisfy_a_runtime_visible_state() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Start the console and wait until the login prompt is visible.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut tests = outcome(2, ToolKind::Verification, 0);
+        tests.stdout = "login PASSED".to_owned();
+        gate.record(&tests);
+
+        assert!(!gate.evidence().completed);
+    }
+
+    #[test]
+    fn expected_prompt_marker_survives_following_probe_wording() {
+        let gate = CompletionGate::new_for_instruction(
+            true,
+            "I expect to see the login prompt through a bounded client probe.",
+        );
+
+        assert_eq!(
+            gate.evidence().required_observable_states,
+            vec!["login".to_owned()]
+        );
     }
 
     #[test]
