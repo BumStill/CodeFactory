@@ -2,7 +2,7 @@
 
 - Req ID: `CF-TB-R46`
 - 日期: `2026-07-21`
-- 状态: candidate verified, not live
+- 状态: live in public `v1.51.5`; released-build canary complete
 - Proof tier: `agent-runtime-no-gui`
 - 基线版本: public `v1.51.4` / `87409c1`
 - candidate headless SHA-256: `913859dd57d99497b65320d2883502ea908b4f31196aab58f302fc4c26e5b997`
@@ -79,8 +79,23 @@ tool request 保存 usage 会漏掉成功的无工具响应。两项均已补齐
 审查同时指出“5 次重试”与“5 次总尝试”的歧义，规格已明确为含首发 5 次总尝试；Anthropic
 直连路径也已接入共享 helper。
 
+## 发布与同题复评
+
+- PR: `#134`
+- merge: `1d4d30243dbffda54c3fd63d24ea91972cdf271a`
+- release: public `v1.51.5` / `4432cbc88cc17c9498729c1c37514f31c3a0cc5a`
+- Auto Release: `29779036673`
+- Release workflow: `29779054193`
+- public DMG SHA-256: `f34202ccd6431123d290aef6bc7fe21f85244faac65a08015c42e447909da0c8`
+- public Windows setup SHA-256: `173d5498a7a9ebd8928b21151e20d2dede32c6f53cc69e9d6c38467868a25a6a`
+
+同一 `circuit-fibsqrt` canary 从 `v1.51.4` 的 response-body fatal、verifier 未运行和伪 `0`
+usage，推进为 `v1.51.5` 的完整 verifier 结果：run
+`76c78caa-ccc6-4174-9440-5e7f345afba0`，`21` 次成功模型响应、`200,687` tokens、
+`21` 个外部工具调用，reward `0` / failure class `verification`。这证明 R46 修复已在发布产物中
+生效，但没有产生分数提升。任务失败转为 Agent 长任务收敛问题，并据此进入 CF-TB-R47。
+
 ## 结论边界
 
-R46 candidate 已通过本地产品路径验证，但当前尚未合并、尚未发布，因此是 `not live`。
-发布后必须用同一 released build 重跑相同 `circuit-fibsqrt` canary；该验收不能替代
-Terminal-Bench reward，也不能提高当前有效固定 18 题 `6 / 18` 基线。
+R46 已产品化并完成 released-build 复评；它恢复了真实执行和用量证据，没有提高当前有效固定
+18 题 `6 / 18` 基线。单题 watchdog canary 明确 `official_comparable: no`，不能用于总体得分。
