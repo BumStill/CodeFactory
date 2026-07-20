@@ -292,13 +292,39 @@ where
             Err(error) => return Err(error),
         };
         usage.add_response(&response);
-        let message = response["choices"]
+        let message = match response["choices"]
             .get(0)
             .and_then(|choice| choice.get("message"))
             .cloned()
-            .ok_or(HeadlessError::MissingChoice)?;
+        {
+            Some(message) => message,
+            None => {
+                write_output(
+                    output,
+                    &OutputMessage::UsageSnapshot {
+                        name: "usage_snapshot".to_owned(),
+                        usage: usage.clone(),
+                    },
+                )
+                .await?;
+                return Err(HeadlessError::MissingChoice);
+            }
+        };
         let final_text = message_content(&message);
-        let mut tool_calls = parse_tool_calls(&message, config.shell_timeout_sec)?;
+        let mut tool_calls = match parse_tool_calls(&message, config.shell_timeout_sec) {
+            Ok(tool_calls) => tool_calls,
+            Err(error) => {
+                write_output(
+                    output,
+                    &OutputMessage::UsageSnapshot {
+                        name: "usage_snapshot".to_owned(),
+                        usage: usage.clone(),
+                    },
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         if finalization_response {
             finalization_pending = false;
             tool_calls.clear();
@@ -343,9 +369,9 @@ where
         finalization_pending = false;
         messages.push(message);
         let mut progress_prompt = None;
+        let mut emitted_tool_request = false;
         let remaining = max_steps.saturating_sub(step_index + 1);
         for tool_call in tool_calls {
-            sequence += 1;
             let started_at_ms = unix_time_ms();
             let wall_time = remaining_wall_time(execution_started, config.wall_time_budget_sec);
             let effective_tool_timeout_sec = wall_time
@@ -383,6 +409,7 @@ where
             let (return_code, stdout, stderr, error, next_working_directory) = match policy_decision
             {
                 PolicyDecision::Allow => {
+                    sequence += 1;
                     write_output(
                         output,
                         &OutputMessage::ToolRequest {
@@ -393,6 +420,7 @@ where
                         },
                     )
                     .await?;
+                    emitted_tool_request = true;
                     read_tool_result(input, &tool_call.id).await?
                 }
                 PolicyDecision::Deny { rule, reason } => (
@@ -419,7 +447,6 @@ where
                 semantic_failure: false,
             }
             .with_detected_semantic_failure();
-            gate.record(&outcome);
             if let Some(next_working_directory) = next_working_directory
                 .as_deref()
                 .map(str::trim)
@@ -431,6 +458,7 @@ where
                 .as_deref()
                 .is_some_and(|message| message.starts_with("policy denied command"));
             if !policy_denied {
+                gate.record(&outcome);
                 if let Some(prompt) = progress_tracker.record(&outcome) {
                     progress_prompt = Some(prompt);
                 }
@@ -448,6 +476,16 @@ where
                 "tool_call_id": tool_call.id,
                 "content": tool_result_content(return_code, &stdout, &stderr, error.as_deref()),
             }));
+        }
+        if !emitted_tool_request {
+            write_output(
+                output,
+                &OutputMessage::UsageSnapshot {
+                    name: "usage_snapshot".to_owned(),
+                    usage: usage.clone(),
+                },
+            )
+            .await?;
         }
         if let Some(prompt) = progress_prompt {
             messages.push(json!({"role": "user", "content": prompt}));
@@ -1373,28 +1411,31 @@ mod tests {
         )
         .await;
 
-        for (id, stdout) in [("mutation-1", ""), ("runtime-1", "0\n")] {
-            let request = read_test_output(&mut output).await;
-            assert_eq!(request["type"], "tool_request");
-            assert_eq!(request["id"], id);
-            write_test_line(
-                &mut input,
-                &json!({
-                    "type": "tool_result",
-                    "id": id,
-                    "return_code": 0,
-                    "stdout": stdout,
-                    "stderr": "",
-                    "error": null
-                }),
-            )
-            .await;
-        }
+        let mutation = read_test_output(&mut output).await;
+        assert_eq!(mutation["type"], "tool_request");
+        assert_eq!(mutation["id"], "mutation-1");
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "tool_result",
+                "id": "mutation-1",
+                "return_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "error": null
+            }),
+        )
+        .await;
 
         let usage_snapshot = read_test_output(&mut output).await;
         assert_eq!(usage_snapshot["type"], "event");
         assert_eq!(usage_snapshot["name"], "usage_snapshot");
-        assert_eq!(usage_snapshot["usage"]["model_requests"], 3);
+        assert_eq!(usage_snapshot["usage"]["model_requests"], 2);
+
+        let recovery_snapshot = read_test_output(&mut output).await;
+        assert_eq!(recovery_snapshot["type"], "event");
+        assert_eq!(recovery_snapshot["name"], "usage_snapshot");
+        assert_eq!(recovery_snapshot["usage"]["model_requests"], 3);
 
         let assertion = read_test_output(&mut output).await;
         assert_eq!(assertion["type"], "tool_request");
@@ -1421,18 +1462,182 @@ mod tests {
         );
         assert_eq!(
             finished["completion_evidence"]["last_machine_checked_verification_sequence"],
-            3
+            2
         );
+        assert_eq!(finished["completion_evidence"]["outcome_count"], 2);
 
         runner.await.unwrap().unwrap();
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 5);
+        let denied_runtime = requests[2]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["tool_call_id"] == "runtime-1")
+            .unwrap();
+        assert!(denied_runtime["content"]
+            .as_str()
+            .unwrap()
+            .contains("machine-checked verification"));
         let recovery_messages = requests[3]["messages"].as_array().unwrap();
         assert!(recovery_messages.iter().any(|message| {
             message["content"]
                 .as_str()
                 .is_some_and(|content| content.contains("machine-checked assertion"))
         }));
+    }
+
+    #[tokio::test]
+    async fn denied_attempt_does_not_desynchronize_the_fix_verification_loop() {
+        let (base_url, server) = fake_openai_server(vec![
+            fake_tool_response("mutation-1", "printf fixed > result.txt"),
+            fake_tool_response("mutation-denied-1", "printf idea-2 > result.txt"),
+            fake_tool_response("assert-failed", "actual=$(./tool 6); test \"$actual\" = 42"),
+            fake_tool_response("repair-1", "printf repaired > result.txt"),
+            fake_tool_response("mutation-denied-2", "printf idea-3 > result.txt"),
+            fake_tool_response("assert-passed", "actual=$(./tool 6); test \"$actual\" = 42"),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Repaired and verified."}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+        ]);
+
+        let (test_input, run_input) = tokio::io::duplex(32 * 1024);
+        let (run_output, test_output) = tokio::io::duplex(32 * 1024);
+        let runner = tokio::spawn(async move {
+            let mut input = BufReader::new(run_input);
+            let mut output = run_output;
+            run(&mut input, &mut output).await
+        });
+        let mut input = test_input;
+        let mut output = BufReader::new(test_output);
+
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "start",
+                "instruction": "Repair the CLI. Running ./tool 6 should output 42.",
+                "model": "fake-model",
+                "api_key": "test-key",
+                "base_url": base_url,
+                "max_steps": 10,
+                "model_timeout_sec": 5,
+                "shell_timeout_sec": 60,
+                "allow_network": false,
+                "policy_profile": "product",
+                "execution_contract_sha256": execution_contract_sha256()
+            }),
+        )
+        .await;
+
+        let mutation = read_test_output(&mut output).await;
+        assert_eq!(mutation["id"], "mutation-1");
+        write_test_line(
+            &mut input,
+            &json!({"type": "tool_result", "id": "mutation-1", "return_code": 0, "stdout": "", "stderr": "", "error": null}),
+        )
+        .await;
+
+        let first_denial_snapshot = read_test_output(&mut output).await;
+        assert_eq!(first_denial_snapshot["type"], "event");
+        assert_eq!(first_denial_snapshot["usage"]["model_requests"], 2);
+
+        let failed_assertion = read_test_output(&mut output).await;
+        assert_eq!(failed_assertion["id"], "assert-failed");
+        write_test_line(
+            &mut input,
+            &json!({"type": "tool_result", "id": "assert-failed", "return_code": 1, "stdout": "", "stderr": "mismatch", "error": null}),
+        )
+        .await;
+
+        let repair = read_test_output(&mut output).await;
+        assert_eq!(repair["id"], "repair-1");
+        write_test_line(
+            &mut input,
+            &json!({"type": "tool_result", "id": "repair-1", "return_code": 0, "stdout": "", "stderr": "", "error": null}),
+        )
+        .await;
+
+        let second_denial_snapshot = read_test_output(&mut output).await;
+        assert_eq!(second_denial_snapshot["type"], "event");
+        assert_eq!(second_denial_snapshot["usage"]["model_requests"], 5);
+
+        let passed_assertion = read_test_output(&mut output).await;
+        assert_eq!(passed_assertion["id"], "assert-passed");
+        write_test_line(
+            &mut input,
+            &json!({"type": "tool_result", "id": "assert-passed", "return_code": 0, "stdout": "", "stderr": "", "error": null}),
+        )
+        .await;
+
+        let finished = read_test_output(&mut output).await;
+        assert_eq!(finished["type"], "finished");
+        assert_eq!(finished["completion_evidence"]["outcome_count"], 4);
+        assert_eq!(finished["completion_evidence"]["last_mutation_sequence"], 3);
+        assert_eq!(
+            finished["completion_evidence"]["last_machine_checked_verification_sequence"],
+            4
+        );
+        assert_eq!(finished["completion_evidence"]["completed"], true);
+
+        runner.await.unwrap().unwrap();
+        assert_eq!(server.join().unwrap().len(), 7);
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_response_persists_usage_before_fatal_exit() {
+        let (base_url, server) = fake_openai_server(vec![json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "malformed-1",
+                        "type": "function",
+                        "function": {"name": "run_shell", "arguments": "{}"}
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        })]);
+
+        let (test_input, run_input) = tokio::io::duplex(8 * 1024);
+        let (run_output, test_output) = tokio::io::duplex(8 * 1024);
+        let runner = tokio::spawn(async move {
+            let mut input = BufReader::new(run_input);
+            let mut output = run_output;
+            run(&mut input, &mut output).await
+        });
+        let mut input = test_input;
+        let mut output = BufReader::new(test_output);
+
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "start",
+                "instruction": "Repair the CLI.",
+                "model": "fake-model",
+                "api_key": "test-key",
+                "base_url": base_url,
+                "max_steps": 2,
+                "model_timeout_sec": 5,
+                "shell_timeout_sec": 60,
+                "allow_network": false,
+                "policy_profile": "product",
+                "execution_contract_sha256": execution_contract_sha256()
+            }),
+        )
+        .await;
+
+        let snapshot = read_test_output(&mut output).await;
+        assert_eq!(snapshot["type"], "event");
+        assert_eq!(snapshot["name"], "usage_snapshot");
+        assert_eq!(snapshot["usage"]["model_requests"], 1);
+        assert_eq!(snapshot["usage"]["total_tokens"], 10);
+
+        let error = runner.await.unwrap().unwrap_err();
+        assert!(matches!(error, HeadlessError::MissingCommand));
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1522,6 +1727,10 @@ mod tests {
             .await;
             verification = read_test_output(&mut output).await;
         }
+        assert_eq!(verification["type"], "event");
+        assert_eq!(verification["name"], "usage_snapshot");
+        assert_eq!(verification["usage"]["model_requests"], 6);
+        verification = read_test_output(&mut output).await;
         assert_eq!(verification["type"], "tool_request");
         assert_eq!(verification["id"], "verify-1");
         write_test_line(
@@ -1540,6 +1749,7 @@ mod tests {
         let finished = read_test_output(&mut output).await;
         assert_eq!(finished["type"], "finished");
         assert_eq!(finished["completion_evidence"]["completed"], true);
+        assert_eq!(finished["completion_evidence"]["outcome_count"], 6);
         assert_eq!(finished["usage"]["model_requests"], 8);
 
         runner.await.unwrap().unwrap();

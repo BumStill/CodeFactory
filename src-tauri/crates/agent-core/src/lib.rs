@@ -142,7 +142,9 @@ Every remaining tool call must directly resolve a current completion blocker. Do
 unrelated test failures, optional compatibility concerns, or hidden tests while a required delivery \
 stage is missing. Produce the first candidate required output artifact before the final third of \
 the budget; do not spend that window on more research or dependency setup while the artifact is \
-missing. To reduce model round trips, batch related reads, edits, and checks into one \
+missing. During the convergence window, follow each successful mutation with a separate \
+machine-checked verification that exits nonzero on mismatch before another edit or exploration. \
+To reduce model round trips, batch related reads and edits into one \
 bounded tool call when their order and failure handling remain clear. If all blockers are resolved, \
 return the final response now. Current completion \
 blockers: {blockers}."
@@ -1622,6 +1624,10 @@ pub fn evaluate_budget_command_with_time_in_directory(
     kind: &ToolKind,
     working_directory: Option<&str>,
 ) -> PolicyDecision {
+    let convergence_window = remaining_model_rounds <= 16
+        || wall_time.is_some_and(|(remaining, total)| {
+            total > 0 && remaining <= total.saturating_mul(2) / 3
+        });
     let time_finalization_window =
         wall_time.is_some_and(|(remaining, total)| total > 0 && remaining <= total / 3);
     let source_delivery_checkpoint = evidence.source_delivery_required
@@ -1678,6 +1684,31 @@ pub fn evaluate_budget_command_with_time_in_directory(
             "execution_budget",
             "before another build or install, derive every local import alias from the repository and complete the required clean residual scan across all observed source/build-input extensions; derive candidate spellings from exact failures, repository references, or a language adapter, write matches to a temporary results file, preserve the grep/rg status, reject status greater than 1, and finish with `test ! -s`",
         );
+    }
+
+    let latest_successful_mutation_is_unverified = !evidence.source_delivery_required
+        && evidence
+            .last_mutation_sequence
+            .is_some_and(|mutation| mutation == evidence.outcome_count)
+        && evidence.last_failure_sequence.unwrap_or(0)
+            < evidence.last_mutation_sequence.unwrap_or(0)
+        && evidence
+            .last_machine_checked_verification_sequence
+            .unwrap_or(0)
+            < evidence.last_mutation_sequence.unwrap_or(0);
+    if convergence_window && latest_successful_mutation_is_unverified {
+        let machine_checked_verification = matches!(
+            kind,
+            ToolKind::Verification
+                | ToolKind::RuntimeProbe
+                | ToolKind::FunctionalProbe { bounded: true }
+        ) && has_machine_checked_assertion(command);
+        if !machine_checked_verification {
+            return deny(
+                "fix_verification_loop",
+                "the latest successful mutation is still unverified; run a separate machine-checked verification that exits nonzero on mismatch before another edit or exploration",
+            );
+        }
     }
 
     if remaining_model_rounds > 8 && !time_finalization_window && !source_delivery_checkpoint {
@@ -4370,7 +4401,8 @@ mod tests {
 
         assert!(prompt.contains("3 model rounds remain"));
         assert!(prompt.contains("build, install, run outside the source directory"));
-        assert!(prompt.contains("batch related reads, edits, and checks"));
+        assert!(prompt.contains("separate machine-checked verification"));
+        assert!(prompt.contains("batch related reads and edits"));
         assert!(prompt.contains("compatible dependency version"));
         assert!(prompt.contains("local import aliases"));
         assert!(prompt.contains("PID, logs, bounded readiness"));
@@ -4431,6 +4463,48 @@ mod tests {
         assert!(should_prompt_time_convergence(600, 900));
         assert!(should_prompt_time_convergence(120, 900));
         assert!(!should_prompt_time_convergence(601, 900));
+    }
+
+    #[test]
+    fn convergence_window_requires_machine_check_after_latest_successful_mutation() {
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 10,
+            last_mutation_sequence: Some(10),
+            machine_checked_behavior_required: true,
+            last_machine_checked_verification_sequence: Some(8),
+            ..CompletionEvidence::default()
+        };
+
+        assert!(!evaluate_budget_command(
+            16,
+            &evidence,
+            "python3 generate_candidate.py > result.txt",
+            &ToolKind::Mutation,
+        )
+        .is_allowed());
+        assert!(!evaluate_budget_command_with_time(
+            60,
+            Some((600, 900)),
+            &evidence,
+            "cat another_idea.txt",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+        assert!(evaluate_budget_command(
+            16,
+            &evidence,
+            "actual=$(./tool 6); test \"$actual\" = 42",
+            &ToolKind::Verification,
+        )
+        .is_allowed());
+        assert!(evaluate_budget_command(
+            17,
+            &evidence,
+            "python3 generate_candidate.py > result.txt",
+            &ToolKind::Mutation,
+        )
+        .is_allowed());
     }
 
     #[test]

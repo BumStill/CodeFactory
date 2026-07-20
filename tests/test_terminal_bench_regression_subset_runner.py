@@ -863,13 +863,34 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             args = self.args(trial_hard_timeout_sec=1200)
             subset = {"id": "subset", "source_run_id": "source", "tasks": [{"name": "write-compressor"}]}
+            job_path = Path(tmp) / "job"
+            agent_path = job_path / "write-compressor__abc123" / "agent"
+            agent_path.mkdir(parents=True)
+            (agent_path / "run-metadata.json").write_text(json.dumps({
+                "runtime_subject": "rust-core",
+                "tool_calls": 21,
+                "usage": {
+                    "model_requests": 21,
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "total_tokens": 120,
+                },
+                "completion_evidence": {
+                    "outcome_count": 23,
+                    "completed": False,
+                    "blockers": ["machine-checked verification is required"],
+                },
+            }))
+            (agent_path / "final.txt").write_text(
+                "Stopped after the wall-clock reserve was exhausted."
+            )
             parsed = {
                 "preview": {
                     "model": "deepseek-v4-pro",
                     "task_limit": "1",
                     "concurrency": "1",
                     "override_storage_mb": "<none>",
-                    "job_path": str(Path(tmp) / "job"),
+                    "job_path": str(job_path),
                 },
                 "imported": {
                     "run": "run-id",
@@ -893,7 +914,16 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
 
             text = report.read_text()
             self.assertIn("- official_comparable: `no`", text)
+            self.assertIn("- harbor_import_comparable: `true`", text)
+            self.assertNotIn("\n- comparable: `true`", text)
             self.assertIn("runner-level trial hard timeout watchdog was enabled", text)
+            self.assertIn("## Agent Completion Evidence", text)
+            self.assertIn("- completed_trials: `0 / 1`", text)
+            self.assertIn("- recorded_outcomes: `23`", text)
+            self.assertIn("- external_tool_requests: `21`", text)
+            self.assertIn("- recorded_non_external_outcomes: `2`", text)
+            self.assertIn("machine-checked verification is required", text)
+            self.assertIn("wall-clock reserve was exhausted", text)
 
     def test_report_marks_outer_timeout_non_comparable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1038,6 +1038,7 @@ def write_report(
     )
     partial_job = load_partial_job(job_path) if job_path else None
     agent_usage = load_agent_usage(job_path)
+    agent_completion = load_agent_completion_evidence(job_path)
     verifier_warnings = detect_verifier_environment_warnings(job_path)
     interventions = interventions or []
     official_comparable = comparable_label(args, interventions)
@@ -1133,6 +1134,20 @@ def write_report(
                 "",
             ]
         )
+    if agent_completion:
+        lines.extend(
+            [
+                "## Agent Completion Evidence",
+                "",
+                f"- completed_trials: `{agent_completion['completed_trials']} / {agent_completion['trials_with_evidence']}`",
+                f"- recorded_outcomes: `{agent_completion['recorded_outcomes']}`",
+                f"- external_tool_requests: `{agent_completion['external_tool_requests']}`",
+                f"- recorded_non_external_outcomes: `{agent_completion['recorded_non_external_outcomes']}`",
+                f"- blockers: `{agent_completion['blockers'] or '<none>'}`",
+                f"- final_stop_summaries: `{agent_completion['final_stop_summaries'] or '<none>'}`",
+                "",
+            ]
+        )
     if imported:
         pass_count = sum(1 for item in trials if float(item["reward"]) > 0)
         lines.extend(
@@ -1143,7 +1158,7 @@ def write_report(
                 f"- dataset: `{imported['dataset']}`",
                 f"- agent: `{imported['agent']}`",
                 f"- model: `{imported['model']}`",
-                f"- comparable: `{imported['comparable']}`",
+                f"- harbor_import_comparable: `{imported['comparable']}`",
                 f"- trials: `{imported['trials']}`",
                 f"- pass_count: `{pass_count}`",
                 f"- mean_reward: `{imported['mean_reward']}`",
@@ -1282,6 +1297,68 @@ def load_agent_usage(job_path: str | Path | None) -> dict[str, int] | None:
         if isinstance(tool_calls, int) and tool_calls >= 0:
             totals["tool_calls"] += tool_calls
     return totals if totals["trials_with_metadata"] else None
+
+
+def load_agent_completion_evidence(
+    job_path: str | Path | None,
+) -> dict[str, object] | None:
+    if not job_path:
+        return None
+    root = Path(job_path)
+    if not root.is_dir():
+        return None
+    totals: dict[str, object] = {
+        "trials_with_evidence": 0,
+        "completed_trials": 0,
+        "recorded_outcomes": 0,
+        "external_tool_requests": 0,
+        "recorded_non_external_outcomes": 0,
+        "blockers": "",
+        "final_stop_summaries": "",
+    }
+    blockers: list[str] = []
+    final_summaries: list[str] = []
+    for metadata_path in sorted(root.glob("*/agent/run-metadata.json")):
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if metadata.get("runtime_subject") != "rust-core":
+            continue
+        evidence = metadata.get("completion_evidence")
+        if not isinstance(evidence, dict):
+            continue
+        totals["trials_with_evidence"] = int(totals["trials_with_evidence"]) + 1
+        if evidence.get("completed") is True:
+            totals["completed_trials"] = int(totals["completed_trials"]) + 1
+        outcome_count = evidence.get("outcome_count")
+        if isinstance(outcome_count, int) and outcome_count >= 0:
+            totals["recorded_outcomes"] = int(totals["recorded_outcomes"]) + outcome_count
+        tool_calls = metadata.get("tool_calls")
+        if isinstance(tool_calls, int) and tool_calls >= 0:
+            totals["external_tool_requests"] = int(totals["external_tool_requests"]) + tool_calls
+        raw_blockers = evidence.get("blockers")
+        if isinstance(raw_blockers, list):
+            for blocker in raw_blockers:
+                if isinstance(blocker, str) and blocker.strip() and blocker not in blockers:
+                    blockers.append(blocker.strip())
+        final_path = metadata_path.parent / "final.txt"
+        try:
+            final_text = " ".join(final_path.read_text().split())
+        except OSError:
+            final_text = ""
+        if final_text:
+            final_summaries.append(final_text[:500])
+    trials_with_evidence = int(totals["trials_with_evidence"])
+    if not trials_with_evidence:
+        return None
+    totals["recorded_non_external_outcomes"] = max(
+        int(totals["recorded_outcomes"]) - int(totals["external_tool_requests"]),
+        0,
+    )
+    totals["blockers"] = "; ".join(blockers).replace("`", "'")
+    totals["final_stop_summaries"] = " | ".join(final_summaries).replace("`", "'")
+    return totals
 
 
 def load_partial_job(job_path: str) -> list[str] | None:

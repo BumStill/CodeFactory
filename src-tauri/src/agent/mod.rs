@@ -3971,6 +3971,57 @@ mod tests {
     }
 
     #[test]
+    fn autonomous_desktop_convergence_requires_verification_before_another_edit() {
+        let mut gate = CompletionGate::new_for_instruction(
+            false,
+            "Repair the CLI. Running ./tool 6 should output 42.",
+        );
+        let mut progress = ProgressTracker::new(8);
+        let mut sequence = 0;
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "write_file",
+            &serde_json::json!({"path": "result.txt", "content": "candidate"}),
+            &tools::ToolOutput::ok("written"),
+        );
+        let evidence = gate.evidence();
+
+        let denied = autonomous_budget_denial(
+            AgentMode::Autonomous,
+            16,
+            &evidence,
+            "write_file",
+            &serde_json::json!({"path": "result.txt", "content": "another candidate"}),
+            Path::new("/workspace"),
+        );
+        assert!(denied
+            .as_deref()
+            .is_some_and(|message| message.contains("machine-checked verification")));
+
+        assert!(autonomous_budget_denial(
+            AgentMode::Autonomous,
+            16,
+            &evidence,
+            "bash",
+            &serde_json::json!({"command": "actual=$(./tool 6); test \"$actual\" = 42"}),
+            Path::new("/workspace"),
+        )
+        .is_none());
+        assert!(autonomous_budget_denial(
+            AgentMode::Interactive,
+            16,
+            &evidence,
+            "write_file",
+            &serde_json::json!({"path": "result.txt", "content": "another candidate"}),
+            Path::new("/workspace"),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn desktop_completion_gate_ignores_read_only_investigation_noise() {
         // Regression for the 2026-07-16 session: printf section headers plus
         // source output containing the literal "error:" tripped the gate and
