@@ -5,10 +5,10 @@ use serde_json::{json, Value};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::time::timeout;
 
 use crate::util::command_env;
 use crate::util::no_window::NoWindow;
+use crate::util::process_tree::{self, ProcessOutputError};
 
 use super::{shell_policy, ExecCtx, ToolOutput};
 use crate::errors::Result;
@@ -49,6 +49,23 @@ pub fn definition() -> ToolDefinition {
 }
 
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
+    execute_inner(args, ctx, None).await
+}
+
+#[cfg(test)]
+async fn execute_with_timeout(
+    args: Value,
+    ctx: &ExecCtx,
+    timeout_duration: Duration,
+) -> Result<ToolOutput> {
+    execute_inner(args, ctx, Some(timeout_duration)).await
+}
+
+async fn execute_inner(
+    args: Value,
+    ctx: &ExecCtx,
+    timeout_override: Option<Duration>,
+) -> Result<ToolOutput> {
     let a: Args = match serde_json::from_value(args.clone()) {
         Ok(v) => v,
         Err(e) => {
@@ -81,18 +98,21 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 
     let timeout_secs =
         effective_command_timeout_sec(&a.command, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
-    let result = timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
+    let timeout_duration = timeout_override.unwrap_or(Duration::from_secs(timeout_secs));
+    let result = process_tree::output_with_timeout(cmd, timeout_duration).await;
 
     match result {
-        Err(_) => Ok(ToolOutput::err(format!(
+        Err(ProcessOutputError::Timeout) => Ok(ToolOutput::err(format!(
             "Command timed out after {timeout_secs}s"
         ))),
-        Ok(Err(e)) => Ok(ToolOutput::err(format!(
-            "Failed to spawn shell '{}': {e}. PATH={}",
-            shell.program,
-            std::env::var("PATH").unwrap_or_else(|_| "<unset>".into())
-        ))),
-        Ok(Ok(output)) => {
+        Err(ProcessOutputError::Unavailable | ProcessOutputError::Failed) => {
+            Ok(ToolOutput::err(format!(
+                "Failed to execute shell '{}'. PATH={}",
+                shell.program,
+                std::env::var("PATH").unwrap_or_else(|_| "<unset>".into())
+            )))
+        }
+        Ok(output) => {
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&output.stdout));
             combined.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -213,5 +233,145 @@ mod tests {
         assert!(output.content.contains("codefactory-shell-ok"));
         assert!(output.content.contains("[shell-audit]"));
         assert!(output.content.contains("exit_code=0"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_terminates_descendants_in_the_shell_process_group() {
+        let cwd = std::env::temp_dir().join(format!("codefactory-bash-timeout-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        let pid_path = cwd.join("descendant.pid");
+        let command = format!("sh -c 'echo $$ > {}; sleep 30' & wait", pid_path.display());
+
+        let output = execute_with_timeout(
+            json!({"command": command}),
+            &ExecCtx::new(cwd.clone(), None),
+            Duration::from_millis(150),
+        )
+        .await
+        .expect("tool returns timeout output");
+
+        let pid = std::fs::read_to_string(&pid_path)
+            .expect("descendant pid written")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric descendant pid");
+        let process_exists = unsafe { libc::kill(pid, 0) } == 0;
+        let _ = std::fs::remove_dir_all(cwd);
+
+        assert!(output.is_error);
+        assert!(output.content.contains("Command timed out"));
+        assert!(
+            !process_exists,
+            "timed-out descendant process {pid} survived"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_service_survives_after_the_shell_tool_returns() {
+        let cwd = std::env::temp_dir().join(format!("codefactory-bash-service-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+
+        let output = execute_with_timeout(
+            json!({
+                "command": "sleep 30 > service.log 2>&1 & echo $! > service.pid"
+            }),
+            &ExecCtx::new(cwd.clone(), None),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("tool returns output");
+
+        let pid = std::fs::read_to_string(cwd.join("service.pid"))
+            .expect("service pid written")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric service pid");
+        let process_exists = unsafe { libc::kill(pid, 0) } == 0;
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_dir_all(cwd);
+
+        assert!(!output.is_error, "service start failed: {}", output.content);
+        assert!(process_exists, "background service {pid} did not survive");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_service_without_redirect_cannot_hold_output_pipes_forever() {
+        let cwd =
+            std::env::temp_dir().join(format!("codefactory-bash-service-pipes-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_with_timeout(
+                json!({"command": "sleep 30 & echo $! > service.pid"}),
+                &ExecCtx::new(cwd.clone(), None),
+                Duration::from_secs(1),
+            ),
+        )
+        .await;
+
+        let pid = std::fs::read_to_string(cwd.join("service.pid"))
+            .expect("service pid written")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric service pid");
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_dir_all(cwd);
+
+        let output = result
+            .expect("background process held output pipes past the tool timeout")
+            .expect("tool returns output");
+        assert!(!output.is_error, "service start failed: {}", output.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_service_holding_only_stderr_preserves_completed_stdout() {
+        let cwd = std::env::temp_dir().join(format!(
+            "codefactory-bash-service-one-pipe-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_with_timeout(
+                json!({
+                    "command": "echo ready; sleep 30 >/dev/null & echo $! > service.pid"
+                }),
+                &ExecCtx::new(cwd.clone(), None),
+                Duration::from_secs(1),
+            ),
+        )
+        .await;
+
+        let pid = std::fs::read_to_string(cwd.join("service.pid"))
+            .expect("service pid written")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric service pid");
+        let process_exists = unsafe { libc::kill(pid, 0) } == 0;
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_dir_all(cwd);
+
+        let output = result
+            .expect("single inherited pipe held the shell tool forever")
+            .expect("tool returns output");
+        assert!(!output.is_error, "service start failed: {}", output.content);
+        assert!(
+            output.content.contains("ready"),
+            "stdout was discarded: {}",
+            output.content
+        );
+        assert!(process_exists, "background service {pid} did not survive");
     }
 }

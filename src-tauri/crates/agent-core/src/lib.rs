@@ -65,7 +65,14 @@ requires one coverage audit against the original request. Map every explicitly n
 component, artifact, and environment constraint to concrete evidence from this run. Import, file \
 existence, or compilation alone does not prove named component behavior. If any required behavior \
 lacks a functional check, use the available tools now to run the missing check and repair any \
-failure. For source compatibility work, rerun a repository-wide residual search after the last \
+failure. Review the repository diff and map every modified path to a requested change. When the \
+original request limits the change scope, revert unrelated changes made by this run without \
+touching pre-existing user changes, then rerun the relevant checks. If the request specifies a \
+named tool, library, model, version, or revision, prove that the implementation exercised that exact named \
+dependency instead of merely importing it. For a state-changing control path, capture \
+before-and-after observable state and assert the requested effect rather than accepting a command \
+acknowledgement. For source compatibility work, \
+rerun a repository-wide residual search after the last \
 source edit, cover every generated or compiled source suffix found in the build configuration, and \
 make the command succeed only when no unresolved matches remain. If coverage is complete, stop and \
 return the final response as a concise user-facing summary in the user's language with the \
@@ -133,7 +140,9 @@ constraints and try a compatible dependency version before adding speculative co
 to project source; after either repair, rerun the original failing test immediately. \
 Every remaining tool call must directly resolve a current completion blocker. Do not investigate \
 unrelated test failures, optional compatibility concerns, or hidden tests while a required delivery \
-stage is missing. To reduce model round trips, batch related reads, edits, and checks into one \
+stage is missing. Produce the first candidate required output artifact before the final third of \
+the budget; do not spend that window on more research or dependency setup while the artifact is \
+missing. To reduce model round trips, batch related reads, edits, and checks into one \
 bounded tool call when their order and failure handling remain clear. If all blockers are resolved, \
 return the final response now. Current completion \
 blockers: {blockers}."
@@ -497,22 +506,24 @@ pub fn effective_command_timeout_sec(command: &str, requested: u64, maximum: u64
 
 pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
     let lower = command.to_ascii_lowercase();
-    if is_functional_probe(&lower) {
-        return ToolKind::FunctionalProbe {
-            bounded: timeout_ms > 0 && has_command_level_bound(&lower),
-        };
-    }
-    if contains_any(
+    let starts_background_service = contains_any(
         &lower,
         &[
             "nohup ",
             "docker run -d",
             "podman run -d",
             "systemctl start ",
+            " -daemonize",
+            " --daemon",
         ],
-    ) || lower.trim_end().ends_with('&')
-    {
+    ) || has_unquoted_background_operator(&lower);
+    if starts_background_service {
         return ToolKind::BackgroundServiceStart;
+    }
+    if is_functional_probe(&lower) {
+        return ToolKind::FunctionalProbe {
+            bounded: timeout_ms > 0 && has_command_level_bound(&lower),
+        };
     }
     if is_dependency_install_command(&lower) {
         return ToolKind::Mutation;
@@ -554,7 +565,30 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
             || command == "["
             || command.starts_with("[ ")
     });
+    let structured_shell_assertion = ["fail", "rc", "status"].iter().any(|variable| {
+        lower.contains(&format!("{variable}=0"))
+            && (lower.contains(&format!("exit ${variable}"))
+                || lower.contains(&format!("exit \"${variable}\"")))
+    }) && !contains_any(
+        &lower,
+        &[
+            "apply_patch",
+            "sed -i",
+            "perl -pi",
+            "tee ",
+            "cat >",
+            "cat >>",
+            "touch ",
+            "mkdir ",
+            "rm ",
+            "mv ",
+            "cp ",
+            "install ",
+            "git apply",
+        ],
+    ) && !has_non_transient_output_redirect(&lower);
     if shell_test_command
+        || structured_shell_assertion
         || contains_any(
             &lower,
             &[
@@ -607,8 +641,7 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
             "install ",
             "git apply",
         ],
-    ) || lower.contains(" > ")
-        || lower.contains(" >> ")
+    ) || has_non_transient_output_redirect(&lower)
     {
         return ToolKind::Mutation;
     }
@@ -637,6 +670,137 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
         return ToolKind::RuntimeProbe;
     }
     ToolKind::ReadOnly
+}
+
+fn has_unquoted_background_operator(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let mut comment = false;
+
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if comment {
+            if byte == b'\n' {
+                comment = false;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' && !single_quoted {
+            escaped = true;
+            continue;
+        }
+        if byte == b'\'' && !double_quoted {
+            single_quoted = !single_quoted;
+            continue;
+        }
+        if byte == b'"' && !single_quoted {
+            double_quoted = !double_quoted;
+            continue;
+        }
+        if single_quoted || double_quoted {
+            continue;
+        }
+        if byte == b'#'
+            && (index == 0
+                || bytes[index - 1].is_ascii_whitespace()
+                || matches!(bytes[index - 1], b';' | b'|' | b'&' | b'(' | b')'))
+        {
+            comment = true;
+            continue;
+        }
+        if byte != b'&' {
+            continue;
+        }
+
+        let previous = index
+            .checked_sub(1)
+            .and_then(|position| bytes.get(position));
+        let next = bytes.get(index + 1);
+        let is_redirection_or_pipeline = previous
+            .is_some_and(|value| matches!(value, b'&' | b'>' | b'<' | b'|'))
+            || next.is_some_and(|value| matches!(value, b'&' | b'>'));
+        if !is_redirection_or_pipeline {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_non_transient_output_redirect(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' && !single_quoted {
+            escaped = true;
+            continue;
+        }
+        if byte == b'\'' && !double_quoted {
+            single_quoted = !single_quoted;
+            continue;
+        }
+        if byte == b'"' && !single_quoted {
+            double_quoted = !double_quoted;
+            continue;
+        }
+        if single_quoted || double_quoted || byte != b'>' {
+            continue;
+        }
+
+        let mut target_start = index + 1;
+        if bytes.get(target_start) == Some(&b'>') {
+            target_start += 1;
+        }
+        while bytes
+            .get(target_start)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            target_start += 1;
+        }
+        if bytes.get(target_start) == Some(&b'&') {
+            continue;
+        }
+        if bytes.get(target_start) == Some(&b'|') {
+            target_start += 1;
+            while bytes
+                .get(target_start)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                target_start += 1;
+            }
+        }
+
+        let target = command[target_start..]
+            .split(|character: char| character.is_whitespace() || ";|&".contains(character))
+            .next()
+            .unwrap_or("")
+            .trim_matches(['\'', '"'])
+            .to_ascii_lowercase();
+        if target.is_empty() {
+            return true;
+        }
+        if target == "/dev/null"
+            || target.starts_with("/tmp/")
+            || target.starts_with("/var/tmp/")
+            || target.starts_with("$tmp")
+            || target.starts_with("${tmp")
+        {
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 fn is_dependency_install_command(command: &str) -> bool {
@@ -766,10 +930,48 @@ impl ToolOutcome {
     }
 
     pub fn with_detected_semantic_failure(mut self) -> Self {
-        self.semantic_failure = detect_semantic_failure(&self.stdout, &self.stderr)
-            || has_mismatched_checksums(&self.command, &self.stdout, &self.stderr);
+        self.semantic_failure =
+            detect_semantic_failure_for_command(&self.command, &self.stdout, &self.stderr)
+                || has_mismatched_checksums(&self.command, &self.stdout, &self.stderr);
         self
     }
+}
+
+fn detect_semantic_failure_for_command(command: &str, stdout: &str, stderr: &str) -> bool {
+    let lower_command = command.to_ascii_lowercase();
+    let expects_absence = contains_any(
+        &lower_command,
+        &[
+            "test ! -e",
+            "test ! -f",
+            "test ! -d",
+            "[ ! -e",
+            "[ ! -f",
+            "[ ! -d",
+            "! kill -0",
+            "! pgrep ",
+        ],
+    ) && !contains_any(&lower_command, &[";", "\n", "&&", "||", "|"]);
+    if !expects_absence {
+        return detect_semantic_failure(stdout, stderr);
+    }
+
+    let remaining_signals = format!("{stdout}\n{stderr}")
+        .lines()
+        .filter(|line| {
+            let line = line.to_ascii_lowercase();
+            !contains_any(
+                &line,
+                &[
+                    "no such file or directory",
+                    "process dead",
+                    "process not running",
+                ],
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    detect_semantic_failure(&remaining_signals, "")
 }
 
 pub fn detect_semantic_failure(stdout: &str, stderr: &str) -> bool {
@@ -777,6 +979,10 @@ pub fn detect_semantic_failure(stdout: &str, stderr: &str) -> bool {
     let explicit_error_line = combined.lines().any(|line| {
         let line = line.trim();
         let reports_error = line.starts_with("error:") || line.contains(" error:");
+        let reports_failure = line.starts_with("failed:")
+            || line.contains(" failed:")
+            || line.starts_with("fail:")
+            || line.contains(" fail:");
         let benign_summary = contains_any(
             line,
             &[
@@ -786,9 +992,14 @@ pub fn detect_semantic_failure(stdout: &str, stderr: &str) -> bool {
                 "error: none",
                 "error: null",
                 "is_error: false",
+                "0 failed",
+                "no failed",
+                "failed: none",
+                "failed: null",
+                "failed: false",
             ],
         );
-        reports_error && !benign_summary
+        (reports_error || reports_failure) && !benign_summary
     });
     explicit_error_line
         || contains_any(
@@ -813,6 +1024,9 @@ pub fn detect_semantic_failure(stdout: &str, stderr: &str) -> bool {
                 "internal compiler error",
                 "externally-managed-environment",
                 "can't open file",
+                "no such file or directory",
+                "process dead",
+                "process not running",
             ],
         )
 }
@@ -986,6 +1200,24 @@ pub fn evaluate_budget_command_with_time_in_directory(
         let latest_tool_failed = evidence
             .last_failure_sequence
             .is_some_and(|sequence| sequence == evidence.outcome_count);
+        let explicit_source_repair_pending = evidence
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("explicit source repair requires a source edit"));
+        if explicit_source_repair_pending {
+            let lower_command = command.to_ascii_lowercase();
+            let repair_mutation = matches!(kind, ToolKind::Mutation)
+                && !is_dependency_install_command(&lower_command)
+                && !is_source_build_or_install_command(&lower_command);
+            let failure_diagnostic = latest_tool_failed && matches!(kind, ToolKind::ReadOnly);
+            if repair_mutation || failure_diagnostic {
+                return PolicyDecision::Allow;
+            }
+            return deny(
+                "execution_budget",
+                "the source-delivery checkpoint has been reached and the requested source repair has not started; inspect only the latest concrete failure, then edit the relevant source before another build, install, or scope expansion",
+            );
+        }
         if let Some(runner) = evidence.missing_test_runner.as_deref() {
             let lower = command.to_ascii_lowercase();
             if is_dependency_install_command(&lower) && lower.contains(runner) {
@@ -1095,6 +1327,7 @@ pub struct CompletionGate {
     last_failed_verification_command: Option<String>,
     scope_narrowing_sequence: Option<u64>,
     source_compatibility_audit_required: bool,
+    source_change_required: bool,
     source_delivery_required: bool,
     project_tests_required: bool,
     required_source_scan_extensions: BTreeSet<String>,
@@ -1171,12 +1404,33 @@ impl CompletionGate {
                     "完整测试",
                 ],
             );
-        Self::new_with_source_requirements(
+        let source_change_required = source_delivery_required
+            && contains_any(
+                &lower,
+                &[
+                    "modify",
+                    "update",
+                    "patch",
+                    "change",
+                    "repair the source",
+                    "fix the source",
+                    "source changes",
+                    "修改源码",
+                    "修复源码",
+                    "源码改动",
+                    "修改",
+                    "修复",
+                    "更新",
+                ],
+            );
+        let mut gate = Self::new_with_source_requirements(
             require_action,
             source_compatibility_audit_required,
             source_delivery_required,
             project_tests_required,
-        )
+        );
+        gate.source_change_required = source_change_required;
+        gate
     }
 
     fn new_with_source_requirements(
@@ -1198,6 +1452,7 @@ impl CompletionGate {
             last_failed_verification_command: None,
             scope_narrowing_sequence: None,
             source_compatibility_audit_required,
+            source_change_required: false,
             source_delivery_required,
             project_tests_required,
             required_source_scan_extensions: BTreeSet::new(),
@@ -1260,7 +1515,7 @@ impl CompletionGate {
         if matches!(outcome.kind, ToolKind::Mutation) {
             self.last_mutation_sequence = Some(outcome.sequence);
         }
-        if matches!(outcome.kind, ToolKind::BackgroundServiceStart) && outcome.succeeded() {
+        if matches!(outcome.kind, ToolKind::BackgroundServiceStart) {
             self.last_service_start_sequence = Some(outcome.sequence);
         }
         if self.last_service_start_sequence.is_some() && outcome.succeeded() {
@@ -1415,6 +1670,11 @@ impl CompletionGate {
         }
 
         if self.source_delivery_required {
+            if self.source_change_required && self.last_source_mutation_sequence.is_none() {
+                blockers.push(
+                    "the explicit source repair requires a source edit before delivery".to_owned(),
+                );
+            }
             let source_floor = self.last_source_mutation_sequence.unwrap_or(0);
             match self.last_source_install_sequence {
                 Some(sequence) if sequence > source_floor => {}
@@ -1590,27 +1850,38 @@ fn is_source_mutation(outcome: &ToolOutcome) -> bool {
     }
 
     let lower_command = outcome.command.to_ascii_lowercase();
-    has_explicit_file_mutation(&lower_command)
-        || (outcome.succeeded() && !is_dependency_install_command(&lower_command))
+    if !has_source_content_mutation(&lower_command)
+        || !command_mentions_source_input(&lower_command)
+    {
+        return false;
+    }
+
+    outcome.succeeded()
 }
 
-fn has_explicit_file_mutation(command: &str) -> bool {
+fn has_source_content_mutation(command: &str) -> bool {
     contains_any(
         command,
         &[
             "apply_patch",
+            "edit_file ",
+            "write_file ",
             "sed -i",
             "perl -pi",
             "tee ",
             "cat >",
             "cat >>",
-            "touch ",
-            "rm ",
-            "mv ",
-            "cp ",
+            "write_text(",
             "git apply",
         ],
-    )
+    ) || (contains_any(command, &["printf ", "echo "])
+        && has_non_transient_output_redirect(command))
+}
+
+fn command_mentions_source_input(command: &str) -> bool {
+    let mut extensions = BTreeSet::new();
+    collect_source_extensions(command, &mut extensions);
+    !extensions.is_empty()
 }
 
 fn detect_missing_test_runner(outcome: &ToolOutcome) -> Option<&'static str> {
@@ -2556,6 +2827,52 @@ mod tests {
             classify_command("python3 server.py >server.log 2>&1 &", 30_000),
             ToolKind::BackgroundServiceStart
         );
+        assert_eq!(
+            classify_command("./server -daemonize -pidfile /tmp/server.pid", 30_000),
+            ToolKind::BackgroundServiceStart
+        );
+        assert_eq!(
+            classify_command("./worker --daemon --pidfile /tmp/worker.pid", 30_000),
+            ToolKind::BackgroundServiceStart
+        );
+    }
+
+    #[test]
+    fn combined_background_service_start_and_probe_stays_a_service_start() {
+        let command = concat!(
+            "cd /var/www/html && python3 -m http.server 8080 &\n",
+            "echo \"PID=$!\"\n",
+            "sleep 1\n",
+            "curl -s http://localhost:8080/"
+        );
+
+        assert_eq!(
+            classify_command(command, 30_000),
+            ToolKind::BackgroundServiceStart
+        );
+
+        assert_eq!(
+            classify_command(
+                "python3 server.py > service.log 2>&1 & echo $! > service.pid",
+                30_000,
+            ),
+            ToolKind::BackgroundServiceStart
+        );
+        for command in [
+            "printf 'x & y' > output.txt",
+            "printf \"x & y\" > output.txt",
+            "first && second",
+            "command 2>&1",
+            "command &> output.log",
+            "command |& tee output.log",
+            "# command &\nprintf done",
+        ] {
+            assert_ne!(
+                classify_command(command, 30_000),
+                ToolKind::BackgroundServiceStart,
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -2636,6 +2953,37 @@ mod tests {
     }
 
     #[test]
+    fn shell_assertion_with_temporary_output_counts_as_verification() {
+        let command = concat!(
+            "FAIL=0\n",
+            "grep -R 'forbidden' . > /tmp/residual.txt || true\n",
+            "if grep -q 'forbidden' /tmp/residual.txt; then FAIL=1; fi\n",
+            "exit $FAIL"
+        );
+
+        assert_eq!(classify_command(command, 300_000), ToolKind::Verification);
+    }
+
+    #[test]
+    fn structured_shell_assertion_cannot_hide_a_workspace_write() {
+        for command in [
+            "FAIL=0; printf x > src/file.rs; exit $FAIL",
+            "FAIL=0; printf x >src/file.rs; exit $FAIL",
+            "STATUS=0; echo x 1>>src/file.rs; exit $STATUS",
+            "RC=0; echo x 2>src/error.log; exit $RC",
+        ] {
+            assert_eq!(
+                classify_command(command, 300_000),
+                ToolKind::Mutation,
+                "{command}"
+            );
+        }
+
+        let temporary = "FAIL=0; grep forbidden . >/tmp/residual.txt || true; exit $FAIL";
+        assert_eq!(classify_command(temporary, 300_000), ToolKind::Verification);
+    }
+
+    #[test]
     fn read_only_failure_alone_does_not_demand_verification() {
         // Reading source that contains the literal string "error:" (semantic
         // failure detection) or a grep with no matches (exit 1) changes no
@@ -2683,6 +3031,8 @@ mod tests {
         assert!(prompt.contains("in the user's language"));
         assert!(prompt.contains("do not repeat analysis or summaries the user has already seen"));
         assert!(prompt.contains("Never mention internal mechanisms"));
+        assert!(prompt.contains("every modified path"));
+        assert!(prompt.contains("revert unrelated changes made by this run"));
     }
 
     #[test]
@@ -2790,6 +3140,23 @@ mod tests {
     }
 
     #[test]
+    fn failed_background_start_keeps_the_service_lifecycle_gate_active() {
+        let mut gate = CompletionGate::default();
+        let mut service = outcome(1, ToolKind::BackgroundServiceStart, 1);
+        service.command = "nohup ./server > service.log 2>&1 & echo $! > service.pid".to_owned();
+        gate.record(&service);
+        gate.record(&outcome(2, ToolKind::Verification, 0));
+
+        let evidence = gate.evidence();
+        assert!(!evidence.completed);
+        assert_eq!(evidence.last_service_start_sequence, Some(1));
+        assert!(evidence
+            .blockers
+            .iter()
+            .any(|item| item.contains("bounded functional probe")));
+    }
+
+    #[test]
     fn semantic_failure_with_zero_exit_code_does_not_unlock_gate() {
         let mut failed = outcome(1, ToolKind::Verification, 0);
         failed.stdout = "3 tests failed".to_owned();
@@ -2835,12 +3202,46 @@ mod tests {
             "g++: internal compiler error: Segmentation fault signal terminated program cc1plus",
             "error: externally-managed-environment",
             "python3: can't open file '/workspace/setup.py': [Errno 2] No such file or directory",
+            "/bin/bash: line 0: cd: /missing/project: No such file or directory",
+            "IPv6 bind failed: [Errno 1] Operation not permitted",
+            "Process dead",
+            "PROBE FAIL: response body is not ready",
         ] {
             let mut masked_failure = outcome(6, ToolKind::Verification, 0);
             masked_failure.stdout = output.to_owned();
             masked_failure = masked_failure.with_detected_semantic_failure();
             assert!(!masked_failure.succeeded(), "{output}");
         }
+    }
+
+    #[test]
+    fn expected_absence_checks_do_not_become_semantic_failures() {
+        for (command, output) in [
+            (
+                "test ! -e stale.pid",
+                "stale.pid: No such file or directory",
+            ),
+            ("! kill -0 4242", "Process not running"),
+        ] {
+            let mut check = outcome(1, ToolKind::Verification, 0);
+            check.command = command.to_owned();
+            check.stdout = output.to_owned();
+            check = check.with_detected_semantic_failure();
+
+            assert!(check.succeeded(), "{command}: {output}");
+        }
+
+        let mut missing_input = outcome(2, ToolKind::Verification, 0);
+        missing_input.command = "python3 setup.py build".to_owned();
+        missing_input.stderr = "setup.py: No such file or directory".to_owned();
+        missing_input = missing_input.with_detected_semantic_failure();
+        assert!(!missing_input.succeeded());
+
+        let mut mixed = outcome(3, ToolKind::Verification, 0);
+        mixed.command = "test ! -e stale.pid; python3 missing.py || true".to_owned();
+        mixed.stderr = "python3: missing.py: No such file or directory".to_owned();
+        mixed = mixed.with_detected_semantic_failure();
+        assert!(!mixed.succeeded());
     }
 
     #[test]
@@ -2910,6 +3311,26 @@ mod tests {
         let prompt = build_budget_convergence_prompt(3, &CompletionEvidence::default());
         assert!(prompt.contains("named component behavior"));
         assert!(prompt.contains("generated and compiled source inputs"));
+    }
+
+    #[test]
+    fn contract_requires_exact_dependencies_observable_controls_and_early_artifacts() {
+        let normalized_contract = EXECUTION_CONTRACT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        assert!(normalized_contract.contains("named tool, library, model, version, or revision"));
+        assert!(normalized_contract.contains("before-and-after observable state"));
+        assert!(normalized_contract.contains("required output artifact"));
+
+        let ready = build_completion_ready_prompt();
+        assert!(ready.contains("named tool, library, model, version, or revision"));
+        assert!(ready.contains("before-and-after observable state"));
+
+        let convergence = build_budget_convergence_prompt(8, &CompletionEvidence::default());
+        assert!(convergence.contains("required output artifact"));
+        assert!(convergence.contains("before the final third"));
     }
 
     #[test]
@@ -3077,6 +3498,65 @@ mod tests {
             &ToolKind::Mutation,
         )
         .is_allowed());
+    }
+
+    #[test]
+    fn explicit_source_repair_cannot_loop_on_install_without_an_edit() {
+        let gate = CompletionGate::new_for_instruction(
+            true,
+            "Modify this incompatible package, compile the extensions, and install it from source.",
+        );
+        assert!(gate
+            .evidence()
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("requires a source edit")));
+
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 12,
+            last_failure_sequence: Some(12),
+            source_delivery_required: true,
+            blockers: vec![
+                "the explicit source repair requires a source edit before delivery".to_owned(),
+            ],
+            ..CompletionEvidence::default()
+        };
+
+        assert!(!evaluate_budget_command_with_time(
+            60,
+            Some((590, 900)),
+            &evidence,
+            "python3 -m pip install -e .",
+            &ToolKind::Mutation,
+        )
+        .is_allowed());
+        assert!(evaluate_budget_command_with_time(
+            60,
+            Some((590, 900)),
+            &evidence,
+            "cat build-error.log",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+        assert!(evaluate_budget_command_with_time(
+            60,
+            Some((590, 900)),
+            &evidence,
+            "sed -i 's/old_api/new_api/g' src/extension.pyx",
+            &ToolKind::Mutation,
+        )
+        .is_allowed());
+
+        let chinese_gate = CompletionGate::new_for_instruction(
+            true,
+            "修复这个不兼容的软件包，编译扩展并从源码安装。",
+        );
+        assert!(chinese_gate
+            .evidence()
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("requires a source edit")));
     }
 
     #[test]
@@ -3532,7 +4012,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_compound_source_edit_is_recorded_before_delivery_recovery() {
+    fn failed_compound_source_edit_requires_a_separate_successful_edit() {
         let mut gate = CompletionGate::new_for_instruction(
             true,
             "Update this package for runtime compatibility, compile the extensions, install from source, and run the project tests.",
@@ -3549,11 +4029,11 @@ mod tests {
         gate.record(&mixed);
 
         let evidence = gate.evidence();
-        assert_eq!(evidence.last_source_mutation_sequence, Some(2));
+        assert_eq!(evidence.last_source_mutation_sequence, None);
         assert!(evidence
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("clean repository-wide residual scan")));
+            .any(|blocker| blocker.contains("requires a source edit")));
         assert!(evidence
             .blockers
             .iter()
@@ -3573,6 +4053,50 @@ mod tests {
         gate.record(&failed_build);
 
         assert_eq!(gate.evidence().last_source_mutation_sequence, None);
+    }
+
+    #[test]
+    fn failed_or_metadata_only_commands_do_not_satisfy_source_change() {
+        for (command, return_code) in [
+            ("sed -i 's/old/new/' pkg/main.py", 1),
+            ("touch pkg/main.py", 0),
+            ("mkdir pkg/generated.py", 0),
+            ("rm pkg/main.py", 0),
+            ("cp pkg/old.py pkg/main.py", 0),
+        ] {
+            let mut gate = CompletionGate::new_for_instruction(
+                true,
+                "Modify this package and install it from source.",
+            );
+            let mut edit = outcome(1, ToolKind::Mutation, return_code);
+            edit.command = command.to_owned();
+            gate.record(&edit);
+
+            assert_eq!(
+                gate.evidence().last_source_mutation_sequence,
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn common_source_change_wording_enables_the_edit_gate() {
+        for instruction in [
+            "Update this package and install it from source.",
+            "Patch this package and install it from source.",
+            "Change this package and install it from source.",
+            "更新这个源码包并从源码安装。",
+        ] {
+            let gate = CompletionGate::new_for_instruction(true, instruction);
+            assert!(
+                gate.evidence()
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.contains("requires a source edit")),
+                "{instruction}"
+            );
+        }
     }
 
     #[test]
@@ -3782,8 +4306,12 @@ mod tests {
         build_inputs.stdout = "Extension('pkg.fast', ['pkg/fast.pyx'])".to_owned();
         gate.record(&build_inputs);
 
-        let mut mixed = outcome(2, ToolKind::Mutation, 1);
-        mixed.command = "sed -i 's/old_api/new_api/' pkg/main.py; OUT=$(rg 'old_api' --glob '*.py' --glob '*.pyx' .); echo 'SCAN CLEAN: 0 unresolved'".to_owned();
+        let mut edit = outcome(2, ToolKind::Mutation, 0);
+        edit.command = "sed -i 's/old_api/new_api/' pkg/main.py".to_owned();
+        gate.record(&edit);
+
+        let mut mixed = outcome(3, ToolKind::ReadOnly, 1);
+        mixed.command = "OUT=$(rg 'old_api' --glob '*.py' --glob '*.pyx' .); echo 'SCAN CLEAN: 0 unresolved'; exit 1".to_owned();
         mixed.stdout = "SCAN CLEAN: 0 unresolved".to_owned();
         gate.record(&mixed);
 

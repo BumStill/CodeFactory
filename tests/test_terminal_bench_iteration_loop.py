@@ -97,16 +97,41 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
 
             self.assertEqual(summary.failure_counts, {"pass": 1, "verification": 1})
 
+    def test_parse_evidence_does_not_treat_planned_task_count_as_trials(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "preflight.md"
+            path.write_text(
+                "- task_count: `18`\n- official_comparable: `yes`\n"
+                "- harbor_started: `no`\n"
+            )
+
+            summary = loop.parse_evidence(path)
+
+            self.assertIsNone(summary.trials)
+            self.assertIsNotNone(loop.delta_comparability_reason(summary, summary))
+
+    def test_comparable_delta_requires_complete_scoring_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "incomplete.md"
+            path.write_text("- trials: `18`\n- official_comparable: `yes`\n")
+            summary = loop.parse_evidence(path)
+
+            reason = loop.delta_comparability_reason(summary, summary)
+
+            self.assertIn("scoring fields", reason or "")
+
     def test_write_iteration_report_records_delta_and_next_queue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             baseline_path = tmp_path / "baseline.md"
             head_path = tmp_path / "head.md"
             baseline_path.write_text(
-                "- run: `baseline`\n- trials: `2`\n- pass_count: `1`\n- mean_reward: `0.5`\n"
+                "- run: `baseline`\n- trials: `2`\n- pass_count: `1`\n"
+                "- mean_reward: `0.5`\n- official_comparable: `yes`\n"
             )
             head_path.write_text(
-                "- run: `head`\n- trials: `2`\n- pass_count: `2`\n- mean_reward: `1.0`\n"
+                "- run: `head`\n- trials: `2`\n- pass_count: `2`\n"
+                "- mean_reward: `1.0`\n- official_comparable: `yes`\n"
             )
             baseline = loop.parse_evidence(baseline_path)
             head = loop.parse_evidence(head_path)
@@ -160,11 +185,11 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
             head_path = tmp_path / "head.md"
             baseline_path.write_text(
                 "- run: `baseline`\n- trials: `18`\n- pass_count: `4`\n"
-                "- mean_reward: `0.222222`\n"
+                "- mean_reward: `0.222222`\n- official_comparable: `yes`\n"
             )
             head_path.write_text(
                 "- run: `head`\n- trials: `1`\n- pass_count: `0`\n"
-                "- mean_reward: `0.0`\n"
+                "- mean_reward: `0.0`\n- official_comparable: `yes`\n"
             )
             baseline = loop.parse_evidence(baseline_path)
             head = loop.parse_evidence(head_path)
@@ -203,6 +228,49 @@ class TerminalBenchIterationLoopTest(unittest.TestCase):
             self.assertIn("- comparable_delta: `no`", text)
             self.assertIn("different trial counts", text)
             self.assertNotIn("- pass_count: `4` -> `0`", text)
+
+    def test_write_iteration_report_rejects_noncomparable_head_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            baseline_path = tmp_path / "baseline.md"
+            head_path = tmp_path / "head.md"
+            baseline_path.write_text(
+                "- run: `baseline`\n- trials: `18`\n- pass_count: `6`\n"
+                "- mean_reward: `0.333333`\n- official_comparable: `yes`\n"
+            )
+            head_path.write_text(
+                "- run: `head`\n- trials: `18`\n- pass_count: `0`\n"
+                "- mean_reward: `0.0`\n- official_comparable: `no`\n"
+            )
+
+            with mock.patch.object(loop, "EVIDENCE_DIR", tmp_path):
+                report = loop.write_iteration_report(
+                    args=mock.Mock(
+                        endpoint="deepseek",
+                        model="deepseek-v4-pro",
+                        shell_timeout_sec=300,
+                        override_storage_mb=None,
+                        hypothesis="validate infrastructure",
+                        target_failure_class="environment",
+                        product_capability_verdict="benchmark-only",
+                        product_capability_impact="make clean-checkout evaluation reproducible",
+                        product_example="CodeFactory can distinguish launch failure from Agent failure",
+                        benchmark_only_boundary="no product Agent behavior changed",
+                    ),
+                    scope="regression",
+                    subset_path=tmp_path / "subset.json",
+                    baseline=loop.parse_evidence(baseline_path),
+                    head=loop.parse_evidence(head_path),
+                    exit_code=0,
+                    ran_command=True,
+                    output="",
+                )
+
+            text = report.read_text()
+            self.assertIn("- official_comparable: `no`", text)
+            self.assertIn("- comparable_delta: `no`", text)
+            self.assertIn("head evidence is marked non-comparable", text)
+            self.assertNotIn("- pass_count: `6` -> `0`", text)
 
     def test_write_iteration_report_requires_product_capability_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

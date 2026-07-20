@@ -290,6 +290,119 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
             "http://host.docker.internal:7897",
         )
 
+    def test_agent_preflight_reuses_explicit_executable_without_building(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "codefactory-agent-headless"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(0o755)
+            env = {"CODEFACTORY_BENCH_AGENT_BINARY": str(binary)}
+
+            with mock.patch.object(runner, "run_capture") as capture:
+                result = runner.prepare_agent_binary(env, timeout_sec=900)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(env["CODEFACTORY_BENCH_AGENT_BINARY"], str(binary.resolve()))
+        capture.assert_not_called()
+        self.assertTrue(any("explicit" in detail for detail in result.details))
+
+    def test_agent_preflight_builds_current_source_and_injects_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            manifest = repo_root / "src-tauri/Cargo.toml"
+            binary = repo_root / "src-tauri/target/debug/codefactory-agent-headless"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text("[workspace]\n")
+            env = {}
+
+            def fake_capture(command, timeout):
+                self.assertEqual(timeout, 900)
+                self.assertEqual(
+                    command,
+                    [
+                        "cargo",
+                        "build",
+                        "--manifest-path",
+                        str(manifest),
+                        "-p",
+                        "codefactory-agent-headless",
+                    ],
+                )
+                binary.parent.mkdir(parents=True)
+                binary.write_text("#!/bin/sh\nexit 0\n")
+                binary.chmod(0o755)
+                return runner.CapturedCommand(0, "Finished dev profile")
+
+            with (
+                mock.patch.object(runner, "REPO_ROOT", repo_root),
+                mock.patch.object(runner, "run_capture", side_effect=fake_capture),
+            ):
+                result = runner.prepare_agent_binary(env, timeout_sec=900)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(env["CODEFACTORY_BENCH_AGENT_BINARY"], str(binary.resolve()))
+        self.assertTrue(any("built from current source" in detail for detail in result.details))
+
+    def test_agent_preflight_blocks_when_build_does_not_produce_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            manifest = repo_root / "src-tauri/Cargo.toml"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text("[workspace]\n")
+            env = {}
+
+            with (
+                mock.patch.object(runner, "REPO_ROOT", repo_root),
+                mock.patch.object(
+                    runner,
+                    "run_capture",
+                    return_value=runner.CapturedCommand(0, "Finished dev profile"),
+                ),
+            ):
+                result = runner.prepare_agent_binary(env, timeout_sec=900)
+
+        self.assertFalse(result.ok)
+        self.assertNotIn("CODEFACTORY_BENCH_AGENT_BINARY", env)
+        self.assertTrue(any("did not produce" in blocker for blocker in result.blockers))
+
+    def test_bind_mount_preflight_blocks_when_container_write_is_not_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            with (
+                mock.patch.object(runner, "REPO_ROOT", repo_root),
+                mock.patch.object(
+                    runner,
+                    "run_capture",
+                    return_value=runner.CapturedCommand(0, "host marker readable\n"),
+                ),
+            ):
+                result = runner.run_bind_mount_preflight(timeout_sec=30)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("container-to-host" in blocker for blocker in result.blockers)
+        )
+
+    def test_bind_mount_preflight_accepts_bidirectional_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+
+            def fake_capture(command, timeout):
+                self.assertEqual(timeout, 30)
+                probe_dir = repo_root / ".codefactory/benchmark-preflight"
+                (probe_dir / "container-to-host.txt").write_text(
+                    runner.BIND_MOUNT_PROBE_TOKEN
+                )
+                return runner.CapturedCommand(0, "host marker readable\n")
+
+            with (
+                mock.patch.object(runner, "REPO_ROOT", repo_root),
+                mock.patch.object(runner, "run_capture", side_effect=fake_capture),
+            ):
+                result = runner.run_bind_mount_preflight(timeout_sec=30)
+
+        self.assertTrue(result.ok)
+        self.assertTrue(any("bidirectional" in detail for detail in result.details))
+
     def test_parse_output_captures_provider_result_status(self) -> None:
         parsed = runner.parse_output(
             "\n".join(
@@ -603,8 +716,30 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
 
             text = report.read_text()
             self.assertIn("- exit_code: `1`", text)
+            self.assertIn("- official_comparable: `no`", text)
             self.assertIn("## Blocker", text)
             self.assertIn("before Harbor produced an importable partial job", text)
+
+    def test_preflight_blocker_report_is_never_officially_comparable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.args()
+            subset = {
+                "id": "subset",
+                "source_run_id": "source",
+                "tasks": [{"name": "filter-js-from-html"}],
+            }
+            preflight = runner.PreflightResult(
+                ok=False,
+                blockers=["Docker is unavailable"],
+                details=["docker info failed"],
+            )
+            with mock.patch.object(runner, "EVIDENCE_DIR", Path(tmp)):
+                report = runner.write_preflight_blocker_report(args, subset, preflight)
+
+            text = report.read_text()
+            self.assertIn("- official_comparable: `no`", text)
+            self.assertIn("- harbor_started: `no`", text)
+            self.assertIn("- trials: `0`", text)
 
     def test_watchdog_stops_stale_trial_container(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -38,6 +38,7 @@ class EvidenceSummary:
     pass_count: int | None
     trials: int | None
     mean_reward: float | None
+    official_comparable: bool | None
     failure_counts: dict[str, int]
 
 
@@ -83,8 +84,9 @@ def parse_evidence(path: Path) -> EvidenceSummary:
     run = field(text, "run")
     subset = field(text, "subset")
     pass_count = int_field(text, "pass_count")
-    trials = int_field(text, "trials") or int_field(text, "task_count")
+    trials = int_field(text, "trials")
     mean_reward = float_field(text, "mean_reward")
+    official_comparable = bool_field(text, "official_comparable")
     failure_counts = parse_count_section(text, "Failure Class Counts")
     if not failure_counts:
         failure_counts = parse_trial_failure_counts(text)
@@ -95,6 +97,7 @@ def parse_evidence(path: Path) -> EvidenceSummary:
         pass_count=pass_count,
         trials=trials,
         mean_reward=mean_reward,
+        official_comparable=official_comparable,
         failure_counts=failure_counts,
     )
 
@@ -155,6 +158,15 @@ def float_field(text: str, name: str) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+def bool_field(text: str, name: str) -> bool | None:
+    value = field(text, name)
+    if value == "yes":
+        return True
+    if value == "no":
+        return False
+    return None
 
 
 def normalize_failure_class(raw: str) -> str:
@@ -278,11 +290,44 @@ def delta_line(label: str, before: int | float | None, after: int | float | None
 
 
 def comparable_delta(baseline: EvidenceSummary | None, head: EvidenceSummary | None) -> bool:
+    return delta_comparability_reason(baseline, head) is None
+
+
+def delta_comparability_reason(
+    baseline: EvidenceSummary | None, head: EvidenceSummary | None
+) -> str | None:
     if baseline is None or head is None:
-        return False
+        return "baseline or head evidence is unavailable"
+    if baseline.official_comparable is False:
+        return "baseline evidence is marked non-comparable"
+    if head.official_comparable is False:
+        return "head evidence is marked non-comparable"
+    if baseline.official_comparable is None or head.official_comparable is None:
+        return "baseline or head lacks explicit comparability metadata"
+    if any(
+        value is None
+        for value in (
+            baseline.run,
+            baseline.pass_count,
+            baseline.mean_reward,
+            head.run,
+            head.pass_count,
+            head.mean_reward,
+        )
+    ):
+        return "baseline or head scoring fields are incomplete"
     if baseline.trials is None or head.trials is None:
-        return False
-    return baseline.trials == head.trials
+        return "baseline or head trial count is unavailable"
+    if baseline.trials <= 0 or head.trials <= 0:
+        return "baseline or head has no completed trials"
+    if baseline.pass_count > baseline.trials or head.pass_count > head.trials:
+        return "baseline or head pass count exceeds completed trials"
+    if baseline.trials != head.trials:
+        return (
+            "baseline and head have different trial counts; use this report as "
+            "targeted canary evidence, not an aggregate score delta"
+        )
+    return None
 
 
 def format_failure_counts(summary: EvidenceSummary | None) -> list[str]:
@@ -335,6 +380,12 @@ def write_iteration_report(
     product_capability = product_metadata["product_capability_impact"]
     product_example = product_metadata["product_example"]
     benchmark_boundary = product_metadata["benchmark_only_boundary"]
+    if args.override_storage_mb or head is None:
+        report_comparable = "no"
+    elif delta_comparability_reason(head, head) is None:
+        report_comparable = "yes"
+    else:
+        report_comparable = "no"
     lines = [
         "# Terminal-Bench 2.1 Product Iteration Report",
         "",
@@ -347,14 +398,15 @@ def write_iteration_report(
         f"- model: `{args.model or '<settings default>'}`",
         f"- shell_timeout_sec: `{args.shell_timeout_sec}`",
         f"- override_storage_mb: `{args.override_storage_mb or '<none>'}`",
-        f"- official_comparable: `{'no' if args.override_storage_mb else 'yes'}`",
+        f"- official_comparable: `{report_comparable}`",
         f"- hypothesis: `{args.hypothesis}`",
             f"- target_failure_class: `{args.target_failure_class}`",
             f"- ran_command: `{'yes' if ran_command else 'no'}`",
     ]
     if exit_code is not None:
         lines.append(f"- exit_code: `{exit_code}`")
-    is_comparable = comparable_delta(baseline, head)
+    comparability_reason = delta_comparability_reason(baseline, head)
+    is_comparable = comparability_reason is None
     if is_comparable:
         delta_lines = [
             delta_line(
@@ -371,10 +423,7 @@ def write_iteration_report(
     else:
         delta_lines = [
             "- comparable_delta: `no`",
-            (
-                "- reason: baseline and head have different trial counts; use this "
-                "report as targeted canary evidence, not an aggregate score delta."
-            ),
+            f"- reason: {comparability_reason}.",
         ]
     lines.extend(
         [

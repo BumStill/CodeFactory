@@ -353,9 +353,10 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
         timeout_sec = int(request_message.get("timeout_sec") or 300)
         if not request_id or not command:
             raise RuntimeError("CodeFactory sidecar protocol tool_request is incomplete")
+        managed_command, pidfile = self._managed_tool_command(request_id, command)
         try:
             result = await environment.exec(
-                command,
+                managed_command,
                 cwd=working_directory,
                 env=self._tool_execution_env(),
                 timeout_sec=max(1, min(timeout_sec, 900)),
@@ -368,7 +369,12 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
                 "stderr": self._truncate(result.stderr or "", 30000),
                 "error": None,
             }
-        except Exception as exc:
+        except BaseException as exc:
+            await self._cleanup_managed_process_group(
+                environment, working_directory, pidfile
+            )
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             return {
                 "type": "tool_result",
                 "id": request_id,
@@ -377,6 +383,42 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
                 "stderr": "",
                 "error": self._single_line(f"{type(exc).__name__}: {exc}", 2000),
             }
+
+    @staticmethod
+    def _managed_tool_command(request_id: str, command: str) -> tuple[str, str]:
+        token = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:16]
+        pidfile = f"/tmp/codefactory-tool-{token}.pgid"
+        script = (
+            f"echo $$ > {shlex.quote(pidfile)}; "
+            f"trap 'rm -f {shlex.quote(pidfile)}' EXIT; "
+            f"/bin/bash -c {shlex.quote(command)}"
+        )
+        return f"setsid /bin/bash -c {shlex.quote(script)}", pidfile
+
+    async def _cleanup_managed_process_group(
+        self,
+        environment: BaseEnvironment,
+        working_directory: str,
+        pidfile: str,
+    ) -> None:
+        quoted_pidfile = shlex.quote(pidfile)
+        cleanup = (
+            "# codefactory-tool-cleanup\n"
+            f"pgid=$(cat {quoted_pidfile} 2>/dev/null || true); "
+            "case \"$pgid\" in ''|*[!0-9]*) ;; *) "
+            "kill -TERM -- \"-$pgid\" 2>/dev/null || true; sleep 1; "
+            "kill -KILL -- \"-$pgid\" 2>/dev/null || true ;; esac; "
+            f"rm -f {quoted_pidfile}"
+        )
+        try:
+            await environment.exec(
+                cleanup,
+                cwd=working_directory,
+                env=self._tool_execution_env(),
+                timeout_sec=10,
+            )
+        except BaseException:
+            return
 
     async def _resolve_container_directory(self, environment: BaseEnvironment) -> str:
         result = await environment.exec(

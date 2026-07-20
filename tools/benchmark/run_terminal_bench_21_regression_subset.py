@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ BOOTSTRAP_SMOKE_IMAGES = [
     ("debian-bookworm", "python:3.10-slim-bookworm"),
     ("ubuntu-noble", "ubuntu:24.04"),
 ]
+BIND_MOUNT_PROBE_TOKEN = "codefactory-terminal-bench-bind-probe-v1"
 
 
 @dataclass(frozen=True)
@@ -431,7 +433,10 @@ def safe_plan(
             f"- min_docker_memory_gb: `{args.min_docker_memory_gb}`",
             f"- min_docker_free_gb: `{args.min_docker_free_gb}`",
             f"- resource_preflight: `{'skipped' if args.skip_resource_preflight else 'enabled'}`",
+            "- bind_mount_preflight: `enabled`",
             f"- preflight_retries: `{args.preflight_retries}`",
+            f"- agent_binary: `{env.get('CODEFACTORY_BENCH_AGENT_BINARY') or '<build from current source before launch>'}`",
+            f"- agent_build_timeout_sec: `{args.agent_build_timeout_sec}`",
             f"- override_storage_mb: `{args.override_storage_mb or '<none>'}`",
             f"- official_comparable: `{comparable_label(args)}`",
             f"- explicit CODEFACTORY_BENCH_API_KEY present: `{explicit_key}`",
@@ -472,6 +477,164 @@ def run_capture(command: list[str], timeout: int) -> CapturedCommand:
         if isinstance(output, bytes):
             output = output.decode(errors="replace")
         return CapturedCommand(124, output + f"\npreflight command timed out after {timeout}s")
+
+
+def prepare_agent_binary(
+    env: dict[str, str], timeout_sec: int
+) -> PreflightResult:
+    explicit_binary = env.get("CODEFACTORY_BENCH_AGENT_BINARY", "").strip()
+    if explicit_binary:
+        binary = Path(explicit_binary).expanduser().resolve()
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            return PreflightResult(
+                False,
+                [
+                    "The explicit CODEFACTORY_BENCH_AGENT_BINARY is missing or not executable."
+                ],
+                [f"explicit agent binary: {binary}"],
+            )
+        env["CODEFACTORY_BENCH_AGENT_BINARY"] = str(binary)
+        return PreflightResult(
+            True,
+            [],
+            [
+                f"agent binary source: explicit ({binary})",
+                f"agent binary sha256: {sha256_file(binary)}",
+            ],
+        )
+
+    manifest = REPO_ROOT / "src-tauri/Cargo.toml"
+    binary_name = (
+        "codefactory-agent-headless.exe"
+        if os.name == "nt"
+        else "codefactory-agent-headless"
+    )
+    binary = REPO_ROOT / "src-tauri/target/debug" / binary_name
+    if not manifest.is_file():
+        return PreflightResult(
+            False,
+            ["Could not find the src-tauri Cargo workspace for the benchmark Agent build."],
+            [f"expected manifest: {manifest}"],
+        )
+
+    command = [
+        "cargo",
+        "build",
+        "--manifest-path",
+        str(manifest),
+        "-p",
+        "codefactory-agent-headless",
+    ]
+    build = run_capture(command, timeout=timeout_sec)
+    if build.returncode != 0:
+        return PreflightResult(
+            False,
+            ["Building codefactory-agent-headless from the current source failed."],
+            [
+                f"command: {shlex.join(command)}",
+                f"exit_code: {build.returncode}",
+                tail(build.output, 8000),
+            ],
+        )
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        return PreflightResult(
+            False,
+            [
+                "Building codefactory-agent-headless completed but did not produce an executable binary."
+            ],
+            [
+                f"expected binary: {binary}",
+                tail(build.output, 8000),
+            ],
+        )
+
+    binary = binary.resolve()
+    env["CODEFACTORY_BENCH_AGENT_BINARY"] = str(binary)
+    return PreflightResult(
+        True,
+        [],
+        [
+            f"agent binary source: built from current source ({binary})",
+            f"agent binary sha256: {sha256_file(binary)}",
+        ],
+    )
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run_bind_mount_preflight(timeout_sec: int) -> PreflightResult:
+    probe_dir = REPO_ROOT / ".codefactory/benchmark-preflight"
+    host_marker = probe_dir / "host-to-container.txt"
+    container_marker = probe_dir / "container-to-host.txt"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    host_marker.write_text(BIND_MOUNT_PROBE_TOKEN)
+    container_marker.unlink(missing_ok=True)
+    container_path = "/codefactory-probe"
+    script = (
+        f"test \"$(cat {container_path}/{host_marker.name})\" = "
+        f"{shlex.quote(BIND_MOUNT_PROBE_TOKEN)} && "
+        f"printf %s {shlex.quote(BIND_MOUNT_PROBE_TOKEN)} >"
+        f"{container_path}/{container_marker.name} && "
+        "printf 'host marker readable\\n'"
+    )
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{probe_dir.resolve()}:{container_path}:rw",
+        "ubuntu:24.04",
+        "sh",
+        "-lc",
+        script,
+    ]
+    try:
+        captured = run_capture(command, timeout=timeout_sec)
+        if captured.returncode != 0:
+            return PreflightResult(
+                False,
+                [
+                    "Docker could not read the benchmark host directory through its bind mount."
+                ],
+                [
+                    f"probe directory: {probe_dir.resolve()}",
+                    tail(captured.output, 4000),
+                ],
+            )
+        try:
+            container_value = container_marker.read_text()
+        except OSError:
+            container_value = ""
+        if container_value != BIND_MOUNT_PROBE_TOKEN:
+            return PreflightResult(
+                False,
+                [
+                    "Docker container-to-host bind mount writes are not visible; refusing to launch Harbor."
+                ],
+                [
+                    f"probe directory: {probe_dir.resolve()}",
+                    "Use a Docker-shared persistent project path such as /Users/<user>/Projects, not this checkout path.",
+                    tail(captured.output, 4000),
+                ],
+            )
+        return PreflightResult(
+            True,
+            [],
+            [f"Docker bind mount is bidirectional: {probe_dir.resolve()}"],
+        )
+    finally:
+        host_marker.unlink(missing_ok=True)
+        container_marker.unlink(missing_ok=True)
+        try:
+            probe_dir.rmdir()
+        except OSError:
+            pass
 
 
 def run_preflight(args: argparse.Namespace) -> PreflightResult:
@@ -823,14 +986,16 @@ def write_preflight_blocker_report(
         f"- endpoint: `{args.endpoint}`",
         "- exit_code: `2`",
         f"- override_storage_mb: `{args.override_storage_mb or '<none>'}`",
-        f"- official_comparable: `{comparable_label(args)}`",
+        "- official_comparable: `no`",
+        "- harbor_started: `no`",
+        "- trials: `0`",
         f"- explicit_key_present: `{'yes' if os.environ.get('CODEFACTORY_BENCH_API_KEY') else 'no'}`",
         f"- heavy_verifier_timeout_overrides: `{format_timeout_overrides(heavy_verifier_timeout_overrides(args))}`",
         f"- verifier_uv_torch_backend: `{args.verifier_uv_torch_backend or '<none>'}`",
         "",
         "## Blocker",
         "",
-        "The provider-backed benchmark was not launched because the local environment failed resource preflight.",
+        "The provider-backed benchmark was not launched because a required preflight failed.",
         "",
         "## Preflight Blockers",
         "",
@@ -854,6 +1019,7 @@ def write_report(
     output: str,
     parsed: dict[str, object],
     interventions: list[WatchdogIntervention] | None = None,
+    agent_preflight: PreflightResult | None = None,
 ) -> Path:
     EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
@@ -875,7 +1041,7 @@ def write_report(
     verifier_warnings = detect_verifier_environment_warnings(job_path)
     interventions = interventions or []
     official_comparable = comparable_label(args, interventions)
-    if exit_code == 124:
+    if exit_code != 0 or not imported:
         official_comparable = "no"
     if imported and str(imported.get("comparable", "")).lower() != "true":
         official_comparable = "no"
@@ -902,9 +1068,22 @@ def write_report(
         "- partial_import_diagnostic: `enabled`",
         "",
     ]
+    if agent_preflight:
+        lines.extend(
+            [
+                "## Agent Binary Preflight",
+                "",
+                *[f"- {detail}" for detail in agent_preflight.details],
+                "",
+            ]
+        )
     notes = comparability_notes(args, interventions)
     if exit_code == 124:
         notes.append("benchmark process exceeded its outer wall timeout")
+    elif exit_code != 0:
+        notes.append("benchmark runner exited nonzero")
+    if not imported:
+        notes.append("no Harbor run was imported")
     if imported and str(imported.get("comparable", "")).lower() != "true":
         notes.append("imported Harbor run was marked non-comparable")
     if notes:
@@ -1257,6 +1436,12 @@ def main() -> int:
     parser.add_argument("--min-docker-free-gb", type=float, default=20.0)
     parser.add_argument("--preflight-timeout-sec", type=int, default=120)
     parser.add_argument("--preflight-retries", type=int, default=1)
+    parser.add_argument(
+        "--agent-build-timeout-sec",
+        type=int,
+        default=900,
+        help="Maximum time to build the current-source Rust headless Agent before Harbor starts.",
+    )
     parser.add_argument("--skip-resource-preflight", action="store_true")
     parser.add_argument(
         "--docker-apt-proxy",
@@ -1309,10 +1494,42 @@ def main() -> int:
             print(f"- {blocker}")
         print(f"\nEvidence report: {report_path}")
         return 2
+    print("\nVerifying bidirectional Docker bind mounts...", flush=True)
+    bind_mount_preflight = run_bind_mount_preflight(args.preflight_timeout_sec)
+    if not bind_mount_preflight.ok:
+        report_path = write_preflight_blocker_report(
+            args, subset, bind_mount_preflight
+        )
+        print("\nDocker bind mount preflight failed:")
+        for blocker in bind_mount_preflight.blockers:
+            print(f"- {blocker}")
+        print(f"\nEvidence report: {report_path}")
+        return 2
+    for detail in bind_mount_preflight.details:
+        print(f"- {detail}")
+    print("\nPreparing current-source CodeFactory headless Agent...", flush=True)
+    agent_preflight = prepare_agent_binary(env, args.agent_build_timeout_sec)
+    if not agent_preflight.ok:
+        report_path = write_preflight_blocker_report(args, subset, agent_preflight)
+        print("\nAgent binary preflight failed:")
+        for blocker in agent_preflight.blockers:
+            print(f"- {blocker}")
+        print(f"\nEvidence report: {report_path}")
+        return 2
+    for detail in agent_preflight.details:
+        print(f"- {detail}")
     exit_code, output, parsed, interventions = run_command_with_retries(
         args, env, subset
     )
-    report_path = write_report(args, subset, exit_code, output, parsed, interventions)
+    report_path = write_report(
+        args,
+        subset,
+        exit_code,
+        output,
+        parsed,
+        interventions,
+        agent_preflight,
+    )
     print(f"\nEvidence report: {report_path}")
     return exit_code
 
