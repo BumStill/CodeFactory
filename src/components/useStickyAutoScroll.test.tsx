@@ -519,4 +519,89 @@ describe("useStickyAutoScroll", () => {
     expect(handle.hasNewContent()).toBe(true);
   });
 
+  it("re-pins and snaps when the user reaches the bottom they could SEE, even though streaming outran the 240px zone", async () => {
+    // v1.49.0 field report: "我已经拉到最下边了,最新的信息还是不会自动滚".
+    // The user drags the thumb to the bottom of what they can see; by the
+    // time the scroll event is handled, streaming has already pushed the
+    // real bottom hundreds of px further — distFromBottom exceeds even the
+    // 240px catch-up zone, so the old logic never re-pins and the view
+    // stays frozen. Reaching the LAST KNOWN bottom (from the previous
+    // scroll event) must count as "user wants the tail": re-pin AND snap
+    // to the true bottom immediately.
+    const { handle } = renderHarness("session-1");
+    setLayout(handle.scroller, { scrollHeight: 2000, clientHeight: 500 });
+    await flushAsync();
+
+    // User scrolls up — unpin. Last known bottom at this event: 1500.
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 900, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.pinned()).toBe(false);
+
+    // They drag all the way down to the bottom they could see (1500)…
+    // …but the stream has already grown the content to 3000 when the
+    // event is processed: distFromBottom = 3000 - 1500 - 500 = 1000.
+    await act(async () => {
+      setLayout(handle.scroller, { scrollHeight: 3000 });
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 1500, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    await flushAsync();
+
+    expect(handle.pinned()).toBe(true);
+    // Re-pin must include an immediate snap to the TRUE bottom — waiting
+    // for the next mutation leaves the user parked mid-stream.
+    expect(handle.scroller.scrollTop).toBe(3000);
+
+    // And the follow must survive subsequent streaming.
+    setLayout(handle.scroller, { scrollHeight: 4000 });
+    await act(async () => {
+      const node = document.createElement("div");
+      node.textContent = "next token batch";
+      handle.scroller.appendChild(node);
+    });
+    await flushAsync();
+    expect(handle.scroller.scrollTop).toBe(4000);
+  });
+
+  it("echo of a clamped programmatic scroll is not mistaken for user scrolling", async () => {
+    // Real browsers clamp `scrollTop = scrollHeight` writes to
+    // scrollHeight - clientHeight; jsdom does not, so emulate the clamp.
+    // The echo detector must record the CLAMPED position — recording the
+    // raw written value makes every echo look like a user scroll.
+    const { handle } = renderHarness("session-1");
+    let top = 0;
+    const clamp = () =>
+      Math.max(0, handle.scroller.scrollHeight - handle.scroller.clientHeight);
+    Object.defineProperty(handle.scroller, "scrollTop", {
+      configurable: true,
+      get: () => top,
+      set: (v: number) => { top = Math.min(Math.max(0, v), clamp()); },
+    });
+    setLayout(handle.scroller, { scrollHeight: 2000, clientHeight: 500 });
+
+    await act(async () => {
+      const node = document.createElement("div");
+      node.textContent = "grow";
+      handle.scroller.appendChild(node);
+    });
+    await flushAsync();
+    expect(handle.scroller.scrollTop).toBe(1500); // clamped snap
+
+    // The browser fires the echo scroll event at the clamped position,
+    // within the ignore window. It must be ignored — and in particular a
+    // user up-scroll right after must still unpin cleanly.
+    await act(async () => {
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.pinned()).toBe(true);
+
+    await act(async () => {
+      handle.scroller.scrollTop = 700;
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.pinned()).toBe(false);
+  });
+
 });

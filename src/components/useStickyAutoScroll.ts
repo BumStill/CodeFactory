@@ -86,12 +86,25 @@ export function useStickyAutoScroll(conversationKey: string | null) {
   // test in useStickyAutoScroll.test.tsx for the exact scenario.
   const newContentBaseline = useRef(0);
 
+  // Bottom position (scrollHeight - clientHeight) observed at the LAST
+  // scroll event or programmatic write. During streaming the real bottom
+  // keeps running away; a user who drags to the bottom they could SEE has
+  // clearly asked for the tail even if, by the time the event is handled,
+  // the content has already grown past every distance threshold. Comparing
+  // against this snapshot instead of the live bottom makes that intent
+  // detectable.
+  const lastKnownBottom = useRef(0);
+
   const programmaticScrollTo = useCallback((y: number) => {
     const el = scrollerRef.current;
     if (!el) return;
-    lastSetScrollTop.current = y;
     ignoreScrollUntil.current = Date.now() + 80;
     el.scrollTop = y;
+    // Record the CLAMPED position the browser actually applied — recording
+    // the raw value (often scrollHeight, one clientHeight past the max)
+    // would make every echo event look like a user scroll.
+    lastSetScrollTop.current = el.scrollTop;
+    lastKnownBottom.current = el.scrollHeight - el.clientHeight;
   }, []);
 
   const stickToBottomIfPinned = useCallback(() => {
@@ -127,7 +140,13 @@ export function useStickyAutoScroll(conversationKey: string | null) {
       // 240px catch-up zone; up-scroll keeps the tight 60px so leaving
       // the stick zone is definitive.
       const threshold = scrollingUp ? 60 : 240;
-      const nearBottom = distFromBottom < threshold;
+      // A fast stream can outrun even the 240px zone between the drag and
+      // this handler. Reaching the bottom the user could SEE (the bottom
+      // as of the previous event) is an unambiguous "give me the tail" —
+      // count it regardless of how far the live bottom has moved since.
+      const reachedSeenBottom = !scrollingUp && newTop >= lastKnownBottom.current - 60;
+      const nearBottom = distFromBottom < threshold || reachedSeenBottom;
+      lastKnownBottom.current = el.scrollHeight - el.clientHeight;
 
       if (nearBottom !== pinnedRef.current) {
         // Update ref synchronously so any MutationObserver hit in the same
@@ -141,6 +160,12 @@ export function useStickyAutoScroll(conversationKey: string | null) {
           hasNewContentRef.current = false;
           setHasNewContent(false);
         }
+        if (nearBottom && distFromBottom > 2) {
+          // Re-pinned away from the live bottom (streaming outran the
+          // drag): snap immediately instead of waiting for the next
+          // mutation, or the user sits parked mid-stream.
+          programmaticScrollTo(el.scrollHeight);
+        }
         if (!nearBottom) {
           // Snapshot the scrollHeight at pin-loss so future mutations can
           // tell "real growth" from "cosmetic re-render".
@@ -150,7 +175,7 @@ export function useStickyAutoScroll(conversationKey: string | null) {
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
-  }, []);
+  }, [programmaticScrollTo]);
 
   // Content-growth observer: every DOM mutation inside the scroller is a
   // potential reason to re-stick. We also queue a RAF retick to catch
