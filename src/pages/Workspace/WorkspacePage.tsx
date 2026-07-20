@@ -26,8 +26,6 @@ import {
   EyeOff,
   PanelLeftClose,
   PanelLeft,
-  PanelRightClose,
-  PanelRight,
 } from "lucide-react";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
@@ -51,7 +49,7 @@ import { QueueBadge } from "../../components/QueueBadge";
 import { useSettingsStore } from "../../stores/settings";
 import { useTasksStore } from "../../stores/tasks";
 import { useSpecsStore } from "../../stores/specs";
-import { useLearningStore } from "../../stores/learning";
+import { useLearningStore, type LearningEvent } from "../../stores/learning";
 import type {
   Theme,
   TaskRun,
@@ -60,6 +58,8 @@ import type {
   VerificationResult,
 } from "../../lib/tauri";
 import { parseVerification, verificationSummary } from "../../lib/verification";
+
+const EMPTY_LEARNING: LearningEvent[] = [];
 
 interface DecomposedTask {
   tmp_id: string;
@@ -128,6 +128,13 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
   // right column: a branch/status bar + slide-out Changes / History / PR panels.
   const [gitPanel, setGitPanel] = useState<"changes" | "history" | "remote" | null>(null);
   const gitBranch = useGitStore((s) => s.status?.branch ?? "");
+  const activeCwd = activeSession?.cwd ?? null;
+  const learningEvents = useLearningStore(
+    (state) => (activeCwd ? state.events[activeCwd] ?? EMPTY_LEARNING : EMPTY_LEARNING),
+  );
+  const loadLearning = useLearningStore((state) => state.load);
+  const subscribeLearning = useLearningStore((state) => state.subscribe);
+  const pendingLearningCount = learningEvents.filter((event) => event.status === "pending").length;
   // Specs workbench, folded into the Workspace as a full-screen overlay: it's
   // invoked in-context, scoped to this session's cwd, and its "开始实现" creates +
   // runs tasks in THIS session (no navigation away — unified flow).
@@ -145,22 +152,6 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
   });
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const sidebarCtrlRef = useRef<HTMLDivElement>(null);
-  // Right project-insights column (environment / memory / checkpoints).
-  // Resource management lives in the backend Resources page, not this Session.
-  const [connectorsCollapsed, setConnectorsCollapsed] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem("cf.workspace.connectorsCollapsed") === "1";
-    } catch {
-      return false;
-    }
-  });
-  useEffect(() => {
-    try {
-      localStorage.setItem("cf.workspace.connectorsCollapsed", connectorsCollapsed ? "1" : "0");
-    } catch {
-      /* persistence is best-effort */
-    }
-  }, [connectorsCollapsed]);
   useEffect(() => {
     try {
       localStorage.setItem("cf.workspace.sidebarCollapsed", sidebarCollapsed ? "1" : "0");
@@ -186,6 +177,14 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
   useEffect(() => {
     selectSession(sessionId);
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!activeCwd) return;
+    void loadLearning(activeCwd);
+    let off: (() => void) | undefined;
+    subscribeLearning(activeCwd).then((unsubscribe) => { off = unsubscribe; });
+    return () => { off?.(); };
+  }, [activeCwd, loadLearning, subscribeLearning]);
 
   return (
     <div className="h-full flex flex-col bg-surface-0">
@@ -321,13 +320,27 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
         >
           <BookOpen size={14} />
         </button>
-        <button
-          onClick={() => setConnectorsCollapsed((v) => !v)}
-          className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-          title={connectorsCollapsed ? "显示项目状态（环境 / 记忆 / 检查点）" : "收起项目状态面板"}
-        >
-          {connectorsCollapsed ? <PanelRight size={14} /> : <PanelRightClose size={14} />}
-        </button>
+        <div className="flex items-center gap-1.5">
+          <GitStatusBar
+            cwd={activeCwd}
+            onOpenChanges={() => setGitPanel("changes")}
+            onOpenHistory={() => setGitPanel("history")}
+            onOpenRemote={() => setGitPanel("remote")}
+          />
+          {pendingLearningCount > 0 && activeCwd && onOpenEvolution && (
+            <button
+              onClick={() => onOpenEvolution(activeCwd)}
+              aria-label={`记忆 ${pendingLearningCount}`}
+              title="审核 AI 学到的项目记忆"
+              className="inline-flex items-center gap-1 rounded border border-accent/30 bg-accent/5 px-2 py-1 text-[11px] text-accent transition-colors hover:bg-accent/10"
+            >
+              <Brain size={11} />
+              <span>记忆</span>
+              <span className="tabular-nums">{pendingLearningCount}</span>
+            </button>
+          )}
+          <CheckpointsPanel sessionId={sessionId} />
+        </div>
         <button
           onClick={onOpenSettings}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
@@ -382,30 +395,6 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
           />
         </main>
 
-        {/* ─── Right: project status (no knowledge/skill management) ─── */}
-        {!connectorsCollapsed && (
-          <aside className="w-60 shrink-0 border-l border-border bg-surface-1 flex flex-col">
-            {/* 环境 — the git status bar (branch / ahead-behind / dirty count),
-                opening the Changes / History / PR panels. */}
-            <GitStatusBar
-              cwd={activeSession?.cwd ?? null}
-              onOpenChanges={() => setGitPanel("changes")}
-              onOpenHistory={() => setGitPanel("history")}
-              onOpenRemote={() => setGitPanel("remote")}
-            />
-            <LearningActivityPanel
-              cwd={activeSession?.cwd ?? null}
-              onOpenEvolution={
-                activeSession?.kind !== "quick" && activeSession?.kind !== "anonymous"
-                  ? onOpenEvolution
-                  : undefined
-              }
-            />
-            {/* ②-4 审核面:每次自主执行(及每条消息)前的检查点都在这里,
-                点「恢复」先看文件级 diff 再决定撤销;不撤即采纳。 */}
-            <CheckpointsPanel sessionId={sessionId} />
-          </aside>
-        )}
       </div>
 
       {/* ── Specs workbench, folded into the Workspace as a full-screen ───
@@ -1204,111 +1193,6 @@ function statusColor(status: string): string {
     case "failed":     return "text-red-500";
     default:           return "text-gray-600";
   }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// LearningActivityPanel — Session-scoped memory review only. Knowledge and
-// skills are configured globally in ResourcesPage and are intentionally absent.
-// ─────────────────────────────────────────────────────────────────────────────
-
-const EMPTY_LEARNING: LearningEventForSelector[] = [];
-
-type LearningEventForSelector = ReturnType<typeof useLearningStore.getState>["events"][string][number];
-
-function LearningActivityPanel({ cwd, onOpenEvolution }: {
-  cwd: string | null;
-  onOpenEvolution?: (cwd: string) => void;
-}) {
-  const learningEvents = useLearningStore(
-    (state) => (cwd ? state.events[cwd] ?? EMPTY_LEARNING : EMPTY_LEARNING),
-  );
-  const loadLearning = useLearningStore((state) => state.load);
-  const subscribeLearning = useLearningStore((state) => state.subscribe);
-
-  useEffect(() => {
-    if (!cwd) return;
-    void loadLearning(cwd);
-    let off: (() => void) | undefined;
-    subscribeLearning(cwd).then((unsubscribe) => { off = unsubscribe; });
-    return () => { off?.(); };
-  }, [cwd, loadLearning, subscribeLearning]);
-
-  return (
-    <>
-      <div className="flex items-center gap-1.5 border-b border-border px-3 py-2">
-        <Brain size={11} className="text-gray-500" />
-        <h2 className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">
-          项目状态
-        </h2>
-      </div>
-      {/* Memory increments — live learning events for this cwd */}
-      <div className="border-t border-border px-3 py-3 max-h-[40%] overflow-y-auto">
-        <div className="flex items-center gap-1.5 mb-1.5">
-          <Brain size={11} className="text-gray-500" />
-          <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">
-            记忆增量
-          </span>
-          {(() => {
-            const pending = learningEvents.filter((e) => e.status === "pending").length;
-            return pending > 0 ? (
-              <span className="ml-auto text-[10px] px-1.5 py-0.5 rounded bg-accent/15 text-accent">
-                {pending} 待审
-              </span>
-            ) : null;
-          })()}
-        </div>
-        {!cwd ? (
-          <p className="text-[10px] text-gray-600">开个项目后这里会显示 AI 学到的事</p>
-        ) : learningEvents.length === 0 ? (
-          <p className="text-[10px] text-gray-600 leading-relaxed">
-            AI 在本次会话中学到的事会出现在这里。<br />
-            <span className="text-gray-700">任务/会话结束后自动总结。</span>
-          </p>
-        ) : (
-          <ul className="space-y-1.5">
-            {learningEvents
-              .filter((e) => e.status === "pending")
-              .slice(0, 5)
-              .map((e) => (
-                <li
-                  key={e.id}
-                  className="rounded border border-accent/30 bg-accent/5 p-1.5 space-y-1"
-                >
-                  <p className="text-[10px] text-gray-300 leading-snug line-clamp-2">
-                    {e.observation}
-                  </p>
-                  <div className="flex items-center gap-1">
-                    <span className="ml-auto text-[8px] text-gray-600">
-                      {e.kind === "preference" ? "偏好" : "记忆"}
-                    </span>
-                  </div>
-                </li>
-              ))}
-            {learningEvents.filter((e) => e.status === "pending").length > 5 && (
-              <li className="text-[9px] text-gray-600 text-center pt-1">
-                还有 {learningEvents.filter((e) => e.status === "pending").length - 5} 条待审
-              </li>
-            )}
-            {learningEvents.filter((e) => e.status === "pending").length === 0 && (
-              <li className="text-[10px] text-gray-600">
-                所有学习事件已处理。
-                <span className="text-gray-700"> 已采纳 {learningEvents.filter((e) => e.status === "accepted").length} · 拒绝 {learningEvents.filter((e) => e.status === "rejected").length}</span>
-              </li>
-            )}
-          </ul>
-        )}
-        {cwd && learningEvents.some((e) => e.status === "pending") && (
-          <button
-            onClick={() => onOpenEvolution?.(cwd)}
-            disabled={!onOpenEvolution}
-            className="mt-2 w-full rounded border border-accent/40 bg-accent/5 px-2 py-1.5 text-[10px] text-accent transition-colors hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            打开当前项目的进化审查
-          </button>
-        )}
-      </div>
-    </>
-  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

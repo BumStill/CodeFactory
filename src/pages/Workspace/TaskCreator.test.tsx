@@ -84,8 +84,11 @@ vi.mock("../../components/ModelPicker", () => ({
 }));
 // Stub CheckpointsPanel — it calls Tauri listen() + list_checkpoints, neither
 // of which exists in jsdom; this flow doesn't exercise checkpoints.
+vi.mock("../../components/GitStatusBar", () => ({
+  GitStatusBar: () => <button aria-label="Git 状态">Git</button>,
+}));
 vi.mock("../../components/CheckpointsPanel", () => ({
-  CheckpointsPanel: () => null,
+  CheckpointsPanel: () => <button aria-label="检查点 0">检查点 0</button>,
 }));
 vi.mock("../../components/MessageList", () => ({
   MessageList: () => null,
@@ -188,6 +191,44 @@ describe("AI task decomposition flow", () => {
     } catch {
       /* localStorage unavailable in this env — nothing to isolate */
     }
+  });
+
+  it("uses compact status controls instead of a permanent right rail", async () => {
+    fakeLearningState.events = {};
+    render(
+      <WorkspacePage
+        sessionId="s1"
+        onBackHome={() => {}}
+        onOpenSettings={() => {}}
+        onOpenSession={() => {}}
+      />,
+    );
+
+    expect(screen.queryByRole("complementary", { name: "项目状态" })).not.toBeInTheDocument();
+    expect(screen.queryByText("项目状态")).not.toBeInTheDocument();
+    expect(screen.queryByText("记忆增量")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /记忆/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Git/ })).toBeInTheDocument();
+  });
+
+  it("shows memory as an on-demand badge only when pending candidates exist", async () => {
+    fakeLearningState.events = {
+      "/Users/x/proj": [{ id: "learn-1", status: "pending", observation: "Prefer TDD" }],
+    };
+    const onOpenEvolution = vi.fn();
+    render(
+      <WorkspacePage
+        sessionId="s1"
+        onBackHome={() => {}}
+        onOpenSettings={() => {}}
+        onOpenSession={() => {}}
+        onOpenEvolution={onOpenEvolution}
+      />,
+    );
+
+    const memory = await screen.findByRole("button", { name: "记忆 1" });
+    await userEvent.click(memory);
+    expect(onOpenEvolution).toHaveBeenCalledWith("/Users/x/proj");
   });
 
   it("keeps knowledge and skill management out of the session workspace", async () => {
