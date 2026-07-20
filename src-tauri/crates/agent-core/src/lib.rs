@@ -521,13 +521,19 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
     if starts_background_service {
         return ToolKind::BackgroundServiceStart;
     }
+    if has_opaque_executable_heredoc(command) {
+        return ToolKind::Mutation;
+    }
+    if is_dependency_install_command(&lower)
+        || has_workspace_mutation(&lower)
+        || has_inline_interpreter_workspace_mutation(&lower)
+    {
+        return ToolKind::Mutation;
+    }
     if is_functional_probe(&lower) {
         return ToolKind::FunctionalProbe {
             bounded: timeout_ms > 0 && has_command_level_bound(&lower),
         };
-    }
-    if is_dependency_install_command(&lower) {
-        return ToolKind::Mutation;
     }
     let single_command_version_check = !contains_any(&lower, &["&&", ";", "\n"])
         && (lower.contains("--version") || shell_command.contains(" -V"))
@@ -559,35 +565,8 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
     if single_command_version_check {
         return ToolKind::ReadOnly;
     }
-    let shell_test_command = lower.split([';', '\n', '&', '|']).any(|segment| {
-        let command = segment.trim_start();
-        command == "test"
-            || command.starts_with("test ")
-            || command == "["
-            || command.starts_with("[ ")
-    });
-    let structured_shell_assertion = ["fail", "rc", "status"].iter().any(|variable| {
-        lower.contains(&format!("{variable}=0"))
-            && (lower.contains(&format!("exit ${variable}"))
-                || lower.contains(&format!("exit \"${variable}\"")))
-    }) && !contains_any(
-        &lower,
-        &[
-            "apply_patch",
-            "sed -i",
-            "perl -pi",
-            "tee ",
-            "cat >",
-            "cat >>",
-            "touch ",
-            "mkdir ",
-            "rm ",
-            "mv ",
-            "cp ",
-            "install ",
-            "git apply",
-        ],
-    ) && !has_non_transient_output_redirect(&lower);
+    let shell_test_command = has_shell_test_command(&lower);
+    let structured_shell_assertion = has_structured_shell_assertion(&lower);
     if shell_test_command
         || structured_shell_assertion
         || contains_any(
@@ -622,40 +601,7 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
     {
         return ToolKind::Verification;
     }
-    // NOTE: bare `printf`/`echo` (no redirect) is how investigation batches
-    // print section headers — that is not a mutation. A `printf … > file`
-    // still classifies as Mutation via the redirect check below.
-    if contains_any(
-        &lower,
-        &[
-            "apply_patch",
-            "sed -i",
-            "perl -pi",
-            "tee ",
-            "cat >",
-            "cat >>",
-            "touch ",
-            "mkdir ",
-            "rm ",
-            "mv ",
-            "cp ",
-            "install ",
-            "git apply",
-        ],
-    ) || has_non_transient_output_redirect(&lower)
-    {
-        return ToolKind::Mutation;
-    }
-    let inline_interpreter_snippet = contains_any(
-        &lower,
-        &[
-            "python -c ",
-            "python3 -c ",
-            "node -e ",
-            "ruby -e ",
-            "perl -e ",
-        ],
-    );
+    let inline_interpreter_snippet = is_inline_interpreter_snippet(&lower);
     if is_external_source_runtime_command(&lower) {
         return ToolKind::RuntimeProbe;
     }
@@ -671,6 +617,87 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
         return ToolKind::RuntimeProbe;
     }
     ToolKind::ReadOnly
+}
+
+fn is_inline_interpreter_snippet(command: &str) -> bool {
+    contains_any(
+        command,
+        &[
+            "python -c ",
+            "python3 -c ",
+            "node -e ",
+            "ruby -e ",
+            "perl -e ",
+        ],
+    )
+}
+
+fn has_inline_interpreter_workspace_mutation(command: &str) -> bool {
+    if !is_inline_interpreter_snippet(command) {
+        return false;
+    }
+
+    let compact = command
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    let opens_writable_file = compact.contains("open(")
+        && contains_any(
+            &compact,
+            &[
+                ",'w'", ",\"w\"", ",'a'", ",\"a\"", ",'x'", ",\"x\"", ",'w+", ",\"w+", ",'a+",
+                ",\"a+",
+            ],
+        );
+
+    opens_writable_file
+        || contains_any(
+            &compact,
+            &[
+                ".write_text(",
+                ".write_bytes(",
+                "writefilesync(",
+                "writefile(",
+                "appendfilesync(",
+                "appendfile(",
+                "fs.rename",
+                "fs.unlink",
+                "fs.rm",
+                "fs.mkdir",
+                "os.remove(",
+                "os.unlink(",
+                "os.rename(",
+                "os.replace(",
+                "os.mkdir(",
+                "os.makedirs(",
+                "shutil.",
+                "file.write(",
+                "fileutils.",
+            ],
+        )
+}
+
+fn has_workspace_mutation(command: &str) -> bool {
+    // Bare `printf`/`echo` is often only a section heading. Redirecting it to
+    // a workspace path still counts as mutation through the redirect check.
+    contains_any(
+        command,
+        &[
+            "apply_patch",
+            "sed -i",
+            "perl -pi",
+            "tee ",
+            "cat >",
+            "cat >>",
+            "touch ",
+            "mkdir ",
+            "rm ",
+            "mv ",
+            "cp ",
+            "install ",
+            "git apply",
+        ],
+    ) || has_non_transient_output_redirect(command)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -715,6 +742,84 @@ fn shell_control_text(command: &str) -> String {
     control
 }
 
+fn has_opaque_executable_heredoc(command: &str) -> bool {
+    let mut control = String::with_capacity(command.len());
+    let mut pending = VecDeque::<HeredocDelimiter>::new();
+    let raw_lines = command.split_inclusive('\n').collect::<Vec<_>>();
+
+    for (line_index, raw_line) in raw_lines.iter().copied().enumerate() {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(delimiter) = pending.front() {
+            let candidate = if delimiter.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if candidate == delimiter.value {
+                pending.pop_front();
+            }
+            continue;
+        }
+
+        let Some(delimiters) = heredoc_delimiters(line) else {
+            return true;
+        };
+        if delimiters.is_empty() {
+            control.push_str(raw_line);
+            continue;
+        }
+        if !heredoc_sequence_closes(&raw_lines, line_index + 1, &delimiters)
+            || !is_literal_data_heredoc(line, &control, &delimiters)
+        {
+            return true;
+        }
+        control.push_str(raw_line);
+        pending.extend(delimiters);
+    }
+
+    false
+}
+
+fn has_shell_test_command(command: &str) -> bool {
+    command.split([';', '\n', '&', '|']).any(|segment| {
+        let command = segment.trim_start();
+        command == "test"
+            || command.starts_with("test ")
+            || command == "["
+            || command.starts_with("[ ")
+            || command == "[["
+            || command.starts_with("[[ ")
+            || command.starts_with("if [ ")
+            || command.starts_with("if [[ ")
+    })
+}
+
+fn has_structured_shell_assertion(command: &str) -> bool {
+    ["fail", "rc", "status"].iter().any(|variable| {
+        command.contains(&format!("{variable}=0"))
+            && (command.contains(&format!("exit ${variable}"))
+                || command.contains(&format!("exit \"${variable}\"")))
+    }) && !contains_any(
+        command,
+        &[
+            "apply_patch",
+            "sed -i",
+            "perl -pi",
+            "tee ",
+            "cat >",
+            "cat >>",
+            "touch ",
+            "mkdir ",
+            "rm ",
+            "mv ",
+            "cp ",
+            "install ",
+            "git apply",
+        ],
+    ) && !has_non_transient_output_redirect(command)
+}
+
 fn heredoc_delimiters(line: &str) -> Option<Vec<HeredocDelimiter>> {
     let bytes = line.as_bytes();
     let mut delimiters = Vec::new();
@@ -755,6 +860,13 @@ fn heredoc_delimiters(line: &str) -> Option<Vec<HeredocDelimiter>> {
                 || matches!(bytes[index - 1], b';' | b'|' | b'&' | b'(' | b')'))
         {
             break;
+        }
+        if byte == b'<'
+            && bytes.get(index + 1) == Some(&b'<')
+            && is_inside_shell_arithmetic(&line[..index])
+        {
+            index += 2;
+            continue;
         }
         if byte != b'<'
             || bytes.get(index + 1) != Some(&b'<')
@@ -824,6 +936,16 @@ fn heredoc_delimiters(line: &str) -> Option<Vec<HeredocDelimiter>> {
     }
 
     Some(delimiters)
+}
+
+fn is_inside_shell_arithmetic(prefix: &str) -> bool {
+    let Some(open) = prefix.rfind("((") else {
+        return false;
+    };
+    match prefix.rfind("))") {
+        Some(close) => close < open,
+        None => true,
+    }
 }
 
 fn is_literal_data_heredoc(
@@ -1116,6 +1238,119 @@ fn is_project_test_command(command: &str) -> bool {
     )
 }
 
+fn has_machine_checked_assertion(command: &str) -> bool {
+    if has_opaque_executable_heredoc(command) {
+        return false;
+    }
+    let lower = shell_control_text(command).to_ascii_lowercase();
+    let masks_assertion_failure = contains_any(&lower, &["|| true", "|| :"]);
+    let contains_machine_check = is_project_test_command(&lower)
+        || is_dedicated_verifier_command(&lower)
+        || has_structured_shell_assertion(&lower)
+        || has_shell_test_command(&lower)
+        || contains_machine_check_marker(&lower);
+    contains_machine_check && !masks_assertion_failure && machine_check_controls_exit_status(&lower)
+}
+
+fn contains_machine_check_marker(command: &str) -> bool {
+    contains_any(
+        command,
+        &[
+            "assert ",
+            "assert(",
+            "assert_eq!",
+            "assert_ne!",
+            ".toequal(",
+            ".tobe(",
+            "cmp ",
+            "diff ",
+            "grep -q",
+            "jq -e",
+        ],
+    )
+}
+
+fn machine_check_controls_exit_status(command: &str) -> bool {
+    if has_structured_shell_assertion(command) {
+        return true;
+    }
+
+    if let Some(failure_branch) = command.rsplit_once("|| {").map(|(_, branch)| branch) {
+        if has_nonzero_exit_or_return(failure_branch) {
+            return true;
+        }
+    }
+    if command.contains("if ")
+        && command.contains("then")
+        && command.contains("fi")
+        && has_nonzero_exit_or_return(command)
+    {
+        return true;
+    }
+
+    command
+        .split([';', '\n'])
+        .rev()
+        .map(str::trim)
+        .find(|segment| !segment.is_empty())
+        .is_some_and(|tail| {
+            is_project_test_command(tail)
+                || is_dedicated_verifier_command(tail)
+                || has_shell_test_command(tail)
+                || contains_machine_check_marker(tail)
+        })
+}
+
+fn has_nonzero_exit_or_return(command: &str) -> bool {
+    contains_any(command, &["exit 1", "exit $", "return 1", "return $"])
+}
+
+fn is_dedicated_verifier_command(command: &str) -> bool {
+    contains_any(
+        command,
+        &[
+            "verify.py",
+            "verify.sh",
+            "verify.js",
+            "verify.ts",
+            "check.py",
+            "check.sh",
+            "check.js",
+            "check.ts",
+        ],
+    )
+}
+
+fn instruction_requires_machine_checked_behavior(instruction: &str) -> bool {
+    let lower = instruction.to_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "should output",
+            "must output",
+            "expected output",
+            "should print",
+            "must print",
+            "should return",
+            "must return",
+            "should give",
+            "must give",
+            " outputs ",
+            " returns ",
+            "应该输出",
+            "应输出",
+            "必须输出",
+            "输出应为",
+            "输出为",
+            "应该返回",
+            "应返回",
+            "必须返回",
+            "返回值",
+            "期望输出",
+        ],
+    )
+}
+
 fn is_functional_probe(command: &str) -> bool {
     let loopback =
         command.contains("localhost") || command.contains("127.0.0.1") || command.contains("[::1]");
@@ -1308,6 +1543,10 @@ pub struct CompletionEvidence {
     pub outcome_count: u64,
     pub last_mutation_sequence: Option<u64>,
     pub last_successful_verification_sequence: Option<u64>,
+    #[serde(default)]
+    pub machine_checked_behavior_required: bool,
+    #[serde(default)]
+    pub last_machine_checked_verification_sequence: Option<u64>,
     pub last_failure_sequence: Option<u64>,
     pub last_service_start_sequence: Option<u64>,
     pub last_service_pid_evidence_sequence: Option<u64>,
@@ -1574,6 +1813,8 @@ pub struct CompletionGate {
     outcome_count: u64,
     last_mutation_sequence: Option<u64>,
     last_successful_verification_sequence: Option<u64>,
+    machine_checked_behavior_required: bool,
+    last_machine_checked_verification_sequence: Option<u64>,
     last_failure_sequence: Option<u64>,
     last_service_start_sequence: Option<u64>,
     last_service_pid_evidence_sequence: Option<u64>,
@@ -1688,6 +1929,8 @@ impl CompletionGate {
         );
         gate.source_change_required = source_change_required;
         gate.required_observable_states = extract_expected_state_markers(instruction);
+        gate.machine_checked_behavior_required =
+            require_action && instruction_requires_machine_checked_behavior(instruction);
         gate
     }
 
@@ -1702,6 +1945,8 @@ impl CompletionGate {
             outcome_count: 0,
             last_mutation_sequence: None,
             last_successful_verification_sequence: None,
+            machine_checked_behavior_required: false,
+            last_machine_checked_verification_sequence: None,
             last_failure_sequence: None,
             last_service_start_sequence: None,
             last_service_pid_evidence_sequence: None,
@@ -1730,6 +1975,20 @@ impl CompletionGate {
 
     pub fn record(&mut self, outcome: &ToolOutcome) {
         self.outcome_count += 1;
+        let machine_checked_behavior = has_machine_checked_assertion(&outcome.command);
+        let behavior_verification_satisfied =
+            !self.machine_checked_behavior_required || machine_checked_behavior;
+        if outcome.succeeded()
+            && machine_checked_behavior
+            && matches!(
+                outcome.kind,
+                ToolKind::Verification
+                    | ToolKind::RuntimeProbe
+                    | ToolKind::FunctionalProbe { bounded: true }
+            )
+        {
+            self.last_machine_checked_verification_sequence = Some(outcome.sequence);
+        }
         if is_source_mutation(outcome) {
             self.last_source_mutation_sequence = Some(outcome.sequence);
         }
@@ -1759,7 +2018,9 @@ impl CompletionGate {
                 && is_external_source_runtime_command(&outcome.command)
             {
                 self.last_external_source_runtime_sequence = Some(outcome.sequence);
-                if self.last_failed_verification_command.is_none() {
+                if self.last_failed_verification_command.is_none()
+                    && behavior_verification_satisfied
+                {
                     self.last_successful_verification_sequence = Some(outcome.sequence);
                 }
             }
@@ -1796,7 +2057,7 @@ impl CompletionGate {
                     self.last_successful_project_test_sequence = Some(outcome.sequence);
                 }
             }
-            if outcome.succeeded() {
+            if outcome.succeeded() && behavior_verification_satisfied {
                 let scope_was_narrowed = self
                     .last_failed_verification_command
                     .as_deref()
@@ -1818,6 +2079,7 @@ impl CompletionGate {
         }
         if matches!(outcome.kind, ToolKind::RuntimeProbe)
             && outcome.succeeded()
+            && behavior_verification_satisfied
             && self.last_failed_verification_command.is_none()
             && self
                 .last_mutation_sequence
@@ -1829,7 +2091,7 @@ impl CompletionGate {
             && outcome.succeeded()
         {
             self.last_bounded_probe_sequence = Some(outcome.sequence);
-            if self.last_failed_verification_command.is_none() {
+            if self.last_failed_verification_command.is_none() && behavior_verification_satisfied {
                 self.last_successful_verification_sequence = Some(outcome.sequence);
             }
         }
@@ -1875,14 +2137,24 @@ impl CompletionGate {
             || self.last_mutation_sequence.is_some()
             || self.last_failure_sequence.is_some();
         if verification_required {
-            match self.last_successful_verification_sequence {
-                Some(sequence) if sequence > verification_floor => {}
-                Some(_) => blockers.push(
-                    "successful verification must be later than the last mutation or failed tool"
+            if self.machine_checked_behavior_required
+                && !self
+                    .last_machine_checked_verification_sequence
+                    .is_some_and(|sequence| sequence > verification_floor)
+            {
+                blockers.push(
+                    "the requested output or return value requires a later machine-checked assertion that exits nonzero on mismatch; printing expected and actual values is diagnostic evidence, not verification"
                         .to_owned(),
-                ),
-                None => {
-                    blockers.push("at least one successful verification is required".to_owned())
+                );
+            } else {
+                match self.last_successful_verification_sequence {
+                    Some(sequence) if sequence > verification_floor => {}
+                    Some(_) => blockers.push(
+                        "successful verification must be later than the last mutation or failed tool"
+                            .to_owned(),
+                    ),
+                    None => blockers
+                        .push("at least one successful verification is required".to_owned()),
                 }
             }
         }
@@ -2009,6 +2281,9 @@ impl CompletionGate {
             outcome_count: self.outcome_count,
             last_mutation_sequence: self.last_mutation_sequence,
             last_successful_verification_sequence: self.last_successful_verification_sequence,
+            machine_checked_behavior_required: self.machine_checked_behavior_required,
+            last_machine_checked_verification_sequence: self
+                .last_machine_checked_verification_sequence,
             last_failure_sequence: self.last_failure_sequence,
             last_service_start_sequence: self.last_service_start_sequence,
             last_service_pid_evidence_sequence: self.last_service_pid_evidence_sequence,
@@ -3416,10 +3691,37 @@ mod tests {
             );
         }
 
-        assert_ne!(
+        assert_eq!(
             classify_command("value=$((1 << 2)); printf '%s\\n' \"$value\"", 30_000),
-            ToolKind::BackgroundServiceStart
+            ToolKind::ReadOnly
         );
+        assert_eq!(
+            classify_command("(( value = 1 << 2 )); printf '%s\\n' \"$value\"", 30_000),
+            ToolKind::ReadOnly
+        );
+    }
+
+    #[test]
+    fn executable_interpreter_heredoc_cannot_masquerade_as_a_shell_test() {
+        let command = concat!(
+            "python3 <<'PY'\n",
+            "test = 'diagnostic fixture'\n",
+            "print('Expected: 42')\n",
+            "PY\n",
+        );
+
+        assert_eq!(classify_command(command, 30_000), ToolKind::Mutation);
+    }
+
+    #[test]
+    fn inline_interpreter_workspace_write_is_a_mutation() {
+        let command = concat!(
+            "python3 -c \"\n",
+            "with open('cli.py','w') as f: f.write('print(42)')\n",
+            "\" && cat cli.py",
+        );
+
+        assert_eq!(classify_command(command, 30_000), ToolKind::Mutation);
     }
 
     #[test]
@@ -3666,6 +3968,75 @@ mod tests {
     }
 
     #[test]
+    fn explicit_expected_behavior_requires_a_machine_checked_probe() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Repair the CLI. Running `./tool 6` should output 42.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+
+        let mut printed_only = outcome(2, ToolKind::RuntimeProbe, 0);
+        printed_only.command = "./tool 6".to_owned();
+        printed_only.stdout = "0\nExpected: 42\n".to_owned();
+        gate.record(&printed_only);
+        let evidence = gate.evidence();
+        assert!(!evidence.completed);
+        assert!(
+            evidence
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("machine-check")),
+            "blockers: {:?}",
+            evidence.blockers
+        );
+
+        let mut build_only = outcome(3, ToolKind::Verification, 0);
+        build_only.command = "cargo build".to_owned();
+        gate.record(&build_only);
+        assert!(!gate.evidence().completed);
+
+        let mut masked = outcome(4, ToolKind::Verification, 0);
+        masked.command = "./tool 6 | grep -qx 42 || true".to_owned();
+        gate.record(&masked);
+        assert!(!gate.evidence().completed);
+
+        let mut swallowed = outcome(5, ToolKind::Verification, 0);
+        swallowed.command = "./tool 6 | grep -qx 42; echo done".to_owned();
+        gate.record(&swallowed);
+        assert!(!gate.evidence().completed);
+
+        let mut asserted = outcome(6, ToolKind::Verification, 0);
+        asserted.command = "actual=$(./tool 6); test \"$actual\" = 42".to_owned();
+        asserted.stdout = "".to_owned();
+        gate.record(&asserted);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn explicit_nonzero_if_branch_is_a_machine_checked_probe() {
+        assert!(has_machine_checked_assertion(
+            "output=$(./tool 6); if [ \"$output\" != 42 ]; then exit 1; fi"
+        ));
+        assert!(!has_machine_checked_assertion(
+            "output=$(./tool 6); if [ \"$output\" != 42 ]; then echo mismatch; fi"
+        ));
+    }
+
+    #[test]
+    fn dedicated_verifier_can_machine_check_explicit_behavior() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Repair the processor; summarize(values) should return sorted squares.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut verifier = outcome(2, ToolKind::RuntimeProbe, 0);
+        verifier.command = "python3 verify.py".to_owned();
+        verifier.stdout = "PUBLIC_ACCEPTANCE_OK\n".to_owned();
+        gate.record(&verifier);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
     fn structured_shell_assertion_cannot_hide_a_workspace_write() {
         for command in [
             "FAIL=0; printf x > src/file.rs; exit $FAIL",
@@ -3682,6 +4053,19 @@ mod tests {
 
         let temporary = "FAIL=0; grep forbidden . >/tmp/residual.txt || true; exit $FAIL";
         assert_eq!(classify_command(temporary, 300_000), ToolKind::Verification);
+    }
+
+    #[test]
+    fn runtime_assertion_cannot_hide_a_workspace_write() {
+        let command = concat!(
+            "cat > cli.py <<'EOF'\n",
+            "print(42)\n",
+            "EOF\n",
+            "output=$(python3 cli.py)\n",
+            "[ \"$output\" = \"42\" ] || { exit 1; }\n",
+        );
+
+        assert_eq!(classify_command(command, 300_000), ToolKind::Mutation);
     }
 
     #[test]
@@ -4024,6 +4408,9 @@ mod tests {
         assert!(normalized_contract.contains("named tool, library, model, version, or revision"));
         assert!(normalized_contract.contains("before-and-after observable state"));
         assert!(normalized_contract.contains("required output artifact"));
+        assert!(normalized_contract.contains("machine-checked assertion"));
+        assert!(normalized_contract
+            .contains("printing expected and actual values is diagnostic evidence"));
 
         let ready = build_completion_ready_prompt();
         assert!(ready.contains("named tool, library, model, version, or revision"));

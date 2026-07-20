@@ -1254,6 +1254,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_output_rejects_print_only_probe_until_machine_assertion() {
+        let (base_url, server) = fake_openai_server(vec![
+            fake_tool_response("mutation-1", "printf fixed > result.txt"),
+            fake_tool_response("runtime-1", "./tool 6"),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "The command ran successfully."
+                    }
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+            fake_tool_response("assert-1", "actual=$(./tool 6); test \"$actual\" = 42"),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Repaired and machine-verified the expected output."
+                    }
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+        ]);
+
+        let (test_input, run_input) = tokio::io::duplex(16 * 1024);
+        let (run_output, test_output) = tokio::io::duplex(16 * 1024);
+        let runner = tokio::spawn(async move {
+            let mut input = BufReader::new(run_input);
+            let mut output = run_output;
+            run(&mut input, &mut output).await
+        });
+        let mut input = test_input;
+        let mut output = BufReader::new(test_output);
+
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "start",
+                "instruction": "Repair the CLI. Running ./tool 6 should output 42.",
+                "model": "fake-model",
+                "api_key": "test-key",
+                "base_url": base_url,
+                "max_steps": 8,
+                "model_timeout_sec": 5,
+                "shell_timeout_sec": 60,
+                "allow_network": false,
+                "policy_profile": "product",
+                "execution_contract_sha256": execution_contract_sha256()
+            }),
+        )
+        .await;
+
+        for (id, stdout) in [("mutation-1", ""), ("runtime-1", "0\n")] {
+            let request = read_test_output(&mut output).await;
+            assert_eq!(request["type"], "tool_request");
+            assert_eq!(request["id"], id);
+            write_test_line(
+                &mut input,
+                &json!({
+                    "type": "tool_result",
+                    "id": id,
+                    "return_code": 0,
+                    "stdout": stdout,
+                    "stderr": "",
+                    "error": null
+                }),
+            )
+            .await;
+        }
+
+        let assertion = read_test_output(&mut output).await;
+        assert_eq!(assertion["type"], "tool_request");
+        assert_eq!(assertion["id"], "assert-1");
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "tool_result",
+                "id": "assert-1",
+                "return_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "error": null
+            }),
+        )
+        .await;
+
+        let finished = read_test_output(&mut output).await;
+        assert_eq!(finished["type"], "finished");
+        assert_eq!(finished["completion_evidence"]["completed"], true);
+        assert_eq!(
+            finished["completion_evidence"]["machine_checked_behavior_required"],
+            true
+        );
+        assert_eq!(
+            finished["completion_evidence"]["last_machine_checked_verification_sequence"],
+            3
+        );
+
+        runner.await.unwrap().unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        let recovery_messages = requests[3]["messages"].as_array().unwrap();
+        assert!(recovery_messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("machine-checked assertion"))
+        }));
+    }
+
+    #[tokio::test]
     async fn post_mutation_inspection_budget_forces_action_before_more_reads() {
         let (base_url, server) = fake_openai_server(vec![
             fake_tool_response("mutation-1", "printf fixed > result.txt"),
