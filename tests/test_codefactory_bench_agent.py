@@ -529,9 +529,42 @@ print("not-json", flush=True)
                 def close(self) -> None:
                     return None
 
-            class EmptyStdout:
+            class ToolThenEmptyStdout:
+                def __init__(self) -> None:
+                    self.lines = [
+                        json.dumps(
+                            {
+                                "type": "tool_request",
+                                "id": "call-usage",
+                                "command": "printf ok",
+                                "timeout_sec": 5,
+                                "usage": {
+                                    "prompt_tokens": 120,
+                                    "completion_tokens": 30,
+                                    "total_tokens": 150,
+                                    "model_requests": 2,
+                                },
+                            }
+                        ).encode("utf-8")
+                        + b"\n",
+                        json.dumps(
+                            {
+                                "type": "event",
+                                "name": "usage_snapshot",
+                                "usage": {
+                                    "prompt_tokens": 200,
+                                    "completion_tokens": 50,
+                                    "total_tokens": 250,
+                                    "model_requests": 3,
+                                },
+                            }
+                        ).encode("utf-8")
+                        + b"\n",
+                        b"",
+                    ]
+
                 async def readline(self) -> bytes:
-                    return b""
+                    return self.lines.pop(0)
 
             class ErrorStderr:
                 async def read(self) -> bytes:
@@ -539,7 +572,7 @@ print("not-json", flush=True)
 
             class AlreadyExitedProcess:
                 stdin = FakeStdin()
-                stdout = EmptyStdout()
+                stdout = ToolThenEmptyStdout()
                 stderr = ErrorStderr()
                 returncode = 1
 
@@ -576,6 +609,15 @@ print("not-json", flush=True)
             self.assertEqual(metadata["mode"], "model-backed")
             self.assertEqual(metadata["status"], "failed")
             self.assertEqual(metadata["failure"]["type"], "RuntimeError")
+            self.assertEqual(
+                metadata["usage"],
+                {
+                    "prompt_tokens": 200,
+                    "completion_tokens": 50,
+                    "total_tokens": 250,
+                    "model_requests": 3,
+                },
+            )
             self.assertEqual(metadata["integrity"]["contamination_scan"], "pass")
 
 

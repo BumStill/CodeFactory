@@ -292,6 +292,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
                 "execution_contract_sha256": contract_sha,
                 "network_policy": network_policy,
                 "execution_budget_sec": self._execution_budget_sec(),
+                "usage": self._latest_usage_snapshot(trajectory),
                 "tool_calls": sum(
                     1 for item in trajectory if item.get("type") == "tool_request"
                 ),
@@ -528,7 +529,35 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
             "content",
             "step",
         }
-        return {key: value for key, value in message.items() if key in allowed}
+        redacted = {key: value for key, value in message.items() if key in allowed}
+        usage = CodeFactoryAgent._usage_snapshot(message.get("usage"))
+        if usage:
+            redacted["usage"] = usage
+        return redacted
+
+    @staticmethod
+    def _usage_snapshot(value: object) -> dict[str, int]:
+        if not isinstance(value, dict):
+            return {}
+        fields = (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "model_requests",
+        )
+        return {
+            field: value[field]
+            for field in fields
+            if type(value.get(field)) is int and value[field] >= 0
+        }
+
+    @staticmethod
+    def _latest_usage_snapshot(trajectory: list[dict[str, Any]]) -> dict[str, int]:
+        for item in reversed(trajectory):
+            usage = CodeFactoryAgent._usage_snapshot(item.get("usage"))
+            if usage:
+                return usage
+        return {}
 
     def _tool_execution_env(self) -> dict[str, str]:
         env = {

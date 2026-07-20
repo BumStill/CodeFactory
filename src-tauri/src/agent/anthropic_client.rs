@@ -66,14 +66,14 @@ pub async fn stream_anthropic(
         body["tools"] = serde_json::Value::Array(anthropic_tools);
     }
 
-    let response = http
-        .post(&url)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
+    let response = crate::http_util::send_with_retry("Anthropic messages request", || {
+        http.post(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&body)
+    })
+    .await?;
     let response = crate::http_util::check_status(response).await?;
 
     let mut byte_stream = response.bytes_stream();

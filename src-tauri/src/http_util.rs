@@ -67,7 +67,11 @@ where
     N: FnMut(RetryNotice),
 {
     for attempt in 1..=MODEL_HTTP_MAX_ATTEMPTS {
-        match build_request().send().await {
+        match build_request()
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .send()
+            .await
+        {
             Ok(response) => {
                 let status = response.status();
                 if attempt < MODEL_HTTP_MAX_ATTEMPTS && is_retryable_status(status) {
@@ -241,7 +245,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        mpsc, Arc,
     };
 
     fn serve_statuses(statuses: Vec<&'static str>) -> (String, Arc<AtomicUsize>) {
@@ -305,5 +309,35 @@ mod tests {
         assert_eq!(notices[0].attempt, 1);
         assert_eq!(notices[0].max_attempts, 3);
         assert!(notices[0].reason.contains("HTTP 503"));
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_requests_identity_encoding() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (request_tx, request_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).expect("read request");
+            request_tx
+                .send(String::from_utf8_lossy(&request[..count]).into_owned())
+                .expect("send captured request");
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        let client = Client::new();
+
+        send_with_retry("test model request", || client.post(&url))
+            .await
+            .expect("request should succeed");
+
+        let request = request_rx.recv().expect("captured request").to_lowercase();
+        assert!(
+            request.contains("accept-encoding: identity\r\n"),
+            "{request}"
+        );
     }
 }
