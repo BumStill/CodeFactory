@@ -11,7 +11,11 @@ shared by the desktop Agent and headless evaluation runtime.
    run a relevant verification command. A successful verification must be later
    than the last mutation. A prior green result is stale after another change.
    Environment, path, version, or dependency inspection is diagnostic evidence,
-   not verification of the requested behavior.
+   not verification of the requested behavior. When the request explicitly says
+   the user expects to see or wait for a visible state, the functional probe must
+   capture that state after the last relevant mutation or service start; process
+   liveness, an open port, transport connection, and command acknowledgement are
+   insufficient.
 3. For source-build work, prove the build, installation or usable artifact,
    runtime behavior outside the source directory, and project tests when those
    stages apply. Enumerate the actual build inputs from manifests and build
@@ -47,9 +51,14 @@ shared by the desktop Agent and headless evaluation runtime.
    stage ordering evidence and will be rejected at the delivery checkpoint.
 4. For a background service, record its PID and log destination, use bounded
    readiness checks, and run a real client or functional probe. Starting a
-   process is not completion. For any state-changing control path, capture
-   before-and-after observable state and assert that the requested change
-   occurred; a command acknowledgement alone is not functional evidence.
+   process is not completion. Classify background execution from shell control
+   syntax only. Ignore control syntax inside a heredoc only when the complete,
+   expansion-disabled payload is direct source data for the standard `cat` or
+   `tee` command. Executable, unquoted, piped, process-substituted, redefined,
+   custom-command, or unclosed heredocs remain fail-closed. For any state-changing
+   control path, capture before-and-after observable state and assert that the
+   requested change occurred; a command acknowledgement alone is not functional
+   evidence.
 5. A failed command is diagnostic evidence, not completion. Diagnose, repair,
    and rerun the smallest relevant check. A timeout or tool transport failure
    must remain a failed tool result that the Agent can diagnose; it must not
