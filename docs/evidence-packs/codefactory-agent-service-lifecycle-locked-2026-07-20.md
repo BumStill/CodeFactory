@@ -37,7 +37,7 @@
 
 `tools::bash::tests::background_service_survives_after_the_shell_tool_returns` 直接调用 CodeFactory 桌面 bash tool，启动重定向日志的后台 `sleep`，在工具调用返回后通过 PID 确认进程仍存活，再精确清理该 PID。`background_service_without_redirect_cannot_hold_output_pipes_forever` 覆盖后台进程同时继承两侧输出管道；`background_service_holding_only_stderr_preserves_completed_stdout` 覆盖仅 stderr 未关闭，确认工具有界返回、保留已完成 stdout 且后台 PID 仍存活。对应 timeout 测试同时确认超时命令的后代不会存活。Harbor bridge 另有 Linux-only CI 测试真实执行 Bash 专属语法，并实际启动和清理 `setsid` 进程组；macOS 本地因系统不提供 `setsid` 跳过这两项，由 PR Linux runner 提供最终证据。
 
-两轮独立审查提出的单侧 reader、workspace redirect 伪验证、失败/元数据型源码编辑、Bash 降级、preflight fail-open、预期负向状态误判和 model deadline 等问题均已先由新增测试复现失败，再由共享产品路径或评测基础设施修复。第二轮进一步覆盖无空格/fd 前缀重定向、复合命令扩大 absence 豁免、以及失败 compound edit 无法证明编辑阶段成功三个反例。当前本地全量结果：桌面 Rust `375 passed / 6 ignored`，共享 core `73 / 73`，headless `15 / 15`，Python `85 / 85` 且 Linux-only `setsid` 两项在 macOS 跳过；前端 `226 / 226` 和 production build 通过。最终 Linux-only 结果仍以 PR CI 为准。
+两轮独立审查提出的单侧 reader、workspace redirect 伪验证、失败/元数据型源码编辑、Bash 降级、preflight fail-open、预期负向状态误判和 model deadline 等问题均已先由新增测试复现失败，再由共享产品路径或评测基础设施修复。第二轮进一步覆盖无空格/fd 前缀重定向、复合命令扩大 absence 豁免、以及失败 compound edit 无法证明编辑阶段成功三个反例。当前本地全量结果：桌面 Rust `375 passed / 6 ignored`，共享 core `73 / 73`，headless `15 / 15`，Python `86 / 86` 且 Linux-only `setsid` 两项在 macOS 跳过；前端 `226 / 226` 和 production build 通过。PR CI 已新增 Ubuntu job，固定安装 `harbor==0.15.0` 并运行同一 Python 全量，使两项 Linux-only 测试成为自动合并门禁。
 
 ## 证据边界
 
