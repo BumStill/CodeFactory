@@ -7,9 +7,11 @@ name: Auto Release
 # user-facing change (feat/fix) to ship. See docs/principles/release-cadence.md.
 #
 # It then determines the version slot from ALL commits since the last tag,
-# bumps the three version files, pushes a vX.Y.Z tag, and lets release.yml
-# build + publish. Bump commits ("chore: bump version to …") are excluded so
-# they can never themselves cause a release.
+# bumps the three version files, pushes a vX.Y.Z tag, then dispatches
+# release.yml from main with that tag. Running Release on the default branch
+# lets consecutive versions share GitHub cache scope while every build still
+# checks out the immutable tag. Bump commits ("chore: bump version to …") are
+# excluded so they can never themselves cause a release.
 
 on:
   workflow_dispatch:
@@ -23,6 +25,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   release:
@@ -30,10 +33,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
-          # Use a PAT so the tag push can trigger release.yml.
-          # GITHUB_TOKEN pushes are intentionally blocked from triggering
-          # further workflows (GitHub's loop-prevention mechanism).
+          # RELEASE_PAT remains supported for repositories whose branch rules
+          # require it; GITHUB_TOKEN is enough for the explicit dispatch below.
           token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Configure git
@@ -170,3 +173,12 @@ jobs:
               sleep $((n * 10))
             done
           done
+
+      - name: Dispatch release build from main
+        if: steps.slot.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          gh workflow run release.yml --ref main -f tag="$TAG"
+          echo "Dispatched Release for $TAG from main"
