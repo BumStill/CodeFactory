@@ -69,6 +69,31 @@ describe("tasks store", () => {
     });
   });
 
+  it("lets the backend resolve knowledge resources when the caller omits context", async () => {
+    const tasks: TaskInput[] = [{
+      tmp_id: "t-0",
+      title: "生成路线图",
+      description: "使用后台资源",
+      cwd: "/Users/x/proj",
+    }];
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "create_task_tree") return Promise.resolve(["task-1"]);
+      if (cmd === "list_tasks") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+
+    await useTasksStore.getState().createTaskTree("s1", tasks, []);
+
+    expect(mocks.invoke).toHaveBeenCalledWith("create_task_tree", {
+      sessionId: "s1",
+      tasksIn: tasks,
+      dependencies: [],
+      context: null,
+      specReqId: null,
+      specTitle: null,
+    });
+  });
+
   it("tags created tasks with their source spec when provided", async () => {
     mocks.invoke.mockImplementation((cmd: string) => {
       if (cmd === "create_task_tree") return Promise.resolve(["task-1"]);

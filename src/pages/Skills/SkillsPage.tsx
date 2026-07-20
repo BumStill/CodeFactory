@@ -10,6 +10,10 @@ interface SkillsPageProps {
   onBack: () => void;
 }
 
+interface SkillsPanelProps {
+  onBack?: () => void;
+}
+
 type Tab = "installed" | "marketplace";
 
 interface MarketplaceSkill {
@@ -28,6 +32,10 @@ const REGISTRY_URL =
   "https://raw.githubusercontent.com/BumStill/codefactory-skills/main/registry.json";
 
 export function SkillsPage({ onBack }: SkillsPageProps) {
+  return <SkillsPanel onBack={onBack} />;
+}
+
+export function SkillsPanel({ onBack }: SkillsPanelProps) {
   const { skills, loading, loadSkills, enableSkill, disableSkill, installFromUrl, importFromDirectory, createSkill, updateSkill, deleteSkill, getSkillDetail } =
     useSkillsStore();
 
@@ -241,13 +249,15 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
       <aside className="w-64 flex-shrink-0 flex flex-col border-r border-border bg-surface-1">
         {/* Header */}
         <div className="flex items-center gap-1 px-3 py-2 border-b border-border">
-          <button
-            onClick={onBack}
-            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-            title="返回"
-          >
-            <ChevronLeft size={14} />
-          </button>
+          {onBack && (
+            <button
+              onClick={onBack}
+              className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+              title="返回"
+            >
+              <ChevronLeft size={14} />
+            </button>
+          )}
           <span className="flex-1 text-xs font-semibold text-gray-400 uppercase tracking-wider">
             技能
           </span>

@@ -72,6 +72,20 @@ impl From<TaskRun> for TaskRunView {
     }
 }
 
+/// Resolve the immutable knowledge snapshot persisted on every autonomous task.
+/// An empty JSON context is intentional and must not collapse to SQL NULL,
+/// because NULL denotes dynamic interactive scope while [] denies task access.
+async fn resolve_task_context_json(
+    pool: &sqlx::SqlitePool,
+    context: Option<TaskConnectorContext>,
+) -> Result<String, AppError> {
+    let resolved_context = match context {
+        Some(context) => context,
+        None => crate::knowledge::enabled_library_context(pool).await?,
+    };
+    Ok(serde_json::to_string(&resolved_context)?)
+}
+
 /// Persist a task tree. `tmp_id`s are mapped to fresh UUIDs and then dependencies
 /// are wired up. Returns the list of real DB ids in the same order as input tasks.
 #[tauri::command]
@@ -88,10 +102,7 @@ pub async fn create_task_tree(
     let mut tmp_to_real: HashMap<String, String> = HashMap::new();
     let mut real_ids: Vec<String> = Vec::with_capacity(tasks_in.len());
     let now = Utc::now().to_rfc3339();
-    let task_context_json = match context.as_ref().filter(|ctx| !ctx.is_empty()) {
-        Some(ctx) => Some(serde_json::to_string(ctx)?),
-        None => None,
-    };
+    let task_context_json = resolve_task_context_json(&pool, context).await?;
 
     for t in &tasks_in {
         let id = Uuid::new_v4().to_string();
@@ -117,7 +128,7 @@ pub async fn create_task_tree(
             error: None,
             attempt_count: 0,
             verification_results: None,
-            task_context_json: task_context_json.clone(),
+            task_context_json: Some(task_context_json.clone()),
             acceptance_criteria_json: acceptance_json,
             spec_req_id: spec_req_id.clone(),
             spec_title: spec_title.clone(),
@@ -386,6 +397,67 @@ pub async fn run_verification_now(
         .map_err(|e| e.to_string())?;
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod resource_context_tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn missing_frontend_context_serializes_an_enabled_library_snapshot() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        crate::knowledge::ensure_schema(&pool)
+            .await
+            .expect("knowledge schema");
+
+        for (id, enabled) in [("enabled-kb", 1_i64), ("disabled-kb", 0_i64)] {
+            sqlx::query(
+                "INSERT INTO knowledge_libraries
+                 (id, name, root_path, enabled, created_at, scan_status)
+                 VALUES (?, ?, ?, ?, '2026-01-01', 'completed')",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(format!("/tmp/{id}"))
+            .bind(enabled)
+            .execute(&pool)
+            .await
+            .expect("insert library");
+        }
+
+        let json = super::resolve_task_context_json(&pool, None)
+            .await
+            .expect("resolve task context");
+        let context = crate::storage::tasks::TaskConnectorContext::from_json(Some(&json))
+            .expect("parse task context");
+
+        assert_eq!(context.knowledge_library_ids(), vec!["enabled-kb"]);
+    }
+
+    #[tokio::test]
+    async fn missing_frontend_context_serializes_an_explicit_empty_scope() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        crate::knowledge::ensure_schema(&pool)
+            .await
+            .expect("knowledge schema");
+
+        let json = super::resolve_task_context_json(&pool, None)
+            .await
+            .expect("resolve empty task context");
+        let context = crate::storage::tasks::TaskConnectorContext::from_json(Some(&json))
+            .expect("empty context must still be persisted as JSON");
+
+        assert!(context.knowledge_libraries.is_empty());
+        assert!(json.contains("knowledge_libraries"));
+    }
 }
 
 // ── Auto PR creation helper ───────────────────────────────────────────────────

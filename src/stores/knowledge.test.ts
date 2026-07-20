@@ -82,6 +82,27 @@ describe("knowledge store", () => {
     expect(useKnowledgeStore.getState().scanning["kb-1"]).toBe(false);
   });
 
+  it("toggles and deletes a library through backend resource commands", async () => {
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_knowledge_libraries") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    useKnowledgeStore.setState({ libraries: [library] });
+
+    await useKnowledgeStore.getState().setLibraryEnabled("kb-1", false);
+    expect(mocks.invoke).toHaveBeenCalledWith("set_knowledge_library_enabled", {
+      libraryId: "kb-1",
+      enabled: false,
+    });
+
+    useKnowledgeStore.setState({ libraries: [library] });
+    await useKnowledgeStore.getState().deleteLibrary("kb-1");
+    expect(mocks.invoke).toHaveBeenCalledWith("delete_knowledge_library", {
+      libraryId: "kb-1",
+    });
+    expect(useKnowledgeStore.getState().libraries).toEqual([]);
+  });
+
   it("keeps existing libraries visible when loading fails", async () => {
     useKnowledgeStore.setState({ libraries: [library] });
     mocks.invoke.mockRejectedValue(new Error("db locked"));

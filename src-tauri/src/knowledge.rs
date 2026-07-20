@@ -210,6 +210,59 @@ pub async fn list_libraries(pool: &SqlitePool) -> crate::errors::Result<Vec<Know
     Ok(rows.iter().map(row_to_library).collect())
 }
 
+pub async fn set_library_enabled(
+    pool: &SqlitePool,
+    library_id: &str,
+    enabled: bool,
+) -> crate::errors::Result<()> {
+    let result = sqlx::query("UPDATE knowledge_libraries SET enabled = ? WHERE id = ?")
+        .bind(if enabled { 1_i64 } else { 0_i64 })
+        .bind(library_id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(crate::errors::AppError::Other(format!(
+            "Knowledge library '{library_id}' was not found"
+        )));
+    }
+    Ok(())
+}
+
+pub async fn delete_library(pool: &SqlitePool, library_id: &str) -> crate::errors::Result<()> {
+    let result = sqlx::query("DELETE FROM knowledge_libraries WHERE id = ?")
+        .bind(library_id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(crate::errors::AppError::Other(format!(
+            "Knowledge library '{library_id}' was not found"
+        )));
+    }
+    Ok(())
+}
+
+pub async fn enabled_library_context(
+    pool: &SqlitePool,
+) -> crate::errors::Result<crate::storage::tasks::TaskConnectorContext> {
+    let libraries = list_libraries(pool)
+        .await?
+        .into_iter()
+        .filter(|library| library.enabled)
+        .map(
+            |library| crate::storage::tasks::TaskKnowledgeLibraryContext {
+                id: library.id,
+                name: library.name,
+                root_path: library.root_path,
+                scan_status: library.scan_status,
+                last_scan_at: library.last_scan_at,
+            },
+        )
+        .collect();
+    Ok(crate::storage::tasks::TaskConnectorContext {
+        knowledge_libraries: libraries,
+    })
+}
+
 pub async fn scan_library(
     pool: &SqlitePool,
     library_id: &str,
@@ -289,7 +342,8 @@ pub async fn search(
             d.library_id, d.path, d.kind, d.title
          FROM knowledge_chunks c
          JOIN knowledge_documents d ON d.id = c.document_id
-         WHERE d.status = 'indexed'",
+         JOIN knowledge_libraries l ON l.id = d.library_id
+         WHERE d.status = 'indexed' AND l.enabled = 1",
     );
     let library_ids = effective_library_ids(&query);
     if !library_ids.is_empty() {
@@ -375,10 +429,7 @@ pub async fn get_chunk(
     })
 }
 
-pub async fn chunk_library_id(
-    pool: &SqlitePool,
-    chunk_id: &str,
-) -> crate::errors::Result<String> {
+pub async fn chunk_library_id(pool: &SqlitePool, chunk_id: &str) -> crate::errors::Result<String> {
     let row: (String,) = sqlx::query_as(
         "SELECT d.library_id
          FROM knowledge_chunks c
@@ -389,6 +440,18 @@ pub async fn chunk_library_id(
     .fetch_one(pool)
     .await?;
     Ok(row.0)
+}
+
+pub async fn library_is_enabled(
+    pool: &SqlitePool,
+    library_id: &str,
+) -> crate::errors::Result<bool> {
+    let enabled: Option<i64> =
+        sqlx::query_scalar("SELECT enabled FROM knowledge_libraries WHERE id = ?")
+            .bind(library_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(enabled.unwrap_or(0) != 0)
 }
 
 async fn library_by_root(
@@ -423,7 +486,9 @@ fn row_to_library(row: &sqlx::sqlite::SqliteRow) -> KnowledgeLibrary {
         root_path: row.try_get("root_path").unwrap_or_default(),
         enabled: row.try_get::<i64, _>("enabled").unwrap_or(1) != 0,
         created_at: row.try_get("created_at").unwrap_or_default(),
-        last_scan_at: row.try_get::<Option<String>, _>("last_scan_at").unwrap_or(None),
+        last_scan_at: row
+            .try_get::<Option<String>, _>("last_scan_at")
+            .unwrap_or(None),
         scan_status: row.try_get("scan_status").unwrap_or_else(|_| "idle".into()),
     }
 }
@@ -569,13 +634,13 @@ async fn existing_document_id(
     library_id: &str,
     path: &str,
 ) -> crate::errors::Result<Option<String>> {
-    Ok(sqlx::query_scalar(
-        "SELECT id FROM knowledge_documents WHERE library_id = ? AND path = ?",
+    Ok(
+        sqlx::query_scalar("SELECT id FROM knowledge_documents WHERE library_id = ? AND path = ?")
+            .bind(library_id)
+            .bind(path)
+            .fetch_optional(pool)
+            .await?,
     )
-    .bind(library_id)
-    .bind(path)
-    .fetch_optional(pool)
-    .await?)
 }
 
 fn extract_document(path: &Path, kind: &str) -> crate::errors::Result<Vec<ExtractedChunk>> {
@@ -784,7 +849,12 @@ fn slide_number_from_name(name: &str) -> Option<i64> {
 }
 
 fn supported_kind(path: &Path) -> Option<&'static str> {
-    match path.extension()?.to_string_lossy().to_ascii_lowercase().as_str() {
+    match path
+        .extension()?
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "docx" => Some("docx"),
         "pptx" => Some("pptx"),
         "pdf" => Some("pdf"),
@@ -918,6 +988,164 @@ mod tests {
     use uuid::Uuid;
 
     #[tokio::test]
+    async fn enabled_library_context_snapshots_only_enabled_libraries() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        super::ensure_schema(&pool).await.expect("knowledge schema");
+
+        for (id, enabled) in [("enabled-kb", 1_i64), ("disabled-kb", 0_i64)] {
+            sqlx::query(
+                "INSERT INTO knowledge_libraries
+                 (id, name, root_path, enabled, created_at, scan_status)
+                 VALUES (?, ?, ?, ?, '2026-01-01', 'completed')",
+            )
+            .bind(id)
+            .bind(format!("name-{id}"))
+            .bind(format!("/tmp/{id}"))
+            .bind(enabled)
+            .execute(&pool)
+            .await
+            .expect("insert library");
+        }
+
+        let context = super::enabled_library_context(&pool)
+            .await
+            .expect("enabled context");
+
+        assert_eq!(context.knowledge_library_ids(), vec!["enabled-kb"]);
+        assert_eq!(context.knowledge_libraries[0].root_path, "/tmp/enabled-kb");
+    }
+
+    #[tokio::test]
+    async fn unscoped_search_excludes_disabled_libraries() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        super::ensure_schema(&pool).await.expect("knowledge schema");
+
+        for (library_id, enabled) in [("enabled-kb", 1_i64), ("disabled-kb", 0_i64)] {
+            let document_id = format!("{library_id}-document");
+            sqlx::query(
+                "INSERT INTO knowledge_libraries
+                 (id, name, root_path, enabled, created_at, scan_status)
+                 VALUES (?, ?, ?, ?, '2026-01-01', 'completed')",
+            )
+            .bind(library_id)
+            .bind(library_id)
+            .bind(format!("/tmp/{library_id}"))
+            .bind(enabled)
+            .execute(&pool)
+            .await
+            .expect("insert library");
+            sqlx::query(
+                "INSERT INTO knowledge_documents
+                 (id, library_id, path, kind, hash, mtime, size, title, status, updated_at)
+                 VALUES (?, ?, ?, 'pdf', 'hash', 1, 10, 'Atlas', 'indexed', '2026-01-01')",
+            )
+            .bind(&document_id)
+            .bind(library_id)
+            .bind(format!("/tmp/{library_id}/atlas.pdf"))
+            .execute(&pool)
+            .await
+            .expect("insert document");
+            sqlx::query(
+                "INSERT INTO knowledge_chunks
+                 (id, document_id, chunk_index, content_type, text, token_estimate, metadata_json)
+                 VALUES (?, ?, 0, 'page', 'Atlas reference', 3, '{}')",
+            )
+            .bind(format!("{library_id}-chunk"))
+            .bind(&document_id)
+            .execute(&pool)
+            .await
+            .expect("insert chunk");
+        }
+
+        let results = super::search(
+            &pool,
+            super::KnowledgeSearchQuery {
+                query: "Atlas".into(),
+                library_id: None,
+                library_ids: None,
+                kind: None,
+                top_k: Some(10),
+                session_id: None,
+                task_id: None,
+            },
+        )
+        .await
+        .expect("search enabled libraries");
+
+        assert_eq!(
+            results.len(),
+            1,
+            "disabled libraries must never leak into unscoped chat search"
+        );
+        assert_eq!(results[0].library_id, "enabled-kb");
+    }
+
+    #[tokio::test]
+    async fn library_management_persists_enabled_state_and_deletes_only_the_index() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .expect("enable foreign keys");
+        super::ensure_schema(&pool).await.expect("knowledge schema");
+
+        let root = std::env::temp_dir().join(format!("codefactory-kb-manage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let source = root.join("source.docx");
+        write_docx(source.clone(), "Atlas source remains on disk");
+
+        let library = super::add_library(&pool, "fixture".into(), root.to_string_lossy().into())
+            .await
+            .expect("add library");
+        super::scan_library(&pool, &library.id)
+            .await
+            .expect("scan library");
+
+        super::set_library_enabled(&pool, &library.id, false)
+            .await
+            .expect("disable library");
+        let libraries = super::list_libraries(&pool).await.expect("list libraries");
+        assert_eq!(libraries.len(), 1);
+        assert!(!libraries[0].enabled);
+
+        super::delete_library(&pool, &library.id)
+            .await
+            .expect("delete library index");
+        assert!(super::list_libraries(&pool)
+            .await
+            .expect("list after delete")
+            .is_empty());
+        let document_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_documents")
+            .fetch_one(&pool)
+            .await
+            .expect("document count");
+        let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_chunks")
+            .fetch_one(&pool)
+            .await
+            .expect("chunk count");
+        assert_eq!(document_count, 0);
+        assert_eq!(chunk_count, 0);
+        assert!(
+            source.exists(),
+            "removing a library must not delete user source files"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn scan_library_indexes_docx_pptx_pdf_and_searches_with_source_refs() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -928,7 +1156,10 @@ mod tests {
 
         let root = std::env::temp_dir().join(format!("codefactory-kb-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create fixture root");
-        write_docx(root.join("proposal.docx"), "Reusable launch narrative for Atlas");
+        write_docx(
+            root.join("proposal.docx"),
+            "Reusable launch narrative for Atlas",
+        );
         write_pptx(root.join("strategy.pptx"), "Atlas launch slide example");
         std::fs::write(
             root.join("brief.pdf"),
@@ -963,11 +1194,15 @@ mod tests {
         assert_eq!(summary.indexed_documents, 3);
         assert_eq!(summary.failed_documents, 0);
         assert!(
-            results.iter().any(|r| r.kind == "docx" && r.path.ends_with("proposal.docx")),
+            results
+                .iter()
+                .any(|r| r.kind == "docx" && r.path.ends_with("proposal.docx")),
             "docx result should include source path, got: {results:?}"
         );
         assert!(
-            results.iter().any(|r| r.kind == "pptx" && r.slide == Some(1)),
+            results
+                .iter()
+                .any(|r| r.kind == "pptx" && r.slide == Some(1)),
             "pptx result should include slide metadata, got: {results:?}"
         );
         assert!(
@@ -1007,12 +1242,11 @@ mod tests {
             .await
             .expect("scan library");
 
-        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT path, status, error FROM knowledge_documents ORDER BY path",
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("documents");
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT path, status, error FROM knowledge_documents ORDER BY path")
+                .fetch_all(&pool)
+                .await
+                .expect("documents");
 
         let _ = std::fs::remove_dir_all(root);
 
@@ -1020,12 +1254,15 @@ mod tests {
         assert_eq!(summary.indexed_documents, 1);
         assert_eq!(summary.failed_documents, 1);
         assert!(
-            rows.iter().any(|(path, status, _)| path.ends_with("valid.docx") && status == "indexed"),
+            rows.iter()
+                .any(|(path, status, _)| path.ends_with("valid.docx") && status == "indexed"),
             "valid document should be indexed: {rows:?}"
         );
         assert!(
             rows.iter().any(|(path, status, error)| {
-                path.ends_with("broken.docx") && status == "error" && error.as_deref().unwrap_or("").contains("Invalid docx zip")
+                path.ends_with("broken.docx")
+                    && status == "error"
+                    && error.as_deref().unwrap_or("").contains("Invalid docx zip")
             }),
             "broken document should be recorded as error without aborting: {rows:?}"
         );
@@ -1035,7 +1272,8 @@ mod tests {
         let file = std::fs::File::create(path).expect("create docx");
         let mut zip = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default();
-        zip.start_file("word/document.xml", options).expect("docx xml");
+        zip.start_file("word/document.xml", options)
+            .expect("docx xml");
         write!(
             zip,
             r#"<w:document><w:body><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:body></w:document>"#,
@@ -1049,7 +1287,8 @@ mod tests {
         let file = std::fs::File::create(path).expect("create pptx");
         let mut zip = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default();
-        zip.start_file("ppt/slides/slide1.xml", options).expect("slide xml");
+        zip.start_file("ppt/slides/slide1.xml", options)
+            .expect("slide xml");
         write!(
             zip,
             r#"<p:sld><p:cSld><p:spTree><a:t>{}</a:t></p:spTree></p:cSld></p:sld>"#,
