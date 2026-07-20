@@ -3146,19 +3146,22 @@ impl ProgressTracker {
                 self.consecutive_read_only = 0;
                 self.read_only_exhausted = false;
             }
-            ToolKind::ReadOnly | ToolKind::RuntimeProbe
-                if outcome.succeeded() && !self.mutation_seen =>
-            {
+            ToolKind::ReadOnly | ToolKind::RuntimeProbe => {
                 self.consecutive_read_only += 1;
                 if self.consecutive_read_only >= self.read_only_limit && !self.read_only_exhausted {
                     self.read_only_exhausted = true;
-                    return Some(
+                    return Some(if self.mutation_seen {
+                        "The bounded post-change inspection budget is exhausted. Use the evidence \
+already collected to make the smallest corrective edit or run a bounded functional verification \
+now. Continue inspecting only if you can name a specific missing fact that blocks both actions."
+                            .to_owned()
+                    } else {
                         "The bounded inspection budget is exhausted and no implementation has \
 started. Use the evidence already collected to create the smallest candidate implementation \
 now, then run a real verification. Continue inspecting only if you can name a specific missing \
 fact that blocks implementation."
-                            .to_owned(),
-                    );
+                            .to_owned()
+                    });
                 }
             }
             _ => {
@@ -3171,6 +3174,14 @@ fact that blocks implementation."
 
     pub fn read_only_exhausted_before_mutation(&self) -> bool {
         !self.mutation_seen && self.read_only_exhausted
+    }
+
+    pub fn read_only_exhausted(&self) -> bool {
+        self.read_only_exhausted
+    }
+
+    pub fn mutation_seen(&self) -> bool {
+        self.mutation_seen
     }
 }
 
@@ -4647,12 +4658,34 @@ mod tests {
     }
 
     #[test]
-    fn mutation_resets_read_only_progress_pressure() {
+    fn mutation_starts_a_new_bounded_read_only_inspection_window() {
         let mut tracker = ProgressTracker::new(2);
         assert!(tracker.record(&outcome(1, ToolKind::ReadOnly, 0)).is_none());
         assert!(tracker.record(&outcome(2, ToolKind::Mutation, 0)).is_none());
         assert!(tracker.record(&outcome(3, ToolKind::ReadOnly, 0)).is_none());
+        let prompt = tracker.record(&outcome(4, ToolKind::ReadOnly, 0)).unwrap();
+        assert!(prompt.contains("post-change"));
+    }
+
+    #[test]
+    fn functional_probe_resets_post_mutation_inspection_pressure() {
+        let mut tracker = ProgressTracker::new(2);
+        assert!(tracker.record(&outcome(1, ToolKind::Mutation, 0)).is_none());
+        assert!(tracker.record(&outcome(2, ToolKind::ReadOnly, 0)).is_none());
+        assert!(tracker
+            .record(&outcome(3, ToolKind::FunctionalProbe { bounded: true }, 0,))
+            .is_none());
         assert!(tracker.record(&outcome(4, ToolKind::ReadOnly, 0)).is_none());
+        assert!(tracker.record(&outcome(5, ToolKind::ReadOnly, 0)).is_some());
+    }
+
+    #[test]
+    fn failed_read_only_outcome_does_not_reset_inspection_pressure() {
+        let mut tracker = ProgressTracker::new(2);
+        assert!(tracker.record(&outcome(1, ToolKind::Mutation, 0)).is_none());
+        assert!(tracker.record(&outcome(2, ToolKind::ReadOnly, 0)).is_none());
+        let prompt = tracker.record(&outcome(3, ToolKind::ReadOnly, 1)).unwrap();
+        assert!(prompt.contains("post-change"));
     }
 
     #[test]
