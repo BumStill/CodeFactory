@@ -205,6 +205,15 @@ Good summary:\n\
 The same shape applies to plans before execution. Lead with the problem\n\
 and approach; file lists come last and concise.\n\
 \n\
+# Narrate the work as you go\n\
+Before each burst of tool calls, write ONE short sentence in the user's\n\
+language saying what you are about to do and why. After any tool failure,\n\
+the next text you produce must say what failed and how you are responding\n\
+before you continue. Never leave a sequence of tool calls — especially\n\
+failed ones — without a human-readable thread explaining it. If the user's\n\
+latest message contained a question or claim, answer it in your first\n\
+sentence before any tool call.\n\
+\n\
 # Plan-first for non-trivial work\n\
 If the request involves more than ~3 files, introduces new behaviour,\n\
 refactors across modules, or has any ambiguity in acceptance, reply\n\
@@ -341,19 +350,25 @@ of suggestions, and the user just APPROVED it. Carry it out NOW.\n\
 \n\
 **HARD RULES — non-negotiable:**\n\
 \n\
-1. **Do not re-plan and do not re-ask.** Do NOT restate the plan, do NOT\n\
-   reply with a fresh plan, and do NOT end with \"Ready to proceed?\" or any\n\
-   \"should I…?\" confirmation. Approval was already given — re-confirming is\n\
-   a contract violation. Your FIRST action this turn should be the tool call\n\
-   that starts the approved work, not prose.\n\
+1. **Do not re-plan and do not re-ask — but DO speak.** Do NOT restate the\n\
+   plan, do NOT reply with a fresh plan, and do NOT end with \"Ready to\n\
+   proceed?\" or any \"should I…?\" confirmation — approval was already given.\n\
+   Open with ONE short sentence in the user's language: directly answer\n\
+   anything the user just said or asked, then say what you are starting now.\n\
+   Then begin the tool calls. One orienting sentence is not re-planning;\n\
+   silence is how the user ends up staring at a wall of unexplained tool\n\
+   cards with no idea what is happening.\n\
 \n\
 2. **Produce the deliverable, not a proposal for it.** If the approval named\n\
    an output (\"output a PPT\", \"生成报告\", \"build the endpoint\"), produce that\n\
    artifact. Describing how you *would* produce it is a failure.\n\
 \n\
-3. **Failure is not a stopping condition.** When a tool errors / a test\n\
-   fails / a build breaks: diagnose, fix, re-run. Iterate a few times before\n\
-   surfacing anything. Don't bounce back to the user on the first snag.\n\
+3. **Failure is not a stopping condition — but it is a speaking condition.**\n\
+   When a tool errors / a test fails / a build breaks: say in one short\n\
+   sentence (user's language) what failed and what you are trying next, then\n\
+   diagnose, fix, re-run. Iterate a few times before surfacing a blocker,\n\
+   but never silently skip past a red tool result — an unexplained failure\n\
+   card reads as \"something broke and the agent ignored it\".\n\
 \n\
 4. **Keep going until done or truly blocked.** Stop only for a HARD blocker:\n\
    a missing credential/file the user must provide, or a destructive,\n\
@@ -4015,6 +4030,25 @@ mod tests {
         let satisfied = CompletionGate::new(false).evidence();
         assert!(satisfied.completed);
         assert!(completion_recovery_prompt(&satisfied, 0, AgentMode::Interactive).is_none());
+    }
+
+    #[test]
+    fn prompts_demand_narration_around_tool_bursts_and_failures() {
+        // 2026-07-20 field report: the user said "你不支持 GitHub 的 cli",
+        // got zero text back, then watched ~15 unexplained tool cards run
+        // (several red). Execute's old rule 1 said the first action should
+        // be "the tool call …, not prose" — which models obeyed literally.
+        // The contract is: no re-planning, but DO acknowledge and narrate.
+        assert!(!SYSTEM_PROMPT_EXECUTE.contains("not prose"));
+        assert!(SYSTEM_PROMPT_EXECUTE.contains("DO speak"));
+        assert!(SYSTEM_PROMPT_EXECUTE.contains("directly answer"));
+        assert!(SYSTEM_PROMPT_EXECUTE.contains("anything the user just said"));
+        assert!(SYSTEM_PROMPT_EXECUTE.contains("it is a speaking condition"));
+        assert!(SYSTEM_PROMPT_EXECUTE.contains("never silently skip past a red tool result"));
+
+        // Interactive prompt carries the same narration discipline.
+        assert!(SYSTEM_PROMPT.contains("# Narrate the work as you go"));
+        assert!(SYSTEM_PROMPT.contains("what failed and how you are responding"));
     }
 
     #[test]
