@@ -459,6 +459,12 @@ pub struct AgentExecutionContext {
     pub knowledge_library_ids: Vec<String>,
 }
 
+fn knowledge_scope_for_tools(
+    execution_context: Option<&AgentExecutionContext>,
+) -> Option<Vec<String>> {
+    execution_context.map(|context| context.knowledge_library_ids.clone())
+}
+
 impl AgentLoop {
     fn emit_transport_retry(
         app: &AppHandle,
@@ -820,11 +826,9 @@ impl AgentLoop {
 
             if tool_calls.is_empty() {
                 let evidence = completion_gate.evidence();
-                if let Some(prompt) = completion_recovery_prompt(
-                    &evidence,
-                    completion_recovery_attempts,
-                    self.mode,
-                ) {
+                if let Some(prompt) =
+                    completion_recovery_prompt(&evidence, completion_recovery_attempts, self.mode)
+                {
                     completion_recovery_attempts += 1;
                     // Make the rejection visible instead of silently looping:
                     // collapse the rejected candidate in the UI, persist the
@@ -1044,11 +1048,9 @@ impl AgentLoop {
                         .execution_context
                         .as_ref()
                         .and_then(|ctx| ctx.task_id.clone()),
-                    knowledge_library_ids: self
-                        .execution_context
-                        .as_ref()
-                        .map(|ctx| ctx.knowledge_library_ids.clone())
-                        .filter(|ids| !ids.is_empty()),
+                    knowledge_library_ids: knowledge_scope_for_tools(
+                        self.execution_context.as_ref(),
+                    ),
                     settings: Some(self.settings.read().await.clone()),
                 };
 
@@ -2269,11 +2271,9 @@ impl AgentLoop {
 
             if tool_calls.is_empty() {
                 let evidence = completion_gate.evidence();
-                if let Some(prompt) = completion_recovery_prompt(
-                    &evidence,
-                    completion_recovery_attempts,
-                    self.mode,
-                ) {
+                if let Some(prompt) =
+                    completion_recovery_prompt(&evidence, completion_recovery_attempts, self.mode)
+                {
                     completion_recovery_attempts += 1;
                     // Make the rejection visible instead of silently looping:
                     // collapse the rejected candidate in the UI, persist the
@@ -2494,11 +2494,9 @@ impl AgentLoop {
                         .execution_context
                         .as_ref()
                         .and_then(|ctx| ctx.task_id.clone()),
-                    knowledge_library_ids: self
-                        .execution_context
-                        .as_ref()
-                        .map(|ctx| ctx.knowledge_library_ids.clone())
-                        .filter(|ids| !ids.is_empty()),
+                    knowledge_library_ids: knowledge_scope_for_tools(
+                        self.execution_context.as_ref(),
+                    ),
                     settings: Some(self.settings.read().await.clone()),
                 };
 
@@ -3301,6 +3299,18 @@ fn glob_match(pattern: &str, input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autonomous_empty_knowledge_scope_remains_explicitly_empty() {
+        let context = AgentExecutionContext {
+            parent_session_id: Some("parent".into()),
+            task_id: Some("task".into()),
+            knowledge_library_ids: Vec::new(),
+        };
+
+        assert_eq!(knowledge_scope_for_tools(Some(&context)), Some(Vec::new()));
+        assert_eq!(knowledge_scope_for_tools(None), None);
+    }
 
     #[tokio::test]
     async fn pending_permission_is_released_by_chat_cancellation() {

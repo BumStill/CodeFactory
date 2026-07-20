@@ -13,6 +13,8 @@ interface KnowledgeState {
   loadLibraries: () => Promise<void>;
   registerLibrary: (name: string, rootPath: string) => Promise<KnowledgeLibrary>;
   scanLibrary: (libraryId: string) => Promise<KnowledgeScanSummary>;
+  setLibraryEnabled: (libraryId: string, enabled: boolean) => Promise<void>;
+  deleteLibrary: (libraryId: string) => Promise<void>;
 }
 
 export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
@@ -63,6 +65,39 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
         scanning: { ...s.scanning, [libraryId]: false },
         error: String(e),
       }));
+      throw e;
+    }
+  },
+
+  setLibraryEnabled: async (libraryId, enabled) => {
+    set({ error: null });
+    try {
+      await invoke("set_knowledge_library_enabled", { libraryId, enabled });
+      set((s) => ({
+        libraries: s.libraries.map((library) =>
+          library.id === libraryId ? { ...library, enabled } : library,
+        ),
+      }));
+    } catch (e) {
+      set({ error: String(e) });
+      throw e;
+    }
+  },
+
+  deleteLibrary: async (libraryId) => {
+    set({ error: null });
+    try {
+      await invoke("delete_knowledge_library", { libraryId });
+      set((s) => {
+        const scanSummaries = { ...s.scanSummaries };
+        delete scanSummaries[libraryId];
+        return {
+          libraries: s.libraries.filter((library) => library.id !== libraryId),
+          scanSummaries,
+        };
+      });
+    } catch (e) {
+      set({ error: String(e) });
       throw e;
     }
   },

@@ -190,22 +190,20 @@ describe("AI task decomposition flow", () => {
     }
   });
 
-  it("opens the skills library from the workspace chrome", async () => {
-    const onOpenSkills = vi.fn();
-
+  it("keeps knowledge and skill management out of the session workspace", async () => {
     render(
       <WorkspacePage
         sessionId="s1"
         onBackHome={() => {}}
         onOpenSettings={() => {}}
         onOpenSession={() => {}}
-        onOpenSkills={onOpenSkills}
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "技能库" }));
-
-    expect(onOpenSkills).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "技能库" })).not.toBeInTheDocument();
+    expect(screen.queryByText("个人知识库")).not.toBeInTheDocument();
+    expect(screen.queryByText("添加知识库")).not.toBeInTheDocument();
+    expect(screen.queryByText("没有激活的技能")).not.toBeInTheDocument();
   });
 
   it("describes → decomposes → reviews → creates task tree end-to-end", async () => {
@@ -226,7 +224,7 @@ describe("AI task decomposition flow", () => {
     });
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     // Open the modal via the empty-state CTA
@@ -246,7 +244,7 @@ describe("AI task decomposition flow", () => {
     // Both AI-suggested tasks appear, editable
     expect(screen.getByDisplayValue("搭项目骨架")).toBeInTheDocument();
     expect(screen.getByDisplayValue("做数据模型")).toBeInTheDocument();
-    expect(screen.getByText("任务上下文")).toBeInTheDocument();
+    expect(screen.queryByText("任务上下文")).not.toBeInTheDocument();
 
     // User edits the first task's title
     const titleInput = screen.getByDisplayValue("搭项目骨架");
@@ -270,17 +268,7 @@ describe("AI task decomposition flow", () => {
     expect(deps).toEqual([
       { task_tmp_id: "t-1", depends_on_tmp_id: "t-0" },
     ]);
-    expect(context).toEqual({
-      knowledge_libraries: [
-        {
-          id: "kb-1",
-          name: "历史方案库",
-          root_path: "/Users/x/Knowledge",
-          scan_status: "ready",
-          last_scan_at: "2026-05-26T00:01:00Z",
-        },
-      ],
-    });
+    expect(context).toBeUndefined();
   });
 
   it("autonomous mode: intent → decompose → create → start, no review modal", async () => {
@@ -300,7 +288,7 @@ describe("AI task decomposition flow", () => {
     });
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     // Flip the 自主 toggle on — the inline bar replaces the modal flow.
@@ -368,7 +356,7 @@ describe("AI task decomposition flow", () => {
     };
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     const repair = await screen.findByRole("button", { name: /修复可修复项/ });
@@ -416,7 +404,7 @@ describe("AI task decomposition flow", () => {
     };
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     expect(await screen.findByText("模型/Provider")).toBeInTheDocument();
@@ -469,7 +457,7 @@ describe("AI task decomposition flow", () => {
     });
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     await user.click(await screen.findByRole("button", { name: "自主" }));
@@ -509,7 +497,7 @@ describe("AI task decomposition flow", () => {
     });
 
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
     await user.click(await screen.findByText(/点这里描述需求/));
@@ -533,46 +521,15 @@ describe("AI task decomposition flow", () => {
     expect(tasks[0].title).toBe("Task B");
   });
 
-  it("shows knowledge libraries as task connectors and scans on demand", async () => {
-    const user = userEvent.setup();
-
-    mocks.invoke.mockImplementation((cmd: string, args: { libraryId?: string }) => {
-      if (cmd === "list_knowledge_libraries") {
-        return Promise.resolve([sampleLibrary]);
-      }
-      if (cmd === "scan_knowledge_library") {
-        expect(args.libraryId).toBe("kb-1");
-        return Promise.resolve({
-          library_id: "kb-1",
-          scanned_files: 3,
-          indexed_documents: 2,
-          failed_documents: 1,
-          chunks_indexed: 16,
-        });
-      }
-      return Promise.resolve(undefined);
-    });
-
+  it("does not load or manage knowledge libraries from the session", async () => {
     render(
-      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSkills={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
+      <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
-    const library = await screen.findByText("历史方案库");
-    expect(library).toBeInTheDocument();
-    expect(screen.getByText("1 个知识库")).toBeInTheDocument();
-
-    const scanButton = screen.getByTitle("扫描知识库");
-    await user.click(scanButton);
-
-    await waitFor(() => {
-      expect(mocks.invoke).toHaveBeenCalledWith("scan_knowledge_library", {
-        libraryId: "kb-1",
-      });
-    });
-    expect(await screen.findByText("2 文档 / 16 片段")).toBeInTheDocument();
-
-    await user.click(await screen.findByText(/点这里描述需求/));
-    expect(screen.getByText("知识库 1")).toBeInTheDocument();
+    await screen.findByText(/点这里描述需求/);
+    expect(mocks.invoke).not.toHaveBeenCalledWith("list_knowledge_libraries");
+    expect(screen.queryByTitle("扫描知识库")).not.toBeInTheDocument();
+    expect(screen.queryByText(/个知识库/)).not.toBeInTheDocument();
   });
 
 });

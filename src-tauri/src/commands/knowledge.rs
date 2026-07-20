@@ -41,6 +41,25 @@ pub async fn scan_knowledge_library(
 }
 
 #[tauri::command]
+pub async fn set_knowledge_library_enabled(
+    library_id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    let pool = state.db.read().await;
+    crate::knowledge::set_library_enabled(&pool, &library_id, enabled).await
+}
+
+#[tauri::command]
+pub async fn delete_knowledge_library(
+    library_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    let pool = state.db.read().await;
+    crate::knowledge::delete_library(&pool, &library_id).await
+}
+
+#[tauri::command]
 pub async fn search_knowledge(
     query: KnowledgeSearchQuery,
     state: State<'_, AppState>,

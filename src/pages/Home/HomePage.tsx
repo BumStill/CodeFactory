@@ -28,7 +28,7 @@ import type { Session, Theme } from "../../lib/tauri";
 
 interface HomePageProps {
   onOpenProject: (sessionId: string) => void;
-  onOpenSkills: () => void;
+  onOpenResources: () => void;
   onOpenControlPlane: () => void;
   onOpenBenchmarks: () => void;
   onOpenSettings: () => void;
@@ -63,7 +63,7 @@ function Brand() {
 
 export function HomePage({
   onOpenProject,
-  onOpenSkills,
+  onOpenResources,
   onOpenControlPlane,
   onOpenBenchmarks,
   onOpenSettings,
@@ -190,9 +190,9 @@ export function HomePage({
             <ShieldCheck size={14} />
           </button>
           <button
-            onClick={onOpenSkills}
+            onClick={onOpenResources}
             className="p-2 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-            title="技能库"
+            title="资源中心"
           >
             <Puzzle size={14} />
           </button>

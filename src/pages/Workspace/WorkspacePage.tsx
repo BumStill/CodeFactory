@@ -11,12 +11,11 @@ import {
   Sun,
   Monitor,
   Plus,
+  RefreshCw,
   Circle,
   CheckCircle2,
   Loader2,
   XCircle,
-  Puzzle,
-  RefreshCw,
   Sparkles,
   Trash2,
   Wand2,
@@ -30,7 +29,6 @@ import {
   PanelRightClose,
   PanelRight,
 } from "lucide-react";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
 import { SessionSidebar } from "../../components/SessionSidebar";
@@ -53,12 +51,8 @@ import { QueueBadge } from "../../components/QueueBadge";
 import { useSettingsStore } from "../../stores/settings";
 import { useTasksStore } from "../../stores/tasks";
 import { useSpecsStore } from "../../stores/specs";
-import { useSkillsStore } from "../../stores/skills";
 import { useLearningStore } from "../../stores/learning";
-import { useKnowledgeStore } from "../../stores/knowledge";
 import type {
-  KnowledgeLibrary,
-  TaskConnectorContext,
   Theme,
   TaskRun,
   TaskInput,
@@ -82,7 +76,6 @@ interface DecomposedTask {
 interface WorkspacePageProps {
   sessionId: string;
   onBackHome: () => void;
-  onOpenSkills: () => void;
   onOpenSettings: () => void;
   /** Switch the workspace to another session in-place (from the sidebar). */
   onOpenSession: (id: string) => void;
@@ -100,7 +93,7 @@ interface WorkspacePageProps {
  *   Center — Execution stream (AI work in progress + chat input)
  *   Right  — Active skills + memory increments (transparency surface)
  */
-export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSettings, onOpenSession, onOpenEvolution }: WorkspacePageProps) {
+export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSession, onOpenEvolution }: WorkspacePageProps) {
   const {
     activeSession,
     selectSession, sendOrQueue, cancelStream, removeFromQueue,
@@ -152,8 +145,8 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSetti
   });
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const sidebarCtrlRef = useRef<HTMLDivElement>(null);
-  // Right "连接器" column (knowledge / skills / memory) — informational, so a
-  // plain collapse toggle (no popover). Persisted independently of the left.
+  // Right project-insights column (environment / memory / checkpoints).
+  // Resource management lives in the backend Resources page, not this Session.
   const [connectorsCollapsed, setConnectorsCollapsed] = useState<boolean>(() => {
     try {
       return localStorage.getItem("cf.workspace.connectorsCollapsed") === "1";
@@ -329,16 +322,9 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSetti
           <BookOpen size={14} />
         </button>
         <button
-          onClick={onOpenSkills}
-          className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-          title="技能库"
-        >
-          <Puzzle size={14} />
-        </button>
-        <button
           onClick={() => setConnectorsCollapsed((v) => !v)}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-          title={connectorsCollapsed ? "显示连接器（知识库 / 技能 / 记忆）" : "收起连接器面板"}
+          title={connectorsCollapsed ? "显示项目状态（环境 / 记忆 / 检查点）" : "收起项目状态面板"}
         >
           {connectorsCollapsed ? <PanelRight size={14} /> : <PanelRightClose size={14} />}
         </button>
@@ -396,7 +382,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSetti
           />
         </main>
 
-        {/* ─── Right: connectors (collapsible — informational, not nav) ── */}
+        {/* ─── Right: project status (no knowledge/skill management) ─── */}
         {!connectorsCollapsed && (
           <aside className="w-60 shrink-0 border-l border-border bg-surface-1 flex flex-col">
             {/* 环境 — the git status bar (branch / ahead-behind / dirty count),
@@ -407,9 +393,8 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSetti
               onOpenHistory={() => setGitPanel("history")}
               onOpenRemote={() => setGitPanel("remote")}
             />
-            <ConnectorsColumn
+            <LearningActivityPanel
               cwd={activeSession?.cwd ?? null}
-              onOpenSkills={onOpenSkills}
               onOpenEvolution={
                 activeSession?.kind !== "quick" && activeSession?.kind !== "anonymous"
                   ? onOpenEvolution
@@ -489,7 +474,6 @@ function buildSpecPrompt(intent: string, reqId: string | null, title: string): s
 function TasksColumn({ sessionId }: { sessionId: string }) {
   const { tasks, running, loadTasks, subscribe, createTaskTree, start, cancel, retryFailedTasks } = useTasksStore();
   const { activeSession } = useChatStore();
-  const { libraries } = useKnowledgeStore();
   const { createSpec, saveSpec } = useSpecsStore();
   const sessionTasks: TaskRun[] = tasks[sessionId] ?? [];
   const isRunning = running[sessionId] ?? false;
@@ -554,7 +538,6 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
 
   const createFromDecomposed = async (decomposed: DecomposedTask[]) => {
     const cwd = activeSession?.cwd ?? "";
-    const knowledgeLibraries = libraries.filter((library) => library.enabled);
     const inputs: TaskInput[] = decomposed.map((d) => ({
       tmp_id: d.tmp_id,
       title: d.title,
@@ -568,12 +551,7 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
         depends_on_tmp_id: depId,
       }))
     );
-    await createTaskTree(
-      sessionId,
-      inputs,
-      deps,
-      buildTaskConnectorContext(knowledgeLibraries),
-    );
+    await createTaskTree(sessionId, inputs, deps);
   };
 
   const handleConfirm = async (decomposed: DecomposedTask[]) => {
@@ -873,7 +851,6 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
       {creatorOpen && (
         <TaskCreatorModal
           cwd={activeSession?.cwd ?? null}
-          knowledgeLibraries={libraries.filter((library) => library.enabled)}
           onCancel={() => setCreatorOpen(false)}
           onConfirm={handleConfirm}
         />
@@ -888,12 +865,11 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
 
 interface TaskCreatorModalProps {
   cwd: string | null;
-  knowledgeLibraries: KnowledgeLibrary[];
   onCancel: () => void;
   onConfirm: (tasks: DecomposedTask[]) => Promise<void>;
 }
 
-function TaskCreatorModal({ cwd, knowledgeLibraries, onCancel, onConfirm }: TaskCreatorModalProps) {
+function TaskCreatorModal({ cwd, onCancel, onConfirm }: TaskCreatorModalProps) {
   const [phase, setPhase] = useState<"input" | "decomposing" | "review">("input");
   const [request, setRequest] = useState("");
   const [tasks, setTasks] = useState<DecomposedTask[]>([]);
@@ -960,7 +936,6 @@ function TaskCreatorModal({ cwd, knowledgeLibraries, onCancel, onConfirm }: Task
         <div className="flex-1 overflow-y-auto p-4">
           {phase === "input" && (
             <>
-              <KnowledgeContextPanel knowledgeLibraries={knowledgeLibraries} />
               <textarea
                 autoFocus
                 value={request}
@@ -993,7 +968,6 @@ function TaskCreatorModal({ cwd, knowledgeLibraries, onCancel, onConfirm }: Task
 
           {phase === "review" && (
             <div className="space-y-3">
-              <KnowledgeContextPanel knowledgeLibraries={knowledgeLibraries} compact />
               <ol className="space-y-2">
                 {tasks.map((t, i) => (
                   <li
@@ -1117,11 +1091,6 @@ function buildTaskTree(tasks: TaskRun[]): { task: TaskRun; depth: number }[] {
 
 function TaskRow({ task, depth }: { task: TaskRun; depth: number }) {
   const Icon = statusIcon(task.status);
-  const context = parseTaskConnectorContext(task.task_context_json);
-  const knowledgeCount = context.knowledge_libraries.length;
-  const hasUnindexed = context.knowledge_libraries.some((library) =>
-    !["ready", "completed", "completed_with_errors"].includes(library.scan_status),
-  );
   // Surface acceptance-criteria verification right here in the task tree — the
   // "did it actually pass?" proof that previously only lived in evidence packs.
   const verif = parseVerification(task.verification_results);
@@ -1178,19 +1147,7 @@ function TaskRow({ task, depth }: { task: TaskRun; depth: number }) {
               </span>
             </div>
           )}
-          {knowledgeCount > 0 && (
-            <div
-              className="mt-0.5 flex items-center gap-1 text-[9px] text-gray-600"
-              title={context.knowledge_libraries
-                .map((library) => `${library.name} · ${scanStatusText(library.scan_status)}`)
-                .join("\n")}
-            >
-              <BookOpen size={9} className="shrink-0 text-accent" />
-              <span>知识库 {knowledgeCount}</span>
-              {hasUnindexed && <span className="text-amber-700 dark:text-amber-300">待索引</span>}
-            </div>
-          )}
-        </div>
+       </div>
       </div>
       {verifOpen && verif && (
         <div className="mb-1 ml-5 mr-1 space-y-0.5">
@@ -1250,220 +1207,40 @@ function statusColor(status: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ConnectorsColumn — shows what capabilities are currently active
+// LearningActivityPanel — Session-scoped memory review only. Knowledge and
+// skills are configured globally in ResourcesPage and are intentionally absent.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Stable empty array so selectors that fall back to it don't churn
-// referential equality every render and re-enter the store subscription.
 const EMPTY_LEARNING: LearningEventForSelector[] = [];
 
 type LearningEventForSelector = ReturnType<typeof useLearningStore.getState>["events"][string][number];
 
-function ConnectorsColumn({ cwd, onOpenSkills, onOpenEvolution }: {
+function LearningActivityPanel({ cwd, onOpenEvolution }: {
   cwd: string | null;
-  onOpenSkills: () => void;
   onOpenEvolution?: (cwd: string) => void;
 }) {
-  const { skills, loadSkills } = useSkillsStore();
   const learningEvents = useLearningStore(
-    (s) => (cwd ? s.events[cwd] ?? EMPTY_LEARNING : EMPTY_LEARNING),
+    (state) => (cwd ? state.events[cwd] ?? EMPTY_LEARNING : EMPTY_LEARNING),
   );
-  const loadLearning = useLearningStore((s) => s.load);
-  const subscribeLearning = useLearningStore((s) => s.subscribe);
+  const loadLearning = useLearningStore((state) => state.load);
+  const subscribeLearning = useLearningStore((state) => state.subscribe);
 
-  // Subscribe to learning events for the current cwd. The store dedups
-  // multiple subscribe() calls per cwd so this is safe to remount.
   useEffect(() => {
     if (!cwd) return;
     void loadLearning(cwd);
     let off: (() => void) | undefined;
-    subscribeLearning(cwd).then((u) => { off = u; });
+    subscribeLearning(cwd).then((unsubscribe) => { off = unsubscribe; });
     return () => { off?.(); };
-  }, [cwd]);
-  const {
-    libraries,
-    scanSummaries,
-    loading: knowledgeLoading,
-    scanning,
-    error: knowledgeError,
-    loadLibraries,
-    registerLibrary,
-    scanLibrary,
-  } = useKnowledgeStore();
-  const [libraryError, setLibraryError] = useState<string | null>(null);
-
-  useEffect(() => {
-    loadSkills();
-    void loadLibraries();
-  }, []);
-
-  const enabled = skills.filter((s) => s.enabled);
-  const enabledLibraries = libraries.filter((library) => library.enabled);
-  const connectorCount = enabled.length + enabledLibraries.length;
-
-  const addLibrary = async () => {
-    setLibraryError(null);
-    try {
-      const selected = await openDialog({
-        directory: true,
-        multiple: false,
-        title: "选择知识库文件夹",
-      });
-      if (typeof selected !== "string") return;
-      const name = selected.split(/[\\/]/).filter(Boolean).pop() ?? "个人知识库";
-      await registerLibrary(name, selected);
-    } catch (e) {
-      setLibraryError(String(e));
-    }
-  };
-
-  const scan = async (libraryId: string) => {
-    setLibraryError(null);
-    try {
-      await scanLibrary(libraryId);
-    } catch (e) {
-      setLibraryError(String(e));
-    }
-  };
+  }, [cwd, loadLearning, subscribeLearning]);
 
   return (
     <>
-      <div className="flex items-center gap-1.5 px-3 py-2 border-b border-border">
-        <Puzzle size={11} className="text-gray-500" />
+      <div className="flex items-center gap-1.5 border-b border-border px-3 py-2">
+        <Brain size={11} className="text-gray-500" />
         <h2 className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">
-          连接器
+          项目状态
         </h2>
-        <span className="ml-auto text-[10px] text-gray-600">{connectorCount}</span>
       </div>
-      <div className="flex-1 overflow-y-auto p-2">
-        <section className="mb-3">
-          <div className="mb-1.5 flex items-center gap-1.5 px-1">
-            <BookOpen size={11} className="text-gray-500" />
-            <h3 className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">
-              个人知识库
-            </h3>
-            <span className="ml-auto text-[10px] text-gray-600">
-              {knowledgeLoading ? "..." : `${enabledLibraries.length} 个知识库`}
-            </span>
-          </div>
-          <div className="space-y-1">
-            {enabledLibraries.length === 0 ? (
-              <button
-                onClick={addLibrary}
-                className="w-full rounded border border-dashed border-border bg-surface-2 px-2 py-3 text-center text-[11px] text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-              >
-                添加本地资料文件夹
-              </button>
-            ) : (
-              <>
-                <button
-                  onClick={addLibrary}
-                  className="flex w-full items-center justify-center gap-1 rounded border border-border bg-surface-2 px-2 py-1.5 text-[11px] text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-                >
-                  <Plus size={11} />
-                  添加知识库
-                </button>
-                <ul className="space-y-1">
-                  {enabledLibraries.map((library) => {
-                    const summary = scanSummaries[library.id];
-                    const isScanning = scanning[library.id] ?? false;
-                    return (
-                      <li
-                        key={library.id}
-                        className="rounded border border-border bg-surface-2 px-2 py-1.5"
-                        title={library.root_path}
-                      >
-                        <div className="flex items-start gap-1.5">
-                          <BookOpen size={10} className="mt-0.5 shrink-0 text-accent" />
-                          <div className="min-w-0 flex-1">
-                            <div className="truncate text-[11px] font-medium text-gray-300">
-                              {library.name}
-                            </div>
-                            <div className="truncate font-mono text-[9px] text-gray-600">
-                              {library.root_path}
-                            </div>
-                          </div>
-                          <button
-                            onClick={() => void scan(library.id)}
-                            disabled={isScanning}
-                            className="rounded p-0.5 text-gray-600 hover:text-gray-300 hover:bg-surface-3 disabled:opacity-40"
-                            title="扫描知识库"
-                          >
-                            <RefreshCw
-                              size={11}
-                              className={isScanning ? "animate-spin" : ""}
-                            />
-                          </button>
-                        </div>
-                        <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-gray-600">
-                          <span className="truncate">
-                            {summary
-                              ? `${summary.indexed_documents} 文档 / ${summary.chunks_indexed} 片段`
-                              : scanStatusText(library.scan_status)}
-                          </span>
-                          {summary && summary.failed_documents > 0 && (
-                            <span className="inline-flex items-center gap-0.5 text-amber-700 dark:text-amber-300">
-                              <AlertTriangle size={9} />
-                              {summary.failed_documents} 失败
-                            </span>
-                          )}
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
-              </>
-            )}
-          </div>
-          {(libraryError || knowledgeError) && (
-            <div className="mt-2 rounded border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-[10px] text-red-700 dark:text-red-300 break-words">
-              {libraryError || knowledgeError}
-            </div>
-          )}
-        </section>
-
-        <section>
-          <div className="mb-1.5 flex items-center gap-1.5 px-1">
-            <Sparkles size={11} className="text-gray-500" />
-            <h3 className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">
-              技能
-            </h3>
-            <span className="ml-auto text-[10px] text-gray-600">{enabled.length}</span>
-          </div>
-          {enabled.length === 0 ? (
-            <button
-              onClick={onOpenSkills}
-              className="w-full rounded px-2 py-5 text-center text-[11px] leading-relaxed text-gray-600 transition-colors hover:bg-surface-2 hover:text-gray-300"
-            >
-              没有激活的技能<br />
-              <span className="text-gray-700">到「技能库」里启用</span>
-            </button>
-          ) : (
-            <ul className="space-y-1">
-              {enabled.map((s) => (
-                <li
-                  key={s.id}
-                  className="px-2 py-1.5 rounded border border-border bg-surface-2 hover:bg-surface-3 transition-colors"
-                  title={s.description}
-                >
-                  <div className="flex items-center gap-1.5">
-                    <Sparkles size={9} className="text-accent shrink-0" />
-                    <span className="text-[11px] font-medium text-gray-300 truncate">
-                      {s.name}
-                    </span>
-                  </div>
-                  {s.description && (
-                    <p className="text-[10px] text-gray-600 mt-0.5 line-clamp-2 leading-tight">
-                      {s.description}
-                    </p>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-      </div>
-
       {/* Memory increments — live learning events for this cwd */}
       <div className="border-t border-border px-3 py-3 max-h-[40%] overflow-y-auto">
         <div className="flex items-center gap-1.5 mb-1.5">
@@ -1531,96 +1308,6 @@ function ConnectorsColumn({ cwd, onOpenSkills, onOpenEvolution }: {
         )}
       </div>
     </>
-  );
-}
-
-function scanStatusText(status: string): string {
-  switch (status) {
-    case "ready": return "已索引";
-    case "completed": return "已索引";
-    case "completed_with_errors": return "部分失败";
-    case "scanning": return "扫描中";
-    case "failed": return "扫描失败";
-    case "idle": return "待扫描";
-    default: return "待扫描";
-  }
-}
-
-function buildTaskConnectorContext(libraries: KnowledgeLibrary[]): TaskConnectorContext {
-  return {
-    knowledge_libraries: libraries.map((library) => ({
-      id: library.id,
-      name: library.name,
-      root_path: library.root_path,
-      scan_status: library.scan_status,
-      last_scan_at: library.last_scan_at,
-    })),
-  };
-}
-
-function parseTaskConnectorContext(raw: string | null): TaskConnectorContext {
-  if (!raw) return { knowledge_libraries: [] };
-  try {
-    const parsed = JSON.parse(raw) as Partial<TaskConnectorContext>;
-    return {
-      knowledge_libraries: Array.isArray(parsed.knowledge_libraries)
-        ? parsed.knowledge_libraries.filter((library) => library && typeof library.id === "string")
-        : [],
-    };
-  } catch {
-    return { knowledge_libraries: [] };
-  }
-}
-
-function KnowledgeContextPanel({
-  knowledgeLibraries,
-  compact = false,
-}: {
-  knowledgeLibraries: KnowledgeLibrary[];
-  compact?: boolean;
-}) {
-  const hasWarnings = knowledgeLibraries.some((library) =>
-    !["ready", "completed", "completed_with_errors"].includes(library.scan_status),
-  );
-  return (
-    <section className={`${compact ? "mb-0" : "mb-3"} rounded border border-border bg-surface-2 px-3 py-2`}>
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="flex items-center gap-1.5 text-[11px] font-medium text-gray-300">
-          <BookOpen size={11} className="text-accent" />
-          任务上下文
-        </div>
-        <span className="inline-flex items-center gap-1 rounded border border-border bg-surface-1 px-2 py-0.5 text-[10px] text-gray-500">
-          知识库 {knowledgeLibraries.length}
-        </span>
-        <span className="inline-flex items-center gap-1 rounded border border-border bg-surface-1 px-2 py-0.5 text-[10px] text-gray-500">
-          <Puzzle size={10} className="text-accent" />
-          kb_search / kb_get_chunk
-        </span>
-        {hasWarnings && (
-          <span className="inline-flex items-center gap-1 text-[10px] text-amber-700 dark:text-amber-300">
-            <AlertTriangle size={10} />
-            有知识库尚未完成索引
-          </span>
-        )}
-      </div>
-      {knowledgeLibraries.length > 0 && (
-        <ul className="mt-2 grid gap-1 sm:grid-cols-2">
-          {knowledgeLibraries.map((library) => (
-            <li
-              key={library.id}
-              className="min-w-0 rounded border border-border bg-surface-1 px-2 py-1"
-              title={library.root_path}
-            >
-              <div className="truncate text-[11px] text-gray-300">{library.name}</div>
-              <div className="flex items-center gap-1 text-[9px] text-gray-600">
-                <span className="truncate">{scanStatusText(library.scan_status)}</span>
-                {library.last_scan_at && <span className="shrink-0">已扫描</span>}
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
-    </section>
   );
 }
 

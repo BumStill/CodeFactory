@@ -72,13 +72,33 @@ describe("HomePage AI Coding OS entry", () => {
     mocks.loadLearning.mockClear();
   });
 
+  it("opens the resources center from the top bar", async () => {
+    const onOpenResources = vi.fn();
+
+    render(
+      <HomePage
+        onOpenProject={() => {}}
+        onOpenResources={onOpenResources}
+        onOpenControlPlane={() => {}}
+        onOpenBenchmarks={() => {}}
+        onOpenSettings={() => {}}
+        onOpenProfile={() => {}}
+        onOpenEvolution={() => {}}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "资源中心" }));
+
+    expect(onOpenResources).toHaveBeenCalledTimes(1);
+  });
+
   it("opens the control plane from the top bar", async () => {
     const onOpenControlPlane = vi.fn();
 
     render(
       <HomePage
         onOpenProject={() => {}}
-        onOpenSkills={() => {}}
+        onOpenResources={() => {}}
         onOpenControlPlane={onOpenControlPlane}
         onOpenBenchmarks={() => {}}
         onOpenSettings={() => {}}
@@ -98,7 +118,7 @@ describe("HomePage AI Coding OS entry", () => {
     render(
       <HomePage
         onOpenProject={() => {}}
-        onOpenSkills={() => {}}
+        onOpenResources={() => {}}
         onOpenControlPlane={() => {}}
         onOpenBenchmarks={onOpenBenchmarks}
         onOpenSettings={() => {}}
@@ -118,7 +138,7 @@ describe("HomePage AI Coding OS entry", () => {
     render(
       <HomePage
         onOpenProject={() => {}}
-        onOpenSkills={() => {}}
+        onOpenResources={() => {}}
         onOpenControlPlane={() => {}}
         onOpenBenchmarks={() => {}}
         onOpenSettings={() => {}}

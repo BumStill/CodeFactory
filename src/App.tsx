@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { HomePage } from "./pages/Home/HomePage";
 import { WorkspacePage } from "./pages/Workspace/WorkspacePage";
-import { SkillsPage } from "./pages/Skills/SkillsPage";
+import { ResourcesPage } from "./pages/Resources/ResourcesPage";
 import { ControlPlanePage } from "./pages/ControlPlane/ControlPlanePage";
 import { BenchmarksPage } from "./pages/Benchmarks/BenchmarksPage";
 import { EvolutionWorkbenchPage } from "./pages/Evolution/EvolutionWorkbenchPage";
@@ -19,7 +19,7 @@ import { useChatStore } from "./stores/chat";
 import { invoke } from "./lib/tauri";
 import type { Session } from "./lib/tauri";
 
-export type AppView = "home" | "workspace" | "specs" | "skills" | "settings" | "profile" | "control-plane" | "benchmarks" | "evolution";
+export type AppView = "home" | "workspace" | "specs" | "resources" | "settings" | "profile" | "control-plane" | "benchmarks" | "evolution";
 
 export default function App() {
   const [view, setView] = useState<AppView>("home");
@@ -92,7 +92,7 @@ export default function App() {
       {view === "home" && (
         <HomePage
           onOpenProject={openProject}
-          onOpenSkills={() => setView("skills")}
+          onOpenResources={() => setView("resources")}
           onOpenControlPlane={() => setView("control-plane")}
           onOpenBenchmarks={() => setView("benchmarks")}
           onOpenSettings={() => setView("settings")}
@@ -105,14 +105,13 @@ export default function App() {
         <WorkspacePage
           sessionId={activeProject}
           onBackHome={backToHome}
-          onOpenSkills={() => setView("skills")}
           onOpenSettings={() => setView("settings")}
           onOpenSession={openProject}
           onOpenEvolution={openEvolution}
         />
       )}
 
-      {view === "skills"   && <SkillsPage   onBack={backToHome} />}
+      {view === "resources" && <ResourcesPage onBack={backToHome} />}
       {view === "control-plane" && <ControlPlanePage onBack={backToHome} />}
       {view === "benchmarks" && <BenchmarksPage onBack={backToHome} />}
       {view === "evolution" && <EvolutionWorkbenchPage onBack={backToHome} initialCwd={evolutionCwd} />}

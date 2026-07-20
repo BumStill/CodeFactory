@@ -11,9 +11,9 @@ mod knowledge;
 mod mcp;
 mod openrouter;
 mod secrets;
-mod trajectory;
 mod storage;
 mod tools;
+mod trajectory;
 mod util;
 
 use sqlx::SqlitePool;
@@ -248,6 +248,8 @@ pub fn run() {
             commands::knowledge::register_knowledge_library,
             commands::knowledge::list_knowledge_libraries,
             commands::knowledge::scan_knowledge_library,
+            commands::knowledge::set_knowledge_library_enabled,
+            commands::knowledge::delete_knowledge_library,
             commands::knowledge::search_knowledge,
             commands::models::list_models,
             commands::session::list_sessions,

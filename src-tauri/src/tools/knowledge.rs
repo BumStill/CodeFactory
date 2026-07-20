@@ -110,11 +110,17 @@ pub async fn execute_get_chunk(args: Value, ctx: &ExecCtx) -> Result<ToolOutput>
             "Knowledge chunk read is unavailable: database is not attached",
         ));
     };
+    let library_id = crate::knowledge::chunk_library_id(pool, &args.chunk_id).await?;
+    if !crate::knowledge::library_is_enabled(pool, &library_id).await? {
+        return Ok(ToolOutput::err(format!(
+            "Knowledge chunk '{}' belongs to a disabled knowledge library",
+            args.chunk_id
+        )));
+    }
     if let Some(scope) = ctx.knowledge_library_ids.as_deref() {
         if scope.is_empty() {
             return Ok(ToolOutput::err("Knowledge chunk read is unavailable: no enabled knowledge libraries are scoped to this task"));
         }
-        let library_id = crate::knowledge::chunk_library_id(pool, &args.chunk_id).await?;
         if !scope.iter().any(|allowed| allowed == &library_id) {
             return Ok(ToolOutput::err(format!(
                 "Knowledge chunk '{}' is outside the enabled task knowledge scope",
@@ -175,6 +181,64 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[tokio::test]
+    async fn kb_get_chunk_rejects_content_from_disabled_library() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        crate::knowledge::ensure_schema(&pool)
+            .await
+            .expect("knowledge schema");
+
+        sqlx::query(
+            "INSERT INTO knowledge_libraries
+             (id, name, root_path, enabled, created_at, scan_status)
+             VALUES ('disabled-kb', 'disabled', '/tmp/disabled-kb', 0, '2026-01-01', 'completed')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO knowledge_documents
+             (id, library_id, path, kind, hash, mtime, size, title, status, updated_at)
+             VALUES ('disabled-doc', 'disabled-kb', '/tmp/disabled-kb/secret.pdf', 'pdf', 'hash', 1, 10, 'Secret', 'indexed', '2026-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO knowledge_chunks
+             (id, document_id, chunk_index, content_type, text, token_estimate, metadata_json)
+             VALUES ('disabled-chunk', 'disabled-doc', 0, 'page', 'private source', 3, '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cwd = std::env::temp_dir().join(format!("codefactory-kb-disabled-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        let output = execute_get_chunk(
+            json!({ "chunk_id": "disabled-chunk" }),
+            &crate::tools::ExecCtx {
+                cwd: cwd.clone(),
+                db: Some(pool),
+                session_id: Some("session".into()),
+                task_id: None,
+                knowledge_library_ids: None,
+                settings: None,
+            },
+        )
+        .await
+        .expect("tool output");
+        let _ = std::fs::remove_dir_all(cwd);
+
+        assert!(output.is_error);
+        assert!(output.content.contains("disabled knowledge library"));
+        assert!(!output.content.contains("private source"));
+    }
 
     #[tokio::test]
     async fn kb_search_uses_attached_database_and_returns_source_json() {
