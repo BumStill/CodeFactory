@@ -1,6 +1,6 @@
 [package]
 name = "codefactory"
-version = "1.49.2"
+version = "1.50.0"
 description = "AI coding assistant for Windows powered by OpenRouter"
 authors = []
 edition = "2021"
