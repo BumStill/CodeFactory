@@ -250,15 +250,6 @@ pub enum StreamEvent {
         kind: String,
         detail: String,
     },
-    /// Ask the UI to open a secure secret prompt (e.g. a GitHub token for the
-    /// delivery chain). The value the user enters is resolved through the
-    /// `provide_secret` command straight into the OS keychain — it never
-    /// appears in chat content, stream text, or the DB.
-    SecretRequest {
-        request_id: String,
-        purpose: String,
-        hint: String,
-    },
     Error {
         message: String,
     },

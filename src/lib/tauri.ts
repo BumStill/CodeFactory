@@ -50,7 +50,6 @@ export type StreamEvent =
       reason: string;
     }
   | { type: "completion_gate_action"; kind: string; detail: string }
-  | { type: "secret_request"; request_id: string; purpose: string; hint: string }
   | { type: "error"; message: string };
 
 export interface Session {
