@@ -143,6 +143,17 @@ function isTestPathFromArgs(toolName: string, raw: string): boolean {
   }
 }
 
+/** First non-empty line of a tool result, capped for the collapsed-card
+ *  error summary. */
+function firstNonEmptyLine(raw: string): string {
+  const line = raw
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.length > 0);
+  const text = line ?? "";
+  return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+}
+
 function basename(path: string | undefined): string {
   if (!path) return "unknown source";
   const normalized = path.replace(/\\/g, "/");
@@ -300,6 +311,15 @@ export function ToolCallCard({ tc }: Props) {
         )}
         <span className="ml-auto shrink-0">{statusIcon}</span>
       </button>
+
+      {/* A failed call must explain itself without a click: surface the
+          first line of the error on the collapsed card. Full output stays
+          behind the expand toggle. */}
+      {!open && (tc.isError || tc.status === "error") && tc.result && (
+        <div className="border-t border-red-500/20 px-3 py-1 pl-9 text-[11px] font-mono text-red-700 dark:text-red-300 truncate">
+          {firstNonEmptyLine(tc.result)}
+        </div>
+      )}
 
       {filePath && (
         <button
