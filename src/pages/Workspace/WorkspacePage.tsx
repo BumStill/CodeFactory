@@ -39,7 +39,6 @@ import { SpecsPage } from "../Specs/SpecsPage";
 import { ModelPicker } from "../../components/ModelPicker";
 import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
-import { SecretPromptModal } from "../../components/SecretPromptModal";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
 import { ExecutionStream } from "../../components/ExecutionStream";
 import { GitStatusBar } from "../../components/GitStatusBar";
@@ -105,11 +104,11 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSetti
   const {
     activeSession,
     selectSession, sendOrQueue, cancelStream, removeFromQueue,
-    respondPermission, respondSecret, exitAnonymous, renameSession,
+    respondPermission, exitAnonymous, renameSession,
   } = useChatStore();
   // Per-session chat state for the ACTIVE session. Background sessions keep
   // streaming into their own buckets; here we render the active one's slice.
-  const { messages, streaming, queue, pendingPermission, pendingSecret } = useChatStore(activeRuntime);
+  const { messages, streaming, queue, pendingPermission } = useChatStore(activeRuntime);
   const isAnonymous = activeSession?.kind === "anonymous";
   const { settings, setTheme } = useSettingsStore();
   const autonomousRunActive = useTasksStore((state) => state.running[sessionId] ?? false);
@@ -445,15 +444,6 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSkills, onOpenSetti
           cwd={activeSession?.cwd ?? null}
           currentBranch={gitBranch}
           onClose={() => setGitPanel(null)}
-        />
-      )}
-
-      {/* ── Secure secret prompt overlay ────────────────────────────────── */}
-      {pendingSecret && (
-        <SecretPromptModal
-          request={pendingSecret}
-          onSubmit={(value) => void respondSecret(value)}
-          onCancel={() => void respondSecret(null)}
         />
       )}
 

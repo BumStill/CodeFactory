@@ -5,7 +5,6 @@ import type { Message, Session, StreamEvent, ModelInfo, ReasoningEffort, AnonTur
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   markPermissionResponse,
-  markSecretResponse,
   reduceChatStreamEvent,
   formatToolArgs,
   type ChatEventState,
@@ -96,8 +95,6 @@ interface ChatStore {
   /** Stop the in-flight turn for `sessionId` (default: the active session). */
   cancelStream: (sessionId?: string) => void;
   respondPermission: (allow: boolean) => Promise<void>;
-  /** Resolve the open secure-secret prompt; null = user cancelled. */
-  respondSecret: (value: string | null) => Promise<void>;
   addLocalAssistantMessage: (content: string) => void;
   clearVisibleConversation: () => void;
   updateActiveSessionModel: (modelId: string) => Promise<void>;
@@ -474,23 +471,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // terminal event is the only safe point to drain a queued message; sending
     // it immediately would race the still-running tool call in the old turn.
     void invoke("cancel_chat", { sessionId: id });
-  },
-
-  respondSecret: async (value) => {
-    const id = get().activeSession?.id;
-    if (!id) return;
-    const pending = get().runtime[id]?.pendingSecret;
-    if (!pending) return;
-    // The secret value goes ONLY to the backend command; state just closes
-    // the prompt.
-    await invoke("provide_secret", { requestId: pending.requestId, value });
-    set((s) => {
-      const prev = s.runtime[id];
-      if (!prev) return {};
-      return {
-        runtime: { ...s.runtime, [id]: { ...prev, ...markSecretResponse(prev) } },
-      };
-    });
   },
 
   respondPermission: async (allow) => {

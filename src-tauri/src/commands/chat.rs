@@ -52,26 +52,6 @@ pub async fn respond_to_permission(
         .map_err(|_| AppError::Other("Permission request receiver closed".into()))
 }
 
-/// Resolve a pending secure-secret prompt from the UI. `value: None` means
-/// the user cancelled. The value is forwarded over a oneshot channel to the
-/// waiting tool and stored only in the OS keychain — never logged, persisted
-/// to the chat DB, or echoed back to the model.
-#[tauri::command]
-pub async fn provide_secret(
-    request_id: String,
-    value: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<(), AppError> {
-    let Some(sender) = state.pending_secrets.lock().await.remove(&request_id) else {
-        return Err(AppError::Other(format!(
-            "Secret request '{request_id}' is no longer active"
-        )));
-    };
-    sender
-        .send(value)
-        .map_err(|_| AppError::Other("Secret request receiver closed".into()))
-}
-
 /// Request cancellation of the in-flight chat turn for `session_id`. Flips the
 /// per-session cooperative flag that the agent loop polls between rounds, so the
 /// turn stops cleanly — it does NOT interrupt an in-flight tool call. No-ops if
@@ -311,7 +291,6 @@ pub async fn send_message(
     let db = state.db.read().await.clone();
     let settings_state = state.settings.clone();
     let pending_permissions = state.pending_permissions.clone();
-    let pending_secrets = state.pending_secrets.clone();
     let mcp_manager: Arc<McpManager> = Arc::clone(&mcp);
 
     // Spawn agent loop (non-blocking); emit Error event to frontend if it fails
@@ -335,7 +314,6 @@ pub async fn send_message(
             None,
             mode,
         )
-        .with_pending_secrets(pending_secrets)
         .with_cancel(cancel_flag);
         if let Err(e) = agent.run(history).await {
             tracing::error!("Agent loop error: {e:#}");
