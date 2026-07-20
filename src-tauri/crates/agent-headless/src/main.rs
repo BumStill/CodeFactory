@@ -342,24 +342,28 @@ where
             let kind = classify_command(&tool_call.command, effective_tool_timeout_sec * 1_000);
             let policy_decision = match policy.evaluate_command(&tool_call.command) {
                 PolicyDecision::Allow
-                    if progress_tracker.read_only_exhausted_before_mutation()
+                    if progress_tracker.read_only_exhausted()
                         && matches!(kind, codefactory_agent_core::ToolKind::ReadOnly) =>
                 {
                     PolicyDecision::Deny {
                         rule: "inspection_budget".to_owned(),
-                        reason: "initial inspection is exhausted; batch any remaining reads with the first implementation or begin the smallest candidate implementation now".to_owned(),
+                        reason: if progress_tracker.mutation_seen() {
+                            "post-change inspection is exhausted; make the smallest corrective edit, run a bounded functional verification, or batch a specifically justified read with that action"
+                                .to_owned()
+                        } else {
+                            "initial inspection is exhausted; batch any remaining reads with the first implementation or begin the smallest candidate implementation now"
+                                .to_owned()
+                        },
                     }
                 }
-                PolicyDecision::Allow => {
-                    evaluate_budget_command_with_time_in_directory(
-                        remaining,
-                        wall_time,
-                        &gate.evidence(),
-                        &tool_call.command,
-                        &kind,
-                        config.working_directory.as_deref(),
-                    )
-                }
+                PolicyDecision::Allow => evaluate_budget_command_with_time_in_directory(
+                    remaining,
+                    wall_time,
+                    &gate.evidence(),
+                    &tool_call.command,
+                    &kind,
+                    config.working_directory.as_deref(),
+                ),
                 denied => denied,
             };
             let (return_code, stdout, stderr, error, next_working_directory) = match policy_decision
@@ -1247,6 +1251,151 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[2]["tool_choice"], "none");
         assert!(requests[2].get("tools").is_none());
+    }
+
+    #[tokio::test]
+    async fn post_mutation_inspection_budget_forces_action_before_more_reads() {
+        let (base_url, server) = fake_openai_server(vec![
+            fake_tool_response("mutation-1", "printf fixed > result.txt"),
+            fake_tool_response("read-1", "cat source-1.txt"),
+            fake_tool_response("read-2", "cat source-2.txt"),
+            fake_tool_response("read-3", "cat source-3.txt"),
+            fake_tool_response("read-4", "cat source-4.txt"),
+            fake_tool_response("read-denied", "cat source-5.txt"),
+            fake_tool_response("verify-1", "timeout 5 curl http://localhost:8000/health"),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Changed the implementation and verified the runtime behavior."
+                    }
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+        ]);
+
+        let (test_input, run_input) = tokio::io::duplex(32 * 1024);
+        let (run_output, test_output) = tokio::io::duplex(32 * 1024);
+        let runner = tokio::spawn(async move {
+            let mut input = BufReader::new(run_input);
+            let mut output = run_output;
+            run(&mut input, &mut output).await
+        });
+        let mut input = test_input;
+        let mut output = BufReader::new(test_output);
+
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "start",
+                "instruction": "Fix the implementation and verify the running service.",
+                "model": "fake-model",
+                "api_key": "test-key",
+                "base_url": base_url,
+                "max_steps": 20,
+                "model_timeout_sec": 5,
+                "shell_timeout_sec": 60,
+                "allow_network": false,
+                "policy_profile": "product",
+                "execution_contract_sha256": execution_contract_sha256()
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            classify_command("printf fixed > result.txt", 30_000),
+            codefactory_agent_core::ToolKind::Mutation
+        );
+        for expected_id in ["mutation-1", "read-1", "read-2", "read-3"] {
+            let request = read_test_output(&mut output).await;
+            assert_eq!(request["type"], "tool_request");
+            assert_eq!(request["id"], expected_id);
+            write_test_line(
+                &mut input,
+                &json!({
+                    "type": "tool_result",
+                    "id": expected_id,
+                    "return_code": 0,
+                    "stdout": "observed",
+                    "stderr": "",
+                    "error": null
+                }),
+            )
+            .await;
+        }
+
+        let mut verification = read_test_output(&mut output).await;
+        if verification["id"] == "read-4" {
+            write_test_line(
+                &mut input,
+                &json!({
+                    "type": "tool_result",
+                    "id": "read-4",
+                    "return_code": 0,
+                    "stdout": "observed",
+                    "stderr": "",
+                    "error": null
+                }),
+            )
+            .await;
+            verification = read_test_output(&mut output).await;
+        }
+        assert_eq!(verification["type"], "tool_request");
+        assert_eq!(verification["id"], "verify-1");
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "tool_result",
+                "id": "verify-1",
+                "return_code": 0,
+                "stdout": "service healthy",
+                "stderr": "",
+                "error": null
+            }),
+        )
+        .await;
+
+        let finished = read_test_output(&mut output).await;
+        assert_eq!(finished["type"], "finished");
+        assert_eq!(finished["completion_evidence"]["completed"], true);
+        assert_eq!(finished["usage"]["model_requests"], 8);
+
+        runner.await.unwrap().unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 8);
+        let denied_tool_result = requests[6]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["tool_call_id"] == "read-denied")
+            .unwrap();
+        assert!(
+            denied_tool_result["content"]
+                .as_str()
+                .unwrap()
+                .contains("post-change inspection is exhausted"),
+            "{denied_tool_result}"
+        );
+    }
+
+    fn fake_tool_response(id: &str, command: &str) -> Value {
+        json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": "run_shell",
+                            "arguments": json!({"command": command, "timeout_sec": 30}).to_string()
+                        }
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
     }
 
     async fn write_test_line<W>(writer: &mut W, value: &Value)

@@ -77,7 +77,13 @@ shared by the desktop Agent and headless evaluation runtime.
 9. Reduce model round trips during autonomous work. Batch related workspace
    reads, compatible edits, and focused checks into one bounded tool call when
    their ordering and failure handling remain clear. Do not serialize a list of
-   independent one-line inspections into separate model requests.
+   independent one-line inspections into separate model requests. The inspection
+   budget applies again after every mutation: once the bounded post-change read
+   window is exhausted, make the smallest corrective edit or run a bounded
+   functional verification before continuing pure inspection. A mutation or
+   functional probe opens a new bounded inspection window; an earlier mutation
+   does not permit unlimited later reads. A failed read or runtime probe still
+   consumes this diagnostic window and must not reset it.
 10. Treat the end of the first third of available execution time as a
    source-delivery checkpoint. After source edits, reserve the remaining two
    thirds for installation, a runtime check from outside the source directory,
