@@ -385,6 +385,7 @@ pub struct AgentLoop {
     http: Client,
     settings: Arc<RwLock<Settings>>,
     pending_permissions: PendingPermissionMap,
+    pending_secrets: Option<crate::PendingSecretMap>,
     mcp_manager: Arc<McpManager>,
     execution_context: Option<AgentExecutionContext>,
     /// Selects iteration ceiling and system prompt. Interactive for
@@ -552,7 +553,16 @@ impl AgentLoop {
             mode,
             anonymous: false,
             cancel: None,
+            pending_secrets: None,
         }
+    }
+
+    /// Attach the shared secure-secret prompt channel (chat surfaces only).
+    /// Interactive tools like `configure_git_remote` need it; headless runs
+    /// leave it unset and those tools degrade gracefully.
+    pub fn with_pending_secrets(mut self, map: crate::PendingSecretMap) -> Self {
+        self.pending_secrets = Some(map);
+        self
     }
 
     /// Mark this loop as an anonymous/ephemeral run: disables ALL DB
@@ -1050,6 +1060,9 @@ impl AgentLoop {
                         .map(|ctx| ctx.knowledge_library_ids.clone())
                         .filter(|ids| !ids.is_empty()),
                     settings: Some(self.settings.read().await.clone()),
+                    app: Some(self.app.clone()),
+                    pending_secrets: self.pending_secrets.clone(),
+                    settings_state: Some(self.settings.clone()),
                 };
 
                 let tool_start = std::time::Instant::now();
@@ -2500,6 +2513,9 @@ impl AgentLoop {
                         .map(|ctx| ctx.knowledge_library_ids.clone())
                         .filter(|ids| !ids.is_empty()),
                     settings: Some(self.settings.read().await.clone()),
+                    app: Some(self.app.clone()),
+                    pending_secrets: self.pending_secrets.clone(),
+                    settings_state: Some(self.settings.clone()),
                 };
 
                 let tool_start = std::time::Instant::now();

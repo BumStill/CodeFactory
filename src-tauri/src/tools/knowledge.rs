@@ -231,6 +231,9 @@ mod tests {
                 task_id: Some("task-1".into()),
                 knowledge_library_ids: Some(vec![library_id.clone()]),
                 settings: None,
+                app: None,
+                pending_secrets: None,
+                settings_state: None,
             },
         )
         .await

@@ -501,8 +501,9 @@ pub async fn deliver<R: DeliveryRemote>(
 /// retrying deliver_changes cannot succeed until a token exists. (The app's
 /// only historical deliver_changes call died exactly here.)
 pub const NO_TOKEN_PR_MESSAGE: &str = "已提交并推送,但未配置远端 token,无法开 PR。\
-请把这句原样告诉用户:在设置→远程仓库里为该仓库配置 GitHub 访问令牌(需 repo 权限),\
-配置完成后回复继续即可自动完成 PR/CI/合并/发布。在用户确认配置完成之前,不要再调用 deliver_changes。";
+现在调用 configure_git_remote 工具进行对话内配置:你负责全部步骤,用户只需在弹出的安全输入框\
+里粘贴 GitHub token(repo 权限)。先告诉用户输入框即将弹出、需要准备什么,再调用该工具;\
+若用户取消,不要反复重试(也可引导用户在设置→远程仓库手动配置)。";
 
 fn ceiling_label(ceiling: DeliveryCeiling) -> &'static str {
     match ceiling {
@@ -543,10 +544,12 @@ pub fn delivery_readiness_from_origin(
         format!(
             "\n\n# Delivery capability (BROKEN — surface early)\n\
              The delivery chain for {owner_repo} cannot open a PR: no GitHub token is \
-             configured (设置→远程仓库). If this task involves delivering code, say so in your \
-             FIRST reply — give the user that settings path and ask them to configure a token \
-             (repo scope) — and do NOT call deliver_changes until they confirm it is configured. \
-             Local work (tests, edits, commits) can proceed in the meantime."
+             configured. Fix it conversationally with the configure_git_remote tool — YOU run \
+             every step; the user only pastes a token (repo scope) into a secure prompt that \
+             never enters the chat. If this task involves delivering code, offer that in your \
+             FIRST reply (tell the user the prompt will pop up and what token to prepare), and \
+             do NOT call deliver_changes until configuration succeeds. Local work (tests, \
+             edits, commits) can proceed in the meantime."
         )
     })
 }
@@ -639,6 +642,13 @@ fn parse_owner_repo(url: &str) -> Option<String> {
 /// Build a [`GithubRemote`] for `cwd` from the user's configured git remote
 /// tokens, or `None` when nothing matches (delivery then blocks cleanly at the
 /// PR step with a configure-a-token message). Never assumes `gh`.
+/// The cwd's `origin` GitHub repo as "owner/repo", if resolvable.
+pub fn origin_owner_repo(cwd: &Path) -> Option<String> {
+    let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
+    let origin = git(Path::new(&root), &["remote", "get-url", "origin"]).ok()?;
+    parse_owner_repo(&origin)
+}
+
 pub fn github_remote_for(
     cwd: &Path,
     settings: &crate::config::settings::Settings,
@@ -836,8 +846,9 @@ mod tests {
         // (git_remotes was never configured). The message must carry the fix
         // path AND forbid blind retries — retrying cannot succeed until the
         // user configures a token.
-        assert!(NO_TOKEN_PR_MESSAGE.contains("设置→远程仓库"));
-        assert!(NO_TOKEN_PR_MESSAGE.contains("不要再调用 deliver_changes"));
+        assert!(NO_TOKEN_PR_MESSAGE.contains("configure_git_remote"));
+        assert!(NO_TOKEN_PR_MESSAGE.contains("安全输入框"));
+        assert!(NO_TOKEN_PR_MESSAGE.contains("不要反复重试"));
     }
 
     #[test]
@@ -851,7 +862,7 @@ mod tests {
         )
         .expect("github origin without a token must produce a warning note");
         assert!(note.contains("FIRST reply"));
-        assert!(note.contains("设置→远程仓库"));
+        assert!(note.contains("configure_git_remote"));
         assert!(note.contains("do NOT call deliver_changes"));
     }
 
