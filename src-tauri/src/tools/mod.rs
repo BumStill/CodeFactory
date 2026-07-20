@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod bash;
 pub mod delivery;
+pub mod git_remote_setup;
 pub mod docx;
 pub mod edit;
 pub mod file_lock;
@@ -55,6 +56,15 @@ pub struct ExecCtx {
     /// tool reads the configured delivery ceiling + git remote tokens). None
     /// in contexts that don't supply it.
     pub settings: Option<crate::config::settings::Settings>,
+    /// UI channel for interactive tools (secure secret prompts). None in
+    /// headless contexts — interactive tools must degrade gracefully.
+    pub app: Option<tauri::AppHandle>,
+    /// Pending secure-secret requests, resolved by the `provide_secret`
+    /// command from the UI. Secret values never enter chat or the DB.
+    pub pending_secrets: Option<crate::PendingSecretMap>,
+    /// Live settings handle for tools that WRITE configuration (snapshot
+    /// `settings` above is read-only).
+    pub settings_state: Option<std::sync::Arc<tokio::sync::RwLock<crate::config::settings::Settings>>>,
 }
 
 #[cfg(test)]
@@ -66,6 +76,9 @@ impl ExecCtx {
             session_id: None,
             task_id: None,
             knowledge_library_ids: None,
+            app: None,
+            pending_secrets: None,
+            settings_state: None,
             settings: None,
         }
     }
@@ -95,6 +108,7 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         xlsx::read_definition(),
         xlsx::edit_definition(),
         delivery::definition(),
+        git_remote_setup::definition(),
     ]
 }
 
@@ -122,6 +136,7 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "read_xlsx" => xlsx::execute_read(args, ctx).await,
         "edit_xlsx" => xlsx::execute_edit(args, ctx).await,
         "deliver_changes" => delivery::execute(args, ctx).await,
+        "configure_git_remote" => git_remote_setup::execute(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),
     }
 }

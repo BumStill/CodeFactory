@@ -385,6 +385,7 @@ pub struct AgentLoop {
     http: Client,
     settings: Arc<RwLock<Settings>>,
     pending_permissions: PendingPermissionMap,
+    pending_secrets: Option<crate::PendingSecretMap>,
     mcp_manager: Arc<McpManager>,
     execution_context: Option<AgentExecutionContext>,
     /// Selects iteration ceiling and system prompt. Interactive for
@@ -552,7 +553,16 @@ impl AgentLoop {
             mode,
             anonymous: false,
             cancel: None,
+            pending_secrets: None,
         }
+    }
+
+    /// Attach the shared secure-secret prompt channel (chat surfaces only).
+    /// Interactive tools like `configure_git_remote` need it; headless runs
+    /// leave it unset and those tools degrade gracefully.
+    pub fn with_pending_secrets(mut self, map: crate::PendingSecretMap) -> Self {
+        self.pending_secrets = Some(map);
+        self
     }
 
     /// Mark this loop as an anonymous/ephemeral run: disables ALL DB
@@ -637,6 +647,15 @@ impl AgentLoop {
         // Model-aware reinforcement for post-approval Execute turns (no-op for
         // high-compliance models and all non-Execute turns).
         system_prompt.push_str(compliance_booster(self.mode, &self.model_id));
+        // Delivery-chain readiness: surface a broken chain (e.g. missing
+        // GitHub token) in the model's FIRST reply instead of letting it be
+        // discovered when deliver_changes blocks after the work is done.
+        {
+            let settings = self.settings.read().await;
+            if let Some(note) = delivery::delivery_readiness_note(&self.cwd, &settings) {
+                system_prompt.push_str(&note);
+            }
+        }
         let api_style = self.api_style.clone();
 
         match api_style {
@@ -1041,6 +1060,9 @@ impl AgentLoop {
                         .map(|ctx| ctx.knowledge_library_ids.clone())
                         .filter(|ids| !ids.is_empty()),
                     settings: Some(self.settings.read().await.clone()),
+                    app: Some(self.app.clone()),
+                    pending_secrets: self.pending_secrets.clone(),
+                    settings_state: Some(self.settings.clone()),
                 };
 
                 let tool_start = std::time::Instant::now();
@@ -1158,7 +1180,8 @@ impl AgentLoop {
                 });
             }
             let evidence = completion_gate.evidence();
-            if evidence.completed
+            if completion_ready_applies(self.mode)
+                && evidence.completed
                 && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
             {
                 last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
@@ -2490,6 +2513,9 @@ impl AgentLoop {
                         .map(|ctx| ctx.knowledge_library_ids.clone())
                         .filter(|ids| !ids.is_empty()),
                     settings: Some(self.settings.read().await.clone()),
+                    app: Some(self.app.clone()),
+                    pending_secrets: self.pending_secrets.clone(),
+                    settings_state: Some(self.settings.clone()),
                 };
 
                 let tool_start = std::time::Instant::now();
@@ -2598,7 +2624,8 @@ impl AgentLoop {
                 }));
             }
             let evidence = completion_gate.evidence();
-            if evidence.completed
+            if completion_ready_applies(self.mode)
+                && evidence.completed
                 && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
             {
                 last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
@@ -2765,6 +2792,19 @@ fn completion_recovery_prompt(
         return None;
     }
     (!evidence.completed).then(|| build_completion_recovery_prompt(evidence))
+}
+
+/// Whether this mode injects the completion-ready ("coverage audit") nudge at
+/// all. The nudge freezes the toolset for the following round, forcing the
+/// model to wrap up — an AUTONOMOUS-contract mechanism, where no user is
+/// present and the scheduler respawns incomplete work. In interactive and
+/// execute chat, `evidence.completed` only means "some mutation was verified"
+/// (any mid-task `tsc`/`vitest` pass qualifies), NOT "the user's task is
+/// done"; firing it mid-task forcibly ends the turn while the model is
+/// announcing its next step, which reads as the assistant stalling. With the
+/// user present, the user decides when the work is finished.
+fn completion_ready_applies(mode: AgentMode) -> bool {
+    matches!(mode, AgentMode::Autonomous)
 }
 
 fn autonomous_budget_denial(
@@ -3981,6 +4021,21 @@ mod tests {
         let satisfied = CompletionGate::new(false).evidence();
         assert!(satisfied.completed);
         assert!(completion_recovery_prompt(&satisfied, 0, AgentMode::Interactive).is_none());
+    }
+
+    #[test]
+    fn completion_ready_nudge_is_autonomous_only() {
+        // The ready ("coverage audit") nudge freezes the toolset for the next
+        // round to force wrap-up. evidence.completed only means "some mutation
+        // got verified" — in a long interactive TDD session that fires on any
+        // mid-task tsc/vitest pass and forcibly stops the turn while the model
+        // is announcing its next step (2026-07-17 session: agent stopped with
+        // a "还不能结束,仍缺少证据" essay after 6 minutes). With the user
+        // present, THEY decide when the work is done; the nudge is an
+        // autonomous-contract mechanism only.
+        assert!(!completion_ready_applies(AgentMode::Interactive));
+        assert!(!completion_ready_applies(AgentMode::Execute));
+        assert!(completion_ready_applies(AgentMode::Autonomous));
     }
 
     #[test]

@@ -16,6 +16,14 @@ export interface PendingPermission {
   args: unknown;
 }
 
+/** Metadata of an open secure-secret prompt. The secret VALUE never passes
+ *  through this state — it goes from the modal straight to provide_secret. */
+export interface PendingSecret {
+  requestId: string;
+  purpose: string;
+  hint: string;
+}
+
 export interface UIMessage {
   id: string;
   role: "user" | "assistant" | "tool" | "system";
@@ -68,6 +76,9 @@ export interface ChatEventState {
   inputTokenTotal: number;
   outputTokenTotal: number;
   pendingPermission: PendingPermission | null;
+  /** Open secure-secret prompt, if any. Optional so existing state
+   *  constructors stay valid; absent means none. */
+  pendingSecret?: PendingSecret | null;
   /** Last reported provider-side prompt_tokens / resolved model limit. */
   contextUsage: ContextUsage | null;
   /** Set whenever the backend just elided messages; UI shows a toast. */
@@ -218,6 +229,16 @@ export function reduceChatStreamEvent(
         ),
       };
 
+    case "secret_request":
+      return {
+        ...state,
+        pendingSecret: {
+          requestId: event.request_id,
+          purpose: event.purpose,
+          hint: event.hint,
+        },
+      };
+
     case "completion_gate_action":
       return {
         ...state,
@@ -240,6 +261,10 @@ export function reduceChatStreamEvent(
   }
 
   return state;
+}
+
+export function markSecretResponse(state: ChatEventState): ChatEventState {
+  return { ...state, pendingSecret: null };
 }
 
 export function markPermissionResponse(
