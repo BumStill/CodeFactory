@@ -42,11 +42,15 @@ CodeFactory UI / CLI
 - 后台服务任务必须记录 PID、日志、bounded readiness 和真实 client/functional probe。
 - 最终回复前必须存在晚于最后一次实现修改的成功验证；失败必须继续迭代或形成明确 blocker。
 
-Harbor 的有效 Agent wall timeout 由 thin bridge 原样传给 Rust sidecar。sidecar 以单一 `Instant` 计算剩余时间：进入总预算后 2/3 区间即持续提示收敛，进入最后 1/3 后 completion budget 拒绝新的范围扩张，最后 30 秒不再启动模型或工具调用而用于写出结构化 `Finished`。模型 transport 的有限重试共享同一个总 deadline，单次工具 timeout 也被剩余墙钟预算裁剪，避免各层 timeout 相加后由 Harbor 强杀而丢失结果与 usage。
+Harbor 的有效 Agent wall timeout 由 thin bridge 原样传给 Rust sidecar。sidecar 以单一 `Instant` 计算剩余时间：进入总预算后 2/3 区间即持续提示收敛，进入最后 1/3 后 completion budget 拒绝新的范围扩张，最后 30 秒不再启动模型或工具调用而用于写出结构化 `Finished`。模型 transport 的每次有限重试拥有独立的单次 timeout，避免第一次慢请求把后续重试压缩成近零窗口；每次尝试同时由全局 wall deadline 裁剪，单次工具 timeout 也被剩余墙钟预算裁剪，避免各层 timeout 相加后由 Harbor 强杀而丢失结果与 usage。
+
+桌面 bash 与 Harbor thin bridge 都把单次工具调用放入独立进程组；Harbor 使用 `/bin/bash` 承载原命令，不能因生命周期包装丢失 `[[ ]]`、数组、process substitution 或 `pipefail` 语义。timeout、取消或 transport 异常按进程组发送终止信号并回收，保证超时的测试、数据库查询、编译或服务启动不会留下继续占用 CPU、端口和输出管道的后代。若父 shell 已正常退出，但正常后台服务仍继承一个或两个 stdout/stderr 管道，桌面端并发收集两侧输出；短暂收尾窗口结束后只中止未完成 reader，保留已经捕获的另一侧输出并返回。这里不能按 timeout 处理，也不能终止已经启动的服务。正常完成的后台服务仍由 completion gate 要求 PID、日志、bounded readiness 和后续独立 functional probe；同一命令里的即时 `curl` 不能代替跨调用存活证明。引号/转义之外的单 `&` 无论位于行尾还是同一行中间都属于后台启动，`&&`、重定向和字符串字面量除外；一次失败或 timeout 的启动尝试也会激活生命周期门禁，不能靠后续普通零退出命令绕过。
+
+Tool outcome 的成功同时依赖进程退出码、transport error 和 semantic failure。`|| true`、末尾 `echo` 或管道归零后，只要输出仍明确出现 `failed:`、`FAIL:`、缺失路径、进程死亡等失败事实，就必须保留 failure sequence。只有整条命令是纯 `test ! -e/-f/-d`、`! kill -0` 等负向断言时，才把对应“已不存在/已停止”文本视为预期结果；带 `;`、`&&`、`||`、pipe 或其他工作步骤的复合命令不获得全局豁免。ReadOnly 读取源码中偶然包含这些文字不会强迫交付级验证，但 mutation、verification、service start 和 functional probe 不得借此假完成。
 
 `CompletionGate` 对源码交付维护独立 sequence：最后源码修改、成功 source install、install 后在源码目录外的 runtime/import smoke、项目验证。兼容性扫描必须递归覆盖构建配置引用的 `.py`、`.pyx`、`.pxd`、生成 `.c` 等输入，并通过明确的 `exit 1/0`、`sys.exit` 或 `test ! -s` 契约表达残留命中；正常输出 `PASSED` 或摘要不应被误判为失败。
 
-当原始需求明确要求项目测试时，`CompletionGate` 额外记录最后一次成功项目测试，并要求其 sequence 晚于最后源码修改、安装和外部运行。已获准的复合工具调用只要包含明确文件修改，即使后续 build/install/runtime 失败，也必须推进最后源码修改 sequence 并使旧交付证据失效；纯依赖安装或 policy deny 不得误记为修改。
+当原始需求明确要求项目测试时，`CompletionGate` 额外记录最后一次成功项目测试，并要求其 sequence 晚于最后源码修改、安装和外部运行。源码修改 sequence 只接受带源码路径且整体成功的内容写入；失败的单命令或复合编辑，以及 `touch/mkdir/rm/cp` 都不算完成编辑。`edit && build/install/runtime` 整体失败时无法仅凭 shell 文本确认失败阶段，因此必须再产生一次独立成功的源码编辑结果；纯依赖安装或 policy deny 也不得误记为修改。
 
 源码兼容迁移必须在首次昂贵 build/install 前从仓库 import 语句推导全部本地 alias，覆盖构建配置已观察到的源码、生成和编译输入扩展。扫描与替换使用 token boundary 和幂等规则，相关修改应批量完成；最后一次修改后的 clean residual scan 是下一次 build/install 的前置门禁，避免只覆盖常见别名、产生二次替换或在部分扫描后反复重建。门禁激活后仍允许读取所需扩展的相关源码、仓库级 alias discovery、纠正性源码修改和带干净退出契约的最终 residual scan，使 Agent 能从不完整别名盘点中恢复；其他探索及 build/install 继续拒绝。
 
@@ -67,6 +71,8 @@ Harbor 的有效 Agent wall timeout 由 thin bridge 原样传给 Rust sidecar。
 Headless 工具输出进入模型前采用 bounded head/tail compaction：保留命令/阶段开头与错误或成功尾部，压缩中间编译日志；总上下文达到预算时保留共享 contract、原始任务和最近完整 tool round。完整 stdout/stderr 仍留在 trajectory 作为审计证据，不以缩短模型上下文为由删除运行证据。
 
 adapter 可以按通用能力类型维护状态，但不得按 benchmark task name、固定 repo、固定 artifact、领域答案、instruction fingerprint 或成功 marker 选择专用脚本。adapter 也不得读取 `/tests`、verifier 文件或 solution。每个 run 必须记录共享 contract SHA-256 和 contamination scan 结果；缺失任一项时 `evaluation_axis=codefactory-agent-capability` 无效。
+
+共享 contract 还约束三类长任务完成证据：指定 tool/library/model/version/revision 时必须实际执行该精确依赖；状态控制必须验证前后可观察差异；指定必需输出 artifact 时必须在最后三分之一预算前产生首个候选。源码修复任务在 source-delivery checkpoint 前必须发生真实源码编辑，完成前还要把每个修改路径映射回原始需求并清除本轮产生的越界改动。
 
 运行拓扑固定为 `Desktop AgentLoop -> codefactory-agent-core` 与 `Harbor -> thin Python bridge -> codefactory-agent-headless -> codefactory-agent-core`。Python 只负责把 JSONL `ToolRequest` 转发给 Harbor `BaseEnvironment.exec` 并回传结构化 `ToolResult`，不得包含模型调用、prompt、policy、任务分类或 repair。单次 trial 不允许在 Rust sidecar 失败后静默退回旧 Python solver。
 

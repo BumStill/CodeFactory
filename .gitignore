@@ -15,6 +15,7 @@ __pycache__/
 src-tauri/WixTools/
 .codex/run-logs/
 .codefactory/benchmark-jobs/
+.codefactory/product-acceptance/
 
 # SQLite databases and secrets (never commit)
 *.db

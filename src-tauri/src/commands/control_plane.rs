@@ -8,12 +8,11 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
 use std::time::Duration;
 use tauri::{AppHandle, State};
-use tokio::io::AsyncReadExt;
 
 use crate::util::no_window::NoWindow;
+use crate::util::process_tree::{self, ProcessOutputError};
 use crate::AppState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -219,116 +218,17 @@ enum GitCommandFailureKind {
     Failed,
 }
 
-#[cfg(unix)]
-fn isolate_process_tree(command: &mut tokio::process::Command) {
-    use std::os::unix::process::CommandExt;
-
-    command.as_std_mut().process_group(0);
-}
-
-#[cfg(not(unix))]
-fn isolate_process_tree(_command: &mut tokio::process::Command) {}
-
-#[cfg(unix)]
-async fn terminate_process_tree(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        // The child is the process-group leader, so a negative PID terminates
-        // descendants that may still own the stdout/stderr pipes.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-    }
-    let _ = child.start_kill();
-}
-
-#[cfg(windows)]
-async fn terminate_process_tree(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        let mut taskkill = tokio::process::Command::new("taskkill").no_window();
-        taskkill.args(["/PID", &pid.to_string(), "/T", "/F"]);
-        let _ = tokio::time::timeout(Duration::from_secs(1), taskkill.status()).await;
-    }
-    let _ = child.start_kill();
-}
-
-#[cfg(not(any(unix, windows)))]
-async fn terminate_process_tree(child: &mut tokio::process::Child) {
-    let _ = child.start_kill();
-}
-
-async fn settle_reader(task: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>) {
-    if tokio::time::timeout(Duration::from_millis(500), &mut *task)
-        .await
-        .is_err()
-    {
-        task.abort();
-        let _ = task.await;
-    }
-}
-
-async fn terminate_and_reap(
-    child: &mut tokio::process::Child,
-    stdout_task: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-    stderr_task: &mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-) {
-    terminate_process_tree(child).await;
-    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
-    settle_reader(stdout_task).await;
-    settle_reader(stderr_task).await;
-}
-
 async fn process_output_with_timeout(
-    mut command: tokio::process::Command,
+    command: tokio::process::Command,
     timeout_duration: Duration,
-) -> Result<Output, GitCommandFailureKind> {
-    command
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    isolate_process_tree(&mut command);
-    let mut child = match command.spawn() {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err(GitCommandFailureKind::Unavailable)
-        }
-        Err(_) => Err(GitCommandFailureKind::Failed),
-        Ok(child) => Ok(child),
-    }?;
-    let mut stdout = child.stdout.take().ok_or(GitCommandFailureKind::Failed)?;
-    let mut stderr = child.stderr.take().ok_or(GitCommandFailureKind::Failed)?;
-    let mut stdout_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
-    });
-    let mut stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
-    });
-
-    let status = match tokio::time::timeout(timeout_duration, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(_)) => {
-            terminate_and_reap(&mut child, &mut stdout_task, &mut stderr_task).await;
-            return Err(GitCommandFailureKind::Failed);
-        }
-        Err(_) => {
-            terminate_and_reap(&mut child, &mut stdout_task, &mut stderr_task).await;
-            return Err(GitCommandFailureKind::Timeout);
-        }
-    };
-
-    let stdout = stdout_task
+) -> Result<std::process::Output, GitCommandFailureKind> {
+    process_tree::output_with_timeout(command, timeout_duration)
         .await
-        .map_err(|_| GitCommandFailureKind::Failed)?
-        .map_err(|_| GitCommandFailureKind::Failed)?;
-    let stderr = stderr_task
-        .await
-        .map_err(|_| GitCommandFailureKind::Failed)?
-        .map_err(|_| GitCommandFailureKind::Failed)?;
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
+        .map_err(|error| match error {
+            ProcessOutputError::Timeout => GitCommandFailureKind::Timeout,
+            ProcessOutputError::Unavailable => GitCommandFailureKind::Unavailable,
+            ProcessOutputError::Failed => GitCommandFailureKind::Failed,
+        })
 }
 
 async fn git_command_output(

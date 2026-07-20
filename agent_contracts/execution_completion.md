@@ -34,6 +34,10 @@ shared by the desktop Agent and headless evaluation runtime.
    Map every explicitly named
    required component to an executed functional check through its public API.
    Importing or locating a compiled extension, plugin, or native library is not a functional check.
+   When the request specifies a named tool, library, model, version, or revision, the
+   implementation and verification must exercise that exact named dependency;
+   importing it while performing the work through an adjacent lower-level
+   dependency is not compliance.
    Do not equate a successful compiler exit with a usable installed result.
    When the request explicitly requires repository or project tests, record a
    successful project-test run after the final source edit, installation, and
@@ -43,7 +47,9 @@ shared by the desktop Agent and headless evaluation runtime.
    stage ordering evidence and will be rejected at the delivery checkpoint.
 4. For a background service, record its PID and log destination, use bounded
    readiness checks, and run a real client or functional probe. Starting a
-   process is not completion.
+   process is not completion. For any state-changing control path, capture
+   before-and-after observable state and assert that the requested change
+   occurred; a command acknowledgement alone is not functional evidence.
 5. A failed command is diagnostic evidence, not completion. Diagnose, repair,
    and rerun the smallest relevant check. A timeout or tool transport failure
    must remain a failed tool result that the Agent can diagnose; it must not
@@ -74,6 +80,11 @@ shared by the desktop Agent and headless evaluation runtime.
    Once the current source revision installs successfully, do not install more
    speculative dependencies until the next runtime or test stage reports a
    concrete missing dependency.
+   For a long task that names a required output artifact, create the first
+   candidate artifact before the final third of the budget, then spend the
+   remaining time validating and repairing it. Research, dependency setup, or
+   repeated inspection must not consume the final third while that artifact is
+   still missing.
 11. If a required test runner is unavailable, install that runner and rerun the
    same focused tests before making additional source edits. A masked zero exit
    from a shell pipeline does not turn a missing runner into successful tests.

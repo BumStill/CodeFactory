@@ -255,6 +255,9 @@ where
                 clamp_timeout_to_wall_reserve(config.model_timeout_sec, remaining, 30)
             })
             .unwrap_or(config.model_timeout_sec);
+        let model_wall_deadline = config.wall_time_budget_sec.map(|total| {
+            execution_started + Duration::from_secs(total.max(1).saturating_sub(30).max(1))
+        });
         let finalization_response = finalization_pending;
         let response = match request_model(
             &client,
@@ -263,6 +266,7 @@ where
             &messages,
             !finalization_response,
             request_timeout_sec,
+            model_wall_deadline,
         )
         .await
         {
@@ -582,7 +586,8 @@ async fn request_model(
     config: &StartConfig,
     messages: &[Value],
     allow_tools: bool,
-    total_timeout_sec: u64,
+    attempt_timeout_sec: u64,
+    wall_deadline: Option<Instant>,
 ) -> Result<Value, HeadlessError> {
     let mut payload = json!({
         "model": config.model,
@@ -606,12 +611,22 @@ async fn request_model(
             }
         }]);
     }
-    let deadline = Instant::now() + Duration::from_secs(total_timeout_sec.max(1));
+    let attempt_timeout = Duration::from_secs(attempt_timeout_sec.max(1));
     for attempt in 1..=MODEL_REQUEST_ATTEMPTS {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        if wall_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(HeadlessError::ModelResponse {
+                attempts: attempt - 1,
+                detail: "wall-clock deadline exhausted before the next model request".to_owned(),
+            });
+        }
+        let effective_timeout = wall_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .map(|remaining| remaining.min(attempt_timeout))
+            .unwrap_or(attempt_timeout)
+            .max(Duration::from_millis(1));
         let mut request = client
             .post(endpoint)
-            .timeout(remaining.max(Duration::from_millis(1)))
+            .timeout(effective_timeout)
             .json(&payload);
         if !config.api_key.is_empty() {
             request = request.bearer_auth(&config.api_key);
@@ -620,7 +635,7 @@ async fn request_model(
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) if attempt < MODEL_REQUEST_ATTEMPTS && is_retryable_model_error(&error) => {
-                wait_before_model_retry(attempt).await;
+                wait_before_model_retry(attempt, wall_deadline).await;
                 continue;
             }
             Err(error) => return Err(HeadlessError::ModelRequest(error)),
@@ -629,7 +644,7 @@ async fn request_model(
         let body = match response.bytes().await {
             Ok(body) => body,
             Err(error) if attempt < MODEL_REQUEST_ATTEMPTS && is_retryable_model_error(&error) => {
-                wait_before_model_retry(attempt).await;
+                wait_before_model_retry(attempt, wall_deadline).await;
                 continue;
             }
             Err(error) => {
@@ -645,7 +660,7 @@ async fn request_model(
             if attempt < MODEL_REQUEST_ATTEMPTS
                 && (status.as_u16() == 429 || status.is_server_error())
             {
-                wait_before_model_retry(attempt).await;
+                wait_before_model_retry(attempt, wall_deadline).await;
                 continue;
             }
             return Err(HeadlessError::ModelHttpStatus {
@@ -657,7 +672,7 @@ async fn request_model(
         match serde_json::from_slice(&body) {
             Ok(value) => return Ok(value),
             Err(_error) if attempt < MODEL_REQUEST_ATTEMPTS => {
-                wait_before_model_retry(attempt).await;
+                wait_before_model_retry(attempt, wall_deadline).await;
                 continue;
             }
             Err(error) => {
@@ -683,8 +698,18 @@ fn is_retryable_model_error(error: &reqwest::Error) -> bool {
         || error.is_decode()
 }
 
-async fn wait_before_model_retry(attempt: usize) {
-    tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+async fn wait_before_model_retry(attempt: usize, wall_deadline: Option<Instant>) {
+    let delay = Duration::from_millis(250 * attempt as u64);
+    let bounded_delay = wall_deadline
+        .map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(delay)
+        })
+        .unwrap_or(delay);
+    if !bounded_delay.is_zero() {
+        tokio::time::sleep(bounded_delay).await;
+    }
 }
 
 fn response_body_preview(body: &[u8]) -> String {
@@ -1355,12 +1380,114 @@ mod tests {
             &[json!({"role": "user", "content": "task"})],
             true,
             5,
+            None,
         )
         .await
         .unwrap();
 
         assert_eq!(response["choices"][0]["message"]["content"], "done");
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_request_timeout_preserves_a_real_retry_window() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            read_http_request(&mut first);
+            thread::sleep(Duration::from_millis(1_500));
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            read_http_request(&mut second);
+            let body = json!({
+                "choices": [{"message": {"role": "assistant", "content": "recovered"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })
+            .to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = second.write_all(reply.as_bytes());
+            let _ = second.flush();
+        });
+
+        let config = StartConfig {
+            instruction: "task".to_owned(),
+            model: "fake-model".to_owned(),
+            api_key: "test-key".to_owned(),
+            base_url: format!("http://{address}/v1"),
+            max_steps: 1,
+            model_timeout_sec: 1,
+            shell_timeout_sec: 30,
+            wall_time_budget_sec: None,
+            working_directory: Some("/workspace".to_owned()),
+            allow_network: false,
+            policy_profile: RuntimePolicyProfile::Product,
+        };
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let response = request_model(
+            &client,
+            &chat_completions_endpoint(&config.base_url),
+            &config,
+            &[json!({"role": "user", "content": "task"})],
+            true,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["choices"][0]["message"]["content"], "recovered");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_request_does_not_start_after_the_wall_deadline() {
+        let config = StartConfig {
+            instruction: "task".to_owned(),
+            model: "fake-model".to_owned(),
+            api_key: "test-key".to_owned(),
+            base_url: "http://127.0.0.1:9/v1".to_owned(),
+            max_steps: 1,
+            model_timeout_sec: 5,
+            shell_timeout_sec: 30,
+            wall_time_budget_sec: Some(60),
+            working_directory: Some("/workspace".to_owned()),
+            allow_network: false,
+            policy_profile: RuntimePolicyProfile::Product,
+        };
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let error = request_model(
+            &client,
+            &chat_completions_endpoint(&config.base_url),
+            &config,
+            &[json!({"role": "user", "content": "task"})],
+            true,
+            5,
+            Some(Instant::now() - Duration::from_millis(1)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HeadlessError::ModelResponse {
+                attempts: 0,
+                ref detail
+            } if detail.contains("wall-clock deadline")
+        ));
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) {

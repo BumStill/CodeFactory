@@ -82,6 +82,18 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertIn("python -m unittest tests.test_release_workflow", ci_workflow)
 
+    def test_ci_runs_agent_bridge_and_evaluation_tests_on_linux(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("agent-bridge-linux:", workflow)
+        job = workflow.split("agent-bridge-linux:", 1)[1]
+        self.assertIn("runs-on: ubuntu-latest", job)
+        self.assertIn("python-version: '3.12'", job)
+        self.assertIn("harbor==0.15.0", job)
+        self.assertIn("python -m unittest discover -s tests -p 'test_*.py'", job)
+
 
 if __name__ == "__main__":
     unittest.main()

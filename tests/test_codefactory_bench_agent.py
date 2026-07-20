@@ -1,6 +1,10 @@
 import asyncio
 import json
+import os
+import shutil
+import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -56,17 +60,171 @@ class FakeEnvironment:
             return ExecResult(stdout="/workspace\n", stderr="", return_code=0)
         if command.startswith("find . -maxdepth 3"):
             return ExecResult(stdout=self.project_manifests, stderr="", return_code=0)
-        if command in self.project_manifests_after_command:
-            self.project_manifests = self.project_manifests_after_command[command]
+        for expected, manifests in self.project_manifests_after_command.items():
+            if expected in command:
+                self.project_manifests = manifests
+                break
         if self.results:
             return self.results.pop(0)
         return ExecResult(stdout="ok", stderr="", return_code=0)
 
 
 class CodeFactoryBenchAgentTest(unittest.TestCase):
+    @staticmethod
+    def _running_linux_process_group_members(pgid: int) -> list[tuple[int, str]]:
+        members: list[tuple[int, str]] = []
+        for stat_path in Path("/proc").glob("[0-9]*/stat"):
+            try:
+                stat = stat_path.read_text()
+                fields = stat[stat.rfind(")") + 2 :].split()
+                state = fields[0]
+                process_group = int(fields[2])
+            except (IndexError, OSError, ValueError):
+                continue
+            if process_group == pgid and state != "Z":
+                members.append((int(stat_path.parent.name), state))
+        return members
+
     def test_harbor_import_path_and_identity_are_stable(self) -> None:
         self.assertEqual(CodeFactoryAgent.import_path(), "codefactory_bench.agent:CodeFactoryAgent")
         self.assertEqual(CodeFactoryAgent.name(), "codefactory-headless")
+
+    def test_timed_out_tool_request_cleans_its_managed_process_group(self) -> None:
+        class TimeoutEnvironment(FakeEnvironment):
+            async def exec(self, command: str, **kwargs: object) -> ExecResult:
+                self.calls.append({"command": command, **kwargs})
+                if "codefactory-tool-cleanup" in command:
+                    return ExecResult(stdout="cleaned", stderr="", return_code=0)
+                raise TimeoutError("tool exceeded environment timeout")
+
+        environment = TimeoutEnvironment()
+        agent = CodeFactoryAgent(logs_dir=Path("unused"), model_name="test-model")
+
+        result = asyncio.run(
+            agent._execute_tool_request(
+                {
+                    "id": "call-timeout",
+                    "command": "sqlite3 database.sqlite < slow.sql",
+                    "timeout_sec": 1,
+                },
+                environment,
+                "/workspace",
+            )
+        )
+
+        self.assertIsNone(result["return_code"])
+        self.assertIn("TimeoutError", str(result["error"]))
+        self.assertEqual(len(environment.calls), 2)
+        self.assertIn("setsid", str(environment.calls[0]["command"]))
+        self.assertIn("sqlite3 database.sqlite < slow.sql", str(environment.calls[0]["command"]))
+        self.assertIn("codefactory-tool-cleanup", str(environment.calls[1]["command"]))
+        self.assertIn("kill", str(environment.calls[1]["command"]))
+
+    def test_managed_tool_command_preserves_bash_syntax(self) -> None:
+        managed, _ = CodeFactoryAgent._managed_tool_command(
+            "call-bash", "[[ -n bash-ok ]] && printf bash-ok"
+        )
+
+        self.assertIn("setsid /bin/bash -c", managed)
+
+    @unittest.skipUnless(
+        shutil.which("setsid") and Path("/bin/bash").exists(),
+        "requires Linux setsid and bash",
+    )
+    def test_managed_tool_command_executes_real_bash_syntax(self) -> None:
+        managed, pidfile = CodeFactoryAgent._managed_tool_command(
+            "call-real-bash", "[[ -n bash-ok ]] && printf bash-ok"
+        )
+
+        completed = subprocess.run(
+            managed,
+            shell=True,
+            executable="/bin/bash",
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "bash-ok")
+        self.assertFalse(Path(pidfile).exists())
+
+    @unittest.skipUnless(
+        shutil.which("setsid") and Path("/bin/bash").exists(),
+        "requires Linux setsid and bash",
+    )
+    def test_cleanup_terminates_a_real_managed_process_group(self) -> None:
+        class LocalEnvironment:
+            async def exec(
+                self,
+                command: str,
+                cwd: str | None = None,
+                env: dict[str, str] | None = None,
+                timeout_sec: int | None = None,
+                user: str | int | None = None,
+            ) -> ExecResult:
+                del user
+                process = await asyncio.create_subprocess_exec(
+                    "/bin/bash",
+                    "-lc",
+                    command,
+                    cwd=cwd,
+                    env={**os.environ, **(env or {})},
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout_sec
+                )
+                return ExecResult(
+                    stdout=stdout.decode(errors="replace"),
+                    stderr=stderr.decode(errors="replace"),
+                    return_code=process.returncode,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = CodeFactoryAgent(logs_dir=Path(tmp), model_name="test-model")
+            managed, pidfile = agent._managed_tool_command(
+                "call-real-cleanup", "sleep 30"
+            )
+            launcher = subprocess.Popen(
+                managed,
+                shell=True,
+                executable="/bin/bash",
+                cwd=tmp,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not Path(pidfile).exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(Path(pidfile).exists(), "managed PGID was not recorded")
+                pgid = int(Path(pidfile).read_text().strip())
+
+                asyncio.run(
+                    agent._cleanup_managed_process_group(
+                        LocalEnvironment(), tmp, pidfile
+                    )
+                )
+
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    launcher.poll()
+                    members = self._running_linux_process_group_members(pgid)
+                    if not members:
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail(
+                        f"managed process group {pgid} has running members: {members}"
+                    )
+            finally:
+                if launcher.poll() is None:
+                    launcher.kill()
+                launcher.wait(timeout=5)
+                Path(pidfile).unlink(missing_ok=True)
 
     def test_setup_records_shared_contract_and_never_inspects_verifier(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -135,7 +293,7 @@ print(json.dumps({"type":"finished","final_text":"verified","execution_contract_
             self.assertEqual(len(env.calls), 4)
             self.assertEqual(env.calls[0]["command"], "pwd -P")
             self.assertTrue(str(env.calls[1]["command"]).startswith("find . -maxdepth 3"))
-            self.assertEqual(env.calls[2]["command"], "python -m unittest")
+            self.assertIn("python -m unittest", str(env.calls[2]["command"]))
             self.assertEqual(env.calls[2]["cwd"], "/workspace")
             self.assertTrue(str(env.calls[3]["command"]).startswith("find . -maxdepth 3"))
             trajectory = json.loads((root / "trajectory.json").read_text())
@@ -185,9 +343,11 @@ print(json.dumps({"type":"finished","final_text":"verified","execution_contract_
             asyncio.run(agent.run("Clone, fix, install, and verify", environment, AgentContext()))
 
             commands = [str(call["command"]) for call in environment.calls]
-            self.assertIn("git clone fixture pyknotid", commands)
+            self.assertTrue(any("git clone fixture pyknotid" in command for command in commands))
             install_call = next(
-                call for call in environment.calls if call["command"] == "pip install -e ."
+                call
+                for call in environment.calls
+                if "pip install -e ." in str(call["command"])
             )
             self.assertEqual(install_call["cwd"], "/workspace/pyknotid")
 
