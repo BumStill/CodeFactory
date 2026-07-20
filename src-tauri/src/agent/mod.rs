@@ -637,6 +637,15 @@ impl AgentLoop {
         // Model-aware reinforcement for post-approval Execute turns (no-op for
         // high-compliance models and all non-Execute turns).
         system_prompt.push_str(compliance_booster(self.mode, &self.model_id));
+        // Delivery-chain readiness: surface a broken chain (e.g. missing
+        // GitHub token) in the model's FIRST reply instead of letting it be
+        // discovered when deliver_changes blocks after the work is done.
+        {
+            let settings = self.settings.read().await;
+            if let Some(note) = delivery::delivery_readiness_note(&self.cwd, &settings) {
+                system_prompt.push_str(&note);
+            }
+        }
         let api_style = self.api_style.clone();
 
         match api_style {
