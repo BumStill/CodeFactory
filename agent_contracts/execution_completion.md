@@ -15,7 +15,14 @@ shared by the desktop Agent and headless evaluation runtime.
    the user expects to see or wait for a visible state, the functional probe must
    capture that state after the last relevant mutation or service start; process
    liveness, an open port, transport connection, and command acknowledgement are
-   insufficient.
+   insufficient. When the request specifies an expected output or return value,
+   the post-change verification must contain a machine-checked assertion, real
+   test runner, or dedicated verifier that exits nonzero on mismatch. Printing
+   expected and actual values is diagnostic evidence, not successful
+   verification. Treat executable interpreter or shell heredocs as opaque
+   state-changing actions; identifiers such as `test = ...` inside their payload
+   must never masquerade as a shell assertion, and a separate machine-checked
+   verification must follow them.
 3. For source-build work, prove the build, installation or usable artifact,
    runtime behavior outside the source directory, and project tests when those
    stages apply. Enumerate the actual build inputs from manifests and build
