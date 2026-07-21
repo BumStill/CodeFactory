@@ -891,6 +891,10 @@ export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
   const [evidenceViewerPath, setEvidenceViewerPath] = useState<string | null>(null);
   // Map of req_id -> evidence pack count for sidebar badges
   const [evidenceCountMap, setEvidenceCountMap] = useState<Record<string, number>>({});
+  // Surface debounced auto-save failures instead of silently dropping them.
+  // The save used to `.catch(() => {})`, so a failed write left the user
+  // editing a spec they believed was saved — a data-loss-class surprise.
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   // Debounced auto-save
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -919,7 +923,9 @@ export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
       if (saveTimer.current) clearTimeout(saveTimer.current);
       saveTimer.current = setTimeout(() => {
         if (activeSpec) {
-          saveSpec(activeSpec.meta.file_path, content).catch(() => {});
+          saveSpec(activeSpec.meta.file_path, content)
+            .then(() => setSaveError(null))
+            .catch((e) => setSaveError(String(e)));
         }
       }, 1000);
     },
@@ -1095,6 +1101,22 @@ export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
             <div className="flex flex-1 min-h-0">
               {/* Edit / Preview / Evidence */}
               <div className="flex-1 flex flex-col min-w-0">
+                {saveError && (
+                  <div className="flex items-center justify-between gap-2 border-b border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs text-red-300">
+                    <span className="truncate">自动保存失败：{saveError}</span>
+                    <button
+                      onClick={() => {
+                        if (!activeSpec) return;
+                        saveSpec(activeSpec.meta.file_path, activeSpec.content)
+                          .then(() => setSaveError(null))
+                          .catch((e) => setSaveError(String(e)));
+                      }}
+                      className="shrink-0 rounded border border-red-500/40 px-2 py-0.5 hover:bg-red-500/20"
+                    >
+                      重试
+                    </button>
+                  </div>
+                )}
                 {tab === "edit" ? (
                   <textarea
                     value={activeSpec.content}
