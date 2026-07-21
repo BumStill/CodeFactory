@@ -2,7 +2,7 @@
 
 - Req ID: `CF-TB-R48`
 - 日期: `2026-07-21`
-- 状态: candidate verified, not live
+- 状态: live in public `v1.51.7`
 - Proof tier: `agent-runtime-no-gui`
 - 基线版本: public `v1.51.6` / `e34c2ec`
 - candidate headless SHA-256: `e9f4493bc86579f3d763a9ad6484a3f6768ad84242f1a920f8971557049b37a5`
@@ -116,8 +116,49 @@ completion evidence 正常闭合。缺陷转移到验证充分性：该断言只
 - governance baseline / long-task validation / `git diff --check`: passed
 - final independent targeted re-review: `no blocker`; `r48_` `15 passed`
 
+## 产品化发布
+
+- PR: `#136`
+- merge commit: `0808cde635c1217d9539937dbdd7345f17a4086e`
+- PR CI: main check、Linux agent bridge、governance baseline、remote real-App GUI 全部通过
+- Auto Release: `29789534085`
+- public release: `v1.51.7` / `50a52bed2ac429b086da687b96b90e92cb506e87`
+- Release workflow: `29789546846`
+- published DMG: `CodeFactory_1.51.7_aarch64.dmg`, SHA-256
+  `548277f03ca446c817b9ef17938da23236a338e56a0b7c5cf0894cebe44232f6`
+- published Windows setup: `CodeFactory_1.51.7_x64-setup.exe`, SHA-256
+  `990a5806c3342ff7683d21e30adbdfe14a7461ddac99e07f2149c8ec6cf90f85`
+- Windows executable closed loop、macOS installed-App GUI、公开 DMG 再下载验证和本机
+  `hdiutil verify` 全部通过
+
+## v1.51.7 同题 Released-Build Canary
+
+保持 `circuit-fibsqrt`、DeepSeek `deepseek-v4-pro`、并发 `1`、900 秒 watchdog、subset、
+resource 和 verifier 不变，只替换为精确发布提交 `v1.51.7`。运行明确为
+`official_comparable=no`，不能替代固定 18 题总分。
+
+- run: `d6ad2b52-412c-48d4-8a6e-3f4ed80e9920`
+- reward: `0`, failure class: `environment`
+- duration: `1,348.95s`
+- released-source headless SHA-256:
+  `dc8cafe28a14893fcf977c0dde7f5828557ff2e8d62be4bd4c2b60fc5428d21d`
+- model requests / tokens / external tool calls: `80 / 686,352 / 69`
+- completed: `false`
+- last successful source mutation: sequence `38`
+- successful machine verification / independent verification: `<none> / <none>`
+- watchdog: sequence `38` 后在 900 秒停止 task container；sequence `39-69` 全部因
+  `service "main" is not running` 失败
+- raw report: `docs/evidence-packs/terminal-bench-21-regression-subset-2026-07-21T00-45-00Z.md`
+
+R48 的正向产品变化已验证：v1.51.6 在 `11` 次工具调用后复用正文示例并错误完成；v1.51.7
+没有接受该路径，completion evidence 保持 `completed=false`。同时 canary 暴露 R49：外层
+watchdog 没有把 900 秒截止时间传给 sidecar，容器停止后 Agent 仍继续到 `80` 次模型请求，
+额外产生 `31` 次必然失败的工具调用。这个成本和取消传播缺陷必须先修复，不能通过放宽 R48
+验证门禁来掩盖。
+
 ## 结论边界
 
-R48 已通过共享策略、headless 协议、锁屏真实 DeepSeek Runtime 和受控 sidecar 策略路径验证，
-但当前尚未合并、尚未发布，因此是 `not live`。只有 PR/CI、release、发布产物验证和同参数
-released-build canary 完成后才能称为产品化。当前有效固定 18 题总分仍为 `6 / 18`。
+R48 已通过共享策略、headless 协议、锁屏真实 DeepSeek Runtime、PR/CI、`v1.51.7` 公开发布、
+发布产物复验和同参数 released-build canary，因此已产品化上线。canary reward 仍为 `0`，且
+启用了 watchdog，所以当前有效固定 18 题总分仍为 `6 / 18`；下一轮先修复 R49 的 host
+deadline/cancellation 传播，再在相同预算下判断 Agent 的真实收敛能力。

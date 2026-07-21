@@ -85,7 +85,12 @@ shared by the desktop Agent and headless evaluation runtime.
 8. The caller owns the total task deadline unless it explicitly supplies a
    shorter Agent wall timeout. Per-request, per-command, and step bounds remain
    active, but an implicit duplicate wall clock must not terminate a valid
-   long-running task early.
+   long-running task early. When the caller supplies a hard host deadline, the
+   Agent must stop starting model requests and tool calls before the caller's
+   cleanup reserve begins, return incomplete evidence with the latest usage,
+   and terminate any child or in-flight tool process that does not exit within
+   that deadline. No child may continue working against a workspace after the
+   caller starts workspace cleanup.
 9. Reduce model round trips during autonomous work. Batch related workspace
    reads, compatible edits, and focused checks into one bounded tool call when
    their ordering and failure handling remain clear. Do not serialize a list of

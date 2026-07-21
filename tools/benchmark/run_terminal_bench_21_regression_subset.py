@@ -24,6 +24,8 @@ TEST_NAME = "benchmark::tests::provider_bridge_runs_real_codefactory_endpoint_fr
 DEFAULT_TRIAL_HARD_TIMEOUT_SEC = 0
 DEFAULT_HEAVY_VERIFIER_HARD_TIMEOUT_SEC = 0
 DEFAULT_HEAVY_VERIFIER_TIMEOUT_MULTIPLIER = 1.0
+HOST_DEADLINE_RESERVE_SEC = 120
+MIN_AGENT_RUNTIME_SEC = 30
 HEAVY_VERIFIER_TRIAL_PREFIXES = ("torch-tensor-parallelism",)
 BOOTSTRAP_SMOKE_IMAGES = [
     ("debian-bookworm", "python:3.10-slim-bookworm"),
@@ -154,17 +156,41 @@ class BenchmarkWatchdog:
         messages: list[str] = []
         for trial_path in self._running_trial_paths():
             trial_name = trial_path.name
-            first_seen = self._first_seen.setdefault(trial_name, now)
+            if trial_name not in self._first_seen:
+                trial_age_sec = 0.0
+                try:
+                    trial_started_at = (trial_path / "config.json").stat().st_mtime
+                    trial_age_sec = max(0.0, time.time() - trial_started_at)
+                except OSError:
+                    pass
+                self._first_seen[trial_name] = now - trial_age_sec
+            first_seen = self._first_seen[trial_name]
             elapsed = int(now - first_seen)
             timeout_sec = self._timeout_for_trial(trial_name)
             if elapsed < timeout_sec or self._already_intervened(trial_name):
                 continue
+            sidecar_status = self._stop_trial_sidecar(trial_path)
+            if sidecar_status == "stop-failed":
+                messages.append(
+                    "benchmark_watchdog_timeout "
+                    f"trial={trial_name} elapsed_sec={elapsed} "
+                    "containers=<deferred> action=sidecar-stop-failed-retry"
+                )
+                continue
             containers = self._stop_trial_containers(trial_name)
+            if sidecar_status == "verified-stopped" and containers:
+                action = "sidecar-stop+docker-stop"
+            elif sidecar_status == "verified-stopped":
+                action = "sidecar-stop"
+            elif containers:
+                action = "docker-stop"
+            else:
+                action = "no-container-found"
             intervention = WatchdogIntervention(
                 trial=trial_name,
                 elapsed_sec=elapsed,
                 containers=containers,
-                action="docker-stop" if containers else "no-container-found",
+                action=action,
             )
             with self._lock:
                 self._interventions.append(intervention)
@@ -202,6 +228,117 @@ class BenchmarkWatchdog:
     def _timeout_for_trial(self, trial_name: str) -> int:
         task_name = trial_name.split("__", 1)[0]
         return self.trial_timeout_overrides.get(task_name, self.timeout_sec)
+
+    def _stop_trial_sidecar(self, trial_path: Path) -> str:
+        runtime_path = trial_path / "agent" / "sidecar-runtime.json"
+        try:
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return "stop-failed"
+        except (OSError, json.JSONDecodeError):
+            return "stop-failed"
+        pid = runtime.get("pid")
+        binary = runtime.get("binary")
+        runtime_token = runtime.get("runtime_token")
+        process_group_id = runtime.get("process_group_id")
+        if runtime.get("status") == "stopped":
+            return "not-running"
+        if runtime.get("status") != "running" or not isinstance(pid, int) or pid <= 0:
+            return "stop-failed"
+        if not isinstance(binary, str) or not binary:
+            return "stop-failed"
+        if not isinstance(runtime_token, str) or not runtime_token:
+            return "stop-failed"
+        if process_group_id != pid:
+            return "stop-failed"
+        process_state = self._sidecar_process_state(
+            pid, binary, runtime_token, process_group_id
+        )
+        if process_state == "absent":
+            return "not-running"
+        if process_state != "matches":
+            return "stop-failed"
+        if not self._signal_process_group(process_group_id, "-TERM"):
+            process_state = self._sidecar_process_state(
+                pid, binary, runtime_token, process_group_id
+            )
+            if process_state == "absent":
+                return "not-running"
+            return "stop-failed"
+        for _ in range(10):
+            process_state = self._sidecar_process_state(
+                pid, binary, runtime_token, process_group_id
+            )
+            if process_state == "absent":
+                return "verified-stopped"
+            if process_state in {"unknown", "mismatch"}:
+                return "stop-failed"
+            time.sleep(0.1)
+        if not self._signal_process_group(process_group_id, "-KILL"):
+            return "stop-failed"
+        for _ in range(10):
+            process_state = self._sidecar_process_state(
+                pid, binary, runtime_token, process_group_id
+            )
+            if process_state == "absent":
+                return "verified-stopped"
+            if process_state in {"unknown", "mismatch"}:
+                return "stop-failed"
+            time.sleep(0.1)
+        return "stop-failed"
+
+    @staticmethod
+    def _sidecar_process_state(
+        pid: int,
+        binary: str,
+        runtime_token: str,
+        process_group_id: int,
+    ) -> str:
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "pgid=", "-o", "command="],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "unknown"
+        output = result.stdout.strip()
+        if result.returncode == 1 and not output:
+            return "absent"
+        if result.returncode != 0 or not output:
+            return "unknown"
+        fields = output.split(maxsplit=1)
+        if len(fields) != 2:
+            return "unknown"
+        try:
+            actual_process_group_id = int(fields[0])
+        except ValueError:
+            return "unknown"
+        command = fields[1]
+        token_arg = f"--codefactory-runtime-token={runtime_token}"
+        if actual_process_group_id != process_group_id:
+            return "mismatch"
+        if not command.startswith(f"{binary} ") or token_arg not in command.split():
+            return "mismatch"
+        return "matches"
+
+    @staticmethod
+    def _signal_process_group(process_group_id: int, signal: str) -> bool:
+        try:
+            result = subprocess.run(
+                ["kill", signal, "--", f"-{process_group_id}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
 
     def _stop_trial_containers(self, trial_name: str) -> list[str]:
         prefix = docker_compose_project_prefix(trial_name)
@@ -296,6 +433,30 @@ def format_timeout_overrides(overrides: dict[str, int]) -> str:
     return ", ".join(f"{name}:{timeout}" for name, timeout in sorted(overrides.items()))
 
 
+def task_host_timeout_caps(args: argparse.Namespace, subset: dict) -> dict[str, int]:
+    trial_timeout_sec = int(getattr(args, "trial_hard_timeout_sec", 0) or 0)
+    if trial_timeout_sec <= 0:
+        return {}
+
+    trial_overrides = heavy_verifier_timeout_overrides(args)
+    caps: dict[str, int] = {}
+    for item in subset.get("tasks", []):
+        task_name = str(item.get("name") or "").strip()
+        if not task_name:
+            continue
+        short_name = task_name.rsplit("/", 1)[-1]
+        hard_timeout_sec = trial_overrides.get(short_name, trial_timeout_sec)
+        if hard_timeout_sec <= HOST_DEADLINE_RESERVE_SEC + MIN_AGENT_RUNTIME_SEC:
+            raise SystemExit(
+                f"trial hard timeout for {task_name} is too short: "
+                f"{hard_timeout_sec}s must exceed the {HOST_DEADLINE_RESERVE_SEC}s "
+                f"host reserve plus {MIN_AGENT_RUNTIME_SEC}s minimum Agent window"
+            )
+        host_cap_sec = hard_timeout_sec - HOST_DEADLINE_RESERVE_SEC
+        caps[task_name] = host_cap_sec
+    return caps
+
+
 def comparability_notes(
     args: argparse.Namespace,
     interventions: list[WatchdogIntervention] | None = None,
@@ -333,6 +494,7 @@ def build_env(args: argparse.Namespace, subset: dict) -> dict[str, str]:
     tasks = [str(item["name"]).strip() for item in subset["tasks"]]
     env = os.environ.copy()
     env.pop("CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC", None)
+    env.pop("CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON", None)
     env.pop("CODEFACTORY_BENCH_TASK_AGENT_TIMEOUTS_JSON", None)
     current_pythonpath = env.get("PYTHONPATH")
     env.update(
@@ -363,6 +525,11 @@ def build_env(args: argparse.Namespace, subset: dict) -> dict[str, str]:
     if task_agent_timeouts:
         env["CODEFACTORY_BENCH_TASK_AGENT_TIMEOUTS_JSON"] = json.dumps(
             task_agent_timeouts, sort_keys=True, separators=(",", ":")
+        )
+    host_timeout_caps = task_host_timeout_caps(args, subset)
+    if host_timeout_caps:
+        env["CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON"] = json.dumps(
+            host_timeout_caps, sort_keys=True, separators=(",", ":")
         )
     if args.agent_wall_timeout_sec > 0:
         env["CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC"] = str(
@@ -442,6 +609,7 @@ def safe_plan(
             f"- explicit CODEFACTORY_BENCH_API_KEY present: `{explicit_key}`",
             f"- keychain timeout: `{args.secret_timeout_sec}s`",
             f"- trial_hard_timeout_sec: `{args.trial_hard_timeout_sec or '<disabled>'}`",
+            f"- task_host_timeout_caps: `{format_timeout_overrides(task_host_timeout_caps(args, subset))}`",
             f"- heavy_verifier_timeout_overrides: `{format_timeout_overrides(heavy_verifier_timeout_overrides(args))}`",
             f"- heavy_verifier_timeout_multiplier: `{heavy_verifier_timeout_multiplier(args, subset) or '<none>'}`",
             f"- docker_apt_proxy: `{args.docker_apt_proxy or '<none>'}`",
@@ -1063,6 +1231,7 @@ def write_report(
         f"- official_comparable: `{official_comparable}`",
         f"- explicit_key_present: `{'yes' if os.environ.get('CODEFACTORY_BENCH_API_KEY') else 'no'}`",
         f"- trial_hard_timeout_sec: `{args.trial_hard_timeout_sec or '<disabled>'}`",
+        f"- task_host_timeout_caps: `{format_timeout_overrides(task_host_timeout_caps(args, subset))}`",
         f"- heavy_verifier_timeout_overrides: `{format_timeout_overrides(heavy_verifier_timeout_overrides(args))}`",
         f"- heavy_verifier_timeout_multiplier: `{heavy_verifier_timeout_multiplier(args, subset) or '<none>'}`",
         f"- verifier_uv_torch_backend: `{args.verifier_uv_torch_backend or '<none>'}`",
