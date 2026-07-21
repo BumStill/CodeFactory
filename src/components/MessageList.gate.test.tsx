@@ -92,4 +92,46 @@ describe("MessageList completion-gate visibility", () => {
     expect(screen.getByText(/完成度检查介入/)).toBeTruthy();
     expect(screen.getByText(/at least one successful verification is required/)).toBeTruthy();
   });
+
+  it("renders a persisted turn error as a visible error notice, not a user bubble", () => {
+    // 2026-07-21 field report: four interruptions, zero forensic trace — the
+    // error only existed as a transient stream event. Persisted turn errors
+    // must render as an error notice and survive reloads.
+    const { container } = render(
+      <MessageList
+        messages={[
+          msg({
+            id: "err",
+            role: "user",
+            content: "[回合错误] 400 This model does not support image input",
+            completionState: "turn_error",
+          }),
+        ]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+    expect(screen.getByText(/回合中断/)).toBeTruthy();
+    expect(screen.getByText(/does not support image input/)).toBeTruthy();
+    expect(container.querySelector(".justify-end")).toBeNull();
+  });
+
+  it("renders a turn notice (e.g. images stripped for a no-vision model) as a neutral notice", () => {
+    const { container } = render(
+      <MessageList
+        messages={[
+          msg({
+            id: "notice",
+            role: "user",
+            content: "已自动移除历史中的图片后重试:当前模型不支持图片输入。",
+            completionState: "turn_notice",
+          }),
+        ]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+    expect(screen.getByText(/已自动移除历史中的图片/)).toBeTruthy();
+    expect(container.querySelector(".justify-end")).toBeNull();
+  });
 });
