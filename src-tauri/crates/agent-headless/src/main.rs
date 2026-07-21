@@ -247,7 +247,7 @@ where
     let mut stopped_for_wall_budget = false;
 
     let max_steps = config.max_steps.max(1);
-    for step_index in 0..max_steps {
+    'execution: for step_index in 0..max_steps {
         let wall_time = remaining_wall_time(execution_started, config.wall_time_budget_sec);
         if wall_time.is_some_and(|(remaining, _)| remaining <= 30) {
             stopped_for_wall_budget = true;
@@ -372,6 +372,12 @@ where
         let mut emitted_tool_request = false;
         let remaining = max_steps.saturating_sub(step_index + 1);
         for tool_call in tool_calls {
+            if remaining_wall_time(execution_started, config.wall_time_budget_sec)
+                .is_some_and(|(remaining, _)| remaining <= 30)
+            {
+                stopped_for_wall_budget = true;
+                break 'execution;
+            }
             let started_at_ms = unix_time_ms();
             let wall_time = remaining_wall_time(execution_started, config.wall_time_budget_sec);
             let effective_tool_timeout_sec = wall_time
@@ -1485,6 +1491,90 @@ mod tests {
                 .as_str()
                 .is_some_and(|content| content.contains("machine-checked assertion"))
         }));
+    }
+
+    #[tokio::test]
+    async fn host_wall_reserve_stops_remaining_tool_calls_in_same_model_response() {
+        let (base_url, server) = fake_openai_server(vec![json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "mutation-1",
+                            "type": "function",
+                            "function": {
+                                "name": "run_shell",
+                                "arguments": "{\"command\":\"printf fixed > result.txt\",\"timeout_sec\":5}"
+                            }
+                        },
+                        {
+                            "id": "must-not-run",
+                            "type": "function",
+                            "function": {
+                                "name": "run_shell",
+                                "arguments": "{\"command\":\"cargo test\",\"timeout_sec\":30}"
+                            }
+                        }
+                    ]
+                }
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+        })]);
+
+        let (test_input, run_input) = tokio::io::duplex(16 * 1024);
+        let (run_output, test_output) = tokio::io::duplex(16 * 1024);
+        let runner = tokio::spawn(async move {
+            let mut input = BufReader::new(run_input);
+            let mut output = run_output;
+            run(&mut input, &mut output).await
+        });
+        let mut input = test_input;
+        let mut output = BufReader::new(test_output);
+
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "start",
+                "instruction": "Fix the project and verify the result.",
+                "model": "fake-model",
+                "api_key": "test-key",
+                "base_url": base_url,
+                "max_steps": 2,
+                "model_timeout_sec": 5,
+                "shell_timeout_sec": 60,
+                "wall_time_budget_sec": 32,
+                "allow_network": false,
+                "execution_contract_sha256": execution_contract_sha256()
+            }),
+        )
+        .await;
+
+        let first = read_test_output(&mut output).await;
+        assert_eq!(first["type"], "tool_request");
+        assert_eq!(first["id"], "mutation-1");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "tool_result",
+                "id": "mutation-1",
+                "return_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "error": null
+            }),
+        )
+        .await;
+
+        let finished = read_test_output(&mut output).await;
+        assert_eq!(finished["type"], "finished");
+        assert_eq!(finished["completion_evidence"]["completed"], false);
+        assert_eq!(finished["usage"]["model_requests"], 1);
+
+        runner.await.unwrap().unwrap();
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     #[tokio::test]

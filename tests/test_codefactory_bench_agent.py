@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
 
-from codefactory_bench.agent import CodeFactoryAgent
+from codefactory_bench.agent import CodeFactoryAgent, HostDeadlineExceeded
 
 
 class FakeNetworkMode:
@@ -109,6 +109,7 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
                 },
                 environment,
                 "/workspace",
+                None,
             )
         )
 
@@ -119,6 +120,241 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
         self.assertIn("sqlite3 database.sqlite < slow.sql", str(environment.calls[0]["command"]))
         self.assertIn("codefactory-tool-cleanup", str(environment.calls[1]["command"]))
         self.assertIn("kill", str(environment.calls[1]["command"]))
+
+    def test_host_deadline_cancels_inflight_tool_and_cleans_process_group(self) -> None:
+        class SlowEnvironment(FakeEnvironment):
+            async def exec(self, command: str, **kwargs: object) -> ExecResult:
+                self.calls.append({"command": command, **kwargs})
+                if "codefactory-tool-cleanup" in command:
+                    return ExecResult(stdout="cleaned", stderr="", return_code=0)
+                await asyncio.sleep(60)
+                raise AssertionError("host deadline did not cancel the tool")
+
+        environment = SlowEnvironment()
+        agent = CodeFactoryAgent(logs_dir=Path("unused"), model_name="test-model")
+
+        with self.assertRaises(HostDeadlineExceeded):
+            asyncio.run(
+                agent._execute_tool_request(
+                    {
+                        "id": "call-host-timeout",
+                        "command": "python long_task.py",
+                        "timeout_sec": 300,
+                    },
+                    environment,
+                    "/workspace",
+                    time.monotonic() + 0.05,
+                )
+            )
+
+        self.assertEqual(len(environment.calls), 2)
+        self.assertIn("python long_task.py", str(environment.calls[0]["command"]))
+        self.assertIn("codefactory-tool-cleanup", str(environment.calls[1]["command"]))
+
+    def test_host_deadline_kills_sidecar_and_persists_request_usage(self) -> None:
+        class BlockingToolEnvironment(FakeEnvironment):
+            async def exec(self, command: str, **kwargs: object) -> ExecResult:
+                self.calls.append({"command": command, **kwargs})
+                if command == "pwd -P":
+                    return ExecResult(stdout="/workspace\n", stderr="", return_code=0)
+                if command.startswith("find . -maxdepth 3"):
+                    return ExecResult(stdout="", stderr="", return_code=0)
+                if "codefactory-tool-cleanup" in command:
+                    return ExecResult(stdout="cleaned", stderr="", return_code=0)
+                await asyncio.sleep(60)
+                raise AssertionError("host deadline did not cancel the tool")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "sidecar-survived.txt"
+            sidecar = self._write_sidecar(
+                root,
+                f"""import json, pathlib, sys, time
+start = json.loads(sys.stdin.readline())
+print(json.dumps({{"type":"tool_request","id":"slow-call","command":"python long_task.py","timeout_sec":300,"usage":{{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"model_requests":2}}}}), flush=True)
+time.sleep(3)
+pathlib.Path({str(marker)!r}).write_text("sidecar was not killed")
+""",
+            )
+            environment = BlockingToolEnvironment()
+            context = AgentContext()
+            agent = CodeFactoryAgent(
+                logs_dir=root,
+                model_name="test-model",
+                extra_env={
+                    "CODEFACTORY_BENCH_API_KEY": "test-key",
+                    "CODEFACTORY_BENCH_AGENT_BINARY": str(sidecar),
+                },
+            )
+            deadline = time.monotonic() + 1.5
+
+            with self.assertRaises(HostDeadlineExceeded):
+                with patch.object(agent, "_ensure_host_deadline", return_value=deadline), patch.object(
+                    agent, "_agent_wall_timeout_sec", return_value=1
+                ):
+                    asyncio.run(agent.run("Complete the task", environment, context))
+
+            metadata = json.loads((root / "run-metadata.json").read_text())
+            self.assertEqual(metadata["failure"]["type"], "HostDeadlineExceeded")
+            self.assertEqual(metadata["status"], "cancelled")
+            self.assertEqual(metadata["tool_calls"], 1)
+            self.assertEqual(
+                metadata["usage"],
+                {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 30,
+                    "total_tokens": 150,
+                    "model_requests": 2,
+                },
+            )
+            trajectory = json.loads((root / "trajectory.json").read_text())
+            self.assertEqual(trajectory["steps"][0]["id"], "slow-call")
+            self.assertFalse(marker.exists())
+            self.assertTrue(
+                any(
+                    "codefactory-tool-cleanup" in str(call["command"])
+                    for call in environment.calls
+                )
+            )
+
+    def test_host_deadline_kills_sidecar_that_hangs_after_finished(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "finished-sidecar-survived.txt"
+            sidecar = self._write_sidecar(
+                root,
+                f"""import json, pathlib, sys, time
+start = json.loads(sys.stdin.readline())
+print(json.dumps({{"type":"finished","final_text":"incomplete","execution_contract_sha256":start["execution_contract_sha256"],"completion_evidence":{{"completed":False}},"usage":{{"prompt_tokens":60,"completion_tokens":15,"total_tokens":75,"model_requests":1}}}}), flush=True)
+time.sleep(3)
+pathlib.Path({str(marker)!r}).write_text("sidecar was not killed")
+""",
+            )
+            context = AgentContext()
+            agent = CodeFactoryAgent(
+                logs_dir=root,
+                model_name="test-model",
+                extra_env={
+                    "CODEFACTORY_BENCH_API_KEY": "test-key",
+                    "CODEFACTORY_BENCH_AGENT_BINARY": str(sidecar),
+                },
+            )
+            deadline = time.monotonic() + 1.5
+
+            with self.assertRaises(HostDeadlineExceeded):
+                with patch.object(
+                    agent, "_ensure_host_deadline", return_value=deadline
+                ), patch.object(agent, "_agent_wall_timeout_sec", return_value=1):
+                    asyncio.run(
+                        agent.run(
+                            "Complete the task",
+                            FakeEnvironment(),
+                            context,
+                        )
+                    )
+
+            metadata = json.loads((root / "run-metadata.json").read_text())
+            self.assertEqual(metadata["failure"]["type"], "HostDeadlineExceeded")
+            self.assertEqual(metadata["status"], "cancelled")
+            self.assertEqual(
+                metadata["usage"],
+                {
+                    "prompt_tokens": 60,
+                    "completion_tokens": 15,
+                    "total_tokens": 75,
+                    "model_requests": 1,
+                },
+            )
+            self.assertFalse(marker.exists())
+            runtime = json.loads((root / "sidecar-runtime.json").read_text())
+            self.assertEqual(runtime["status"], "stopped")
+
+    def test_completed_tool_result_is_persisted_before_deadline_delivery_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sidecar = self._write_sidecar(
+                root,
+                """import json, sys, time
+json.loads(sys.stdin.readline())
+print(json.dumps({"type":"tool_request","id":"completed-call","command":"printf complete","timeout_sec":5,"usage":{"prompt_tokens":20,"completion_tokens":5,"total_tokens":25,"model_requests":1}}), flush=True)
+time.sleep(3)
+""",
+            )
+            agent = CodeFactoryAgent(
+                logs_dir=root,
+                model_name="test-model",
+                extra_env={
+                    "CODEFACTORY_BENCH_API_KEY": "test-key",
+                    "CODEFACTORY_BENCH_AGENT_BINARY": str(sidecar),
+                },
+            )
+
+            with self.assertRaises(HostDeadlineExceeded):
+                with patch.object(
+                    agent,
+                    "_resolve_project_directory",
+                    new=AsyncMock(
+                        side_effect=[
+                            ("/workspace", False),
+                            HostDeadlineExceeded(
+                                "deadline reached during project refresh"
+                            ),
+                        ]
+                    ),
+                ):
+                    asyncio.run(
+                        agent.run(
+                            "Complete the task",
+                            FakeEnvironment(),
+                            AgentContext(),
+                        )
+                    )
+
+            trajectory = json.loads((root / "trajectory.json").read_text())
+            self.assertEqual([step["type"] for step in trajectory["steps"]], [
+                "tool_request",
+                "tool_result",
+            ])
+            self.assertEqual(trajectory["steps"][1]["stdout"], "ok")
+
+    def test_host_deadline_is_anchored_to_trial_config_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trial = Path(tmp) / "example__trial"
+            logs_dir = trial / "agent"
+            logs_dir.mkdir(parents=True)
+            config = trial / "config.json"
+            config.write_text("{}")
+            started_at = time.time() - 200
+            os.utime(config, (started_at, started_at))
+            agent = CodeFactoryAgent(
+                logs_dir=logs_dir,
+                model_name="test-model",
+                extra_env={
+                    "CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON": json.dumps(
+                        {"example": 780}
+                    )
+                },
+            )
+
+            remaining = agent._ensure_host_deadline() - time.monotonic()
+
+            self.assertGreaterEqual(remaining, 578)
+            self.assertLessEqual(remaining, 581)
+
+    def test_host_deadline_fails_closed_when_trial_config_is_missing(self) -> None:
+        agent = CodeFactoryAgent(
+            logs_dir=Path("missing__trial") / "agent",
+            model_name="test-model",
+            extra_env={
+                "CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON": json.dumps(
+                    {"missing": 780}
+                )
+            },
+        )
+
+        remaining = agent._ensure_host_deadline() - time.monotonic()
+
+        self.assertLessEqual(remaining, 0.01)
 
     def test_managed_tool_command_preserves_bash_syntax(self) -> None:
         managed, _ = CodeFactoryAgent._managed_tool_command(
@@ -405,6 +641,39 @@ print(json.dumps({"type":"finished","final_text":"ok","execution_contract_sha256
         )
         self.assertEqual(configured._agent_wall_timeout_sec(), 1800)
 
+    def test_lifecycle_host_deadline_is_separate_from_explicit_run_budget(self) -> None:
+        agent = CodeFactoryAgent(
+            logs_dir=Path("build-cython-ext__trial") / "agent",
+            model_name="test-model",
+            extra_env={
+                "CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC": "1800",
+                "CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON": json.dumps(
+                    {"build-cython-ext": 780, "filter-js-from-html": 1680}
+                ),
+            },
+        )
+
+        self.assertEqual(agent._agent_wall_timeout_sec(), 1800)
+        self.assertEqual(agent._host_lifecycle_timeout_sec(), 780)
+
+    def test_per_task_host_deadline_is_forwarded_as_execution_budget(self) -> None:
+        agent = CodeFactoryAgent(
+            logs_dir=Path("build-cython-ext__trial") / "agent",
+            model_name="test-model",
+            extra_env={
+                "CODEFACTORY_BENCH_TASK_AGENT_TIMEOUTS_JSON": json.dumps(
+                    {"build-cython-ext": 900}
+                ),
+                "CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON": json.dumps(
+                    {"build-cython-ext": 780}
+                ),
+            },
+        )
+
+        self.assertEqual(agent._execution_budget_sec(), 900)
+        deadline = time.monotonic() + 780
+        self.assertEqual(agent._remaining_execution_budget_sec(deadline), 780)
+
     def test_headless_default_step_budget_matches_product_execute_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -432,6 +701,7 @@ print(json.dumps({"type":"finished","final_text":"ok","execution_contract_sha256
             root = Path(tmp)
             logs_dir = root / "build-cython-ext__trial" / "agent"
             logs_dir.mkdir(parents=True)
+            (logs_dir.parent / "config.json").write_text("{}")
             sidecar = self._write_sidecar(
                 root,
                 """import json, sys
@@ -455,6 +725,49 @@ print(json.dumps({"type":"finished","final_text":"ok","execution_contract_sha256
 
             environment = FakeEnvironment(project_manifests="./pyknotid/setup.py\0")
             asyncio.run(agent.run("Complete a timed coding task", environment, AgentContext()))
+
+    def test_sidecar_receives_remaining_host_capped_execution_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logs_dir = root / "build-cython-ext__trial" / "agent"
+            logs_dir.mkdir(parents=True)
+            (logs_dir.parent / "config.json").write_text("{}")
+            sidecar = self._write_sidecar(
+                root,
+                """import json, sys
+start = json.loads(sys.stdin.readline())
+assert 700 <= start["wall_time_budget_sec"] <= 780, start
+print(json.dumps({"type":"finished","final_text":"ok","execution_contract_sha256":start["execution_contract_sha256"],"completion_evidence":{"completed":False},"usage":{}}), flush=True)
+""",
+            )
+            agent = CodeFactoryAgent(
+                logs_dir=logs_dir,
+                model_name="test-model",
+                extra_env={
+                    "CODEFACTORY_BENCH_API_KEY": "test-key",
+                    "CODEFACTORY_BENCH_AGENT_BINARY": str(sidecar),
+                    "CODEFACTORY_BENCH_TASK_AGENT_TIMEOUTS_JSON": json.dumps(
+                        {"build-cython-ext": 900}
+                    ),
+                    "CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON": json.dumps(
+                        {"build-cython-ext": 780}
+                    ),
+                },
+            )
+
+            asyncio.run(
+                agent.run("Complete a host-capped task", FakeEnvironment(), AgentContext())
+            )
+
+            metadata = json.loads((logs_dir / "run-metadata.json").read_text())
+            self.assertEqual(metadata["execution_budget_sec"], 900)
+            self.assertEqual(metadata["host_timeout_sec"], 780)
+            runtime = json.loads((logs_dir / "sidecar-runtime.json").read_text())
+            self.assertEqual(runtime["status"], "stopped")
+            self.assertGreater(runtime["pid"], 0)
+            self.assertEqual(runtime["process_group_id"], runtime["pid"])
+            self.assertEqual(len(runtime["runtime_token"]), 32)
+            self.assertEqual(runtime["exit_code"], 0)
 
     def test_sidecar_secret_is_passed_only_in_start_message_and_not_logged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -571,6 +884,7 @@ print("not-json", flush=True)
                     return b"model request failed: upstream response body truncated"
 
             class AlreadyExitedProcess:
+                pid = 4242
                 stdin = FakeStdin()
                 stdout = ToolThenEmptyStdout()
                 stderr = ErrorStderr()
@@ -619,6 +933,10 @@ print("not-json", flush=True)
                 },
             )
             self.assertEqual(metadata["integrity"]["contamination_scan"], "pass")
+            runtime = json.loads((root / "sidecar-runtime.json").read_text())
+            self.assertEqual(runtime["status"], "stopped")
+            self.assertEqual(runtime["pid"], 4242)
+            self.assertEqual(runtime["exit_code"], 1)
 
 
 if __name__ == "__main__":

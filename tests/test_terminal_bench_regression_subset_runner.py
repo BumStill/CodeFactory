@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -189,12 +190,107 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
             env["CODEFACTORY_BENCH_TASK_NAMES"], "write-compressor,kv-store-grpc"
         )
 
-    def test_build_env_does_not_override_harbor_agent_timeout_by_default(self) -> None:
+    def test_build_env_propagates_trial_watchdog_deadline_to_each_agent(self) -> None:
         subset = {"tasks": [{"name": "terminal-bench/example"}]}
 
-        env = runner.build_env(self.args(agent_wall_timeout_sec=0), subset)
+        env = runner.build_env(
+            self.args(agent_wall_timeout_sec=0, trial_hard_timeout_sec=900),
+            subset,
+        )
 
+        self.assertEqual(
+            json.loads(env["CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON"]),
+            {"terminal-bench/example": 780},
+        )
+
+    def test_build_env_leaves_agent_deadline_unmodified_without_watchdog(self) -> None:
+        subset = {"tasks": [{"name": "terminal-bench/example"}]}
+
+        with mock.patch.dict(
+            runner.os.environ,
+            {"CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON": '{"example":42}'},
+        ):
+            env = runner.build_env(
+                self.args(agent_wall_timeout_sec=0, trial_hard_timeout_sec=0),
+                subset,
+            )
+
+        self.assertNotIn("CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON", env)
         self.assertNotIn("CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC", env)
+
+    def test_build_env_rejects_watchdog_too_short_for_agent_and_cleanup(self) -> None:
+        subset = {"tasks": [{"name": "terminal-bench/example"}]}
+
+        with self.assertRaisesRegex(SystemExit, "too short"):
+            runner.build_env(
+                self.args(agent_wall_timeout_sec=0, trial_hard_timeout_sec=150),
+                subset,
+            )
+
+    def test_build_env_watchdog_cap_wins_over_longer_explicit_agent_timeout(
+        self,
+    ) -> None:
+        subset = {"tasks": [{"name": "terminal-bench/example"}]}
+
+        env = runner.build_env(
+            self.args(agent_wall_timeout_sec=1800, trial_hard_timeout_sec=900),
+            subset,
+        )
+
+        self.assertEqual(
+            json.loads(env["CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON"]),
+            {"terminal-bench/example": 780},
+        )
+
+    def test_build_env_keeps_explicit_run_budget_separate_from_host_deadline(self) -> None:
+        subset = {"tasks": [{"name": "terminal-bench/example"}]}
+
+        env = runner.build_env(
+            self.args(agent_wall_timeout_sec=600, trial_hard_timeout_sec=900),
+            subset,
+        )
+
+        self.assertEqual(
+            json.loads(env["CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON"]),
+            {"terminal-bench/example": 780},
+        )
+        self.assertEqual(env["CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC"], "600")
+
+    def test_build_env_uses_heavy_trial_watchdog_override_for_agent_deadline(
+        self,
+    ) -> None:
+        subset = {"tasks": [{"name": "torch-tensor-parallelism"}]}
+
+        env = runner.build_env(
+            self.args(
+                agent_wall_timeout_sec=0,
+                trial_hard_timeout_sec=1200,
+                heavy_verifier_hard_timeout_sec=2400,
+            ),
+            subset,
+        )
+
+        self.assertEqual(
+            json.loads(env["CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON"]),
+            {"torch-tensor-parallelism": 2280},
+        )
+
+    def test_build_env_keeps_heavy_host_deadline_separate_from_explicit_run_budget(self) -> None:
+        subset = {"tasks": [{"name": "torch-tensor-parallelism"}]}
+
+        env = runner.build_env(
+            self.args(
+                agent_wall_timeout_sec=1800,
+                trial_hard_timeout_sec=1200,
+                heavy_verifier_hard_timeout_sec=2400,
+            ),
+            subset,
+        )
+
+        self.assertEqual(
+            json.loads(env["CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON"]),
+            {"torch-tensor-parallelism": 2280},
+        )
 
     def test_build_env_passes_official_per_task_agent_budgets_without_overriding_harbor(self) -> None:
         subset = {
@@ -210,7 +306,10 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
             json.loads(env["CODEFACTORY_BENCH_TASK_AGENT_TIMEOUTS_JSON"]),
             {"build-cython-ext": 900, "filter-js-from-html": 1800},
         )
-        self.assertNotIn("CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC", env)
+        self.assertEqual(
+            json.loads(env["CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON"]),
+            {"build-cython-ext": 1080, "filter-js-from-html": 1080},
+        )
 
     def test_timeout_multiplier_marks_run_noncomparable(self) -> None:
         args = self.args(
@@ -747,6 +846,11 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
             trial_path = job_path / "query-optimize__zBaaXr3"
             trial_path.mkdir()
             (trial_path / "config.json").write_text("{}")
+            agent_path = trial_path / "agent"
+            agent_path.mkdir()
+            (agent_path / "sidecar-runtime.json").write_text(
+                json.dumps({"status": "stopped"})
+            )
 
             watchdog = runner.BenchmarkWatchdog(timeout_sec=10)
             watchdog.job_path = job_path
@@ -772,12 +876,327 @@ class TerminalBenchRegressionSubsetRunnerTest(unittest.TestCase):
             self.assertEqual(interventions[0].containers, ["query-optimize__zbaaxr3-main-1"])
             self.assertEqual(interventions[0].action, "docker-stop")
 
+    def test_watchdog_stops_verified_sidecar_before_trial_container(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = Path(tmp)
+            trial_path = job_path / "query-optimize__zBaaXr3"
+            agent_path = trial_path / "agent"
+            agent_path.mkdir(parents=True)
+            (trial_path / "config.json").write_text("{}")
+            (agent_path / "sidecar-runtime.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "pid": 4242,
+                        "binary": "/tmp/codefactory-agent-headless",
+                        "runtime_token": "trial-token",
+                        "process_group_id": 4242,
+                    }
+                )
+            )
+
+            watchdog = runner.BenchmarkWatchdog(timeout_sec=10)
+            watchdog.job_path = job_path
+            watchdog._first_seen[trial_path.name] = 0
+            commands = []
+            sidecar_alive = True
+
+            def fake_run(command, **kwargs):
+                nonlocal sidecar_alive
+                commands.append(command)
+                if command[:3] == ["ps", "-p", "4242"]:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0 if sidecar_alive else 1,
+                        stdout=(
+                            "4242 /tmp/codefactory-agent-headless "
+                            "--codefactory-runtime-token=trial-token\n"
+                            if sidecar_alive
+                            else ""
+                        ),
+                    )
+                if command == ["kill", "-TERM", "--", "-4242"]:
+                    sidecar_alive = False
+                    return subprocess.CompletedProcess(command, 0, stdout="")
+                if command[:3] == ["docker", "ps", "--format"]:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout="query-optimize__zbaaxr3-main-1\n",
+                    )
+                if command[:2] == ["docker", "stop"]:
+                    return subprocess.CompletedProcess(command, 0, stdout="")
+                raise AssertionError(f"unexpected command: {command}")
+
+            with mock.patch.object(runner.subprocess, "run", side_effect=fake_run):
+                messages = watchdog.check_once(now=11)
+
+            self.assertEqual(len(messages), 1)
+            intervention = watchdog.interventions()[0]
+            self.assertEqual(intervention.action, "sidecar-stop+docker-stop")
+            kill_index = commands.index(["kill", "-TERM", "--", "-4242"])
+            docker_stop_index = next(
+                index
+                for index, command in enumerate(commands)
+                if command[:2] == ["docker", "stop"]
+            )
+            self.assertLess(kill_index, docker_stop_index)
+
+    def test_watchdog_does_not_signal_pid_when_sidecar_binary_does_not_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = Path(tmp)
+            trial_path = job_path / "query-optimize__zBaaXr3"
+            agent_path = trial_path / "agent"
+            agent_path.mkdir(parents=True)
+            (trial_path / "config.json").write_text("{}")
+            (agent_path / "sidecar-runtime.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "pid": 4242,
+                        "binary": "/tmp/codefactory-agent-headless",
+                        "runtime_token": "trial-token",
+                        "process_group_id": 4242,
+                    }
+                )
+            )
+
+            watchdog = runner.BenchmarkWatchdog(timeout_sec=10)
+            watchdog.job_path = job_path
+            watchdog._first_seen[trial_path.name] = 0
+            commands = []
+
+            def fake_run(command, **kwargs):
+                commands.append(command)
+                if command[:3] == ["ps", "-p", "4242"]:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout=(
+                            "4242 /tmp/codefactory-agent-headless "
+                            "--codefactory-runtime-token=other-token\n"
+                        ),
+                    )
+                if command[:3] == ["docker", "ps", "--format"]:
+                    return subprocess.CompletedProcess(command, 0, stdout="")
+                raise AssertionError(f"unexpected command: {command}")
+
+            with mock.patch.object(runner.subprocess, "run", side_effect=fake_run):
+                messages = watchdog.check_once(now=11)
+
+            self.assertEqual(len(messages), 1)
+            self.assertIn("sidecar-stop-failed-retry", messages[0])
+            self.assertEqual(watchdog.interventions(), [])
+            self.assertFalse(any(command[:1] == ["kill"] for command in commands))
+
+    def test_watchdog_does_not_signal_when_actual_process_group_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = Path(tmp)
+            trial_path = job_path / "example__trial"
+            agent_path = trial_path / "agent"
+            agent_path.mkdir(parents=True)
+            (trial_path / "config.json").write_text("{}")
+            (agent_path / "sidecar-runtime.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "pid": 4242,
+                        "binary": "/tmp/codefactory-agent-headless",
+                        "runtime_token": "trial-token",
+                        "process_group_id": 4242,
+                    }
+                )
+            )
+            watchdog = runner.BenchmarkWatchdog(timeout_sec=10)
+            watchdog.job_path = job_path
+            watchdog._first_seen[trial_path.name] = 0
+            commands = []
+
+            def fake_run(command, **kwargs):
+                commands.append(command)
+                if command[:3] == ["ps", "-p", "4242"]:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout=(
+                            "7777 /tmp/codefactory-agent-headless "
+                            "--codefactory-runtime-token=trial-token\n"
+                        ),
+                    )
+                if command[:3] == ["docker", "ps", "--format"]:
+                    return subprocess.CompletedProcess(command, 0, stdout="")
+                raise AssertionError(f"unexpected command: {command}")
+
+            with mock.patch.object(runner.subprocess, "run", side_effect=fake_run):
+                messages = watchdog.check_once(now=11)
+
+            self.assertEqual(len(messages), 1)
+            self.assertIn("sidecar-stop-failed-retry", messages[0])
+            self.assertEqual(watchdog.interventions(), [])
+            self.assertFalse(any(command[:1] == ["kill"] for command in commands))
+
+    def test_watchdog_retries_when_sidecar_identity_check_is_uncertain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = Path(tmp)
+            trial_path = job_path / "example__trial"
+            agent_path = trial_path / "agent"
+            agent_path.mkdir(parents=True)
+            (trial_path / "config.json").write_text("{}")
+            (agent_path / "sidecar-runtime.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "pid": 4242,
+                        "binary": "/tmp/codefactory-agent-headless",
+                        "runtime_token": "trial-token",
+                        "process_group_id": 4242,
+                    }
+                )
+            )
+            watchdog = runner.BenchmarkWatchdog(timeout_sec=10)
+            watchdog.job_path = job_path
+            watchdog._first_seen[trial_path.name] = 0
+
+            with mock.patch.object(
+                runner.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(["ps"], 5),
+            ):
+                messages = watchdog.check_once(now=11)
+
+            self.assertIn("sidecar-stop-failed-retry", messages[0])
+            self.assertEqual(watchdog.interventions(), [])
+
+    def test_watchdog_retries_when_runtime_metadata_is_temporarily_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = Path(tmp)
+            trial_path = job_path / "example__trial"
+            agent_path = trial_path / "agent"
+            agent_path.mkdir(parents=True)
+            (trial_path / "config.json").write_text("{}")
+            (agent_path / "sidecar-runtime.json").write_text("{partial")
+            watchdog = runner.BenchmarkWatchdog(timeout_sec=10)
+            watchdog.job_path = job_path
+            watchdog._first_seen[trial_path.name] = 0
+
+            messages = watchdog.check_once(now=11)
+
+            self.assertIn("sidecar-stop-failed-retry", messages[0])
+            self.assertEqual(watchdog.interventions(), [])
+
+    def test_watchdog_retries_sidecar_stop_before_stopping_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = Path(tmp)
+            trial_path = job_path / "example__trial"
+            agent_path = trial_path / "agent"
+            agent_path.mkdir(parents=True)
+            (trial_path / "config.json").write_text("{}")
+            (agent_path / "sidecar-runtime.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "pid": 4242,
+                        "binary": "/tmp/codefactory-agent-headless",
+                        "runtime_token": "trial-token",
+                        "process_group_id": 4242,
+                    }
+                )
+            )
+
+            watchdog = runner.BenchmarkWatchdog(timeout_sec=10)
+            watchdog.job_path = job_path
+            watchdog._first_seen[trial_path.name] = 0
+            commands = []
+            allow_stop = False
+            sidecar_alive = True
+
+            def fake_run(command, **kwargs):
+                nonlocal sidecar_alive
+                commands.append(command)
+                if command[:3] == ["ps", "-p", "4242"]:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0 if sidecar_alive else 1,
+                        stdout=(
+                            "4242 /tmp/codefactory-agent-headless "
+                            "--codefactory-runtime-token=trial-token\n"
+                            if sidecar_alive
+                            else ""
+                        ),
+                    )
+                if command == ["kill", "-TERM", "--", "-4242"]:
+                    if allow_stop:
+                        sidecar_alive = False
+                    return subprocess.CompletedProcess(command, 0, stdout="")
+                if command == ["kill", "-KILL", "--", "-4242"]:
+                    return subprocess.CompletedProcess(command, 1, stdout="")
+                if command[:3] == ["docker", "ps", "--format"]:
+                    return subprocess.CompletedProcess(
+                        command, 0, stdout="example__trial-main-1\n"
+                    )
+                if command[:2] == ["docker", "stop"]:
+                    return subprocess.CompletedProcess(command, 0, stdout="")
+                raise AssertionError(f"unexpected command: {command}")
+
+            with mock.patch.object(
+                runner.subprocess, "run", side_effect=fake_run
+            ), mock.patch.object(runner.time, "sleep", return_value=None):
+                first_messages = watchdog.check_once(now=11)
+                allow_stop = True
+                second_messages = watchdog.check_once(now=12)
+
+            self.assertIn("sidecar-stop-failed-retry", first_messages[0])
+            self.assertEqual(watchdog.interventions()[0].action, "sidecar-stop+docker-stop")
+            self.assertEqual(len(second_messages), 1)
+            docker_stop_indices = [
+                index
+                for index, command in enumerate(commands)
+                if command[:2] == ["docker", "stop"]
+            ]
+            second_term_index = max(
+                index
+                for index, command in enumerate(commands)
+                if command == ["kill", "-TERM", "--", "-4242"]
+            )
+            self.assertEqual(len(docker_stop_indices), 1)
+            self.assertGreater(docker_stop_indices[0], second_term_index)
+
+    def test_watchdog_anchors_timeout_to_trial_config_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            job_path = Path(tmp)
+            trial_path = job_path / "example__trial"
+            trial_path.mkdir()
+            config = trial_path / "config.json"
+            config.write_text("{}")
+            os.utime(config, (989, 989))
+            watchdog = runner.BenchmarkWatchdog(timeout_sec=10)
+            watchdog.job_path = job_path
+
+            def fake_run(command, **kwargs):
+                if command[:3] == ["docker", "ps", "--format"]:
+                    return subprocess.CompletedProcess(command, 0, stdout="")
+                raise AssertionError(f"unexpected command: {command}")
+
+            with mock.patch.object(runner.time, "time", return_value=1000), mock.patch.object(
+                runner.subprocess, "run", side_effect=fake_run
+            ):
+                messages = watchdog.check_once(now=100)
+
+            self.assertEqual(len(messages), 1)
+            self.assertIn("sidecar-stop-failed-retry", messages[0])
+            self.assertEqual(watchdog.interventions(), [])
+
     def test_watchdog_uses_heavy_verifier_timeout_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             job_path = Path(tmp)
             trial_path = job_path / "torch-tensor-parallelism__abc123"
             trial_path.mkdir()
             (trial_path / "config.json").write_text("{}")
+            agent_path = trial_path / "agent"
+            agent_path.mkdir()
+            (agent_path / "sidecar-runtime.json").write_text(
+                json.dumps({"status": "stopped"})
+            )
 
             watchdog = runner.BenchmarkWatchdog(
                 timeout_sec=1200,

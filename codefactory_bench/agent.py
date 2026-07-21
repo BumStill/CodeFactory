@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import posixpath
+import secrets
 import shlex
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable
 
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
@@ -17,6 +19,10 @@ from harbor.models.agent.context import AgentContext
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = REPO_ROOT / "agent_contracts" / "execution_completion.md"
+
+
+class HostDeadlineExceeded(TimeoutError):
+    pass
 
 
 def _load_execution_contract() -> tuple[str, str]:
@@ -48,6 +54,8 @@ class CodeFactoryAgent(BaseAgent):
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self._extra_env = extra_env or {}
         self._agent_timeout_sec = int(agent_timeout_sec) if agent_timeout_sec else None
+        self._host_deadline: float | None = None
+        self._run_deadline: float | None = None
 
     @staticmethod
     def name() -> str:
@@ -62,6 +70,7 @@ class CodeFactoryAgent(BaseAgent):
 
     async def setup(self, environment: BaseEnvironment) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        deadline = self._ensure_host_deadline()
         _, contract_sha = _load_execution_contract()
         payload: dict[str, Any] = {
             "agent": self.name(),
@@ -69,6 +78,7 @@ class CodeFactoryAgent(BaseAgent):
             "mode": self._mode(),
             "model_name": self._model_name(),
             "execution_budget_sec": self._execution_budget_sec(),
+            "host_timeout_sec": self._host_lifecycle_timeout_sec(),
             "execution_contract_sha256": contract_sha,
             "integrity": {
                 "contamination_scan": "pass",
@@ -78,16 +88,26 @@ class CodeFactoryAgent(BaseAgent):
         proxy = self._bench_env("CODEFACTORY_BENCH_DOCKER_APT_PROXY")
         if proxy:
             try:
-                result = await environment.exec(
-                    self._container_network_bootstrap_command(proxy),
-                    env=self._tool_execution_env(),
-                    timeout_sec=240,
+                result = await self._await_with_host_deadline(
+                    environment.exec(
+                        self._container_network_bootstrap_command(proxy),
+                        env=self._tool_execution_env(),
+                        timeout_sec=240,
+                    ),
+                    deadline,
+                    "container network bootstrap",
                 )
                 payload["container_network_bootstrap"] = {
                     "return_code": result.return_code,
                     "stdout_tail": self._tail(result.stdout or "", 500),
                     "stderr_tail": self._tail(result.stderr or "", 500),
                 }
+            except HostDeadlineExceeded as exc:
+                payload["container_network_bootstrap"] = {
+                    "error": self._single_line(f"{type(exc).__name__}: {exc}", 500)
+                }
+                self._write_json("setup.json", payload)
+                raise
             except Exception as exc:
                 payload["container_network_bootstrap"] = {
                     "error": self._single_line(f"{type(exc).__name__}: {exc}", 500)
@@ -137,6 +157,7 @@ echo codefactory-container-network-bootstrap-ok"""
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
+        deadline = self._ensure_run_deadline()
         _, contract_sha = _load_execution_contract()
         command = """set -u
 echo agent=codefactory-headless
@@ -144,10 +165,14 @@ echo mode=baseline-no-model
 echo cwd=$(pwd)
 echo kernel=$(uname -a 2>/dev/null || true)
 find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
-        result = await environment.exec(
-            command,
-            env=self._tool_execution_env(),
-            timeout_sec=self._command_timeout_sec(),
+        result = await self._await_with_host_deadline(
+            environment.exec(
+                command,
+                env=self._tool_execution_env(),
+                timeout_sec=self._command_timeout_sec(),
+            ),
+            deadline,
+            "baseline inspection",
         )
         output = result.stdout or ""
         if result.stderr:
@@ -174,23 +199,46 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
+        wall_timeout_sec = self._host_lifecycle_timeout_sec()
+        deadline = self._ensure_run_deadline()
         _, contract_sha = _load_execution_contract()
         binary = self._resolve_sidecar_binary()
+        runtime_token = secrets.token_hex(16)
         model = self._model_name()
         api_key = self._bench_env("CODEFACTORY_BENCH_API_KEY")
         assert model and api_key
         allow_network, network_policy = self._resolve_network_policy(environment)
-        container_directory = await self._resolve_container_directory(environment)
-        working_directory, project_root_confirmed = await self._resolve_project_directory(
-            environment, container_directory
+        container_directory = await self._await_with_host_deadline(
+            self._resolve_container_directory(environment),
+            deadline,
+            "container directory resolution",
+        )
+        working_directory, project_root_confirmed = await self._await_with_host_deadline(
+            self._resolve_project_directory(environment, container_directory),
+            deadline,
+            "project directory resolution",
         )
 
-        process = await asyncio.create_subprocess_exec(
-            str(binary),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self._sidecar_process_env(),
+        process = await self._await_with_host_deadline(
+            asyncio.create_subprocess_exec(
+                str(binary),
+                f"--codefactory-runtime-token={runtime_token}",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._sidecar_process_env(),
+                start_new_session=True,
+            ),
+            deadline,
+            "sidecar launch",
+        )
+        self._write_sidecar_runtime(
+            status="running",
+            pid=process.pid,
+            binary=str(binary),
+            runtime_token=runtime_token,
+            process_group_id=process.pid,
+            host_timeout_sec=wall_timeout_sec,
         )
         assert process.stdin and process.stdout and process.stderr
 
@@ -204,34 +252,32 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
             "max_steps": self._int_env("CODEFACTORY_BENCH_MAX_STEPS", 80),
             "model_timeout_sec": self._int_env("CODEFACTORY_BENCH_MODEL_TIMEOUT_SEC", 90),
             "shell_timeout_sec": self._int_env("CODEFACTORY_BENCH_SHELL_TIMEOUT_SEC", 300),
-            "wall_time_budget_sec": self._execution_budget_sec(),
+            "wall_time_budget_sec": self._remaining_execution_budget_sec(deadline),
             "working_directory": working_directory,
             "allow_network": allow_network,
             "execution_contract_sha256": contract_sha,
         }
-        process.stdin.write((json.dumps(start) + "\n").encode("utf-8"))
-        await process.stdin.drain()
-
         trajectory: list[dict[str, Any]] = []
         finished: dict[str, Any] | None = None
-        wall_timeout_sec = self._agent_wall_timeout_sec()
-        deadline = (
-            time.monotonic() + wall_timeout_sec if wall_timeout_sec is not None else None
-        )
+        exit_code: int | None = None
+        stderr = ""
 
         try:
+            self._raise_if_host_deadline_elapsed(deadline, "sidecar start")
+            process.stdin.write((json.dumps(start) + "\n").encode("utf-8"))
+            await self._await_with_host_deadline(
+                process.stdin.drain(), deadline, "sidecar start"
+            )
             while True:
-                if deadline is None:
-                    raw = await process.stdout.readline()
-                else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError(
-                            "CodeFactory Rust sidecar exceeded the agent wall timeout"
-                        )
-                    raw = await asyncio.wait_for(process.stdout.readline(), timeout=remaining)
+                raw = await self._await_with_host_deadline(
+                    process.stdout.readline(), deadline, "sidecar protocol"
+                )
                 if not raw:
-                    stderr = (await process.stderr.read()).decode("utf-8", errors="replace")
+                    stderr = (
+                        await self._await_with_host_deadline(
+                            process.stderr.read(), deadline, "sidecar stderr"
+                        )
+                    ).decode("utf-8", errors="replace")
                     raise RuntimeError(
                         "CodeFactory sidecar protocol ended before finished: "
                         + self._single_line(stderr, 1000)
@@ -246,22 +292,36 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
                 message_type = message["type"]
                 if message_type == "tool_request":
                     trajectory.append(self._redact_protocol_message(message))
+                    self._write_trajectory(trajectory, contract_sha)
                     tool_result = await self._execute_tool_request(
-                        message, environment, working_directory
+                        message, environment, working_directory, deadline
                     )
                     tool_result["working_directory"] = working_directory
                     next_working_directory = working_directory
+                    tool_result["next_working_directory"] = next_working_directory
+                    trajectory.append(self._redact_protocol_message(tool_result))
+                    self._write_trajectory(trajectory, contract_sha)
                     if tool_result.get("return_code") == 0 and not project_root_confirmed:
                         (
                             next_working_directory,
                             project_root_confirmed,
-                        ) = await self._resolve_project_directory(
-                            environment, container_directory
+                        ) = await self._await_with_host_deadline(
+                            self._resolve_project_directory(
+                                environment, container_directory
+                            ),
+                            deadline,
+                            "project directory refresh",
                         )
                     tool_result["next_working_directory"] = next_working_directory
-                    trajectory.append(self._redact_protocol_message(tool_result))
+                    trajectory[-1] = self._redact_protocol_message(tool_result)
+                    self._write_trajectory(trajectory, contract_sha)
+                    self._raise_if_host_deadline_elapsed(
+                        deadline, "tool result delivery"
+                    )
                     process.stdin.write((json.dumps(tool_result) + "\n").encode("utf-8"))
-                    await process.stdin.drain()
+                    await self._await_with_host_deadline(
+                        process.stdin.drain(), deadline, "tool result delivery"
+                    )
                     working_directory = next_working_directory
                     self._write_trajectory(trajectory, contract_sha)
                     continue
@@ -271,27 +331,71 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
                     continue
                 if message_type == "finished":
                     finished = message
+                    final_usage = self._usage_snapshot(message.get("usage"))
+                    if final_usage:
+                        trajectory.append(
+                            {
+                                "type": "event",
+                                "name": "usage_snapshot",
+                                "usage": final_usage,
+                            }
+                        )
+                        self._write_trajectory(trajectory, contract_sha)
                     break
                 raise RuntimeError(f"CodeFactory sidecar protocol returned unknown type: {message_type}")
+            if process.stdin and not process.stdin.is_closing():
+                process.stdin.close()
+            exit_code = await self._await_with_host_deadline(
+                process.wait(), deadline, "sidecar exit"
+            )
+            stderr = (
+                await self._await_with_host_deadline(
+                    process.stderr.read(), deadline, "sidecar stderr"
+                )
+            ).decode("utf-8", errors="replace")
+            if exit_code != 0:
+                raise RuntimeError(
+                    f"CodeFactory sidecar exited with {exit_code}: "
+                    f"{self._single_line(stderr, 1000)}"
+                )
+            assert finished is not None
+            if finished.get("execution_contract_sha256") != contract_sha:
+                raise RuntimeError("CodeFactory sidecar execution contract hash mismatch")
         except BaseException as exc:
             if process.returncode is None:
                 try:
                     process.kill()
                 except ProcessLookupError:
                     pass
-            await process.wait()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+            stopped = process.returncode is not None
+            self._write_sidecar_runtime(
+                status="stopped" if stopped else "running",
+                pid=process.pid,
+                binary=str(binary),
+                runtime_token=runtime_token,
+                process_group_id=process.pid,
+                host_timeout_sec=wall_timeout_sec,
+                exit_code=process.returncode,
+            )
             failure_metadata = {
                 "agent": self.name(),
                 "runtime_subject": "rust-core",
                 "mode": "model-backed",
                 "model": model,
                 "status": (
-                    "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+                    "cancelled"
+                    if isinstance(exc, (asyncio.CancelledError, HostDeadlineExceeded))
+                    else "failed"
                 ),
                 "instruction_sha256": instruction_sha,
                 "execution_contract_sha256": contract_sha,
                 "network_policy": network_policy,
                 "execution_budget_sec": self._execution_budget_sec(),
+                "host_timeout_sec": wall_timeout_sec,
                 "usage": self._latest_usage_snapshot(trajectory),
                 "tool_calls": sum(
                     1 for item in trajectory if item.get("type") == "tool_request"
@@ -309,15 +413,17 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
             if process.stdin and not process.stdin.is_closing():
                 process.stdin.close()
 
-        exit_code = await process.wait()
-        stderr = (await process.stderr.read()).decode("utf-8", errors="replace")
-        if exit_code != 0:
-            raise RuntimeError(
-                f"CodeFactory sidecar exited with {exit_code}: {self._single_line(stderr, 1000)}"
-            )
+        assert exit_code is not None
+        self._write_sidecar_runtime(
+            status="stopped",
+            pid=process.pid,
+            binary=str(binary),
+            runtime_token=runtime_token,
+            process_group_id=process.pid,
+            host_timeout_sec=wall_timeout_sec,
+            exit_code=exit_code,
+        )
         assert finished is not None
-        if finished.get("execution_contract_sha256") != contract_sha:
-            raise RuntimeError("CodeFactory sidecar execution contract hash mismatch")
 
         final_text = str(finished.get("final_text") or "")
         (self.logs_dir / "final.txt").write_text(final_text, encoding="utf-8")
@@ -332,6 +438,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
             "network_policy": network_policy,
             "working_directory": working_directory,
             "execution_budget_sec": self._execution_budget_sec(),
+            "host_timeout_sec": wall_timeout_sec,
             "completion_evidence": finished.get("completion_evidence") or {},
             "usage": finished.get("usage") or {},
             "tool_calls": sum(1 for item in trajectory if item.get("type") == "tool_request"),
@@ -348,6 +455,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
         request_message: dict[str, Any],
         environment: BaseEnvironment,
         working_directory: str,
+        deadline: float | None,
     ) -> dict[str, Any]:
         request_id = str(request_message.get("id") or "")
         command = str(request_message.get("command") or "").strip()
@@ -356,11 +464,22 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
             raise RuntimeError("CodeFactory sidecar protocol tool_request is incomplete")
         managed_command, pidfile = self._managed_tool_command(request_id, command)
         try:
-            result = await environment.exec(
-                managed_command,
-                cwd=working_directory,
-                env=self._tool_execution_env(),
-                timeout_sec=max(1, min(timeout_sec, 900)),
+            remaining = None if deadline is None else deadline - time.monotonic()
+            self._raise_if_host_deadline_elapsed(deadline, "tool execution")
+            effective_timeout_sec = max(1, min(timeout_sec, 900))
+            if remaining is not None:
+                effective_timeout_sec = max(
+                    1, min(effective_timeout_sec, int(remaining))
+                )
+            result = await self._await_with_host_deadline(
+                environment.exec(
+                    managed_command,
+                    cwd=working_directory,
+                    env=self._tool_execution_env(),
+                    timeout_sec=effective_timeout_sec,
+                ),
+                deadline,
+                "tool execution",
             )
             return {
                 "type": "tool_result",
@@ -374,7 +493,7 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
             await self._cleanup_managed_process_group(
                 environment, working_directory, pidfile
             )
-            if isinstance(exc, asyncio.CancelledError):
+            if isinstance(exc, (asyncio.CancelledError, HostDeadlineExceeded)):
                 raise
             return {
                 "type": "tool_result",
@@ -384,6 +503,45 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
                 "stderr": "",
                 "error": self._single_line(f"{type(exc).__name__}: {exc}", 2000),
             }
+
+    @staticmethod
+    def _raise_if_host_deadline_elapsed(
+        deadline: float | None, operation: str
+    ) -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise HostDeadlineExceeded(
+                f"CodeFactory host deadline elapsed during {operation}"
+            )
+
+    async def _await_with_host_deadline(
+        self,
+        awaitable: Awaitable[Any],
+        deadline: float | None,
+        operation: str,
+    ) -> Any:
+        if deadline is None:
+            return await awaitable
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+            raise HostDeadlineExceeded(
+                f"CodeFactory host deadline elapsed during {operation}"
+            )
+
+        task = asyncio.ensure_future(awaitable)
+        done, _ = await asyncio.wait({task}, timeout=remaining)
+        if task in done:
+            return task.result()
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+        raise HostDeadlineExceeded(
+            f"CodeFactory host deadline elapsed during {operation}"
+        )
 
     @staticmethod
     def _managed_tool_command(request_id: str, command: str) -> tuple[str, str]:
@@ -634,19 +792,65 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
 
     def _agent_wall_timeout_sec(self) -> int | None:
         raw = self._bench_env("CODEFACTORY_BENCH_AGENT_WALL_TIMEOUT_SEC")
-        if raw is None:
-            return None
-        try:
-            value = int(raw)
-        except ValueError:
-            return None
-        return max(30, value) if value > 0 else None
+        if raw is not None:
+            try:
+                value = int(raw)
+            except ValueError:
+                value = 0
+            if value > 0:
+                return max(30, value)
+        return None
+
+    def _host_lifecycle_timeout_sec(self) -> int | None:
+        return self._per_task_timeout_sec(
+            "CODEFACTORY_BENCH_TASK_HOST_TIMEOUTS_JSON"
+        )
+
+    def _ensure_host_deadline(self) -> float | None:
+        if self._host_deadline is None:
+            timeout_sec = self._host_lifecycle_timeout_sec()
+            if timeout_sec is not None:
+                trial_age_sec = 0.0
+                try:
+                    trial_started_at = (self.logs_dir.parent / "config.json").stat().st_mtime
+                    trial_age_sec = max(0.0, time.time() - trial_started_at)
+                except OSError:
+                    trial_age_sec = float(timeout_sec)
+                remaining_sec = max(0.0, timeout_sec - trial_age_sec)
+                self._host_deadline = time.monotonic() + remaining_sec
+        return self._host_deadline
+
+    def _ensure_run_deadline(self) -> float | None:
+        if self._run_deadline is None:
+            run_budget_sec = self._execution_budget_sec()
+            if run_budget_sec is not None:
+                self._run_deadline = time.monotonic() + run_budget_sec
+        candidates = [
+            value
+            for value in (self._ensure_host_deadline(), self._run_deadline)
+            if value is not None
+        ]
+        return min(candidates) if candidates else None
+
+    def _remaining_execution_budget_sec(self, deadline: float | None) -> int | None:
+        execution_budget_sec = self._execution_budget_sec()
+        if deadline is None:
+            return execution_budget_sec
+        remaining_sec = max(1, math.ceil(deadline - time.monotonic()))
+        if execution_budget_sec is None:
+            return remaining_sec
+        return min(execution_budget_sec, remaining_sec)
 
     def _command_timeout_sec(self) -> int:
         return self._agent_timeout_sec or 120
 
     def _official_task_execution_budget_sec(self) -> int | None:
-        raw = self._bench_env("CODEFACTORY_BENCH_TASK_AGENT_TIMEOUTS_JSON")
+        return self._per_task_timeout_sec(
+            "CODEFACTORY_BENCH_TASK_AGENT_TIMEOUTS_JSON"
+        )
+
+    def _per_task_timeout_sec(self, env_key: str) -> int | None:
+        raw = self._bench_env(env_key)
         if raw is None:
             return None
         try:
@@ -669,15 +873,38 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
         external_budget = (
             self._official_task_execution_budget_sec() or self._agent_timeout_sec
         )
-        private_cap = self._agent_wall_timeout_sec()
-        if external_budget is not None and private_cap is not None:
-            return min(external_budget, private_cap)
-        return external_budget or private_cap
+        explicit_run_budget = self._agent_wall_timeout_sec()
+        if external_budget is not None and explicit_run_budget is not None:
+            return min(external_budget, explicit_run_budget)
+        return external_budget or explicit_run_budget
 
     def _write_json(self, name: str, payload: dict[str, Any]) -> None:
         (self.logs_dir / name).write_text(
             json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
         )
+
+    def _write_sidecar_runtime(
+        self,
+        *,
+        status: str,
+        pid: int,
+        binary: str,
+        runtime_token: str,
+        process_group_id: int,
+        host_timeout_sec: int | None,
+        exit_code: int | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "status": status,
+            "pid": pid,
+            "binary": binary,
+            "runtime_token": runtime_token,
+            "process_group_id": process_group_id,
+            "host_timeout_sec": host_timeout_sec,
+        }
+        if exit_code is not None:
+            payload["exit_code"] = exit_code
+        self._write_json("sidecar-runtime.json", payload)
 
     @staticmethod
     def _truncate(value: str, limit: int) -> str:
