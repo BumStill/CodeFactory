@@ -20,9 +20,11 @@ pub use dispatch::decide_chat_mode;
 use chrono::Utc;
 use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
-    build_completion_recovery_prompt, classify_command, evaluate_budget_command_in_directory,
-    sanitize_completion_summary, should_prompt_budget_convergence, CompletionEvidence,
-    CompletionGate, PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
+    build_completion_recovery_prompt, classify_command, completion_evidence_made_progress,
+    evaluate_budget_command_in_directory, provider_rejects_required_tool_choice,
+    sanitize_completion_summary,
+    should_prompt_budget_convergence, CompletionEvidence, CompletionGate, PolicyDecision,
+    ProgressTracker, ToolKind, ToolOutcome,
 };
 use futures_util::{Stream, StreamExt};
 use reqwest::Client;
@@ -722,6 +724,7 @@ impl AgentLoop {
         let mut progress_tracker = ProgressTracker::new(8);
         let mut finalization_pending = false;
         let mut completion_recovery_attempts = 0_u32;
+        let mut require_tool_next = false;
         let max_iterations = self.mode.max_iterations();
         for iteration in 0..max_iterations {
             // Cooperative cancellation: if the user hit "stop" for this chat
@@ -770,16 +773,15 @@ impl AgentLoop {
             }
 
             let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
-            let call_result = match self.api_style {
-                ApiStyle::Chatgpt => {
-                    self.call_chatgpt_model(&messages, active_tool_defs, event_name)
-                        .await
-                }
-                _ => {
-                    self.call_openai_model(&messages, active_tool_defs, event_name)
-                        .await
-                }
-            };
+            let required_tool_response = require_tool_next && !finalization_pending;
+            let call_result = self
+                .call_openai_transport(
+                    &messages,
+                    active_tool_defs,
+                    required_tool_response,
+                    event_name,
+                )
+                .await;
             let (text, tool_calls, usage, reasoning) = match call_result {
                 Ok(ok) => ok,
                 // The active model rejects image input (e.g. the user switched
@@ -806,20 +808,18 @@ impl AgentLoop {
                             },
                         )
                         .ok();
-                    match self.api_style {
-                        ApiStyle::Chatgpt => {
-                            self.call_chatgpt_model(&messages, active_tool_defs, event_name)
-                                .await?
-                        }
-                        _ => {
-                            self.call_openai_model(&messages, active_tool_defs, event_name)
-                                .await?
-                        }
-                    }
+                    self.call_openai_transport(
+                        &messages,
+                        active_tool_defs,
+                        required_tool_response,
+                        event_name,
+                    )
+                    .await?
                 }
                 Err(e) => return Err(e),
             };
             finalization_pending = false;
+            require_tool_next = false;
 
             if self.is_cancelled() {
                 self.emit_cancelled_done(event_name);
@@ -883,6 +883,7 @@ impl AgentLoop {
                 match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
                     CompletionFinalization::Recover(prompt) => {
                         completion_recovery_attempts += 1;
+                        require_tool_next = self.mode != AgentMode::Interactive;
                         // Make the rejection visible instead of silently looping:
                         // collapse the rejected candidate in the UI, persist the
                         // injected instruction so rebuilt history stays faithful.
@@ -966,6 +967,7 @@ impl AgentLoop {
 
             let mut result_messages = Vec::new();
             let mut progress_prompt = None;
+            let completion_evidence_before_tool_batch = completion_gate.evidence();
 
             for (tool_index, tc) in tool_calls.iter().enumerate() {
                 if let Some(remaining) =
@@ -1178,7 +1180,6 @@ impl AgentLoop {
                 ) {
                     progress_prompt = Some(prompt);
                 }
-
                 // Post-tool hook
                 hook_runner
                     .fire(hooks::HookEvent::PostTool {
@@ -1213,6 +1214,14 @@ impl AgentLoop {
                     reasoning_content: None,
                 });
             }
+
+            completion_recovery_attempts = completion_recovery_attempts_after_tool_batch(
+                completion_recovery_attempts,
+                completion_evidence_made_progress(
+                    &completion_evidence_before_tool_batch,
+                    &completion_gate.evidence(),
+                ),
+            );
 
             messages.push(ChatMessage {
                 role: "assistant".into(),
@@ -1437,10 +1446,46 @@ impl AgentLoop {
     /// the OpenAI-shaped ChatMessage history into Responses `instructions` +
     /// `input` items, parses the Responses SSE stream, and returns the same
     /// (text, tool_calls, usage, reasoning) contract as call_openai_model.
+    async fn call_openai_transport(
+        &self,
+        messages: &[ChatMessage],
+        tool_defs: &[ToolDefinition],
+        require_tool: bool,
+        event_name: &str,
+    ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
+        let first = match self.api_style {
+            ApiStyle::Chatgpt => {
+                self.call_chatgpt_model(messages, tool_defs, require_tool, event_name)
+                    .await
+            }
+            _ => {
+                self.call_openai_model(messages, tool_defs, require_tool, event_name)
+                    .await
+            }
+        };
+        let required_choice_unsupported = first.as_ref().err().is_some_and(|error| {
+            require_tool && provider_rejects_required_tool_choice(&error.to_string())
+        });
+        if !required_choice_unsupported {
+            return first;
+        }
+        match self.api_style {
+            ApiStyle::Chatgpt => {
+                self.call_chatgpt_model(messages, tool_defs, false, event_name)
+                    .await
+            }
+            _ => {
+                self.call_openai_model(messages, tool_defs, false, event_name)
+                    .await
+            }
+        }
+    }
+
     async fn call_chatgpt_model(
         &self,
         messages: &[ChatMessage],
         tool_defs: &[ToolDefinition],
+        require_tool: bool,
         event_name: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         let finalization_response = tool_defs.is_empty();
@@ -1528,7 +1573,13 @@ impl AgentLoop {
             "model": self.model_id,
             "instructions": instructions,
             "input": input,
-            "tool_choice": if tools.is_empty() { "none" } else { "auto" },
+            "tool_choice": if tools.is_empty() {
+                "none"
+            } else if require_tool {
+                "required"
+            } else {
+                "auto"
+            },
             "parallel_tool_calls": false,
             "store": false,
             "stream": true,
@@ -1717,6 +1768,7 @@ impl AgentLoop {
         &self,
         messages: &[ChatMessage],
         tool_defs: &[ToolDefinition],
+        require_tool: bool,
         event_name: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         let finalization_response = tool_defs.is_empty();
@@ -1728,7 +1780,7 @@ impl AgentLoop {
         let outbound_model =
             crate::config::settings::normalize_model_id(&self.model_id, &self.base_url);
 
-        let (tools, tool_choice) = openai_tool_controls(tool_defs);
+        let (tools, tool_choice) = openai_tool_controls(tool_defs, require_tool);
         let req = ChatRequest {
             model: outbound_model,
             messages: messages.to_vec(),
@@ -2194,6 +2246,50 @@ impl AgentLoop {
         msgs
     }
 
+    async fn call_anthropic_transport(
+        &self,
+        system_prompt: &str,
+        messages: Vec<serde_json::Value>,
+        tool_defs: &[ToolDefinition],
+        require_tool: bool,
+        event_name: &str,
+    ) -> Result<anthropic_client::AnthropicResponse> {
+        let first = anthropic_client::stream_anthropic(
+            &self.http,
+            &self.base_url,
+            &self.api_key,
+            &self.model_id,
+            system_prompt,
+            messages.clone(),
+            tool_defs,
+            require_tool,
+            self.cancel.as_ref(),
+            &self.app,
+            event_name,
+        )
+        .await;
+        let required_choice_unsupported = first.as_ref().err().is_some_and(|error| {
+            require_tool && provider_rejects_required_tool_choice(&error.to_string())
+        });
+        if !required_choice_unsupported {
+            return first;
+        }
+        anthropic_client::stream_anthropic(
+            &self.http,
+            &self.base_url,
+            &self.api_key,
+            &self.model_id,
+            system_prompt,
+            messages,
+            tool_defs,
+            false,
+            self.cancel.as_ref(),
+            &self.app,
+            event_name,
+        )
+        .await
+    }
+
     async fn run_anthropic(
         &mut self,
         history: Vec<Message>,
@@ -2225,6 +2321,7 @@ impl AgentLoop {
         let mut progress_tracker = ProgressTracker::new(8);
         let mut finalization_pending = false;
         let mut completion_recovery_attempts = 0_u32;
+        let mut require_tool_next = false;
         let max_iterations = self.mode.max_iterations();
         for iteration in 0..max_iterations {
             // Cooperative cancellation: if the user hit "stop" for this chat
@@ -2255,16 +2352,12 @@ impl AgentLoop {
             };
 
             let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
-            let first_attempt = anthropic_client::stream_anthropic(
-                &self.http,
-                &self.base_url,
-                &self.api_key,
-                &self.model_id,
+            let required_tool_response = require_tool_next && !finalization_pending;
+            let first_attempt = self.call_anthropic_transport(
                 system_prompt,
                 messages.clone(),
                 active_tool_defs,
-                self.cancel.as_ref(),
-                &self.app,
+                required_tool_response,
                 event_name,
             )
             .await;
@@ -2292,16 +2385,11 @@ impl AgentLoop {
                             },
                         )
                         .ok();
-                    anthropic_client::stream_anthropic(
-                        &self.http,
-                        &self.base_url,
-                        &self.api_key,
-                        &self.model_id,
+                    self.call_anthropic_transport(
                         system_prompt,
                         messages.clone(),
                         active_tool_defs,
-                        self.cancel.as_ref(),
-                        &self.app,
+                        required_tool_response,
                         event_name,
                     )
                     .await?
@@ -2309,6 +2397,7 @@ impl AgentLoop {
                 Err(e) => return Err(e),
             };
             finalization_pending = false;
+            require_tool_next = false;
 
             if resp.cancelled || self.is_cancelled() {
                 self.emit_cancelled_done(event_name);
@@ -2372,6 +2461,7 @@ impl AgentLoop {
                 match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
                     CompletionFinalization::Recover(prompt) => {
                         completion_recovery_attempts += 1;
+                        require_tool_next = self.mode != AgentMode::Interactive;
                         // Make the rejection visible instead of silently looping:
                         // collapse the rejected candidate in the UI, persist the
                         // injected instruction so rebuilt history stays faithful.
@@ -2464,6 +2554,7 @@ impl AgentLoop {
             // Execute tools and collect tool_result blocks
             let mut tool_result_blocks: Vec<serde_json::Value> = Vec::new();
             let mut progress_prompt = None;
+            let completion_evidence_before_tool_batch = completion_gate.evidence();
 
             for (tool_index, tc) in tool_calls.iter().enumerate() {
                 if let Some(remaining) =
@@ -2668,7 +2759,6 @@ impl AgentLoop {
                 ) {
                     progress_prompt = Some(prompt);
                 }
-
                 // Post-tool hook
                 hook_runner
                     .fire(hooks::HookEvent::PostTool {
@@ -2700,6 +2790,14 @@ impl AgentLoop {
                     "content": output.content,
                 }));
             }
+
+            completion_recovery_attempts = completion_recovery_attempts_after_tool_batch(
+                completion_recovery_attempts,
+                completion_evidence_made_progress(
+                    &completion_evidence_before_tool_batch,
+                    &completion_gate.evidence(),
+                ),
+            );
 
             // Append a single user message with all tool_result blocks
             if !tool_result_blocks.is_empty() {
@@ -2773,11 +2871,15 @@ impl AgentLoop {
 
 fn openai_tool_controls(
     tool_defs: &[ToolDefinition],
+    require_tool: bool,
 ) -> (Option<Vec<ToolDefinition>>, serde_json::Value) {
     if tool_defs.is_empty() {
         (None, serde_json::json!("none"))
     } else {
-        (Some(tool_defs.to_vec()), serde_json::json!("auto"))
+        (
+            Some(tool_defs.to_vec()),
+            serde_json::json!(if require_tool { "required" } else { "auto" }),
+        )
     }
 }
 
@@ -2857,15 +2959,26 @@ fn completion_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (St
 }
 
 /// How many times one run may reject the model's tool-call-free final response
-/// and inject a completion-recovery prompt. Interactive chat gets exactly one
-/// nudge: the user is watching, and every rejected candidate is already
-/// rendered, so a rejection loop reads as the assistant repeating the same
-/// answer (2026-07-16 session: seven near-identical replies in 13 minutes).
-/// Execute/Autonomous runs get a few more attempts before the gate yields.
+/// and inject a completion-recovery prompt. Every mode gets exactly one nudge.
+/// Interactive keeps normal tool selection; Execute/Autonomous require a tool
+/// call on that recovery response so repeated text-only analysis cannot consume
+/// the remaining budget (2026-07-16 session: seven near-identical replies in
+/// 13 minutes).
 fn completion_recovery_limit(mode: AgentMode) -> u32 {
     match mode {
         AgentMode::Interactive => 1,
-        AgentMode::Execute | AgentMode::Autonomous => 3,
+        AgentMode::Execute | AgentMode::Autonomous => 1,
+    }
+}
+
+fn completion_recovery_attempts_after_tool_batch(
+    attempts: u32,
+    material_evidence_progress: bool,
+) -> u32 {
+    if material_evidence_progress {
+        0
+    } else {
+        attempts
     }
 }
 
@@ -4327,6 +4440,64 @@ mod tests {
     }
 
     #[test]
+    fn desktop_final_stage_requires_repair_after_one_failure_diagnostic() {
+        let mut gate = CompletionGate::new(true);
+        let mut progress = ProgressTracker::new(8);
+        let mut sequence = 0;
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "write_file",
+            &serde_json::json!({"path": "src/worker.rs", "content": "candidate"}),
+            &tools::ToolOutput::ok("written"),
+        );
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "bash",
+            &serde_json::json!({"command": "cargo test worker::tests::behavior"}),
+            &tools::ToolOutput::err("assertion failed"),
+        );
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "read_file",
+            &serde_json::json!({"path": "src/worker.rs"}),
+            &tools::ToolOutput::ok("candidate"),
+        );
+        let evidence = gate.evidence();
+
+        for mode in [AgentMode::Autonomous, AgentMode::Execute] {
+            let denied = autonomous_budget_denial(
+                mode,
+                8,
+                &evidence,
+                "read_file",
+                &serde_json::json!({"path": "src/another_module.rs"}),
+                Path::new("/workspace"),
+            );
+            assert!(denied
+                .as_deref()
+                .is_some_and(|message| message.contains("final-stage diagnostic read")));
+        }
+        assert!(autonomous_budget_denial(
+            AgentMode::Interactive,
+            8,
+            &evidence,
+            "read_file",
+            &serde_json::json!({"path": "src/another_module.rs"}),
+            Path::new("/workspace"),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn desktop_completion_route_requires_non_example_behavior_evidence() {
         let mut gate = CompletionGate::new_for_instruction(
             false,
@@ -4426,14 +4597,20 @@ mod tests {
         assert!(!unsatisfied.completed);
         assert!(completion_recovery_prompt(&unsatisfied, 0, AgentMode::Interactive).is_some());
         assert!(completion_recovery_prompt(&unsatisfied, 1, AgentMode::Interactive).is_none());
-        assert!(completion_recovery_prompt(&unsatisfied, 2, AgentMode::Execute).is_some());
-        assert!(completion_recovery_prompt(&unsatisfied, 3, AgentMode::Execute).is_none());
-        assert!(completion_recovery_prompt(&unsatisfied, 2, AgentMode::Autonomous).is_some());
-        assert!(completion_recovery_prompt(&unsatisfied, 3, AgentMode::Autonomous).is_none());
+        assert!(completion_recovery_prompt(&unsatisfied, 0, AgentMode::Execute).is_some());
+        assert!(completion_recovery_prompt(&unsatisfied, 1, AgentMode::Execute).is_none());
+        assert!(completion_recovery_prompt(&unsatisfied, 0, AgentMode::Autonomous).is_some());
+        assert!(completion_recovery_prompt(&unsatisfied, 1, AgentMode::Autonomous).is_none());
 
         let satisfied = CompletionGate::new(false).evidence();
         assert!(satisfied.completed);
         assert!(completion_recovery_prompt(&satisfied, 0, AgentMode::Interactive).is_none());
+    }
+
+    #[test]
+    fn denied_tool_batch_does_not_reset_completion_recovery() {
+        assert_eq!(completion_recovery_attempts_after_tool_batch(1, false), 1);
+        assert_eq!(completion_recovery_attempts_after_tool_batch(1, true), 0);
     }
 
     #[test]
@@ -4805,10 +4982,22 @@ mod tests {
 
     #[test]
     fn completion_finalization_disables_openai_tools() {
-        let (tools, tool_choice) = openai_tool_controls(&[]);
+        let (tools, tool_choice) = openai_tool_controls(&[], false);
 
         assert!(tools.is_none());
         assert_eq!(tool_choice, serde_json::json!("none"));
+    }
+
+    #[test]
+    fn completion_recovery_requires_an_openai_tool_call() {
+        let definitions = tools::all_definitions();
+
+        let (tools, tool_choice) = openai_tool_controls(&definitions, true);
+        assert_eq!(tools.as_ref().map(Vec::len), Some(definitions.len()));
+        assert_eq!(tool_choice, serde_json::json!("required"));
+
+        let (_, normal_choice) = openai_tool_controls(&definitions, false);
+        assert_eq!(normal_choice, serde_json::json!("auto"));
     }
 
     #[test]

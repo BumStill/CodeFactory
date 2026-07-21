@@ -124,6 +124,22 @@ shared by the desktop Agent and headless evaluation runtime.
    dependency, inspect the project's declared constraints and prefer a
    reproducible compatible dependency version before adding speculative source
    shims. Rerun the original failing test immediately after either repair.
+13. In the final third of a host-supplied wall-clock execution budget, or the
+   final eight model rounds when the host exposes only a round budget, an
+   unresolved failed mutation or check permits one bounded
+   read-only diagnostic. After that diagnostic, make the smallest corrective
+   mutation or rerun a focused machine check; do not continue read-only
+   exploration. A new real failure may open one new diagnostic, while only a
+   successful mutation, closure of the failed check at the same or broader
+   scope, or another material reduction in completion blockers resets this
+   recovery state. Failed tools, diagnostic reads, and unrelated green checks
+   do not reset it. If the
+   completion decision rejects a text-only final response, the next response
+   must execute a bounded tool call that directly resolves a blocker unless a
+   precise external blocker requires user action. If the provider accepts tools
+   but rejects forced tool selection, retry once with automatic tool selection;
+   the local state machine must still stop incomplete when no tool is returned.
+   Repeated text-only analysis must not consume the remaining execution budget.
 
 ## Integrity Rules
 

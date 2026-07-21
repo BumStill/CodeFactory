@@ -2,11 +2,12 @@
 
 - Req ID: `CF-TB-R49`
 - 日期: `2026-07-21`
-- 状态: candidate, not live
-- Proof tier: `controlled-headless-runtime`
+- 状态: live in public `v1.51.9`
+- Proof tier: `released-artifact + released-source-canary`
 - 失败基线: public `v1.51.7` / `50a52bed2ac429b086da687b96b90e92cb506e87`
-- candidate base: current `origin/main` / public `v1.51.8` / `eb6068d`
-- candidate headless SHA-256: `0fbcd73c4a1b2b9b23d6cb3c1323806d6e68bc521ef75dd349bc03f9faccc02d`
+- released merge: PR `#141` / `c7db48864a7b265a43077ca8320d1d312481c4cb`
+- released tag: public `v1.51.9` / `19d0e3084fc80da5cda970f3e30bae555b7f1fe9`
+- released-source canary headless SHA-256: `15584e3fbbf58b48a975d0a9ac4c325d3749d776180796737ede63d0a6ddaab0`
 
 ## Released-Build 失败证据
 
@@ -97,16 +98,22 @@ workspace 被关闭时，Agent 不会继续消耗模型额度或对失效目录�
 - final narrow independent review: `no blocker / no P1`
 - macOS controlled process-group probe: real PID/PGID/binary/token state `matches`
 - final independent re-review: `no blocker / no P1`
-- PR/CI、remote real-App、release: 待执行
+- PR `#141`: main CI、Linux bridge、governance、remote real-App GUI 全部通过
+- Auto Release: `29795501256`, success, created `v1.51.9`
+- Release: `29795518456`, success, Windows/macOS/finalize/published-macOS 全部通过
+- public DMG SHA-256: `089a26f58177bab252332f75f5a7c519566eaa5d613c6feb9be92ba3d8a472f4`
+- public Windows setup SHA-256: `c9a52b0c29ee140747ec10578a262984fa06c49943eecfd683d4a6b06568e7d7`
+- independent `hdiutil verify`: passed
 
-该修复不依赖本机 GUI 或解锁状态；本地证明使用真实 headless 子进程和受控 environment，PR 的
-远端 macOS GUI 与 Linux bridge 会继续作为交付门禁。当前仍是 `not live`，只有合并、Auto Release、
-公开产物复验和同参数 released-build canary 完成后才能改为 live。
+该修复不依赖本机 GUI 或解锁状态；真实 headless 子进程、远端 macOS GUI、Linux bridge、公开安装包
+和精确发布源码 canary 均已完成。R49 现已 live。
 
-## 发布后复评门禁
+## 发布后复评结果
 
 在精确发布 tag 上保持 `circuit-fibsqrt`、DeepSeek `deepseek-v4-pro`、并发 `1`、900 秒 outer
-watchdog、subset、resource 和 verifier 不变。合格的 R49 差异应为：Agent 在约 780 秒 host cap
-内干净结束，runner watchdog 不介入，不出现 container stop 后的新模型/工具调用，usage 如实保留，
-总成本显著低于 v1.51.7 的 `686,352` tokens。reward 仍由 verifier 决定；单题结果不改变固定 18
-题分数。
+watchdog、subset、resource 和 verifier 均未改变。run `ce1ecc95-3077-497d-ae9c-272d02a1f3fb`
+在 trial config 锚点后约 750 秒写入最终轨迹，`sidecar-runtime.json` 为 `status=stopped`、
+`exit_code=0`、`host_timeout_sec=780`；runner 没有 intervention，进程扫描无 sidecar/Harbor 残留。
+usage 为 `17` model requests、`126,633` tokens、`12` tool calls，比 v1.51.7 的 `686,352`
+tokens 下降约 `81.5%`。reward 仍为 `0` / verification，证明下一缺口是最终阶段没有从失败诊断
+回到纠正性修改和机器复验，而不是生命周期基础设施。该单题结果不改变固定 18 题的 `6 / 18`。

@@ -1,11 +1,12 @@
 use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
     build_completion_recovery_prompt, build_product_system_prompt, build_system_prompt,
-    build_time_convergence_prompt, classify_command, effective_command_timeout_sec,
-    evaluate_budget_command_with_time_in_directory, execution_contract_sha256,
-    sanitize_completion_summary, should_prompt_budget_convergence, should_prompt_time_convergence,
-    BenchmarkPolicy, CompletionEvidence, CompletionGate, PolicyDecision, ProductPolicy,
-    ProgressTracker, ToolOutcome,
+    build_time_convergence_prompt, classify_command, completion_evidence_made_progress,
+    effective_command_timeout_sec, evaluate_budget_command_with_time_in_directory,
+    execution_contract_sha256, provider_rejects_required_tool_choice, sanitize_completion_summary,
+    should_prompt_budget_convergence, should_prompt_time_convergence, BenchmarkPolicy,
+    CompletionEvidence, CompletionGate, PolicyDecision, ProductPolicy, ProgressTracker,
+    ToolOutcome,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -243,6 +244,8 @@ where
     let mut last_completion_nudge_sequence = None;
     let mut progress_tracker = ProgressTracker::new(4);
     let mut finalization_pending = false;
+    let mut require_tool_next = false;
+    let mut completion_recovery_attempts = 0_u32;
     let execution_started = Instant::now();
     let mut stopped_for_wall_budget = false;
 
@@ -263,6 +266,7 @@ where
             execution_started + Duration::from_secs(total.max(1).saturating_sub(30).max(1))
         });
         let finalization_response = finalization_pending;
+        let required_tool_response = require_tool_next && !finalization_response;
         let model_request_attempts = model_request_attempts(tool_history.len());
         let response = match request_model(
             &client,
@@ -270,6 +274,7 @@ where
             &config,
             &messages,
             !finalization_response,
+            required_tool_response,
             request_timeout_sec,
             model_request_attempts,
             model_wall_deadline,
@@ -350,6 +355,19 @@ where
                 .await?;
                 return Ok(());
             }
+            if required_tool_response || completion_recovery_attempts >= 1 {
+                write_output(
+                    output,
+                    &OutputMessage::Finished {
+                        final_text: last_final_text,
+                        execution_contract_sha256: execution_contract_sha256(),
+                        completion_evidence: evidence,
+                        usage,
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
             write_output(
                 output,
                 &OutputMessage::UsageSnapshot {
@@ -363,13 +381,17 @@ where
                 "role": "user",
                 "content": build_completion_recovery_prompt(&evidence),
             }));
+            completion_recovery_attempts += 1;
+            require_tool_next = true;
             continue;
         }
 
         finalization_pending = false;
+        require_tool_next = false;
         messages.push(message);
         let mut progress_prompt = None;
         let mut emitted_tool_request = false;
+        let completion_evidence_before_tool_batch = gate.evidence();
         let remaining = max_steps.saturating_sub(step_index + 1);
         for tool_call in tool_calls {
             if remaining_wall_time(execution_started, config.wall_time_budget_sec)
@@ -492,6 +514,11 @@ where
                 },
             )
             .await?;
+        } else if completion_evidence_made_progress(
+            &completion_evidence_before_tool_batch,
+            &gate.evidence(),
+        ) {
+            completion_recovery_attempts = 0;
         }
         if let Some(prompt) = progress_prompt {
             messages.push(json!({"role": "user", "content": prompt}));
@@ -649,6 +676,54 @@ async fn request_model(
     config: &StartConfig,
     messages: &[Value],
     allow_tools: bool,
+    require_tool: bool,
+    attempt_timeout_sec: u64,
+    max_attempts: usize,
+    wall_deadline: Option<Instant>,
+) -> Result<Value, HeadlessError> {
+    let first = request_model_with_tool_choice(
+        client,
+        endpoint,
+        config,
+        messages,
+        allow_tools,
+        require_tool,
+        attempt_timeout_sec,
+        max_attempts,
+        wall_deadline,
+    )
+    .await;
+    let required_choice_unsupported = matches!(
+        &first,
+        Err(HeadlessError::ModelHttpStatus { status, body })
+            if require_tool
+                && matches!(*status, 400 | 422)
+                && provider_rejects_required_tool_choice(body)
+    );
+    if required_choice_unsupported {
+        return request_model_with_tool_choice(
+            client,
+            endpoint,
+            config,
+            messages,
+            allow_tools,
+            false,
+            attempt_timeout_sec,
+            max_attempts,
+            wall_deadline,
+        )
+        .await;
+    }
+    first
+}
+
+async fn request_model_with_tool_choice(
+    client: &Client,
+    endpoint: &str,
+    config: &StartConfig,
+    messages: &[Value],
+    allow_tools: bool,
+    require_tool: bool,
     attempt_timeout_sec: u64,
     max_attempts: usize,
     wall_deadline: Option<Instant>,
@@ -656,7 +731,13 @@ async fn request_model(
     let mut payload = json!({
         "model": config.model,
         "messages": messages,
-        "tool_choice": if allow_tools { "auto" } else { "none" }
+        "tool_choice": if !allow_tools {
+            "none"
+        } else if require_tool {
+            "required"
+        } else {
+            "auto"
+        }
     });
     if allow_tools {
         payload["tools"] = json!([{
@@ -1494,6 +1575,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_text_only_completion_requires_tool_or_stops_after_one_retry() {
+        let (base_url, server) = fake_openai_server(vec![
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Done without evidence."}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+            }),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Still no tool call."}}],
+                "usage": {"prompt_tokens": 6, "completion_tokens": 2, "total_tokens": 8}
+            }),
+        ]);
+
+        let (test_input, run_input) = tokio::io::duplex(16 * 1024);
+        let (run_output, test_output) = tokio::io::duplex(16 * 1024);
+        let runner = tokio::spawn(async move {
+            let mut input = BufReader::new(run_input);
+            let mut output = run_output;
+            run(&mut input, &mut output).await
+        });
+        let mut input = test_input;
+        let mut output = BufReader::new(test_output);
+
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "start",
+                "instruction": "Repair the implementation and verify it.",
+                "model": "fake-model",
+                "api_key": "test-key",
+                "base_url": base_url,
+                "max_steps": 6,
+                "model_timeout_sec": 5,
+                "shell_timeout_sec": 60,
+                "allow_network": false,
+                "policy_profile": "product",
+                "execution_contract_sha256": execution_contract_sha256()
+            }),
+        )
+        .await;
+
+        let first_snapshot = read_test_output(&mut output).await;
+        assert_eq!(first_snapshot["type"], "event");
+        assert_eq!(first_snapshot["usage"]["model_requests"], 1);
+
+        let finished = read_test_output(&mut output).await;
+        assert_eq!(finished["type"], "finished");
+        assert_eq!(finished["completion_evidence"]["completed"], false);
+        assert_eq!(finished["usage"]["model_requests"], 2);
+
+        runner.await.unwrap().unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["tool_choice"], "auto");
+        assert_eq!(requests[1]["tool_choice"], "required");
+    }
+
+    #[tokio::test]
+    async fn required_tool_choice_rejection_falls_back_to_auto_once() {
+        let (base_url, server) = fake_openai_server(vec![
+            json!({
+                "__status": 400,
+                "__body": {
+                    "error": {"message": "Thinking mode does not support this tool_choice"}
+                }
+            }),
+            fake_tool_response("repair-1", "printf repaired > result.txt"),
+        ]);
+        let config = StartConfig {
+            instruction: "repair".to_owned(),
+            model: "fake-model".to_owned(),
+            api_key: "test-key".to_owned(),
+            base_url,
+            max_steps: 2,
+            model_timeout_sec: 5,
+            shell_timeout_sec: 30,
+            wall_time_budget_sec: None,
+            working_directory: Some("/workspace".to_owned()),
+            allow_network: false,
+            policy_profile: RuntimePolicyProfile::Product,
+        };
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let response = request_model(
+            &client,
+            &chat_completions_endpoint(&config.base_url),
+            &config,
+            &[json!({"role": "user", "content": "repair"})],
+            true,
+            true,
+            5,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(response["choices"][0]["message"]["tool_calls"].is_array());
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["tool_choice"], "required");
+        assert_eq!(requests[1]["tool_choice"], "auto");
+    }
+
+    #[tokio::test]
+    async fn policy_denied_recovery_tool_does_not_reopen_text_recovery() {
+        let (base_url, server) = fake_openai_server(vec![
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Done."}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+            fake_tool_response("denied-network", "curl https://example.com"),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Still done."}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+        ]);
+        let (test_input, run_input) = tokio::io::duplex(16 * 1024);
+        let (run_output, test_output) = tokio::io::duplex(16 * 1024);
+        let runner = tokio::spawn(async move {
+            let mut input = BufReader::new(run_input);
+            let mut output = run_output;
+            run(&mut input, &mut output).await
+        });
+        let mut input = test_input;
+        let mut output = BufReader::new(test_output);
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "start",
+                "instruction": "Repair and verify the implementation.",
+                "model": "fake-model",
+                "api_key": "test-key",
+                "base_url": base_url,
+                "max_steps": 10,
+                "model_timeout_sec": 5,
+                "shell_timeout_sec": 30,
+                "allow_network": false,
+                "policy_profile": "product",
+                "execution_contract_sha256": execution_contract_sha256()
+            }),
+        )
+        .await;
+
+        let first_snapshot = read_test_output(&mut output).await;
+        assert_eq!(first_snapshot["type"], "event");
+        let denial_snapshot = read_test_output(&mut output).await;
+        assert_eq!(denial_snapshot["type"], "event");
+        let finished = read_test_output(&mut output).await;
+        assert_eq!(finished["type"], "finished");
+        assert_eq!(finished["completion_evidence"]["completed"], false);
+
+        runner.await.unwrap().unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["tool_choice"], "auto");
+        assert_eq!(requests[1]["tool_choice"], "required");
+        assert_eq!(requests[2]["tool_choice"], "auto");
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_tool_does_not_reopen_text_recovery() {
+        let (base_url, server) = fake_openai_server(vec![
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Done."}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+            fake_tool_response("failed-check", "cargo test worker::tests::behavior"),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Still done."}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+        ]);
+        let (test_input, run_input) = tokio::io::duplex(16 * 1024);
+        let (run_output, test_output) = tokio::io::duplex(16 * 1024);
+        let runner = tokio::spawn(async move {
+            let mut input = BufReader::new(run_input);
+            let mut output = run_output;
+            run(&mut input, &mut output).await
+        });
+        let mut input = test_input;
+        let mut output = BufReader::new(test_output);
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "start",
+                "instruction": "Repair and verify the implementation.",
+                "model": "fake-model",
+                "api_key": "test-key",
+                "base_url": base_url,
+                "max_steps": 10,
+                "model_timeout_sec": 5,
+                "shell_timeout_sec": 30,
+                "allow_network": false,
+                "policy_profile": "product",
+                "execution_contract_sha256": execution_contract_sha256()
+            }),
+        )
+        .await;
+
+        assert_eq!(read_test_output(&mut output).await["type"], "event");
+        let tool_request = read_test_output(&mut output).await;
+        assert_eq!(tool_request["type"], "tool_request");
+        assert_eq!(tool_request["id"], "failed-check");
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "tool_result",
+                "id": "failed-check",
+                "return_code": 1,
+                "stdout": "",
+                "stderr": "assertion failed",
+                "error": null
+            }),
+        )
+        .await;
+
+        let finished = read_test_output(&mut output).await;
+        assert_eq!(finished["type"], "finished");
+        assert_eq!(finished["completion_evidence"]["completed"], false);
+        assert_eq!(finished["usage"]["model_requests"], 3);
+
+        runner.await.unwrap().unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["tool_choice"], "auto");
+        assert_eq!(requests[1]["tool_choice"], "required");
+        assert_eq!(requests[2]["tool_choice"], "auto");
+    }
+
+    #[tokio::test]
     async fn host_wall_reserve_stops_remaining_tool_calls_in_same_model_response() {
         let (base_url, server) = fake_openai_server(vec![json!({
             "choices": [{
@@ -1777,6 +2091,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_stage_denies_second_read_after_failure_until_repair() {
+        let (base_url, server) = fake_openai_server(vec![
+            fake_tool_response("mutation-1", "printf candidate > result.txt"),
+            fake_tool_response("verify-failed", "cargo test focused_behavior"),
+            fake_tool_response("diagnostic-1", "sed -n '1,120p' src/worker.rs"),
+            fake_tool_response("diagnostic-denied", "cat src/another_module.rs"),
+            fake_tool_response("repair-1", "printf repaired > result.txt"),
+            fake_tool_response("verify-passed", "cargo test focused_behavior"),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Repaired and verified."}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+        ]);
+
+        let (test_input, run_input) = tokio::io::duplex(32 * 1024);
+        let (run_output, test_output) = tokio::io::duplex(32 * 1024);
+        let runner = tokio::spawn(async move {
+            let mut input = BufReader::new(run_input);
+            let mut output = run_output;
+            run(&mut input, &mut output).await
+        });
+        let mut input = test_input;
+        let mut output = BufReader::new(test_output);
+
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "start",
+                "instruction": "Repair the implementation and verify the behavior.",
+                "model": "fake-model",
+                "api_key": "test-key",
+                "base_url": base_url,
+                "max_steps": 10,
+                "model_timeout_sec": 5,
+                "shell_timeout_sec": 60,
+                "allow_network": false,
+                "policy_profile": "product",
+                "execution_contract_sha256": execution_contract_sha256()
+            }),
+        )
+        .await;
+
+        for (id, return_code, stdout, stderr) in [
+            ("mutation-1", 0, "", ""),
+            ("verify-failed", 1, "", "assertion failed"),
+            ("diagnostic-1", 0, "relevant source", ""),
+        ] {
+            let request = read_test_output(&mut output).await;
+            assert_eq!(request["type"], "tool_request");
+            assert_eq!(request["id"], id);
+            write_test_line(
+                &mut input,
+                &json!({
+                    "type": "tool_result",
+                    "id": id,
+                    "return_code": return_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "error": null
+                }),
+            )
+            .await;
+        }
+
+        let denial_snapshot = read_test_output(&mut output).await;
+        assert_eq!(denial_snapshot["type"], "event");
+        assert_eq!(denial_snapshot["name"], "usage_snapshot");
+        assert_eq!(denial_snapshot["usage"]["model_requests"], 4);
+
+        for id in ["repair-1", "verify-passed"] {
+            let request = read_test_output(&mut output).await;
+            assert_eq!(request["type"], "tool_request");
+            assert_eq!(request["id"], id);
+            write_test_line(
+                &mut input,
+                &json!({
+                    "type": "tool_result",
+                    "id": id,
+                    "return_code": 0,
+                    "stdout": if id == "verify-passed" { "test passed" } else { "" },
+                    "stderr": "",
+                    "error": null
+                }),
+            )
+            .await;
+        }
+
+        let finished = read_test_output(&mut output).await;
+        assert_eq!(finished["type"], "finished");
+        assert_eq!(finished["completion_evidence"]["completed"], true);
+        assert_eq!(
+            finished["completion_evidence"]["last_failure_diagnostic_sequence"],
+            3
+        );
+
+        runner.await.unwrap().unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 7);
+        let denied_result = requests[4]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["tool_call_id"] == "diagnostic-denied")
+            .unwrap();
+        assert!(denied_result["content"]
+            .as_str()
+            .unwrap()
+            .contains("failure_repair_loop"));
+    }
+
+    #[tokio::test]
     async fn malformed_tool_response_persists_usage_before_fatal_exit() {
         let (base_url, server) = fake_openai_server(vec![json!({
             "choices": [{
@@ -2027,9 +2452,14 @@ mod tests {
                     .position(|window| window == b"\r\n\r\n")
                     .unwrap();
                 captured.push(serde_json::from_slice(&request[header_end + 4..]).unwrap());
-                let body = response.to_string();
+                let status = response
+                    .get("__status")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(200);
+                let body = response.get("__body").unwrap_or(&response).to_string();
+                let reason = if status == 200 { "OK" } else { "Bad Request" };
                 let reply = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -2112,6 +2542,7 @@ mod tests {
             &config,
             &[json!({"role": "user", "content": "task"})],
             true,
+            false,
             5,
             MODEL_REQUEST_INITIAL_ATTEMPTS,
             None,
@@ -2184,6 +2615,7 @@ mod tests {
             &config,
             &[json!({"role": "user", "content": "task"})],
             true,
+            false,
             5,
             MODEL_REQUEST_PROGRESS_ATTEMPTS,
             None,
@@ -2250,6 +2682,7 @@ mod tests {
             &config,
             &[json!({"role": "user", "content": "task"})],
             true,
+            false,
             1,
             MODEL_REQUEST_INITIAL_ATTEMPTS,
             None,
@@ -2287,6 +2720,7 @@ mod tests {
             &config,
             &[json!({"role": "user", "content": "task"})],
             true,
+            false,
             5,
             MODEL_REQUEST_INITIAL_ATTEMPTS,
             Some(Instant::now() - Duration::from_millis(1)),

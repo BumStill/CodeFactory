@@ -42,6 +42,7 @@ pub async fn stream_anthropic(
     system_prompt: &str,
     messages: Vec<serde_json::Value>,
     tools: &[ToolDefinition],
+    require_tool: bool,
     cancel: Option<&Arc<AtomicBool>>,
     app_handle: &AppHandle,
     event_name: &str,
@@ -64,6 +65,9 @@ pub async fn stream_anthropic(
     });
     if !anthropic_tools.is_empty() {
         body["tools"] = serde_json::Value::Array(anthropic_tools);
+        if require_tool {
+            body["tool_choice"] = serde_json::json!({"type": "any"});
+        }
     }
 
     let response = crate::http_util::send_with_retry("Anthropic messages request", || {
