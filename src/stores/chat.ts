@@ -609,7 +609,7 @@ function handleStreamEvent(
       return; // more conversation coming — defer post-mortem
     }
 
-    // Chat-end post-mortem trigger. Mirrors the task path (stores/tasks.ts).
+    // Chat-end self-evolution trigger. Mirrors the task path (stores/tasks.ts).
     // Guards: throttled per session, skip too-short conversations, skip
     // 'error' terminations, and NEVER for anonymous chats (no-trace = no
     // learning).
@@ -618,20 +618,29 @@ function handleStreamEvent(
       session &&
       session.kind !== "anonymous" &&
       event.type === "done" &&
-      useSettingsStore.getState().settings?.remote_postmortem_enabled === true &&
       (get().runtime[sessionId]?.messages.length ?? 0) >= POSTMORTEM_MIN_MESSAGES
     ) {
       const last = _lastPostmortemAt[session.id] ?? 0;
       if (Date.now() - last >= POSTMORTEM_THROTTLE_MS) {
         _lastPostmortemAt[session.id] = Date.now();
-        // Fire-and-forget; backend errors are logged but never block UX.
-        invoke("run_postmortem", {
-          sessionId: session.id,
-          cwd: session.cwd,
-        }).catch((e) => {
+        // Local deterministic cross-session mining runs by DEFAULT: it makes no
+        // model call and nothing leaves the machine, so the self-evolution loop
+        // produces evidence-backed candidates out of the box. Fire-and-forget.
+        invoke("mine_cross_session_patterns", { cwd: session.cwd }).catch((e) => {
           // eslint-disable-next-line no-console
-          console.warn("chat postmortem failed (non-fatal)", e);
+          console.warn("local pattern mining failed (non-fatal)", e);
         });
+        // The model-based post-mortem sends a redacted summary to the configured
+        // provider, so it stays strictly opt-in (privacy + token cost).
+        if (useSettingsStore.getState().settings?.remote_postmortem_enabled === true) {
+          invoke("run_postmortem", {
+            sessionId: session.id,
+            cwd: session.cwd,
+          }).catch((e) => {
+            // eslint-disable-next-line no-console
+            console.warn("chat postmortem failed (non-fatal)", e);
+          });
+        }
       }
     }
   }

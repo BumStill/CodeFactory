@@ -804,9 +804,9 @@ export function SettingsPage({ onBack }: Props) {
                 className="mt-0.5"
               />
               <span>
-                <span className="block text-xs font-medium text-gray-200">允许远程会话复盘</span>
+                <span className="block text-xs font-medium text-gray-200">允许远程会话复盘（发送摘要到模型）</span>
                 <span className="block text-xs leading-5 text-gray-500">
-                  会话结束后，把有限、脱敏的摘要发送到当前配置的模型以生成候选。默认关闭；本地跨会话分析和进化审查不受影响。
+                  仅控制这一项：会话结束后把有限、脱敏的摘要发送到当前配置的模型以生成候选，默认关闭。本地跨会话挖掘与进化审查是确定性的、不发送任何数据，会话结束后始终自动运行——与此开关无关。
                 </span>
               </span>
             </label>
