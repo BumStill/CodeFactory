@@ -3,7 +3,6 @@ import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   BookOpen,
-  ChevronLeft,
   ChevronDown,
   ChevronRight,
   Settings as SettingsIcon,
@@ -26,6 +25,11 @@ import {
   EyeOff,
   PanelLeftClose,
   PanelLeft,
+  Puzzle,
+  ShieldCheck,
+  Gauge,
+  UserRound,
+  GitPullRequestArrow,
 } from "lucide-react";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
@@ -75,12 +79,18 @@ interface DecomposedTask {
 
 interface WorkspacePageProps {
   sessionId: string;
+  /** Start another empty quick draft; kept under the legacy prop name so
+   * existing embedders remain source-compatible while Home no longer exists. */
   onBackHome: () => void;
   onOpenSettings: () => void;
   /** Switch the workspace to another session in-place (from the sidebar). */
   onOpenSession: (id: string) => void;
-  /** Open the human evolution review workbench, scoped to this project. */
-  onOpenEvolution?: (cwd: string) => void;
+  onOpenResources?: () => void;
+  onOpenControlPlane?: () => void;
+  onOpenBenchmarks?: () => void;
+  onOpenProfile?: () => void;
+  /** Open the human evolution review workbench, optionally scoped to a project. */
+  onOpenEvolution?: (cwd?: string) => void;
 }
 
 /**
@@ -93,22 +103,34 @@ interface WorkspacePageProps {
  *   Center — Execution stream (AI work in progress + chat input)
  *   Right  — Active skills + memory increments (transparency surface)
  */
-export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSession, onOpenEvolution }: WorkspacePageProps) {
+export function WorkspacePage({
+  sessionId,
+  onBackHome,
+  onOpenSettings,
+  onOpenSession,
+  onOpenResources,
+  onOpenControlPlane,
+  onOpenBenchmarks,
+  onOpenProfile,
+  onOpenEvolution,
+}: WorkspacePageProps) {
   const {
-    activeSession,
+    activeSession, draftSession,
     selectSession, sendOrQueue, cancelStream, removeFromQueue,
     respondPermission, exitAnonymous, renameSession,
   } = useChatStore();
+  const activeDraft = draftSession?.id === sessionId ? draftSession : null;
   // Per-session chat state for the ACTIVE session. Background sessions keep
   // streaming into their own buckets; here we render the active one's slice.
   const { messages, streaming, queue, pendingPermission } = useChatStore(activeRuntime);
   const isAnonymous = activeSession?.kind === "anonymous";
   const { settings, setTheme } = useSettingsStore();
-  const autonomousRunActive = useTasksStore((state) => state.running[sessionId] ?? false);
+  const persistedRunActive = useTasksStore((state) => state.running[sessionId] ?? false);
+  const autonomousRunActive = activeDraft ? false : persistedRunActive;
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
   const guideNextStep = async (message: string) => {
     const trimmed = message.trim();
-    if (!trimmed) return;
+    if (!trimmed || activeDraft) return;
     await invoke("queue_interjection", { sessionId, message: trimmed });
   };
   // Double-click the session title (here or in the sidebar) to rename it inline.
@@ -128,7 +150,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
   // right column: a branch/status bar + slide-out Changes / History / PR panels.
   const [gitPanel, setGitPanel] = useState<"changes" | "history" | "remote" | null>(null);
   const gitBranch = useGitStore((s) => s.status?.branch ?? "");
-  const activeCwd = activeSession?.cwd ?? null;
+  const activeCwd = activeSession?.cwd ?? activeDraft?.cwd ?? null;
   const learningEvents = useLearningStore(
     (state) => (activeCwd ? state.events[activeCwd] ?? EMPTY_LEARNING : EMPTY_LEARNING),
   );
@@ -175,8 +197,12 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
   }, [switcherOpen]);
 
   useEffect(() => {
-    selectSession(sessionId);
-  }, [sessionId]);
+    // Draft IDs are reused by materialization. Once the first message creates
+    // the real session, activeSession already contains that same ID; calling
+    // selectSession here would reload get_messages and race the live stream.
+    if (activeDraft || activeSession?.id === sessionId) return;
+    void selectSession(sessionId);
+  }, [activeDraft, activeSession?.id, selectSession, sessionId]);
 
   useEffect(() => {
     if (!activeCwd) return;
@@ -194,9 +220,10 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
         <button
           onClick={onBackHome}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-          title="返回首页"
+          title="新建空白会话"
+          aria-label="新建空白会话"
         >
-          <ChevronLeft size={14} />
+          <Plus size={14} />
         </button>
         {/* Sidebar toggle: collapse the session rail, or (when collapsed) open
             a quick-switcher popover so navigation is never buried. */}
@@ -249,15 +276,15 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
                   }
                 }}
               >
-                {activeSession?.title || "..."}
+                {activeSession?.title || (activeDraft?.mode === "project" ? "新项目" : "新对话")}
               </span>
             )}
-            {activeSession?.kind === "quick" && (
+            {(activeSession?.kind === "quick" || activeDraft?.mode === "quick") && (
               <span
                 className="text-[9px] px-1.5 py-0.5 rounded bg-accent/15 text-accent font-normal"
-                title="一次性助手会话，不会出现在「最近项目」"
+                title={activeDraft ? "尚未创建记录；发送首条消息后生成" : "一次性助手会话，不会出现在「最近项目」"}
               >
-                Quick
+                {activeDraft ? "草稿" : "Quick"}
               </span>
             )}
             {isAnonymous && (
@@ -271,7 +298,11 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
             )}
           </div>
           <div className="text-[10px] text-gray-600 font-mono truncate">
-            {isAnonymous ? "无痕会话 · 不落库 · 不计费 · 不学习" : activeSession?.cwd}
+            {isAnonymous
+              ? "无痕会话 · 不落库 · 不计费 · 不学习"
+              : activeDraft
+                ? (activeDraft.mode === "project" ? activeDraft.cwd : "发送首条消息后创建会话")
+                : activeSession?.cwd}
           </div>
         </div>
         {isAnonymous && (
@@ -339,8 +370,58 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
               <span className="tabular-nums">{pendingLearningCount}</span>
             </button>
           )}
-          <CheckpointsPanel sessionId={sessionId} />
+          {!activeDraft && <CheckpointsPanel sessionId={sessionId} />}
         </div>
+        {onOpenProfile && (
+          <button
+            onClick={onOpenProfile}
+            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+            title="我的画像"
+            aria-label="我的画像"
+          >
+            <UserRound size={14} />
+          </button>
+        )}
+        {onOpenEvolution && (
+          <button
+            onClick={() => onOpenEvolution(activeCwd ?? undefined)}
+            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+            title="进化审查"
+            aria-label="进化审查"
+          >
+            <GitPullRequestArrow size={14} />
+          </button>
+        )}
+        {onOpenBenchmarks && (
+          <button
+            onClick={onOpenBenchmarks}
+            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+            title="能力评测"
+            aria-label="能力评测"
+          >
+            <Gauge size={14} />
+          </button>
+        )}
+        {onOpenResources && (
+          <button
+            onClick={onOpenResources}
+            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+            title="资源中心"
+            aria-label="资源中心"
+          >
+            <Puzzle size={14} />
+          </button>
+        )}
+        {onOpenControlPlane && (
+          <button
+            onClick={onOpenControlPlane}
+            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+            title="AI Coding OS"
+            aria-label="AI Coding OS"
+          >
+            <ShieldCheck size={14} />
+          </button>
+        )}
         <button
           onClick={onOpenSettings}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
@@ -355,7 +436,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
 
         {/* ─── Left: Session sidebar + adaptive task tree (collapsible) ─── */}
         {!sidebarCollapsed && (
-          <aside className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col min-h-0">
+          <aside aria-label="会话列表" className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col min-h-0">
             <SessionSidebar currentSessionId={sessionId} onOpenSession={onOpenSession} />
             {/* Adaptive: the task tree only makes sense for project sessions.
                 Quick + anonymous chats have no tasks, so the panel is omitted. */}
@@ -368,12 +449,12 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
         )}
 
         {/* ─── Center: Execution stream + input ──────────────────────── */}
-        <main className="flex-1 flex flex-col min-w-0">
-          <ExecutionStream sessionId={sessionId} />
+        <main aria-label="会话窗口" className="flex-1 flex flex-col min-w-0">
+          {!activeDraft && <ExecutionStream sessionId={sessionId} />}
           <MessageList
             messages={messages}
             streaming={streaming}
-            cwd={activeSession?.cwd ?? null}
+            cwd={activeCwd}
             onUsePrompt={(text) => setPendingInsert(text)}
           />
           <ContextUsageBar sessionId={activeSession?.id} />
@@ -381,17 +462,17 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
             <QueueBadge queue={queue} onRemove={removeFromQueue} />
           )}
           <MessageInput
-            key={activeSession?.id ?? sessionId}
+            key={activeSession?.id ?? activeDraft?.id ?? sessionId}
             initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
             onSend={(t) => void sendOrQueue(t)}
             onGuide={guideNextStep}
             onCancel={() => cancelStream()}
             streaming={streaming}
             guidanceActive={autonomousRunActive}
-            disabled={!activeSession}
+            disabled={!activeSession && !activeDraft}
             pendingInsert={pendingInsert}
             onInsertConsumed={() => setPendingInsert(undefined)}
-            cwd={activeSession?.cwd ?? null}
+            cwd={activeCwd}
           />
         </main>
 

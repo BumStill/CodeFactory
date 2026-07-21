@@ -9,9 +9,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 
 const mocks = vi.hoisted(() => ({
-  createQuickSession: vi.fn(),
+  beginQuickDraft: vi.fn(),
+  beginProjectDraft: vi.fn(),
+  startAnonymousSession: vi.fn(),
   openDialog: vi.fn(),
-  createSession: vi.fn(),
   loadSessions: vi.fn(),
   loadQuickSessions: vi.fn(),
 }));
@@ -29,7 +30,10 @@ const fakeChatState = {
   ],
   quickSessions: [mk({ id: "q1", title: "改图脚本", updated_at: 200, kind: "quick" })],
   activeModel: "anthropic/claude-opus-4-7",
-  createSession: mocks.createSession,
+  draftSession: null,
+  beginQuickDraft: mocks.beginQuickDraft,
+  beginProjectDraft: mocks.beginProjectDraft,
+  startAnonymousSession: mocks.startAnonymousSession,
   loadSessions: mocks.loadSessions,
   loadQuickSessions: mocks.loadQuickSessions,
 };
@@ -43,7 +47,7 @@ vi.mock("../stores/chat", () => ({
 }));
 vi.mock("../lib/tauri", async (orig) => {
   const real = (await orig()) as Record<string, unknown>;
-  return { ...real, createQuickSession: mocks.createQuickSession };
+  return { ...real };
 });
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mocks.openDialog }));
 
@@ -87,35 +91,31 @@ describe("SessionSidebar", () => {
     expect(onOpen).toHaveBeenCalledWith("p2");
   });
 
-  it("creates a fresh quick task from the + 新建 menu and opens it", async () => {
+  it("opens a fresh in-memory quick draft from + 新建 without persistence", async () => {
     const onOpen = vi.fn();
-    mocks.createQuickSession.mockResolvedValue(mk({ id: "qNew", kind: "quick" }));
+    mocks.beginQuickDraft.mockReturnValue({ id: "draft-q", mode: "quick", cwd: null, modelId: "m", text: "" });
     render(<SessionSidebar currentSessionId="p1" onOpenSession={onOpen} />);
 
     fireEvent.click(screen.getByRole("button", { name: /新建/ }));
     fireEvent.click(await screen.findByText("新建快速任务"));
 
-    await waitFor(() =>
-      expect(mocks.createQuickSession).toHaveBeenCalledWith("anthropic/claude-opus-4-7"),
-    );
-    await waitFor(() => expect(onOpen).toHaveBeenCalledWith("qNew"));
-    expect(mocks.loadQuickSessions).toHaveBeenCalled(); // list refreshed after create
+    await waitFor(() => expect(mocks.beginQuickDraft).toHaveBeenCalledTimes(1));
+    expect(onOpen).toHaveBeenCalledWith("draft-q");
+    expect(mocks.loadQuickSessions).not.toHaveBeenCalledTimes(2);
   });
 
-  it("creates a project via the directory picker", async () => {
+  it("opens a project draft after directory selection without persistence", async () => {
     const onOpen = vi.fn();
     mocks.openDialog.mockResolvedValue("/Users/x/newproj");
-    mocks.createSession.mockResolvedValue(mk({ id: "pNew", kind: "project" }));
+    mocks.beginProjectDraft.mockReturnValue({ id: "draft-p", mode: "project", cwd: "/Users/x/newproj", modelId: "m", text: "" });
     render(<SessionSidebar currentSessionId="p1" onOpenSession={onOpen} />);
 
     fireEvent.click(screen.getByRole("button", { name: /新建/ }));
     fireEvent.click(await screen.findByText("新建项目"));
 
     await waitFor(() => expect(mocks.openDialog).toHaveBeenCalled());
-    await waitFor(() =>
-      expect(mocks.createSession).toHaveBeenCalledWith("/Users/x/newproj", "anthropic/claude-opus-4-7"),
-    );
-    await waitFor(() => expect(onOpen).toHaveBeenCalledWith("pNew"));
+    expect(mocks.beginProjectDraft).toHaveBeenCalledWith("/Users/x/newproj");
+    expect(onOpen).toHaveBeenCalledWith("draft-p");
   });
 
   it("aborts project creation when the picker is cancelled", async () => {
@@ -127,7 +127,7 @@ describe("SessionSidebar", () => {
     fireEvent.click(await screen.findByText("新建项目"));
 
     await waitFor(() => expect(mocks.openDialog).toHaveBeenCalled());
-    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.beginProjectDraft).not.toHaveBeenCalled();
     expect(onOpen).not.toHaveBeenCalled();
   });
 

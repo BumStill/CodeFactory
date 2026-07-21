@@ -4,15 +4,16 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 
-vi.mock("./pages/Home/HomePage", () => ({
-  HomePage: ({ onOpenResources }: { onOpenResources: () => void }) => (
-    <button onClick={onOpenResources}>打开资源中心</button>
-  ),
-}));
+const draft = { id: "draft-start", mode: "quick", cwd: null, modelId: "test-model", text: "" };
+
 vi.mock("./pages/Resources/ResourcesPage", () => ({
   ResourcesPage: () => <main aria-label="资源中心页面">资源中心已打开</main>,
 }));
-vi.mock("./pages/Workspace/WorkspacePage", () => ({ WorkspacePage: () => null }));
+vi.mock("./pages/Workspace/WorkspacePage", () => ({
+  WorkspacePage: ({ onOpenResources }: { onOpenResources?: () => void }) => (
+    <button onClick={onOpenResources}>打开资源中心</button>
+  ),
+}));
 vi.mock("./pages/ControlPlane/ControlPlanePage", () => ({ ControlPlanePage: () => null }));
 vi.mock("./pages/Benchmarks/BenchmarksPage", () => ({ BenchmarksPage: () => null }));
 vi.mock("./pages/Evolution/EvolutionWorkbenchPage", () => ({ EvolutionWorkbenchPage: () => null }));
@@ -27,17 +28,20 @@ vi.mock("./stores/settings", () => ({
     selector({ load: vi.fn(), settings: { onboarded: true } }),
 }));
 vi.mock("./stores/chat", () => ({
-  useChatStore: () => ({ activeModel: "test-model", createSession: vi.fn() }),
+  useChatStore: () => ({
+    draftSession: null,
+    beginQuickDraft: vi.fn(() => draft),
+    beginProjectDraft: vi.fn(),
+  }),
 }));
 vi.mock("./stores/chatgptCatalog", () => ({ syncChatGptCatalog: vi.fn() }));
-vi.mock("./lib/tauri", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
 describe("App resource navigation", () => {
-  it("routes the home backend entry to ResourcesPage", async () => {
+  it("routes the workspace toolbar entry to ResourcesPage", async () => {
     render(<App />);
 
-    await userEvent.click(screen.getByRole("button", { name: "打开资源中心" }));
+    await userEvent.click(await screen.findByRole("button", { name: "打开资源中心" }));
 
     expect(screen.getByRole("main", { name: "资源中心页面" })).toHaveTextContent("资源中心已打开");
   });
