@@ -229,6 +229,30 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
   const nowMs = useNowTick(isStreamingTail);
   const [showRejected, setShowRejected] = useState(false);
 
+  // A persisted turn failure (provider error that killed the turn). Red
+  // notice with the raw error so it survives reloads — the 2026-07-21
+  // interruptions left zero trace because errors were transient events.
+  if (msg.completionState === "turn_error") {
+    return (
+      <div className="flex justify-center">
+        <div className="max-w-[85%] rounded border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-[11px] leading-snug text-red-800 dark:text-red-200 break-words">
+          回合中断:{msg.content.replace(/^回合中断[::]\s*/, "")}
+        </div>
+      </div>
+    );
+  }
+
+  // Neutral runtime notices (e.g. images stripped for a no-vision model).
+  if (msg.completionState === "turn_notice") {
+    return (
+      <div className="flex justify-center">
+        <div className="max-w-[85%] rounded border border-sky-500/30 bg-sky-500/10 px-2.5 py-1 text-[11px] leading-snug text-sky-800 dark:text-sky-200 break-words">
+          {msg.content}
+        </div>
+      </div>
+    );
+  }
+
   // Injected completion-gate instructions are persisted as user-role turns
   // for history fidelity, but they are the harness talking — render them as
   // a centered system notice, never as a user bubble.
