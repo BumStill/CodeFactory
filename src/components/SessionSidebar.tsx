@@ -13,7 +13,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Plus, ChevronDown, Zap, Folder, EyeOff, Loader2, Pencil, Trash2, MoreHorizontal } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../stores/chat";
-import { createQuickSession } from "../lib/tauri";
 import { formatRelativeTime } from "../lib/time";
 import type { Session } from "../lib/tauri";
 
@@ -27,8 +26,9 @@ interface SessionSidebarProps {
 export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSidebarProps) {
   const sessions = useChatStore((s) => s.sessions);
   const quickSessions = useChatStore((s) => s.quickSessions);
-  const activeModel = useChatStore((s) => s.activeModel);
-  const createSession = useChatStore((s) => s.createSession);
+  const draftSession = useChatStore((s) => s.draftSession);
+  const beginQuickDraft = useChatStore((s) => s.beginQuickDraft);
+  const beginProjectDraft = useChatStore((s) => s.beginProjectDraft);
   const loadSessions = useChatStore((s) => s.loadSessions);
   const loadQuickSessions = useChatStore((s) => s.loadQuickSessions);
   const startAnonymousSession = useChatStore((s) => s.startAnonymousSession);
@@ -36,7 +36,6 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
   const renameSession = useChatStore((s) => s.renameSession);
 
   const [menuOpen, setMenuOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   // Load both lists when the sidebar first mounts.
@@ -63,43 +62,24 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
     () => [...sessions, ...quickSessions].sort((a, b) => b.updated_at - a.updated_at),
     [sessions, quickSessions],
   );
+  const draftActive = draftSession?.id === currentSessionId;
 
-  const handleNewQuick = async () => {
+  const handleNewQuick = () => {
     setMenuOpen(false);
-    if (busy) return;
-    setBusy(true);
-    try {
-      const s = await createQuickSession(activeModel);
-      await loadQuickSessions();
-      onOpenSession(s.id);
-    } catch (e) {
-      // eslint-disable-next-line no-alert
-      alert(`新建快速任务失败：${String(e)}`);
-    } finally {
-      setBusy(false);
-    }
+    const draft = beginQuickDraft();
+    onOpenSession(draft.id);
   };
 
   const handleNewProject = async () => {
     setMenuOpen(false);
-    if (busy) return;
     const dir = await openDialog({ directory: true, title: "选择项目目录" });
     if (!dir) return;
-    setBusy(true);
-    try {
-      const s = await createSession(dir as string, activeModel);
-      if (s) onOpenSession(s.id);
-    } catch (e) {
-      // eslint-disable-next-line no-alert
-      alert(`新建项目失败：${String(e)}`);
-    } finally {
-      setBusy(false);
-    }
+    const draft = beginProjectDraft(dir as string);
+    onOpenSession(draft.id);
   };
 
   const handleNewAnonymous = () => {
     setMenuOpen(false);
-    if (busy) return;
     // Purely in-memory — no backend call, nothing persisted. Navigate to it.
     const s = startAnonymousSession();
     onOpenSession(s.id);
@@ -111,8 +91,7 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
       <div className="relative p-2 border-b border-border" ref={menuRef}>
         <button
           onClick={() => setMenuOpen((v) => !v)}
-          disabled={busy}
-          className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-accent px-2 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
+          className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-accent px-2 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
         >
           <Plus size={13} />
           新建
@@ -153,7 +132,26 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
         <h2 className="px-1.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">
           最近会话
         </h2>
-        {merged.length === 0 ? (
+        {draftActive && draftSession && (
+          <button
+            type="button"
+            aria-current="page"
+            className="mb-1 flex w-full items-center gap-1.5 rounded-md border border-accent/40 bg-accent/15 px-2 py-2 text-left"
+          >
+            {draftSession.mode === "quick" ? (
+              <Zap size={11} className="shrink-0 text-accent" />
+            ) : (
+              <Folder size={11} className="shrink-0 text-gray-500" />
+            )}
+            <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-gray-100">
+              {draftSession.mode === "quick" ? "新对话" : (draftSession.cwd?.split(/[/\\]/).pop() || "新项目")}
+            </span>
+            <span className="shrink-0 rounded bg-accent/15 px-1 py-0.5 text-[8px] text-accent">
+              草稿
+            </span>
+          </button>
+        )}
+        {merged.length === 0 && !draftActive ? (
           <p className="px-1.5 py-6 text-center text-[11px] leading-relaxed text-gray-600">
             还没有会话
             <br />
