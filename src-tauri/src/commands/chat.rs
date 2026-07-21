@@ -71,6 +71,7 @@ pub async fn send_message(
     app: AppHandle,
     session_id: String,
     content: String,
+    user_message_persisted: Option<bool>,
     state: State<'_, AppState>,
     mcp: State<'_, Arc<McpManager>>,
 ) -> Result<(), AppError> {
@@ -85,23 +86,26 @@ pub async fn send_message(
 
     let settings = state.settings.read().await.clone();
 
-    // Persist user message
+    // Persist user message unless draft materialization already wrote it in
+    // the same transaction as the session row. The count still determines
+    // first-turn title behavior for legacy create-then-send callers.
     let is_first_message = {
         let pool = state.db.read().await;
-        let msg_id = Uuid::new_v4().to_string();
-        let now = Utc::now().timestamp_millis();
-        sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-        )
-        .bind(&msg_id)
-        .bind(&session_id)
-        .bind("user")
-        .bind(&content)
-        .bind(now)
-        .execute(&*pool)
-        .await?;
+        if !user_message_persisted.unwrap_or(false) {
+            let msg_id = Uuid::new_v4().to_string();
+            let now = Utc::now().timestamp_millis();
+            sqlx::query(
+                "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
+            )
+            .bind(&msg_id)
+            .bind(&session_id)
+            .bind("user")
+            .bind(&content)
+            .bind(now)
+            .execute(&*pool)
+            .await?;
+        }
 
-        // Check if this is the first message in the session
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages WHERE session_id = ?")
             .bind(&session_id)
             .fetch_one(&*pool)

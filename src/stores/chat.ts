@@ -26,6 +26,16 @@ export interface QueuedMessage {
   enqueuedAt: number;
 }
 
+/** A conversation shell that exists only in frontend memory until the first
+ * real message is submitted. It must never be passed to backend session APIs. */
+export interface DraftSession {
+  id: string;
+  mode: "quick" | "project";
+  cwd: string | null;
+  modelId: string;
+  text: string;
+}
+
 export const QUEUE_MAX = 5;
 
 /** All ephemeral chat state for ONE session. Buckets are keyed by session id in
@@ -68,6 +78,11 @@ interface ChatStore {
   sessions: Session[];
   quickSessions: Session[];
   activeSession: Session | null;
+  draftSession: DraftSession | null;
+  beginQuickDraft: () => DraftSession;
+  beginProjectDraft: (cwd: string) => DraftSession;
+  updateDraftText: (text: string) => void;
+  discardDraft: () => void;
   /** Per-session ephemeral chat state, keyed by session id. Source of truth for
    *  messages / streaming / queue / token + context stats. Multiple sessions
    *  can be present and streaming at the same time. */
@@ -83,9 +98,9 @@ interface ChatStore {
   renameSession: (id: string, title: string) => Promise<void>;
   /** Send to `sessionId` (default: the active session). Targeting lets the
    *  queue-drain fire the next message into a background session too. */
-  sendMessage: (content: string, sessionId?: string) => Promise<void>;
-  /** Send right now if the active session is idle, otherwise enqueue. */
-  sendOrQueue: (content: string) => Promise<"sent" | "queued" | "full">;
+  sendMessage: (content: string, sessionId?: string, userMessagePersisted?: boolean) => Promise<void>;
+  /** Send right now if idle, enqueue if streaming, or materialize an active draft. */
+  sendOrQueue: (content: string) => Promise<"sent" | "queued" | "full" | "failed">;
   /** Remove a queued message (active session) before it fires. */
   removeFromQueue: (id: string) => void;
   /** Empty the active session's queue without sending. */
@@ -110,6 +125,7 @@ interface ChatStore {
   _unlisten: Record<string, UnlistenFn | undefined>;
   _unlistenSessionUpdated: Record<string, UnlistenFn | undefined>;
   _streamingMsgId: Record<string, string | undefined>;
+  _draftMaterialization: Promise<Session> | null;
 }
 
 /** Selector: the active session's runtime slice (or the empty default). Use as
@@ -129,12 +145,44 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   sessions: [],
   quickSessions: [],
   activeSession: null,
+  draftSession: null,
   runtime: {},
   models: [],
   activeModel: "anthropic/claude-opus-4-7",
   _unlisten: {},
   _unlistenSessionUpdated: {},
   _streamingMsgId: {},
+  _draftMaterialization: null,
+
+  beginQuickDraft: () => {
+    const draft: DraftSession = {
+      id: crypto.randomUUID(),
+      mode: "quick",
+      cwd: null,
+      modelId: get().activeModel,
+      text: "",
+    };
+    set({ activeSession: null, draftSession: draft });
+    return draft;
+  },
+
+  beginProjectDraft: (cwd) => {
+    const draft: DraftSession = {
+      id: crypto.randomUUID(),
+      mode: "project",
+      cwd,
+      modelId: get().activeModel,
+      text: "",
+    };
+    set({ activeSession: null, draftSession: draft });
+    return draft;
+  },
+
+  updateDraftText: (text) => set((state) => ({
+    draftSession: state.draftSession ? { ...state.draftSession, text } : null,
+  })),
+
+  discardDraft: () => set({ draftSession: null }),
 
   loadSessions: async () => {
     const sessions = await invoke<Session[]>("list_sessions");
@@ -152,6 +200,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     set((s) => ({
       sessions: [session, ...s.sessions],
       activeSession: session,
+      draftSession: null,
       activeModel: session.model_id,
       runtime: { ...s.runtime, [session.id]: freshRuntime() },
     }));
@@ -178,6 +227,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const msgs = await invoke<Message[]>("get_messages", { sessionId: id });
     set((s) => ({
       activeSession: session,
+      draftSession: null,
       activeModel: session.model_id,
       runtime: { ...s.runtime, [id]: freshRuntime(dbMessagesToUI(msgs)) },
     }));
@@ -219,7 +269,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }));
   },
 
-  sendMessage: async (content, sessionId) => {
+  sendMessage: async (content, sessionId, userMessagePersisted = false) => {
     const target = sessionId ? findSession(get(), sessionId) : get().activeSession;
     if (!target) return;
     const id = target.id;
@@ -292,7 +342,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       if (isAnon) {
         await sendMessageAnonymous(id, content, anonHistory, target.cwd, target.model_id);
       } else {
-        await invoke("send_message", { sessionId: id, content });
+        await invoke("send_message", {
+          sessionId: id,
+          content,
+          userMessagePersisted,
+        });
       }
     } catch (e) {
       set((s) => {
@@ -318,6 +372,50 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const text = content.trim();
     if (!text) return "sent";
     const active = get().activeSession;
+    const draft = get().draftSession;
+    if (!active && draft) {
+      get().updateDraftText(text);
+      let materialization = get()._draftMaterialization;
+      if (!materialization) {
+        materialization = invoke<Session>("materialize_draft_session", {
+          draftId: draft.id,
+          mode: draft.mode,
+          cwd: draft.cwd,
+          modelId: draft.modelId,
+          firstMessage: text,
+        });
+        set({ _draftMaterialization: materialization });
+      }
+      try {
+        const session = await materialization;
+        // A concurrent Enter joins the same materialization and must not start
+        // a duplicate turn after the first caller has already begun streaming.
+        const alreadyMaterialized = get().activeSession?.id === session.id;
+        set((state) => ({
+          activeSession: session,
+          draftSession: null,
+          activeModel: session.model_id,
+          _draftMaterialization: null,
+          runtime: {
+            ...state.runtime,
+            [session.id]: state.runtime[session.id] ?? freshRuntime(),
+          },
+          sessions: session.kind === "project"
+            ? [session, ...state.sessions.filter((item) => item.id !== session.id)]
+            : state.sessions,
+          quickSessions: session.kind === "quick"
+            ? [session, ...state.quickSessions.filter((item) => item.id !== session.id)]
+            : state.quickSessions,
+        }));
+        if (!alreadyMaterialized) {
+          await get().sendMessage(text, session.id, true);
+        }
+        return "sent";
+      } catch {
+        set({ _draftMaterialization: null });
+        return "failed";
+      }
+    }
     if (!active) return "sent";
     const id = active.id;
     const rt = get().runtime[id];
@@ -379,7 +477,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   updateActiveSessionModel: async (modelId) => {
     const activeSession = get().activeSession;
-    set({ activeModel: modelId });
+    const draftSession = get().draftSession;
+    set({
+      activeModel: modelId,
+      draftSession: draftSession ? { ...draftSession, modelId } : draftSession,
+    });
     if (!activeSession) return;
     if (activeSession.kind === "anonymous") {
       // No DB row to persist to — reflect the choice on the in-memory session.
