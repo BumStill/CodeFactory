@@ -1,15 +1,18 @@
 # Self-Evolution — overview & roadmap
 
-> **2026-07-14 implementation truth audit:** P0–P4 的部分逻辑和 UI 已存在，但
-> v1.43.0 的真实 Agent 路径没有写入规范化 `tool_calls`，普通聊天 post-mortem
-> 也只读取 `task_runs`。因此 P1/P3/P4 暂时只能视为“实现框架已存在、真实观察层
-> 未闭合”，不能以 shipped 文案作为产品完成证据。修复顺序与验收见
-> `docs/specs/feature-specs/evolution-agent-closed-loop.md`。
-> `codex/evolution-agent-loop` 已完成本地 Trace Truth 首个切片，以及一级「进化审查」
-> 工作台、人工采纳/拒绝、持久 job/event 日志和重启中断终态的真实 Dev App 证据。
-> 但在本轮 PR+CI、合并、刻意发版与发布包主路径验证前仍是 `not live`；通用
-> Evals/activation、versioned review、Quick 稳定 scope 和其余底座证据仍未完成，
-> 不能提前恢复完整 shipped 声明。
+> **2026-07-21 status:** 观察层已闭合（v1.48.0 起）——真实聊天/agent 循环对每个
+> 声明的工具调用写入规范化 `tool_calls`（`agent/mod.rs` → `trajectory.rs`），reflect
+> 层从 `tool_calls` 消费（`commands/learning.rs`）；anonymous 会话正确排除。因此上一版
+> 「真实观察层未闭合」的审计结论**已不再成立**。
+>
+> 会话结束后的**本地确定性跨会话挖掘**（`mine_cross_session_patterns`，无模型调用、
+> 数据不出本机）现在**默认自动运行**，因此差异化的 reflect→memory 闭环**开箱即用**、
+> 会产出有证据支撑的候选进人工「进化审查」。发送脱敏摘要给模型的**远程复盘**
+> （`run_postmortem`）仍严格 opt-in（`remote_postmortem_enabled`，默认关）。
+>
+> 仍诚实存在的缺口（非本文档吹的 shipped）：接受后的记忆缺**曝光追踪/退化**
+> （只增不减，见 `docs/BACKLOG.md`）；P4 的自主 implement→verify→PR 明确**未实现**，
+> 只有只读提案。
 
 > CodeFactory's tagline is **软件工厂 · 本地助手 · 自进化**. "Self-evolution" is
 > the system by which the product gets better from its own use — the factory
@@ -50,9 +53,9 @@ memory → behavior. Everything below widens the "Adapt" scope.
 | Phase | Adapts | Gist | Risk |
 |---|---|---|---|
 | **P0 — substrate** ✅ | memory/preferences | Memory system A1–A3 (done) | low |
-| **P1 — cross-session pattern mining** ⚠️ | memory quality | Command/UI 已存在；在 Phase 0 真实写入规范化轨迹并完成 live verification 前，不视为 shipped。See `P1-cross-session-pattern-mining.md`. | low |
+| **P1 — cross-session pattern mining** ✅ | memory quality | 规范化轨迹已闭合（v1.48.0），确定性挖掘会话结束后**默认自动运行**（`mine_cross_session_patterns`，无模型调用），候选进人工进化审查。剩余增量：记忆曝光追踪/退化（`docs/BACKLOG.md`）。See `P1-cross-session-pattern-mining.md`. | low |
 | **P2 — skill auto-evolution** ✅ | agent capability | **Shipped** (`propose_skills_from_patterns` — writes *disabled* proposal skills the user previews + enables; never auto-enables). A recurring task pattern → auto-propose/refine a skill. Reuses the existing skill system. See `P2-skill-auto-evolution.md`. | medium |
-| **P3 — self-tuning** ⚠️ | routing/policies | 自校准逻辑存在；工具可靠性/门控依赖 Phase 0 真实轨迹，验证前不视为完整 shipped。See `P3-self-tuning.md`. | medium |
+| **P3 — self-tuning** ⚠️ | routing/policies | 自校准逻辑存在；其依赖的规范化轨迹已闭合（v1.48.0），工具可靠性/门控统计已能读到有数据的 `tool_calls`。仍未完整 shipped：激活效果的评估与回归证据。See `P3-self-tuning.md`. | medium |
 | **P4 — self-modification** | **its own code** | 只读提案 UI/命令存在；摩擦数据同样依赖 Phase 0。自主 implement→verify→PR 仍明确未实现。See `P4-self-modification.md`. | high |
 
 ## Safety model (non-negotiable for every phase)

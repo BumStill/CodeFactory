@@ -115,7 +115,7 @@ describe("per-session streaming concurrency", () => {
     expect(activeRuntime(useChatStore.getState()).streaming).toBe(false); // B: idle
   });
 
-  it("keeps remote post-mortem off until the user explicitly opts in", async () => {
+  it("runs local mining by default but keeps remote post-mortem off until opt-in", async () => {
     useChatStore.setState({
       activeSession: A as never,
       runtime: {
@@ -130,6 +130,9 @@ describe("per-session streaming concurrency", () => {
     await useChatStore.getState().sendMessage("finish this", "A");
     streamHandlers.A({ type: "done", input_tokens: 1, output_tokens: 2 });
 
+    // Deterministic local mining (no model call) runs out of the box …
+    expect(invokeMock).toHaveBeenCalledWith("mine_cross_session_patterns", { cwd: "/p/A" });
+    // … but the model-based post-mortem stays off until explicitly enabled.
     expect(invokeMock).not.toHaveBeenCalledWith("run_postmortem", expect.anything());
   });
 
@@ -151,6 +154,8 @@ describe("per-session streaming concurrency", () => {
     await useChatStore.getState().sendMessage("finish this", "B");
     streamHandlers.B({ type: "done", input_tokens: 1, output_tokens: 2 });
 
+    // With opt-in on, BOTH the local miner and the remote post-mortem fire.
+    expect(invokeMock).toHaveBeenCalledWith("mine_cross_session_patterns", { cwd: "/p/B" });
     expect(invokeMock).toHaveBeenCalledWith("run_postmortem", {
       sessionId: "B",
       cwd: "/p/B",

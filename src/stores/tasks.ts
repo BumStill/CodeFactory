@@ -283,16 +283,24 @@ export const useTasksStore = create<TasksState>((set, get) => ({
               set((s) => ({
                 running: { ...s.running, [sessionId]: false },
               }));
-              // Self-evolution: one post-mortem pass per session run.
-              // Best-effort + capped at 500 tokens server-side — see
-              // src-tauri/src/commands/learning.rs for the token economy
-              // rationale. Failure is silent; the next session will retry.
+              // Self-evolution: one pass per session run. Failure is silent;
+              // the next session will retry.
               const cwd = all[0]?.cwd;
-              if (cwd && useSettingsStore.getState().settings?.remote_postmortem_enabled === true) {
-                invoke("run_postmortem", { sessionId, cwd }).catch((e) => {
+              if (cwd) {
+                // Local deterministic mining runs by DEFAULT — no model call,
+                // nothing leaves the machine.
+                invoke("mine_cross_session_patterns", { cwd }).catch((e) => {
                   // eslint-disable-next-line no-console
-                  console.warn("postmortem failed (non-fatal)", e);
+                  console.warn("local pattern mining failed (non-fatal)", e);
                 });
+                // The model-based post-mortem (bounded, redacted, ≤500 tokens —
+                // see src-tauri/src/commands/learning.rs) stays strictly opt-in.
+                if (useSettingsStore.getState().settings?.remote_postmortem_enabled === true) {
+                  invoke("run_postmortem", { sessionId, cwd }).catch((e) => {
+                    // eslint-disable-next-line no-console
+                    console.warn("postmortem failed (non-fatal)", e);
+                  });
+                }
               }
             }
           }, 100);
