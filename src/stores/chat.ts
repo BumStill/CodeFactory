@@ -94,7 +94,10 @@ interface ChatStore {
   setModel: (modelId: string) => void;
   /** Stop the in-flight turn for `sessionId` (default: the active session). */
   cancelStream: (sessionId?: string) => void;
-  respondPermission: (allow: boolean) => Promise<void>;
+  respondPermission: (
+    allow: boolean,
+    opts?: { grantFullAccess?: boolean },
+  ) => Promise<void>;
   addLocalAssistantMessage: (content: string) => void;
   clearVisibleConversation: () => void;
   updateActiveSessionModel: (modelId: string) => Promise<void>;
@@ -473,11 +476,31 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     void invoke("cancel_chat", { sessionId: id });
   },
 
-  respondPermission: async (allow) => {
+  respondPermission: async (allow, opts) => {
     const id = get().activeSession?.id;
     if (!id) return;
     const pending = get().runtime[id]?.pendingPermission;
     if (!pending) return;
+    // "完全访问并允许": persist full_access so this call AND every subsequent
+    // tool call stops prompting. The running agent loop re-reads settings from
+    // the shared handle on each tool call, so flipping it here (before we
+    // unblock the current call) takes effect for the rest of this turn too, and
+    // `save_settings` persists it for future sessions + reflects it in Settings.
+    // Previously this button was a no-op alias of "仅允许一次".
+    if (allow && opts?.grantFullAccess) {
+      const { settings, save } = useSettingsStore.getState();
+      if (settings && !settings.permissions.full_access) {
+        try {
+          await save({
+            ...settings,
+            permissions: { ...settings.permissions, full_access: true },
+          });
+        } catch {
+          // Persisting failed — fall back to allow-once so the call doesn't
+          // hang. The user can enable full access from Settings instead.
+        }
+      }
+    }
     await invoke("respond_to_permission", { toolCallId: pending.toolCallId, allow });
     set((s) => {
       const prev = s.runtime[id];
