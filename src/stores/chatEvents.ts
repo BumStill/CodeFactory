@@ -34,7 +34,18 @@ export interface UIMessage {
   completionState?: string;
   /** Live gate interventions on the streaming turn, in arrival order. */
   gateActions?: GateActionState[];
+  /** Turn timeline: narration and tool calls in arrival order. Only built
+   *  during live streaming — hydrated history is already interleaved as
+   *  separate rows. */
+  segments?: TurnSegment[];
 }
+
+/** One slice of a streaming turn, in arrival order: narration text or a
+ *  tool invocation. Preserves the interleaving that a single concatenated
+ *  content string loses (the "two blobs" wall-of-text bug). */
+export type TurnSegment =
+  | { kind: "text"; text: string }
+  | { kind: "tool"; toolCallId: string };
 
 export interface GateActionState {
   kind: string;
@@ -83,9 +94,17 @@ export function reduceChatStreamEvent(
     case "text_delta":
       return {
         ...state,
-        messages: state.messages.map((m) =>
-          m.id === msgId ? { ...m, content: m.content + event.content } : m,
-        ),
+        messages: state.messages.map((m) => {
+          if (m.id !== msgId) return m;
+          const segments = [...(m.segments ?? [])];
+          const tail = segments[segments.length - 1];
+          if (tail && tail.kind === "text") {
+            segments[segments.length - 1] = { kind: "text", text: tail.text + event.content };
+          } else {
+            segments.push({ kind: "text", text: event.content });
+          }
+          return { ...m, content: m.content + event.content, segments };
+        }),
       };
 
     case "tool_call_start":
@@ -96,6 +115,14 @@ export function reduceChatStreamEvent(
           name: event.name,
           args: formatToolArgs(event.args),
           status: "running",
+        }).map((m) => {
+          if (m.id !== msgId) return m;
+          const segments = m.segments ?? [];
+          // Re-announced ids (permission flow) must not duplicate the segment.
+          if (segments.some((s) => s.kind === "tool" && s.toolCallId === event.id)) {
+            return m;
+          }
+          return { ...m, segments: [...segments, { kind: "tool", toolCallId: event.id }] };
         }),
       };
 
