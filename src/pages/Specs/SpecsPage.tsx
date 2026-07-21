@@ -1102,7 +1102,7 @@ export function SpecsPage({ onBack, onOpenWorkspace }: SpecsPageProps) {
               {/* Edit / Preview / Evidence */}
               <div className="flex-1 flex flex-col min-w-0">
                 {saveError && (
-                  <div className="flex items-center justify-between gap-2 border-b border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs text-red-300">
+                  <div className="flex items-center justify-between gap-2 border-b border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs text-red-700 dark:text-red-300">
                     <span className="truncate">自动保存失败：{saveError}</span>
                     <button
                       onClick={() => {
