@@ -298,6 +298,8 @@ pub async fn send_message(
     let event_name = format!("stream:{}", session_id);
     let session_id_clone = session_id.clone();
     tokio::spawn(async move {
+        let db_for_error = db.clone();
+        let session_for_error = session_id_clone.clone();
         let mut agent = AgentLoop::new_with_mode(
             app,
             db,
@@ -317,6 +319,27 @@ pub async fn send_message(
         .with_cancel(cancel_flag);
         if let Err(e) = agent.run(history).await {
             tracing::error!("Agent loop error: {e:#}");
+            // Persist the failure so it survives reloads: the 2026-07-21
+            // field report had four interruptions with zero forensic trace
+            // because the error only ever existed as this transient stream
+            // event. Tagged turn_error → rendered as an error notice, and
+            // excluded from provider history replay.
+            let error_text = format!("回合中断:{e}");
+            if let Err(persist_err) = sqlx::query(
+                "INSERT INTO messages (id, session_id, role, content, completion_state, created_at) \
+                 VALUES (?,?,?,?,?,?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&session_for_error)
+            .bind("user")
+            .bind(&error_text)
+            .bind("turn_error")
+            .bind(chrono::Utc::now().timestamp_millis())
+            .execute(&db_for_error)
+            .await
+            {
+                tracing::warn!("failed to persist turn error: {persist_err}");
+            }
             app_clone
                 .emit(
                     &event_name,

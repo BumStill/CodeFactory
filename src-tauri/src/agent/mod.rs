@@ -770,15 +770,54 @@ impl AgentLoop {
             }
 
             let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
-            let (text, tool_calls, usage, reasoning) = match self.api_style {
+            let call_result = match self.api_style {
                 ApiStyle::Chatgpt => {
                     self.call_chatgpt_model(&messages, active_tool_defs, event_name)
-                        .await?
+                        .await
                 }
                 _ => {
                     self.call_openai_model(&messages, active_tool_defs, event_name)
-                        .await?
+                        .await
                 }
+            };
+            let (text, tool_calls, usage, reasoning) = match call_result {
+                Ok(ok) => ok,
+                // The active model rejects image input (e.g. the user switched
+                // the session to a no-vision model with image attachments in
+                // history). Strip images to placeholders and retry ONCE —
+                // otherwise every「继续」replays the same history and dies the
+                // same death (2026-07-21 field report).
+                Err(e) if is_vision_rejection(&e.to_string()) => {
+                    let stripped = strip_image_parts(&mut messages);
+                    if stripped == 0 {
+                        return Err(e);
+                    }
+                    let notice = format!(
+                        "已自动移除历史中的 {stripped} 张图片后重试:当前模型不支持图片输入。\
+如需图片理解,请切换回支持图片的模型。"
+                    );
+                    self.persist_gate_message(&notice, "turn_notice").await?;
+                    self.app
+                        .emit(
+                            event_name,
+                            StreamEvent::CompletionGateAction {
+                                kind: "turn_notice".into(),
+                                detail: notice.clone(),
+                            },
+                        )
+                        .ok();
+                    match self.api_style {
+                        ApiStyle::Chatgpt => {
+                            self.call_chatgpt_model(&messages, active_tool_defs, event_name)
+                                .await?
+                        }
+                        _ => {
+                            self.call_openai_model(&messages, active_tool_defs, event_name)
+                                .await?
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
             };
             finalization_pending = false;
 
@@ -2023,7 +2062,7 @@ impl AgentLoop {
             reasoning_content: None,
         }];
 
-        for m in repair_incomplete_tool_history(history) {
+        for m in repair_incomplete_tool_history(replayable_history(history)) {
             match m.role.as_str() {
                 "tool" => {
                     // Content stored as: {"tool_call_id": "…", "content": "…"}
@@ -2087,7 +2126,7 @@ impl AgentLoop {
     fn build_anthropic_messages(&self, history: Vec<Message>) -> Vec<serde_json::Value> {
         let mut msgs: Vec<serde_json::Value> = Vec::new();
 
-        for m in repair_incomplete_tool_history(history) {
+        for m in repair_incomplete_tool_history(replayable_history(history)) {
             match m.role.as_str() {
                 "tool" => {
                     let (tool_call_id, content) = parse_tool_message_content(&m.content);
@@ -2216,7 +2255,7 @@ impl AgentLoop {
             };
 
             let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
-            let resp = anthropic_client::stream_anthropic(
+            let first_attempt = anthropic_client::stream_anthropic(
                 &self.http,
                 &self.base_url,
                 &self.api_key,
@@ -2228,7 +2267,47 @@ impl AgentLoop {
                 &self.app,
                 event_name,
             )
-            .await?;
+            .await;
+            let resp = match first_attempt {
+                Ok(resp) => resp,
+                // Same no-vision degradation as the OpenAI loop: strip image
+                // parts to placeholders and retry once instead of killing the
+                // turn on every replay of an image-bearing history.
+                Err(e) if is_vision_rejection(&e.to_string()) => {
+                    let stripped = strip_image_values(&mut messages);
+                    if stripped == 0 {
+                        return Err(e);
+                    }
+                    let notice = format!(
+                        "已自动移除历史中的 {stripped} 张图片后重试:当前模型不支持图片输入。\
+如需图片理解,请切换回支持图片的模型。"
+                    );
+                    self.persist_gate_message(&notice, "turn_notice").await?;
+                    self.app
+                        .emit(
+                            event_name,
+                            StreamEvent::CompletionGateAction {
+                                kind: "turn_notice".into(),
+                                detail: notice.clone(),
+                            },
+                        )
+                        .ok();
+                    anthropic_client::stream_anthropic(
+                        &self.http,
+                        &self.base_url,
+                        &self.api_key,
+                        &self.model_id,
+                        system_prompt,
+                        messages.clone(),
+                        active_tool_defs,
+                        self.cancel.as_ref(),
+                        &self.app,
+                        event_name,
+                    )
+                    .await?
+                }
+                Err(e) => return Err(e),
+            };
             finalization_pending = false;
 
             if resp.cancelled || self.is_cancelled() {
@@ -2840,6 +2919,74 @@ fn completion_recovery_prompt(
         CompletionFinalization::Recover(prompt) => Some(prompt),
         CompletionFinalization::Complete | CompletionFinalization::Blocked(_) => None,
     }
+}
+
+/// Placeholder inserted in place of an image part when the active model
+/// rejects vision input. Visible to the model (so it knows an image existed)
+/// and stable for the strip functions' idempotence checks.
+const IMAGE_STRIPPED_PLACEHOLDER: &str = "[图片已省略:当前模型不支持图片输入]";
+
+/// Does this provider error mean "the model can't accept image input"?
+/// Deliberately narrow: capability wording only, never generic failures —
+/// a false positive would silently drop the user's images on a transient
+/// error, so unknown errors must stay unmatched and surface as-is.
+fn is_vision_rejection(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    ["image", "vision", "multimodal"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+        && !lower.contains("rate limit")
+}
+
+/// Replace image parts in OpenAI-shaped messages with a text placeholder.
+/// Returns how many were stripped (0 = nothing to do → do not retry again).
+fn strip_image_parts(messages: &mut [ChatMessage]) -> usize {
+    let mut stripped = 0;
+    for message in messages.iter_mut() {
+        if let MessageContent::Parts(parts) = &mut message.content {
+            for part in parts.iter_mut() {
+                if part.r#type == "image_url" {
+                    part.r#type = "text".into();
+                    part.text = Some(IMAGE_STRIPPED_PLACEHOLDER.to_string());
+                    part.image_url = None;
+                    stripped += 1;
+                }
+            }
+        }
+    }
+    stripped
+}
+
+/// Same as [`strip_image_parts`] for the Anthropic-shaped JSON message array
+/// (`type: "image"` blocks and any `image_url` compatibility parts).
+fn strip_image_values(messages: &mut [serde_json::Value]) -> usize {
+    let mut stripped = 0;
+    for message in messages.iter_mut() {
+        let Some(parts) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if kind == "image" || kind == "image_url" {
+                *part = serde_json::json!({
+                    "type": "text",
+                    "text": IMAGE_STRIPPED_PLACEHOLDER,
+                });
+                stripped += 1;
+            }
+        }
+    }
+    stripped
+}
+
+/// History rows that may be replayed to the provider. Persisted turn-error
+/// notices are for the user and forensics only — replaying them would inject
+/// fake user turns the model never saw.
+fn replayable_history(history: Vec<Message>) -> Vec<Message> {
+    history
+        .into_iter()
+        .filter(|m| m.completion_state.as_deref() != Some("turn_error"))
+        .collect()
 }
 
 /// Whether this mode injects the completion-ready ("coverage audit") nudge at
@@ -3764,6 +3911,113 @@ mod tests {
             resolve_chatgpt_reasoning_effort(&settings, "chatgpt", "gpt-session-model", None),
             ReasoningEffort::Low
         );
+    }
+
+    #[test]
+    fn vision_rejection_detector_matches_capability_errors_only() {
+        // 2026-07-21 field report: switching the session to DeepSeek (no
+        // vision) made every turn die on the replayed image attachment.
+        for err in [
+            "400 This model does not support image input",
+            "invalid content type: image_url is not supported",
+            "Multimodal content is not enabled for this model",
+            "unsupported message content type Vision",
+        ] {
+            assert!(is_vision_rejection(err), "{err}");
+        }
+        for err in [
+            "429 rate limit exceeded",
+            "500 Internal Server Error",
+            "context length exceeded",
+        ] {
+            assert!(!is_vision_rejection(err), "{err}");
+        }
+    }
+
+    #[test]
+    fn strip_image_parts_replaces_images_with_placeholders() {
+        let mut messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: MessageContent::Parts(vec![
+                    ContentPart {
+                        r#type: "text".into(),
+                        text: Some("看下这个截图".into()),
+                        image_url: None,
+                    },
+                    ContentPart {
+                        r#type: "image_url".into(),
+                        text: None,
+                        image_url: Some(ImageUrl {
+                            url: "data:image/png;base64,AAAA".into(),
+                        }),
+                    },
+                ]),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: MessageContent::Text("ok".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+        ];
+        let stripped = strip_image_parts(&mut messages);
+        assert_eq!(stripped, 1);
+        match &messages[0].content {
+            MessageContent::Parts(parts) => {
+                assert!(parts.iter().all(|p| p.r#type == "text"));
+                let joined: String =
+                    parts.iter().filter_map(|p| p.text.clone()).collect::<Vec<_>>().join(" ");
+                assert!(joined.contains("看下这个截图"));
+                assert!(joined.contains("图片已省略"));
+            }
+            MessageContent::Text(_) => panic!("parts must stay parts"),
+        }
+        // Idempotent: second pass strips nothing.
+        assert_eq!(strip_image_parts(&mut messages), 0);
+    }
+
+    #[test]
+    fn strip_image_values_handles_anthropic_shaped_content() {
+        let mut messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "截图如下" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" } },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,BBBB" } },
+            ],
+        })];
+        let stripped = strip_image_values(&mut messages);
+        assert_eq!(stripped, 2);
+        let parts = messages[0]["content"].as_array().unwrap();
+        assert!(parts.iter().all(|p| p["type"] == "text"));
+        assert_eq!(strip_image_values(&mut messages), 0);
+    }
+
+    #[test]
+    fn turn_error_records_are_excluded_from_provider_history() {
+        // A persisted turn-error notice is for the USER (and forensics); it
+        // must never be replayed to the model as a fake user turn.
+        let mut err = stored_message("user", "[回合错误] 400 no vision", None);
+        err.completion_state = Some("turn_error".into());
+        let history = vec![
+            stored_message("user", "hi", None),
+            err,
+            stored_message("assistant", "hello", None),
+        ];
+        let filtered = replayable_history(history);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|m| !m.content.contains("回合错误")));
+        // Gate artifacts (user-role turns the model really saw) stay in.
+        let mut gate = stored_message("user", "The completion gate…", None);
+        gate.completion_state = Some("gate_recovery".into());
+        assert_eq!(replayable_history(vec![gate]).len(), 1);
     }
 
     fn stored_message(role: &str, content: &str, tool_calls: Option<String>) -> Message {
