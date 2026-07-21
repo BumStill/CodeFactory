@@ -234,6 +234,7 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
   // other row `active` is false, so this is inert.
   const nowMs = useNowTick(isStreamingTail);
   const [showRejected, setShowRejected] = useState(false);
+  const [showAllSteps, setShowAllSteps] = useState(false);
 
   // A persisted turn failure (provider error that killed the turn). Red
   // notice with the raw error so it survives reloads — the 2026-07-21
@@ -322,11 +323,69 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
       ? formatDuration(msg.durationMs)
       : null;
 
+  // Turn timeline: when segments exist (live-streamed turns), render
+  // narration and tool cards in ARRIVAL order — mid-turn narration as light
+  // step lines, only the final segment as full prose. Without segments
+  // (hydrated history), fall back to the classic cards-then-content layout;
+  // persisted turns are already split into separate interleaved rows.
+  const timeline = msg.segments && msg.segments.length > 0 ? msg.segments : null;
+  const toolById = new Map((msg.toolCalls ?? []).map((tc) => [tc.id, tc]));
+  const lastTextIndex = timeline
+    ? timeline.reduce((acc, s, i) => (s.kind === "text" ? i : acc), -1)
+    : -1;
+  // Long turns: collapse everything before the visible tail window.
+  const COLLAPSE_THRESHOLD = 10;
+  const TAIL_VISIBLE = 4;
+  const collapsible = timeline && timeline.length > COLLAPSE_THRESHOLD;
+  const visibleFrom = collapsible && !showAllSteps ? timeline.length - TAIL_VISIBLE : 0;
+  const hiddenSteps = collapsible && !showAllSteps ? visibleFrom : 0;
+
   return (
     <div className="group text-sm text-gray-200 space-y-1.5">
-      {msg.toolCalls?.map((tc) => (
-        <ToolCallCard key={tc.id} tc={tc} />
-      ))}
+      {timeline ? (
+        <>
+          {collapsible && (
+            <button
+              type="button"
+              onClick={() => setShowAllSteps((v) => !v)}
+              className="text-[11px] text-gray-500 hover:text-gray-300 border border-surface-3 rounded px-2 py-0.5"
+            >
+              {showAllSteps ? "收起早期步骤" : `前 ${hiddenSteps} 步(点击展开)`}
+            </button>
+          )}
+          {timeline.map((segment, index) => {
+            if (index < visibleFrom && !showAllSteps) return null;
+            if (segment.kind === "tool") {
+              const tc = toolById.get(segment.toolCallId);
+              return tc ? <ToolCallCard key={`tool-${segment.toolCallId}`} tc={tc} /> : null;
+            }
+            const isFinal = index === lastTextIndex;
+            if (!isFinal) {
+              return (
+                <div
+                  key={`seg-${index}`}
+                  data-segment="step"
+                  className="border-l-2 border-surface-3 pl-2.5 py-0.5 text-[12px] leading-relaxed text-gray-400 whitespace-pre-wrap"
+                >
+                  {segment.text}
+                </div>
+              );
+            }
+            return (
+              <div
+                key={`seg-${index}`}
+                data-segment="final"
+                className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
+              >
+                <ReactMarkdown components={markdownComponents}>{segment.text}</ReactMarkdown>
+                {isStreamingTail && <TypingDots />}
+              </div>
+            );
+          })}
+        </>
+      ) : (
+        msg.toolCalls?.map((tc) => <ToolCallCard key={tc.id} tc={tc} />)
+      )}
       {msg.transportRetries?.map((retry, index) => (
         <div
           key={`${retry.attempt}-${index}`}
@@ -344,7 +403,7 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
           {action.detail ? ` · ${action.detail}` : ""}
         </div>
       ))}
-      {msg.content && (
+      {!timeline && msg.content && (
         <div className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
           <ReactMarkdown components={markdownComponents}>{msg.content}</ReactMarkdown>
           {isStreamingTail && <TypingDots />}

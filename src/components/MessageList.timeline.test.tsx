@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Turn-timeline rendering. The 26-minute-turn screenshot showed every tool
+// card stacked above one 800-character narration wall. With segments, the
+// row renders in arrival order, mid-turn narration reads as light step
+// lines, and long turns collapse their early steps.
+
+import { describe, it, expect } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
+import { MessageList } from "./MessageList";
+import type { UIMessage, TurnSegment } from "../stores/chatEvents";
+
+const msg = (over: Partial<UIMessage> = {}): UIMessage => ({
+  id: "m1",
+  role: "assistant",
+  content: "",
+  createdAt: Date.now(),
+  ...over,
+});
+
+function interleaved(): UIMessage {
+  return msg({
+    content: "两类红灯都稳定复现了。最终总结:全部修复。",
+    segments: [
+      { kind: "text", text: "两类红灯都稳定复现了。" },
+      { kind: "tool", toolCallId: "t1" },
+      { kind: "text", text: "最终总结:全部修复。" },
+    ],
+    toolCalls: [
+      { id: "t1", name: "bash", args: "{}", status: "done", result: "ok" },
+    ],
+  });
+}
+
+describe("MessageList turn timeline", () => {
+  it("renders segments in arrival order instead of tools-then-text blobs", () => {
+    const { container } = render(
+      <MessageList messages={[interleaved()]} streaming={false} cwd={null} />,
+    );
+    const text = container.textContent ?? "";
+    const first = text.indexOf("两类红灯都稳定复现了");
+    const tool = text.indexOf("bash");
+    const last = text.indexOf("最终总结");
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(tool).toBeGreaterThan(first);
+    expect(last).toBeGreaterThan(tool);
+  });
+
+  it("styles mid-turn narration as step lines and the final segment as prose", () => {
+    const { container } = render(
+      <MessageList messages={[interleaved()]} streaming={false} cwd={null} />,
+    );
+    const steps = container.querySelectorAll("[data-segment='step']");
+    expect(steps.length).toBe(1);
+    expect(steps[0].textContent).toContain("两类红灯都稳定复现了");
+    const finals = container.querySelectorAll("[data-segment='final']");
+    expect(finals.length).toBe(1);
+    expect(finals[0].textContent).toContain("最终总结");
+  });
+
+  it("collapses early steps of a very long turn behind a toggle", () => {
+    const segments: TurnSegment[] = [];
+    const toolCalls = [];
+    for (let i = 0; i < 12; i++) {
+      segments.push({ kind: "text", text: `第 ${i} 步叙述。` });
+      segments.push({ kind: "tool", toolCallId: `t${i}` });
+      toolCalls.push({
+        id: `t${i}`,
+        name: "bash",
+        args: "{}",
+        status: "done" as const,
+        result: "ok",
+      });
+    }
+    segments.push({ kind: "text", text: "收尾总结。" });
+    const long = msg({ content: "…", segments, toolCalls });
+
+    render(<MessageList messages={[long]} streaming={false} cwd={null} />);
+    // Early steps are hidden by default…
+    expect(screen.queryByText(/第 0 步叙述/)).toBeNull();
+    // …behind a summary toggle, while the tail stays visible.
+    expect(screen.getByText(/收尾总结/)).toBeTruthy();
+    const toggle = screen.getByText(/前 \d+ 步/);
+    fireEvent.click(toggle);
+    expect(screen.getByText(/第 0 步叙述/)).toBeTruthy();
+  });
+});
