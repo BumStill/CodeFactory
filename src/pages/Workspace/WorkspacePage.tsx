@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   AlertTriangle,
   BookOpen,
@@ -23,8 +23,6 @@ import {
   Square,
   Brain,
   EyeOff,
-  PanelLeftClose,
-  PanelLeft,
   Puzzle,
   ShieldCheck,
   Gauge,
@@ -34,7 +32,6 @@ import {
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
 import { SessionSidebar } from "../../components/SessionSidebar";
-import { SessionSwitcherPopover } from "../../components/SessionSwitcherPopover";
 import { SpecsPage } from "../Specs/SpecsPage";
 import { ModelPicker } from "../../components/ModelPicker";
 import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
@@ -161,40 +158,23 @@ export function WorkspacePage({
   // invoked in-context, scoped to this session's cwd, and its "开始实现" creates +
   // runs tasks in THIS session (no navigation away — unified flow).
   const [specsOpen, setSpecsOpen] = useState(false);
+  const [taskPanelRequested, setTaskPanelRequested] = useState(false);
+  const projectTaskCount = useTasksStore((state) => state.tasks[sessionId]?.length ?? 0);
+  const loadProjectTasks = useTasksStore((state) => state.loadTasks);
+  const isProjectSession = Boolean(
+    activeSession && activeSession.kind !== "quick" && activeSession.kind !== "anonymous",
+  );
 
-  // Collapsible session sidebar. Collapsed → the left rail hides (chat widens)
-  // and the top-left icon opens a popover with the full quick-switcher, so
-  // collapsing never buries navigation. Persisted so it sticks across launches.
-  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem("cf.workspace.sidebarCollapsed") === "1";
-    } catch {
-      return false; // localStorage unavailable (e.g. some test envs)
-    }
-  });
-  const [switcherOpen, setSwitcherOpen] = useState(false);
-  const sidebarCtrlRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    try {
-      localStorage.setItem("cf.workspace.sidebarCollapsed", sidebarCollapsed ? "1" : "0");
-    } catch {
-      /* persistence is best-effort */
-    }
-    if (!sidebarCollapsed) setSwitcherOpen(false);
-  }, [sidebarCollapsed]);
-  // Dismiss the collapsed-state quick switcher on an outside click. The ref
-  // wraps BOTH the toggle button and the popover, so clicking the toggle
-  // itself doesn't count as "outside" (the button owns its own toggle).
+    setTaskPanelRequested(false);
+  }, [sessionId]);
+
+  // Discover persisted tasks without mounting the task UI. The Session rail
+  // stays visually clean when there are none; existing runs still reappear.
   useEffect(() => {
-    if (!switcherOpen) return;
-    const onDown = (e: MouseEvent) => {
-      if (sidebarCtrlRef.current && !sidebarCtrlRef.current.contains(e.target as Node)) {
-        setSwitcherOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [switcherOpen]);
+    if (!isProjectSession) return;
+    void loadProjectTasks(sessionId);
+  }, [isProjectSession, loadProjectTasks, sessionId]);
 
   useEffect(() => {
     // Draft IDs are reused by materialization. Once the first message creates
@@ -225,32 +205,6 @@ export function WorkspacePage({
         >
           <Plus size={14} />
         </button>
-        {/* Sidebar toggle: collapse the session rail, or (when collapsed) open
-            a quick-switcher popover so navigation is never buried. */}
-        <div className="relative" ref={sidebarCtrlRef}>
-          <button
-            onClick={() =>
-              sidebarCollapsed ? setSwitcherOpen((v) => !v) : setSidebarCollapsed(true)
-            }
-            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-            title={sidebarCollapsed ? "会话（点击快速切换 / 展开侧栏）" : "收起会话侧栏"}
-          >
-            {sidebarCollapsed ? <PanelLeft size={14} /> : <PanelLeftClose size={14} />}
-          </button>
-          {sidebarCollapsed && switcherOpen && (
-            <SessionSwitcherPopover
-              currentSessionId={sessionId}
-              onOpenSession={(id) => {
-                onOpenSession(id);
-                setSwitcherOpen(false);
-              }}
-              onExpand={() => {
-                setSidebarCollapsed(false);
-                setSwitcherOpen(false);
-              }}
-            />
-          )}
-        </div>
         <div className="flex-1 min-w-0">
           <div className="text-sm font-medium text-gray-200 truncate flex items-center gap-2">
             {titleEditing && activeSession ? (
@@ -351,6 +305,17 @@ export function WorkspacePage({
         >
           <BookOpen size={14} />
         </button>
+        {isProjectSession && projectTaskCount === 0 && (
+          <button
+            onClick={() => setTaskPanelRequested(true)}
+            className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[11px] text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300"
+            title="让 AI 把项目需求拆解为可执行步骤"
+            aria-label="AI 拆解项目任务"
+          >
+            <Wand2 size={13} />
+            <span>拆任务</span>
+          </button>
+        )}
         <div className="flex items-center gap-1.5">
           <GitStatusBar
             cwd={activeCwd}
@@ -434,19 +399,15 @@ export function WorkspacePage({
       {/* ── Body: 3 columns ──────────────────────────────────────────────── */}
       <div className="flex-1 flex min-h-0">
 
-        {/* ─── Left: Session sidebar + adaptive task tree (collapsible) ─── */}
-        {!sidebarCollapsed && (
-          <aside aria-label="会话列表" className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col min-h-0">
-            <SessionSidebar currentSessionId={sessionId} onOpenSession={onOpenSession} />
-            {/* Adaptive: the task tree only makes sense for project sessions.
-                Quick + anonymous chats have no tasks, so the panel is omitted. */}
-            {activeSession &&
-              activeSession.kind !== "quick" &&
-              activeSession.kind !== "anonymous" && (
-                <TasksColumn sessionId={sessionId} />
-              )}
-          </aside>
-        )}
+        {/* ─── Left: the session rail is a permanent part of the app shell. ─── */}
+        <aside aria-label="会话列表" className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col min-h-0">
+          <SessionSidebar currentSessionId={sessionId} onOpenSession={onOpenSession} />
+          {/* Existing AI execution tasks are contextual detail for a project,
+              not navigation. Keep the area out of the way until tasks exist. */}
+          {isProjectSession && (projectTaskCount > 0 || taskPanelRequested) && (
+            <TasksColumn sessionId={sessionId} />
+          )}
+        </aside>
 
         {/* ─── Center: Execution stream + input ──────────────────────── */}
         <main aria-label="会话窗口" className="flex-1 flex flex-col min-w-0">
@@ -732,10 +693,10 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
           title={collapsed ? "展开任务" : "折叠任务"}
         >
           {collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
-          任务
-          {sessionTasks.length > 0 && (
-            <span className="ml-0.5 text-gray-600">· {sessionTasks.length}</span>
-          )}
+          <span title="AI 根据项目需求拆解并调度的执行步骤，不是会话列表">
+            项目执行任务
+          </span>
+          <span className="ml-0.5 text-gray-600">· {sessionTasks.length}</span>
         </button>
         <div className="flex items-center gap-1">
           <button

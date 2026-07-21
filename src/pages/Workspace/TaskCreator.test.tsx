@@ -193,6 +193,39 @@ describe("AI task decomposition flow", () => {
     }
   });
 
+  it("keeps an empty project's session rail clean without an unexplained task panel", async () => {
+    fakeState.tasks = { s1: [] };
+    render(
+      <WorkspacePage
+        sessionId="s1"
+        onBackHome={() => {}}
+        onOpenSettings={() => {}}
+        onOpenSession={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole("complementary", { name: "会话列表" })).toBeInTheDocument();
+    expect(screen.queryByText("项目执行任务")).not.toBeInTheDocument();
+    expect(screen.queryByText("还没有任务")).not.toBeInTheDocument();
+  });
+
+  it("labels existing AI execution tasks explicitly instead of calling them generic tasks", async () => {
+    fakeState.tasks = {
+      s1: [{ id: "t1", title: "实现登录页", status: "pending" }],
+    };
+    render(
+      <WorkspacePage
+        sessionId="s1"
+        onBackHome={() => {}}
+        onOpenSettings={() => {}}
+        onOpenSession={() => {}}
+      />,
+    );
+
+    expect(await screen.findByText("项目执行任务")).toBeInTheDocument();
+    expect(screen.getByTitle("AI 根据项目需求拆解并调度的执行步骤，不是会话列表")).toBeInTheDocument();
+  });
+
   it("uses compact status controls instead of a permanent right rail", async () => {
     fakeLearningState.events = {};
     render(
@@ -268,7 +301,9 @@ describe("AI task decomposition flow", () => {
       <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
-    // Open the modal via the empty-state CTA
+    // Explicitly open project execution tasks; the Session rail stays clean
+    // until the user asks for task decomposition.
+    await user.click(screen.getByRole("button", { name: "AI 拆解项目任务" }));
     const cta = await screen.findByText(/点这里描述需求/);
     await user.click(cta);
 
@@ -332,7 +367,8 @@ describe("AI task decomposition flow", () => {
       <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
-    // Flip the 自主 toggle on — the inline bar replaces the modal flow.
+    // Reveal the project execution area, then flip autonomous mode on.
+    await user.click(screen.getByRole("button", { name: "AI 拆解项目任务" }));
     const toggle = await screen.findByRole("button", { name: /自主/ });
     await user.click(toggle);
 
@@ -501,6 +537,7 @@ describe("AI task decomposition flow", () => {
       <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
+    await user.click(screen.getByRole("button", { name: "AI 拆解项目任务" }));
     await user.click(await screen.findByRole("button", { name: "自主" }));
     await user.click(screen.getByRole("button", { name: /先写规范/ }));
     await user.type(await screen.findByLabelText("自主任务描述"), "做一个大功能");
@@ -541,6 +578,7 @@ describe("AI task decomposition flow", () => {
       <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
+    await user.click(screen.getByRole("button", { name: "AI 拆解项目任务" }));
     await user.click(await screen.findByText(/点这里描述需求/));
     await user.type(await screen.findByPlaceholderText(/例如：做一个本地记账/), "x");
     await user.click(screen.getByRole("button", { name: "AI 拆解" }));
@@ -567,6 +605,7 @@ describe("AI task decomposition flow", () => {
       <WorkspacePage sessionId="s1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />,
     );
 
+    await userEvent.click(screen.getByRole("button", { name: "AI 拆解项目任务" }));
     await screen.findByText(/点这里描述需求/);
     expect(mocks.invoke).not.toHaveBeenCalledWith("list_knowledge_libraries");
     expect(screen.queryByTitle("扫描知识库")).not.toBeInTheDocument();
