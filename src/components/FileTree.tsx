@@ -20,11 +20,12 @@ function fileIcon(node: FileNode): string {
 
 interface FileNodeItemProps {
   node: FileNode;
+  root: string;
   onSelectFile: (path: string) => void;
   depth: number;
 }
 
-function FileNodeItem({ node, onSelectFile, depth }: FileNodeItemProps) {
+function FileNodeItem({ node, root, onSelectFile, depth }: FileNodeItemProps) {
   const [open, setOpen] = useState(false);
   const [children, setChildren] = useState<FileNode[]>(node.children ?? []);
   const [loaded, setLoaded] = useState(node.children !== undefined);
@@ -36,7 +37,11 @@ function FileNodeItem({ node, onSelectFile, depth }: FileNodeItemProps) {
     }
     if (!open && !loaded) {
       try {
-        const nodes = await invoke<FileNode[]>("list_dir", { path: node.path, depth: 1 });
+        const nodes = await invoke<FileNode[]>("list_dir", {
+          path: node.path,
+          root,
+          depth: 1,
+        });
         setChildren(nodes);
         setLoaded(true);
       } catch {
@@ -63,6 +68,7 @@ function FileNodeItem({ node, onSelectFile, depth }: FileNodeItemProps) {
             <FileNodeItem
               key={child.path}
               node={child}
+              root={root}
               onSelectFile={onSelectFile}
               depth={depth + 1}
             />
@@ -85,7 +91,7 @@ export function FileTree({ cwd, onSelectFile }: FileTreeProps) {
   useEffect(() => {
     if (!cwd) return;
     setNodes([]);
-    invoke<FileNode[]>("list_dir", { path: cwd, depth: 2 })
+    invoke<FileNode[]>("list_dir", { path: cwd, root: cwd, depth: 2 })
       .then(setNodes)
       .catch(() => {});
   }, [cwd]);
@@ -107,6 +113,7 @@ export function FileTree({ cwd, onSelectFile }: FileTreeProps) {
             <FileNodeItem
               key={node.path}
               node={node}
+              root={cwd}
               onSelectFile={onSelectFile}
               depth={0}
             />

@@ -428,7 +428,7 @@ export function WorkspacePage({ sessionId, onBackHome, onOpenSettings, onOpenSes
           fullAccess={settings?.permissions.full_access ?? false}
           onAllow={() => respondPermission(true)}
           onDeny={() => respondPermission(false)}
-          onAllowFullAccess={() => respondPermission(true)}
+          onAllowFullAccess={() => respondPermission(true, { grantFullAccess: true })}
         />
       )}
     </div>
