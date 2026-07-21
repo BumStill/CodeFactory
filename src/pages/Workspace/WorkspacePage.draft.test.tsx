@@ -43,8 +43,13 @@ vi.mock("../../stores/chat", () => ({
   activeRuntime: () => runtime,
 }));
 vi.mock("../../stores/tasks", () => ({
-  useTasksStore: (selector?: (s: { running: Record<string, boolean>; executionLog: Record<string, unknown[]> }) => unknown) => {
-    const state = { running: {}, executionLog: {} };
+  useTasksStore: (selector?: (s: {
+    tasks: Record<string, unknown[]>;
+    running: Record<string, boolean>;
+    executionLog: Record<string, unknown[]>;
+    loadTasks: () => Promise<void>;
+  }) => unknown) => {
+    const state = { tasks: {}, running: {}, executionLog: {}, loadTasks: vi.fn(async () => {}) };
     return selector ? selector(state) : state;
   },
 }));
@@ -73,13 +78,22 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 import { WorkspacePage } from "./WorkspacePage";
 
 describe("Workspace virtual draft", () => {
-  beforeEach(() => Object.values(mocks).forEach((mock) => mock.mockClear()));
+  beforeEach(() => {
+    Object.values(mocks).forEach((mock) => mock.mockClear());
+    try {
+      localStorage.setItem("cf.workspace.sidebarCollapsed", "1");
+    } catch {
+      // Some local runners do not expose localStorage; the structural
+      // assertions below still prove there is no collapse control.
+    }
+  });
 
-  it("renders the session rail and enabled chat input without loading a persisted session", async () => {
+  it("keeps the session rail permanently visible and the chat input enabled", async () => {
     render(<WorkspacePage sessionId="draft-1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />);
 
     expect(screen.getByRole("complementary", { name: "会话列表" })).toBeInTheDocument();
     expect(screen.getByRole("main", { name: "会话窗口" })).toBeInTheDocument();
+    expect(screen.queryByTitle(/收起会话侧栏|展开侧栏/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "发送第一条消息" })).toBeEnabled();
     expect(screen.getAllByText("草稿").length).toBeGreaterThan(0);
     expect(screen.queryByText("不应出现检查点")).not.toBeInTheDocument();
