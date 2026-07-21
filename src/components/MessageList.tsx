@@ -173,7 +173,13 @@ export function MessageList({ messages, streaming, cwd, onUsePrompt }: Props) {
   // session change and re-pins to the bottom. Empty list → null (fine; no
   // scroller rendered anyway).
   const conversationKey = messages[0]?.id ?? null;
-  const { scrollerRef, pinned, hasNewContent, jumpToBottom } = useStickyAutoScroll(conversationKey);
+  const contentSignal = messages.length === 0
+    ? null
+    : `${messages.length}:${messages[messages.length - 1]?.id ?? ""}`;
+  const { scrollerRef, pinned, hasNewContent, jumpToBottom } = useStickyAutoScroll(
+    conversationKey,
+    contentSignal,
+  );
 
   if (messages.length === 0) {
     return <WelcomeScreen onUsePrompt={onUsePrompt} />;

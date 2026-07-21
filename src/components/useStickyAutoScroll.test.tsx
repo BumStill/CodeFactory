@@ -101,9 +101,134 @@ function renderHarness(initialKey: string | null = "session-1"): RenderResult {
   };
 }
 
+function DelayedHarness(props: {
+  showScroller: boolean;
+  conversationKey: string | null;
+  onReady: (handle: HarnessHandle) => void;
+  pinnedRef: { current: boolean };
+  hasNewContentRef: { current: boolean };
+}) {
+  const { scrollerRef, pinned, hasNewContent, jumpToBottom } = useStickyAutoScroll(props.conversationKey);
+  props.pinnedRef.current = pinned;
+  props.hasNewContentRef.current = hasNewContent;
+
+  useEffect(() => {
+    if (props.showScroller && scrollerRef.current) {
+      props.onReady({
+        scroller: scrollerRef.current,
+        pinned: () => props.pinnedRef.current,
+        hasNewContent: () => props.hasNewContentRef.current,
+        jumpToBottom,
+      });
+    }
+  }, [props.showScroller, props.conversationKey, jumpToBottom, props, scrollerRef]);
+
+  return props.showScroller ? <div ref={scrollerRef} data-testid="delayed-scroller" /> : null;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 describe("useStickyAutoScroll", () => {
+  it("attaches growth tracking when an initially empty conversation mounts its scroller later", async () => {
+    let handle: HarnessHandle | null = null;
+    const pinnedRef = { current: true };
+    const hasNewContentRef = { current: false };
+    const onReady = (next: HarnessHandle) => { handle = next; };
+    const utils = render(
+      <DelayedHarness
+        showScroller={false}
+        conversationKey={null}
+        onReady={onReady}
+        pinnedRef={pinnedRef}
+        hasNewContentRef={hasNewContentRef}
+      />,
+    );
+
+    await act(async () => {
+      utils.rerender(
+        <DelayedHarness
+          showScroller
+          conversationKey="first-message"
+          onReady={onReady}
+          pinnedRef={pinnedRef}
+          hasNewContentRef={hasNewContentRef}
+        />,
+      );
+    });
+    if (!handle) throw new Error("delayed scroller did not mount");
+    const ready = handle as HarnessHandle;
+    setLayout(ready.scroller, { scrollHeight: 1200, clientHeight: 500, scrollTop: 0 });
+    await flushAsync();
+
+    setLayout(ready.scroller, { scrollHeight: 2600 });
+    await act(async () => {
+      const streamed = document.createElement("p");
+      streamed.textContent = "first assistant response keeps streaming";
+      ready.scroller.appendChild(streamed);
+    });
+    await flushAsync();
+
+    expect(ready.scroller.scrollTop).toBe(2600);
+    expect(ready.pinned()).toBe(true);
+
+    // The delayed mount must attach the user-scroll listener too, not just
+    // perform a one-off snap. Once the user moves up, later tokens stay put.
+    await act(async () => {
+      Object.defineProperty(ready.scroller, "scrollTop", { value: 600, configurable: true, writable: true });
+      ready.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(ready.pinned()).toBe(false);
+    setLayout(ready.scroller, { scrollHeight: 3400 });
+    await act(async () => {
+      const streamed = document.createElement("p");
+      streamed.textContent = "more after the reader scrolled up";
+      ready.scroller.appendChild(streamed);
+    });
+    await flushAsync();
+    expect(ready.scroller.scrollTop).toBe(600);
+  });
+
+  it("keeps the pin-loss bottom stable across a multi-event thumb drag while the stream grows", async () => {
+    const { handle } = renderHarness("session-1");
+    setLayout(handle.scroller, { scrollHeight: 2000, clientHeight: 500 });
+    await flushAsync();
+
+    // Leave the tail. The bottom visible at pin loss is 1500.
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 700, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.pinned()).toBe(false);
+
+    // Drag downward through multiple browser scroll events. New tokens arrive
+    // between events, so the live bottom keeps advancing. Updating the baseline
+    // on every event makes the target impossible to catch.
+    await act(async () => {
+      setLayout(handle.scroller, { scrollHeight: 2600 });
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 1050, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+      setLayout(handle.scroller, { scrollHeight: 3200 });
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 1300, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+      setLayout(handle.scroller, { scrollHeight: 3800 });
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 1500, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    await flushAsync();
+
+    expect(handle.pinned()).toBe(true);
+    expect(handle.scroller.scrollTop).toBe(3800);
+
+    setLayout(handle.scroller, { scrollHeight: 4400 });
+    await act(async () => {
+      const next = document.createElement("p");
+      next.textContent = "stream continues";
+      handle.scroller.appendChild(next);
+    });
+    await flushAsync();
+    expect(handle.scroller.scrollTop).toBe(4400);
+  });
+
   it("snaps to the bottom on initial mount", async () => {
     const { handle } = renderHarness("session-1");
     setLayout(handle.scroller, { scrollHeight: 5000, clientHeight: 600, scrollTop: 0 });

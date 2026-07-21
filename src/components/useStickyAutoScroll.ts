@@ -41,8 +41,12 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
  * The hook needs an explicit signal that "this is a new viewport" —
  * pin state shouldn't leak across.
  */
-export function useStickyAutoScroll(conversationKey: string | null) {
+export function useStickyAutoScroll(
+  conversationKey: string | null,
+  contentSignal?: unknown,
+) {
   const scrollerRef = useRef<HTMLDivElement>(null);
+  const [scrollerMounted, setScrollerMounted] = useState(false);
   const [pinned, setPinned] = useState(true);
   const pinnedRef = useRef(true);
   pinnedRef.current = pinned;
@@ -86,14 +90,10 @@ export function useStickyAutoScroll(conversationKey: string | null) {
   // test in useStickyAutoScroll.test.tsx for the exact scenario.
   const newContentBaseline = useRef(0);
 
-  // Bottom position (scrollHeight - clientHeight) observed at the LAST
-  // scroll event or programmatic write. During streaming the real bottom
-  // keeps running away; a user who drags to the bottom they could SEE has
-  // clearly asked for the tail even if, by the time the event is handled,
-  // the content has already grown past every distance threshold. Comparing
-  // against this snapshot instead of the live bottom makes that intent
-  // detectable.
-  const lastKnownBottom = useRef(0);
+  // Bottom position captured when pinning is lost. It remains stable while
+  // the user drags back toward the tail; streaming must not move the target
+  // between scroll events or the thumb can chase forever without re-pinning.
+  const pinLossBottom = useRef(0);
 
   const programmaticScrollTo = useCallback((y: number) => {
     const el = scrollerRef.current;
@@ -104,7 +104,6 @@ export function useStickyAutoScroll(conversationKey: string | null) {
     // the raw value (often scrollHeight, one clientHeight past the max)
     // would make every echo event look like a user scroll.
     lastSetScrollTop.current = el.scrollTop;
-    lastKnownBottom.current = el.scrollHeight - el.clientHeight;
   }, []);
 
   const stickToBottomIfPinned = useCallback(() => {
@@ -144,9 +143,9 @@ export function useStickyAutoScroll(conversationKey: string | null) {
       // this handler. Reaching the bottom the user could SEE (the bottom
       // as of the previous event) is an unambiguous "give me the tail" —
       // count it regardless of how far the live bottom has moved since.
-      const reachedSeenBottom = !scrollingUp && newTop >= lastKnownBottom.current - 60;
+      const reachedSeenBottom =
+        !scrollingUp && !pinnedRef.current && newTop >= pinLossBottom.current - 60;
       const nearBottom = distFromBottom < threshold || reachedSeenBottom;
-      lastKnownBottom.current = el.scrollHeight - el.clientHeight;
 
       if (nearBottom !== pinnedRef.current) {
         // Update ref synchronously so any MutationObserver hit in the same
@@ -167,15 +166,16 @@ export function useStickyAutoScroll(conversationKey: string | null) {
           programmaticScrollTo(el.scrollHeight);
         }
         if (!nearBottom) {
-          // Snapshot the scrollHeight at pin-loss so future mutations can
-          // tell "real growth" from "cosmetic re-render".
+          // Capture both growth and the bottom the user could see at the exact
+          // moment they detached. Keep this bottom stable until they re-pin.
           newContentBaseline.current = el.scrollHeight;
+          pinLossBottom.current = Math.max(0, el.scrollHeight - el.clientHeight);
         }
       }
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
-  }, [programmaticScrollTo]);
+  }, [programmaticScrollTo, scrollerMounted]);
 
   // Content-growth observer: every DOM mutation inside the scroller is a
   // potential reason to re-stick. We also queue a RAF retick to catch
@@ -212,7 +212,13 @@ export function useStickyAutoScroll(conversationKey: string | null) {
     requestAnimationFrame(stickToBottomIfPinned);
 
     return () => obs.disconnect();
-  }, [stickToBottomIfPinned]);
+  }, [contentSignal, scrollerMounted, stickToBottomIfPinned]);
+
+  // Track when the scroller DOM node appears or disappears so observers
+  // are reattached (e.g. WelcomeScreen → first message transition).
+  useLayoutEffect(() => {
+    setScrollerMounted(!!scrollerRef.current);
+  });
 
   // Session-switch reset: force re-pin and snap to bottom when the
   // conversation identity changes. The double-RAF mirrors the late-layout
