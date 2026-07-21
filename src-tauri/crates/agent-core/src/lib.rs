@@ -52,11 +52,26 @@ pub fn build_completion_recovery_prompt(evidence: &CompletionEvidence) -> String
     format!(
         "The completion gate rejected the attempted final response. Continue using tools until \
 the following evidence blockers are resolved: {}. Run only what resolves these blockers and \
-do not restate your previous summary — the user has already seen it. Once the blockers are \
+do not restate your previous summary — the user has already seen it. The next response must contain a bounded tool call \
+that directly resolves a blocker unless a precise external blocker requires user action. After a failed mutation or check, \
+use at most one bounded diagnostic read, then make the smallest corrective mutation or rerun a focused machine check; \
+do not spend another response on text-only analysis. Once the blockers are \
 resolved, reply in the user's language with a brief final answer that adds only the new \
 verification outcome, and never mention internal mechanisms such as this gate.",
         evidence.blockers.join("; ")
     )
+}
+
+/// Some reasoning transports accept tools but reject forced tool selection.
+/// Keep this detector narrow so malformed requests and unrelated provider 400s
+/// still fail visibly instead of silently changing request semantics.
+pub fn provider_rejects_required_tool_choice(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("tool_choice")
+        && (detail.contains("does not support")
+            || detail.contains("not supported")
+            || detail.contains("unsupported")
+            || detail.contains("invalid"))
 }
 
 pub fn build_completion_ready_prompt() -> &'static str {
@@ -2188,6 +2203,10 @@ pub struct CompletionEvidence {
     #[serde(default)]
     pub last_independent_verification_sequence: Option<u64>,
     pub last_failure_sequence: Option<u64>,
+    #[serde(default)]
+    pub last_failure_diagnostic_sequence: Option<u64>,
+    #[serde(default)]
+    pub failed_verification_fingerprint: Option<String>,
     pub last_service_start_sequence: Option<u64>,
     pub last_service_pid_evidence_sequence: Option<u64>,
     pub last_service_log_evidence_sequence: Option<u64>,
@@ -2209,6 +2228,76 @@ pub struct CompletionEvidence {
     pub observed_observable_states: Vec<String>,
     pub completed: bool,
     pub blockers: Vec<String>,
+}
+
+/// Returns true only when an executed tool materially advances the shared
+/// completion evidence. Transport recovery limits must not be reset by failed
+/// tools, diagnostic reads, or unrelated green checks.
+pub fn completion_evidence_made_progress(
+    before: &CompletionEvidence,
+    after: &CompletionEvidence,
+) -> bool {
+    let advanced = |before: Option<u64>, after: Option<u64>| match (before, after) {
+        (Some(before), Some(after)) => after > before,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+
+    let verification_ticket_open = after.failed_verification_fingerprint.is_some();
+
+    (!before.completed && after.completed)
+        || after.blockers.len() < before.blockers.len()
+        || (before.failed_verification_fingerprint.is_some()
+            && after.failed_verification_fingerprint.is_none())
+        || advanced(before.last_mutation_sequence, after.last_mutation_sequence)
+        || advanced(
+            before.last_successful_verification_sequence,
+            after.last_successful_verification_sequence,
+        )
+        || (!verification_ticket_open
+            && (advanced(
+                before.last_machine_checked_verification_sequence,
+                after.last_machine_checked_verification_sequence,
+            ) || advanced(
+                before.last_independent_verification_sequence,
+                after.last_independent_verification_sequence,
+            )))
+        || advanced(
+            before.last_service_pid_evidence_sequence,
+            after.last_service_pid_evidence_sequence,
+        )
+        || advanced(
+            before.last_service_log_evidence_sequence,
+            after.last_service_log_evidence_sequence,
+        )
+        || (!verification_ticket_open
+            && advanced(
+                before.last_bounded_probe_sequence,
+                after.last_bounded_probe_sequence,
+            ))
+        || advanced(
+            before.last_source_scan_sequence,
+            after.last_source_scan_sequence,
+        )
+        || advanced(
+            before.last_source_mutation_sequence,
+            after.last_source_mutation_sequence,
+        )
+        || advanced(
+            before.last_source_install_sequence,
+            after.last_source_install_sequence,
+        )
+        || advanced(
+            before.last_external_source_runtime_sequence,
+            after.last_external_source_runtime_sequence,
+        )
+        || (after.project_tests_required
+            && !verification_ticket_open
+            && advanced(
+                before.last_successful_project_test_sequence,
+                after.last_successful_project_test_sequence,
+            ))
+        || after.observed_observable_states.len() > before.observed_observable_states.len()
 }
 
 pub fn evaluate_budget_command(
@@ -2494,6 +2583,27 @@ pub fn evaluate_budget_command_with_time_in_directory(
         }
     }
 
+    let unresolved_failure = evidence.last_failure_sequence.is_some_and(|failure| {
+        failure > evidence.last_successful_verification_sequence.unwrap_or(0)
+    });
+    let failure_diagnostic_consumed = match (
+        evidence.last_failure_sequence,
+        evidence.last_failure_diagnostic_sequence,
+    ) {
+        (Some(failure), Some(diagnostic)) => diagnostic > failure,
+        _ => false,
+    };
+    if (remaining_model_rounds <= 8 || time_finalization_window)
+        && unresolved_failure
+        && failure_diagnostic_consumed
+        && matches!(kind, ToolKind::ReadOnly)
+    {
+        return deny(
+            "failure_repair_loop",
+            "the final-stage diagnostic read has already been used for the current failure; make the smallest corrective mutation or rerun a focused machine check before more read-only exploration",
+        );
+    }
+
     let time_read_only_exhausted =
         wall_time.is_some_and(|(remaining, total)| total > 0 && remaining <= (total / 6).max(60));
     if (remaining_model_rounds <= 3 || time_read_only_exhausted)
@@ -2505,6 +2615,74 @@ pub fn evaluate_budget_command_with_time_in_directory(
         );
     }
     PolicyDecision::Allow
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerificationScope {
+    family: String,
+    working_directory: String,
+    selectors: BTreeSet<String>,
+    configuration: BTreeSet<String>,
+    restrictions: BTreeSet<String>,
+    exact_command: String,
+}
+
+impl VerificationScope {
+    fn from_outcome(outcome: &ToolOutcome) -> Self {
+        verification_scope(&outcome.command, outcome.working_directory.as_deref())
+    }
+
+    fn covers(&self, failed: &Self) -> bool {
+        if self.family != failed.family
+            || self.working_directory != failed.working_directory
+            || self.configuration != failed.configuration
+            || !self.restrictions.is_subset(&failed.restrictions)
+        {
+            return false;
+        }
+        if self.family == "exact" || self.family.starts_with("executable:") {
+            return self.exact_command == failed.exact_command;
+        }
+        self.selectors.is_empty() || self.selectors.is_superset(&failed.selectors)
+    }
+
+    fn is_strictly_narrower_than(&self, failed: &Self) -> bool {
+        self.family == failed.family
+            && self.working_directory == failed.working_directory
+            && self.configuration == failed.configuration
+            && (self.restrictions.len() > failed.restrictions.len()
+                || (failed.selectors.is_empty() && !self.selectors.is_empty()))
+    }
+
+    fn fingerprint(&self) -> String {
+        let serialized = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            self.family,
+            self.working_directory,
+            self.selectors
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            self.configuration
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            self.restrictions
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            self.exact_command,
+        );
+        format!("{:x}", Sha256::digest(serialized.as_bytes()))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FailedVerification {
+    scope: VerificationScope,
 }
 
 #[derive(Debug, Clone)]
@@ -2521,11 +2699,12 @@ pub struct CompletionGate {
     last_example_only_verification_sequence: Option<u64>,
     last_independent_verification_sequence: Option<u64>,
     last_failure_sequence: Option<u64>,
+    last_failure_diagnostic_sequence: Option<u64>,
     last_service_start_sequence: Option<u64>,
     last_service_pid_evidence_sequence: Option<u64>,
     last_service_log_evidence_sequence: Option<u64>,
     last_bounded_probe_sequence: Option<u64>,
-    last_failed_verification_command: Option<String>,
+    failed_verifications: Vec<FailedVerification>,
     scope_narrowing_sequence: Option<u64>,
     source_compatibility_audit_required: bool,
     source_change_required: bool,
@@ -2663,11 +2842,12 @@ impl CompletionGate {
             last_example_only_verification_sequence: None,
             last_independent_verification_sequence: None,
             last_failure_sequence: None,
+            last_failure_diagnostic_sequence: None,
             last_service_start_sequence: None,
             last_service_pid_evidence_sequence: None,
             last_service_log_evidence_sequence: None,
             last_bounded_probe_sequence: None,
-            last_failed_verification_command: None,
+            failed_verifications: Vec::new(),
             scope_narrowing_sequence: None,
             source_compatibility_audit_required,
             source_change_required: false,
@@ -2690,6 +2870,9 @@ impl CompletionGate {
 
     pub fn record(&mut self, outcome: &ToolOutcome) {
         self.outcome_count += 1;
+        if matches!(outcome.kind, ToolKind::ReadOnly) && self.has_unresolved_failure() {
+            self.last_failure_diagnostic_sequence = Some(outcome.sequence);
+        }
         let machine_checked_behavior = has_machine_checked_assertion(&outcome.command);
         let example_only_verification = self.verification_diversity_required
             && machine_checked_behavior
@@ -2745,9 +2928,7 @@ impl CompletionGate {
                 && is_external_source_runtime_command(&outcome.command)
             {
                 self.last_external_source_runtime_sequence = Some(outcome.sequence);
-                if self.last_failed_verification_command.is_none()
-                    && behavior_verification_satisfied
-                {
+                if self.failed_verifications.is_empty() && behavior_verification_satisfied {
                     self.last_successful_verification_sequence = Some(outcome.sequence);
                 }
             }
@@ -2760,7 +2941,7 @@ impl CompletionGate {
         {
             self.missing_test_runner = None;
         }
-        if matches!(outcome.kind, ToolKind::Mutation) {
+        if matches!(outcome.kind, ToolKind::Mutation) && outcome.succeeded() {
             self.last_mutation_sequence = Some(outcome.sequence);
         }
         if matches!(outcome.kind, ToolKind::BackgroundServiceStart) {
@@ -2774,6 +2955,43 @@ impl CompletionGate {
                 self.last_service_log_evidence_sequence = Some(outcome.sequence);
             }
         }
+        let verification_like = matches!(
+            outcome.kind,
+            ToolKind::Verification
+                | ToolKind::RuntimeProbe
+                | ToolKind::FunctionalProbe { bounded: true }
+        );
+        let mut verification_scope_was_narrowed = false;
+        if verification_like && outcome.succeeded() && behavior_verification_satisfied {
+            let successful_scope = VerificationScope::from_outcome(outcome);
+            verification_scope_was_narrowed = self
+                .failed_verifications
+                .iter()
+                .any(|failed| successful_scope.is_strictly_narrower_than(&failed.scope));
+            self.failed_verifications
+                .retain(|failed| !successful_scope.covers(&failed.scope));
+            if verification_scope_was_narrowed {
+                self.scope_narrowing_sequence = Some(outcome.sequence);
+            } else if self.failed_verifications.is_empty() {
+                self.scope_narrowing_sequence = None;
+            }
+        } else if verification_like
+            && !outcome.succeeded()
+            && verification_reached_test_scope(outcome)
+        {
+            let failed_scope = VerificationScope::from_outcome(outcome);
+            if !self
+                .failed_verifications
+                .iter()
+                .any(|failed| failed.scope.covers(&failed_scope))
+            {
+                self.failed_verifications
+                    .retain(|failed| !failed_scope.covers(&failed.scope));
+                self.failed_verifications.push(FailedVerification {
+                    scope: failed_scope,
+                });
+            }
+        }
         if matches!(outcome.kind, ToolKind::Verification) {
             if is_project_test_command(&outcome.command) {
                 self.last_project_test_sequence = Some(outcome.sequence);
@@ -2785,29 +3003,16 @@ impl CompletionGate {
                 }
             }
             if outcome.succeeded() && behavior_verification_satisfied {
-                let scope_was_narrowed = self
-                    .last_failed_verification_command
-                    .as_deref()
-                    .is_some_and(|failed_command| {
-                        verification_scope_restriction_count(&outcome.command)
-                            > verification_scope_restriction_count(failed_command)
-                    });
-                if scope_was_narrowed {
-                    self.scope_narrowing_sequence = Some(outcome.sequence);
-                    self.last_failure_sequence = Some(outcome.sequence);
-                } else {
+                if self.failed_verifications.is_empty() && !verification_scope_was_narrowed {
                     self.last_successful_verification_sequence = Some(outcome.sequence);
-                    self.last_failed_verification_command = None;
                     self.scope_narrowing_sequence = None;
                 }
-            } else {
-                self.last_failed_verification_command = Some(outcome.command.clone());
             }
         }
         if matches!(outcome.kind, ToolKind::RuntimeProbe)
             && outcome.succeeded()
             && behavior_verification_satisfied
-            && self.last_failed_verification_command.is_none()
+            && self.failed_verifications.is_empty()
             && self
                 .last_mutation_sequence
                 .is_some_and(|sequence| outcome.sequence > sequence)
@@ -2818,7 +3023,7 @@ impl CompletionGate {
             && outcome.succeeded()
         {
             self.last_bounded_probe_sequence = Some(outcome.sequence);
-            if self.last_failed_verification_command.is_none() && behavior_verification_satisfied {
+            if self.failed_verifications.is_empty() && behavior_verification_satisfied {
                 self.last_successful_verification_sequence = Some(outcome.sequence);
             }
         }
@@ -2847,6 +3052,12 @@ impl CompletionGate {
 
     pub fn evidence(&self) -> CompletionEvidence {
         let mut blockers = Vec::new();
+        if !self.failed_verifications.is_empty() {
+            blockers.push(
+                "rerun every unresolved failed check at the same or broader scope after the repair; unrelated or narrower green checks cannot close these failures"
+                    .to_owned(),
+            );
+        }
         if self.scope_narrowing_sequence.is_some() {
             blockers.push(
                 "verification scope was narrowed after a failure; rerun the original scope after repairing it"
@@ -3028,6 +3239,11 @@ impl CompletionGate {
             last_example_only_verification_sequence: self.last_example_only_verification_sequence,
             last_independent_verification_sequence: self.last_independent_verification_sequence,
             last_failure_sequence: self.last_failure_sequence,
+            last_failure_diagnostic_sequence: self.last_failure_diagnostic_sequence,
+            failed_verification_fingerprint: self
+                .failed_verifications
+                .first()
+                .map(|failed| failed.scope.fingerprint()),
             last_service_start_sequence: self.last_service_start_sequence,
             last_service_pid_evidence_sequence: self.last_service_pid_evidence_sequence,
             last_service_log_evidence_sequence: self.last_service_log_evidence_sequence,
@@ -3062,6 +3278,270 @@ impl CompletionGate {
             blockers,
         }
     }
+
+    fn has_unresolved_failure(&self) -> bool {
+        self.last_failure_sequence.is_some_and(|failure| {
+            failure > self.last_successful_verification_sequence.unwrap_or(0)
+        })
+    }
+}
+
+fn verification_scope(command: &str, working_directory: Option<&str>) -> VerificationScope {
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let tokens = normalized
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '-' | '.' | '/' | ':' | '@'))
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let lower_tokens = tokens
+        .iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    let mut family = None;
+    let mut runner_end = 0_usize;
+    for (index, token) in lower_tokens.iter().enumerate() {
+        let next = lower_tokens
+            .get(index + 1)
+            .map(String::as_str)
+            .unwrap_or("");
+        let next_next = lower_tokens
+            .get(index + 2)
+            .map(String::as_str)
+            .unwrap_or("");
+        let detected = match (token.as_str(), next, next_next) {
+            ("cargo", "test", _) => Some(("cargo:test", index + 2)),
+            ("go", "test", _) => Some(("go:test", index + 2)),
+            ("dotnet", "test", _) => Some(("dotnet:test", index + 2)),
+            ("swift", "test", _) => Some(("swift:test", index + 2)),
+            ("python" | "python3", "-m", "pytest") => Some(("pytest", index + 3)),
+            ("npm" | "pnpm" | "yarn" | "bun", "test", _) => Some(("javascript:test", index + 2)),
+            ("npm" | "pnpm" | "yarn" | "bun", "exec", "vitest") => Some(("vitest", index + 3)),
+            ("npm" | "pnpm" | "yarn" | "bun", "exec", "jest") => Some(("jest", index + 3)),
+            ("pytest", _, _) => Some(("pytest", index + 1)),
+            ("vitest", _, _) => Some(("vitest", index + 1)),
+            ("jest", _, _) => Some(("jest", index + 1)),
+            ("ctest", _, _) => Some(("ctest", index + 1)),
+            ("mvn", "test", _) => Some(("maven:test", index + 2)),
+            ("gradle" | "gradlew", "test", _) => Some(("gradle:test", index + 2)),
+            _ => None,
+        };
+        if let Some((detected_family, end)) = detected {
+            family = Some(detected_family.to_owned());
+            runner_end = end;
+            break;
+        }
+    }
+    let structured_runner_detected = family.is_some();
+
+    if family.is_none() {
+        if let Some(executable) = tokens.iter().find(|token| {
+            token.starts_with("./")
+                || token.starts_with("../")
+                || [".js", ".py", ".sh", ".ts"]
+                    .iter()
+                    .any(|extension| token.ends_with(extension))
+        }) {
+            family = Some(format!("executable:{executable}"));
+        }
+    }
+
+    if has_machine_checked_assertion(command) && !structured_runner_detected {
+        family = Some("exact".to_owned());
+        runner_end = 0;
+    }
+
+    let mut effective_directory = PathBuf::from(working_directory.unwrap_or("."));
+    for segment in shell_verification_segments(command) {
+        let payload = execution_payload(&segment);
+        let words = payload
+            .split_whitespace()
+            .map(|word| word.trim_matches(['\'', '"']))
+            .collect::<Vec<_>>();
+        if words.first().is_some_and(|word| *word == "cd") {
+            if let Some(directory) = words.get(1) {
+                let directory = Path::new(directory);
+                effective_directory = if directory.is_absolute() {
+                    directory.to_path_buf()
+                } else {
+                    effective_directory.join(directory)
+                };
+                effective_directory = normalize_lexical_path(&effective_directory);
+            }
+            continue;
+        }
+        if family
+            .as_deref()
+            .is_some_and(|family| segment_runs_verification_family(&payload, family))
+        {
+            break;
+        }
+    }
+    let effective_directory = normalize_lexical_path(&effective_directory)
+        .to_string_lossy()
+        .trim_end_matches(['/', '\\'])
+        .to_owned();
+
+    let mut selectors = BTreeSet::new();
+    let mut configuration = BTreeSet::new();
+    let mut restrictions = BTreeSet::new();
+    let mut consumed_value = false;
+    let structured_runner = family
+        .as_deref()
+        .is_some_and(|family| family != "exact" && !family.starts_with("executable:"));
+    for (index, token) in tokens
+        .iter()
+        .enumerate()
+        .skip(runner_end)
+        .filter(|_| structured_runner)
+    {
+        if consumed_value {
+            consumed_value = false;
+            continue;
+        }
+        let (raw_flag, inline_value) = token
+            .split_once('=')
+            .map(|(flag, value)| (flag, Some(value)))
+            .unwrap_or((token, None));
+        let flag = raw_flag.to_ascii_lowercase();
+        let next_value = inline_value.or_else(|| tokens.get(index + 1).copied());
+        let mut record_value = |target: &mut BTreeSet<String>| {
+            if let Some(value) = next_value.filter(|value| !value.starts_with('-')) {
+                target.insert(format!("{flag}:{value}"));
+                consumed_value = inline_value.is_none();
+            } else {
+                target.insert(flag.clone());
+            }
+        };
+        if matches!(
+            flag.as_str(),
+            "-p" | "--package" | "--test" | "--bin" | "--example"
+        ) {
+            record_value(&mut selectors);
+            continue;
+        }
+        if matches!(
+            flag.as_str(),
+            "-k" | "--filter" | "--grep" | "--skip" | "--exclude" | "--ignore" | "--ignore-glob"
+        ) {
+            record_value(&mut restrictions);
+            continue;
+        }
+        if matches!(
+            flag.as_str(),
+            "--features"
+                | "--all-features"
+                | "--no-default-features"
+                | "--workspace"
+                | "--profile"
+                | "--release"
+                | "--target"
+        ) {
+            record_value(&mut configuration);
+            continue;
+        }
+        let lower_token = token.to_ascii_lowercase();
+        if family.is_some()
+            && !token.starts_with('-')
+            && !matches!(lower_token.as_str(), "run" | "test" | "tests")
+            && (token.contains("::")
+                || token.starts_with("./")
+                || token.starts_with("../")
+                || token.starts_with("tests/")
+                || token.starts_with("src/")
+                || matches!(
+                    family.as_deref(),
+                    Some("pytest" | "unittest" | "vitest" | "jest" | "ctest")
+                )
+                || index == runner_end)
+        {
+            selectors.insert(format!("target:{token}"));
+        }
+    }
+
+    VerificationScope {
+        family: family.unwrap_or_else(|| "exact".to_owned()),
+        working_directory: effective_directory,
+        selectors,
+        configuration,
+        restrictions,
+        exact_command: normalized,
+    }
+}
+
+fn segment_runs_verification_family(segment: &str, family: &str) -> bool {
+    let words = segment
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric()
+                    && !matches!(character, '_' | '-' | '.' | '/' | ':' | '@')
+            })
+            .to_ascii_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let adjacent = |first: &str, second: &str| {
+        words
+            .windows(2)
+            .any(|pair| pair[0] == first && pair[1] == second)
+    };
+    match family {
+        "cargo:test" => adjacent("cargo", "test"),
+        "go:test" => adjacent("go", "test"),
+        "dotnet:test" => adjacent("dotnet", "test"),
+        "swift:test" => adjacent("swift", "test"),
+        "pytest" => {
+            words.iter().any(|word| word == "pytest")
+                || words
+                    .windows(3)
+                    .any(|triple| triple[1] == "-m" && triple[2] == "pytest")
+        }
+        "unittest" => words
+            .windows(3)
+            .any(|triple| triple[1] == "-m" && triple[2] == "unittest"),
+        "javascript:test" => ["npm", "pnpm", "yarn", "bun"]
+            .iter()
+            .any(|runner| adjacent(runner, "test")),
+        "vitest" | "jest" | "ctest" => words.iter().any(|word| word == family),
+        "maven:test" => adjacent("mvn", "test"),
+        "gradle:test" => adjacent("gradle", "test") || adjacent("gradlew", "test"),
+        "exact" => true,
+        executable if executable.starts_with("executable:") => executable
+            .strip_prefix("executable:")
+            .is_some_and(|target| words.iter().any(|word| word == target)),
+        _ => false,
+    }
+}
+
+fn verification_reached_test_scope(outcome: &ToolOutcome) -> bool {
+    let output = format!("{}\n{}", outcome.stdout, outcome.stderr).to_ascii_lowercase();
+    !((output.contains("cd:") && output.contains("no such file or directory"))
+        || output.contains("command not found")
+        || python_runner_module_missing(&outcome.command, &output)
+        || output.contains("could not find `cargo.toml`")
+        || output.contains("could not find cargo.toml"))
+}
+
+fn python_runner_module_missing(command: &str, output: &str) -> bool {
+    let words = command
+        .split_whitespace()
+        .map(|word| word.trim_matches(['\'', '"']))
+        .collect::<Vec<_>>();
+    let Some(module) = words
+        .windows(2)
+        .find_map(|pair| (pair[0] == "-m").then(|| pair[1].to_ascii_lowercase()))
+    else {
+        return false;
+    };
+    let missing = [
+        format!("no module named {module}"),
+        format!("no module named '{module}'"),
+        format!("no module named \"{module}\""),
+    ];
+    !output.contains("traceback") && missing.iter().any(|pattern| output.contains(pattern))
 }
 
 fn extract_expected_state_markers(instruction: &str) -> BTreeSet<String> {
@@ -4091,25 +4571,6 @@ fn source_scan_has_clean_exit_contract(command: &str) -> bool {
             ],
         );
     structured_exit || robust_shell_exit
-}
-
-fn verification_scope_restriction_count(command: &str) -> usize {
-    command
-        .split_whitespace()
-        .filter(|token| {
-            let token = token.to_ascii_lowercase();
-            token == "-k"
-                || token == "--skip"
-                || token == "--exclude"
-                || token == "--filter"
-                || token == "--grep"
-                || token.starts_with("--ignore=")
-                || token.starts_with("--ignore-glob=")
-                || token.starts_with("--exclude=")
-                || token.starts_with("--filter=")
-                || token.starts_with("--grep=")
-        })
-        .count()
 }
 
 fn has_service_pid_evidence(command: &str, stdout: &str) -> bool {
@@ -5288,6 +5749,7 @@ mod tests {
     fn mutation_and_verification_failures_still_demand_verification() {
         let mut gate = CompletionGate::new(false);
         gate.record(&outcome(1, ToolKind::Mutation, 1));
+        assert_eq!(gate.evidence().last_mutation_sequence, None);
         assert!(!gate.evidence().completed);
         gate.record(&outcome(2, ToolKind::Verification, 0));
         assert!(gate.evidence().completed);
@@ -5300,12 +5762,344 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_green_check_does_not_resolve_failed_check() {
+        let mut gate = CompletionGate::new(true);
+        let mut failed = outcome(1, ToolKind::Verification, 1);
+        failed.command = "cargo test worker::tests::original_behavior".to_owned();
+        gate.record(&failed);
+
+        let mut unrelated = outcome(2, ToolKind::Verification, 0);
+        unrelated.command = "cargo test parser::tests::unrelated_behavior".to_owned();
+        gate.record(&unrelated);
+
+        let evidence = gate.evidence();
+        assert!(!evidence.completed);
+        assert!(evidence.failed_verification_fingerprint.is_some());
+        assert!(evidence
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("every unresolved failed check")));
+
+        let mut repaired = outcome(3, ToolKind::Verification, 0);
+        repaired.command = "cargo test worker::tests::original_behavior".to_owned();
+        gate.record(&repaired);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn narrower_failed_check_cannot_replace_the_original_failure() {
+        let mut gate = CompletionGate::new(true);
+        let mut workspace_failure = outcome(1, ToolKind::Verification, 1);
+        workspace_failure.command = "cargo test --workspace".to_owned();
+        workspace_failure.working_directory = Some("/workspace".to_owned());
+        gate.record(&workspace_failure);
+
+        let mut narrow_failure = outcome(2, ToolKind::Verification, 1);
+        narrow_failure.command = "cargo test -p crate_a focused_test".to_owned();
+        narrow_failure.working_directory = Some("/workspace".to_owned());
+        gate.record(&narrow_failure);
+
+        let mut narrow_success = narrow_failure.clone();
+        narrow_success.sequence = 3;
+        narrow_success.return_code = Some(0);
+        gate.record(&narrow_success);
+        assert!(!gate.evidence().completed);
+
+        let mut workspace_success = workspace_failure;
+        workspace_success.sequence = 4;
+        workspace_success.return_code = Some(0);
+        gate.record(&workspace_success);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn verification_scope_keeps_working_directory_package_and_configuration() {
+        let mut gate = CompletionGate::new(true);
+        let mut failed = outcome(1, ToolKind::Verification, 1);
+        failed.command = "cargo test -p crate_a --features sqlite".to_owned();
+        failed.working_directory = Some("/workspace/crate_a".to_owned());
+        gate.record(&failed);
+
+        let mut other_package = outcome(2, ToolKind::Verification, 0);
+        other_package.command = "cargo test -p crate_b --features sqlite".to_owned();
+        other_package.working_directory = Some("/workspace/crate_b".to_owned());
+        gate.record(&other_package);
+        assert!(!gate.evidence().completed);
+
+        let mut other_configuration = outcome(3, ToolKind::Verification, 0);
+        other_configuration.command = "cargo test -p crate_a --features postgres".to_owned();
+        other_configuration.working_directory = Some("/workspace/crate_a".to_owned());
+        gate.record(&other_configuration);
+        assert!(!gate.evidence().completed);
+
+        let mut repaired = failed;
+        repaired.sequence = 4;
+        repaired.return_code = Some(0);
+        gate.record(&repaired);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn broader_full_suite_resolves_a_focused_failed_check() {
+        let mut gate = CompletionGate::new(true);
+        let mut focused = outcome(1, ToolKind::Verification, 1);
+        focused.command = "cargo test worker::tests::original_behavior".to_owned();
+        focused.working_directory = Some("/workspace".to_owned());
+        gate.record(&focused);
+
+        let mut full = outcome(2, ToolKind::Verification, 0);
+        full.command = "cargo test".to_owned();
+        full.working_directory = Some("/workspace".to_owned());
+        gate.record(&full);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn unrelated_green_check_does_not_resolve_failed_runtime_probe() {
+        let mut gate = CompletionGate::new(true);
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+
+        let mut failed_probe = outcome(2, ToolKind::RuntimeProbe, 1);
+        failed_probe.command = "curl --fail http://127.0.0.1:8080/health".to_owned();
+        gate.record(&failed_probe);
+
+        let mut unrelated = outcome(3, ToolKind::Verification, 0);
+        unrelated.command = "cargo test parser::tests::unrelated_behavior".to_owned();
+        gate.record(&unrelated);
+        assert!(!gate.evidence().completed);
+        assert!(gate.evidence().failed_verification_fingerprint.is_some());
+
+        let mut repaired_probe = failed_probe;
+        repaired_probe.sequence = 4;
+        repaired_probe.return_code = Some(0);
+        gate.record(&repaired_probe);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn python_test_import_failure_creates_a_replayable_ticket() {
+        let mut gate = CompletionGate::new(true);
+        let mut failed = outcome(1, ToolKind::Verification, 1);
+        failed.command = "python3 -m pytest tests/test_service.py".to_owned();
+        failed.stderr =
+            "ImportError while importing test module\nModuleNotFoundError: No module named 'myapp'"
+                .to_owned();
+        gate.record(&failed);
+        assert!(gate.evidence().failed_verification_fingerprint.is_some());
+
+        let mut unrelated = outcome(2, ToolKind::Verification, 0);
+        unrelated.command = "cargo test parser::tests::unrelated_behavior".to_owned();
+        gate.record(&unrelated);
+        assert!(!gate.evidence().completed);
+
+        failed.sequence = 3;
+        failed.return_code = Some(0);
+        failed.stderr.clear();
+        gate.record(&failed);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn verification_scope_distinguishes_workspace_shell_and_vitest_targets() {
+        let cases = [
+            ("cargo test --workspace", "cargo test"),
+            (
+                "test \"$(./tool case-a)\" = expected-a",
+                "test \"$(./tool case-b)\" = expected-b",
+            ),
+            (
+                "pnpm exec vitest run src/a.test.ts",
+                "pnpm exec vitest run src/b.test.ts",
+            ),
+        ];
+        for (failed_command, unrelated_command) in cases {
+            let mut gate = CompletionGate::new(true);
+            let mut failed = outcome(1, ToolKind::Verification, 1);
+            failed.command = failed_command.to_owned();
+            failed.working_directory = Some("/workspace".to_owned());
+            gate.record(&failed);
+
+            let mut unrelated = outcome(2, ToolKind::Verification, 0);
+            unrelated.command = unrelated_command.to_owned();
+            unrelated.working_directory = Some("/workspace".to_owned());
+            gate.record(&unrelated);
+            assert!(
+                !gate.evidence().completed,
+                "unrelated command unexpectedly covered {failed_command}: {unrelated_command}"
+            );
+
+            failed.sequence = 3;
+            failed.return_code = Some(0);
+            gate.record(&failed);
+            assert!(gate.evidence().completed);
+        }
+    }
+
+    #[test]
+    fn verification_scope_preserves_case_and_normalizes_relative_directories() {
+        let mut case_sensitive = CompletionGate::new(true);
+        let mut failed = outcome(1, ToolKind::Verification, 1);
+        failed.command = "cargo test".to_owned();
+        failed.working_directory = Some("/workspace/CaseSensitive".to_owned());
+        case_sensitive.record(&failed);
+
+        let mut wrong_case = outcome(2, ToolKind::Verification, 0);
+        wrong_case.command = "cargo test".to_owned();
+        wrong_case.working_directory = Some("/workspace/casesensitive".to_owned());
+        case_sensitive.record(&wrong_case);
+        assert!(!case_sensitive.evidence().completed);
+
+        let mut equivalent = CompletionGate::new(true);
+        let mut relative = outcome(1, ToolKind::Verification, 1);
+        relative.command = "cd crate_a && cargo test".to_owned();
+        relative.working_directory = Some("/workspace".to_owned());
+        equivalent.record(&relative);
+
+        let mut absolute = outcome(2, ToolKind::Verification, 0);
+        absolute.command = "cargo test".to_owned();
+        absolute.working_directory = Some("/workspace/crate_a".to_owned());
+        equivalent.record(&absolute);
+        assert!(equivalent.evidence().completed);
+
+        let mut trailing_cd = CompletionGate::new(true);
+        let mut chained = outcome(1, ToolKind::Verification, 1);
+        chained.command = "cd crate_a && cargo test && cd ../other".to_owned();
+        chained.working_directory = Some("/workspace".to_owned());
+        trailing_cd.record(&chained);
+        let mut direct = outcome(2, ToolKind::Verification, 0);
+        direct.command = "cargo test".to_owned();
+        direct.working_directory = Some("/workspace/crate_a".to_owned());
+        trailing_cd.record(&direct);
+        assert!(trailing_cd.evidence().completed);
+
+        let mut js_trailing_cd = CompletionGate::new(true);
+        let mut js_chained = outcome(1, ToolKind::Verification, 1);
+        js_chained.command = "cd web && pnpm test && cd ../other".to_owned();
+        js_chained.working_directory = Some("/workspace".to_owned());
+        assert_eq!(
+            verification_scope(&js_chained.command, js_chained.working_directory.as_deref())
+                .working_directory,
+            "/workspace/web"
+        );
+        js_trailing_cd.record(&js_chained);
+        let mut js_direct = outcome(2, ToolKind::Verification, 0);
+        js_direct.command = "pnpm test".to_owned();
+        js_direct.working_directory = Some("/workspace/web".to_owned());
+        let failed_scope = VerificationScope::from_outcome(&js_chained);
+        let successful_scope = VerificationScope::from_outcome(&js_direct);
+        assert!(
+            successful_scope.covers(&failed_scope),
+            "successful={successful_scope:?} failed={failed_scope:?}"
+        );
+        js_trailing_cd.record(&js_direct);
+        assert!(js_trailing_cd.evidence().completed);
+    }
+
+    #[test]
+    fn selector_superset_covers_a_failed_subset() {
+        let mut gate = CompletionGate::new(true);
+        let mut failed = outcome(1, ToolKind::Verification, 1);
+        failed.command = "cargo test -p crate_a".to_owned();
+        failed.working_directory = Some("/workspace".to_owned());
+        gate.record(&failed);
+
+        let mut broader = outcome(2, ToolKind::Verification, 0);
+        broader.command = "cargo test -p crate_a -p crate_b".to_owned();
+        broader.working_directory = Some("/workspace".to_owned());
+        gate.record(&broader);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn precondition_failure_does_not_create_an_unrunnable_verification_ticket() {
+        let mut gate = CompletionGate::new(true);
+        let mut missing_directory = outcome(1, ToolKind::Verification, 1);
+        missing_directory.command = "cd /missing-project && cargo test".to_owned();
+        missing_directory.working_directory = Some("/workspace".to_owned());
+        missing_directory.stderr =
+            "bash: cd: /missing-project: No such file or directory".to_owned();
+        gate.record(&missing_directory);
+        assert!(!gate.evidence().completed);
+        assert!(gate.evidence().failed_verification_fingerprint.is_none());
+
+        let mut actual_check = outcome(2, ToolKind::Verification, 0);
+        actual_check.command = "cargo test".to_owned();
+        actual_check.working_directory = Some("/workspace".to_owned());
+        gate.record(&actual_check);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
     fn recovery_prompt_forbids_restating_the_previous_summary() {
         let gate = CompletionGate::new(true);
         let prompt = build_completion_recovery_prompt(&gate.evidence());
         assert!(prompt.contains("do not restate your previous summary"));
+        assert!(prompt.contains("next response must contain a bounded tool call"));
+        assert!(prompt.contains("one bounded diagnostic read"));
         assert!(prompt.contains("in the user's language"));
         assert!(prompt.contains("never mention internal mechanisms"));
+    }
+
+    #[test]
+    fn required_tool_choice_fallback_matches_only_provider_capability_rejections() {
+        assert!(provider_rejects_required_tool_choice(
+            "Thinking mode does not support this tool_choice"
+        ));
+        assert!(provider_rejects_required_tool_choice(
+            "unsupported value for tool_choice: required"
+        ));
+        assert!(!provider_rejects_required_tool_choice(
+            "HTTP 400: invalid model id"
+        ));
+        assert!(!provider_rejects_required_tool_choice(
+            "HTTP 401: invalid API key"
+        ));
+    }
+
+    #[test]
+    fn completion_recovery_resets_only_for_material_evidence_progress() {
+        let mut gate = CompletionGate::new(true);
+        let initial = gate.evidence();
+
+        let mut failed = outcome(1, ToolKind::Verification, 1);
+        failed.command = "cargo test worker::tests::behavior".to_owned();
+        gate.record(&failed);
+        let after_failure = gate.evidence();
+        assert!(!completion_evidence_made_progress(&initial, &after_failure));
+
+        gate.record(&outcome(2, ToolKind::ReadOnly, 0));
+        let after_diagnostic = gate.evidence();
+        assert!(!completion_evidence_made_progress(
+            &after_failure,
+            &after_diagnostic
+        ));
+
+        let mut unrelated = outcome(3, ToolKind::Verification, 0);
+        unrelated.command = "cargo test parser::tests::unrelated".to_owned();
+        gate.record(&unrelated);
+        let after_unrelated = gate.evidence();
+        assert!(
+            !completion_evidence_made_progress(&after_diagnostic, &after_unrelated),
+            "before={after_diagnostic:?} after={after_unrelated:?}"
+        );
+
+        let mut repaired = failed;
+        repaired.sequence = 4;
+        repaired.return_code = Some(0);
+        gate.record(&repaired);
+        let after_repair = gate.evidence();
+        assert!(completion_evidence_made_progress(
+            &after_unrelated,
+            &after_repair
+        ));
+
+        let before_mutation = CompletionGate::new(true).evidence();
+        let mut mutation_gate = CompletionGate::new(true);
+        mutation_gate.record(&outcome(1, ToolKind::Mutation, 0));
+        assert!(completion_evidence_made_progress(
+            &before_mutation,
+            &mutation_gate.evidence()
+        ));
     }
 
     #[test]
@@ -5707,6 +6501,70 @@ mod tests {
             &evidence,
             "test \"$(./tool 7)\" = 49",
             &ToolKind::Verification,
+        )
+        .is_allowed());
+    }
+
+    #[test]
+    fn final_third_allows_one_failure_diagnostic_then_requires_repair() {
+        let mut gate = CompletionGate::new(true);
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        gate.record(&outcome(2, ToolKind::Verification, 1));
+
+        assert!(evaluate_budget_command_with_time(
+            20,
+            Some((300, 900)),
+            &gate.evidence(),
+            "sed -n '1,120p' src/worker.rs",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+
+        gate.record(&outcome(3, ToolKind::ReadOnly, 0));
+        let evidence = gate.evidence();
+        let denied = evaluate_budget_command_with_time(
+            20,
+            Some((300, 900)),
+            &evidence,
+            "cat src/another_module.rs",
+            &ToolKind::ReadOnly,
+        );
+        assert!(matches!(
+            denied,
+            PolicyDecision::Deny { ref rule, .. } if rule == "failure_repair_loop"
+        ));
+        assert!(evaluate_budget_command_with_time(
+            20,
+            Some((300, 900)),
+            &evidence,
+            "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: src/worker.rs\n@@\n-old\n+new\n*** End Patch\nPATCH",
+            &ToolKind::Mutation,
+        )
+        .is_allowed());
+        assert!(evaluate_budget_command_with_time(
+            20,
+            Some((300, 900)),
+            &evidence,
+            "cargo test worker::tests::repairs_failure",
+            &ToolKind::Verification,
+        )
+        .is_allowed());
+        assert!(evaluate_budget_command_with_time(
+            20,
+            Some((301, 900)),
+            &evidence,
+            "cat src/another_module.rs",
+            &ToolKind::ReadOnly,
+        )
+        .is_allowed());
+
+        gate.record(&outcome(4, ToolKind::Mutation, 1));
+        assert!(evaluate_budget_command_with_time(
+            20,
+            Some((300, 900)),
+            &gate.evidence(),
+            "cat src/worker.rs",
+            &ToolKind::ReadOnly,
         )
         .is_allowed());
     }
