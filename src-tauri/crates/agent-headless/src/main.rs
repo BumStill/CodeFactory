@@ -1488,6 +1488,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn example_only_assertions_require_an_independent_behavior_check() {
+        let (base_url, server) = fake_openai_server(vec![
+            fake_tool_response("mutation-1", "printf fixed > result.txt"),
+            fake_tool_response(
+                "examples-1",
+                "test \"$(./tool 3)\" = 9 && test \"$(./tool 5)\" = 25",
+            ),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Examples pass, complete."}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+            fake_tool_response("independent-1", "test \"$(./tool 7)\" = 49"),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Verified beyond the examples."}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+        ]);
+
+        let (test_input, run_input) = tokio::io::duplex(32 * 1024);
+        let (run_output, test_output) = tokio::io::duplex(32 * 1024);
+        let runner = tokio::spawn(async move {
+            let mut input = BufReader::new(run_input);
+            let mut output = run_output;
+            run(&mut input, &mut output).await
+        });
+        let mut input = test_input;
+        let mut output = BufReader::new(test_output);
+
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "start",
+                "instruction": "Implement behavior for arbitrary inputs. For example, ./tool 3 should output 9, and ./tool 5 should output 25.",
+                "model": "fake-model",
+                "api_key": "test-key",
+                "base_url": base_url,
+                "max_steps": 8,
+                "model_timeout_sec": 5,
+                "shell_timeout_sec": 60,
+                "allow_network": false,
+                "policy_profile": "product",
+                "execution_contract_sha256": execution_contract_sha256()
+            }),
+        )
+        .await;
+
+        let mutation = read_test_output(&mut output).await;
+        assert_eq!(mutation["id"], "mutation-1");
+        write_test_line(
+            &mut input,
+            &json!({"type": "tool_result", "id": "mutation-1", "return_code": 0, "stdout": "", "stderr": "", "error": null}),
+        )
+        .await;
+
+        let examples = read_test_output(&mut output).await;
+        assert_eq!(examples["id"], "examples-1");
+        write_test_line(
+            &mut input,
+            &json!({"type": "tool_result", "id": "examples-1", "return_code": 0, "stdout": "", "stderr": "", "error": null}),
+        )
+        .await;
+
+        let recovery_snapshot = read_test_output(&mut output).await;
+        assert_eq!(recovery_snapshot["type"], "event");
+        assert_eq!(recovery_snapshot["name"], "usage_snapshot");
+
+        let independent = read_test_output(&mut output).await;
+        assert_eq!(independent["id"], "independent-1");
+        write_test_line(
+            &mut input,
+            &json!({"type": "tool_result", "id": "independent-1", "return_code": 0, "stdout": "", "stderr": "", "error": null}),
+        )
+        .await;
+
+        let finished = read_test_output(&mut output).await;
+        assert_eq!(finished["type"], "finished");
+        assert_eq!(finished["completion_evidence"]["completed"], true);
+        assert_eq!(
+            finished["completion_evidence"]["last_example_only_verification_sequence"],
+            2
+        );
+        assert_eq!(
+            finished["completion_evidence"]["last_independent_verification_sequence"],
+            3
+        );
+        assert_eq!(finished["completion_evidence"]["outcome_count"], 3);
+
+        runner.await.unwrap().unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[3]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("examples are smoke tests"))
+            }));
+    }
+
+    #[tokio::test]
     async fn denied_attempt_does_not_desynchronize_the_fix_verification_loop() {
         let (base_url, server) = fake_openai_server(vec![
             fake_tool_response("mutation-1", "printf fixed > result.txt"),

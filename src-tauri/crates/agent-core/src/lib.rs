@@ -65,7 +65,9 @@ requires one coverage audit against the original request. Map every explicitly n
 component, artifact, and environment constraint to concrete evidence from this run. Import, file \
 existence, or compilation alone does not prove named component behavior. If any required behavior \
 lacks a functional check, use the available tools now to run the missing check and repair any \
-failure. Review the repository diff and map every modified path to a requested change. When the \
+failure. Request examples are smoke checks only for behavior over variable inputs; add a project \
+test, dedicated verifier, generated/property check, or machine-checked non-example case. Review \
+the repository diff and map every modified path to a requested change. When the \
 original request limits the change scope, revert unrelated changes made by this run without \
 touching pre-existing user changes, then rerun the relevant checks. If the request specifies a \
 named tool, library, model, version, or revision, prove that the implementation exercised that exact named \
@@ -144,6 +146,8 @@ stage is missing. Produce the first candidate required output artifact before th
 the budget; do not spend that window on more research or dependency setup while the artifact is \
 missing. During the convergence window, follow each successful mutation with a separate \
 machine-checked verification that exits nonzero on mismatch before another edit or exploration. \
+If that check only copies examples from the request, follow it with a project test, dedicated \
+verifier, generated/property check, or at least one machine-checked non-example case before finalizing. \
 To reduce model round trips, batch related reads and edits into one \
 bounded tool call when their order and failure handling remain clear. If all blockers are resolved, \
 return the final response now. Current completion \
@@ -1353,6 +1357,634 @@ fn instruction_requires_machine_checked_behavior(instruction: &str) -> bool {
     )
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ExplicitExampleNumericLiterals {
+    values: BTreeSet<String>,
+    occurrences: usize,
+    command_sources: BTreeSet<String>,
+}
+
+fn extract_explicit_example_numeric_literals(instruction: &str) -> ExplicitExampleNumericLiterals {
+    const EXAMPLE_ANCHORS: [&str; 5] = ["for example", "as an example", "e.g.", "例如", "比如"];
+
+    let lower = instruction.to_lowercase();
+    let mut literals = ExplicitExampleNumericLiterals::default();
+    for anchor in EXAMPLE_ANCHORS {
+        let mut remainder = lower.as_str();
+        while let Some(position) = remainder.find(anchor) {
+            let example_start = position + anchor.len();
+            let example = &remainder[example_start..];
+            let example = example.split('\n').next().unwrap_or(example);
+            let example = first_sentence(example);
+            let example_literals = numeric_literal_occurrences(example);
+            literals.occurrences += example_literals.len();
+            literals.values.extend(example_literals);
+            literals
+                .command_sources
+                .extend(example_command_sources(example));
+            remainder = &remainder[example_start + example.len()..];
+        }
+    }
+    literals
+}
+
+fn normalized_command_source(token: &str) -> Option<String> {
+    let token = token
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+            )
+        })
+        .trim_start_matches("./");
+    let source = token.rsplit('/').next().unwrap_or(token);
+    (!source.is_empty()
+        && source.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        }))
+    .then(|| source.to_ascii_lowercase())
+}
+
+fn example_command_sources(example: &str) -> BTreeSet<String> {
+    const NON_COMMAND_ARGUMENT_LABELS: [&str; 20] = [
+        "input",
+        "value",
+        "number",
+        "integer",
+        "case",
+        "example",
+        "argument",
+        "arg",
+        "parameter",
+        "param",
+        "with",
+        "using",
+        "for",
+        "of",
+        "输入",
+        "值",
+        "数字",
+        "整数",
+        "示例",
+        "参数",
+    ];
+    let lower = example.to_lowercase();
+    let input_clause_end = [
+        " should output",
+        " must output",
+        " should print",
+        " must print",
+        " should return",
+        " must return",
+        " returns ",
+        " outputs ",
+        " 应该输出",
+        " 应输出",
+        " 必须输出",
+        " 应该返回",
+        " 应返回",
+        " 必须返回",
+    ]
+    .iter()
+    .filter_map(|marker| lower.find(marker))
+    .min()
+    .unwrap_or(lower.len());
+    let words = lower[..input_clause_end]
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let Some(input_index) = words
+        .iter()
+        .rposition(|word| !numeric_literal_occurrences(word).is_empty())
+    else {
+        return BTreeSet::new();
+    };
+    words[..input_index]
+        .iter()
+        .rev()
+        .filter(|word| !word.starts_with('-'))
+        .filter_map(|word| normalized_command_source(word))
+        .find(|source| !NON_COMMAND_ARGUMENT_LABELS.contains(&source.as_str()))
+        .into_iter()
+        .collect()
+}
+
+fn first_sentence(text: &str) -> &str {
+    for (index, character) in text.char_indices() {
+        if !matches!(character, '.' | '!' | '?' | '。' | '！' | '？') {
+            continue;
+        }
+        if matches!(character, '。' | '！' | '？') {
+            return &text[..index];
+        }
+        let end = index + character.len_utf8();
+        if text[end..].chars().next().is_none_or(char::is_whitespace) {
+            return &text[..index];
+        }
+    }
+    text
+}
+
+fn numeric_literal_occurrences(text: &str) -> Vec<String> {
+    semantic_words(text)
+        .into_iter()
+        .map(|token| token.trim_matches(['\'', '’', '`']).to_owned())
+        .filter(|token| token.chars().all(|character| character.is_ascii_digit()))
+        .filter_map(|token| token.parse::<u128>().ok())
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn shell_verification_segments(command: &str) -> Vec<String> {
+    split_shell_syntax(&shell_control_text(command), false)
+}
+
+fn shell_pipeline_segments(statement: &str) -> Vec<String> {
+    split_shell_syntax(statement, true)
+}
+
+fn split_shell_syntax(command: &str, split_pipes: bool) -> Vec<String> {
+    fn finish(segments: &mut Vec<String>, current: &mut String) {
+        let segment = current.trim();
+        if !segment.is_empty() {
+            segments.push(segment.to_owned());
+        }
+        current.clear();
+    }
+
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut characters = command.chars().peekable();
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut backtick_quoted = false;
+    let mut escaped = false;
+    let mut paren_depth = 0_u32;
+
+    while let Some(character) = characters.next() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && !single_quoted {
+            current.push(character);
+            escaped = true;
+            continue;
+        }
+        if character == '\'' && !double_quoted && !backtick_quoted {
+            single_quoted = !single_quoted;
+            current.push(character);
+            continue;
+        }
+        if character == '"' && !single_quoted && !backtick_quoted {
+            double_quoted = !double_quoted;
+            current.push(character);
+            continue;
+        }
+        if character == '`' && !single_quoted {
+            backtick_quoted = !backtick_quoted;
+            current.push(character);
+            continue;
+        }
+        if single_quoted || double_quoted || backtick_quoted {
+            current.push(character);
+            continue;
+        }
+        match character {
+            '(' => {
+                paren_depth += 1;
+                current.push(character);
+            }
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                current.push(character);
+            }
+            '#' if paren_depth == 0
+                && current.chars().next_back().is_none_or(char::is_whitespace) =>
+            {
+                for comment in characters.by_ref() {
+                    if comment == '\n' {
+                        break;
+                    }
+                }
+                finish(&mut segments, &mut current);
+            }
+            ';' | '\n' if paren_depth == 0 => finish(&mut segments, &mut current),
+            '&' if paren_depth == 0 => {
+                if characters.peek() == Some(&'&') {
+                    characters.next();
+                }
+                finish(&mut segments, &mut current);
+            }
+            '|' if paren_depth == 0 => {
+                let logical_or = characters.peek() == Some(&'|');
+                if logical_or {
+                    characters.next();
+                }
+                if logical_or || split_pipes {
+                    finish(&mut segments, &mut current);
+                } else {
+                    current.push(character);
+                }
+            }
+            _ => current.push(character),
+        }
+    }
+    finish(&mut segments, &mut current);
+    segments
+}
+
+fn segment_after_execution_prefixes(mut segment: &str) -> &str {
+    loop {
+        segment = segment.trim_start_matches(['(', '{', ' ']);
+        let Some(first) = segment.split_whitespace().next() else {
+            return "";
+        };
+        let assignment_prefix = first.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        });
+        if assignment_prefix {
+            segment = after_shell_word(segment);
+            continue;
+        }
+        match first {
+            "command" | "sudo" | "exec" | "env" => {
+                segment = after_shell_word(segment);
+            }
+            "timeout" => {
+                segment = after_shell_word(after_shell_word(segment));
+            }
+            _ => return segment,
+        }
+    }
+}
+
+fn after_shell_word(text: &str) -> &str {
+    text.find(char::is_whitespace)
+        .map(|index| text[index..].trim_start())
+        .unwrap_or("")
+}
+
+fn execution_payload(segment: &str) -> String {
+    let executable = segment_after_execution_prefixes(segment);
+    let first = executable.split_whitespace().next().unwrap_or("");
+    if matches!(first, "bash" | "sh" | "zsh") {
+        let option_and_payload = after_shell_word(executable);
+        let option = option_and_payload.split_whitespace().next().unwrap_or("");
+        if option.starts_with('-') && option.contains('c') {
+            return after_shell_word(option_and_payload)
+                .trim_matches(['\'', '"'])
+                .to_owned();
+        }
+    }
+    executable.to_owned()
+}
+
+fn verification_is_nonexecuting(command: &str) -> bool {
+    let normalized = command.to_ascii_lowercase().replace(['\'', '"'], "");
+    if normalized.contains('$') || normalized.contains('`') || normalized.contains('\\') {
+        return true;
+    }
+    normalized.split_whitespace().any(|word| {
+        matches!(
+            word,
+            "--no-run" | "--help" | "-h" | "--version" | "--co" | "-list" | "--markers"
+        ) || word.starts_with("--collect")
+            || word.starts_with("--list")
+            || word.starts_with("--fixtures")
+    })
+}
+
+fn invokes_project_test_command(command: &str) -> bool {
+    shell_verification_segments(command)
+        .iter()
+        .any(|statement| {
+            shell_pipeline_segments(statement).iter().any(|segment| {
+                let lower = execution_payload(segment).to_ascii_lowercase();
+                if verification_is_nonexecuting(&lower) {
+                    return false;
+                }
+                contains_any_at_start(
+                    &lower,
+                    &[
+                        "pytest",
+                        "python -m pytest",
+                        "python3 -m pytest",
+                        "python -m unittest",
+                        "python3 -m unittest",
+                        "vitest",
+                        "jest",
+                        "cargo test",
+                        "npm test",
+                        "npm run test",
+                        "pnpm test",
+                        "pnpm exec vitest",
+                        "yarn test",
+                        "bun test",
+                        "make test",
+                        "ctest",
+                        "go test",
+                        "mvn test",
+                        "gradle test",
+                        "gradlew test",
+                        "./gradlew test",
+                        "dotnet test",
+                        "swift test",
+                    ],
+                )
+            })
+        })
+}
+
+fn invokes_dedicated_verifier_command(command: &str) -> bool {
+    shell_verification_segments(command)
+        .iter()
+        .any(|statement| {
+            shell_pipeline_segments(statement).iter().any(|segment| {
+                let executable = execution_payload(segment);
+                if verification_is_nonexecuting(&executable) {
+                    return false;
+                }
+                let words = executable.split_whitespace().collect::<Vec<_>>();
+                let candidate = match words.first().copied() {
+                    Some("python" | "python3" | "bash" | "sh" | "node") => words.get(1).copied(),
+                    candidate => candidate,
+                }
+                .unwrap_or("")
+                .trim_start_matches("./");
+                matches!(
+                    candidate.rsplit('/').next().unwrap_or(candidate),
+                    "verify.py"
+                        | "verify.sh"
+                        | "verify.js"
+                        | "verify.ts"
+                        | "check.py"
+                        | "check.sh"
+                        | "check.js"
+                        | "check.ts"
+                )
+            })
+        })
+}
+
+fn contains_any_at_start(text: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| {
+        text == *prefix
+            || text
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
+    })
+}
+
+fn command_source_candidates(command: &str) -> BTreeSet<String> {
+    let executable = execution_payload(command);
+    let words = executable.split_whitespace().collect::<Vec<_>>();
+    let mut candidates = BTreeSet::new();
+    if let Some(source) = words
+        .first()
+        .and_then(|word| normalized_command_source(word))
+    {
+        candidates.insert(source);
+    }
+    if matches!(words.first().copied(), Some("python" | "python3" | "node")) {
+        if let Some(source) = words
+            .iter()
+            .skip(1)
+            .find(|word| !word.starts_with('-'))
+            .and_then(|word| normalized_command_source(word))
+        {
+            candidates.insert(source);
+        }
+    }
+    candidates
+}
+
+fn behavior_command_substitution(text: &str, expected_sources: &BTreeSet<String>) -> bool {
+    fn substitution_end(text: &str, body_start: usize) -> Option<usize> {
+        let bytes = text.as_bytes();
+        let mut index = body_start;
+        let mut depth = 1_u32;
+        let mut single_quoted = false;
+        let mut double_quoted = false;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\\' if !single_quoted => index = (index + 2).min(bytes.len()),
+                b'\'' if !double_quoted => {
+                    single_quoted = !single_quoted;
+                    index += 1;
+                }
+                b'"' if !single_quoted => {
+                    double_quoted = !double_quoted;
+                    index += 1;
+                }
+                b'$' if !single_quoted && !double_quoted && bytes.get(index + 1) == Some(&b'(') => {
+                    depth += 1;
+                    index += 2;
+                }
+                b')' if !single_quoted && !double_quoted => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                    index += 1;
+                }
+                _ => index += 1,
+            }
+        }
+        None
+    }
+
+    let bytes = text.as_bytes();
+    let mut index = 0_usize;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if !single_quoted => index = (index + 2).min(bytes.len()),
+            b'\'' if !double_quoted => {
+                single_quoted = !single_quoted;
+                index += 1;
+            }
+            b'"' if !single_quoted => {
+                double_quoted = !double_quoted;
+                index += 1;
+            }
+            b'$' if !single_quoted && bytes.get(index + 1) == Some(&b'(') => {
+                let body_start = index + 2;
+                let Some(end) = substitution_end(text, body_start) else {
+                    return false;
+                };
+                if behavior_command_source(&text[body_start..end], expected_sources) {
+                    return true;
+                }
+                index = end + 1;
+            }
+            b'`' if !single_quoted => {
+                let body_start = index + 1;
+                let mut end = body_start;
+                while end < bytes.len() && bytes[end] != b'`' {
+                    end += if bytes[end] == b'\\' { 2 } else { 1 };
+                }
+                if end >= bytes.len() {
+                    return false;
+                }
+                if behavior_command_source(&text[body_start..end], expected_sources) {
+                    return true;
+                }
+                index = end + 1;
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+fn behavior_command_source(command: &str, expected_sources: &BTreeSet<String>) -> bool {
+    if expected_sources.is_empty() {
+        return false;
+    }
+    command_source_candidates(command)
+        .iter()
+        .any(|source| expected_sources.contains(source))
+}
+
+fn assignment_name(segment: &str) -> Option<String> {
+    let (prefix, _) = segment.split_once('=')?;
+    let name = prefix
+        .split_whitespace()
+        .next_back()
+        .unwrap_or("")
+        .trim_end_matches('+');
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+fn assignment_name_and_literals(
+    segment: &str,
+    expected_sources: &BTreeSet<String>,
+) -> Option<(String, Vec<String>)> {
+    let name = assignment_name(segment)?;
+    let (_, value) = segment.split_once('=')?;
+    behavior_command_substitution(value, expected_sources)
+        .then(|| (name, numeric_literal_occurrences(value)))
+}
+
+fn shell_variable_writes(statement: &str) -> Vec<String> {
+    let payload = execution_payload(statement);
+    let words = payload
+        .split_whitespace()
+        .map(|word| word.trim_matches(['\'', '"']))
+        .collect::<Vec<_>>();
+    match words.first().copied() {
+        Some("printf") => words
+            .windows(2)
+            .find(|pair| pair[0] == "-v")
+            .map(|pair| vec![pair[1].to_owned()])
+            .unwrap_or_default(),
+        Some("read" | "readarray" | "mapfile" | "unset") => words
+            .iter()
+            .skip(1)
+            .filter(|word| !word.starts_with('-'))
+            .map(|word| word.trim_end_matches('=').to_owned())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn transparent_pipeline_stage(statement: &str) -> bool {
+    execution_payload(statement)
+        .split_whitespace()
+        .next()
+        .is_some_and(|command| command.trim_start_matches("./") == "tee")
+}
+
+fn linked_verification_numeric_literals(
+    command: &str,
+    expected_sources: &BTreeSet<String>,
+) -> Vec<String> {
+    let statements = shell_verification_segments(command);
+    let mut dynamic_assignments = BTreeMap::<String, Vec<String>>::new();
+    let mut linked = Vec::new();
+
+    for statement in &statements {
+        let payload = execution_payload(statement);
+        if contains_any_at_start(&payload, &["eval", "source", "."]) {
+            dynamic_assignments.clear();
+        }
+        for name in shell_variable_writes(statement) {
+            dynamic_assignments.remove(&name);
+        }
+        if let Some(name) = assignment_name(statement) {
+            dynamic_assignments.remove(&name);
+            if let Some((_, literals)) = assignment_name_and_literals(statement, expected_sources) {
+                dynamic_assignments.insert(name, literals);
+            }
+        }
+        let pipeline = shell_pipeline_segments(statement);
+        for (index, assertion) in pipeline.iter().map(String::as_str).enumerate() {
+            let assertion_payload = execution_payload(assertion);
+            let lower = assertion_payload.to_ascii_lowercase();
+            if !has_shell_test_command(&assertion_payload) && !contains_machine_check_marker(&lower)
+            {
+                continue;
+            }
+            let mut assertion_linked =
+                behavior_command_substitution(&assertion_payload, expected_sources);
+            if !assertion_linked && index > 0 {
+                for producer in pipeline[..index].iter().rev() {
+                    if behavior_command_source(producer, expected_sources) {
+                        assertion_linked = true;
+                        linked.extend(numeric_literal_occurrences(&execution_payload(producer)));
+                        break;
+                    }
+                    if !transparent_pipeline_stage(producer) {
+                        break;
+                    }
+                }
+            }
+            for (name, assignment_literals) in &dynamic_assignments {
+                if assertion_payload.contains(&format!("${name}"))
+                    || assertion_payload.contains(&format!("${{{name}}}"))
+                {
+                    assertion_linked = true;
+                    linked.extend(assignment_literals.iter().cloned());
+                }
+            }
+            if assertion_linked {
+                linked.extend(numeric_literal_occurrences(&assertion_payload));
+            }
+        }
+    }
+    linked
+}
+
+fn verification_uses_only_explicit_examples(
+    command: &str,
+    explicit_example_numeric_literals: &BTreeSet<String>,
+    explicit_example_command_sources: &BTreeSet<String>,
+) -> bool {
+    if explicit_example_numeric_literals.is_empty()
+        || invokes_project_test_command(command)
+        || invokes_dedicated_verifier_command(command)
+    {
+        return false;
+    }
+
+    let command_literals =
+        linked_verification_numeric_literals(command, explicit_example_command_sources);
+    let distinct_literals = command_literals.iter().cloned().collect::<BTreeSet<_>>();
+    command_literals.len() < 2 || distinct_literals.is_subset(explicit_example_numeric_literals)
+}
+
 fn is_functional_probe(command: &str) -> bool {
     let loopback =
         command.contains("localhost") || command.contains("127.0.0.1") || command.contains("[::1]");
@@ -1549,6 +2181,12 @@ pub struct CompletionEvidence {
     pub machine_checked_behavior_required: bool,
     #[serde(default)]
     pub last_machine_checked_verification_sequence: Option<u64>,
+    #[serde(default)]
+    pub verification_diversity_required: bool,
+    #[serde(default)]
+    pub last_example_only_verification_sequence: Option<u64>,
+    #[serde(default)]
+    pub last_independent_verification_sequence: Option<u64>,
     pub last_failure_sequence: Option<u64>,
     pub last_service_start_sequence: Option<u64>,
     pub last_service_pid_evidence_sequence: Option<u64>,
@@ -1711,6 +2349,37 @@ pub fn evaluate_budget_command_with_time_in_directory(
         }
     }
 
+    let verification_floor = evidence
+        .last_mutation_sequence
+        .into_iter()
+        .chain(evidence.last_failure_sequence)
+        .max()
+        .unwrap_or(0);
+    let independent_verification_pending = evidence.verification_diversity_required
+        && evidence
+            .last_example_only_verification_sequence
+            .is_some_and(|sequence| sequence > verification_floor)
+        && !evidence
+            .last_independent_verification_sequence
+            .is_some_and(|sequence| sequence > verification_floor);
+    if convergence_window && independent_verification_pending {
+        if matches!(kind, ToolKind::Mutation) {
+            return PolicyDecision::Allow;
+        }
+        let machine_checked_verification = matches!(
+            kind,
+            ToolKind::Verification
+                | ToolKind::RuntimeProbe
+                | ToolKind::FunctionalProbe { bounded: true }
+        ) && has_machine_checked_assertion(command);
+        if !machine_checked_verification {
+            return deny(
+                "verification_diversity",
+                "the latest check copied only request examples; create or run a focused test/verifier, generated/property check, or at least one machine-checked non-example case before further exploration",
+            );
+        }
+    }
+
     if remaining_model_rounds > 8 && !time_finalization_window && !source_delivery_checkpoint {
         return PolicyDecision::Allow;
     }
@@ -1846,6 +2515,11 @@ pub struct CompletionGate {
     last_successful_verification_sequence: Option<u64>,
     machine_checked_behavior_required: bool,
     last_machine_checked_verification_sequence: Option<u64>,
+    verification_diversity_required: bool,
+    explicit_example_numeric_literals: BTreeSet<String>,
+    explicit_example_command_sources: BTreeSet<String>,
+    last_example_only_verification_sequence: Option<u64>,
+    last_independent_verification_sequence: Option<u64>,
     last_failure_sequence: Option<u64>,
     last_service_start_sequence: Option<u64>,
     last_service_pid_evidence_sequence: Option<u64>,
@@ -1961,7 +2635,12 @@ impl CompletionGate {
         gate.source_change_required = source_change_required;
         gate.required_observable_states = extract_expected_state_markers(instruction);
         gate.machine_checked_behavior_required =
-            require_action && instruction_requires_machine_checked_behavior(instruction);
+            instruction_requires_machine_checked_behavior(instruction);
+        let explicit_examples = extract_explicit_example_numeric_literals(instruction);
+        gate.verification_diversity_required =
+            gate.machine_checked_behavior_required && explicit_examples.occurrences >= 4;
+        gate.explicit_example_numeric_literals = explicit_examples.values;
+        gate.explicit_example_command_sources = explicit_examples.command_sources;
         gate
     }
 
@@ -1978,6 +2657,11 @@ impl CompletionGate {
             last_successful_verification_sequence: None,
             machine_checked_behavior_required: false,
             last_machine_checked_verification_sequence: None,
+            verification_diversity_required: false,
+            explicit_example_numeric_literals: BTreeSet::new(),
+            explicit_example_command_sources: BTreeSet::new(),
+            last_example_only_verification_sequence: None,
+            last_independent_verification_sequence: None,
             last_failure_sequence: None,
             last_service_start_sequence: None,
             last_service_pid_evidence_sequence: None,
@@ -2007,6 +2691,13 @@ impl CompletionGate {
     pub fn record(&mut self, outcome: &ToolOutcome) {
         self.outcome_count += 1;
         let machine_checked_behavior = has_machine_checked_assertion(&outcome.command);
+        let example_only_verification = self.verification_diversity_required
+            && machine_checked_behavior
+            && verification_uses_only_explicit_examples(
+                &outcome.command,
+                &self.explicit_example_numeric_literals,
+                &self.explicit_example_command_sources,
+            );
         let behavior_verification_satisfied =
             !self.machine_checked_behavior_required || machine_checked_behavior;
         if outcome.succeeded()
@@ -2019,6 +2710,11 @@ impl CompletionGate {
             )
         {
             self.last_machine_checked_verification_sequence = Some(outcome.sequence);
+            if example_only_verification {
+                self.last_example_only_verification_sequence = Some(outcome.sequence);
+            } else {
+                self.last_independent_verification_sequence = Some(outcome.sequence);
+            }
         }
         if is_source_mutation(outcome) {
             self.last_source_mutation_sequence = Some(outcome.sequence);
@@ -2188,6 +2884,19 @@ impl CompletionGate {
                         .push("at least one successful verification is required".to_owned()),
                 }
             }
+            if self.verification_diversity_required
+                && self
+                    .last_machine_checked_verification_sequence
+                    .is_some_and(|sequence| sequence > verification_floor)
+                && !self
+                    .last_independent_verification_sequence
+                    .is_some_and(|sequence| sequence > verification_floor)
+            {
+                blockers.push(
+                    "checks copied only from the request examples are smoke tests, not sufficient completion evidence; run a project test, dedicated verifier, generated/property check, or at least one machine-checked non-example case"
+                        .to_owned(),
+                );
+            }
         }
 
         let observable_floor =
@@ -2315,6 +3024,9 @@ impl CompletionGate {
             machine_checked_behavior_required: self.machine_checked_behavior_required,
             last_machine_checked_verification_sequence: self
                 .last_machine_checked_verification_sequence,
+            verification_diversity_required: self.verification_diversity_required,
+            last_example_only_verification_sequence: self.last_example_only_verification_sequence,
+            last_independent_verification_sequence: self.last_independent_verification_sequence,
             last_failure_sequence: self.last_failure_sequence,
             last_service_start_sequence: self.last_service_start_sequence,
             last_service_pid_evidence_sequence: self.last_service_pid_evidence_sequence,
@@ -4044,6 +4756,461 @@ mod tests {
     }
 
     #[test]
+    fn copied_instruction_examples_are_smoke_checks_not_completion_evidence() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Create a processor for arbitrary inputs. For example, `./tool 3` should output 9, and `./tool 5` should output 25.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+
+        let mut examples_only = outcome(2, ToolKind::Verification, 0);
+        examples_only.command = concat!(
+            "test \"$(./tool 3)\" = \"9\" && ",
+            "test \"$(./tool 5)\" = \"25\""
+        )
+        .to_owned();
+        gate.record(&examples_only);
+
+        let evidence = gate.evidence();
+        assert!(!evidence.completed);
+        assert!(
+            evidence
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("examples")),
+            "blockers: {:?}",
+            evidence.blockers
+        );
+
+        let mut existence_only = outcome(3, ToolKind::Verification, 0);
+        existence_only.command = "test \"$(./tool 7)\"".to_owned();
+        gate.record(&existence_only);
+        assert!(!gate.evidence().completed);
+
+        let mut independent_case = outcome(4, ToolKind::Verification, 0);
+        independent_case.command = "test \"$(./tool 7)\" = \"49\"".to_owned();
+        gate.record(&independent_case);
+        assert!(
+            gate.evidence().completed,
+            "blockers: {:?}",
+            gate.evidence().blockers
+        );
+    }
+
+    #[test]
+    fn operational_numbers_outside_assertions_do_not_fake_verification_diversity() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Handle arbitrary inputs. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+
+        for (sequence, command) in [
+            (
+                2,
+                "echo 999 && test \"$(./tool 3)\" = 9 && test \"$(./tool 5)\" = 25",
+            ),
+            (
+                3,
+                "timeout 30 sh -c 'test \"$(./tool 3)\" = 9 && test \"$(./tool 5)\" = 25'",
+            ),
+        ] {
+            let mut verification = outcome(sequence, ToolKind::Verification, 0);
+            verification.command = command.to_owned();
+            gate.record(&verification);
+            assert!(
+                !gate.evidence().completed,
+                "unexpected completion for {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn example_literal_extraction_stops_before_later_operational_numbers() {
+        let literals = extract_explicit_example_numeric_literals(
+            "For example, ./tool 3 should output 9 and ./tool 5 should output 25. Use timeout 99 and version 2026 after verification.",
+        );
+        assert_eq!(
+            literals.values,
+            ["3", "5", "9", "25"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn example_literal_extraction_collects_repeated_example_sentences() {
+        let literals = extract_explicit_example_numeric_literals(
+            "For example, ./tool 3 should output 9. For example, ./tool 5 should output 25.",
+        );
+        assert_eq!(
+            literals.values,
+            ["3", "5", "9", "25"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn project_test_suite_supersedes_example_only_smoke_checks() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Implement behavior for arbitrary inputs. For example, tool 10 should output 100 and tool 20 should output 400.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+
+        let mut examples_only = outcome(2, ToolKind::Verification, 0);
+        examples_only.command =
+            "test \"$(./tool 10)\" = 100 && test \"$(./tool 20)\" = 400".to_owned();
+        gate.record(&examples_only);
+        assert!(!gate.evidence().completed);
+
+        let mut project_tests = outcome(3, ToolKind::Verification, 0);
+        project_tests.command = "cargo test".to_owned();
+        gate.record(&project_tests);
+        assert!(
+            gate.evidence().completed,
+            "blockers: {:?}",
+            gate.evidence().blockers
+        );
+    }
+
+    #[test]
+    fn a_single_exact_example_does_not_force_diversity_for_fixed_output_work() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Repair this fixed command. For example, ./tool 6 should output 42.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut verification = outcome(2, ToolKind::Verification, 0);
+        verification.command = "test \"$(./tool 6)\" = 42".to_owned();
+        gate.record(&verification);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn r48_desktop_style_gate_requires_diversity_after_a_mutation() {
+        let mut gate = CompletionGate::new_for_instruction(
+            false,
+            "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut examples_only = outcome(2, ToolKind::Verification, 0);
+        examples_only.command = "test \"$(./tool 3)\" = 9 && test \"$(./tool 5)\" = 25".to_owned();
+        gate.record(&examples_only);
+        assert!(!gate.evidence().completed);
+    }
+
+    #[test]
+    fn r48_constant_assertion_and_fuzz_comment_are_not_independent_evidence() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        for (sequence, command) in [
+            (2, "test 999 = 999 # fuzz"),
+            (3, "test 999 = 999 && test 998 = 998 # fuzz"),
+            (4, "test 999 = 999\n# $(./tool 7) fuzz\ntest 998 = 998"),
+            (5, "test \"$(printf '$(./tool 7)')\" = '$(./tool 7)'"),
+        ] {
+            let mut fake = outcome(sequence, ToolKind::Verification, 0);
+            fake.command = command.to_owned();
+            gate.record(&fake);
+            assert!(!gate.evidence().completed, "unexpected: {command}");
+        }
+    }
+
+    #[test]
+    fn r48_unrelated_pipeline_and_quoted_test_name_do_not_bypass_diversity() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        for (sequence, command) in [
+            (2, "printf ignored | test 999 -lt 1000"),
+            (
+                3,
+                "echo 'cargo test'; test \"$(./tool 3)\" = 9 && test \"$(./tool 5)\" = 25",
+            ),
+            (
+                4,
+                "printf 'ignored; cargo test --all' >/dev/null; test \"$(./tool 3)\" = 9 && test \"$(./tool 5)\" = 25",
+            ),
+        ] {
+            let mut fake = outcome(sequence, ToolKind::Verification, 0);
+            fake.command = command.to_owned();
+            gate.record(&fake);
+            assert!(!gate.evidence().completed, "unexpected: {command}");
+        }
+    }
+
+    #[test]
+    fn r48_static_reassignment_clears_the_dynamic_value_link() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut fake = outcome(2, ToolKind::Verification, 0);
+        fake.command = "actual=$(./tool 7); export actual=999; test \"$actual\" = 999".to_owned();
+        gate.record(&fake);
+        assert!(!gate.evidence().completed);
+
+        let mut builtin_overwrite = CompletionGate::new_for_instruction(
+            true,
+            "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        builtin_overwrite.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut fake = outcome(2, ToolKind::Verification, 0);
+        fake.command = "actual=$(./tool 7); printf -v actual 49; test \"$actual\" = 49".to_owned();
+        builtin_overwrite.record(&fake);
+        assert!(!builtin_overwrite.evidence().completed);
+    }
+
+    #[test]
+    fn r48_unrelated_executable_cannot_impersonate_the_example_target() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut fake = outcome(2, ToolKind::Verification, 0);
+        fake.command = "expr 999 | grep -qx 999".to_owned();
+        gate.record(&fake);
+        assert!(!gate.evidence().completed);
+
+        let mut chinese = CompletionGate::new_for_instruction(
+            true,
+            "处理任意整数。例如，工具输入 3 应输出 9，输入 5 应输出 25。",
+        );
+        chinese.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut fake = outcome(2, ToolKind::Verification, 0);
+        fake.command = "expr 7 | grep -qx 49".to_owned();
+        chinese.record(&fake);
+        assert!(!chinese.evidence().completed);
+    }
+
+    #[test]
+    fn r48_nonexecuting_test_and_verifier_modes_are_not_independent_evidence() {
+        for command in [
+            "cargo test --no-run",
+            "cargo test --no'-run'",
+            "cargo test --no\\-run",
+            "flag=--no-run; cargo test \"$flag\"",
+            "cargo test --version",
+            "pytest --collect-only",
+            "pytest -h",
+            "vitest --list",
+            "python3 verify.py --help",
+        ] {
+            let mut gate = CompletionGate::new_for_instruction(
+                true,
+                "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+            );
+            gate.record(&outcome(1, ToolKind::Mutation, 0));
+            let mut fake = outcome(2, ToolKind::Verification, 0);
+            fake.command = command.to_owned();
+            gate.record(&fake);
+            assert!(!gate.evidence().completed, "unexpected: {command}");
+        }
+    }
+
+    #[test]
+    fn r48_variable_assignment_links_input_to_asserted_output() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut independent = outcome(2, ToolKind::Verification, 0);
+        independent.command = "actual=$(./tool 7); test \"$actual\" = 49".to_owned();
+        gate.record(&independent);
+        assert!(
+            gate.evidence().completed,
+            "blockers: {:?}",
+            gate.evidence().blockers
+        );
+    }
+
+    #[test]
+    fn r48_behavior_pipeline_links_input_to_grep_assertion() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut independent = outcome(2, ToolKind::Verification, 0);
+        independent.command = "./tool 7 | grep -qx 49".to_owned();
+        gate.record(&independent);
+        assert!(
+            gate.evidence().completed,
+            "blockers: {:?}",
+            gate.evidence().blockers
+        );
+    }
+
+    #[test]
+    fn r48_target_identity_comes_from_the_input_invocation_only() {
+        let instruction = "Handle arbitrary values. For example, ./tool --input 3 should output 9 and ./tool --input 5 should output 25.";
+        let mut fake_gate = CompletionGate::new_for_instruction(true, instruction);
+        fake_gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut fake = outcome(2, ToolKind::Verification, 0);
+        fake.command = "output 7 | grep -qx 49".to_owned();
+        fake_gate.record(&fake);
+        assert!(!fake_gate.evidence().completed);
+
+        let mut discarded = CompletionGate::new_for_instruction(true, instruction);
+        discarded.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut fake = outcome(2, ToolKind::Verification, 0);
+        fake.command = "./tool --input 7 | printf 49 | grep -qx 49".to_owned();
+        discarded.record(&fake);
+        assert!(!discarded.evidence().completed);
+
+        let mut real_gate = CompletionGate::new_for_instruction(true, instruction);
+        real_gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut real = outcome(2, ToolKind::Verification, 0);
+        real.command = "./tool --input 7 | grep -qx 49".to_owned();
+        real_gate.record(&real);
+        assert!(real_gate.evidence().completed);
+
+        let phrased = extract_explicit_example_numeric_literals(
+            "For example, run ./tool with input 3 should output 9 and input 5 should output 25.",
+        );
+        assert_eq!(phrased.command_sources, BTreeSet::from(["tool".to_owned()]));
+    }
+
+    #[test]
+    fn r48_quoted_shell_target_is_linked_through_a_pipeline() {
+        let instruction = "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.";
+        let examples = extract_explicit_example_numeric_literals(instruction);
+        assert_eq!(
+            examples.command_sources,
+            BTreeSet::from(["tool".to_owned()])
+        );
+        assert_eq!(
+            shell_pipeline_segments("bash -lc './tool 7' | grep -qx 49"),
+            vec!["bash -lc './tool 7'", "grep -qx 49"]
+        );
+        assert_eq!(
+            shell_verification_segments("bash -lc './tool 7' | grep -qx 49"),
+            vec!["bash -lc './tool 7' | grep -qx 49"]
+        );
+        assert_eq!(execution_payload("bash -lc './tool 7'"), "./tool 7");
+        assert_eq!(
+            command_source_candidates("bash -lc './tool 7'"),
+            BTreeSet::from(["tool".to_owned()])
+        );
+        assert!(behavior_command_source(
+            "bash -lc './tool 7'",
+            &examples.command_sources,
+        ));
+        assert!(!behavior_command_substitution(
+            "grep -qx 49",
+            &examples.command_sources,
+        ));
+        assert_eq!(
+            linked_verification_numeric_literals(
+                "bash -lc './tool 7' | grep -qx 49",
+                &examples.command_sources,
+            ),
+            vec!["7", "49"]
+        );
+        let mut gate = CompletionGate::new_for_instruction(true, instruction);
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut independent = outcome(2, ToolKind::Verification, 0);
+        independent.command = "bash -lc './tool 7' | grep -qx 49".to_owned();
+        gate.record(&independent);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn r48_quoted_test_runner_and_multistage_target_pipeline_are_supported() {
+        let mut quoted = CompletionGate::new_for_instruction(
+            true,
+            "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        quoted.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut project_tests = outcome(2, ToolKind::Verification, 0);
+        project_tests.command = "bash -lc 'cargo test'".to_owned();
+        quoted.record(&project_tests);
+        assert!(quoted.evidence().completed);
+
+        let mut env_prefixed = CompletionGate::new_for_instruction(
+            true,
+            "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        env_prefixed.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut project_tests = outcome(2, ToolKind::Verification, 0);
+        project_tests.command =
+            "CARGO_TARGET_DIR=/tmp/cf cargo test -p codefactory-agent-core".to_owned();
+        env_prefixed.record(&project_tests);
+        assert!(env_prefixed.evidence().completed);
+
+        let mut piped = CompletionGate::new_for_instruction(
+            true,
+            "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        piped.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut independent = outcome(2, ToolKind::Verification, 0);
+        independent.command = "./tool 7 | tee /tmp/out | grep -qx 49".to_owned();
+        piped.record(&independent);
+        assert!(
+            piped.evidence().completed,
+            "blockers: {:?}",
+            piped.evidence().blockers
+        );
+    }
+
+    #[test]
+    fn r48_example_anchor_is_not_double_counted() {
+        let literals = extract_explicit_example_numeric_literals(
+            "Handle one fixed case; e.g., ./tool 3 should output 9.",
+        );
+        assert_eq!(literals.occurrences, 2);
+        let gate = CompletionGate::new_for_instruction(
+            true,
+            "Handle one fixed case; e.g., ./tool 3 should output 9.",
+        );
+        assert!(!gate.verification_diversity_required);
+    }
+
+    #[test]
+    fn r48_zero_one_two_and_repeated_outputs_still_enable_diversity() {
+        let mut gate = CompletionGate::new_for_instruction(
+            true,
+            "Handle arbitrary values. For example, ./tool 0 should output 1 and ./tool 2 should output 1.",
+        );
+        gate.record(&outcome(1, ToolKind::Mutation, 0));
+        let mut examples_only = outcome(2, ToolKind::Verification, 0);
+        examples_only.command = "test \"$(./tool 0)\" = 1 && test \"$(./tool 2)\" = 1".to_owned();
+        gate.record(&examples_only);
+        assert!(!gate.evidence().completed);
+
+        let mut independent = outcome(3, ToolKind::Verification, 0);
+        independent.command = "test \"$(./tool 3)\" = 9".to_owned();
+        gate.record(&independent);
+        assert!(gate.evidence().completed);
+    }
+
+    #[test]
+    fn r48_chinese_sentence_boundary_excludes_following_operational_numbers() {
+        let literals = extract_explicit_example_numeric_literals(
+            "例如，工具输入 3 应输出 9，输入 5 应输出 25。超时 99 秒，版本 2026。",
+        );
+        assert_eq!(
+            literals.values,
+            ["3", "5", "9", "25"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+    }
+
+    #[test]
     fn explicit_nonzero_if_branch_is_a_machine_checked_probe() {
         assert!(has_machine_checked_assertion(
             "output=$(./tool 6); if [ \"$output\" != 42 ]; then exit 1; fi"
@@ -4443,10 +5610,12 @@ mod tests {
         assert!(normalized_contract.contains("machine-checked assertion"));
         assert!(normalized_contract
             .contains("printing expected and actual values is diagnostic evidence"));
+        assert!(normalized_contract.contains("examples copied from the request are smoke checks"));
 
         let ready = build_completion_ready_prompt();
         assert!(ready.contains("named tool, library, model, version, or revision"));
         assert!(ready.contains("before-and-after observable state"));
+        assert!(ready.contains("Request examples are smoke checks only"));
 
         let convergence = build_budget_convergence_prompt(8, &CompletionEvidence::default());
         assert!(convergence.contains("required output artifact"));
@@ -4502,6 +5671,64 @@ mod tests {
             17,
             &evidence,
             "python3 generate_candidate.py > result.txt",
+            &ToolKind::Mutation,
+        )
+        .is_allowed());
+    }
+
+    #[test]
+    fn convergence_window_blocks_reads_after_example_only_smoke_check() {
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 11,
+            last_mutation_sequence: Some(10),
+            machine_checked_behavior_required: true,
+            last_machine_checked_verification_sequence: Some(11),
+            verification_diversity_required: true,
+            last_example_only_verification_sequence: Some(11),
+            ..CompletionEvidence::default()
+        };
+
+        let denied = evaluate_budget_command_with_time(
+            12,
+            Some((400, 900)),
+            &evidence,
+            "cat another_idea.txt",
+            &ToolKind::ReadOnly,
+        );
+        assert!(!denied.is_allowed());
+        assert!(matches!(
+            denied,
+            PolicyDecision::Deny { ref rule, .. } if rule == "verification_diversity"
+        ));
+        assert!(evaluate_budget_command_with_time(
+            12,
+            Some((400, 900)),
+            &evidence,
+            "test \"$(./tool 7)\" = 49",
+            &ToolKind::Verification,
+        )
+        .is_allowed());
+    }
+
+    #[test]
+    fn r48_convergence_allows_a_test_harness_mutation_after_example_smoke() {
+        let evidence = CompletionEvidence {
+            require_action: true,
+            outcome_count: 11,
+            last_mutation_sequence: Some(10),
+            machine_checked_behavior_required: true,
+            last_machine_checked_verification_sequence: Some(11),
+            verification_diversity_required: true,
+            last_example_only_verification_sequence: Some(11),
+            ..CompletionEvidence::default()
+        };
+
+        assert!(evaluate_budget_command_with_time(
+            12,
+            Some((400, 900)),
+            &evidence,
+            "printf 'test_case()' > tests/test_behavior.py",
             &ToolKind::Mutation,
         )
         .is_allowed());

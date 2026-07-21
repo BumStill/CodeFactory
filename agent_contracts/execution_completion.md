@@ -19,7 +19,12 @@ shared by the desktop Agent and headless evaluation runtime.
    the post-change verification must contain a machine-checked assertion, real
    test runner, or dedicated verifier that exits nonzero on mismatch. Printing
    expected and actual values is diagnostic evidence, not successful
-   verification. Treat executable interpreter or shell heredocs as opaque
+   verification. Examples copied from the request are smoke checks, not
+   sufficient completion evidence for behavior over variable inputs. Also run
+   a project test, dedicated verifier, generated or property check, or at least
+   one machine-checked non-example case whose asserted data comes from the same
+   target under test. Discovery-only test modes such as no-run, collect, list,
+   help, or version are not execution evidence. Treat executable interpreter or shell heredocs as opaque
    state-changing actions; identifiers such as `test = ...` inside their payload
    must never masquerade as a shell assertion, and a separate machine-checked
    verification must follow them.

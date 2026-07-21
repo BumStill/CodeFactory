@@ -841,34 +841,45 @@ impl AgentLoop {
 
             if tool_calls.is_empty() {
                 let evidence = completion_gate.evidence();
-                if let Some(prompt) =
-                    completion_recovery_prompt(&evidence, completion_recovery_attempts, self.mode)
-                {
-                    completion_recovery_attempts += 1;
-                    // Make the rejection visible instead of silently looping:
-                    // collapse the rejected candidate in the UI, persist the
-                    // injected instruction so rebuilt history stays faithful.
-                    self.mark_rejected_candidate(assistant_message_id.as_deref())
-                        .await?;
-                    self.persist_gate_message(&prompt, "gate_recovery").await?;
-                    self.app
-                        .emit(
-                            event_name,
-                            StreamEvent::CompletionGateAction {
-                                kind: "recovery".into(),
-                                detail: evidence.blockers.join("; "),
-                            },
-                        )
-                        .ok();
-                    messages.push(ChatMessage {
-                        role: "user".into(),
-                        content: MessageContent::Text(prompt),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        name: None,
-                        reasoning_content: None,
-                    });
-                    continue;
+                match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
+                    CompletionFinalization::Recover(prompt) => {
+                        completion_recovery_attempts += 1;
+                        // Make the rejection visible instead of silently looping:
+                        // collapse the rejected candidate in the UI, persist the
+                        // injected instruction so rebuilt history stays faithful.
+                        self.mark_rejected_candidate(assistant_message_id.as_deref())
+                            .await?;
+                        self.persist_gate_message(&prompt, "gate_recovery").await?;
+                        self.app
+                            .emit(
+                                event_name,
+                                StreamEvent::CompletionGateAction {
+                                    kind: "recovery".into(),
+                                    detail: evidence.blockers.join("; "),
+                                },
+                            )
+                            .ok();
+                        messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: MessageContent::Text(prompt),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
+                            reasoning_content: None,
+                        });
+                        continue;
+                    }
+                    CompletionFinalization::Blocked(message) => {
+                        self.mark_rejected_candidate(assistant_message_id.as_deref())
+                            .await?;
+                        self.persist_gate_message(&message, "gate_blocked").await?;
+                        self.app
+                            .emit(event_name, StreamEvent::Error { message })
+                            .ok();
+                        emitted_terminal = true;
+                        break;
+                    }
+                    CompletionFinalization::Complete => {}
                 }
                 // Always emit a terminal Done so the frontend's `streaming`
                 // flag clears — even when the provider omitted usage on the
@@ -1227,24 +1238,17 @@ impl AgentLoop {
             }
         }
 
-        // Safety net: the loop only emits a terminal Done when the model
-        // produces a tool-call-free turn. If it instead burns through the whole
-        // iteration budget (a tool call every round — far more likely on
-        // Execute turns), no terminal event was sent and the frontend would
-        // hang "running" forever. Emit one now so the stream always closes.
+        // Safety net: close the stream when every round used tools, but preserve
+        // completion truth instead of converting an exhausted loop into success.
         if !emitted_terminal {
+            let evidence = completion_gate.evidence();
             tracing::warn!(
-                "agent loop hit the iteration ceiling ({}) without a terminal turn; emitting Done",
+                "agent loop hit the iteration ceiling ({}) without a terminal turn; completed={}",
                 self.mode.max_iterations(),
+                evidence.completed,
             );
             self.app
-                .emit(
-                    &event_name,
-                    StreamEvent::Done {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                    },
-                )
+                .emit(&event_name, iteration_ceiling_terminal_event(&evidence))
                 .ok();
         }
 
@@ -2286,33 +2290,44 @@ impl AgentLoop {
 
             if tool_calls.is_empty() {
                 let evidence = completion_gate.evidence();
-                if let Some(prompt) =
-                    completion_recovery_prompt(&evidence, completion_recovery_attempts, self.mode)
-                {
-                    completion_recovery_attempts += 1;
-                    // Make the rejection visible instead of silently looping:
-                    // collapse the rejected candidate in the UI, persist the
-                    // injected instruction so rebuilt history stays faithful.
-                    self.mark_rejected_candidate(assistant_message_id.as_deref())
-                        .await?;
-                    self.persist_gate_message(&prompt, "gate_recovery").await?;
-                    self.app
-                        .emit(
-                            event_name,
-                            StreamEvent::CompletionGateAction {
-                                kind: "recovery".into(),
-                                detail: evidence.blockers.join("; "),
-                            },
-                        )
-                        .ok();
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": [{
-                            "type": "text",
-                            "text": prompt,
-                        }],
-                    }));
-                    continue;
+                match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
+                    CompletionFinalization::Recover(prompt) => {
+                        completion_recovery_attempts += 1;
+                        // Make the rejection visible instead of silently looping:
+                        // collapse the rejected candidate in the UI, persist the
+                        // injected instruction so rebuilt history stays faithful.
+                        self.mark_rejected_candidate(assistant_message_id.as_deref())
+                            .await?;
+                        self.persist_gate_message(&prompt, "gate_recovery").await?;
+                        self.app
+                            .emit(
+                                event_name,
+                                StreamEvent::CompletionGateAction {
+                                    kind: "recovery".into(),
+                                    detail: evidence.blockers.join("; "),
+                                },
+                            )
+                            .ok();
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": [{
+                                "type": "text",
+                                "text": prompt,
+                            }],
+                        }));
+                        continue;
+                    }
+                    CompletionFinalization::Blocked(message) => {
+                        self.mark_rejected_candidate(assistant_message_id.as_deref())
+                            .await?;
+                        self.persist_gate_message(&message, "gate_blocked").await?;
+                        self.app
+                            .emit(event_name, StreamEvent::Error { message })
+                            .ok();
+                        emitted_terminal = true;
+                        break;
+                    }
+                    CompletionFinalization::Complete => {}
                 }
                 emitted_terminal = true;
                 let inp = resp.input_tokens;
@@ -2659,22 +2674,17 @@ impl AgentLoop {
             }
         }
 
-        // Safety net: see run_openai — if the loop exhausted its iteration
-        // budget without a tool-call-free turn, no Done was emitted and the
-        // frontend would hang "running" forever. Emit one so the stream closes.
+        // Safety net: see run_openai. Close the stream without treating
+        // incomplete completion evidence as success.
         if !emitted_terminal {
+            let evidence = completion_gate.evidence();
             tracing::warn!(
-                "agent loop hit the iteration ceiling ({}) without a terminal turn; emitting Done",
+                "agent loop hit the iteration ceiling ({}) without a terminal turn; completed={}",
                 self.mode.max_iterations(),
+                evidence.completed,
             );
             self.app
-                .emit(
-                    event_name,
-                    StreamEvent::Done {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                    },
-                )
+                .emit(event_name, iteration_ceiling_terminal_event(&evidence))
                 .ok();
         }
 
@@ -2780,15 +2790,56 @@ fn completion_recovery_limit(mode: AgentMode) -> u32 {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CompletionFinalization {
+    Complete,
+    Recover(String),
+    Blocked(String),
+}
+
+fn completion_finalization(
+    evidence: &CompletionEvidence,
+    attempts: u32,
+    mode: AgentMode,
+) -> CompletionFinalization {
+    if evidence.completed {
+        return CompletionFinalization::Complete;
+    }
+    if attempts < completion_recovery_limit(mode) {
+        return CompletionFinalization::Recover(build_completion_recovery_prompt(evidence));
+    }
+    CompletionFinalization::Blocked(completion_blocked_message(evidence))
+}
+
+fn completion_blocked_message(evidence: &CompletionEvidence) -> String {
+    format!(
+        "Completion blocked because required verification is still missing: {}",
+        evidence.blockers.join("; ")
+    )
+}
+
+fn iteration_ceiling_terminal_event(evidence: &CompletionEvidence) -> StreamEvent {
+    if evidence.completed {
+        StreamEvent::Done {
+            input_tokens: 0,
+            output_tokens: 0,
+        }
+    } else {
+        StreamEvent::Error {
+            message: completion_blocked_message(evidence),
+        }
+    }
+}
+
 fn completion_recovery_prompt(
     evidence: &CompletionEvidence,
     attempts: u32,
     mode: AgentMode,
 ) -> Option<String> {
-    if attempts >= completion_recovery_limit(mode) {
-        return None;
+    match completion_finalization(evidence, attempts, mode) {
+        CompletionFinalization::Recover(prompt) => Some(prompt),
+        CompletionFinalization::Complete | CompletionFinalization::Blocked(_) => None,
     }
-    (!evidence.completed).then(|| build_completion_recovery_prompt(evidence))
 }
 
 /// Whether this mode injects the completion-ready ("coverage audit") nudge at
@@ -4022,6 +4073,54 @@ mod tests {
     }
 
     #[test]
+    fn desktop_completion_route_requires_non_example_behavior_evidence() {
+        let mut gate = CompletionGate::new_for_instruction(
+            false,
+            "Handle arbitrary values. For example, ./tool 3 should output 9 and ./tool 5 should output 25.",
+        );
+        let mut progress = ProgressTracker::new(8);
+        let mut sequence = 0;
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "write_file",
+            &serde_json::json!({"path": "tool", "content": "implementation"}),
+            &tools::ToolOutput::ok("written"),
+        );
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "bash",
+            &serde_json::json!({
+                "command": "test \"$(./tool 3)\" = 9 && test \"$(./tool 5)\" = 25"
+            }),
+            &tools::ToolOutput::ok("examples passed"),
+        );
+
+        let smoke = gate.evidence();
+        assert!(smoke.verification_diversity_required);
+        assert_eq!(smoke.last_example_only_verification_sequence, Some(2));
+        assert!(!smoke.completed);
+
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "bash",
+            &serde_json::json!({"command": "test \"$(./tool 7)\" = 49"}),
+            &tools::ToolOutput::ok("independent case passed"),
+        );
+        let completed = gate.evidence();
+        assert_eq!(completed.last_independent_verification_sequence, Some(3));
+        assert!(completed.completed, "blockers: {:?}", completed.blockers);
+    }
+
+    #[test]
     fn desktop_completion_gate_ignores_read_only_investigation_noise() {
         // Regression for the 2026-07-16 session: printf section headers plus
         // source output containing the literal "error:" tripped the gate and
@@ -4081,6 +4180,38 @@ mod tests {
         let satisfied = CompletionGate::new(false).evidence();
         assert!(satisfied.completed);
         assert!(completion_recovery_prompt(&satisfied, 0, AgentMode::Interactive).is_none());
+    }
+
+    #[test]
+    fn exhausted_recovery_is_a_blocked_terminal_not_success() {
+        let unsatisfied = CompletionGate::new(true).evidence();
+        assert!(matches!(
+            completion_finalization(&unsatisfied, 1, AgentMode::Interactive),
+            CompletionFinalization::Blocked(_)
+        ));
+        assert!(matches!(
+            completion_finalization(&unsatisfied, 3, AgentMode::Execute),
+            CompletionFinalization::Blocked(_)
+        ));
+        assert!(matches!(
+            completion_finalization(&unsatisfied, 3, AgentMode::Autonomous),
+            CompletionFinalization::Blocked(_)
+        ));
+
+        let satisfied = CompletionGate::new(false).evidence();
+        assert!(matches!(
+            completion_finalization(&satisfied, 99, AgentMode::Interactive),
+            CompletionFinalization::Complete
+        ));
+
+        assert!(matches!(
+            iteration_ceiling_terminal_event(&unsatisfied),
+            StreamEvent::Error { .. }
+        ));
+        assert!(matches!(
+            iteration_ceiling_terminal_event(&satisfied),
+            StreamEvent::Done { .. }
+        ));
     }
 
     #[test]
