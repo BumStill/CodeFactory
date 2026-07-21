@@ -134,4 +134,28 @@ describe("MessageList completion-gate visibility", () => {
     expect(screen.getByText(/已自动移除历史中的图片/)).toBeTruthy();
     expect(container.querySelector(".justify-end")).toBeNull();
   });
+
+  it("renders a verification-incomplete warning as an amber notice, with the reply left visible", () => {
+    // 2026-07-21 field report: exhausting gate recovery used to FOLD the
+    // reply and kill the turn with an untranslated internal error. Now the
+    // reply stands and a plain-Chinese warning follows it.
+    const { container } = render(
+      <MessageList
+        messages={[
+          msg({ id: "answer", content: "这是最终回复内容。" }),
+          msg({
+            id: "warn",
+            role: "user",
+            content: "⚠ 以上回复未经完整验证:本轮修改后仍有检查未复验。",
+            completionState: "gate_warning",
+          }),
+        ]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+    expect(screen.getByText(/这是最终回复内容/)).toBeTruthy();
+    expect(screen.getByText(/未经完整验证/)).toBeTruthy();
+    expect(container.querySelector(".justify-end")).toBeNull();
+  });
 });

@@ -947,6 +947,20 @@ impl AgentLoop {
                         });
                         continue;
                     }
+                    CompletionFinalization::ReleaseWithWarning(warning) => {
+                        // The reply stands — no folding, no Error. Persist a
+                        // visible warning and fall through to the normal Done.
+                        self.persist_gate_message(&warning, "gate_warning").await?;
+                        self.app
+                            .emit(
+                                event_name,
+                                StreamEvent::CompletionGateAction {
+                                    kind: "warning".into(),
+                                    detail: warning.clone(),
+                                },
+                            )
+                            .ok();
+                    }
                     CompletionFinalization::Blocked(message) => {
                         self.mark_rejected_candidate(assistant_message_id.as_deref())
                             .await?;
@@ -1334,7 +1348,7 @@ impl AgentLoop {
                 evidence.completed,
             );
             self.app
-                .emit(&event_name, iteration_ceiling_terminal_event(&evidence))
+                .emit(&event_name, iteration_ceiling_terminal_event(&evidence, self.mode))
                 .ok();
         }
 
@@ -2524,6 +2538,20 @@ impl AgentLoop {
                         }));
                         continue;
                     }
+                    CompletionFinalization::ReleaseWithWarning(warning) => {
+                        // The reply stands — no folding, no Error. Persist a
+                        // visible warning and fall through to the normal Done.
+                        self.persist_gate_message(&warning, "gate_warning").await?;
+                        self.app
+                            .emit(
+                                event_name,
+                                StreamEvent::CompletionGateAction {
+                                    kind: "warning".into(),
+                                    detail: warning.clone(),
+                                },
+                            )
+                            .ok();
+                    }
                     CompletionFinalization::Blocked(message) => {
                         self.mark_rejected_candidate(assistant_message_id.as_deref())
                             .await?;
@@ -2899,7 +2927,7 @@ impl AgentLoop {
                 evidence.completed,
             );
             self.app
-                .emit(event_name, iteration_ceiling_terminal_event(&evidence))
+                .emit(event_name, iteration_ceiling_terminal_event(&evidence, self.mode))
                 .ok();
         }
 
@@ -3024,6 +3052,15 @@ fn completion_recovery_attempts_after_tool_batch(
 enum CompletionFinalization {
     Complete,
     Recover(String),
+    /// Chat surfaces after recovery exhaustion: the model's reply is the best
+    /// available answer — release it, but persist this human-readable warning
+    /// so the user knows verification is incomplete. Never an Error, never
+    /// internal-contract wording (2026-07-21 field report: an untranslated
+    /// "Completion blocked…rerun every unresolved failed check" killed the
+    /// turn and hid the reply).
+    ReleaseWithWarning(String),
+    /// Unattended Autonomous runs only — the scheduler treats this as an
+    /// incomplete attempt and respawns.
     Blocked(String),
 }
 
@@ -3038,7 +3075,27 @@ fn completion_finalization(
     if attempts < completion_recovery_limit(mode) {
         return CompletionFinalization::Recover(build_completion_recovery_prompt(evidence));
     }
-    CompletionFinalization::Blocked(completion_blocked_message(evidence))
+    match mode {
+        AgentMode::Autonomous => {
+            CompletionFinalization::Blocked(completion_blocked_message(evidence))
+        }
+        AgentMode::Interactive | AgentMode::Execute => {
+            CompletionFinalization::ReleaseWithWarning(unverified_release_warning(evidence))
+        }
+    }
+}
+
+/// User-facing warning when a chat turn ends without complete verification.
+/// Chinese, plain language, no gate terminology; the raw blocker list goes
+/// to the log only.
+fn unverified_release_warning(evidence: &CompletionEvidence) -> String {
+    tracing::info!(
+        "releasing chat turn with unverified blockers: {}",
+        evidence.blockers.join("; ")
+    );
+    "⚠ 以上回复未经完整验证:本轮修改后仍有检查未复验(或失败未复跑)。\
+结论可能不完整;回复「继续验证」可让我补齐。"
+        .to_string()
 }
 
 fn completion_blocked_message(evidence: &CompletionEvidence) -> String {
@@ -3048,8 +3105,11 @@ fn completion_blocked_message(evidence: &CompletionEvidence) -> String {
     )
 }
 
-fn iteration_ceiling_terminal_event(evidence: &CompletionEvidence) -> StreamEvent {
-    if evidence.completed {
+fn iteration_ceiling_terminal_event(
+    evidence: &CompletionEvidence,
+    mode: AgentMode,
+) -> StreamEvent {
+    if evidence.completed || !matches!(mode, AgentMode::Autonomous) {
         StreamEvent::Done {
             input_tokens: 0,
             output_tokens: 0,
@@ -3068,7 +3128,9 @@ fn completion_recovery_prompt(
 ) -> Option<String> {
     match completion_finalization(evidence, attempts, mode) {
         CompletionFinalization::Recover(prompt) => Some(prompt),
-        CompletionFinalization::Complete | CompletionFinalization::Blocked(_) => None,
+        CompletionFinalization::Complete
+        | CompletionFinalization::ReleaseWithWarning(_)
+        | CompletionFinalization::Blocked(_) => None,
     }
 }
 
@@ -4652,16 +4714,33 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_recovery_is_a_blocked_terminal_not_success() {
+    fn exhausted_recovery_releases_with_warning_in_chat_and_blocks_autonomous() {
+        // Updated from `exhausted_recovery_is_a_blocked_terminal_not_success`,
+        // which pinned the behavior the 2026-07-21 field report complained
+        // about: in Interactive/Execute chat, exhausting recovery FOLDED the
+        // model's final reply and killed the turn with an untranslated
+        // internal-contract Error ("Completion blocked because required
+        // verification is still missing: rerun every unresolved failed
+        // check…"). With the user present, the reply is the best available
+        // answer: release it WITH a visible warning. Hard-blocking remains
+        // correct only for unattended Autonomous runs (the scheduler
+        // respawns those).
         let unsatisfied = CompletionGate::new(true).evidence();
         assert!(matches!(
             completion_finalization(&unsatisfied, 1, AgentMode::Interactive),
-            CompletionFinalization::Blocked(_)
+            CompletionFinalization::ReleaseWithWarning(_)
         ));
         assert!(matches!(
             completion_finalization(&unsatisfied, 3, AgentMode::Execute),
-            CompletionFinalization::Blocked(_)
+            CompletionFinalization::ReleaseWithWarning(_)
         ));
+        if let CompletionFinalization::ReleaseWithWarning(warning) =
+            completion_finalization(&unsatisfied, 1, AgentMode::Interactive)
+        {
+            // Human-readable Chinese, no internal-contract terminology.
+            assert!(warning.contains("未经完整验证"));
+            assert!(!warning.contains("Completion blocked"));
+        }
         assert!(matches!(
             completion_finalization(&unsatisfied, 3, AgentMode::Autonomous),
             CompletionFinalization::Blocked(_)
@@ -4673,12 +4752,18 @@ mod tests {
             CompletionFinalization::Complete
         ));
 
+        // Iteration ceiling: chat surfaces end with Done (the reply stands,
+        // warning persisted separately); only Autonomous errors out.
         assert!(matches!(
-            iteration_ceiling_terminal_event(&unsatisfied),
+            iteration_ceiling_terminal_event(&unsatisfied, AgentMode::Interactive),
+            StreamEvent::Done { .. }
+        ));
+        assert!(matches!(
+            iteration_ceiling_terminal_event(&unsatisfied, AgentMode::Autonomous),
             StreamEvent::Error { .. }
         ));
         assert!(matches!(
-            iteration_ceiling_terminal_event(&satisfied),
+            iteration_ceiling_terminal_event(&satisfied, AgentMode::Interactive),
             StreamEvent::Done { .. }
         ));
     }

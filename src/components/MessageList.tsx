@@ -249,6 +249,17 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
     );
   }
 
+  // Verification-incomplete warning: the reply stands, amber notice below.
+  if (msg.completionState === "gate_warning") {
+    return (
+      <div className="flex justify-center">
+        <div className="max-w-[85%] rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-[11px] leading-snug text-amber-800 dark:text-amber-200 break-words whitespace-pre-wrap">
+          {msg.content}
+        </div>
+      </div>
+    );
+  }
+
   // Neutral runtime notices (e.g. images stripped for a no-vision model).
   if (msg.completionState === "turn_notice") {
     return (
@@ -399,8 +410,9 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
           key={`gate-${index}`}
           className="w-fit max-w-full rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1 text-[11px] leading-snug text-sky-800 dark:text-sky-200 break-words"
         >
-          完成度检查介入({action.kind === "recovery" ? "要求补充验证" : "要求收尾"})
-          {action.detail ? ` · ${action.detail}` : ""}
+          {action.kind === "warning"
+            ? action.detail
+            : `完成度检查介入(${action.kind === "recovery" ? "要求补充验证" : "要求收尾"})${action.detail ? ` · ${action.detail}` : ""}`}
         </div>
       ))}
       {!timeline && msg.content && (
