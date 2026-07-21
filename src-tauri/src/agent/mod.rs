@@ -789,6 +789,44 @@ impl AgentLoop {
                 // history). Strip images to placeholders and retry ONCE —
                 // otherwise every「继续」replays the same history and dies the
                 // same death (2026-07-21 field report).
+                // Provider says the prompt is over the window: the resolved
+                // window metadata or the token estimate was wrong. Emergency-
+                // compress against a reduced budget and retry ONCE — a killed
+                // turn on a replayable history dies identically on every
+                //「继续」(2026-07-21: three context-window deaths in one day).
+                Err(e) if context::is_context_overflow(&e.to_string()) => {
+                    let emergency_limit = (context_limit / 5).max(1) * 4;
+                    let compression = context::compress_if_needed(
+                        std::mem::take(&mut messages),
+                        system_prompt,
+                        emergency_limit,
+                    );
+                    if !compression.compressed {
+                        return Err(e);
+                    }
+                    messages = repair_openai_tool_protocol(compression.messages);
+                    let notice = format!(
+                        "上下文超出模型窗口,已压缩 {} 条历史(约释放 {} tokens)后重试。",
+                        compression.elided_count, compression.tokens_freed
+                    );
+                    self.persist_gate_message(&notice, "turn_notice").await?;
+                    self.app
+                        .emit(
+                            event_name,
+                            StreamEvent::CompletionGateAction {
+                                kind: "turn_notice".into(),
+                                detail: notice.clone(),
+                            },
+                        )
+                        .ok();
+                    self.call_openai_transport(
+                        &messages,
+                        active_tool_defs,
+                        required_tool_response,
+                        event_name,
+                    )
+                    .await?
+                }
                 Err(e) if is_vision_rejection(&e.to_string()) => {
                     let stripped = strip_image_parts(&mut messages);
                     if stripped == 0 {

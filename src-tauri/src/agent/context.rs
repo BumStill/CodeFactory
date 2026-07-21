@@ -128,7 +128,25 @@ pub fn resolve_context_window(
         }
     }
 
-    // 3. Pattern-match against known model families. Direct providers don't
+    // 3. Route-capability override BEFORE the public name-based capacity:
+    //    the ChatGPT subscription backend caps gpt-5.x at the Codex route
+    //    window (272K) regardless of the API model's 1.05M capacity. Guessing
+    //    1.05M put the compression trigger at ~787K so compression never
+    //    fired, and the route rejected real prompts with "input exceeds the
+    //    context window" (2026-07-21, three killed turns). Explicit catalog
+    //    metadata above still wins.
+    if let Some(ep) = settings.endpoints.get(endpoint_name) {
+        if matches!(ep.api_style, crate::config::settings::ApiStyle::Chatgpt)
+            && model_id.to_lowercase().starts_with("gpt-5")
+        {
+            return ResolvedContextWindow {
+                default_limit: 272_000,
+                max_limit: 272_000,
+            };
+        }
+    }
+
+    // 4. Pattern-match against known model families. Direct providers don't
     //    expose /models or return context_length, so without this the UI bar
     //    shows nonsense like "60K / 16K = 375 %" for a real 128K-context call.
     if let Some(n) = guess_context_from_name(model_id) {
@@ -299,6 +317,24 @@ pub struct CompressionResult {
 /// Why assistant messages too: in long conversations the model's own
 /// markdown output can consume more tokens than tool results — leaving
 /// those untouched is how we shipped "context window exceeded" errors.
+/// Does this provider error mean "the prompt is over the context window"?
+/// Narrow on purpose (capacity wording only) — a false positive would
+/// silently degrade history on unrelated failures.
+pub fn is_context_overflow(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "context window",
+        "context length",
+        "context_length",
+        "maximum context",
+        "prompt is too long",
+        "input exceeds",
+        "too many tokens",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 pub fn compress_if_needed(
     messages: Vec<ChatMessage>,
     system_prompt: &str,
@@ -558,6 +594,61 @@ mod tests {
         let window = resolve_context_window(&settings, "chatgpt", "gpt-5.6-sol", None);
         assert_eq!(window.default_limit, 258_400);
         assert_eq!(window.max_limit, 258_400);
+    }
+
+    #[test]
+    fn chatgpt_subscription_route_caps_gpt56_at_the_route_window() {
+        // 2026-07-21 field failure: gpt-5.6-sol via the ChatGPT subscription
+        // backend rejected prompts with "input exceeds the context window"
+        // three times. Name-guess said 1.05M (API capacity) so compression
+        // never triggered; the subscription route caps at 272K.
+        let mut settings = Settings::default();
+        settings.endpoints.insert(
+            "chatgpt".into(),
+            Endpoint {
+                base_url: "https://chatgpt.com/backend-api/codex".into(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                custom_models: vec![],
+                active_model: Some("gpt-5.6-sol".into()),
+            },
+        );
+        let window = resolve_context_window(&settings, "chatgpt", "gpt-5.6-sol", None);
+        assert_eq!(window.default_limit, 272_000);
+        assert_eq!(window.max_limit, 272_000);
+
+        let mut api = Settings::default();
+        api.endpoints.insert(
+            "openai".into(),
+            Endpoint {
+                base_url: "https://api.openai.com/v1".into(),
+                key_ref: None,
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: None,
+            },
+        );
+        let window = resolve_context_window(&api, "openai", "gpt-5.6-sol", None);
+        assert_eq!(window.default_limit, 1_050_000);
+    }
+
+    #[test]
+    fn context_overflow_detector_matches_capacity_errors_only() {
+        for err in [
+            "ChatGPT 后端返回错误:Your input exceeds the context window of this model.",
+            "400 This model's maximum context length is 65536 tokens",
+            "context_length_exceeded",
+            "prompt is too long: 210000 tokens > 200000 maximum",
+        ] {
+            assert!(super::is_context_overflow(err), "{err}");
+        }
+        for err in [
+            "429 rate limit exceeded",
+            "This model does not support image input",
+            "500 Internal Server Error",
+        ] {
+            assert!(!super::is_context_overflow(err), "{err}");
+        }
     }
 
     #[test]
