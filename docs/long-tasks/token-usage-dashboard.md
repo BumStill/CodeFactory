@@ -14,9 +14,9 @@
 
 ## Current State
 
-- Current phase: Phase 4 — Release Proof
-- Current checkpoint: Phase 0-3 的首发范围已实现并通过本地回归、双视口 headless 与隔离 Dev App 数据库验证；尚未完成 PR/CI、合并、刻意发版和精确公开产物 smoke，因此仍为 `not live`
-- Next owner: release/QA 角色复核 diff 与证据，完成同步门禁、PR+CI、合并、按需发版和 macOS/Windows 精确产物验证
+- Current phase: Complete — Live in v1.58.0
+- Current checkpoint: CF-USAGE-R1..R22 已由 PR #160 合并；PR 与合并后 main CI、锁屏无关远端 GUI、刻意发版、Windows/macOS 构建、公开 DMG 二次下载与 GUI smoke 均通过，能力已随 v1.58.0 上线
+- Next owner: 产品运营按真实使用数据观察采集缺失率、预算触发与高消耗来源；后续增强不属于本次完成门禁
 - Updated at: 2026-07-22
 
 ## Completed Items
@@ -34,13 +34,12 @@
 - 日期下钻展示入口与高消耗会话；“查看会话”和“查看作业日志”分离，只有能由 `task_runs` 反查父会话时才显式展示真实作业日志入口并高亮任务。
 - Workspace 底栏切到新真相源；Profile 移除旧的第二套成本统计写入口。
 - 文档复核将模型/Endpoint/项目筛选和自定义日期明确列为后续分析增强，不冒充本次首发能力。
+- PR #160 通过全部检查后 squash 合并到 `main`；合并后精确提交的 CI 与治理门禁再次通过。
+- Auto Release 将版本从 v1.57.0 升至 v1.58.0；Windows 安装器、macOS DMG、Tauri updater 资产与跨平台 `latest.json` 已公开。
+- 发布 workflow 在独立 macOS runner 上安装构建产物，并在发布后从匿名公开 URL 重新下载 DMG 完成二次 GUI 验证。
+- 本次隔离 Dev 验收结束后已主动关闭 Tauri/Vite/esbuild/debug 进程组并确认 1424 端口释放；后续 Dev 实例必须按工作树登记并在用完后清理。
 
 ## Remaining Items
-
-### Phase 4 — Release Proof
-
-- PR、CI、独立 QA、合并和刻意发版。
-- Windows installer、macOS DMG、公开产物下载、build metadata、迁移、多轮、地图、重启和 rollback smoke。
 
 ### 后续增强（非本次首发门禁）
 
@@ -50,22 +49,24 @@
 ## Blockers
 
 - 当前无 blocker。
-- 本机锁屏时不要求用户解锁、不绕过 macOS 安全；继续运行 headless 双视口、CLI 和 GitHub runner。Tauri 壳由远端 macOS artifact smoke 补充，不能用 headless 冒充。
+- 本机锁屏未要求用户解锁、未绕过 macOS 安全；headless 双视口、隔离 runtime、远端真实 GUI 和公开 macOS artifact smoke 共同补齐了验证链路。
 
 ## Evidence
 
-- Local evidence: `pnpm test` 62 files / 266 tests 全绿；`pnpm test:rust:fast` 430 passed / 6 ignored；`pnpm build`、`cargo check`、治理基线、长任务 validator 通过。
+- Local evidence: `pnpm test` 63 files / 267 tests 全绿；`pnpm test:rust:fast` 430 passed / 6 ignored；`pnpm build`、`cargo check`、治理基线、长任务 validator 通过。
 - Local evidence: `pnpm test:usage:headless` 在 1366×768 与 375×812 通过，验证今日摘要、三种地图指标、zero/missing/today/over-budget、日期下钻、真实作业日志交接、预算与移动端按月列表；证据目录为系统临时目录 `codefactory-token-usage-headless`。
 - Local evidence: `/Applications/CodeFactoryUsageDev.app` 使用隔离 HOME/DB 启动；settings 为 `full_access=true, ask=[], deny=[]`；SQLite 存在四张用量/预算/迁移表，`usage-v1` 回执存在且 `PRAGMA integrity_check=ok`。
-- Release evidence: 尚无，本能力当前 `not live`。
-- Blocking evidence: 本机交互桌面在锁屏状态不可见；未要求用户解锁，已用 headless 双视口和隔离 Dev runtime 继续验证，Tauri 壳由发布 runner/产物 smoke 补齐。
+- PR evidence: PR #160 合并提交 `0da9525`；PR CI run `29908680308`、远端真实 GUI run `29908680360`、合并后 main CI run `29909157635` 全部成功。
+- Release evidence: Auto Release run `29909721966` 生成 v1.58.0 与版本提交 `10bbf34`；Release run `29909741236` 的 changelog、prepare、Windows、macOS、finalize 与 published-macOS 六个 job 全部成功。
+- Public evidence: GitHub Release `v1.58.0` 为非 draft、非 prerelease；DMG、Windows EXE、双平台 updater 包/签名和 `latest.json` 均已上传。匿名 DMG range 请求返回 HTTP 206；manifest 版本为 1.58.0，并包含 `darwin-aarch64`、`windows-x86_64`、`windows-x86_64-nsis`。
+- Blocking evidence: 本机交互桌面在锁屏状态不可见；未要求用户解锁，最终由 lock-independent remote GUI、安装后 artifact smoke 与公开产物二次下载验证补齐，不再构成 blocker。
 
 ## AI Collaboration
 
 - context scope: `src-tauri/src/agent/mod.rs`、`commands/costs.rs`、provider Usage、SQLite、`ContextUsageBar`、`CostDashboardSection`、Welcome、Settings、Profile 和现有作业日志 route。
 - assumptions: 首版本地单用户、逐 Provider 请求计量、Token 预算优先、无云端账单依赖；成本与任务质量分离。
 - review point: development 不得先画地图再补数据；QA 必须用工具多轮真实路径对账；release 必须验证 exact artifact 和旧库迁移。
-- validation result: 实现与本地验证完成；PR/CI、合并、release 和精确产物验证待完成，因此当前 `not live`。
+- validation result: 实现、本地验证、PR/CI、合并、刻意发版和精确公开产物验证全部完成；v1.58.0 当前为 `live`。
 
 ## Stop Boundary
 
