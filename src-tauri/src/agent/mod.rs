@@ -1272,6 +1272,7 @@ impl AgentLoop {
 
                 let ctx = ExecCtx {
                     cwd: self.cwd.clone(),
+                    #[cfg(not(test))]
                     app: Some(self.app.clone()),
                     db: Some(self.db.clone()),
                     session_id: Some(self.audit_session_id()),
@@ -2939,6 +2940,7 @@ impl AgentLoop {
 
                 let ctx = ExecCtx {
                     cwd: self.cwd.clone(),
+                    #[cfg(not(test))]
                     app: Some(self.app.clone()),
                     db: Some(self.db.clone()),
                     session_id: Some(self.audit_session_id()),
