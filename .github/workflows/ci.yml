@@ -99,10 +99,25 @@ jobs:
       # "old sessions won't open" bug land here as failing tests so we
       # catch them before tagging a release instead of after a user
       # reports it.
-      - name: Cargo test
+      - name: Build Rust tests
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/codefactory-cargo-test-target
-        run: cargo test --manifest-path src-tauri/Cargo.toml --quiet
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-run --quiet
+
+      - name: Diagnose and run Rust tests
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/codefactory-cargo-test-target
+        run: |
+          $testExe = Get-ChildItem "$env:CARGO_TARGET_DIR/debug/deps/codefactory_lib-*.exe" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $testExe) { throw "Rust test executable not found" }
+          Write-Host "TEST_EXE=$($testExe.FullName)"
+          & dumpbin /dependents $testExe.FullName
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with $LASTEXITCODE" }
+          & $testExe.FullName __codefactory_loader_probe_no_test__ --exact
+          if ($LASTEXITCODE -ne 0) { throw "loader probe failed with $LASTEXITCODE" }
+          cargo test --manifest-path src-tauri/Cargo.toml --quiet
 
       - name: Evolution executable closed-loop smoke
         shell: pwsh
