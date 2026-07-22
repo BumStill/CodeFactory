@@ -500,9 +500,10 @@ pub async fn deliver<R: DeliveryRemote>(
 /// path AND the model-behavior contract: surface it to the user and wait —
 /// retrying deliver_changes cannot succeed until a token exists. (The app's
 /// only historical deliver_changes call died exactly here.)
-pub const NO_TOKEN_PR_MESSAGE: &str = "已提交并推送,但未配置远端 token,无法开 PR。\
-请把这句原样告诉用户:在设置→远程仓库里为该仓库配置 GitHub 访问令牌(需 repo 权限),\
-配置完成后回复继续即可自动完成 PR/CI/合并/发布。在用户确认配置完成之前,不要再调用 deliver_changes。";
+pub const NO_TOKEN_PR_MESSAGE: &str = "已提交并推送,但没有可用的 GitHub 通道,无法开 PR。\
+两条路任选其一(推荐前者):1) 在终端执行 `gh auth login` 登录 GitHub CLI——登录一次,\
+交付链即刻可用,无需在应用里配任何令牌;2) 在设置→远程仓库为该仓库配置访问令牌。\
+把这两条路原样告诉用户;在用户完成其一之前,不要再调用 deliver_changes 重试。";
 
 fn ceiling_label(ceiling: DeliveryCeiling) -> &'static str {
     match ceiling {
@@ -522,11 +523,30 @@ pub fn delivery_readiness_from_origin(
     origin_url: Option<&str>,
     settings: &crate::config::settings::Settings,
 ) -> Option<String> {
+    delivery_readiness_with_gh(origin_url, settings, gh_cli_available())
+}
+
+/// Testable core of [`delivery_readiness_from_origin`] with the gh probe
+/// injected.
+pub fn delivery_readiness_with_gh(
+    origin_url: Option<&str>,
+    settings: &crate::config::settings::Settings,
+    gh_available: bool,
+) -> Option<String> {
     use crate::config::settings::GitProvider;
     if settings.delivery_ceiling == DeliveryCeiling::Off {
         return None;
     }
     let owner_repo = origin_url.and_then(parse_owner_repo)?;
+    if gh_available {
+        return Some(format!(
+            "\n\n# Delivery capability\n\
+             Repo {owner_repo}: a logged-in GitHub CLI is available — the delivery chain \
+             (PR/CI/merge/release, up to ceiling {}) works with ZERO app-side token setup. \
+             Never ask the user to configure a remote token while gh is available.",
+            ceiling_label(settings.delivery_ceiling)
+        ));
+    }
     let has_github_remote = settings
         .git_remotes
         .iter()
@@ -542,11 +562,12 @@ pub fn delivery_readiness_from_origin(
     } else {
         format!(
             "\n\n# Delivery capability (BROKEN — surface early)\n\
-             The delivery chain for {owner_repo} cannot open a PR: no GitHub token is \
-             configured (设置→远程仓库). If this task involves delivering code, say so in your \
-             FIRST reply — give the user that settings path and ask them to configure a token \
-             (repo scope) — and do NOT call deliver_changes until they confirm it is configured. \
-             Local work (tests, edits, commits) can proceed in the meantime."
+             The delivery chain for {owner_repo} cannot open a PR: no logged-in GitHub CLI \
+             and no configured token. If this task involves delivering code, say so in your \
+             FIRST reply and offer both fixes — preferred: run `gh auth login` once in a \
+             terminal (zero app-side config); alternative: 设置→远程仓库 token setup — and \
+             do NOT call deliver_changes until one of them is done. Local work (tests, \
+             edits, commits) can proceed in the meantime."
         )
     })
 }
@@ -605,6 +626,249 @@ async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32
         ))
         .await;
         waited += step;
+    }
+}
+
+// ── GitHub provider (gh CLI, preferred) ─────────────────────────────────────
+
+/// Which remote transport a delivery run will use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteKind {
+    /// A logged-in `gh` CLI on this machine — zero app-side configuration.
+    GhCli,
+    /// The portable token+REST client from configured git_remotes.
+    RestToken,
+}
+
+/// gh CLI first (the user already authenticated it once, system-wide), the
+/// configured token second, nothing → the caller blocks with guidance. Field
+/// report: delivery kept demanding an app token while a logged-in gh sat
+/// right there.
+pub fn resolve_remote_kind(gh_available: bool, has_rest_token: bool) -> Option<RemoteKind> {
+    if gh_available {
+        Some(RemoteKind::GhCli)
+    } else if has_rest_token {
+        Some(RemoteKind::RestToken)
+    } else {
+        None
+    }
+}
+
+/// Is a logged-in gh CLI available? `gh auth status` exits non-zero when the
+/// binary is missing OR no host is authenticated — exactly the two cases
+/// where the REST fallback should take over.
+pub fn gh_cli_available() -> bool {
+    Command::new("gh")
+        .no_window()
+        .args(["auth", "status"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn gh_pr_create_args(title: &str, body: &str, head: &str, base: &str) -> Vec<String> {
+    vec![
+        "pr".into(), "create".into(),
+        "--title".into(), title.into(),
+        "--body".into(), body.into(),
+        "--head".into(), head.into(),
+        "--base".into(), base.into(),
+    ]
+}
+
+fn gh_pr_merge_args(number: u64, method: MergeMethod) -> Vec<String> {
+    let flag = match method {
+        MergeMethod::Squash => "--squash",
+        MergeMethod::Merge => "--merge",
+        MergeMethod::Rebase => "--rebase",
+    };
+    vec!["pr".into(), "merge".into(), number.to_string(), flag.into()]
+}
+
+fn gh_workflow_run_args(workflow: &str, git_ref: &str) -> Vec<String> {
+    vec![
+        "workflow".into(), "run".into(), workflow.into(),
+        "--ref".into(), git_ref.into(),
+    ]
+}
+
+/// [`DeliveryRemote`] over a logged-in `gh` CLI. All commands run in the repo
+/// root so gh resolves the repo from the checkout, using the user's existing
+/// system-wide authentication — no app-side token required.
+pub struct GhCliRemote {
+    cwd: PathBuf,
+    repo: String,
+    default_branch: String,
+    release_workflow: String,
+}
+
+/// Build a [`GhCliRemote`] for `cwd` when it is a GitHub checkout. Does not
+/// probe authentication — pair with [`gh_cli_available`].
+pub fn gh_remote_for(cwd: &Path) -> Option<GhCliRemote> {
+    let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
+    let origin = git(Path::new(&root), &["remote", "get-url", "origin"]).ok()?;
+    let repo = parse_owner_repo(&origin)?;
+    let default_branch = git(
+        Path::new(&root),
+        &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .and_then(|s| s.rsplit('/').next().map(String::from))
+    .unwrap_or_else(|| "main".to_string());
+    Some(GhCliRemote {
+        cwd: PathBuf::from(root),
+        repo,
+        default_branch,
+        release_workflow: "auto-release.yml".to_string(),
+    })
+}
+
+impl GhCliRemote {
+    fn gh(&self, args: &[String]) -> Result<String, String> {
+        let out = Command::new("gh")
+            .no_window()
+            .current_dir(&self.cwd)
+            .args(args)
+            .output()
+            .map_err(|e| format!("failed to spawn gh: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+}
+
+impl DeliveryRemote for GhCliRemote {
+    async fn open_or_get_pr(
+        &self,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<(u64, String), String> {
+        // Reuse an open PR for this head first — idempotence contract.
+        let existing = self.gh(&[
+            "pr".into(), "list".into(),
+            "--head".into(), head.into(),
+            "--base".into(), base.into(),
+            "--state".into(), "open".into(),
+            "--json".into(), "number,url".into(),
+            "--limit".into(), "1".into(),
+        ])?;
+        if let Ok(list) = serde_json::from_str::<serde_json::Value>(&existing) {
+            if let Some(pr) = list.as_array().and_then(|a| a.first()) {
+                if let (Some(n), Some(u)) = (pr["number"].as_u64(), pr["url"].as_str()) {
+                    return Ok((n, u.to_string()));
+                }
+            }
+        }
+        self.gh(&gh_pr_create_args(title, body, head, base))?;
+        let created = self.gh(&[
+            "pr".into(), "view".into(), head.into(),
+            "--json".into(), "number,url".into(),
+        ])?;
+        let v: serde_json::Value = serde_json::from_str(&created)
+            .map_err(|e| format!("gh pr view returned non-JSON: {e}"))?;
+        match (v["number"].as_u64(), v["url"].as_str()) {
+            (Some(n), Some(u)) => Ok((n, u.to_string())),
+            _ => Err("gh pr view missing number/url".into()),
+        }
+    }
+
+    async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
+        let raw = self.gh(&[
+            "api".into(),
+            format!("repos/{}/commits/{}/check-runs", self.repo, sha),
+        ])?;
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("check-runs non-JSON: {e}"))?;
+        let runs = v["check_runs"].as_array().cloned().unwrap_or_default();
+        if runs.is_empty() {
+            return Ok(CiStatus::None);
+        }
+        let mut pending = false;
+        for run in &runs {
+            let status = run["status"].as_str().unwrap_or("");
+            let conclusion = run["conclusion"].as_str().unwrap_or("");
+            if status != "completed" {
+                pending = true;
+            } else if !matches!(conclusion, "success" | "skipped" | "neutral") {
+                let name = run["name"].as_str().unwrap_or("check");
+                return Ok(CiStatus::Failure(format!("{name}: {conclusion}")));
+            }
+        }
+        Ok(if pending { CiStatus::Pending } else { CiStatus::Success })
+    }
+
+    async fn merge_pr(&self, number: u64, method: MergeMethod) -> Result<(), String> {
+        self.gh(&gh_pr_merge_args(number, method)).map(|_| ())
+    }
+
+    async fn trigger_release(&self) -> Result<String, String> {
+        self.gh(&gh_workflow_run_args(&self.release_workflow, &self.default_branch))
+            .map(|_| format!("已通过 gh 触发发布工作流 {}", self.release_workflow))
+    }
+}
+
+/// Static-dispatch wrapper so `deliver` keeps its generic signature while the
+/// call site picks gh-vs-REST at runtime.
+pub enum EitherRemote {
+    Gh(GhCliRemote),
+    Rest(GithubRemote),
+}
+
+impl DeliveryRemote for EitherRemote {
+    async fn open_or_get_pr(
+        &self,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<(u64, String), String> {
+        match self {
+            EitherRemote::Gh(r) => r.open_or_get_pr(title, body, head, base).await,
+            EitherRemote::Rest(r) => r.open_or_get_pr(title, body, head, base).await,
+        }
+    }
+    async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
+        match self {
+            EitherRemote::Gh(r) => r.ci_status(sha).await,
+            EitherRemote::Rest(r) => r.ci_status(sha).await,
+        }
+    }
+    async fn merge_pr(&self, number: u64, method: MergeMethod) -> Result<(), String> {
+        match self {
+            EitherRemote::Gh(r) => r.merge_pr(number, method).await,
+            EitherRemote::Rest(r) => r.merge_pr(number, method).await,
+        }
+    }
+    async fn trigger_release(&self) -> Result<String, String> {
+        match self {
+            EitherRemote::Gh(r) => r.trigger_release().await,
+            EitherRemote::Rest(r) => r.trigger_release().await,
+        }
+    }
+}
+
+
+/// Resolve the best available remote for `cwd`: logged-in gh CLI first, the
+/// configured token+REST client second, `None` → delivery blocks with
+/// guidance covering BOTH setup paths.
+pub fn resolve_delivery_remote(
+    cwd: &Path,
+    settings: &crate::config::settings::Settings,
+) -> Option<EitherRemote> {
+    let gh_ok = gh_cli_available();
+    let rest = github_remote_for(cwd, settings);
+    match resolve_remote_kind(gh_ok, rest.is_some()) {
+        Some(RemoteKind::GhCli) => gh_remote_for(cwd)
+            .map(EitherRemote::Gh)
+            .or(rest.map(EitherRemote::Rest)),
+        Some(RemoteKind::RestToken) => rest.map(EitherRemote::Rest),
+        None => None,
     }
 }
 
@@ -832,11 +1096,11 @@ mod tests {
 
     #[test]
     fn no_token_message_tells_the_model_to_stop_retrying() {
-        // The app's only historical deliver_changes call blocked exactly here
-        // (git_remotes was never configured). The message must carry the fix
-        // path AND forbid blind retries — retrying cannot succeed until the
-        // user configures a token.
-        assert!(NO_TOKEN_PR_MESSAGE.contains("设置→远程仓库"));
+        // The message must offer BOTH setup paths — a one-time `gh auth
+        // login` (preferred: zero app-side config) and the conversational
+        // token flow — and forbid blind retries until one succeeds.
+        assert!(NO_TOKEN_PR_MESSAGE.contains("gh auth login"));
+        assert!(NO_TOKEN_PR_MESSAGE.contains("远程仓库"));
         assert!(NO_TOKEN_PR_MESSAGE.contains("不要再调用 deliver_changes"));
     }
 
@@ -845,13 +1109,14 @@ mod tests {
         // The broken chain must be surfaced in the model's FIRST reply, not
         // discovered after the work is done.
         let settings = crate::config::settings::Settings::default();
-        let note = delivery_readiness_from_origin(
+        let note = delivery_readiness_with_gh(
             Some("git@github.com:BumStill/CodeFactory.git"),
             &settings,
+            false,
         )
-        .expect("github origin without a token must produce a warning note");
+        .expect("github origin without gh or a token must produce a warning note");
         assert!(note.contains("FIRST reply"));
-        assert!(note.contains("设置→远程仓库"));
+        assert!(note.contains("gh auth login"));
         assert!(note.contains("do NOT call deliver_changes"));
     }
 
@@ -869,9 +1134,10 @@ mod tests {
                 token: "t".into(),
                 default_repo: Some("BumStill/CodeFactory".into()),
             });
-        let note = delivery_readiness_from_origin(
+        let note = delivery_readiness_with_gh(
             Some("https://github.com/BumStill/CodeFactory.git"),
             &settings,
+            false,
         )
         .expect("configured remote must produce a capability note");
         assert!(note.contains("pr_only"));
@@ -881,17 +1147,18 @@ mod tests {
     #[test]
     fn readiness_note_stays_silent_when_off_or_not_github() {
         let settings = crate::config::settings::Settings::default();
-        assert!(delivery_readiness_from_origin(None, &settings).is_none());
+        assert!(delivery_readiness_with_gh(None, &settings, false).is_none());
         assert!(
-            delivery_readiness_from_origin(Some("https://gitlab.com/x/y.git"), &settings)
+            delivery_readiness_with_gh(Some("https://gitlab.com/x/y.git"), &settings, false)
                 .is_none()
         );
 
         let mut off = crate::config::settings::Settings::default();
         off.delivery_ceiling = DeliveryCeiling::Off;
-        assert!(delivery_readiness_from_origin(
+        assert!(delivery_readiness_with_gh(
             Some("https://github.com/BumStill/CodeFactory.git"),
-            &off
+            &off,
+            false,
         )
         .is_none());
     }
@@ -916,6 +1183,61 @@ mod tests {
 
         let full = finish(outcome, "b", DeliveryCeiling::ThroughRelease);
         assert!(!full.summary.contains("交付上限"));
+    }
+
+    #[test]
+    fn gh_cli_is_preferred_over_rest_token_and_both_over_nothing() {
+        // Field report: the delivery chain kept demanding a configured token
+        // while a logged-in `gh` CLI sat right there. gh comes first; the
+        // token+REST path stays as the fallback for machines without gh.
+        use super::RemoteKind;
+        assert_eq!(resolve_remote_kind(true, true), Some(RemoteKind::GhCli));
+        assert_eq!(resolve_remote_kind(true, false), Some(RemoteKind::GhCli));
+        assert_eq!(resolve_remote_kind(false, true), Some(RemoteKind::RestToken));
+        assert_eq!(resolve_remote_kind(false, false), None);
+    }
+
+    #[test]
+    fn gh_cli_argv_builders_produce_exact_commands() {
+        let create = gh_pr_create_args("t", "b", "feat/x", "main");
+        assert_eq!(
+            create,
+            vec!["pr", "create", "--title", "t", "--body", "b", "--head", "feat/x", "--base", "main"]
+        );
+        let merge = gh_pr_merge_args(42, MergeMethod::Squash);
+        assert_eq!(merge, vec!["pr", "merge", "42", "--squash"]);
+        let release = gh_workflow_run_args("auto-release.yml", "main");
+        assert_eq!(
+            release,
+            vec!["workflow", "run", "auto-release.yml", "--ref", "main"]
+        );
+    }
+
+    #[test]
+    fn no_token_message_offers_the_gh_cli_path_first() {
+        assert!(NO_TOKEN_PR_MESSAGE.contains("gh auth login"));
+        assert!(NO_TOKEN_PR_MESSAGE.contains("远程仓库"));
+    }
+
+    /// Real-runtime smoke: with a logged-in gh on this machine, ci_status on
+    /// the repo's own HEAD must parse into a valid CiStatus. Skips cleanly
+    /// when gh is absent or unauthenticated.
+    #[tokio::test]
+    async fn gh_cli_remote_reads_real_ci_status_when_gh_is_authenticated() {
+        if !gh_cli_available() {
+            eprintln!("skipping gh smoke: gh missing or unauthenticated");
+            return;
+        }
+        let cwd = std::env::current_dir().unwrap();
+        let Some(remote) = gh_remote_for(&cwd) else {
+            eprintln!("skipping gh smoke: not a github repo checkout");
+            return;
+        };
+        let head = git(&cwd, &["rev-parse", "HEAD"]).unwrap();
+        match remote.ci_status(&head).await {
+            Ok(_) => {}
+            Err(e) => panic!("gh ci_status must parse: {e}"),
+        }
     }
 
     #[test]

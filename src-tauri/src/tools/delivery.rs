@@ -61,7 +61,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         extra_excludes: settings.delivery_exclude_globs.clone(),
     };
 
-    let remote = delivery::github_remote_for(&ctx.cwd, &settings);
+    let remote = delivery::resolve_delivery_remote(&ctx.cwd, &settings);
 
     let outcome = delivery::deliver(
         &ctx.cwd,
