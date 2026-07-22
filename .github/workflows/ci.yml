@@ -121,12 +121,42 @@ jobs:
           Write-Host "DUMPBIN=$dumpbin"
           & $dumpbin /dependents $testExe.FullName
           if ($LASTEXITCODE -ne 0) { throw "dumpbin dependents failed with $LASTEXITCODE" }
-          & $dumpbin /imports $testExe.FullName
+          $imports = & $dumpbin /imports $testExe.FullName
           if ($LASTEXITCODE -ne 0) { throw "dumpbin imports failed with $LASTEXITCODE" }
-          $bcrypt = Join-Path $env:SystemRoot "System32\bcryptprimitives.dll"
-          Get-Item $bcrypt | Select-Object FullName,Length,@{Name="Version";Expression={$_.VersionInfo.FileVersion}} | Format-List
-          & $dumpbin /exports $bcrypt
-          if ($LASTEXITCODE -ne 0) { throw "dumpbin exports failed with $LASTEXITCODE" }
+          $imports | Write-Host
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class NativeImportProbe {
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern IntPtr LoadLibraryW(string path);
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern IntPtr GetProcAddress(IntPtr module, string name);
+            [DllImport("kernel32.dll")]
+            public static extern bool FreeLibrary(IntPtr module);
+          }
+"@
+          $currentDll = $null
+          $missing = [System.Collections.Generic.List[string]]::new()
+          foreach ($line in $imports) {
+            if ($line -match '^    ([A-Za-z0-9_.-]+\.dll)$') {
+              $currentDll = $Matches[1]
+              continue
+            }
+            if ($currentDll -and $line -match '^\s+[0-9A-F]+\s+([A-Za-z_?@][^ ]*)$') {
+              $symbol = $Matches[1]
+              $module = [NativeImportProbe]::LoadLibraryW($currentDll)
+              if ($module -eq [IntPtr]::Zero) {
+                $missing.Add("DLL $currentDll failed to load: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())")
+              } elseif ([NativeImportProbe]::GetProcAddress($module, $symbol) -eq [IntPtr]::Zero) {
+                $missing.Add("ENTRY $currentDll!$symbol missing: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())")
+              }
+              if ($module -ne [IntPtr]::Zero) { [void][NativeImportProbe]::FreeLibrary($module) }
+            }
+          }
+          Write-Host "--- Missing imports ---"
+          $missing | ForEach-Object { Write-Host $_ }
+          if ($missing.Count -gt 0) { throw "$($missing.Count) direct imports are unavailable" }
           $probeStarted = Get-Date
           & $testExe.FullName __codefactory_loader_probe_no_test__ --exact
           $probeExit = $LASTEXITCODE
