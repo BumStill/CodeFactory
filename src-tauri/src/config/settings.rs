@@ -416,6 +416,10 @@ pub struct CustomModel {
     pub default_reasoning_effort: Option<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_reasoning_efforts: Option<Vec<ReasoningEffort>>,
+    /// Whether this model accepts image input. Explicit metadata wins over
+    /// the conservative name-based guess in `agent::context`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -722,6 +726,7 @@ mod reasoning_effort_tests {
                     effective_context_window_percent: Some(95),
                     default_reasoning_effort: None,
                     supported_reasoning_efforts: None,
+                supports_vision: None,
                 }],
                 active_model: Some("gpt-5.5".into()),
             },
