@@ -29,11 +29,15 @@ export interface UIMessage {
    *  state (done/error). Absent while still streaming (the UI ticks live off
    *  `createdAt` instead) and for plain user messages. */
   durationMs?: number;
-  /** Completion-gate provenance from the DB: "rejected_candidate" collapses
-   *  the reply, "gate_recovery"/"gate_ready" render as system notices. */
+  /** Internal completion-review provenance from the DB. Drafts and
+   *  injected review instructions are excluded from the chat transcript. */
   completionState?: string;
-  /** Live gate interventions on the streaming turn, in arrival order. */
+  /** User-facing runtime warnings/notices retained for this turn. */
   gateActions?: GateActionState[];
+  /** Internal review rounds stay out of the transcript. During recovery,
+   *  model text is buffered only so a warning-released answer can be promoted. */
+  internalReviewState?: "recovery" | "finalizing";
+  internalReviewDraft?: string;
   /** Turn timeline: narration and tool calls in arrival order. Only built
    *  during live streaming — hydrated history is already interleaved as
    *  separate rows. */
@@ -96,6 +100,12 @@ export function reduceChatStreamEvent(
         ...state,
         messages: state.messages.map((m) => {
           if (m.id !== msgId) return m;
+          if (m.internalReviewState === "recovery") {
+            return {
+              ...m,
+              internalReviewDraft: (m.internalReviewDraft ?? "") + event.content,
+            };
+          }
           const segments = [...(m.segments ?? [])];
           const tail = segments[segments.length - 1];
           if (tail && tail.kind === "text") {
@@ -108,6 +118,14 @@ export function reduceChatStreamEvent(
       };
 
     case "tool_call_start":
+      if (state.messages.some((m) => m.id === msgId && m.internalReviewState === "recovery")) {
+        return {
+          ...state,
+          messages: state.messages.map((m) =>
+            m.id === msgId ? { ...m, internalReviewDraft: "" } : m,
+          ),
+        };
+      }
       return {
         ...state,
         messages: upsertToolCall(state.messages, msgId, {
@@ -126,7 +144,10 @@ export function reduceChatStreamEvent(
         }),
       };
 
-    case "permission_request":
+    case "permission_request": {
+      const internalRecovery = state.messages.some(
+        (m) => m.id === msgId && m.internalReviewState === "recovery",
+      );
       return {
         ...state,
         pendingPermission: {
@@ -134,13 +155,16 @@ export function reduceChatStreamEvent(
           toolName: event.tool_name,
           args: event.args,
         },
-        messages: upsertToolCall(state.messages, msgId, {
-          id: event.tool_call_id,
-          name: event.tool_name,
-          args: formatToolArgs(event.args),
-          status: "waiting_permission",
-        }),
+        messages: internalRecovery
+          ? state.messages
+          : upsertToolCall(state.messages, msgId, {
+              id: event.tool_call_id,
+              name: event.tool_name,
+              args: formatToolArgs(event.args),
+              status: "waiting_permission",
+            }),
       };
+    }
 
     case "tool_result": {
       const nextStatus = event.status;
@@ -191,15 +215,27 @@ export function reduceChatStreamEvent(
         ...state,
         streaming: false,
         pendingPermission: null,
-        messages: state.messages.map((m) =>
-          m.id === msgId
-            ? {
-                ...m,
-                content: m.content + `\n\nError: ${event.message}`,
-                durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
-              }
-            : m,
-        ),
+        messages: state.messages.map((m) => {
+          if (m.id !== msgId) return m;
+          if (m.internalReviewState) {
+            const content = "本次处理未能完成，请重试。";
+            return {
+              ...m,
+              content,
+              toolCalls: [],
+              segments: [{ kind: "text", text: content }],
+              gateActions: undefined,
+              internalReviewState: undefined,
+              internalReviewDraft: undefined,
+              durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
+            };
+          }
+          return {
+            ...m,
+            content: m.content + `\n\nError: ${event.message}`,
+            durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
+          };
+        }),
       };
     }
 
@@ -246,20 +282,68 @@ export function reduceChatStreamEvent(
       };
 
     case "completion_gate_action":
-      return {
-        ...state,
-        messages: state.messages.map((m) =>
-          m.id === msgId
-            ? {
-                ...m,
-                gateActions: [
-                  ...(m.gateActions ?? []),
-                  { kind: event.kind, detail: event.detail },
-                ],
-              }
-            : m,
-        ),
-      };
+      // Recovery/ready events delimit internal review rounds. Drop everything
+      // accumulated in the shared streaming bubble so rejected drafts, repair
+      // commands, and verification chatter cannot become the user's answer.
+      // The next model text then starts a clean, self-contained final reply.
+      if (event.kind === "recovery" || event.kind === "ready") {
+        return {
+          ...state,
+          messages: state.messages.map((m) =>
+            m.id === msgId
+              ? {
+                  ...m,
+                  content: "",
+                  toolCalls: [],
+                  segments: [],
+                  gateActions: undefined,
+                  internalReviewState: event.kind === "recovery" ? "recovery" : "finalizing",
+                  internalReviewDraft: "",
+                }
+              : m,
+          ),
+        };
+      }
+      if (event.kind === "warning") {
+        return {
+          ...state,
+          messages: state.messages.map((m) => {
+            if (m.id !== msgId) return m;
+            const finalText =
+              m.internalReviewState === "recovery"
+                ? (m.internalReviewDraft ?? "")
+                : ([...(m.segments ?? [])]
+                    .reverse()
+                    .find((segment) => segment.kind === "text")?.text ?? m.content);
+            return {
+              ...m,
+              content: finalText,
+              toolCalls: [],
+              segments: finalText ? [{ kind: "text", text: finalText }] : [],
+              gateActions: [{ kind: "warning", detail: event.detail }],
+              internalReviewState: undefined,
+              internalReviewDraft: undefined,
+            };
+          }),
+        };
+      }
+      if (event.kind === "turn_notice") {
+        return {
+          ...state,
+          messages: state.messages.map((m) =>
+            m.id === msgId
+              ? {
+                  ...m,
+                  gateActions: [
+                    ...(m.gateActions ?? []),
+                    { kind: "turn_notice", detail: event.detail },
+                  ],
+                }
+              : m,
+          ),
+        };
+      }
+      return state;
 
     case "tool_call_args_delta":
     case "tool_call_end":

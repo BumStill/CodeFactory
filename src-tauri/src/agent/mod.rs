@@ -22,9 +22,8 @@ use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
     build_completion_recovery_prompt, classify_command, completion_evidence_made_progress,
     evaluate_budget_command_in_directory, provider_rejects_required_tool_choice,
-    sanitize_completion_summary,
-    should_prompt_budget_convergence, CompletionEvidence, CompletionGate, PolicyDecision,
-    ProgressTracker, ToolKind, ToolOutcome,
+    sanitize_completion_summary, should_prompt_budget_convergence, CompletionEvidence,
+    CompletionGate, PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
 };
 use futures_util::{Stream, StreamExt};
 use reqwest::Client;
@@ -1056,7 +1055,7 @@ impl AgentLoop {
                 match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
                     CompletionFinalization::Recover(prompt) => {
                         completion_recovery_attempts += 1;
-                        require_tool_next = self.mode != AgentMode::Interactive;
+                        require_tool_next = completion_recovery_requires_tool(self.mode);
                         // Make the rejection visible instead of silently looping:
                         // collapse the rejected candidate in the UI, persist the
                         // injected instruction so rebuilt history stays faithful.
@@ -1273,6 +1272,7 @@ impl AgentLoop {
 
                 let ctx = ExecCtx {
                     cwd: self.cwd.clone(),
+                    app: Some(self.app.clone()),
                     db: Some(self.db.clone()),
                     session_id: Some(self.audit_session_id()),
                     task_id: self
@@ -1460,7 +1460,10 @@ impl AgentLoop {
                 evidence.completed,
             );
             self.app
-                .emit(&event_name, iteration_ceiling_terminal_event(&evidence, self.mode))
+                .emit(
+                    &event_name,
+                    iteration_ceiling_terminal_event(&evidence, self.mode),
+                )
                 .ok();
         }
 
@@ -2588,14 +2591,15 @@ impl AgentLoop {
 
             let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
             let required_tool_response = require_tool_next && !finalization_pending;
-            let first_attempt = self.call_anthropic_transport(
-                system_prompt,
-                messages.clone(),
-                active_tool_defs,
-                required_tool_response,
-                event_name,
-            )
-            .await;
+            let first_attempt = self
+                .call_anthropic_transport(
+                    system_prompt,
+                    messages.clone(),
+                    active_tool_defs,
+                    required_tool_response,
+                    event_name,
+                )
+                .await;
             let resp = match first_attempt {
                 Ok(resp) => resp,
                 // Same no-vision degradation as the OpenAI loop: strip image
@@ -2712,7 +2716,7 @@ impl AgentLoop {
                 match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
                     CompletionFinalization::Recover(prompt) => {
                         completion_recovery_attempts += 1;
-                        require_tool_next = self.mode != AgentMode::Interactive;
+                        require_tool_next = completion_recovery_requires_tool(self.mode);
                         // Make the rejection visible instead of silently looping:
                         // collapse the rejected candidate in the UI, persist the
                         // injected instruction so rebuilt history stays faithful.
@@ -2935,6 +2939,7 @@ impl AgentLoop {
 
                 let ctx = ExecCtx {
                     cwd: self.cwd.clone(),
+                    app: Some(self.app.clone()),
                     db: Some(self.db.clone()),
                     session_id: Some(self.audit_session_id()),
                     task_id: self
@@ -3108,7 +3113,10 @@ impl AgentLoop {
                 evidence.completed,
             );
             self.app
-                .emit(event_name, iteration_ceiling_terminal_event(&evidence, self.mode))
+                .emit(
+                    event_name,
+                    iteration_ceiling_terminal_event(&evidence, self.mode),
+                )
                 .ok();
         }
 
@@ -3196,7 +3204,7 @@ fn completion_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (St
         classify_command(&command, 300_000)
     } else if tool_name.starts_with("write_")
         || tool_name.starts_with("edit_")
-        || matches!(tool_name, "write_file" | "edit_file")
+        || matches!(tool_name, "write_file" | "edit_file" | "delegate_tasks")
     {
         ToolKind::Mutation
     } else {
@@ -3205,17 +3213,21 @@ fn completion_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (St
     (command, kind)
 }
 
-/// How many times one run may reject the model's tool-call-free final response
-/// and inject a completion-recovery prompt. Every mode gets exactly one nudge.
-/// Interactive keeps normal tool selection; Execute/Autonomous require a tool
-/// call on that recovery response so repeated text-only analysis cannot consume
-/// the remaining budget (2026-07-16 session: seven near-identical replies in
-/// 13 minutes).
+/// How many times one run may reject a tool-call-free final response and ask
+/// the model to resolve concrete completion blockers. User-facing chat gets
+/// three bounded, tool-required recovery opportunities: enough to survive an
+/// incidental shell/precondition mistake without restoring the historical
+/// unbounded near-duplicate loop. Autonomous attempts stay single-shot because
+/// the scheduler can respawn them with a fresh evidence brief.
 fn completion_recovery_limit(mode: AgentMode) -> u32 {
     match mode {
-        AgentMode::Interactive => 1,
-        AgentMode::Execute | AgentMode::Autonomous => 1,
+        AgentMode::Interactive | AgentMode::Execute => 3,
+        AgentMode::Autonomous => 1,
     }
+}
+
+fn completion_recovery_requires_tool(_mode: AgentMode) -> bool {
+    true
 }
 
 fn completion_recovery_attempts_after_tool_batch(
@@ -3286,10 +3298,7 @@ fn completion_blocked_message(evidence: &CompletionEvidence) -> String {
     )
 }
 
-fn iteration_ceiling_terminal_event(
-    evidence: &CompletionEvidence,
-    mode: AgentMode,
-) -> StreamEvent {
+fn iteration_ceiling_terminal_event(evidence: &CompletionEvidence, mode: AgentMode) -> StreamEvent {
     if evidence.completed || !matches!(mode, AgentMode::Autonomous) {
         StreamEvent::Done {
             input_tokens: 0,
@@ -3790,7 +3799,8 @@ fn build_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
 /// conventions such as `/workspace` before its first tool call.
 fn base_system_prompt(mode: AgentMode, cwd: &Path) -> String {
     format!(
-        "{}\n\n{}\n\n# Working Directory\n\
+        "{}\n\n{}\n\n# Product Self-Repair Context\n\
+         When the user reports behavior of the running product and the selected repository is that product's codebase, treat it as a product bug you can fix here. Inspect and fix it in this repository; do not stop at explaining the issue or asking the user to switch contexts.\n\n# Working Directory\n\
          The project root and default tool working directory is:\n{}\n\
          Use this exact path or paths relative to it. Do not assume `/workspace` or another container path.",
         mode.system_prompt(),
@@ -4373,8 +4383,11 @@ mod tests {
         match &messages[0].content {
             MessageContent::Parts(parts) => {
                 assert!(parts.iter().all(|p| p.r#type == "text"));
-                let joined: String =
-                    parts.iter().filter_map(|p| p.text.clone()).collect::<Vec<_>>().join(" ");
+                let joined: String = parts
+                    .iter()
+                    .filter_map(|p| p.text.clone())
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 assert!(joined.contains("看下这个截图"));
                 assert!(joined.contains("图片已省略"));
             }
@@ -4470,6 +4483,20 @@ mod tests {
     //   2. system prompt — autonomous tells the model "don't ask, iterate"
     // These tests guard against accidentally regressing either by reverting
     // a constant or losing the autonomous prompt branch.
+
+    #[test]
+    fn current_repository_is_treated_as_the_product_when_the_user_reports_app_behavior() {
+        for mode in [
+            AgentMode::Interactive,
+            AgentMode::Execute,
+            AgentMode::Autonomous,
+        ] {
+            let prompt = base_system_prompt(mode, Path::new("/projects/CodeFactory"));
+            assert!(prompt.contains("the running product"));
+            assert!(prompt.contains("fix it in this repository"));
+            assert!(prompt.contains("do not stop at explaining"));
+        }
+    }
 
     #[test]
     fn agent_mode_iteration_budgets_differ_significantly() {
@@ -4677,6 +4704,58 @@ mod tests {
     }
 
     #[test]
+    fn desktop_completion_recovers_from_shell_setup_error_without_ending_the_session() {
+        let mut gate = CompletionGate::default();
+        let mut progress = ProgressTracker::new(8);
+        let mut sequence = 0;
+
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "write_file",
+            &serde_json::json!({"path": "src/app.rs", "content": "fixed"}),
+            &tools::ToolOutput::ok("written"),
+        );
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "bash",
+            &serde_json::json!({
+                "command": "status=0; grep -n stale src/app.rs || status=$?; test \"$status\" -le 1"
+            }),
+            &tools::ToolOutput::err("zsh:1: read-only variable: status"),
+        );
+
+        let failed = gate.evidence();
+        assert!(failed.failed_verification_fingerprint.is_none());
+        assert!(matches!(
+            completion_finalization(&failed, 0, AgentMode::Interactive),
+            CompletionFinalization::Recover(_)
+        ));
+
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/workspace"),
+            "bash",
+            &serde_json::json!({"command": "cargo test"}),
+            &tools::ToolOutput::ok("test result: ok. 1 passed; 0 failed"),
+        );
+
+        let recovered = gate.evidence();
+        assert!(recovered.completed, "blockers: {:?}", recovered.blockers);
+        assert_eq!(
+            completion_finalization(&recovered, 1, AgentMode::Interactive),
+            CompletionFinalization::Complete
+        );
+    }
+
+    #[test]
     fn autonomous_desktop_convergence_requires_verification_before_another_edit() {
         let mut gate = CompletionGate::new_for_instruction(
             false,
@@ -4879,16 +4958,28 @@ mod tests {
 
     #[test]
     fn completion_recovery_prompt_respects_mode_rejection_limits() {
-        // Interactive chat gets exactly one recovery nudge; a rejection loop
-        // reads to the user as the assistant repeating the same answer.
+        // User-facing chat gets several tool-backed repair opportunities. The
+        // limit still prevents the historical unbounded near-duplicate loop,
+        // while one incidental verifier/precondition mistake no longer ends
+        // an otherwise active product-fix session.
         let unsatisfied = CompletionGate::new(true).evidence();
         assert!(!unsatisfied.completed);
-        assert!(completion_recovery_prompt(&unsatisfied, 0, AgentMode::Interactive).is_some());
-        assert!(completion_recovery_prompt(&unsatisfied, 1, AgentMode::Interactive).is_none());
-        assert!(completion_recovery_prompt(&unsatisfied, 0, AgentMode::Execute).is_some());
-        assert!(completion_recovery_prompt(&unsatisfied, 1, AgentMode::Execute).is_none());
+        for attempts in 0..3 {
+            assert!(
+                completion_recovery_prompt(&unsatisfied, attempts, AgentMode::Interactive,)
+                    .is_some()
+            );
+            assert!(
+                completion_recovery_prompt(&unsatisfied, attempts, AgentMode::Execute).is_some()
+            );
+        }
+        assert!(completion_recovery_prompt(&unsatisfied, 3, AgentMode::Interactive).is_none());
+        assert!(completion_recovery_prompt(&unsatisfied, 3, AgentMode::Execute).is_none());
         assert!(completion_recovery_prompt(&unsatisfied, 0, AgentMode::Autonomous).is_some());
         assert!(completion_recovery_prompt(&unsatisfied, 1, AgentMode::Autonomous).is_none());
+        assert!(completion_recovery_requires_tool(AgentMode::Interactive));
+        assert!(completion_recovery_requires_tool(AgentMode::Execute));
+        assert!(completion_recovery_requires_tool(AgentMode::Autonomous));
 
         let satisfied = CompletionGate::new(false).evidence();
         assert!(satisfied.completed);
@@ -4916,6 +5007,10 @@ mod tests {
         let unsatisfied = CompletionGate::new(true).evidence();
         assert!(matches!(
             completion_finalization(&unsatisfied, 1, AgentMode::Interactive),
+            CompletionFinalization::Recover(_)
+        ));
+        assert!(matches!(
+            completion_finalization(&unsatisfied, 3, AgentMode::Interactive),
             CompletionFinalization::ReleaseWithWarning(_)
         ));
         assert!(matches!(
@@ -4923,7 +5018,7 @@ mod tests {
             CompletionFinalization::ReleaseWithWarning(_)
         ));
         if let CompletionFinalization::ReleaseWithWarning(warning) =
-            completion_finalization(&unsatisfied, 1, AgentMode::Interactive)
+            completion_finalization(&unsatisfied, 3, AgentMode::Interactive)
         {
             // Human-readable Chinese, no internal-contract terminology.
             assert!(warning.contains("未经完整验证"));

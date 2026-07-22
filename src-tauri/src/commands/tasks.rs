@@ -29,6 +29,41 @@ use crate::AppState;
 /// is fire-and-forget — it polls the flag and exits gracefully.
 pub type SchedulerHandles = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 
+/// Spawn one scheduler run behind a concrete `()` boundary. Keeping this in
+/// the task module prevents the session-native delegation tool from embedding
+/// `run_session`'s opaque future back into the AgentLoop tool future (which
+/// would otherwise create a recursive async type through subagents).
+#[cfg(not(test))]
+pub fn spawn_delegated_session(
+    scheduler: Arc<TaskScheduler>,
+    session_id: String,
+    settings: crate::config::settings::Settings,
+    app: AppHandle,
+    pending_permissions: crate::PendingPermissionMap,
+    interjections: crate::commands::interjections::InterjectionQueue,
+    handles: SchedulerHandles,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = scheduler
+            .run_session(
+                session_id.clone(),
+                settings,
+                app,
+                pending_permissions,
+                interjections,
+                None,
+            )
+            .await
+        {
+            tracing::error!(
+                "session-native delegated execution failed for {}: {error:#}",
+                session_id
+            );
+        }
+        handles.lock().await.remove(&session_id);
+    });
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskInput {
     pub tmp_id: String,

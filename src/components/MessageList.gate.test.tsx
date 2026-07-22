@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Completion-gate visibility tests for MessageList.
+// Completion-gate isolation tests for MessageList.
 //
 // Regression for the 2026-07-16 session: the gate rejected the model's final
 // response seven times, every rejected candidate rendered as a full normal
 // reply, and the injected recovery instruction was invisible — so the user
 // saw the assistant repeat itself for 13 minutes with no explanation. These
-// tests pin the visible contract: rejected candidates collapse, gate nudges
-// render as system notices (not user bubbles), live gate actions show up.
+// tests pin the user-facing contract: internal gate traffic is never rendered,
+// while user-actionable warnings and ordinary final answers remain visible.
 
 import { describe, it, expect } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { MessageList } from "./MessageList";
-import type { UIMessage } from "../stores/chatEvents";
+import {
+  reduceChatStreamEvent,
+  type ChatEventState,
+  type UIMessage,
+} from "../stores/chatEvents";
 
 const msg = (over: Partial<UIMessage> = {}): UIMessage => ({
   id: "m1",
@@ -22,9 +26,9 @@ const msg = (over: Partial<UIMessage> = {}): UIMessage => ({
   ...over,
 });
 
-describe("MessageList completion-gate visibility", () => {
-  it("collapses a rejected candidate reply behind a toggle", () => {
-    render(
+describe("MessageList completion-review isolation", () => {
+  it("hides rejected candidates instead of exposing internal review history", () => {
+    const { container } = render(
       <MessageList
         messages={[
           msg({ id: "candidate", completionState: "rejected_candidate" }),
@@ -35,27 +39,27 @@ describe("MessageList completion-gate visibility", () => {
       />,
     );
 
-    // Collapsed by default: the candidate body is hidden, the notice shows.
     expect(screen.queryByText(/candidate answer with a very long plan/)).toBeNull();
-    const toggle = screen.getByText(/被完成度检查驳回的候选回复/);
-    expect(toggle).toBeTruthy();
-    // The final answer still renders normally.
+    expect(screen.queryByText(/完成度检查|候选回复|点击展开/)).toBeNull();
     expect(screen.getByText(/brief final answer/)).toBeTruthy();
-
-    // Expanding reveals the candidate content.
-    fireEvent.click(toggle);
-    expect(screen.getByText(/candidate answer with a very long plan/)).toBeTruthy();
+    expect(container.textContent).toBe("brief final answer");
   });
 
-  it("renders a gate nudge as a system notice, not a user bubble", () => {
+  it("hides persisted recovery and ready instructions entirely", () => {
     const { container } = render(
       <MessageList
         messages={[
           msg({
-            id: "nudge",
+            id: "recovery",
             role: "user",
             content: "The completion gate rejected the attempted final response…",
             completionState: "gate_recovery",
+          }),
+          msg({
+            id: "ready",
+            role: "user",
+            content: "The structured completion evidence is satisfied…",
+            completionState: "gate_ready",
           }),
         ]}
         streaming={false}
@@ -63,23 +67,21 @@ describe("MessageList completion-gate visibility", () => {
       />,
     );
 
-    // System notice label is visible…
-    expect(screen.getByText(/完成度检查/)).toBeTruthy();
-    // …and it must NOT use the right-aligned user bubble layout.
+    expect(container.textContent).toBe("");
     expect(container.querySelector(".justify-end")).toBeNull();
   });
 
-  it("shows live gate actions on the streaming assistant message", () => {
-    render(
+  it("does not expose live gate actions in the assistant timeline", () => {
+    const { container } = render(
       <MessageList
         messages={[
           msg({
             id: "streaming",
-            content: "first attempt…",
+            content: "正在处理用户要求。",
             gateActions: [
               {
                 kind: "recovery",
-                detail: "at least one successful verification is required",
+                detail: "background services require a later successful bounded functional probe",
               },
             ],
           }),
@@ -89,8 +91,97 @@ describe("MessageList completion-gate visibility", () => {
       />,
     );
 
-    expect(screen.getByText(/完成度检查介入/)).toBeTruthy();
-    expect(screen.getByText(/at least one successful verification is required/)).toBeTruthy();
+    expect(screen.getByText(/正在处理用户要求/)).toBeTruthy();
+    expect(screen.queryByText(/完成度检查|background services require/)).toBeNull();
+    expect(container.textContent).not.toContain("completion");
+  });
+
+  it("renders only the self-contained answer after a real recovery event sequence", () => {
+    let state: ChatEventState = {
+      messages: [
+        msg({
+          id: "streaming",
+          content: "先执行与用户无关的内部步骤。",
+          toolCalls: [
+            { id: "old", name: "bash", args: "{}", status: "done", result: "ok" },
+          ],
+          segments: [
+            { kind: "text", text: "先执行与用户无关的内部步骤。" },
+            { kind: "tool", toolCallId: "old" },
+          ],
+        }),
+      ],
+      streaming: true,
+      inputTokenTotal: 0,
+      outputTokenTotal: 0,
+      pendingPermission: null,
+      contextUsage: null,
+      compressionToast: null,
+    };
+
+    state = reduceChatStreamEvent(
+      state,
+      {
+        type: "completion_gate_action",
+        kind: "recovery",
+        detail: "background services require a later successful bounded functional probe",
+      },
+      "streaming",
+    );
+    state = reduceChatStreamEvent(
+      state,
+      { type: "text_delta", content: "后台服务已运行，现在执行后续探针。" },
+      "streaming",
+    );
+    state = reduceChatStreamEvent(
+      state,
+      { type: "tool_call_start", id: "probe", name: "bash", args: {} },
+      "streaming",
+    );
+    state = reduceChatStreamEvent(
+      state,
+      { type: "completion_gate_action", kind: "ready", detail: "" },
+      "streaming",
+    );
+    state = reduceChatStreamEvent(
+      state,
+      {
+        type: "text_delta",
+        content: "已完成：拆任务能力已内置到当前会话，用户无需进入独立页面。",
+      },
+      "streaming",
+    );
+
+    const { container } = render(
+      <MessageList messages={state.messages} streaming={false} cwd={null} />,
+    );
+    expect(container.textContent).toBe(
+      "已完成：拆任务能力已内置到当前会话，用户无需进入独立页面。",
+    );
+    expect(container.querySelector("[data-segment='step']")).toBeNull();
+    expect(screen.queryByText(/bash|后台服务|完成度检查|background services/)).toBeNull();
+  });
+
+  it("shows a user-facing verification warning without internal gate wording", () => {
+    render(
+      <MessageList
+        messages={[
+          msg({
+            id: "warning",
+            content: "功能已经内置到会话。",
+            gateActions: [
+              { kind: "warning", detail: "⚠ 仍有一项检查未通过。" },
+            ],
+          }),
+        ]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+
+    expect(screen.getByText("功能已经内置到会话。")).toBeTruthy();
+    expect(screen.getByText("⚠ 仍有一项检查未通过。")).toBeTruthy();
+    expect(screen.queryByText(/完成度检查|completion gate/)).toBeNull();
   });
 
   it("renders a persisted turn error as a visible error notice, not a user bubble", () => {

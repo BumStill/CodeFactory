@@ -236,6 +236,9 @@ export const useTasksStore = create<TasksState>((set, get) => ({
       const u = await listen<TaskEventPayload>(`${k}:${sessionId}`, (event) => {
         // Append to the execution log so the UI can stream progress.
         const payload = event.payload;
+        if (k === "task_started" || k === "task_progress" || k === "task_retry") {
+          set((s) => ({ running: { ...s.running, [sessionId]: true } }));
+        }
         // Backend may attach files_changed + cwd on task_completed only.
         // Cast through Record because TaskEventPayload may not yet declare
         // these fields in the local type; the wire format does include them.

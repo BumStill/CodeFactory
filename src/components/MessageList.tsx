@@ -234,7 +234,6 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
   // of hooks. Only the live streaming tail arms the 1s ticker; for every
   // other row `active` is false, so this is inert.
   const nowMs = useNowTick(isStreamingTail);
-  const [showRejected, setShowRejected] = useState(false);
   const [showAllSteps, setShowAllSteps] = useState(false);
 
   // A persisted turn failure (provider error that killed the turn). Red
@@ -272,40 +271,16 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
     );
   }
 
-  // Injected completion-gate instructions are persisted as user-role turns
-  // for history fidelity, but they are the harness talking — render them as
-  // a centered system notice, never as a user bubble.
-  if (msg.completionState === "gate_recovery" || msg.completionState === "gate_ready") {
-    return (
-      <div className="flex justify-center">
-        <div className="max-w-[85%] rounded border border-sky-500/30 bg-sky-500/10 px-2.5 py-1 text-[11px] leading-snug text-sky-800 dark:text-sky-200">
-          {msg.completionState === "gate_recovery"
-            ? "完成度检查驳回了上一条候选回复,要求先补充验证"
-            : "完成度检查通过,要求给出最终收尾"}
-        </div>
-      </div>
-    );
-  }
-
-  // A candidate reply the gate rejected: collapse it behind a toggle so the
-  // transcript doesn't read as the assistant repeating itself.
-  if (msg.completionState === "rejected_candidate") {
-    return (
-      <div className="text-sm space-y-1.5">
-        <button
-          type="button"
-          onClick={() => setShowRejected((v) => !v)}
-          className="text-[11px] text-gray-500 hover:text-gray-300 border border-surface-3 rounded px-2 py-1"
-        >
-          被完成度检查驳回的候选回复({showRejected ? "收起" : "点击展开"})
-        </button>
-        {showRejected && (
-          <div className="prose dark:prose-invert prose-sm max-w-none opacity-70 [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
-            <ReactMarkdown components={markdownComponents}>{msg.content}</ReactMarkdown>
-          </div>
-        )}
-      </div>
-    );
+  // Completion review is an internal control loop. Persisted recovery
+  // instructions and rejected drafts remain available to the agent's history,
+  // but never become chat content: they are neither user input nor a useful
+  // assistant answer.
+  if (
+    msg.completionState === "gate_recovery" ||
+    msg.completionState === "gate_ready" ||
+    msg.completionState === "rejected_candidate"
+  ) {
+    return null;
   }
 
   if (isUser) {
@@ -406,16 +381,20 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
           模型连接重试 {retry.attempt}/{retry.maxAttempts} · {retry.reason}
         </div>
       ))}
-      {msg.gateActions?.map((action, index) => (
-        <div
-          key={`gate-${index}`}
-          className="w-fit max-w-full rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1 text-[11px] leading-snug text-sky-800 dark:text-sky-200 break-words"
-        >
-          {action.kind === "warning"
-            ? action.detail
-            : `完成度检查介入(${action.kind === "recovery" ? "要求补充验证" : "要求收尾"})${action.detail ? ` · ${action.detail}` : ""}`}
-        </div>
-      ))}
+      {msg.gateActions
+        ?.filter((action) => action.kind === "warning" || action.kind === "turn_notice")
+        .map((action, index) => (
+          <div
+            key={`notice-${index}`}
+            className={
+              action.kind === "warning"
+                ? "w-fit max-w-full rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] leading-snug text-amber-800 dark:text-amber-200 break-words"
+                : "w-fit max-w-full rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1 text-[11px] leading-snug text-sky-800 dark:text-sky-200 break-words"
+            }
+          >
+            {action.detail}
+          </div>
+        ))}
       {!timeline && msg.content && (
         <div className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
           <ReactMarkdown components={markdownComponents}>{msg.content}</ReactMarkdown>

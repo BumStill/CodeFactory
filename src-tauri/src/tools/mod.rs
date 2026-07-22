@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod bash;
 pub mod delivery;
+pub mod delegate_tasks;
 pub mod parallel;
 pub mod docx;
 pub mod edit;
@@ -48,6 +49,7 @@ impl ToolOutput {
 
 pub struct ExecCtx {
     pub cwd: PathBuf,
+    pub app: Option<tauri::AppHandle>,
     pub db: Option<sqlx::SqlitePool>,
     pub session_id: Option<String>,
     pub task_id: Option<String>,
@@ -63,6 +65,7 @@ impl ExecCtx {
     pub fn new(cwd: PathBuf, db: Option<sqlx::SqlitePool>) -> Self {
         Self {
             cwd,
+            app: None,
             db,
             session_id: None,
             task_id: None,
@@ -95,6 +98,7 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         skill_mgmt::fetch_definition(),
         xlsx::read_definition(),
         xlsx::edit_definition(),
+        delegate_tasks::definition(),
         delivery::definition(),
         parallel::definition(),
     ]
@@ -123,6 +127,7 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "skill_fetch" => skill_mgmt::execute_fetch(args, ctx).await,
         "read_xlsx" => xlsx::execute_read(args, ctx).await,
         "edit_xlsx" => xlsx::execute_edit(args, ctx).await,
+        "delegate_tasks" => delegate_tasks::execute(args, ctx).await,
         "deliver_changes" => delivery::execute(args, ctx).await,
         "dispatch_parallel_tasks" => parallel::execute(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),

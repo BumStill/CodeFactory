@@ -14,6 +14,12 @@ use crate::AppState;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GithubCliCredentialStatus {
+    pub installed: bool,
+    pub authenticated: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GitRemoteView {
     pub id: String,
@@ -62,6 +68,15 @@ async fn find_remote(state: &AppState, remote_id: &str) -> Result<GitRemoteConfi
 }
 
 // ── Remote config commands ────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn github_cli_credential_status() -> GithubCliCredentialStatus {
+    let status = crate::util::github_cli::auth_status("github.com");
+    GithubCliCredentialStatus {
+        installed: status.installed,
+        authenticated: status.authenticated,
+    }
+}
 
 #[tauri::command]
 pub async fn list_git_remotes(

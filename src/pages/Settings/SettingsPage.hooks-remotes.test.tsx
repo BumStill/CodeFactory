@@ -133,6 +133,8 @@ function setupInvoke() {
   let hooks = [existingHook];
   mocks.invoke.mockImplementation(async (cmd: string, args?: any) => {
     switch (cmd) {
+      case "github_cli_credential_status":
+        return { installed: true, authenticated: true };
       case "list_hooks":
         return hooks;
       case "update_hook":
@@ -241,6 +243,18 @@ describe("SettingsPage Hooks and Remotes tabs", () => {
 
     await user.click(screen.getByRole("button", { name: "删除远程仓库 origin" }));
     expect(mocks.deleteRemote).toHaveBeenCalledWith("remote-1");
+  });
+
+  it("shows that an authenticated GitHub CLI is automatically reused", async () => {
+    const user = userEvent.setup();
+    render(<SettingsPage onBack={() => {}} />);
+
+    await user.click(screen.getByRole("button", { name: "远程仓库" }));
+
+    expect(await screen.findByText(/已登录 GitHub CLI/)).toBeInTheDocument();
+    expect(screen.getByText(/无需重复配置 token/)).toBeInTheDocument();
+    expect(mocks.invoke).toHaveBeenCalledWith("github_cli_credential_status");
+    expect(screen.queryByText("尚未配置远程仓库。")).not.toBeInTheDocument();
   });
 
   it("adds a remote from labeled fields and auto-fills provider API URLs", async () => {
