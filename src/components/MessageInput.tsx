@@ -64,6 +64,11 @@ interface Props {
   initialHistory?: string[];
 }
 
+/** How long after compositionend an Enter keydown is still treated as the
+ *  candidate-commit key rather than a send (WebKit event ordering). Real
+ *  human "commit then send" double-Enters measure well above this. */
+const IME_COMMIT_GRACE_MS = 100;
+
 export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, guidanceActive = false, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd, initialHistory }: Props) {
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -261,8 +266,24 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
     });
   };
 
+  // ── IME composition tracking (see the Enter guard below) ──
+  const composingRef = useRef(false);
+  const compositionEndedAtRef = useRef(0);
+
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
+      // IME guard: Enter with the candidate list open COMMITS the
+      // composition, it doesn't send. Chromium delivers that keydown while
+      // still composing; WebKit (our runtime) fires compositionend FIRST and
+      // then the same physical Enter as a plain keydown — only the short
+      // window after compositionend tells it apart from a real send.
+      if (
+        composingRef.current ||
+        e.nativeEvent.isComposing ||
+        Date.now() - compositionEndedAtRef.current < IME_COMMIT_GRACE_MS
+      ) {
+        return;
+      }
       e.preventDefault();
       void submit();
       return;
@@ -393,6 +414,13 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
             autoResize();
           }}
           onKeyDown={onKey}
+          onCompositionStart={() => {
+            composingRef.current = true;
+          }}
+          onCompositionEnd={() => {
+            composingRef.current = false;
+            compositionEndedAtRef.current = Date.now();
+          }}
           onPaste={onPaste}
           rows={1}
           placeholder={
