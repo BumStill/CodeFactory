@@ -3,20 +3,28 @@
 //! has multiple independently executable parts; users never need to leave the
 //! conversation or operate a separate decomposition workflow.
 
+#[cfg(not(test))]
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+#[cfg(not(test))]
 use std::sync::Arc;
+#[cfg(not(test))]
 use tauri::Manager;
+#[cfg(not(test))]
 use uuid::Uuid;
 
 use super::{ExecCtx, ToolOutput};
+#[cfg(not(test))]
 use crate::agent::scheduler::TaskScheduler;
+#[cfg(not(test))]
 use crate::commands::tasks::SchedulerHandles;
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
+#[cfg(not(test))]
 use crate::storage::tasks::{self as task_storage, TaskRun};
+#[cfg(not(test))]
 use crate::AppState;
 
 const MAX_DELEGATED_TASKS: usize = 8;
@@ -162,6 +170,7 @@ fn validate_tasks(tasks: &[DelegatedTask]) -> std::result::Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(test))]
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let args: DelegateTasksArgs = serde_json::from_value(args)?;
     if let Err(message) = validate_tasks(&args.tasks) {
@@ -280,6 +289,26 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             "message": "Delegated tasks are running inside this session. Do not duplicate their implementation in the parent agent."
         })
         .to_string(),
+    ))
+}
+
+
+// Keep validation and tool-dispatch coverage in unit-test builds without
+// linking the desktop scheduler runtime into the standalone Windows test
+// harness. Production builds use the implementation above unchanged.
+#[cfg(test)]
+pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
+    let args: DelegateTasksArgs = serde_json::from_value(args)?;
+    if let Err(message) = validate_tasks(&args.tasks) {
+        return Ok(ToolOutput::err(message));
+    }
+    if ctx.task_id.is_some() {
+        return Ok(ToolOutput::err(
+            "subagents cannot recursively delegate more tasks",
+        ));
+    }
+    Ok(ToolOutput::err(
+        "delegate_tasks execution is unavailable in unit-test builds",
     ))
 }
 
