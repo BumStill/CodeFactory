@@ -267,7 +267,10 @@ mod tests {
     /// Real-runtime smoke: only meaningful on a machine with docker; CI
     /// runners without it skip. Runs a trivial command through the ACTUAL
     /// docker wrapper and checks the output and that host paths don't leak
-    /// beyond the mounted project dir.
+    /// beyond the mounted project dir. Unix-only: Windows CI runners DO
+    /// ship docker, but sandbox mode itself reports unsupported there and
+    /// $HOME does not exist.
+    #[cfg(unix)]
     #[tokio::test]
     async fn docker_sandbox_executes_a_real_command_when_docker_is_present() {
         if !super::sandbox::runtime_available("docker") {
