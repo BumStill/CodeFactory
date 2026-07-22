@@ -100,7 +100,9 @@ jobs:
       # catch them before tagging a release instead of after a user
       # reports it.
       - name: Cargo test
-        run: cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1 --nocapture
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/codefactory-cargo-test-target
+        run: cargo test --manifest-path src-tauri/Cargo.toml --quiet
 
       - name: Evolution executable closed-loop smoke
         shell: pwsh
