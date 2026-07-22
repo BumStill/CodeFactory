@@ -122,6 +122,32 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
     }
   }, [tab]);
 
+  const handleImportOpenClaw = async () => {
+    setInstallError(null);
+    setInstalling(true);
+    try {
+      const found = await invoke<
+        { name: string; description: string; path: string; already_installed: boolean }[]
+      >("scan_openclaw_skills");
+      const fresh = found.filter((skill) => !skill.already_installed);
+      if (found.length === 0) {
+        setInstallError("没有在 ~/.openclaw 或 ~/.claude 的技能目录里发现可导入的技能。");
+        return;
+      }
+      if (fresh.length === 0) {
+        setInstallError(`发现 ${found.length} 个 OpenClaw 技能,均已导入过。`);
+        return;
+      }
+      for (const skill of fresh) {
+        await importFromDirectory(skill.path);
+      }
+    } catch (e) {
+      setInstallError(String(e));
+    } finally {
+      setInstalling(false);
+    }
+  };
+
   const handleImportDir = async () => {
     setInstallError(null);
     try {
@@ -316,6 +342,15 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
                   title="从本地目录导入（支持 SKILL.md，如 superpowers / openspec，可整个仓库批量导入）"
                 >
                   <FolderOpen size={12} />
+                </button>
+                <button
+                  onClick={handleImportOpenClaw}
+                  disabled={installing}
+                  className="p-1.5 rounded bg-surface-3 hover:bg-surface-2 text-gray-300 border border-border disabled:opacity-50 transition-colors"
+                  title="一键导入 OpenClaw 技能（自动扫描 ~/.openclaw/workspace/skills 与 ~/.claude/skills，已导入的自动跳过）"
+                  aria-label="一键导入 OpenClaw 技能"
+                >
+                  <Download size={12} />
                 </button>
               </div>
               <button

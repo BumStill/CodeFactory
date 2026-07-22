@@ -476,6 +476,104 @@ pub async fn install_skill_from_directory(dir_path: String) -> Result<Vec<SkillM
     Ok(imported)
 }
 
+// ── OpenClaw one-click import (scan known roots) ──────────────────────────────
+
+/// Preview row for a skill discovered in an OpenClaw/Claude skills root.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OpenClawSkillPreview {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    /// A skill with the same slug already exists locally — the UI greys it
+    /// out instead of double-importing.
+    pub already_installed: bool,
+}
+
+/// The known on-disk locations OpenClaw / Claude Code keep skills in.
+/// Missing directories are fine — the scanner skips them.
+pub fn openclaw_skill_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = dirs_home() {
+        roots.push(home.join(".openclaw").join("workspace").join("skills"));
+        roots.push(home.join(".claude").join("skills"));
+    }
+    roots
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Scan `roots` for skill directories (SKILL.md / manifest.json) and build
+/// previews. `installed_ids` are the local skill slugs used to mark
+/// duplicates. Pure over its inputs — unit-tested with temp roots.
+pub fn scan_skill_roots(roots: &[PathBuf], installed_ids: &[String]) -> Vec<OpenClawSkillPreview> {
+    let mut previews = Vec::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        let mut dirs = Vec::new();
+        collect_skill_dirs(root, 2, &mut dirs);
+        for dir in dirs {
+            let (name, description) = if dir.join("SKILL.md").exists() {
+                match std::fs::read_to_string(dir.join("SKILL.md")) {
+                    Ok(raw) => {
+                        let parsed = parse_skill_md(&raw);
+                        let fallback = dir
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        (
+                            if parsed.name.trim().is_empty() { fallback } else { parsed.name },
+                            parsed.description,
+                        )
+                    }
+                    Err(_) => continue,
+                }
+            } else {
+                match std::fs::read_to_string(dir.join("manifest.json"))
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<ManifestFile>(&raw).ok())
+                {
+                    Some(mf) => (mf.name, mf.description),
+                    None => continue,
+                }
+            };
+            let slug = slugify(&name);
+            previews.push(OpenClawSkillPreview {
+                already_installed: installed_ids.contains(&slug),
+                name,
+                description,
+                path: dir.to_string_lossy().to_string(),
+            });
+        }
+    }
+    previews
+}
+
+/// Scan the known OpenClaw/Claude roots and preview importable skills.
+#[tauri::command]
+pub async fn scan_openclaw_skills() -> Result<Vec<OpenClawSkillPreview>, String> {
+    let installed: Vec<String> = list_user_and_builtin_skill_ids();
+    Ok(scan_skill_roots(&openclaw_skill_roots(), &installed))
+}
+
+fn list_user_and_builtin_skill_ids() -> Vec<String> {
+    let mut ids = Vec::new();
+    let dir = user_skills_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                ids.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+    ids
+}
+
 // ── Reusable, app-independent skill ops (shared by agent tools) ───────────────
 
 /// Create a new USER skill on disk. Only touches the user skills dir (no
@@ -1214,6 +1312,67 @@ pub async fn propose_skills_from_patterns(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scan_skill_roots_previews_openclaw_skills_and_marks_installed() {
+        // One-click OpenClaw import (WorkBuddy-gap P2): scan known roots,
+        // preview name/description, and mark skills whose id already exists
+        // locally so the UI can grey them out instead of double-importing.
+        let root = std::env::temp_dir().join(format!("cf-openclaw-scan-{}", std::process::id()));
+        let skill = root.join("dream-governor");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: dream-governor\ndescription: Turn dreams into governance work\n---\n\n# Dream Governor\nbody",
+        )
+        .unwrap();
+        let empty = root.join("not-a-skill");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        let found = scan_skill_roots(&[root.clone()], &["dream-governor".to_string()]);
+        assert_eq!(found.len(), 1);
+        let preview = &found[0];
+        assert_eq!(preview.name, "dream-governor");
+        assert!(preview.description.contains("governance work"));
+        assert!(preview.already_installed);
+        assert!(preview.path.ends_with("dream-governor"));
+
+        let fresh = scan_skill_roots(&[root.clone()], &[]);
+        assert!(!fresh[0].already_installed);
+
+        // Missing roots scan to empty, never error.
+        let ghost = std::path::PathBuf::from("/definitely/not/a/real/root");
+        assert!(scan_skill_roots(&[ghost], &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Real-machine smoke: when actual OpenClaw skills exist on this
+    /// machine, the scanner must parse them. Skips silently elsewhere.
+    #[test]
+    fn scan_finds_real_openclaw_skills_when_present() {
+        let roots = openclaw_skill_roots();
+        if !roots.iter().any(|r| r.is_dir()) {
+            eprintln!("skipping real openclaw scan smoke: no roots on this machine");
+            return;
+        }
+        let found = scan_skill_roots(&roots, &[]);
+        for preview in &found {
+            assert!(!preview.name.trim().is_empty());
+            assert!(!preview.path.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn openclaw_skill_roots_cover_the_known_locations() {
+        let roots = openclaw_skill_roots();
+        let joined = roots
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(";");
+        assert!(joined.contains(".openclaw/workspace/skills"));
+        assert!(joined.contains(".claude/skills"));
+    }
+
     use super::*;
 
     #[test]

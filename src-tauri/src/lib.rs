@@ -308,6 +308,7 @@ pub fn run() {
             commands::skills::disable_skill,
             commands::skills::install_skill_from_url,
             commands::skills::install_skill_from_directory,
+            commands::skills::scan_openclaw_skills,
             commands::skills::create_skill,
             commands::skills::update_skill,
             commands::skills::delete_skill,
