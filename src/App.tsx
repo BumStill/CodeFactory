@@ -10,6 +10,7 @@ import { ProfilePage } from "./pages/Profile/ProfilePage";
 import { ToastContainer } from "./components/Toast";
 import { EvidenceViewer } from "./components/EvidenceViewer";
 import { UpdaterBanner } from "./components/UpdaterBanner";
+import { OnboardingWizard } from "./components/OnboardingWizard";
 import { useSettingsStore } from "./stores/settings";
 import { syncChatGptCatalog } from "./stores/chatgptCatalog";
 import { useChatStore } from "./stores/chat";
@@ -118,6 +119,18 @@ export default function App() {
         />
       )}
 
+      {settings && !settings.onboarded && (
+        <OnboardingWizard
+          modelReady={Object.values(settings.endpoints ?? {}).length > 0}
+          ceiling={settings.delivery_ceiling ?? "pr_only"}
+          onCeilingChange={(ceiling) =>
+            void useSettingsStore.getState().save({ ...settings, delivery_ceiling: ceiling })
+          }
+          onDone={() =>
+            void useSettingsStore.getState().save({ ...settings, onboarded: true })
+          }
+        />
+      )}
       <ToastContainer onViewPack={(path) => setEvidenceViewerPath(path)} />
 
       {evidenceViewerPath && (

@@ -272,6 +272,7 @@ pub fn run() {
             commands::chat::send_message_anonymous,
             commands::chat::respond_to_permission,
             commands::chat::cancel_chat,
+            commands::chat::delivery_channel_status,
             commands::files::list_dir,
             commands::files::save_chat_attachment,
             commands::terminal::terminal_create,

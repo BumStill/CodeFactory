@@ -57,6 +57,28 @@ pub async fn respond_to_permission(
 /// turn stops cleanly — it does NOT interrupt an in-flight tool call. No-ops if
 /// nothing is running for that session. Scoped to chat only: this never touches
 /// the task scheduler (that has its own `cancel_implementation`).
+/// Readiness of the delivery channel for the onboarding wizard: a logged-in
+/// gh CLI (preferred, zero app-side config) or a configured REST token.
+#[derive(serde::Serialize)]
+pub struct DeliveryChannelStatus {
+    pub gh_cli: bool,
+    pub rest_token: bool,
+}
+
+#[tauri::command]
+pub async fn delivery_channel_status(
+    state: State<'_, AppState>,
+) -> Result<DeliveryChannelStatus, AppError> {
+    let settings = state.settings.read().await;
+    let rest_token = settings
+        .git_remotes
+        .iter()
+        .any(|r| matches!(r.provider, crate::config::settings::GitProvider::Github));
+    drop(settings);
+    let gh_cli = crate::agent::delivery::gh_cli_available();
+    Ok(DeliveryChannelStatus { gh_cli, rest_token })
+}
+
 #[tauri::command]
 pub async fn cancel_chat(session_id: String, state: State<'_, AppState>) -> Result<(), AppError> {
     if let Some(flag) = state.chat_cancels.lock().await.get(&session_id) {
