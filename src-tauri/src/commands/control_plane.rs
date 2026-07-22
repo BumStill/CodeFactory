@@ -174,16 +174,6 @@ fn authority_for_project(cwd: Option<&Path>) -> Vec<ControlPlaneItem> {
     repo_specs.label = "docs/specs".into();
     items.push(repo_specs);
 
-    let project_specs_path = cwd.join(".codefactory").join("specs");
-    let mut project_specs = status_for_path(
-        &project_specs_path,
-        "Project delivery contracts are present.",
-        "No project delivery contracts yet.",
-    );
-    project_specs.id = "project-specs".into();
-    project_specs.label = ".codefactory/specs".into();
-    items.push(project_specs);
-
     let hook_path = cwd.join(".githooks").join("pre-commit");
     let mut sync_gate = status_for_path(
         &hook_path,
@@ -712,12 +702,21 @@ mod tests {
         let cwd = tmp_project();
         std::fs::write(cwd.join("AGENTS.md"), "# rules\n").unwrap();
         std::fs::create_dir_all(cwd.join("docs/specs")).unwrap();
+        std::fs::create_dir_all(cwd.join(".codefactory/specs")).unwrap();
 
         let items = authority_for_project(Some(&cwd));
 
         assert_eq!(
             items.iter().find(|i| i.id == "agents-md").unwrap().status,
             ControlPlaneStatus::Ok
+        );
+        assert_eq!(
+            items.iter().find(|i| i.id == "repo-specs").unwrap().status,
+            ControlPlaneStatus::Ok
+        );
+        assert!(
+            items.iter().all(|i| i.id != "project-specs"),
+            ".codefactory/specs is legacy product state, not repository authority"
         );
         assert_eq!(
             items.iter().find(|i| i.id == "sync-gate").unwrap().status,

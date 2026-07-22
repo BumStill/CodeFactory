@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 mod agent;
+mod ai_text;
 mod benchmark;
 mod codex_auth;
 mod commands;
@@ -297,15 +298,6 @@ pub fn run() {
             commands::tasks::retry_failed_tasks,
             commands::tasks::get_verification_results,
             commands::tasks::run_verification_now,
-            commands::specs::list_specs,
-            commands::specs::get_spec,
-            commands::specs::save_spec,
-            commands::specs::create_spec,
-            commands::specs::delete_spec,
-            commands::specs::approve_spec,
-            commands::specs::spec_ai_assist,
-            commands::specs::decompose_spec_to_tasks,
-            commands::specs::decompose_request_to_tasks,
             commands::evidence::generate_evidence_pack,
             commands::evidence::list_evidence_packs,
             commands::evidence::get_evidence_pack,
@@ -347,7 +339,6 @@ pub fn run() {
             commands::git_remote::list_prs,
             commands::git_remote::create_pr,
             commands::git_remote::list_repos,
-            commands::git_remote::issue_to_spec,
             commands::costs::get_session_cost,
             commands::costs::get_today_cost,
             commands::costs::get_monthly_cost,

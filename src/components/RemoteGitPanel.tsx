@@ -45,31 +45,10 @@ function renderBody(text: string): string {
 
 interface IssueDetailProps {
   issue: RemoteIssue;
-  remoteId: string;
-  repo: string;
-  cwd: string;
   onBack: () => void;
 }
 
-function IssueDetail({ issue, remoteId, repo, cwd, onBack }: IssueDetailProps) {
-  const { issueToSpec } = useGitRemoteStore();
-  const [busy, setBusy] = useState(false);
-  const [toast, setToast] = useState<string | null>(null);
-
-  const handleCreateSpec = async () => {
-    setBusy(true);
-    try {
-      const path = await issueToSpec(remoteId, repo, issue.number, cwd);
-      setToast(`规范已创建：${path.split(/[\\/]/).pop()}`);
-      setTimeout(() => setToast(null), 4000);
-    } catch (e) {
-      setToast(`错误：${String(e)}`);
-      setTimeout(() => setToast(null), 5000);
-    } finally {
-      setBusy(false);
-    }
-  };
-
+function IssueDetail({ issue, onBack }: IssueDetailProps) {
   return (
     <div className="flex flex-col h-full">
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0">
@@ -126,21 +105,6 @@ function IssueDetail({ issue, remoteId, repo, cwd, onBack }: IssueDetailProps) {
         />
       </div>
 
-      {toast && (
-        <div className="mx-3 mb-2 px-3 py-2 rounded bg-surface-3 text-xs text-gray-300 border border-border">
-          {toast}
-        </div>
-      )}
-
-      <div className="flex gap-2 p-3 border-t border-border shrink-0">
-        <button
-          onClick={handleCreateSpec}
-          disabled={busy}
-          className="flex-1 px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
-        >
-          {busy ? "创建中…" : "创建为规范"}
-        </button>
-      </div>
     </div>
   );
 }
@@ -349,11 +313,9 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
 
 interface IssuesTabProps {
   remotes: GitRemoteConfig[];
-  cwd: string;
-  currentBranch: string;
 }
 
-function IssuesTab({ remotes, cwd }: IssuesTabProps) {
+function IssuesTab({ remotes }: IssuesTabProps) {
   const { issues, loading, error, loadIssues } = useGitRemoteStore();
   const [remoteId, setRemoteId] = useState(remotes[0]?.id ?? "");
   const [repo, setRepo] = useState(remotes[0]?.default_repo ?? "");
@@ -389,9 +351,6 @@ function IssuesTab({ remotes, cwd }: IssuesTabProps) {
     return (
       <IssueDetail
         issue={selectedIssue}
-        remoteId={remoteId}
-        repo={repo}
-        cwd={cwd}
         onBack={() => setSelectedIssue(null)}
       />
     );
@@ -661,12 +620,11 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
 // ── Main RemoteGitPanel ───────────────────────────────────────────────────────
 
 interface RemoteGitPanelProps {
-  cwd: string | null;
   currentBranch: string;
   onClose: () => void;
 }
 
-export function RemoteGitPanel({ cwd, currentBranch, onClose }: RemoteGitPanelProps) {
+export function RemoteGitPanel({ currentBranch, onClose }: RemoteGitPanelProps) {
   const { remotes, loadRemotes } = useGitRemoteStore();
   const [tab, setTab] = useState<"issues" | "prs">("issues");
 
@@ -719,7 +677,7 @@ export function RemoteGitPanel({ cwd, currentBranch, onClose }: RemoteGitPanelPr
       ) : (
         <div className="flex-1 min-h-0">
           {tab === "issues" ? (
-            <IssuesTab remotes={remotes} cwd={cwd ?? ""} currentBranch={currentBranch} />
+            <IssuesTab remotes={remotes} />
           ) : (
             <PRsTab remotes={remotes} currentBranch={currentBranch} />
           )}

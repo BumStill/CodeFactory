@@ -1024,7 +1024,7 @@ export function SettingsPage({ onBack }: Props) {
 
 const HOOK_EVENTS = [
   "pre_tool", "post_tool", "pre_task", "post_task",
-  "session_start", "session_end", "spec_approved", "verification_failed",
+  "session_start", "session_end", "verification_failed",
 ];
 
 const HOOK_ACTIONS: { value: HookActionType; label: string; placeholder: string }[] = [

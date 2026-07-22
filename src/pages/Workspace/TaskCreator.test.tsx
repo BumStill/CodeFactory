@@ -174,10 +174,12 @@ describe("session-native task delegation", () => {
     fakeLearningState.events = {};
   });
 
-  it("has no standalone decomposition entry or empty task surface", async () => {
+  it("has no standalone spec, plan, decomposition, or empty task surface", async () => {
     fakeTasksState.tasks = { s1: [] };
     renderWorkspace();
 
+    expect(screen.queryByTitle(/规范工作台/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /规范|计划/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "AI 拆解项目任务" })).not.toBeInTheDocument();
     expect(screen.queryByText("拆任务")).not.toBeInTheDocument();
     expect(screen.queryByText("会话执行详情")).not.toBeInTheDocument();
@@ -195,6 +197,16 @@ describe("session-native task delegation", () => {
     expect(within(conversation).getByText("会话执行详情")).toBeInTheDocument();
     expect(within(conversation).getByText("实现登录页")).toBeInTheDocument();
     expect(within(sessionRail).queryByText("会话执行详情")).not.toBeInTheDocument();
+  });
+
+  it("keeps legacy spec provenance visible without reopening a spec product surface", () => {
+    fakeTasksState.tasks = {
+      s1: [task({ spec_req_id: "CF-010", spec_title: "Token 成本仪表盘" })],
+    };
+    renderWorkspace();
+
+    expect(screen.getByText("规范《Token 成本仪表盘》")).toBeInTheDocument();
+    expect(screen.queryByTitle(/规范工作台/)).not.toBeInTheDocument();
   });
 
   it("continues pending delegated work from the session detail", async () => {

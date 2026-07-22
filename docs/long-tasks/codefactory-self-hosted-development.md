@@ -12,7 +12,7 @@
 
 ## Current State
 - Current phase: 基本能力确认完成，可以开始自托管开发；本轮不实现新的“自开发闭环”产品功能。
-- Current checkpoint: v1.45.3 已具备自主模式、规范优先拆解、任务 DAG、acceptance criteria、Agent 工具调用、任务内重试、项目验证、checkpoint/revert、per-task worktree、失败归因、Evidence Pack 和配置化 draft PR。headless、CLI 与 GitHub macOS runner 已证明锁屏不阻断验证和发布。
+- Current checkpoint: v1.45.3 已具备任务 DAG、acceptance criteria、Agent 工具调用、任务内重试、项目验证、checkpoint/revert、per-task worktree、失败归因、Evidence Pack 和配置化 draft PR；后续会话内委派与仓库规范归属由 `repository-owned-specifications.md` 接管。headless、CLI 与 GitHub macOS runner 已证明锁屏不阻断验证和发布。
 - Next owner: 后续开发直接在 CodeFactory 中打开 `/Users/leo/Projects/CodeFactory`，从本记录或具体 long task 领取一个产品待办，按“一项改动 -> 验证 -> PR/CI -> 合并 -> 发布 -> 发布版复验”执行。
 - Updated at: 2026-07-16
 
@@ -36,7 +36,7 @@
 - None。当前 CodeFactory 可以开始自托管开发；缺口是流程注意事项和具体产品待办，不是启动前阻塞。
 
 ## Evidence
-- Local evidence: `src/pages/Workspace/WorkspacePage.tsx` 已有自主模式和规范优先路径；`src-tauri/src/agent/scheduler.rs` 已有 retry/acceptance/verification；`src-tauri/src/agent/worktree.rs` 已有任务隔离；`src-tauri/src/commands/tasks.rs` 已有 checkpoint、Evidence Pack 和 draft PR 入口。
+- Local evidence: `src/pages/Workspace/WorkspacePage.tsx` 已有会话执行详情；`src-tauri/src/tools/delegate_tasks.rs` 负责会话内委派；`src-tauri/src/agent/scheduler.rs` 已有 retry/acceptance/verification；`src-tauri/src/agent/worktree.rs` 已有任务隔离；`src-tauri/src/commands/tasks.rs` 已有 checkpoint、Evidence Pack 和 draft PR 入口。
 - Release evidence: v1.45.3 已完成公开 macOS artifact GUI 验证，验证和交付不依赖本机解锁。
 - Blocking evidence: `src-tauri/src/storage/tasks.rs` 当前没有普通 `task_runs` 的进程 owner/lease 启动恢复；这是已知限制，但不阻止在 CodeFactory 中开始下一项开发。
 
@@ -50,4 +50,3 @@
 - 本记录只管理自托管开发方式与未完成项，不代替具体产品规格。
 - 不把本地测试或分支存在当成已产品化；每个确定性改动必须合并并按发布节奏交付。
 - 不把已被主干等价覆盖的旧分支再次硬合并。
-

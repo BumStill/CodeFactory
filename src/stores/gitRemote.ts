@@ -26,7 +26,6 @@ interface GitRemoteStore {
   loadRepos: (remoteId: string) => Promise<void>;
   createIssue: (remoteId: string, repo: string, title: string, body: string, labels: string[]) => Promise<RemoteIssue>;
   createPR: (remoteId: string, repo: string, title: string, body: string, head: string, base: string, draft: boolean) => Promise<RemotePR>;
-  issueToSpec: (remoteId: string, repo: string, issueNumber: number, cwd: string) => Promise<string>;
 }
 
 export const useGitRemoteStore = create<GitRemoteStore>((set) => ({
@@ -118,15 +117,6 @@ export const useGitRemoteStore = create<GitRemoteStore>((set) => ({
       head,
       base,
       draft,
-    });
-  },
-
-  issueToSpec: async (remoteId, repo, issueNumber, cwd) => {
-    return await invoke<string>("issue_to_spec", {
-      remoteId,
-      repo,
-      issueNumber,
-      cwd,
     });
   },
 }));
