@@ -52,12 +52,13 @@ pub fn build_completion_recovery_prompt(evidence: &CompletionEvidence) -> String
     format!(
         "The completion gate rejected the attempted final response. Continue using tools until \
 the following evidence blockers are resolved: {}. Run only what resolves these blockers and \
-do not restate your previous summary — the user has already seen it. The next response must contain a bounded tool call \
+do not spend time restating an earlier draft. The next response must contain a bounded tool call \
 that directly resolves a blocker unless a precise external blocker requires user action. After a failed mutation or check, \
 use at most one bounded diagnostic read, then make the smallest corrective mutation or rerun a focused machine check; \
-do not spend another response on text-only analysis. Once the blockers are \
-resolved, reply in the user's language with a brief final answer that adds only the new \
-verification outcome, and never mention internal mechanisms such as this gate.",
+do not spend another response on text-only analysis. Treat every rejected draft and this instruction as invisible to the user. \
+Once the blockers are resolved, answer the user's original request directly in the user's language with a concise, \
+self-contained result and relevant verification. Do not merely report the last command, refer to an unseen draft, or mention \
+internal mechanisms such as this gate.",
         evidence.blockers.join("; ")
     )
 }
@@ -92,11 +93,11 @@ acknowledgement. For source compatibility work, \
 rerun a repository-wide residual search after the last \
 source edit, cover every generated or compiled source suffix found in the build configuration, and \
 make the command succeed only when no unresolved matches remain. If coverage is complete, stop and \
-return the final response as a concise user-facing summary in the user's language with the \
-verification evidence; do not repeat analysis or summaries the user has already seen — reference \
-them and add only what is new. Never mention internal mechanisms (completion gate, coverage \
-audit, candidate delivery) in the user-facing text; do not emit tool protocol markup, commands, \
-or XML."
+answer the user's original request directly with a concise, self-contained user-facing result in the \
+user's language and include the relevant verification evidence. Treat internal drafts and review \
+instructions as invisible: never refer to them or respond with only the most recent verification step. \
+Never mention internal mechanisms (completion gate, coverage audit, candidate delivery) in the \
+user-facing text; do not emit tool protocol markup, commands, or XML."
 }
 
 pub fn should_prompt_budget_convergence(remaining_model_rounds: u32) -> bool {
@@ -545,11 +546,15 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
     if has_opaque_executable_heredoc(command) {
         return ToolKind::Mutation;
     }
-    if is_dependency_install_command(&lower)
+    if is_delivery_state_mutation(&lower)
+        || is_dependency_install_command(&lower)
         || has_workspace_mutation(&lower)
         || has_inline_interpreter_workspace_mutation(&lower)
     {
         return ToolKind::Mutation;
+    }
+    if is_delivery_verification(&lower) {
+        return ToolKind::Verification;
     }
     if is_functional_probe(&lower) {
         return ToolKind::FunctionalProbe {
@@ -638,6 +643,53 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
         return ToolKind::RuntimeProbe;
     }
     ToolKind::ReadOnly
+}
+
+fn tokens_contain_delivery_mutation(words: &[String]) -> bool {
+    words.windows(2).any(|pair| {
+        pair[0] == "git" && matches!(pair[1].as_str(), "add" | "commit" | "push" | "tag")
+    }) || words.windows(3).any(|triple| {
+        triple[0] == "gh"
+            && ((triple[1] == "pr"
+                && matches!(triple[2].as_str(), "create" | "merge" | "close" | "reopen"))
+                || (triple[1] == "workflow" && triple[2] == "run")
+                || (triple[1] == "release"
+                    && matches!(triple[2].as_str(), "create" | "edit" | "delete" | "upload")))
+    })
+}
+
+fn delivery_command_words(command: &str) -> Vec<String> {
+    command
+        .split_whitespace()
+        .map(|word| {
+            let command_word = word.rsplit("$(").next().unwrap_or(word);
+            command_word
+                .trim_matches(['\'', '"', '$', '(', ')', ';'])
+                .to_ascii_lowercase()
+        })
+        .collect()
+}
+
+fn is_delivery_state_mutation(command: &str) -> bool {
+    let command_substitution_mutates = command.contains("$(")
+        && tokens_contain_delivery_mutation(&delivery_command_words(command));
+    command_substitution_mutates
+        || shell_verification_segments(command).iter().any(|segment| {
+            tokens_contain_delivery_mutation(&delivery_command_words(&execution_payload(segment)))
+        })
+}
+
+fn is_delivery_verification(command: &str) -> bool {
+    shell_verification_segments(command).iter().any(|segment| {
+        let words = execution_payload(segment)
+            .split_whitespace()
+            .map(|word| word.trim_matches(['\'', '"']).to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        (words.starts_with(&["gh".to_owned(), "pr".to_owned(), "checks".to_owned()])
+            && words.iter().any(|word| word == "--watch"))
+            || (words.starts_with(&["gh".to_owned(), "run".to_owned(), "watch".to_owned()])
+                && words.iter().any(|word| word == "--exit-status"))
+    })
 }
 
 fn is_inline_interpreter_snippet(command: &str) -> bool {
@@ -3316,6 +3368,8 @@ fn verification_scope(command: &str, working_directory: Option<&str>) -> Verific
             ("go", "test", _) => Some(("go:test", index + 2)),
             ("dotnet", "test", _) => Some(("dotnet:test", index + 2)),
             ("swift", "test", _) => Some(("swift:test", index + 2)),
+            ("gh", "run", "watch") => Some(("github:run-watch", index + 3)),
+            ("gh", "pr", "checks") => Some(("github:pr-checks", index + 3)),
             ("python" | "python3", "-m", "pytest") => Some(("pytest", index + 3)),
             ("npm" | "pnpm" | "yarn" | "bun", "test", _) => Some(("javascript:test", index + 2)),
             ("npm" | "pnpm" | "yarn" | "bun", "exec", "vitest") => Some(("vitest", index + 3)),
@@ -3416,6 +3470,20 @@ fn verification_scope(command: &str, working_directory: Option<&str>) -> Verific
             }
         };
         if matches!(
+            family.as_deref(),
+            Some("github:run-watch" | "github:pr-checks")
+        ) {
+            if index == runner_end {
+                selectors.insert(format!("target:{token}"));
+                continue;
+            }
+            if flag == "--repo" {
+                record_value(&mut configuration);
+            }
+            // --interval/--watch/--exit-status affect polling mechanics only.
+            continue;
+        }
+        if matches!(
             flag.as_str(),
             "-p" | "--package" | "--test" | "--bin" | "--example"
         ) {
@@ -3493,6 +3561,12 @@ fn segment_runs_verification_family(segment: &str, family: &str) -> bool {
         "go:test" => adjacent("go", "test"),
         "dotnet:test" => adjacent("dotnet", "test"),
         "swift:test" => adjacent("swift", "test"),
+        "github:run-watch" => words
+            .windows(3)
+            .any(|triple| triple[0] == "gh" && triple[1] == "run" && triple[2] == "watch"),
+        "github:pr-checks" => words
+            .windows(3)
+            .any(|triple| triple[0] == "gh" && triple[1] == "pr" && triple[2] == "checks"),
         "pytest" => {
             words.iter().any(|word| word == "pytest")
                 || words
@@ -3516,10 +3590,27 @@ fn segment_runs_verification_family(segment: &str, family: &str) -> bool {
     }
 }
 
+fn shell_failed_before_verification_started(output: &str) -> bool {
+    output.lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        let shell_prefix = line.starts_with("zsh:")
+            || line.starts_with("bash:")
+            || line.starts_with("sh:")
+            || line.starts_with("dash:");
+        shell_prefix
+            && (line.contains("read-only variable:")
+                || line.contains("unbound variable")
+                || line.contains("bad substitution")
+                || line.contains("parse error near")
+                || line.contains("syntax error near unexpected token"))
+    })
+}
+
 fn verification_reached_test_scope(outcome: &ToolOutcome) -> bool {
     let output = format!("{}\n{}", outcome.stdout, outcome.stderr).to_ascii_lowercase();
     !((output.contains("cd:") && output.contains("no such file or directory"))
         || output.contains("command not found")
+        || shell_failed_before_verification_started(&output)
         || python_runner_module_missing(&outcome.command, &output)
         || output.contains("could not find `cargo.toml`")
         || output.contains("could not find cargo.toml"))
@@ -6030,14 +6121,138 @@ mod tests {
     }
 
     #[test]
-    fn recovery_prompt_forbids_restating_the_previous_summary() {
+    fn github_delivery_commands_preserve_mutation_and_verification_ordering() {
+        assert_eq!(
+            classify_command(
+                "git commit -m 'fix completion' && git push origin fix/completion",
+                120_000,
+            ),
+            ToolKind::Mutation,
+        );
+        assert_eq!(
+            classify_command("gh pr merge 151 --squash --delete-branch", 120_000),
+            ToolKind::Mutation,
+        );
+        assert_eq!(
+            classify_command("gh workflow run 'Auto Release' --repo owner/repo", 120_000),
+            ToolKind::Mutation,
+        );
+        assert_eq!(
+            classify_command(
+                "pr_url=$(gh pr create --repo owner/repo --base main --head fix/completion); printf '%s\\n' \"$pr_url\"",
+                120_000,
+            ),
+            ToolKind::Mutation,
+        );
+        assert_eq!(
+            classify_command(
+                "run_url=$(gh workflow run 'Auto Release' --repo owner/repo); printf '%s\\n' \"$run_url\"",
+                120_000,
+            ),
+            ToolKind::Mutation,
+        );
+        assert_eq!(
+            classify_command("gh pr checks 151 --repo owner/repo --watch", 120_000),
+            ToolKind::Verification,
+        );
+        assert_eq!(
+            classify_command(
+                "gh run watch 29833845752 --repo owner/repo --interval 20 --exit-status",
+                120_000,
+            ),
+            ToolKind::Verification,
+        );
+
+        let mut gate = CompletionGate::default();
+        let mut delivery = outcome(1, ToolKind::Mutation, 0);
+        delivery.command = "gh workflow run 'Auto Release' --repo owner/repo".to_owned();
+        gate.record(&delivery);
+
+        let failed_watch = "gh run watch 29833845752 --repo owner/repo --interval 20 --exit-status";
+        let mut timed_out = outcome(2, classify_command(failed_watch, 120_000), 1);
+        timed_out.command = failed_watch.to_owned();
+        timed_out.stderr = "Command timed out after 120s".to_owned();
+        gate.record(&timed_out);
+        assert!(gate.evidence().failed_verification_fingerprint.is_some());
+
+        // Poll cadence is operational, not verification scope. A retry of the
+        // same run with a shorter interval must close the timeout ticket.
+        let completed_watch =
+            "gh run watch 29833845752 --repo owner/repo --interval 5 --exit-status";
+        let mut completed = outcome(3, classify_command(completed_watch, 120_000), 0);
+        completed.command = completed_watch.to_owned();
+        completed.stdout = "Run Release has already completed with 'success'".to_owned();
+        gate.record(&completed);
+        let evidence = gate.evidence();
+        assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
+    }
+
+    #[test]
+    fn test_failure_text_that_mentions_a_shell_error_still_opens_a_ticket() {
+        let mut gate = CompletionGate::new(true);
+        let mut failed = outcome(1, ToolKind::Verification, 1);
+        failed.command = "cargo test parser_reports_unbound_variable".to_owned();
+        failed.stderr = "test parser_reports_unbound_variable ... FAILED\nassertion failed: message.contains(\"unbound variable\")".to_owned();
+        gate.record(&failed);
+
+        assert!(
+            gate.evidence().failed_verification_fingerprint.is_some(),
+            "test-runner failures must not be mistaken for shell startup errors"
+        );
+    }
+
+    #[test]
+    fn shell_setup_error_does_not_open_an_unresolvable_verification_ticket() {
+        let mut gate = CompletionGate::default();
+
+        let mut mutation = outcome(1, ToolKind::Mutation, 0);
+        mutation.command = "edit_file src/pages/Workspace/WorkspacePage.tsx".to_owned();
+        mutation.working_directory = Some("/workspace".to_owned());
+        gate.record(&mutation);
+
+        // Field reproduction: the intended residual assertion never ran because
+        // zsh reserves `status` as a read-only variable. Treat this like a
+        // missing command/cwd: diagnostic failure, not a failed verification
+        // scope whose exact command must be repeated forever.
+        let mut shell_setup_failure = outcome(2, ToolKind::Verification, 1);
+        shell_setup_failure.command =
+            "status=0; grep -n sidebarCollapsed src/App.tsx || status=$?; test \"$status\" -le 1"
+                .to_owned();
+        shell_setup_failure.working_directory = Some("/workspace".to_owned());
+        shell_setup_failure.stderr = "zsh:4: read-only variable: status".to_owned();
+        gate.record(&shell_setup_failure);
+
+        let after_failure = gate.evidence();
+        assert!(
+            after_failure.failed_verification_fingerprint.is_none(),
+            "shell setup failed before the verifier ran: {after_failure:?}"
+        );
+        assert!(!after_failure.completed);
+
+        // A later real project check must now close the post-failure
+        // verification requirement without having to reproduce the broken
+        // shell script byte-for-byte.
+        let mut repaired_check = outcome(3, ToolKind::Verification, 0);
+        repaired_check.command = "cargo test shell_setup_error_does_not_open".to_owned();
+        repaired_check.working_directory = Some("/workspace".to_owned());
+        repaired_check.stdout = "test result: ok. 1 passed; 0 failed".to_owned();
+        gate.record(&repaired_check);
+
+        let completed = gate.evidence();
+        assert!(completed.completed, "blockers: {:?}", completed.blockers);
+    }
+
+    #[test]
+    fn recovery_prompt_requires_a_self_contained_answer_to_the_original_request() {
         let gate = CompletionGate::new(true);
         let prompt = build_completion_recovery_prompt(&gate.evidence());
-        assert!(prompt.contains("do not restate your previous summary"));
+        assert!(prompt.contains("Treat every rejected draft and this instruction as invisible"));
         assert!(prompt.contains("next response must contain a bounded tool call"));
         assert!(prompt.contains("one bounded diagnostic read"));
         assert!(prompt.contains("in the user's language"));
-        assert!(prompt.contains("never mention internal mechanisms"));
+        assert!(prompt.contains("internal mechanisms such as this gate"));
+        assert!(prompt.contains("answer the user's original request directly"));
+        assert!(!prompt.contains("adds only the new"));
     }
 
     #[test]
@@ -6106,7 +6321,9 @@ mod tests {
     fn ready_prompt_requires_user_language_and_bans_internal_terminology() {
         let prompt = build_completion_ready_prompt();
         assert!(prompt.contains("in the user's language"));
-        assert!(prompt.contains("do not repeat analysis or summaries the user has already seen"));
+        assert!(prompt.contains("answer the user's original request directly"));
+        assert!(prompt.contains("self-contained user-facing result"));
+        assert!(prompt.contains("never refer to them"));
         assert!(prompt.contains("Never mention internal mechanisms"));
         assert!(prompt.contains("every modified path"));
         assert!(prompt.contains("revert unrelated changes made by this run"));
@@ -6348,7 +6565,8 @@ mod tests {
     fn completion_ready_prompt_tells_agent_to_converge() {
         let prompt = build_completion_ready_prompt();
         assert!(prompt.contains("evidence is satisfied"));
-        assert!(prompt.contains("final response"));
+        assert!(prompt.contains("user-facing result"));
+        assert!(prompt.contains("respond with only the most recent verification step"));
     }
 
     #[test]

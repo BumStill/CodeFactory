@@ -224,6 +224,7 @@ mod tests {
             json!({ "chunk_id": "disabled-chunk" }),
             &crate::tools::ExecCtx {
                 cwd: cwd.clone(),
+                app: None,
                 db: Some(pool),
                 session_id: Some("session".into()),
                 task_id: None,
@@ -290,6 +291,7 @@ mod tests {
             json!({ "query": "Atlas", "top_k": 5 }),
             &crate::tools::ExecCtx {
                 cwd: cwd.clone(),
+                app: None,
                 db: Some(pool.clone()),
                 session_id: Some("parent-session".into()),
                 task_id: Some("task-1".into()),

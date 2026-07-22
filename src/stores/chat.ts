@@ -822,8 +822,47 @@ function parsePersistedToolReplay(raw: string): {
 export function dbMessagesToUI(messages: Message[]): UIMessage[] {
   const hydrated: UIMessage[] = [];
   const toolOwners = new Map<string, number>();
+  let suppressingInternalRecovery = false;
+  let currentUserTurnStart = 0;
 
   for (const message of messages) {
+    const completionState = message.completion_state;
+    let internalRecoveryError = false;
+    if (
+      completionState === "rejected_candidate" ||
+      completionState === "gate_recovery" ||
+      completionState === "gate_ready"
+    ) {
+      // Match the live reducer: once internal review starts, remove every
+      // assistant/tool artifact produced for this user turn, including work
+      // that preceded the first rejected draft or ready signal.
+      hydrated.splice(currentUserTurnStart);
+      toolOwners.clear();
+      suppressingInternalRecovery = true;
+      continue;
+    }
+
+    if (suppressingInternalRecovery) {
+      // A terminal error is useful, but raw provider/review details are not.
+      if (completionState === "turn_error") {
+        suppressingInternalRecovery = false;
+        internalRecoveryError = true;
+      // A new untagged user turn means the prior run ended before it could
+      // produce a final answer. Never let suppression consume real user input.
+      } else if (message.role === "user" && !completionState) {
+        suppressingInternalRecovery = false;
+      } else if (
+        message.role === "assistant" &&
+        parsePersistedToolCalls(message.tool_calls).length === 0
+      ) {
+        // Rejected drafts are tagged above. Therefore the first remaining
+        // tool-free assistant turn is the accepted (or warning-released)
+        // answer and resumes the user-visible transcript.
+        suppressingInternalRecovery = false;
+      } else {
+        continue;
+      }
+    }
     if (message.role === "tool") {
       const replay = parsePersistedToolReplay(message.content);
       const ownerIndex = replay ? toolOwners.get(replay.toolCallId) : undefined;
@@ -843,7 +882,14 @@ export function dbMessagesToUI(messages: Message[]): UIMessage[] {
       continue;
     }
 
-    const uiMessage = dbToUI(message);
+    const uiMessage = internalRecoveryError
+      ? { ...dbToUI(message), content: "本次处理未能完成，请重试。" }
+      : dbToUI(message);
+    if (message.role === "user" && !completionState) {
+      // Keep the real user bubble; any following assistant/tool rows belong to
+      // this turn and may be rolled back if an internal review signal follows.
+      currentUserTurnStart = hydrated.length + 1;
+    }
     if (message.role === "assistant") {
       const toolCalls = parsePersistedToolCalls(message.tool_calls);
       if (toolCalls.length > 0) {

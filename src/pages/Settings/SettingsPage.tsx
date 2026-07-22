@@ -9,7 +9,7 @@ import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
 import { useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
-import type { Settings, Endpoint, ApiStyle, CustomModel, AddGitRemoteRequest, GitRemoteConfig, GitProvider, CodexAccount } from "../../lib/tauri";
+import type { Settings, Endpoint, ApiStyle, CustomModel, AddGitRemoteRequest, GitRemoteConfig, GitProvider, CodexAccount, GithubCliCredentialStatus } from "../../lib/tauri";
 import { CHATGPT_DEFAULT_MODEL, CHATGPT_ENDPOINT_KEY } from "../../lib/chatgptModels";
 import { syncChatGptCatalog } from "../../stores/chatgptCatalog";
 
@@ -888,8 +888,8 @@ export function SettingsPage({ onBack }: Props) {
               <label className="text-xs text-gray-500">自动交付上限</label>
               <p className="text-[11px] leading-5 text-gray-600">
                 代码改动测试通过后,AI 自动把工作推进到哪一步为止。由你决定边界:从只开 PR
-                到一路合并、发布上线。合并/发布受远端分支保护与令牌权限约束;需在「远程仓库」里配置访问令牌才能开
-                PR。
+                到一路合并、发布上线。合并/发布受远端分支保护与凭据权限约束；CodeFactory 会优先使用
+                「远程仓库」令牌，也会自动复用已登录的 GitHub CLI。
               </p>
               <select
                 value={generalDraft.delivery_ceiling}
@@ -1139,8 +1139,14 @@ function RemotesTab() {
   const [addOpen, setAddOpen]       = useState(false);
   const [testResults, setTestResults] = useState<Record<string, string>>({});
   const [testing, setTesting]       = useState<string | null>(null);
+  const [githubCli, setGithubCli] = useState<GithubCliCredentialStatus | null>(null);
 
-  useEffect(() => { loadRemotes(); }, [loadRemotes]);
+  useEffect(() => {
+    loadRemotes();
+    invoke<GithubCliCredentialStatus>("github_cli_credential_status")
+      .then(setGithubCli)
+      .catch(() => setGithubCli({ installed: false, authenticated: false }));
+  }, [loadRemotes]);
 
   const handleTest = async (id: string) => {
     setTesting(id);
@@ -1169,7 +1175,19 @@ function RemotesTab() {
         </button>
       </div>
 
-      {remotes.length === 0 && <p className="text-xs text-gray-600">尚未配置远程仓库。</p>}
+      <div className="rounded-lg border border-border bg-surface-1 px-3 py-2 text-xs">
+        {githubCli?.authenticated ? (
+          <p className="text-green-400">✓ 已登录 GitHub CLI；PR 交付会自动复用该凭据，无需重复配置 token。</p>
+        ) : githubCli?.installed ? (
+          <p className="text-amber-400">GitHub CLI 尚未登录；运行 gh auth login，或添加远程仓库令牌。</p>
+        ) : (
+          <p className="text-gray-500">可添加远程仓库令牌；安装并登录 GitHub CLI 后也会被自动识别。</p>
+        )}
+      </div>
+
+      {remotes.length === 0 && githubCli && !githubCli.authenticated && (
+        <p className="text-xs text-gray-600">尚无可用的远程仓库凭据。</p>
+      )}
 
       {remotes.map((remote: GitRemoteConfig) => (
         <div key={remote.id} className="rounded-lg border border-border bg-surface-1 px-3 py-2 space-y-1.5">
@@ -1242,7 +1260,12 @@ function AddRemoteForm({
   };
 
   const handleSave = async () => {
-    if (!name.trim() || !token.trim()) { setErr("请填写名称和令牌。"); return; }
+    if (!name.trim() || !token.trim()) {
+      setErr(provider === "github"
+        ? "请填写名称和令牌；若已登录 GitHub CLI，则无需新增此配置。"
+        : "请填写名称和令牌。");
+      return;
+    }
     setSaving(true); setErr(null);
     try {
       await addRemote({

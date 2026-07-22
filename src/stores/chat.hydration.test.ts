@@ -139,13 +139,45 @@ describe("persisted chat hydration", () => {
     );
   });
 
-  it("carries completion_state through so gate artifacts render as such", () => {
+  it("hydrates only the original request and final answer across internal recovery rounds", () => {
     const rows: Message[] = [
+      {
+        id: "user",
+        session_id: "session-1",
+        role: "user",
+        content: "把拆任务内置到当前 session。",
+        created_at: 99,
+      },
+      {
+        id: "early-tool-turn",
+        session_id: "session-1",
+        role: "assistant",
+        content: "先运行与用户无关的内部检查。",
+        tool_calls: JSON.stringify([
+          {
+            id: "early-probe",
+            type: "function",
+            function: { name: "bash", arguments: "{}" },
+          },
+        ]),
+        created_at: 99.5,
+      },
+      {
+        id: "early-tool-result",
+        session_id: "session-1",
+        role: "tool",
+        content: JSON.stringify({
+          tool_call_id: "early-probe",
+          content: "internal check passed",
+          status: "done",
+        }),
+        created_at: 99.6,
+      },
       {
         id: "candidate",
         session_id: "session-1",
         role: "assistant",
-        content: "full plan, first attempt",
+        content: "unrelated candidate answer",
         created_at: 100,
         completion_state: "rejected_candidate",
       },
@@ -158,17 +190,103 @@ describe("persisted chat hydration", () => {
         completion_state: "gate_recovery",
       },
       {
+        id: "internal-tool-turn",
+        session_id: "session-1",
+        role: "assistant",
+        content: "后台服务已运行，现在执行后续探针。",
+        tool_calls: JSON.stringify([
+          {
+            id: "probe-1",
+            type: "function",
+            function: { name: "bash", arguments: "{}" },
+          },
+        ]),
+        created_at: 102,
+      },
+      {
+        id: "internal-tool-result",
+        session_id: "session-1",
+        role: "tool",
+        content: JSON.stringify({
+          tool_call_id: "probe-1",
+          content: "later client probe passed",
+          status: "done",
+        }),
+        created_at: 103,
+      },
+      {
+        id: "gate-ready",
+        session_id: "session-1",
+        role: "user",
+        content: "The structured completion evidence is satisfied…",
+        created_at: 104,
+        completion_state: "gate_ready",
+      },
+      {
         id: "final",
         session_id: "session-1",
         role: "assistant",
-        content: "brief final answer",
-        created_at: 102,
+        content: "已完成：拆任务已内置到当前会话。",
+        created_at: 105,
       },
     ];
 
     const hydrated = dbMessagesToUI(rows);
-    expect(hydrated[0].completionState).toBe("rejected_candidate");
-    expect(hydrated[1].completionState).toBe("gate_recovery");
-    expect(hydrated[2].completionState).toBeUndefined();
+    expect(hydrated.map(({ role, content }) => ({ role, content }))).toEqual([
+      { role: "user", content: "把拆任务内置到当前 session。" },
+      { role: "assistant", content: "已完成：拆任务已内置到当前会话。" },
+    ]);
+    expect(hydrated.flatMap((message) => message.toolCalls ?? [])).toEqual([]);
   });
+
+  it("hydrates an internal recovery failure without raw control-loop details", () => {
+    const rows: Message[] = [
+      {
+        id: "user",
+        session_id: "session-1",
+        role: "user",
+        content: "完成这个修改。",
+        created_at: 1,
+      },
+      {
+        id: "candidate",
+        session_id: "session-1",
+        role: "assistant",
+        content: "draft",
+        completion_state: "rejected_candidate",
+        created_at: 2,
+      },
+      {
+        id: "recovery",
+        session_id: "session-1",
+        role: "user",
+        content: "The completion gate rejected the response",
+        completion_state: "gate_recovery",
+        created_at: 3,
+      },
+      {
+        id: "error",
+        session_id: "session-1",
+        role: "user",
+        content: "回合中断:Completion blocked: unresolved probe fingerprint",
+        completion_state: "turn_error",
+        created_at: 4,
+      },
+    ];
+
+    const hydrated = dbMessagesToUI(rows);
+    expect(hydrated.map(({ role, content, completionState }) => ({
+      role,
+      content,
+      completionState,
+    }))).toEqual([
+      { role: "user", content: "完成这个修改。", completionState: undefined },
+      {
+        role: "user",
+        content: "本次处理未能完成，请重试。",
+        completionState: "turn_error",
+      },
+    ]);
+  });
+
 });

@@ -335,6 +335,7 @@ pub fn run() {
             commands::mcp::disable_mcp_server,
             commands::mcp::list_mcp_tools,
             commands::mcp::test_mcp_tool,
+            commands::git_remote::github_cli_credential_status,
             commands::git_remote::list_git_remotes,
             commands::git_remote::add_git_remote,
             commands::git_remote::delete_git_remote,

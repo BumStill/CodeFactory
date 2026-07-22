@@ -244,8 +244,8 @@ pub enum StreamEvent {
     /// rejected the model's tool-call-free final response and injected a
     /// recovery instruction (the turn continues); `kind: "ready"` — evidence
     /// is satisfied and a final coverage-audit instruction was injected.
-    /// Surfaced so the user can see WHY the assistant keeps going instead of
-    /// watching it silently repeat itself.
+    /// Emitted as an internal stream boundary so the frontend can discard
+    /// rejected drafts and verification chatter before the final user answer.
     CompletionGateAction {
         kind: String,
         detail: String,

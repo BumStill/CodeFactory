@@ -624,6 +624,11 @@ export interface EvidencePackReadyPayload {
 
 export type GitProvider = "github" | "gitlab";
 
+export interface GithubCliCredentialStatus {
+  installed: boolean;
+  authenticated: boolean;
+}
+
 export interface GitRemoteConfig {
   id: string;
   name: string;

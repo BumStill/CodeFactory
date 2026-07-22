@@ -15,11 +15,9 @@
 //!   `ThroughMerge`, up to `ThroughRelease`. The app never hardcodes a policy;
 //!   a per-call request may only *lower* the configured ceiling.
 //! - **Hybrid provider**: local ops (stage / commit / push) shell out to the
-//!   `git` CLI, exactly like [`crate::commands::git`] and [`crate::agent::checkpoint`]
-//!   already do — no new runtime dependency. Remote ops (PR / CI / merge /
-//!   release) go through the portable token+REST [`crate::git_remote`] layer via
-//!   the [`DeliveryRemote`] trait; **`gh` is never assumed** (it is not present
-//!   on arbitrary end-user machines).
+//!   `git` CLI. Remote ops use the portable REST layer with a configured app
+//!   token when present, then automatically fall back to the active GitHub CLI
+//!   login. `gh` remains optional; users never have to duplicate its token.
 //! - **Noise-safe staging**: delivery NEVER runs `git add -A`/`git add .`. It
 //!   stages tracked modifications with `git add -u` (which by definition adds no
 //!   untracked file) plus only those untracked files that are real source and
@@ -418,7 +416,7 @@ pub async fn deliver<R: DeliveryRemote>(
 
     // ── Open (or reuse) PR ──────────────────────────────────────────────────
     let Some(remote) = remote else {
-        return outcome.blocked_at(StepResult::blocked("pr", NO_TOKEN_PR_MESSAGE));
+        return outcome.blocked_at(StepResult::blocked("pr", NO_GITHUB_CREDENTIALS_PR_MESSAGE));
     };
     let title = opts.title.clone().unwrap_or_else(|| {
         generate_commit_message(&repo.root, &repo.branch, None)
@@ -496,13 +494,9 @@ pub async fn deliver<R: DeliveryRemote>(
     finish(outcome, &repo.branch, ceiling)
 }
 
-/// Blocked-at-PR message when no remote token is configured. Carries the fix
-/// path AND the model-behavior contract: surface it to the user and wait —
-/// retrying deliver_changes cannot succeed until a token exists. (The app's
-/// only historical deliver_changes call died exactly here.)
-pub const NO_TOKEN_PR_MESSAGE: &str = "已提交并推送,但未配置远端 token,无法开 PR。\
-请把这句原样告诉用户:在设置→远程仓库里为该仓库配置 GitHub 访问令牌(需 repo 权限),\
-配置完成后回复继续即可自动完成 PR/CI/合并/发布。在用户确认配置完成之前,不要再调用 deliver_changes。";
+/// Blocked-at-PR message only after BOTH supported credential sources fail.
+pub const NO_GITHUB_CREDENTIALS_PR_MESSAGE: &str = "已提交并推送,但没有可用的 GitHub 凭据,无法开 PR。\
+CodeFactory 会自动使用已登录的 GitHub CLI；请先运行 gh auth login，或在设置→远程仓库配置访问令牌，然后重试交付。";
 
 fn ceiling_label(ceiling: DeliveryCeiling) -> &'static str {
     match ceiling {
@@ -518,47 +512,62 @@ fn ceiling_label(ceiling: DeliveryCeiling) -> &'static str {
 /// the model surfaces a broken chain in its FIRST reply instead of the user
 /// discovering it when deliver_changes blocks after the work is already done.
 /// Silent (None) when delivery is off or the origin isn't a GitHub repo.
-pub fn delivery_readiness_from_origin(
+pub fn delivery_readiness_from_origin_with_cli(
     origin_url: Option<&str>,
     settings: &crate::config::settings::Settings,
+    github_cli_authenticated: bool,
 ) -> Option<String> {
     use crate::config::settings::GitProvider;
     if settings.delivery_ceiling == DeliveryCeiling::Off {
         return None;
     }
     let owner_repo = origin_url.and_then(parse_owner_repo)?;
-    let has_github_remote = settings
+    let has_app_token = settings
         .git_remotes
         .iter()
-        .any(|r| matches!(r.provider, GitProvider::Github));
-    Some(if has_github_remote {
-        format!(
-            "\n\n# Delivery capability\n\
-             Repo {owner_repo} has GitHub credentials configured; delivery ceiling = {}. \
-             Code work ends by calling deliver_changes once tests are green — it carries the \
-             work up to that ceiling automatically.",
-            ceiling_label(settings.delivery_ceiling)
-        )
+        .filter(|remote| matches!(remote.provider, GitProvider::Github))
+        .any(|remote| crate::config::settings::resolve_git_remote_token(remote).is_ok());
+    let source = if has_app_token {
+        Some("CodeFactory 远程仓库令牌")
+    } else if github_cli_authenticated {
+        Some("已登录的 GitHub CLI（自动复用，无需重复配置 token）")
     } else {
-        format!(
-            "\n\n# Delivery capability (BROKEN — surface early)\n\
-             The delivery chain for {owner_repo} cannot open a PR: no GitHub token is \
-             configured (设置→远程仓库). If this task involves delivering code, say so in your \
-             FIRST reply — give the user that settings path and ask them to configure a token \
-             (repo scope) — and do NOT call deliver_changes until they confirm it is configured. \
-             Local work (tests, edits, commits) can proceed in the meantime."
-        )
+        None
+    };
+
+    Some(match source {
+        Some(source) => format!(
+            "
+
+# Delivery capability
+\
+             Repo {owner_repo} has usable GitHub credentials from {source}; delivery ceiling = {}. \
+             Code work ends by calling deliver_changes once tests are green — it carries the \
+             work up to that ceiling automatically. Do not ask the user to configure another token.",
+            ceiling_label(settings.delivery_ceiling)
+        ),
+        None => format!(
+            "
+
+# Delivery capability (credentials unavailable)
+\
+             Repo {owner_repo} has no usable GitHub credential. CodeFactory supports either an \
+             active GitHub CLI login (`gh auth login`) or a token in 设置→远程仓库. Local work can \
+             continue, but PR delivery needs one of those credential sources."
+        ),
     })
 }
 
-/// Wrapper reading the cwd's `origin` URL; see [`delivery_readiness_from_origin`].
+/// Wrapper reading the cwd's `origin` and probing the current GitHub CLI login
+/// on every agent run. No chat memory or persisted duplicate token is needed.
 pub fn delivery_readiness_note(
     cwd: &Path,
     settings: &crate::config::settings::Settings,
 ) -> Option<String> {
     let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
     let origin = git(Path::new(&root), &["remote", "get-url", "origin"]).ok();
-    delivery_readiness_from_origin(origin.as_deref(), settings)
+    let cli_authenticated = crate::util::github_cli::auth_token("github.com").is_some();
+    delivery_readiness_from_origin_with_cli(origin.as_deref(), settings, cli_authenticated)
 }
 
 fn finish(mut outcome: DeliveryOutcome, branch: &str, ceiling: DeliveryCeiling) -> DeliveryOutcome {
@@ -639,35 +648,72 @@ fn parse_owner_repo(url: &str) -> Option<String> {
 /// Build a [`GithubRemote`] for `cwd` from the user's configured git remote
 /// tokens, or `None` when nothing matches (delivery then blocks cleanly at the
 /// PR step with a configure-a-token message). Never assumes `gh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GithubCredentialSource {
+    AppRemote,
+    GithubCli,
+}
+
+fn resolve_github_credential_with<ResolveApp, ResolveCli>(
+    owner_repo: &str,
+    settings: &crate::config::settings::Settings,
+    mut resolve_app_token: ResolveApp,
+    cli_token: ResolveCli,
+) -> Option<(String, String, GithubCredentialSource)>
+where
+    ResolveApp: FnMut(&crate::config::settings::GitRemoteConfig) -> Option<String>,
+    ResolveCli: FnOnce() -> Option<String>,
+{
+    use crate::config::settings::GitProvider;
+    let matching = settings.git_remotes.iter().filter(|remote| {
+        matches!(remote.provider, GitProvider::Github)
+            && remote.default_repo.as_deref() == Some(owner_repo)
+    });
+    let other_github = settings.git_remotes.iter().filter(|remote| {
+        matches!(remote.provider, GitProvider::Github)
+            && remote.default_repo.as_deref() != Some(owner_repo)
+    });
+
+    for remote in matching.chain(other_github) {
+        if let Some(token) = resolve_app_token(remote) {
+            return Some((
+                remote.base_url.clone(),
+                token,
+                GithubCredentialSource::AppRemote,
+            ));
+        }
+    }
+
+    cli_token().map(|token| {
+        (
+            "https://api.github.com".to_owned(),
+            token,
+            GithubCredentialSource::GithubCli,
+        )
+    })
+}
+
+/// Build a GitHub REST remote from the app keychain first, then transparently
+/// reuse the active `gh auth` credential. The CLI credential remains owned by
+/// GitHub CLI and is resolved afresh for every delivery attempt.
 pub fn github_remote_for(
     cwd: &Path,
     settings: &crate::config::settings::Settings,
 ) -> Option<GithubRemote> {
-    use crate::config::settings::GitProvider;
     let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
     let origin = git(Path::new(&root), &["remote", "get-url", "origin"]).ok()?;
     let owner_repo = parse_owner_repo(&origin)?;
-
-    // Prefer a git_remotes entry whose default_repo matches; else the first
-    // GitHub remote with a resolvable token.
-    let remote = settings
-        .git_remotes
-        .iter()
-        .find(|r| {
-            matches!(r.provider, GitProvider::Github)
-                && r.default_repo.as_deref() == Some(owner_repo.as_str())
-        })
-        .or_else(|| {
-            settings
-                .git_remotes
-                .iter()
-                .find(|r| matches!(r.provider, GitProvider::Github))
-        })?;
-    let token = crate::config::settings::resolve_git_remote_token(remote).ok()?;
+    let (base_url, token, source) = resolve_github_credential_with(
+        &owner_repo,
+        settings,
+        |remote| crate::config::settings::resolve_git_remote_token(remote).ok(),
+        || crate::util::github_cli::auth_token("github.com"),
+    )?;
+    tracing::info!(repo = %owner_repo, credential_source = ?source, "resolved GitHub delivery credential");
     let client = crate::git_remote::client::RemoteGitClient::new(
-        &remote.base_url,
+        &base_url,
         &token,
-        remote.provider.clone(),
+        crate::config::settings::GitProvider::Github,
     );
     let default_branch = git(
         Path::new(&root),
@@ -679,7 +725,7 @@ pub fn github_remote_for(
         ],
     )
     .ok()
-    .and_then(|s| s.rsplit('/').next().map(String::from))
+    .and_then(|value| value.rsplit('/').next().map(String::from))
     .unwrap_or_else(|| "main".to_string());
 
     Some(GithubRemote {
@@ -831,32 +877,81 @@ mod tests {
     }
 
     #[test]
-    fn no_token_message_tells_the_model_to_stop_retrying() {
-        // The app's only historical deliver_changes call blocked exactly here
-        // (git_remotes was never configured). The message must carry the fix
-        // path AND forbid blind retries — retrying cannot succeed until the
-        // user configures a token.
-        assert!(NO_TOKEN_PR_MESSAGE.contains("设置→远程仓库"));
-        assert!(NO_TOKEN_PR_MESSAGE.contains("不要再调用 deliver_changes"));
+    fn missing_credentials_message_names_both_supported_sources() {
+        assert!(NO_GITHUB_CREDENTIALS_PR_MESSAGE.contains("gh auth login"));
+        assert!(NO_GITHUB_CREDENTIALS_PR_MESSAGE.contains("设置→远程仓库"));
     }
 
     #[test]
-    fn readiness_note_warns_before_work_when_github_origin_has_no_token() {
-        // The broken chain must be surfaced in the model's FIRST reply, not
-        // discovered after the work is done.
+    fn github_credential_resolution_prefers_app_token_and_falls_back_to_cli() {
+        use std::cell::Cell;
+
         let settings = crate::config::settings::Settings::default();
-        let note = delivery_readiness_from_origin(
+        let resolved = resolve_github_credential_with(
+            "BumStill/CodeFactory",
+            &settings,
+            |_| None,
+            || Some("cli-token".into()),
+        )
+        .expect("CLI login should be a credential source");
+        assert_eq!(resolved.0, "https://api.github.com");
+        assert_eq!(resolved.1, "cli-token");
+        assert_eq!(resolved.2, GithubCredentialSource::GithubCli);
+
+        let mut configured = crate::config::settings::Settings::default();
+        configured
+            .git_remotes
+            .push(crate::config::settings::GitRemoteConfig {
+                id: "configured".into(),
+                name: "github".into(),
+                provider: crate::config::settings::GitProvider::Github,
+                base_url: "https://enterprise.example/api/v3".into(),
+                token_ref: Some("test-only-ref".into()),
+                token: String::new(),
+                default_repo: Some("BumStill/CodeFactory".into()),
+            });
+        let cli_called = Cell::new(false);
+        let resolved = resolve_github_credential_with(
+            "BumStill/CodeFactory",
+            &configured,
+            |remote| (remote.id == "configured").then(|| "app-token".into()),
+            || {
+                cli_called.set(true);
+                Some("cli-token".into())
+            },
+        )
+        .expect("configured app credential should win");
+        assert_eq!(resolved.0, "https://enterprise.example/api/v3");
+        assert_eq!(resolved.1, "app-token");
+        assert_eq!(resolved.2, GithubCredentialSource::AppRemote);
+        assert!(!cli_called.get(), "CLI must not be queried when app auth works");
+
+        assert!(resolve_github_credential_with(
+            "BumStill/CodeFactory",
+            &settings,
+            |_| None,
+            || None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn readiness_note_accepts_authenticated_github_cli_without_app_token() {
+        let settings = crate::config::settings::Settings::default();
+        let note = delivery_readiness_from_origin_with_cli(
             Some("git@github.com:BumStill/CodeFactory.git"),
             &settings,
+            true,
         )
-        .expect("github origin without a token must produce a warning note");
-        assert!(note.contains("FIRST reply"));
-        assert!(note.contains("设置→远程仓库"));
-        assert!(note.contains("do NOT call deliver_changes"));
+        .expect("authenticated GitHub CLI must enable delivery");
+        assert!(note.contains("GitHub CLI"));
+        assert!(note.contains("无需重复配置 token"));
+        assert!(note.contains("deliver_changes"));
+        assert!(!note.contains("credentials unavailable"));
     }
 
     #[test]
-    fn readiness_note_reports_ceiling_when_remote_is_configured() {
+    fn readiness_note_reports_ceiling_when_credentials_are_available() {
         let mut settings = crate::config::settings::Settings::default();
         settings
             .git_remotes
@@ -869,29 +964,72 @@ mod tests {
                 token: "t".into(),
                 default_repo: Some("BumStill/CodeFactory".into()),
             });
-        let note = delivery_readiness_from_origin(
+        let note = delivery_readiness_from_origin_with_cli(
             Some("https://github.com/BumStill/CodeFactory.git"),
             &settings,
+            true,
         )
         .expect("configured remote must produce a capability note");
         assert!(note.contains("pr_only"));
         assert!(note.contains("deliver_changes"));
     }
 
+    #[tokio::test]
+    async fn live_github_cli_login_builds_the_delivery_remote_without_app_token() {
+        if std::env::var_os("CODEFACTORY_EXPECT_GH_AUTH").is_none() {
+            return;
+        }
+        let root = make_repo("live-gh-cli");
+        git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:BumStill/CodeFactory.git",
+            ],
+        )
+        .unwrap();
+
+        let remote = github_remote_for(
+            &root,
+            &crate::config::settings::Settings::default(),
+        )
+        .expect("the active gh login must construct a delivery remote");
+        assert_eq!(remote.repo, "BumStill/CodeFactory");
+        let prs = crate::git_remote::github::list_prs(&remote.client, &remote.repo, "open")
+            .await
+            .expect("the GitHub CLI credential must authenticate the product REST client");
+        assert!(
+            prs.iter().all(|pr| !pr.url.is_empty()),
+            "every returned PR must have a URL"
+        );
+        let note = delivery_readiness_note(
+            &root,
+            &crate::config::settings::Settings::default(),
+        )
+        .expect("the active gh login must mark delivery ready");
+        assert!(note.contains("GitHub CLI"));
+        assert!(note.contains("deliver_changes"));
+        assert!(!note.contains("credentials unavailable"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
     #[test]
     fn readiness_note_stays_silent_when_off_or_not_github() {
         let settings = crate::config::settings::Settings::default();
-        assert!(delivery_readiness_from_origin(None, &settings).is_none());
+        assert!(delivery_readiness_from_origin_with_cli(None, &settings, false).is_none());
         assert!(
-            delivery_readiness_from_origin(Some("https://gitlab.com/x/y.git"), &settings)
+            delivery_readiness_from_origin_with_cli(Some("https://gitlab.com/x/y.git"), &settings, false)
                 .is_none()
         );
 
         let mut off = crate::config::settings::Settings::default();
         off.delivery_ceiling = DeliveryCeiling::Off;
-        assert!(delivery_readiness_from_origin(
+        assert!(delivery_readiness_from_origin_with_cli(
             Some("https://github.com/BumStill/CodeFactory.git"),
-            &off
+            &off,
+            true,
         )
         .is_none());
     }

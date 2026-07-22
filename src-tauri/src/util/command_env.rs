@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::env;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use tokio::process::Command;
@@ -30,17 +31,68 @@ pub fn apply_developer_path(cmd: &mut Command) {
     }
 }
 
-fn developer_path() -> Option<OsString> {
-    if EXTRA_PATHS.is_empty() {
-        return None;
+pub fn apply_developer_path_std(cmd: &mut StdCommand) {
+    if let Some(path) = developer_path() {
+        cmd.env("PATH", path);
     }
+}
 
-    let mut paths: Vec<std::path::PathBuf> =
-        EXTRA_PATHS.iter().map(std::path::PathBuf::from).collect();
+fn developer_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = EXTRA_PATHS.iter().map(PathBuf::from).collect();
     if let Some(existing) = env::var_os("PATH") {
         paths.extend(env::split_paths(&existing));
     }
-    env::join_paths(paths).ok()
+    paths
+}
+
+fn developer_path() -> Option<OsString> {
+    env::join_paths(developer_paths()).ok()
+}
+
+/// Resolve a developer CLI using the same augmented PATH given to shell tools.
+/// This matters for GUI-launched apps on macOS, where `/opt/homebrew/bin` is
+/// commonly absent from the inherited environment.
+pub fn resolve_developer_command(program: &str) -> PathBuf {
+    let requested = Path::new(program);
+    if requested.components().count() > 1 {
+        return requested.to_path_buf();
+    }
+
+    #[cfg(windows)]
+    let executable_name = if requested.extension().is_none() {
+        format!("{program}.exe")
+    } else {
+        program.to_owned()
+    };
+    #[cfg(not(windows))]
+    let executable_name = program.to_owned();
+
+    for directory in developer_paths() {
+        let candidate = directory.join(&executable_name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let known_roots = [
+            env::var_os("ProgramFiles").map(PathBuf::from),
+            env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        ];
+        for root in known_roots.into_iter().flatten() {
+            let candidate = if root.ends_with("Local") {
+                root.join("Programs").join("GitHub CLI").join("gh.exe")
+            } else {
+                root.join("GitHub CLI").join("gh.exe")
+            };
+            if program.eq_ignore_ascii_case("gh") && candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    PathBuf::from(executable_name)
 }
 
 pub struct ShellInvocation {
