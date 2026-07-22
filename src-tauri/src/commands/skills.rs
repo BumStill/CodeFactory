@@ -1366,9 +1366,11 @@ mod tests {
         let roots = openclaw_skill_roots();
         let joined = roots
             .iter()
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
             .collect::<Vec<_>>()
             .join(";");
+        // Normalize separators so the assertion holds on Windows (backslashes)
+        // as well as unix — the roots themselves are platform-native paths.
         assert!(joined.contains(".openclaw/workspace/skills"));
         assert!(joined.contains(".claude/skills"));
     }
