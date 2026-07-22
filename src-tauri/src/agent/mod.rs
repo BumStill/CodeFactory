@@ -1395,6 +1395,14 @@ impl AgentLoop {
                 },
             )
             .ok();
+        {
+            let settings = self.settings.read().await;
+            crate::notify::send(
+                &settings,
+                crate::notify::NotifyEvent::PermissionWaiting,
+                format!("工具 {} 正在等待你的批准", tc.function.name),
+            );
+        }
 
         let allow =
             await_permission_response(receiver, self.cancel.as_ref(), Duration::from_secs(600))

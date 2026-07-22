@@ -450,6 +450,8 @@ export function SettingsPage({ onBack }: Props) {
     max_parallel_tasks: number;
     subagent_isolation: NonNullable<Settings["subagent_isolation"]>;
     delivery_ceiling: NonNullable<Settings["delivery_ceiling"]>;
+    im_webhook_url: string;
+    im_webhook_format: NonNullable<Settings["im_webhook_format"]>;
   } | null>(null);
   const [generalSaved, setGeneralSaved] = useState(false);
 
@@ -486,6 +488,8 @@ export function SettingsPage({ onBack }: Props) {
       max_parallel_tasks: settings.max_parallel_tasks ?? 3,
       subagent_isolation: settings.subagent_isolation ?? "shared",
       delivery_ceiling: settings.delivery_ceiling ?? "pr_only",
+      im_webhook_url: settings.im_webhook_url ?? "",
+      im_webhook_format: settings.im_webhook_format ?? "wecom",
     });
   }, [settings]);
 
@@ -596,6 +600,8 @@ export function SettingsPage({ onBack }: Props) {
       max_parallel_tasks: Math.min(8, Math.max(1, Math.round(generalDraft.max_parallel_tasks) || 3)),
       subagent_isolation: generalDraft.subagent_isolation,
       delivery_ceiling: generalDraft.delivery_ceiling,
+      im_webhook_url: generalDraft.im_webhook_url.trim(),
+      im_webhook_format: generalDraft.im_webhook_format,
     } as Settings & { auto_create_pr: boolean });
 
     setGeneralSaved(true);
@@ -908,6 +914,39 @@ export function SettingsPage({ onBack }: Props) {
                 <option value="through_merge">…并合并</option>
                 <option value="through_release">…并发布上线</option>
               </select>
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-xs text-gray-500">IM 通知(手机上掌握进度)</label>
+              <p className="text-[11px] leading-5 text-gray-600">
+                配置群机器人 Webhook 后,任务完成/失败、会话回合中断、工具等待批准时会推送一条消息。
+                仅单向通知,不含任何令牌或代码内容;留空即关闭。
+              </p>
+              <div className="flex items-center gap-2">
+                <select
+                  value={generalDraft.im_webhook_format}
+                  onChange={(e) =>
+                    setGeneralDraft({
+                      ...generalDraft,
+                      im_webhook_format: e.target.value as NonNullable<Settings["im_webhook_format"]>,
+                    })
+                  }
+                  className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                >
+                  <option value="wecom">企业微信</option>
+                  <option value="feishu">飞书</option>
+                  <option value="generic">通用 JSON</option>
+                </select>
+                <input
+                  value={generalDraft.im_webhook_url}
+                  onChange={(e) =>
+                    setGeneralDraft({ ...generalDraft, im_webhook_url: e.target.value })
+                  }
+                  placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…"
+                  className="flex-1 rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                  aria-label="IM Webhook 地址"
+                />
+              </div>
             </div>
 
             <div className="flex justify-end">
