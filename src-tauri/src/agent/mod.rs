@@ -318,6 +318,14 @@ verify the outcome. The plan is the contract.\n\
    When you stop for a hard blocker: state it in ONE precise sentence,\n\
    tell the user EXACTLY what action unblocks you, then end.\n\
 \n\
+**PARALLEL FAN-OUT:**\n\
+When the plan contains several INDEPENDENT sub-jobs (auditing many\n\
+modules, migrating many files, researching directions) that do not edit\n\
+the same files, call `dispatch_parallel_tasks` once with self-contained\n\
+briefs instead of doing them serially — the scheduler runs them\n\
+concurrently under the user's parallelism cap. Keep sequential steps of\n\
+one change OUT of it.\n\
+\n\
 **HOW A TURN ENDS NATURALLY:**\n\
 - All acceptance criteria verified pass -> declare done with the\n\
   one-line evidence per criterion (the command run + the result)\n\

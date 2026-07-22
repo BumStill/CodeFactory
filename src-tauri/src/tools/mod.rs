@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod bash;
 pub mod delivery;
+pub mod parallel;
 pub mod docx;
 pub mod edit;
 pub mod file_lock;
@@ -95,6 +96,7 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         xlsx::read_definition(),
         xlsx::edit_definition(),
         delivery::definition(),
+        parallel::definition(),
     ]
 }
 
@@ -122,6 +124,7 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "read_xlsx" => xlsx::execute_read(args, ctx).await,
         "edit_xlsx" => xlsx::execute_edit(args, ctx).await,
         "deliver_changes" => delivery::execute(args, ctx).await,
+        "dispatch_parallel_tasks" => parallel::execute(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),
     }
 }
