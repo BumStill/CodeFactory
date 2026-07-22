@@ -26,7 +26,7 @@ use tauri::{command, AppHandle, Emitter, State};
 use uuid::Uuid;
 
 use crate::commands::memory::ProjectMemory;
-use crate::commands::specs::{run_one_shot_text, AiMessage as OneShotAiMessage};
+use crate::ai_text::{run_one_shot_text, AiMessage as OneShotAiMessage};
 use crate::config::settings::ApiStyle;
 use crate::errors::AppError;
 use crate::AppState;

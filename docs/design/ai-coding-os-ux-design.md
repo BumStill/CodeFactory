@@ -29,7 +29,7 @@ Workspace 后续可追加同入口，但 v1 先在 Home 顶部提供全局入口
 │ 项目上下文 / 当前 cwd / 生成时间             │
 ├────────────────────────────────────────────┤
 │ Authority Surfaces                         │
-│  AGENTS.md  docs/specs  .codefactory/specs │
+│  AGENTS.md  docs/specs                     │
 │  sync hook  release cadence                │
 ├────────────────────────────────────────────┤
 │ Memory Lifecycle                           │

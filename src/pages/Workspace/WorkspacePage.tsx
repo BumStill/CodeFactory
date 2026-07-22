@@ -28,7 +28,6 @@ import {
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
 import { SessionSidebar } from "../../components/SessionSidebar";
-import { SpecsPage } from "../Specs/SpecsPage";
 import { ModelPicker } from "../../components/ModelPicker";
 import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
@@ -136,10 +135,6 @@ export function WorkspacePage({
   const loadLearning = useLearningStore((state) => state.load);
   const subscribeLearning = useLearningStore((state) => state.subscribe);
   const pendingLearningCount = learningEvents.filter((event) => event.status === "pending").length;
-  // Specs workbench, folded into the Workspace as a full-screen overlay: it's
-  // invoked in-context, scoped to this session's cwd, and its "开始实现" creates +
-  // runs tasks in THIS session (no navigation away — unified flow).
-  const [specsOpen, setSpecsOpen] = useState(false);
   const projectTaskCount = useTasksStore((state) => state.tasks[sessionId]?.length ?? 0);
   const loadProjectTasks = useTasksStore((state) => state.loadTasks);
   const subscribeProjectTasks = useTasksStore((state) => state.subscribe);
@@ -280,13 +275,6 @@ export function WorkspacePage({
           ))}
         </div>
 
-        <button
-          onClick={() => setSpecsOpen(true)}
-          className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-          title="规范工作台（在当前会话里写需求规范并就地实现）"
-        >
-          <BookOpen size={14} />
-        </button>
         <div className="flex items-center gap-1.5">
           <GitStatusBar
             cwd={activeCwd}
@@ -409,25 +397,11 @@ export function WorkspacePage({
 
       </div>
 
-      {/* ── Specs workbench, folded into the Workspace as a full-screen ───
-          overlay. SpecsPage reads the active session from the chat store, so
-          it auto-scopes to this session's cwd; its "开始实现" runs in this very
-          session. onOpenWorkspace just closes (we're already here). */}
-      {specsOpen && (
-        <div className="fixed inset-0 z-50">
-          <SpecsPage
-            onBack={() => setSpecsOpen(false)}
-            onOpenWorkspace={() => setSpecsOpen(false)}
-          />
-        </div>
-      )}
-
       {/* ── Git / environment slide-out panels (opened from the status bar) ─ */}
       {gitPanel === "changes" && <GitChangesPanel onClose={() => setGitPanel(null)} />}
       {gitPanel === "history" && <GitHistoryPanel onClose={() => setGitPanel(null)} />}
       {gitPanel === "remote" && (
         <RemoteGitPanel
-          cwd={activeSession?.cwd ?? null}
           currentBranch={gitBranch}
           onClose={() => setGitPanel(null)}
         />

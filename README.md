@@ -43,7 +43,7 @@ API key.
 | 🗂 **Sessions** | Lightweight quick chats and full project workspaces share one rail — rename or delete inline, and multiple sessions stream concurrently without blocking each other. |
 | 🧠 **Context-aware** | Live context-window meter, adaptive compression of oversized tool results when nearing the model's limit, `reasoning_content` propagation for DeepSeek reasoner / Claude thinking-mode models. |
 | 🛡 **Safe by default** | Configurable permission policy per-tool. Path-typo detection blocks hallucinated targets like `app/__iniy/` before they write. Daily DB backups with 7-day rolling retention. |
-| 🤖 **Subagents** | Spec → tasks → parallel subagent dispatch, shared brief, verification engine, evidence pack auto-collection. |
+| 🤖 **Subagents** | Conversation-native task delegation → parallel subagent dispatch, shared brief, verification engine, evidence pack auto-collection. Long-lived specs stay in the repository and travel with Git. |
 | 🪝 **Hooks & Skills** | Run scripts on tool events (commit-on-edit, lint-on-write). Create, edit, import, or let the agent search for skill packs (system prompts + slash commands) right from the chat box — pull in Superpowers / OpenSpec-style skills with a preview-then-enable step. |
 | 🌐 **MCP client** | Connect Model Context Protocol servers for arbitrary tool extension. |
 | 🔁 **Auto-update** | Signed updates over GitHub Releases. New version arrives → in-app banner → one-click install + relaunch. Your data stays. |

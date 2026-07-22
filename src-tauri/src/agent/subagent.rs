@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::agent::{AgentExecutionContext, AgentLoop};
-use crate::commands::specs::{run_one_shot_text, AiMessage};
+use crate::ai_text::{run_one_shot_text, AiMessage};
 use crate::config::settings::{ApiStyle, Settings};
 use crate::errors::{AppError, Result};
 use crate::mcp::McpManager;

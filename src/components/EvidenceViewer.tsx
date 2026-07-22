@@ -163,7 +163,7 @@ function sourceLocator(source: KnowledgeRefSource): string | null {
   return null;
 }
 
-// ── Simple markdown renderer (same logic as SpecsPage) ───────────────────────
+// ── Simple markdown renderer for evidence documents ─────────────────────────
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
