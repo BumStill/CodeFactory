@@ -11,8 +11,8 @@
 - Blocked means: 同一外部条件连续三轮阻断交付，且没有安全的本地、headless 或 GitHub runner 替代路径；必须记录失败证据和恢复动作。
 
 ## Current State
-- Current phase: 实现与本地验证完成，准备提交堆叠 PR。
-- Current checkpoint: 独立 Specs 产品模块、Issue→Spec 和 Control Plane 的 `.codefactory/specs` 权威项已删除；旧规范已迁入 Git 文档；Agent prompt 已优先发现 `AGENTS.md` 与已有仓库意图目录。
+- Current phase: 堆叠 draft PR 已创建，等待上游与 CI 门禁。
+- Current checkpoint: PR #159（`codex/repo-owned-specs` → `codex/resume-completion-recovery-tdd`）已推送；两条 governance checks 通过。
 - Next owner: 当前 Codex 主执行线。
 - Updated at: 2026-07-22
 
@@ -26,11 +26,12 @@
 - [x] 完成前端、Rust、构建、治理与真实浏览器验收。
 
 ## Remaining Items
-- [ ] 提交、推送、创建堆叠 PR，等待上游 #157 与本 PR CI。
+- [ ] 等待上游 #157 修绿并合并；把 PR #159 retarget 到 `main`，触发并通过完整 CI。
 - [ ] 合并后按 release cadence 判断刻意发版，并在发布产物复验。
 
 ## Blockers
 - 上游 PR #157 当前 `check` 失败；本切片可继续开发和验证，但在 #157 修绿/合并前不能进入 main。
+- `.github/workflows/ci.yml` 只监听 base=`main` 的 PR；PR #159 作为堆叠 PR 当前只运行 governance。上游合并并 retarget 后才会触发完整 CI，不把当前状态标为 CI green。
 
 ## Evidence
 - Local evidence:
@@ -41,6 +42,7 @@
   - 桌面 App 已成功启动并检查首页顶栏；项目选择已定位到本 worktree，但 macOS 在最终 `Open` 前锁屏，因此项目会话用 lock-safe 浏览器门禁补证，不声称完成了锁屏后的桌面点击路径。
   - 旧规范 SHA-256 保持不变：`settings-hooks-remotes-tabs.md` 为 `5c02ff36687b57fa066fe1eb02935f0f0535c168734646c34bb2dbe8d9fb7449`；`token-cost-dashboard.md` 为 `45d92bd60f47fa2989a40c60d4cfcd7840adc69c0fd1e682aa580a19ee29b67d`。
 - Release evidence: 当前 `not live`。
+- PR evidence: draft PR #159；governance-baseline 2/2 passed；完整 CI 未触发。
 - Blocking evidence: PR #157 `mergeStateStatus=UNSTABLE`，Windows `check` 失败；其他 governance、agent bridge、remote GUI checks 通过。
 
 ## AI Collaboration
