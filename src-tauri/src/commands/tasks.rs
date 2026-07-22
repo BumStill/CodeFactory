@@ -33,6 +33,7 @@ pub type SchedulerHandles = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 /// the task module prevents the session-native delegation tool from embedding
 /// `run_session`'s opaque future back into the AgentLoop tool future (which
 /// would otherwise create a recursive async type through subagents).
+#[cfg(not(test))]
 pub fn spawn_delegated_session(
     scheduler: Arc<TaskScheduler>,
     session_id: String,
