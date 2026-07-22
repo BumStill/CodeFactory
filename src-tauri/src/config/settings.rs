@@ -152,6 +152,41 @@ pub struct Settings {
     /// pending (bounded so a delivery never hangs a turn forever).
     #[serde(default = "default_delivery_ci_timeout_secs")]
     pub delivery_ci_timeout_secs: u32,
+    /// Local token budgets are advisory. Crossing a threshold changes the
+    /// usage surfaces but never stops a task or silently switches models.
+    #[serde(default)]
+    pub usage_budget: UsageBudget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UsageBudget {
+    #[serde(default)]
+    pub daily_token_limit: u64,
+    #[serde(default)]
+    pub monthly_token_limit: u64,
+    #[serde(default = "default_usage_alert_thresholds")]
+    pub alert_thresholds: Vec<f64>,
+    #[serde(default = "default_true")]
+    pub alerts_enabled: bool,
+}
+
+fn default_usage_alert_thresholds() -> Vec<f64> {
+    vec![0.5, 0.8, 1.0]
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for UsageBudget {
+    fn default() -> Self {
+        Self {
+            daily_token_limit: 0,
+            monthly_token_limit: 0,
+            alert_thresholds: default_usage_alert_thresholds(),
+            alerts_enabled: true,
+        }
+    }
 }
 
 /// How far the agent carries a code change toward production, unattended. The
@@ -555,6 +590,7 @@ impl Default for Settings {
             delivery_merge_method: MergeMethod::Squash,
             delivery_exclude_globs: Vec::new(),
             delivery_ci_timeout_secs: default_delivery_ci_timeout_secs(),
+            usage_budget: UsageBudget::default(),
         }
     }
 }

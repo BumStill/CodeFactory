@@ -19,6 +19,7 @@ interface Props {
   cwd?: string | null;
   /** Called when the user picks an example prompt from the welcome screen. */
   onUsePrompt?: (text: string) => void;
+  onOpenUsage?: () => void;
 }
 
 // ── Shiki singleton ──────────────────────────────────────────────────────────
@@ -167,7 +168,7 @@ function TypingDots() {
 }
 
 // ── Main component ───────────────────────────────────────────────────────────
-export function MessageList({ messages, streaming, cwd, onUsePrompt }: Props) {
+export function MessageList({ messages, streaming, cwd, onUsePrompt, onOpenUsage }: Props) {
   // Use the first message's id as the conversation identity. Different
   // sessions have different first messages → the scroll hook treats it as a
   // session change and re-pins to the bottom. Empty list → null (fine; no
@@ -182,7 +183,7 @@ export function MessageList({ messages, streaming, cwd, onUsePrompt }: Props) {
   );
 
   if (messages.length === 0) {
-    return <WelcomeScreen onUsePrompt={onUsePrompt} />;
+    return <WelcomeScreen onUsePrompt={onUsePrompt} onOpenUsage={onOpenUsage} />;
   }
 
   const visible = messages.filter((m) => m.role !== "tool" && m.role !== "system");

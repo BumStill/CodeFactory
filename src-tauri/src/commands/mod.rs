@@ -26,3 +26,5 @@ pub mod skills;
 pub mod specs;
 pub mod tasks;
 pub mod terminal;
+#[cfg(test)]
+mod usage_acceptance_tests;

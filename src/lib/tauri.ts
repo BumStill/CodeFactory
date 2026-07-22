@@ -438,6 +438,12 @@ export interface Settings {
   delivery_exclude_globs?: string[];
   /** Max seconds delivery polls CI before reporting it still pending. Missing → 1800. */
   delivery_ci_timeout_secs?: number;
+  usage_budget?: {
+    daily_token_limit: number;
+    monthly_token_limit: number;
+    alert_thresholds: number[];
+    alerts_enabled: boolean;
+  };
 }
 
 // ── Git ─────────────────────────────────────────────────────────────────────

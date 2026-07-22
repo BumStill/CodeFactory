@@ -189,6 +189,15 @@ pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
 /// This function bypasses all of that: it reads `pragma_table_info` and
 /// conditionally ALTERs missing columns. Safe to run on every startup,
 /// works for fresh installs and any historical state alike.
+async fn table_exists(pool: &SqlitePool, table: &str) -> crate::errors::Result<bool> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?")
+            .bind(table)
+            .fetch_one(pool)
+            .await?;
+    Ok(count > 0)
+}
+
 async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     // ── Tables that historic ad-hoc migrations created — fresh installs
     //    miss them and the corresponding command modules would crash on
@@ -214,6 +223,268 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_cost_entries_created ON cost_entries(created_at)")
         .execute(pool)
         .await?;
+
+    // Request-level model usage is the accounting truth source. The legacy
+    // cost_entries table only captured the final tool-free round and applied a
+    // single guessed price to every provider, so it remains for rollback but
+    // is no longer suitable for user-facing totals.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS model_usage_events (
+            id                 TEXT PRIMARY KEY,
+            request_id         TEXT NOT NULL UNIQUE,
+            attempt_id         TEXT,
+            session_id         TEXT NOT NULL,
+            task_id            TEXT,
+            surface            TEXT NOT NULL,
+            provider           TEXT NOT NULL,
+            endpoint           TEXT NOT NULL,
+            model              TEXT NOT NULL,
+            input_tokens       INTEGER NOT NULL CHECK(input_tokens >= 0),
+            output_tokens      INTEGER NOT NULL CHECK(output_tokens >= 0),
+            reasoning_tokens   INTEGER NOT NULL DEFAULT 0 CHECK(reasoning_tokens >= 0),
+            cached_tokens      INTEGER NOT NULL DEFAULT 0 CHECK(cached_tokens >= 0),
+            actual_cost_usd    REAL,
+            estimated_cost_usd REAL,
+            cost_source        TEXT NOT NULL,
+            source             TEXT NOT NULL DEFAULT 'provider_usage',
+            created_at         TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    ensure_column(pool, "model_usage_events", "attempt_id", "TEXT").await?;
+    sqlx::query("UPDATE model_usage_events SET attempt_id = request_id WHERE attempt_id IS NULL")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_model_usage_attempt ON model_usage_events(attempt_id)",
+    )
+    .execute(pool)
+    .await?;
+    for index_sql in [
+        "CREATE INDEX IF NOT EXISTS idx_model_usage_created ON model_usage_events(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_model_usage_session ON model_usage_events(session_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_model_usage_surface ON model_usage_events(surface, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_model_usage_model ON model_usage_events(model, created_at)",
+    ] {
+        sqlx::query(index_sql).execute(pool).await?;
+    }
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS usage_tracking_metadata (
+            singleton  INTEGER PRIMARY KEY CHECK(singleton = 1),
+            started_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS usage_budget_receipts (
+            id            TEXT PRIMARY KEY,
+            period_kind   TEXT NOT NULL,
+            period_key    TEXT NOT NULL,
+            threshold     REAL NOT NULL,
+            usage_tokens  INTEGER NOT NULL,
+            limit_tokens  INTEGER NOT NULL,
+            triggered_at  TEXT NOT NULL,
+            UNIQUE(period_kind, period_key, threshold)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS usage_migration_receipts (
+            version      TEXT PRIMARY KEY,
+            scanned      INTEGER NOT NULL,
+            inserted     INTEGER NOT NULL,
+            skipped      INTEGER NOT NULL,
+            conflicted   INTEGER NOT NULL,
+            completed_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_usage_budget_period
+         ON usage_budget_receipts(period_kind, period_key)",
+    )
+    .execute(pool)
+    .await?;
+    let tracking_started = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    sqlx::query(
+        "INSERT OR IGNORE INTO usage_tracking_metadata(singleton, started_at) VALUES (1, ?)",
+    )
+    .bind(&tracking_started)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE usage_tracking_metadata
+         SET started_at = strftime('%Y-%m-%dT%H:%M:%fZ', started_at)
+         WHERE strftime('%Y-%m-%dT%H:%M:%fZ', started_at) IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE model_usage_events
+         SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', created_at)
+         WHERE strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
+
+    // Link the assistant transcript row to the exact provider attempt. This
+    // lets startup repair distinguish a live-recorded round from a genuinely
+    // historical message without comparing token values or timestamps.
+    ensure_column(pool, "messages", "usage_request_id", "TEXT").await?;
+    if table_exists(pool, "messages").await? {
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_usage_request ON messages(usage_request_id)",
+        )
+        .execute(pool)
+        .await?;
+    }
+
+    let mut migration_scanned = 0_i64;
+    let mut migration_inserted = 0_i64;
+    let mut migration_skipped = 0_i64;
+    let mut migration_conflicted = 0_i64;
+
+    // Backfill per-message provider usage first. Assistant messages already
+    // preserve one usage object per provider round, including tool rounds.
+    // The deterministic request id makes startup repair safe to rerun.
+    if table_exists(pool, "messages").await? && table_exists(pool, "sessions").await? {
+        let message_scanned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages m
+             WHERE m.role = 'assistant'
+               AND (COALESCE(m.input_tokens, 0) > 0 OR COALESCE(m.output_tokens, 0) > 0)
+               AND m.created_at < CAST(strftime('%s', (
+                   SELECT started_at FROM usage_tracking_metadata WHERE singleton = 1
+               )) AS INTEGER) * 1000",
+        )
+        .fetch_one(pool)
+        .await?;
+        let message_conflicted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages m
+             WHERE m.role = 'assistant'
+               AND (COALESCE(m.input_tokens, 0) > 0 OR COALESCE(m.output_tokens, 0) > 0)
+               AND m.created_at < CAST(strftime('%s', (
+                   SELECT started_at FROM usage_tracking_metadata WHERE singleton = 1
+               )) AS INTEGER) * 1000
+               AND (EXISTS (
+                   SELECT 1 FROM model_usage_events existing
+                   WHERE existing.request_id = 'message:' || m.id
+               ) OR (m.usage_request_id IS NOT NULL AND EXISTS (
+                   SELECT 1 FROM model_usage_events live
+                   WHERE live.request_id = m.usage_request_id
+               )))",
+        )
+        .fetch_one(pool)
+        .await?;
+        let message_result = sqlx::query(
+            "INSERT OR IGNORE INTO model_usage_events (
+                id, request_id, attempt_id, session_id, task_id, surface, provider, endpoint, model,
+                input_tokens, output_tokens, reasoning_tokens, cached_tokens,
+                actual_cost_usd, estimated_cost_usd, cost_source, source, created_at
+             )
+             SELECT 'message:' || m.id, 'message:' || m.id, 'message:' || m.id, m.session_id, NULL,
+                    'interactive', 'historical', 'historical-message',
+                    COALESCE(m.model_id, s.model_id, 'unknown'),
+                    COALESCE(m.input_tokens, 0), COALESCE(m.output_tokens, 0), 0, 0,
+                    NULL, NULL, 'unknown', 'backfill_message',
+                    strftime('%Y-%m-%dT%H:%M:%fZ', m.created_at / 1000.0, 'unixepoch')
+             FROM messages m
+             LEFT JOIN sessions s ON s.id = m.session_id
+             WHERE m.role = 'assistant'
+               AND (COALESCE(m.input_tokens, 0) > 0 OR COALESCE(m.output_tokens, 0) > 0)
+               AND m.created_at < CAST(strftime('%s', (
+                   SELECT started_at FROM usage_tracking_metadata WHERE singleton = 1
+               )) AS INTEGER) * 1000
+               AND (m.usage_request_id IS NULL OR NOT EXISTS (
+                   SELECT 1 FROM model_usage_events live
+                   WHERE live.request_id = m.usage_request_id
+               ))",
+        )
+        .execute(pool)
+        .await?;
+        migration_scanned += message_scanned;
+        migration_inserted += message_result.rows_affected() as i64;
+        migration_conflicted += message_conflicted;
+        migration_skipped +=
+            (message_scanned - message_result.rows_affected() as i64 - message_conflicted).max(0);
+    }
+
+    // Legacy cost rows are incomplete estimates. Import only rows that do not
+    // match a message backfill, and never promote their guessed dollars to
+    // provider-actual spend.
+    let legacy_scanned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cost_entries")
+        .fetch_one(pool)
+        .await?;
+    let legacy_skipped: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cost_entries c
+         WHERE EXISTS (
+             SELECT 1 FROM model_usage_events u
+             WHERE u.source = 'backfill_message'
+               AND u.session_id = c.session_id
+               AND u.input_tokens = c.input_tokens
+               AND u.output_tokens = c.output_tokens
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    let legacy_conflicted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cost_entries c
+         WHERE NOT EXISTS (
+             SELECT 1 FROM model_usage_events u
+             WHERE u.source = 'backfill_message'
+               AND u.session_id = c.session_id
+               AND u.input_tokens = c.input_tokens
+               AND u.output_tokens = c.output_tokens
+         ) AND EXISTS (
+             SELECT 1 FROM model_usage_events existing
+             WHERE existing.request_id = 'legacy:' || c.id
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    let legacy_result = sqlx::query(
+        "INSERT OR IGNORE INTO model_usage_events (
+            id, request_id, attempt_id, session_id, task_id, surface, provider, endpoint, model,
+            input_tokens, output_tokens, reasoning_tokens, cached_tokens,
+            actual_cost_usd, estimated_cost_usd, cost_source, source, created_at
+         )
+         SELECT 'legacy:' || c.id, 'legacy:' || c.id, 'legacy:' || c.id, c.session_id, NULL,
+                'interactive', c.endpoint, c.endpoint, c.model,
+                c.input_tokens, c.output_tokens, 0, 0,
+                NULL, c.cost_usd, 'legacy_estimate', 'legacy_cost_entry',
+                COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', c.created_at), c.created_at)
+         FROM cost_entries c
+         WHERE NOT EXISTS (
+             SELECT 1 FROM model_usage_events u
+             WHERE u.source = 'backfill_message'
+               AND u.session_id = c.session_id
+               AND u.input_tokens = c.input_tokens
+               AND u.output_tokens = c.output_tokens
+         )",
+    )
+    .execute(pool)
+    .await?;
+    migration_scanned += legacy_scanned;
+    migration_inserted += legacy_result.rows_affected() as i64;
+    migration_skipped += legacy_skipped;
+    migration_conflicted += legacy_conflicted;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO usage_migration_receipts
+         (version, scanned, inserted, skipped, conflicted, completed_at)
+         VALUES ('usage-v1', ?, ?, ?, ?, ?)",
+    )
+    .bind(migration_scanned)
+    .bind(migration_inserted)
+    .bind(migration_skipped)
+    .bind(migration_conflicted)
+    .bind(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS task_runs (

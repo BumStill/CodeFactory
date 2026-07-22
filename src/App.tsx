@@ -18,7 +18,9 @@ export type AppView = "workspace" | "resources" | "settings" | "profile" | "cont
 
 export default function App() {
   const [view, setView] = useState<AppView>("workspace");
+  const [settingsInitialTab, setSettingsInitialTab] = useState<"usage" | undefined>();
   const [activeProject, setActiveProject] = useState<string | null>(null);
+  const [workspaceTaskLogId, setWorkspaceTaskLogId] = useState<string | null>(null);
   const [evolutionCwd, setEvolutionCwd] = useState<string | null>(null);
   const [evidenceViewerPath, setEvidenceViewerPath] = useState<string | null>(null);
   const loadSettings = useSettingsStore((s) => s.load);
@@ -43,6 +45,13 @@ export default function App() {
   }, [settingsLoaded]);
 
   const openProject = (sessionId: string) => {
+    setWorkspaceTaskLogId(null);
+    setActiveProject(sessionId);
+    setView("workspace");
+  };
+
+  const openJobLog = (sessionId: string, taskId: string) => {
+    setWorkspaceTaskLogId(taskId);
     setActiveProject(sessionId);
     setView("workspace");
   };
@@ -65,6 +74,16 @@ export default function App() {
     setView("evolution");
   };
 
+  const openSettings = () => {
+    setSettingsInitialTab(undefined);
+    setView("settings");
+  };
+
+  const openUsage = () => {
+    setSettingsInitialTab("usage");
+    setView("settings");
+  };
+
   return (
     <>
       <UpdaterBanner />
@@ -73,8 +92,10 @@ export default function App() {
         <WorkspacePage
           sessionId={activeProject}
           onBackHome={openFreshQuickDraft}
-          onOpenSettings={() => setView("settings")}
+          onOpenSettings={openSettings}
+          onOpenUsage={openUsage}
           onOpenSession={openProject}
+          initialTaskLogId={workspaceTaskLogId}
           onOpenResources={() => setView("resources")}
           onOpenControlPlane={() => setView("control-plane")}
           onOpenBenchmarks={() => setView("benchmarks")}
@@ -88,7 +109,14 @@ export default function App() {
       {view === "benchmarks" && <BenchmarksPage onBack={backToWorkspace} />}
       {view === "evolution" && <EvolutionWorkbenchPage onBack={backToWorkspace} initialCwd={evolutionCwd} />}
       {view === "profile" && <ProfilePage onBack={backToWorkspace} onOpenEvolution={openEvolution} />}
-      {view === "settings" && <SettingsPage onBack={backToWorkspace} />}
+      {view === "settings" && (
+        <SettingsPage
+          onBack={backToWorkspace}
+          initialTab={settingsInitialTab}
+          onOpenSession={openProject}
+          onOpenJobLog={openJobLog}
+        />
+      )}
 
       <ToastContainer onViewPack={(path) => setEvidenceViewerPath(path)} />
 
