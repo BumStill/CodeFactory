@@ -9,6 +9,7 @@ mod git_remote;
 mod http_util;
 mod knowledge;
 mod mcp;
+mod notify;
 mod openrouter;
 mod secrets;
 mod storage;

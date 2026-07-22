@@ -426,6 +426,9 @@ export interface Settings {
   /** How far the agent auto-delivers code changes. The user owns this ceiling.
    *  Optional for backward compat — missing → "pr_only". */
   delivery_ceiling?: 'off' | 'pr_only' | 'through_ci_green' | 'through_merge' | 'through_release';
+  /** One-way IM notifications for task terminals / turn errors / permission waits. Empty URL = off. */
+  im_webhook_url?: string;
+  im_webhook_format?: 'wecom' | 'feishu' | 'generic';
   /** Merge strategy for delivery at ThroughMerge+. Missing → "squash". */
   delivery_merge_method?: 'squash' | 'merge' | 'rebase';
   /** Extra repo-relative path prefixes excluded from delivery commits. */

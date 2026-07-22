@@ -294,6 +294,7 @@ pub async fn send_message(
 
     let db = state.db.read().await.clone();
     let settings_state = state.settings.clone();
+    let settings_for_notify = state.settings.clone();
     let pending_permissions = state.pending_permissions.clone();
     let mcp_manager: Arc<McpManager> = Arc::clone(&mcp);
 
@@ -343,6 +344,14 @@ pub async fn send_message(
             .await
             {
                 tracing::warn!("failed to persist turn error: {persist_err}");
+            }
+            {
+                let settings = settings_for_notify.read().await;
+                crate::notify::send(
+                    &settings,
+                    crate::notify::NotifyEvent::TurnError,
+                    e.to_string().chars().take(200).collect(),
+                );
             }
             app_clone
                 .emit(

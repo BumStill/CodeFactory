@@ -52,6 +52,18 @@ pub struct McpServerConfig {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImWebhookFormat {
+    /// Enterprise WeChat group-bot markdown message.
+    #[default]
+    Wecom,
+    /// Feishu custom-bot text message.
+    Feishu,
+    /// Neutral JSON for self-hosted relays.
+    Generic,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub endpoints: HashMap<String, Endpoint>,
@@ -101,6 +113,13 @@ pub struct Settings {
     /// enough to break the "green build but no PR" stall.
     #[serde(default)]
     pub delivery_ceiling: DeliveryCeiling,
+    /// IM webhook for one-way notifications (task finished/failed, turn
+    /// errors, permission waits). Empty = disabled.
+    #[serde(default)]
+    pub im_webhook_url: String,
+    /// Payload shape for `im_webhook_url`.
+    #[serde(default)]
+    pub im_webhook_format: ImWebhookFormat,
     /// Merge strategy used when the ceiling reaches `ThroughMerge`+.
     #[serde(default)]
     pub delivery_merge_method: MergeMethod,
@@ -508,6 +527,8 @@ impl Default for Settings {
             max_parallel_tasks: default_max_parallel_tasks(),
             subagent_isolation: SubagentIsolation::Shared,
             delivery_ceiling: DeliveryCeiling::PrOnly,
+            im_webhook_url: String::new(),
+            im_webhook_format: ImWebhookFormat::Wecom,
             delivery_merge_method: MergeMethod::Squash,
             delivery_exclude_globs: Vec::new(),
             delivery_ci_timeout_secs: default_delivery_ci_timeout_secs(),
