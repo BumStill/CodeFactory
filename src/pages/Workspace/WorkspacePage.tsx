@@ -6,9 +6,6 @@ import {
   ChevronDown,
   ChevronRight,
   Settings as SettingsIcon,
-  Moon,
-  Sun,
-  Monitor,
   Plus,
   RefreshCw,
   Circle,
@@ -17,18 +14,11 @@ import {
   XCircle,
   Play,
   Square,
-  Brain,
   EyeOff,
-  Puzzle,
-  ShieldCheck,
-  Gauge,
-  UserRound,
-  GitPullRequestArrow,
 } from "lucide-react";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
 import { SessionSidebar } from "../../components/SessionSidebar";
-import { SpecsPage } from "../Specs/SpecsPage";
 import { ModelPicker } from "../../components/ModelPicker";
 import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
@@ -45,11 +35,8 @@ import { useChatStore, activeRuntime } from "../../stores/chat";
 import { QueueBadge } from "../../components/QueueBadge";
 import { useSettingsStore } from "../../stores/settings";
 import { useTasksStore } from "../../stores/tasks";
-import { useLearningStore, type LearningEvent } from "../../stores/learning";
-import type { Theme, TaskRun, VerificationResult } from "../../lib/tauri";
+import type { TaskRun, VerificationResult } from "../../lib/tauri";
 import { parseVerification, verificationSummary } from "../../lib/verification";
-
-const EMPTY_LEARNING: LearningEvent[] = [];
 
 interface WorkspacePageProps {
   sessionId: string;
@@ -62,12 +49,6 @@ interface WorkspacePageProps {
   onOpenSession: (id: string) => void;
   /** Reveal the task workbench and highlight this task when deep-linked from usage. */
   initialTaskLogId?: string | null;
-  onOpenResources?: () => void;
-  onOpenControlPlane?: () => void;
-  onOpenBenchmarks?: () => void;
-  onOpenProfile?: () => void;
-  /** Open the human evolution review workbench, optionally scoped to a project. */
-  onOpenEvolution?: (cwd?: string) => void;
 }
 
 /**
@@ -87,11 +68,6 @@ export function WorkspacePage({
   onOpenUsage,
   onOpenSession,
   initialTaskLogId,
-  onOpenResources,
-  onOpenControlPlane,
-  onOpenBenchmarks,
-  onOpenProfile,
-  onOpenEvolution,
 }: WorkspacePageProps) {
   const {
     activeSession, draftSession,
@@ -103,7 +79,7 @@ export function WorkspacePage({
   // streaming into their own buckets; here we render the active one's slice.
   const { messages, streaming, queue, pendingPermission } = useChatStore(activeRuntime);
   const isAnonymous = activeSession?.kind === "anonymous";
-  const { settings, setTheme } = useSettingsStore();
+  const settings = useSettingsStore((state) => state.settings);
   const persistedRunActive = useTasksStore((state) => state.running[sessionId] ?? false);
   const autonomousRunActive = activeDraft ? false : persistedRunActive;
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
@@ -130,16 +106,6 @@ export function WorkspacePage({
   const [gitPanel, setGitPanel] = useState<"changes" | "history" | "remote" | null>(null);
   const gitBranch = useGitStore((s) => s.status?.branch ?? "");
   const activeCwd = activeSession?.cwd ?? activeDraft?.cwd ?? null;
-  const learningEvents = useLearningStore(
-    (state) => (activeCwd ? state.events[activeCwd] ?? EMPTY_LEARNING : EMPTY_LEARNING),
-  );
-  const loadLearning = useLearningStore((state) => state.load);
-  const subscribeLearning = useLearningStore((state) => state.subscribe);
-  const pendingLearningCount = learningEvents.filter((event) => event.status === "pending").length;
-  // Specs workbench, folded into the Workspace as a full-screen overlay: it's
-  // invoked in-context, scoped to this session's cwd, and its "开始实现" creates +
-  // runs tasks in THIS session (no navigation away — unified flow).
-  const [specsOpen, setSpecsOpen] = useState(false);
   const projectTaskCount = useTasksStore((state) => state.tasks[sessionId]?.length ?? 0);
   const loadProjectTasks = useTasksStore((state) => state.loadTasks);
   const subscribeProjectTasks = useTasksStore((state) => state.subscribe);
@@ -166,19 +132,11 @@ export function WorkspacePage({
     void selectSession(sessionId);
   }, [activeDraft, activeSession?.id, selectSession, sessionId]);
 
-  useEffect(() => {
-    if (!activeCwd) return;
-    void loadLearning(activeCwd);
-    let off: (() => void) | undefined;
-    subscribeLearning(activeCwd).then((unsubscribe) => { off = unsubscribe; });
-    return () => { off?.(); };
-  }, [activeCwd, loadLearning, subscribeLearning]);
-
   return (
     <div className="h-full flex flex-col bg-surface-0">
 
       {/* ── Header ────────────────────────────────────────────────────────── */}
-      <header className="flex items-center gap-3 px-3 py-1.5 border-b border-border bg-surface-1 shrink-0">
+      <header aria-label="会话工具栏" className="flex items-center gap-3 px-3 py-1.5 border-b border-border bg-surface-1 shrink-0">
         <button
           onClick={onBackHome}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
@@ -259,34 +217,6 @@ export function WorkspacePage({
             the global default, so the picker is hidden for them. */}
         {!isAnonymous && <ReasoningEffortPicker />}
 
-        {/* Theme toggle */}
-        <div className="flex items-center rounded border border-border overflow-hidden">
-          {([
-            { v: "dark",   Icon: Moon },
-            { v: "light",  Icon: Sun },
-            { v: "system", Icon: Monitor },
-          ] as { v: Theme; Icon: React.ElementType }[]).map(({ v, Icon }) => (
-            <button
-              key={v}
-              onClick={() => setTheme(v)}
-              className={`p-1 transition-colors ${
-                settings?.theme === v
-                  ? "bg-surface-3 text-accent"
-                  : "text-gray-600 hover:text-gray-300 hover:bg-surface-3"
-              }`}
-            >
-              <Icon size={13} />
-            </button>
-          ))}
-        </div>
-
-        <button
-          onClick={() => setSpecsOpen(true)}
-          className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-          title="规范工作台（在当前会话里写需求规范并就地实现）"
-        >
-          <BookOpen size={14} />
-        </button>
         <div className="flex items-center gap-1.5">
           <GitStatusBar
             cwd={activeCwd}
@@ -294,74 +224,13 @@ export function WorkspacePage({
             onOpenHistory={() => setGitPanel("history")}
             onOpenRemote={() => setGitPanel("remote")}
           />
-          {pendingLearningCount > 0 && activeCwd && onOpenEvolution && (
-            <button
-              onClick={() => onOpenEvolution(activeCwd)}
-              aria-label={`记忆 ${pendingLearningCount}`}
-              title="审核 AI 学到的项目记忆"
-              className="inline-flex items-center gap-1 rounded border border-accent/30 bg-accent/5 px-2 py-1 text-[11px] text-accent transition-colors hover:bg-accent/10"
-            >
-              <Brain size={11} />
-              <span>记忆</span>
-              <span className="tabular-nums">{pendingLearningCount}</span>
-            </button>
-          )}
           {!activeDraft && <CheckpointsPanel sessionId={sessionId} />}
         </div>
-        {onOpenProfile && (
-          <button
-            onClick={onOpenProfile}
-            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-            title="我的画像"
-            aria-label="我的画像"
-          >
-            <UserRound size={14} />
-          </button>
-        )}
-        {onOpenEvolution && (
-          <button
-            onClick={() => onOpenEvolution(activeCwd ?? undefined)}
-            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-            title="进化审查"
-            aria-label="进化审查"
-          >
-            <GitPullRequestArrow size={14} />
-          </button>
-        )}
-        {onOpenBenchmarks && (
-          <button
-            onClick={onOpenBenchmarks}
-            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-            title="能力评测"
-            aria-label="能力评测"
-          >
-            <Gauge size={14} />
-          </button>
-        )}
-        {onOpenResources && (
-          <button
-            onClick={onOpenResources}
-            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-            title="资源中心"
-            aria-label="资源中心"
-          >
-            <Puzzle size={14} />
-          </button>
-        )}
-        {onOpenControlPlane && (
-          <button
-            onClick={onOpenControlPlane}
-            className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-            title="AI Coding OS"
-            aria-label="AI Coding OS"
-          >
-            <ShieldCheck size={14} />
-          </button>
-        )}
         <button
           onClick={onOpenSettings}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
           title="设置"
+          aria-label="设置"
         >
           <SettingsIcon size={14} />
         </button>
@@ -409,25 +278,11 @@ export function WorkspacePage({
 
       </div>
 
-      {/* ── Specs workbench, folded into the Workspace as a full-screen ───
-          overlay. SpecsPage reads the active session from the chat store, so
-          it auto-scopes to this session's cwd; its "开始实现" runs in this very
-          session. onOpenWorkspace just closes (we're already here). */}
-      {specsOpen && (
-        <div className="fixed inset-0 z-50">
-          <SpecsPage
-            onBack={() => setSpecsOpen(false)}
-            onOpenWorkspace={() => setSpecsOpen(false)}
-          />
-        </div>
-      )}
-
       {/* ── Git / environment slide-out panels (opened from the status bar) ─ */}
       {gitPanel === "changes" && <GitChangesPanel onClose={() => setGitPanel(null)} />}
       {gitPanel === "history" && <GitHistoryPanel onClose={() => setGitPanel(null)} />}
       {gitPanel === "remote" && (
         <RemoteGitPanel
-          cwd={activeSession?.cwd ?? null}
           currentBranch={gitBranch}
           onClose={() => setGitPanel(null)}
         />

@@ -34,11 +34,6 @@ const ALLOWED_PATTERNS: { file: string; substring: string }[] = [
   { file: "RemoteGitPanel.tsx",   substring: 'bg-green-900 text-green-200' },
   { file: "RemoteGitPanel.tsx",   substring: 'bg-blue-900 text-blue-200' },
   { file: "SettingsPage.tsx",     substring: 'bg-orange-900 text-orange-200' },
-  { file: "SpecsPage.tsx",        substring: 'review: "bg-yellow-800 text-yellow-200"' },
-  { file: "SpecsPage.tsx",        substring: 'approved: "bg-green-800 text-green-200"' },
-  { file: "SpecsPage.tsx",        substring: 'implementing: "bg-blue-800 text-blue-200"' },
-  { file: "SpecsPage.tsx",        substring: 'bg-green-800 hover:bg-green-700 text-green-100' },
-  { file: "SpecsPage.tsx",        substring: 'bg-blue-800 hover:bg-blue-700 text-blue-100' },
 ];
 
 const FORBIDDEN_PATTERN = /text-(amber|emerald|cyan|red|blue|green|orange|yellow|pink|rose|indigo|violet|fuchsia|teal|sky|lime)-([12]00|300)\b/g;

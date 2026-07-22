@@ -22,6 +22,11 @@ const mocks = vi.hoisted(() => ({
   updaterInitialize: vi.fn(),
   updaterCheckNow: vi.fn(),
   updaterInstall: vi.fn(),
+  openProfile: vi.fn(),
+  openEvolution: vi.fn(),
+  openBenchmarks: vi.fn(),
+  openResources: vi.fn(),
+  openControlPlane: vi.fn(),
 }));
 
 // Intentionally omits max_parallel_tasks / subagent_isolation: a settings.json
@@ -130,6 +135,33 @@ describe("SettingsPage parallel-task controls", () => {
     mocks.codexAccount.mockResolvedValue(null);
     // DataSection on the 通用 tab fetches the data dir on mount.
     mocks.invoke.mockResolvedValue("");
+  });
+
+  it("makes moved workspace capabilities readable and reachable from settings", async () => {
+    render(
+      <SettingsPage
+        onBack={() => {}}
+        initialTab="capabilities"
+        onOpenProfile={mocks.openProfile}
+        onOpenEvolution={mocks.openEvolution}
+        onOpenBenchmarks={mocks.openBenchmarks}
+        onOpenResources={mocks.openResources}
+        onOpenControlPlane={mocks.openControlPlane}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { name: "功能" })).toBeInTheDocument();
+    const routes = [
+      ["我的画像", mocks.openProfile],
+      ["进化审查", mocks.openEvolution],
+      ["能力评测", mocks.openBenchmarks],
+      ["资源中心", mocks.openResources],
+      ["AI Coding OS", mocks.openControlPlane],
+    ] as const;
+    for (const [label, callback] of routes) {
+      fireEvent.click(screen.getByRole("button", { name: new RegExp(label) }));
+      expect(callback).toHaveBeenCalledTimes(1);
+    }
   });
 
   it("hydrates defaults for settings saved before the fields existed", async () => {

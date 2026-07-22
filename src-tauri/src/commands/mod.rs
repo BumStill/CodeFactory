@@ -23,7 +23,6 @@ pub mod session;
 mod session_quick_tests;
 pub mod settings;
 pub mod skills;
-pub mod specs;
 pub mod tasks;
 pub mod terminal;
 #[cfg(test)]

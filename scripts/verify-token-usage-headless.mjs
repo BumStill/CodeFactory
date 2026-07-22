@@ -63,6 +63,24 @@ async function assertHeatmapGeometry(grid, expectedCells, label) {
   return { cells, box };
 }
 
+async function assertTrendGeometry(grid, label) {
+  const cells = grid.getByRole("gridcell");
+  assert(await cells.count() === 28, `${label} must render 28 daily bars`);
+  assert(await grid.getAttribute("aria-rowcount") === "1", `${label} must use one chronological row`);
+  assert(await grid.getAttribute("aria-colcount") === "28", `${label} must expose 28 columns`);
+  const sizes = await cells.evaluateAll((elements) => elements.map((element) => {
+    const rect = element.getBoundingClientRect();
+    return { width: rect.width, height: rect.height };
+  }));
+  assert(
+    sizes.every(({ width, height }) => width >= 4 && width <= 14 && height >= 2 && height <= 40),
+    `${label} bars escaped compact bounds: ${JSON.stringify(sizes.slice(0, 4))}`,
+  );
+  const box = await grid.boundingBox();
+  assert(box && box.width >= 240 && box.height <= 48, `${label} must fill a horizontal summary: ${JSON.stringify(box)}`);
+  return { cells, box };
+}
+
 async function assertNoDocumentOverflow(page, label) {
   const dimensions = await page.evaluate(() => ({
     innerWidth: window.innerWidth,
@@ -139,9 +157,12 @@ async function run() {
     page.on("pageerror", (error) => browserMessages.push(`pageerror:${error.stack ?? error}`));
     await page.goto(baseUrl, { waitUntil: "networkidle" });
 
-    await page.getByRole("region", { name: "最近 28 天 Token 用量" }).waitFor();
-    const welcomeGrid = page.getByRole("grid", { name: "最近 28 天 Token 消耗" });
-    await assertHeatmapGeometry(welcomeGrid, 28, "1366px welcome heatmap");
+    await page.getByRole("region", { name: "CodeFactory 欢迎" }).waitFor();
+    const welcomeCard = page.getByRole("region", { name: "今日用量与过去 4 周趋势" });
+    const welcomeGrid = page.getByRole("grid", { name: "过去 4 周 Token 趋势" });
+    await assertTrendGeometry(welcomeGrid, "1366px welcome trend");
+    const wideCardBox = await welcomeCard.boundingBox();
+    assert(wideCardBox && wideCardBox.height <= 150, `1366px welcome usage card is too tall: ${JSON.stringify(wideCardBox)}`);
     assert(await page.getByText("80K").isVisible(), "welcome today's total missing");
     assert(await page.getByText("订阅流量").isVisible(), "subscription semantics missing");
     assert(!await page.getByText(/实际费用 \$/).isVisible(), "subscription traffic exposed fake actual dollars");
@@ -181,12 +202,11 @@ async function run() {
 
     await page.setViewportSize({ width: 800, height: 600 });
     await page.reload({ waitUntil: "networkidle" });
-    await page.getByRole("region", { name: "最近 28 天 Token 用量" }).waitFor();
-    await assertHeatmapGeometry(
-      page.getByRole("grid", { name: "最近 28 天 Token 消耗" }),
-      28,
-      "800px welcome heatmap",
-    );
+    await page.getByRole("region", { name: "CodeFactory 欢迎" }).waitFor();
+    await assertTrendGeometry(page.getByRole("grid", { name: "过去 4 周 Token 趋势" }), "800px welcome trend");
+    const minimumWelcomeCard = await page.getByRole("region", { name: "今日用量与过去 4 周趋势" }).boundingBox();
+    assert(minimumWelcomeCard && minimumWelcomeCard.height <= 190, `800px welcome usage card is too tall: ${JSON.stringify(minimumWelcomeCard)}`);
+    assert(await page.getByRole("heading", { name: "可以试试" }).isVisible(), "800px task suggestions heading missing");
     const detailsButtonBox = await page.getByRole("button", { name: "查看用量详情" }).boundingBox();
     assert(
       detailsButtonBox && detailsButtonBox.y + detailsButtonBox.height <= 600,
@@ -220,6 +240,12 @@ async function run() {
 
     await page.setViewportSize({ width: 375, height: 812 });
     await page.reload({ waitUntil: "networkidle" });
+    await page.getByRole("region", { name: "CodeFactory 欢迎" }).waitFor();
+    await assertTrendGeometry(page.getByRole("grid", { name: "过去 4 周 Token 趋势" }), "375px welcome trend");
+    const narrowWelcomeCard = await page.getByRole("region", { name: "今日用量与过去 4 周趋势" }).boundingBox();
+    assert(narrowWelcomeCard && narrowWelcomeCard.height <= 210, `375px welcome usage card is too tall: ${JSON.stringify(narrowWelcomeCard)}`);
+    await assertNoDocumentOverflow(page, "375px welcome");
+    await page.screenshot({ path: path.join(artifactDir, "narrow-welcome.png"), fullPage: true });
     await page.getByRole("button", { name: "设置 / 用量与预算" }).click();
     await page.getByRole("region", { name: "用量与预算" }).waitFor();
     await assertNoDocumentOverflow(page, "375px settings");
@@ -234,7 +260,7 @@ async function run() {
     const receipt = {
       status: "pass",
       browser: executablePath,
-      surfaces: ["new-session-28-day-summary", "settings-365-180-90-heatmap", "day-detail-job-log", "budget-threshold"],
+      surfaces: ["new-session-28-day-trend", "settings-365-180-90-heatmap", "day-detail-job-log", "budget-threshold"],
       viewports: ["1366x768", "800x600", "375x812"],
       billing_semantics: "subscription-no-fake-dollar",
       keyboard_paths: ["day-grid-enter", "range-button-enter"],

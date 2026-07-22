@@ -19,7 +19,7 @@ CodeFactory 过去的定位是本地 AI 编程工作台：打开项目、选择�
 | ID | 目标 | 验收方式 |
 | --- | --- | --- |
 | AICOS-B1 | 用户能在 CodeFactory 内看到当前项目的控制面状态 | 有专门入口展示 Authority、Memory、Capabilities、Delivery 四类状态 |
-| AICOS-B2 | 分散的规则 surface 被显式呈现 | 控制面列出 `AGENTS.md`、`docs/specs`、项目 `.codefactory/specs`、git hook、release cadence 等是否存在 |
+| AICOS-B2 | 分散的规则 surface 被显式呈现 | 控制面列出 `AGENTS.md`、仓库约定的 `docs/specs`、git hook、release cadence 等是否存在；不把产品私有目录当作规范权威 |
 | AICOS-B3 | 记忆不再只是聊天缓存 | 控制面展示 pending/accepted/rejected learning events，作为 memory proposal lifecycle 的 v1 状态 |
 | AICOS-B4 | 技能、MCP、知识库、hooks、Git remote 统一成能力视图 | 控制面展示 capability 数量、启用数量和风险提示 |
 | AICOS-B5 | Git/发布交付门禁可见 | 控制面展示当前分支、dirty 状态、sync gate 文件是否存在、当前 checkout 是否启用该 hook、release workflow、latest release 标记 |
@@ -44,7 +44,7 @@ CodeFactory 过去的定位是本地 AI 编程工作台：打开项目、选择�
 - 不在本次实现完整规则编辑器。
 - 不在本次实现自动 promotion/review 工作流。
 - 不在本次实现云同步、团队权限、多租户。
-- 不在本次替代现有 Profile、Skills、Settings、Specs 页面；控制面先作为系统总览。
+- 不在本次替代现有 Profile、Skills、Settings 页面；长期规范是仓库文件，不属于独立产品页面。
 
 ## 产品原则
 

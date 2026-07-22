@@ -78,18 +78,20 @@ describe("new-session token usage summary", () => {
     });
   });
 
-  it("shows today's usage separately from the compact 28-day history and exposes the full dashboard", async () => {
+  it("shows today's usage beside an accessible 28-day trend and exposes the full dashboard", async () => {
     const onOpenUsage = vi.fn();
     const user = userEvent.setup();
     render(<WelcomeScreen onOpenUsage={onOpenUsage} />);
 
-    const region = await screen.findByRole("region", { name: "最近 28 天 Token 用量" });
-    const map = within(region).getByRole("grid", { name: "最近 28 天 Token 消耗" });
-    await waitFor(() => expect(within(map).getAllByRole("gridcell")).toHaveLength(28));
+    const region = await screen.findByRole("region", { name: "今日用量与过去 4 周趋势" });
+    const trend = within(region).getByRole("grid", { name: "过去 4 周 Token 趋势" });
+    await waitFor(() => expect(within(trend).getAllByRole("gridcell")).toHaveLength(28));
+    expect(trend).toHaveAttribute("aria-rowcount", "1");
+    expect(trend).toHaveAttribute("aria-colcount", "28");
     expect(within(region).getByText("今日用量")).toBeInTheDocument();
     expect(within(region).getByText("27K")).toBeInTheDocument();
     expect(within(region).getByText("4 次请求")).toBeInTheDocument();
-    expect(region).toHaveTextContent("最近 28 天");
+    expect(region).toHaveTextContent("过去 4 周");
     expect(region).toHaveTextContent("订阅流量");
     expect(region.textContent).not.toMatch(/\$\s*0\.16/);
     expect(mocks.invoke).toHaveBeenCalledWith("get_usage_dashboard", {
@@ -101,20 +103,25 @@ describe("new-session token usage summary", () => {
     expect(onOpenUsage).toHaveBeenCalledTimes(1);
   });
 
-  it("makes missing and zero days understandable without reading square colors", async () => {
+  it("makes missing and zero days understandable without tiny status glyphs", async () => {
     render(<WelcomeScreen />);
-    const map = await screen.findByRole("grid", { name: "最近 28 天 Token 消耗" });
-    expect(within(map).getByRole("gridcell", { name: /2026-07-19.*数据缺失/ })).toBeInTheDocument();
-    expect(within(map).getByRole("gridcell", { name: /2026-07-20.*0 Tokens.*已记录/ })).toBeInTheDocument();
+    const trend = await screen.findByRole("grid", { name: "过去 4 周 Token 趋势" });
+    const missing = within(trend).getByRole("gridcell", { name: /2026-07-19.*数据缺失/ });
+    const zero = within(trend).getByRole("gridcell", { name: /2026-07-20.*0 Tokens.*已记录/ });
+    expect(missing).not.toHaveClass("border-dashed");
+    expect(missing).toHaveClass("bg-accent/20");
+    expect(zero).toHaveClass("bg-accent/20");
+    expect(zero).not.toHaveClass("outline");
+    expect(trend).not.toHaveTextContent(/[×·!]/);
   });
 
   it("keeps an anonymous session transient without querying or displaying persisted history", async () => {
     chatState.activeSession.kind = "anonymous";
     render(<WelcomeScreen />);
 
-    const region = await screen.findByRole("region", { name: "最近 28 天 Token 用量" });
+    const region = await screen.findByRole("region", { name: "今日用量与过去 4 周趋势" });
     expect(within(region).getByText(/匿名会话.*不计入今日统计/)).toBeInTheDocument();
     expect(mocks.invoke).not.toHaveBeenCalledWith("get_usage_dashboard", expect.anything());
-    expect(within(region).queryByRole("grid", { name: "最近 28 天 Token 消耗" })).not.toBeInTheDocument();
+    expect(within(region).queryByRole("grid", { name: "过去 4 周 Token 趋势" })).not.toBeInTheDocument();
   });
 });

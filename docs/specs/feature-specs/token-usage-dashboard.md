@@ -14,7 +14,7 @@
 | CF-USAGE-R8 | 用户补充 | 设置展示 GitHub 风格近 90 天/半年/一年 Token 消耗地图 | usage map | unit + headless + real app | frontend + QA |
 | CF-USAGE-R9 | 可解释性 | 地图支持 Tokens/预算占比/请求次数，区分零、缺失、今天和超预算 | usage map + queries | scale/state/accessibility tests | frontend + QA |
 | CF-USAGE-R10 | 用户路径 | 选择日期后入口拆分与 Top 会话同步过滤，并可分别深链会话或真实端到端作业日志 | Settings + routing | integration + real deep-link path | frontend + backend + QA |
-| CF-USAGE-R11 | 用户需求 | 新会话显示 28 天地图缩略图，进入完整地图不丢选中范围 | Welcome + Settings routing | route-state test + real app | frontend + QA |
+| CF-USAGE-R11 | 用户需求 | 新会话显示 28 天横向趋势，进入完整地图不丢选中范围 | Welcome + Settings routing | route-state test + real app | frontend + QA |
 | CF-USAGE-R12 | 预算治理 | 支持日/月 Token 预算和 50/80/100% 本机提醒，不自动停止或换模型 | settings + alert receipt | threshold/idempotency tests | backend + frontend + QA |
 | CF-USAGE-R13 | 现有界面 | Workspace 底栏继续区分累计 Token 与上下文窗口，并可深链详情 | ContextUsageBar | component + stream real app | frontend + QA |
 | CF-USAGE-R14 | 单一入口 | Profile 移除旧成本透视；新会话、Workspace 底栏与设置首个一级 tab 均进入同一用量真相面，无第二套统计/预算写入口 | Profile + Settings | navigation/negative action assertion | frontend + QA |
@@ -69,7 +69,7 @@
 ### 4.4 地图
 
 - 每格一个当地日；支持 90d/半年/一年，默认一年。
-- 日期格使用有上限的固定方形尺寸；28 天缩略图不得把周列设为 `1fr` 或均分整卡宽度，1366×768 下单格宽高必须保持在 6–16px。
+- Welcome 使用独立 1×28 趋势，不复用 7 行日历；趋势条宽 4–12px、高 2–36px。Settings 日期格继续使用有上限的固定方形尺寸。
 - Tokens 为相对对数分档；预算占比为固定档；请求次数为分位档。
 - zero、missing、today、over-budget 四种状态必须兼具颜色之外的标识。
 - Hover/focus 展示精确数据；click/Enter/Space 选中并同步下方过滤。
@@ -110,7 +110,7 @@
 | Error | SQLite/query failure | 显示 unavailable/last updated，不显示 0 | failure injection + screenshot |
 | Privacy | usage fixture 含 secret-like request metadata | DB/API/UI 0 命中 prompt/secret/reasoning 内容 | scan evidence |
 | Viewport | 1366×768 | 地图、筛选、Top 会话和预算动作可达 | headless + real screenshot |
-| Geometry | 28 天 Welcome 缩略图 | 28 个日期格均为 6–16px 方形，地图总高度不超过 120px | real browser bounding boxes + screenshot |
+| Geometry | 28 天 Welcome 趋势 | 28 个趋势条、1 行 28 列，趋势高不超过 48px，用量卡在 1366px 不超过 150px | real browser bounding boxes + screenshot |
 | Viewport | 390×812 | 无整页横向溢出；地图区滚动；列表替代；键盘路径通过 | headless screenshot + receipt |
 | Restart | 记录后完整重启 | 今日/地图/预算 receipt 恢复，数值不重复 | real Dev App |
 | Release | exact Windows/macOS artifact | migration、multi-round、map、restart smoke，版本/commit 精确 | CI artifact receipts |

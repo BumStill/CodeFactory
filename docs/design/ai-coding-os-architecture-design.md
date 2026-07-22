@@ -19,7 +19,7 @@ Desktop UX
 
 | 模块 | 职责 | v1 数据来源 |
 | --- | --- | --- |
-| Authority scanner | 发现项目和仓库规则 surface | `AGENTS.md`、`docs/specs`、`.codefactory/specs`、`.githooks/pre-commit`、`.github/workflows/auto-release.yml` |
+| Authority scanner | 发现项目和仓库规则 surface | `AGENTS.md`、仓库约定的 `docs/specs`、`.githooks/pre-commit`、`.github/workflows/auto-release.yml` |
 | Memory proposal reader | 汇总待审核记忆/偏好 | SQLite `learning_events` |
 | Capability inventory | 汇总可用能力和启用状态 | Skills、MCP settings、Knowledge libraries、Hooks、Git remotes |
 | Delivery gate scanner | 汇总交付风险和门禁 | git branch/status、sync gate、release cadence、latest release workflow files |

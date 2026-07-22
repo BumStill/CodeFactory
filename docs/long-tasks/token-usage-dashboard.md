@@ -14,9 +14,9 @@
 
 ## Current State
 
-- Current phase: Complete — heatmap geometry hotfix live in v1.58.1
-- Current checkpoint: PR #162 已合并，合并后 main CI 与治理门禁通过；Auto Release 切出 v1.58.1，Windows/macOS 构建、匿名公开 DMG 二次下载、安装后 GUI smoke 和 updater manifest 对账均通过
-- Next owner: 产品运营观察真实使用页面；如再次出现格子拉伸，6–16px 浏览器 geometry gate 必须直接阻止合并
+- Current phase: Reopened — Welcome visual hierarchy redesign in progress
+- Current checkpoint: v1.58.1 修复了巨型方格，但真实截图证明 4×7 邮票热力图、重复标签和大面积空白仍不合格；Welcome 将改用独立 1×28 横向趋势，Settings 7 行日历保持不变
+- Next owner: 当前 Codex 与 Workspace 顶栏收敛一起完成 red/green、真实 App、PR+CI、合并和刻意发版
 - Updated at: 2026-07-22
 
 ## Completed Items
@@ -40,6 +40,11 @@
 - 本次隔离 Dev 验收结束后已主动关闭 Tauri/Vite/esbuild/debug 进程组并确认 1424 端口释放；后续 Dev 实例必须按工作树登记并在用完后清理。
 
 ## Remaining Items
+
+### Welcome 信息层级重设计
+
+- 进行中：用紧凑横向摘要替代 4×7 邮票热力图；Hero、中文文案、建议任务和三视口一并验收。
+- 保持：Settings 90/180/365 天 7 行日历、日期下钻与预算语义不变。
 
 ### v1.58.0 live regression hotfix
 

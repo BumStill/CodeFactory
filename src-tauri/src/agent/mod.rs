@@ -3703,6 +3703,51 @@ fn detect_project_config(cwd: &Path) -> Option<(&'static str, std::path::PathBuf
     None
 }
 
+const REPOSITORY_INTENT_FILE_LIMIT: usize = 64;
+
+/// Discover versioned product-intent documents without injecting every body
+/// into the system prompt. The repository's own rules remain authoritative;
+/// these common directories are only indexed when they already exist.
+fn repository_intent_paths(cwd: &Path) -> Vec<String> {
+    fn walk(cwd: &Path, dir: &Path, paths: &mut Vec<String>) {
+        if paths.len() >= REPOSITORY_INTENT_FILE_LIMIT {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries = entries.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if paths.len() >= REPOSITORY_INTENT_FILE_LIMIT {
+                break;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                walk(cwd, &path, paths);
+            } else if file_type.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("md")
+            {
+                if let Ok(relative) = path.strip_prefix(cwd) {
+                    paths.push(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+
+    let mut paths = Vec::new();
+    for relative in ["docs/specs", "docs/design"] {
+        walk(cwd, &cwd.join(relative), &mut paths);
+    }
+    paths
+}
+
 // Scaffolding: standalone project-knowledge prompt builder, kept as the
 // test-covered reference path (and referenced by docs in commands/memory.rs and
 // agent/user_context.rs). The live loop (`AgentLoop::run`) currently inlines its
@@ -3732,6 +3777,36 @@ fn project_knowledge_blocks(cwd: &Path) -> Vec<context_budget::Block> {
     use context_budget::Block;
     let mut blocks = Vec::new();
 
+    // Repository rules outrank assistant memory and are therefore allocated
+    // context budget first. A capped ordinary file keeps the contract portable
+    // across repositories without creating CodeFactory-owned project state.
+    if let Some(content) = read_file_capped(&cwd.join("AGENTS.md"), 6000) {
+        blocks.push(Block::new(
+            format!("# Repository Authority (`AGENTS.md`)\n{content}"),
+            0,
+            6200,
+        ));
+    }
+
+    let intent_paths = repository_intent_paths(cwd);
+    if !intent_paths.is_empty() {
+        let index = intent_paths
+            .iter()
+            .map(|path| format!("- `{path}`"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        blocks.push(Block::new(
+            format!(
+                "# Repository Intent Index\n\
+                 These are ordinary versioned repository files, not Agent-owned records. \
+                 Read only the relevant files before planning or implementation, and follow \
+                 `AGENTS.md` when deciding where durable decisions belong.\n{index}"
+            ),
+            1,
+            4600,
+        ));
+    }
+
     // Memory — `.codefactory/memory.md` (preferred, modern; matches the
     // .cursorrules / .claude/ family) + legacy `CODEFACTORY.md`, combined under
     // one heading. Each source keeps its prior 4000-char cap.
@@ -3756,7 +3831,7 @@ fn project_knowledge_blocks(cwd: &Path) -> Vec<context_budget::Block> {
         }
     }
     if !mem.is_empty() {
-        blocks.push(Block::new(mem, 1, 8200));
+        blocks.push(Block::new(mem, 2, 8200));
     }
 
     // README — first of the candidates that exists.
@@ -3801,7 +3876,8 @@ fn build_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
 /// conventions such as `/workspace` before its first tool call.
 fn base_system_prompt(mode: AgentMode, cwd: &Path) -> String {
     format!(
-        "{}\n\n{}\n\n# Product Self-Repair Context\n\
+        "{}\n\n{}\n\n# Repository-Owned Intent\n\
+         Long-lived requirements, specifications, architecture decisions, and acceptance criteria belong to ordinary versioned files in the repository, not to Agent memory or an app-owned specification database. Before non-trivial planning or implementation, inspect `AGENTS.md`, the README, and relevant existing files such as `docs/specs` or `docs/design`; follow the repository's own convention rather than creating `.codefactory/specs`; plans and delegated task state belong to the current conversation; do not direct the user to a separate specification or planning screen. When a durable decision changes, edit the repository document through normal file tools so it appears in the diff and travels with Git.\n\n# Product Self-Repair Context\n\
          When the user reports behavior of the running product and the selected repository is that product's codebase, treat it as a product bug you can fix here. Inspect and fix it in this repository; do not stop at explaining the issue or asking the user to switch contexts.\n\n# Working Directory\n\
          The project root and default tool working directory is:\n{}\n\
          Use this exact path or paths relative to it. Do not assume `/workspace` or another container path.",
@@ -4501,6 +4577,23 @@ mod tests {
     }
 
     #[test]
+    fn repository_intent_belongs_to_git_while_plans_belong_to_the_session() {
+        for mode in [
+            AgentMode::Interactive,
+            AgentMode::Execute,
+            AgentMode::Autonomous,
+        ] {
+            let prompt = base_system_prompt(mode, Path::new("/projects/CodeFactory"));
+            assert!(prompt.contains("# Repository-Owned Intent"));
+            assert!(prompt.contains("AGENTS.md"));
+            assert!(prompt.contains("docs/specs"));
+            assert!(prompt.contains("docs/design"));
+            assert!(prompt.contains("plans and delegated task state belong to the current conversation"));
+            assert!(prompt.contains("do not direct the user to a separate specification or planning screen"));
+        }
+    }
+
+    #[test]
     fn agent_mode_iteration_budgets_differ_significantly() {
         let interactive = AgentMode::Interactive.max_iterations();
         let autonomous = AgentMode::Autonomous.max_iterations();
@@ -4648,9 +4741,18 @@ mod tests {
     }
 
     #[test]
-    fn project_knowledge_blocks_cover_memory_readme_config_with_priorities() {
+    fn project_knowledge_blocks_prioritize_repo_authority_before_memory() {
         let cwd = std::env::temp_dir().join(format!("codefactory-pkb-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(cwd.join(".codefactory")).unwrap();
+        std::fs::create_dir_all(cwd.join("docs/specs/feature-specs")).unwrap();
+        std::fs::create_dir_all(cwd.join("docs/design")).unwrap();
+        std::fs::write(cwd.join("AGENTS.md"), "# Repository rules\nUse pnpm.").unwrap();
+        std::fs::write(
+            cwd.join("docs/specs/feature-specs/login.md"),
+            "# Login contract",
+        )
+        .unwrap();
+        std::fs::write(cwd.join("docs/design/auth.md"), "# Auth design").unwrap();
         std::fs::write(
             cwd.join(".codefactory").join("memory.md"),
             "remember pnpm not npm",
@@ -4661,18 +4763,24 @@ mod tests {
 
         let blocks = project_knowledge_blocks(&cwd);
 
-        // memory, README, config — in that render order, with eviction
-        // priorities memory(1) < README(4) < config(5).
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].priority, 1);
-        assert!(blocks[0].content.contains("# Project Memory"));
-        assert!(blocks[0].content.contains("remember pnpm not npm"));
-        assert_eq!(blocks[1].priority, 4);
-        assert!(blocks[1].content.contains("# Project README"));
-        assert!(blocks[1].content.contains("hello world"));
-        assert_eq!(blocks[2].priority, 5);
-        assert!(blocks[2].content.contains("# Project Config"));
-        assert!(blocks[2].content.contains("name = \"x\""));
+        assert_eq!(blocks.len(), 5);
+        assert_eq!(blocks[0].priority, 0);
+        assert!(blocks[0].content.contains("# Repository Authority"));
+        assert!(blocks[0].content.contains("Use pnpm."));
+        assert_eq!(blocks[1].priority, 1);
+        assert!(blocks[1].content.contains("# Repository Intent Index"));
+        assert!(blocks[1].content.contains("docs/specs/feature-specs/login.md"));
+        assert!(blocks[1].content.contains("docs/design/auth.md"));
+        assert!(!blocks[1].content.contains(".codefactory/specs"));
+        assert_eq!(blocks[2].priority, 2);
+        assert!(blocks[2].content.contains("# Project Memory"));
+        assert!(blocks[2].content.contains("remember pnpm not npm"));
+        assert_eq!(blocks[3].priority, 4);
+        assert!(blocks[3].content.contains("# Project README"));
+        assert!(blocks[3].content.contains("hello world"));
+        assert_eq!(blocks[4].priority, 5);
+        assert!(blocks[4].content.contains("# Project Config"));
+        assert!(blocks[4].content.contains("name = \"x\""));
 
         std::fs::remove_dir_all(cwd).unwrap();
     }

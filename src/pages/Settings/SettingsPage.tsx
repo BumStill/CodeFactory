@@ -3,6 +3,7 @@ import React, { useEffect, useState } from "react";
 import {
   ArrowLeft, Plus, Trash2, Eye, EyeOff, Check, AlertCircle, ChevronDown,
   RefreshCw, Download, Package, LogIn, LogOut, Sparkles, Github, ExternalLink,
+  ArrowRight, UserRound, GitPullRequestArrow, Gauge, Puzzle, ShieldCheck,
 } from "lucide-react";
 import { invoke, codexLogin, codexLogout, codexAccount } from "../../lib/tauri";
 import { useSettingsStore } from "../../stores/settings";
@@ -16,12 +17,17 @@ import { UsageDashboardSection } from "../../components/UsageDashboardSection";
 
 interface Props {
   onBack: () => void;
-  initialTab?: "usage";
+  initialTab?: "usage" | "capabilities";
   onOpenSession?: (sessionId: string) => void;
   onOpenJobLog?: (sessionId: string, taskId: string) => void;
+  onOpenProfile?: () => void;
+  onOpenEvolution?: () => void;
+  onOpenBenchmarks?: () => void;
+  onOpenResources?: () => void;
+  onOpenControlPlane?: () => void;
 }
 
-type Tab = "usage" | "endpoints" | "permissions" | "general" | "hooks" | "remotes" | "appearance" | "about";
+type Tab = "capabilities" | "usage" | "endpoints" | "permissions" | "general" | "hooks" | "remotes" | "appearance" | "about";
 const SHELL_OPTIONS =
   typeof navigator !== "undefined" && /Mac|Linux/.test(navigator.platform)
     ? ["zsh", "bash", "powershell", "cmd"]
@@ -438,7 +444,17 @@ function AddEndpointModal({
 
 // ── Main Settings Page ────────────────────────────────────────────────────────
 
-export function SettingsPage({ onBack, initialTab, onOpenSession, onOpenJobLog }: Props) {
+export function SettingsPage({
+  onBack,
+  initialTab,
+  onOpenSession,
+  onOpenJobLog,
+  onOpenProfile,
+  onOpenEvolution,
+  onOpenBenchmarks,
+  onOpenResources,
+  onOpenControlPlane,
+}: Props) {
   const { settings, load, save, saveApiKey } = useSettingsStore();
   const [tab, setTab] = useState<Tab>(initialTab ?? "endpoints");
   const [endpointDrafts, setEndpointDrafts] = useState<EndpointDraft[]>([]);
@@ -621,6 +637,7 @@ export function SettingsPage({ onBack, initialTab, onOpenSession, onOpenJobLog }
   // ── Render ─────────────────────────────────────────────────────────────────
 
   const tabs: { id: Tab; label: string }[] = [
+    { id: "capabilities", label: "功能" },
     { id: "usage", label: "用量与预算" },
     { id: "endpoints", label: "端点" },
     { id: "permissions", label: "权限" },
@@ -663,6 +680,43 @@ export function SettingsPage({ onBack, initialTab, onOpenSession, onOpenJobLog }
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto p-5">
+
+        {/* ── Product capabilities moved out of the Workspace toolbar ── */}
+        {tab === "capabilities" && (
+          <section className="max-w-3xl space-y-4" aria-labelledby="settings-capabilities-title">
+            <div>
+              <h2 id="settings-capabilities-title" className="text-base font-semibold text-gray-100">功能</h2>
+              <p className="mt-1 text-xs leading-5 text-gray-400">管理跨会话能力。当前会话的模型、Git 和检查点仍留在工作区顶栏。</p>
+            </div>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {([
+                { label: "我的画像", description: "查看偏好、长期记忆与可撤销建议", Icon: UserRound, action: onOpenProfile },
+                { label: "进化审查", description: "审核会话学习结果与激活候选", Icon: GitPullRequestArrow, action: onOpenEvolution },
+                { label: "能力评测", description: "查看 Evals、能力基线和验证记录", Icon: Gauge, action: onOpenBenchmarks },
+                { label: "资源中心", description: "管理可复用知识、技能与连接器", Icon: Puzzle, action: onOpenResources },
+                { label: "AI Coding OS", description: "检查本地控制平面与同步状态", Icon: ShieldCheck, action: onOpenControlPlane },
+              ] as const).map(({ label, description, Icon, action }) => (
+                <button
+                  key={label}
+                  type="button"
+                  onClick={action}
+                  disabled={!action}
+                  className="group flex items-center gap-3 rounded-xl border border-border bg-surface-1 p-3 text-left transition-colors hover:border-accent/40 hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-surface-3 text-gray-300 group-hover:text-accent"><Icon size={16} /></span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium text-gray-100">{label}</span>
+                    <span className="mt-0.5 block text-[11px] leading-4 text-gray-400">{description}</span>
+                  </span>
+                  <ArrowRight size={13} className="shrink-0 text-gray-500 group-hover:text-accent" />
+                </button>
+              ))}
+            </div>
+            <div className="rounded-lg border border-border bg-surface-1 px-3 py-2.5 text-[11px] leading-5 text-gray-400">
+              规范随当前代码库存在；任务计划与拆解由会话内部执行，不再提供独立工作台。
+            </div>
+          </section>
+        )}
 
         {/* ── Usage & budgets ── */}
         {tab === "usage" && (
@@ -1034,7 +1088,7 @@ export function SettingsPage({ onBack, initialTab, onOpenSession, onOpenJobLog }
 
 const HOOK_EVENTS = [
   "pre_tool", "post_tool", "pre_task", "post_task",
-  "session_start", "session_end", "spec_approved", "verification_failed",
+  "session_start", "session_end", "verification_failed",
 ];
 
 const HOOK_ACTIONS: { value: HookActionType; label: string; placeholder: string }[] = [
