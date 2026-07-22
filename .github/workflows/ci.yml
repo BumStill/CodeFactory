@@ -135,7 +135,7 @@ jobs:
             [DllImport("kernel32.dll")]
             public static extern bool FreeLibrary(IntPtr module);
           }
-"@
+          "@
           $currentDll = $null
           $missing = [System.Collections.Generic.List[string]]::new()
           foreach ($line in $imports) {
