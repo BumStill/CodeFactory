@@ -82,6 +82,7 @@ export function TokenUsageHeatmap({
   const cellRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const interactive = Boolean(onSelectDate);
   const todayDate = days.length > 0 ? days[days.length - 1]?.local_date : undefined;
+  const cellSize = compact ? "10px" : "12px";
   const monthRows = useMemo(() => {
     const grouped = new Map<string, UsageHeatmapDay[]>();
     for (const day of days) {
@@ -109,8 +110,11 @@ export function TokenUsageHeatmap({
         aria-label={ariaLabel}
         aria-rowcount={7}
         aria-colcount={Math.ceil(days.length / 7)}
-        className={`grid grid-flow-col grid-rows-7 gap-1 ${compact ? "min-h-12" : "min-h-24"}`}
-        style={{ gridAutoColumns: compact ? "minmax(6px, 1fr)" : "minmax(9px, 1fr)" }}
+        className="inline-grid grid-flow-col gap-1"
+        style={{
+          gridAutoColumns: cellSize,
+          gridTemplateRows: `repeat(7, ${cellSize})`,
+        }}
       >
         {days.map((day, index) => {
           const selected = selectedDate === day.local_date;

@@ -22,7 +22,7 @@
 | CF-USAGE-R16 | Provider 兼容 | OpenAI-compatible、Anthropic、ChatGPT 订阅、本地和 Usage 缺失均有明确行为 | provider adapters | route matrix + payload assertions | backend + QA |
 | CF-USAGE-R17 | 实时性/可观测 | 落库后 2 秒内刷新；失败/partial/unavailable 不静默显示成 0 | event + queries + UI | latency + failure injection | backend + frontend + QA |
 | CF-USAGE-R18 | Anonymous 边界 | anonymous 明示为临时用量，不写 DB、今日、预算、地图或 Top 会话 | agent + UI | before/after DB counts + restart | backend + QA |
-| CF-USAGE-R19 | 可访问/视口 | 地图可键盘操作，390×812 不造成整页水平溢出且有列表替代 | usage map | axe/keyboard + dual viewport screenshots | frontend + QA |
+| CF-USAGE-R19 | 可访问/视口 | 地图可键盘操作，390×812 不造成整页水平溢出且有列表替代；日期格保持紧凑方形，不能按容器剩余宽度拉伸 | usage map | axe/keyboard + cell geometry + dual viewport screenshots | frontend + QA |
 | CF-USAGE-R20 | 隐私 | 计量/深链不保存或展示 prompt、reasoning、工具参数、凭据和原始 payload | recorder + API + UI | secret fixture zero-match | backend + QA |
 | CF-USAGE-R21 | 质量护栏 | API 返回来源计数与缺失计数，拆分总和可与总量对账 | observation | source counts + reconciliation test | backend + QA |
 | CF-USAGE-R22 | 发布门禁 | PR+CI、迁移、真实 App、锁屏 headless、安装包和公开产物均通过前保持 not live | delivery | evidence pack + exact artifact smoke | QA + release |
@@ -69,6 +69,7 @@
 ### 4.4 地图
 
 - 每格一个当地日；支持 90d/半年/一年，默认一年。
+- 日期格使用有上限的固定方形尺寸；28 天缩略图不得把周列设为 `1fr` 或均分整卡宽度，1366×768 下单格宽高必须保持在 6–16px。
 - Tokens 为相对对数分档；预算占比为固定档；请求次数为分位档。
 - zero、missing、today、over-budget 四种状态必须兼具颜色之外的标识。
 - Hover/focus 展示精确数据；click/Enter/Space 选中并同步下方过滤。
@@ -109,6 +110,7 @@
 | Error | SQLite/query failure | 显示 unavailable/last updated，不显示 0 | failure injection + screenshot |
 | Privacy | usage fixture 含 secret-like request metadata | DB/API/UI 0 命中 prompt/secret/reasoning 内容 | scan evidence |
 | Viewport | 1366×768 | 地图、筛选、Top 会话和预算动作可达 | headless + real screenshot |
+| Geometry | 28 天 Welcome 缩略图 | 28 个日期格均为 6–16px 方形，地图总高度不超过 120px | real browser bounding boxes + screenshot |
 | Viewport | 390×812 | 无整页横向溢出；地图区滚动；列表替代；键盘路径通过 | headless screenshot + receipt |
 | Restart | 记录后完整重启 | 今日/地图/预算 receipt 恢复，数值不重复 | real Dev App |
 | Release | exact Windows/macOS artifact | migration、multi-round、map、restart smoke，版本/commit 精确 | CI artifact receipts |
