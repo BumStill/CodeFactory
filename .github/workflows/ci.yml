@@ -127,8 +127,22 @@ jobs:
           Get-Item $bcrypt | Select-Object FullName,Length,@{Name="Version";Expression={$_.VersionInfo.FileVersion}} | Format-List
           & $dumpbin /exports $bcrypt
           if ($LASTEXITCODE -ne 0) { throw "dumpbin exports failed with $LASTEXITCODE" }
+          $probeStarted = Get-Date
           & $testExe.FullName __codefactory_loader_probe_no_test__ --exact
-          if ($LASTEXITCODE -ne 0) { throw "loader probe failed with $LASTEXITCODE" }
+          $probeExit = $LASTEXITCODE
+          if ($probeExit -ne 0) {
+            Start-Sleep -Seconds 2
+            Write-Host "--- Windows loader events after probe ---"
+            Get-WinEvent -FilterHashtable @{LogName="Application"; StartTime=$probeStarted} -ErrorAction SilentlyContinue |
+              Where-Object { $_.Message -match "codefactory_lib|entry point|procedure|SideBySide|0xc0000139" } |
+              Select-Object TimeCreated,ProviderName,Id,LevelDisplayName,Message |
+              Format-List | Out-String -Width 4096 | Write-Host
+            Get-WinEvent -FilterHashtable @{LogName="System"; StartTime=$probeStarted} -ErrorAction SilentlyContinue |
+              Where-Object { $_.Message -match "codefactory_lib|entry point|procedure|SideBySide|0xc0000139" } |
+              Select-Object TimeCreated,ProviderName,Id,LevelDisplayName,Message |
+              Format-List | Out-String -Width 4096 | Write-Host
+            throw "loader probe failed with $probeExit"
+          }
           cargo test --manifest-path src-tauri/Cargo.toml --quiet
 
       - name: Evolution executable closed-loop smoke
