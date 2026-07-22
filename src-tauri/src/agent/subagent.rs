@@ -212,6 +212,7 @@ pub async fn run_subagent(
                 .as_ref()
                 .map(|ctx| ctx.knowledge_library_ids())
                 .unwrap_or_default(),
+            usage_surface: crate::agent::UsageSurface::Subagent,
         }),
         crate::agent::AgentMode::Autonomous,
     );

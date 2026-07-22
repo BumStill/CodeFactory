@@ -57,8 +57,11 @@ interface WorkspacePageProps {
    * existing embedders remain source-compatible while Home no longer exists. */
   onBackHome: () => void;
   onOpenSettings: () => void;
+  onOpenUsage?: () => void;
   /** Switch the workspace to another session in-place (from the sidebar). */
   onOpenSession: (id: string) => void;
+  /** Reveal the task workbench and highlight this task when deep-linked from usage. */
+  initialTaskLogId?: string | null;
   onOpenResources?: () => void;
   onOpenControlPlane?: () => void;
   onOpenBenchmarks?: () => void;
@@ -81,7 +84,9 @@ export function WorkspacePage({
   sessionId,
   onBackHome,
   onOpenSettings,
+  onOpenUsage,
   onOpenSession,
+  initialTaskLogId,
   onOpenResources,
   onOpenControlPlane,
   onOpenBenchmarks,
@@ -373,7 +378,7 @@ export function WorkspacePage({
         {/* ─── Center: conversation + its internal execution detail ─────── */}
         <main aria-label="会话窗口" className="flex-1 flex flex-col min-w-0">
           {isProjectSession && projectTaskCount > 0 && (
-            <TasksColumn sessionId={sessionId} />
+            <TasksColumn sessionId={sessionId} highlightedTaskId={initialTaskLogId} />
           )}
           {!activeDraft && <ExecutionStream sessionId={sessionId} />}
           <MessageList
@@ -381,6 +386,7 @@ export function WorkspacePage({
             streaming={streaming}
             cwd={activeCwd}
             onUsePrompt={(text) => setPendingInsert(text)}
+            onOpenUsage={onOpenUsage}
           />
           <ContextUsageBar sessionId={activeSession?.id} />
           {queue.length > 0 && (
@@ -447,7 +453,7 @@ export function WorkspacePage({
 
 // Task decomposition is internal to the conversation; this panel only renders
 // the execution detail after the agent has delegated work.
-function TasksColumn({ sessionId }: { sessionId: string }) {
+function TasksColumn({ sessionId, highlightedTaskId }: { sessionId: string; highlightedTaskId?: string | null }) {
   const { tasks, running, start, cancel, retryFailedTasks } = useTasksStore();
   const sessionTasks: TaskRun[] = tasks[sessionId] ?? [];
   const isRunning = running[sessionId] ?? false;
@@ -517,7 +523,7 @@ function TasksColumn({ sessionId }: { sessionId: string }) {
             {repairableFailedCount > 0 && <span className="text-amber-700 dark:text-amber-300">可重试 {repairableFailedCount}</span>}
             {blockedFailedCount > 0 && <span className="text-red-700 dark:text-red-300">需处理 {blockedFailedCount}</span>}
           </div>
-          <div className="flex-1 overflow-y-auto p-2"><ul className="space-y-0.5">{buildTaskTree(sessionTasks).map(({ task, depth }) => <TaskRow key={task.id} task={task} depth={depth} />)}</ul></div>
+          <div className="flex-1 overflow-y-auto p-2"><ul className="space-y-0.5">{buildTaskTree(sessionTasks).map(({ task, depth }) => <TaskRow key={task.id} task={task} depth={depth} highlighted={task.id === highlightedTaskId} />)}</ul></div>
         </>
       )}
     </div>
@@ -542,7 +548,7 @@ function buildTaskTree(tasks: TaskRun[]): { task: TaskRun; depth: number }[] {
   return out;
 }
 
-function TaskRow({ task, depth }: { task: TaskRun; depth: number }) {
+function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: number; highlighted?: boolean }) {
   const Icon = statusIcon(task.status);
   // Surface acceptance-criteria verification right here in the task tree — the
   // "did it actually pass?" proof that previously only lived in evidence packs.
@@ -551,7 +557,9 @@ function TaskRow({ task, depth }: { task: TaskRun; depth: number }) {
   const [verifOpen, setVerifOpen] = useState(false);
   return (
     <li
-      className="rounded hover:bg-surface-3 transition-colors"
+      id={`task-log-${task.id}`}
+      aria-current={highlighted ? "true" : undefined}
+      className={`rounded transition-colors ${highlighted ? "bg-accent/10 ring-1 ring-accent/40" : "hover:bg-surface-3"}`}
       style={{ paddingLeft: `${0.375 + depth * 0.875}rem` }}
     >
       <div className="group flex items-start gap-2 px-1.5 py-1">

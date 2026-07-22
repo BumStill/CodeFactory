@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { FolderOpen, Clock, ArrowRight } from "lucide-react";
 import { useChatStore } from "../stores/chat";
+import { WelcomeUsageCard } from "./WelcomeUsageCard";
 
 /**
  * In-line render of the app's "Crystallization" gem mark — same geometry
@@ -35,6 +36,8 @@ interface Props {
    * decides what to do — typically: fill the input box.
    */
   onUsePrompt?: (text: string) => void;
+  /** Opens Settings directly on the first-class usage dashboard. */
+  onOpenUsage?: () => void;
 }
 
 // Curated short prompts that hint at what the agent can do, mostly bias
@@ -63,7 +66,7 @@ const EXAMPLES: { title: string; prompt: string }[] = [
   },
 ];
 
-export function WelcomeScreen({ onUsePrompt }: Props) {
+export function WelcomeScreen({ onUsePrompt, onOpenUsage }: Props) {
   const { sessions, activeSession, activeModel, selectSession } = useChatStore();
 
   // Show up to 4 most recent sessions other than the currently-active one.
@@ -98,6 +101,11 @@ export function WelcomeScreen({ onUsePrompt }: Props) {
             </span>
           </div>
         )}
+
+        <WelcomeUsageCard
+          anonymous={activeSession?.kind === "anonymous"}
+          onOpenUsage={onOpenUsage}
+        />
 
         {/* Example prompts */}
         <div className="space-y-2">

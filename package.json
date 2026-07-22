@@ -12,6 +12,7 @@
     "test:rust:fast": "node scripts/cargo-shared.mjs test --manifest-path src-tauri/Cargo.toml",
     "test:evolution:headless": "node scripts/verify-evolution-workbench-headless.mjs",
     "test:resume:headless": "node scripts/verify-resume-journal-headless.mjs",
+    "test:usage:headless": "node scripts/verify-token-usage-headless.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {

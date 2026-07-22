@@ -150,6 +150,26 @@ pub struct Usage {
     // so the total is deserialized but unused.
     #[allow(dead_code)]
     pub total_tokens: u32,
+    /// OpenRouter includes actual request cost in the final usage chunk.
+    /// Direct providers and subscription endpoints commonly omit it.
+    #[serde(default)]
+    pub cost: Option<f64>,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokenDetails>,
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokenDetails>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PromptTokenDetails {
+    #[serde(default)]
+    pub cached_tokens: u32,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CompletionTokenDetails {
+    #[serde(default)]
+    pub reasoning_tokens: u32,
 }
 
 // ── Model list ───────────────────────────────────────────────────────────────

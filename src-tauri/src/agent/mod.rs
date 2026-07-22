@@ -414,6 +414,10 @@ pub struct AgentLoop {
     /// Selects iteration ceiling and system prompt. Interactive for
     /// chat panel use, Autonomous for subagent / approved-task runs.
     mode: AgentMode,
+    /// Stable for one AgentLoop execution; combined with the provider-round
+    /// index to make usage persistence idempotent without collapsing genuine
+    /// multi-round tool work.
+    usage_run_id: String,
     /// Ephemeral "anonymous" run: when true, NOTHING is written to the DB
     /// (no user/assistant/tool messages, no cost entries). The conversation
     /// exists only in the frontend's memory and this run's model context, so
@@ -476,11 +480,32 @@ fn resolve_chatgpt_reasoning_effort(
         .unwrap_or(ReasoningEffort::Medium)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsageSurface {
+    #[default]
+    Interactive,
+    Autonomous,
+    Subagent,
+    Eval,
+}
+
+impl UsageSurface {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Autonomous => "autonomous",
+            Self::Subagent => "subagent",
+            Self::Eval => "eval",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AgentExecutionContext {
     pub parent_session_id: Option<String>,
     pub task_id: Option<String>,
     pub knowledge_library_ids: Vec<String>,
+    pub usage_surface: UsageSurface,
 }
 
 fn knowledge_scope_for_tools(
@@ -580,9 +605,84 @@ impl AgentLoop {
             mcp_manager,
             execution_context,
             mode,
+            usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,
             cancel: None,
         }
+    }
+
+    async fn record_usage_event_for_round(&self, usage: &Usage, iteration: usize) {
+        if self.anonymous || (usage.prompt_tokens == 0 && usage.completion_tokens == 0) {
+            return;
+        }
+        let surface = self
+            .execution_context
+            .as_ref()
+            .map_or(UsageSurface::Interactive, |context| context.usage_surface)
+            .as_str();
+        let local_endpoint = {
+            let base = self.base_url.to_ascii_lowercase();
+            base.contains("127.0.0.1")
+                || base.contains("localhost")
+                || base.contains("0.0.0.0")
+                || base.starts_with("http://[::1]")
+        };
+        let (provider, actual_cost_usd, cost_source) = if self.api_style == ApiStyle::Chatgpt {
+            ("chatgpt".to_string(), None, "subscription".to_string())
+        } else if local_endpoint {
+            (self.endpoint_name.clone(), None, "local".to_string())
+        } else if let Some(cost) = usage
+            .cost
+            .filter(|value| value.is_finite() && *value >= 0.0)
+        {
+            let provider = if self.base_url.contains("openrouter.ai") {
+                "openrouter".to_string()
+            } else {
+                self.endpoint_name.clone()
+            };
+            (provider, Some(cost), "provider_actual".to_string())
+        } else {
+            (self.endpoint_name.clone(), None, "unknown".to_string())
+        };
+        let event = crate::commands::costs::UsageEventInput {
+            request_id: self.usage_request_id(iteration),
+            session_id: self.session_id.clone(),
+            task_id: self
+                .execution_context
+                .as_ref()
+                .and_then(|context| context.task_id.clone()),
+            surface: surface.to_string(),
+            provider,
+            endpoint: self.endpoint_name.clone(),
+            model: self.model_id.clone(),
+            input_tokens: usage.prompt_tokens as i64,
+            output_tokens: usage.completion_tokens as i64,
+            reasoning_tokens: usage
+                .completion_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.reasoning_tokens as i64),
+            cached_tokens: usage
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cached_tokens as i64),
+            actual_cost_usd,
+            estimated_cost_usd: None,
+            cost_source,
+            created_at: None,
+        };
+        match crate::commands::costs::record_usage_event(&self.db, event).await {
+            Ok(true) => {
+                self.app.emit("model-usage-recorded", &self.session_id).ok();
+                // Compatibility for the existing footer during the migration.
+                self.app.emit("token-usage-recorded", &self.session_id).ok();
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!("failed to record request usage: {error}"),
+        }
+    }
+
+    fn usage_request_id(&self, iteration: usize) -> String {
+        format!("{}:{iteration}", self.usage_run_id)
     }
 
     /// Mark this loop as an anonymous/ephemeral run: disables ALL DB
@@ -884,6 +984,14 @@ impl AgentLoop {
             finalization_pending = false;
             require_tool_next = false;
 
+            // The provider request has completed. Persist already-consumed
+            // Usage before honoring a cancellation that arrived in flight.
+            let usage_request_id = self.usage_request_id(iteration);
+            if let Some(round_usage) = usage.as_ref() {
+                self.record_usage_event_for_round(round_usage, iteration)
+                    .await;
+            }
+
             if self.is_cancelled() {
                 self.emit_cancelled_done(event_name);
                 emitted_terminal = true;
@@ -921,6 +1029,7 @@ impl AgentLoop {
                             Some(&tool_calls)
                         },
                         reasoning.as_deref(),
+                        Some(&usage_request_id),
                     )
                     .await?
                 } else {
@@ -1016,29 +1125,6 @@ impl AgentLoop {
                     )
                     .ok();
                 emitted_terminal = true;
-                // Cost is only recorded when the provider reported usage.
-                if let Some(u) = &usage {
-                    // Persist cost entry and notify frontend to refresh stats.
-                    // Anonymous runs are NEVER billed into today/month stats.
-                    if !self.anonymous {
-                        let inp = u.prompt_tokens as i64;
-                        let out = u.completion_tokens as i64;
-                        if let Err(e) = crate::commands::costs::record_cost_entry(
-                            &self.db,
-                            &self.session_id,
-                            &self.model_id,
-                            &self.endpoint_name,
-                            inp,
-                            out,
-                        )
-                        .await
-                        {
-                            tracing::warn!("Failed to record cost entry: {e}");
-                        } else {
-                            self.app.emit("token-usage-recorded", &self.session_id).ok();
-                        }
-                    }
-                }
                 break;
             }
 
@@ -1801,6 +1887,25 @@ impl AgentLoop {
                                 prompt_tokens: inp,
                                 completion_tokens: out,
                                 total_tokens: inp + out,
+                                cost: u.get("cost").and_then(|v| v.as_f64()),
+                                prompt_tokens_details: Some(
+                                    crate::openrouter::types::PromptTokenDetails {
+                                        cached_tokens: u
+                                            .pointer("/input_tokens_details/cached_tokens")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0)
+                                            as u32,
+                                    },
+                                ),
+                                completion_tokens_details: Some(
+                                    crate::openrouter::types::CompletionTokenDetails {
+                                        reasoning_tokens: u
+                                            .pointer("/output_tokens_details/reasoning_tokens")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0)
+                                            as u32,
+                                    },
+                                ),
                             });
                         }
                     }
@@ -2091,6 +2196,7 @@ impl AgentLoop {
         usage: Option<&Usage>,
         tool_calls: Option<&[ToolCall]>,
         reasoning_content: Option<&str>,
+        usage_request_id: Option<&str>,
     ) -> Result<Option<String>> {
         // Anonymous runs never touch the DB — the assistant turn lives only in
         // the in-memory `messages` vec for the rest of this run.
@@ -2109,8 +2215,8 @@ impl AgentLoop {
             .map(|tcs| crate::trajectory::redact_tool_calls_for_storage(tcs).unwrap_or_default());
 
         sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, input_tokens, output_tokens, tool_calls, reasoning_content, created_at) \
-             VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages (id, session_id, role, content, input_tokens, output_tokens, tool_calls, reasoning_content, usage_request_id, created_at) \
+             VALUES (?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(&msg_id)
         .bind(&self.session_id)
@@ -2120,6 +2226,7 @@ impl AgentLoop {
         .bind(output_tok)
         .bind(tool_calls_json)
         .bind(persisted_reasoning)
+        .bind(usage_request_id)
         .bind(now)
         .execute(&self.db)
         .await?;
@@ -2531,6 +2638,21 @@ impl AgentLoop {
             finalization_pending = false;
             require_tool_next = false;
 
+            let usage_request_id = self.usage_request_id(iteration);
+            if resp.input_tokens > 0 || resp.output_tokens > 0 {
+                let round_usage = Usage {
+                    prompt_tokens: resp.input_tokens.max(0) as u32,
+                    completion_tokens: resp.output_tokens.max(0) as u32,
+                    total_tokens: resp.input_tokens.saturating_add(resp.output_tokens).max(0)
+                        as u32,
+                    cost: None,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                };
+                self.record_usage_event_for_round(&round_usage, iteration)
+                    .await;
+            }
+
             if resp.cancelled || self.is_cancelled() {
                 self.emit_cancelled_done(event_name);
                 emitted_terminal = true;
@@ -2568,6 +2690,7 @@ impl AgentLoop {
                         Some(&tool_calls)
                     },
                     None,
+                    Some(&usage_request_id),
                 )
                 .await?
             } else {
@@ -2656,24 +2779,6 @@ impl AgentLoop {
                         },
                     )
                     .ok();
-                // Persist cost entry — NEVER for anonymous runs (no billing,
-                // no usage-stats trace). Mirrors the OpenAI-path guard.
-                if !self.anonymous {
-                    if let Err(e) = crate::commands::costs::record_cost_entry(
-                        &self.db,
-                        &self.session_id,
-                        &self.model_id,
-                        &self.endpoint_name,
-                        inp,
-                        out,
-                    )
-                    .await
-                    {
-                        tracing::warn!("Failed to record cost entry (anthropic): {e}");
-                    } else {
-                        self.app.emit("token-usage-recorded", &self.session_id).ok();
-                    }
-                }
                 break;
             }
 
@@ -3818,6 +3923,7 @@ mod tests {
             parent_session_id: Some("parent".into()),
             task_id: Some("task".into()),
             knowledge_library_ids: Vec::new(),
+            usage_surface: UsageSurface::Subagent,
         };
 
         assert_eq!(knowledge_scope_for_tools(Some(&context)), Some(Vec::new()));

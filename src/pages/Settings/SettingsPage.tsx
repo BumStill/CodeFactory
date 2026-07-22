@@ -12,12 +12,16 @@ import { useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
 import type { Settings, Endpoint, ApiStyle, CustomModel, AddGitRemoteRequest, GitRemoteConfig, GitProvider, CodexAccount, GithubCliCredentialStatus } from "../../lib/tauri";
 import { CHATGPT_DEFAULT_MODEL, CHATGPT_ENDPOINT_KEY } from "../../lib/chatgptModels";
 import { syncChatGptCatalog } from "../../stores/chatgptCatalog";
+import { UsageDashboardSection } from "../../components/UsageDashboardSection";
 
 interface Props {
   onBack: () => void;
+  initialTab?: "usage";
+  onOpenSession?: (sessionId: string) => void;
+  onOpenJobLog?: (sessionId: string, taskId: string) => void;
 }
 
-type Tab = "endpoints" | "permissions" | "general" | "hooks" | "remotes" | "appearance" | "about";
+type Tab = "usage" | "endpoints" | "permissions" | "general" | "hooks" | "remotes" | "appearance" | "about";
 const SHELL_OPTIONS =
   typeof navigator !== "undefined" && /Mac|Linux/.test(navigator.platform)
     ? ["zsh", "bash", "powershell", "cmd"]
@@ -434,9 +438,9 @@ function AddEndpointModal({
 
 // ── Main Settings Page ────────────────────────────────────────────────────────
 
-export function SettingsPage({ onBack }: Props) {
+export function SettingsPage({ onBack, initialTab, onOpenSession, onOpenJobLog }: Props) {
   const { settings, load, save, saveApiKey } = useSettingsStore();
-  const [tab, setTab] = useState<Tab>("endpoints");
+  const [tab, setTab] = useState<Tab>(initialTab ?? "endpoints");
   const [endpointDrafts, setEndpointDrafts] = useState<EndpointDraft[]>([]);
   const [showAddEp, setShowAddEp] = useState(false);
   const [permDraft, setPermDraft] = useState<Settings["permissions"] | null>(null);
@@ -617,6 +621,7 @@ export function SettingsPage({ onBack }: Props) {
   // ── Render ─────────────────────────────────────────────────────────────────
 
   const tabs: { id: Tab; label: string }[] = [
+    { id: "usage", label: "用量与预算" },
     { id: "endpoints", label: "端点" },
     { id: "permissions", label: "权限" },
     { id: "general", label: "通用" },
@@ -629,7 +634,7 @@ export function SettingsPage({ onBack }: Props) {
   return (
     <div className="flex h-full flex-col bg-surface-0 text-gray-200">
       {/* Header */}
-      <header className="flex items-center gap-3 px-4 py-2.5 border-b border-border bg-surface-1 shrink-0">
+      <header className="flex flex-wrap items-center gap-3 px-4 py-2.5 border-b border-border bg-surface-1 shrink-0">
         <button
           onClick={onBack}
           className="p-1 rounded text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
@@ -639,7 +644,7 @@ export function SettingsPage({ onBack }: Props) {
         <span className="text-sm font-semibold">设置</span>
 
         {/* Tabs */}
-        <div className="ml-4 flex gap-1">
+        <div className="ml-4 flex max-w-full gap-1 overflow-x-auto">
           {tabs.map((t) => (
             <button
               key={t.id}
@@ -658,6 +663,11 @@ export function SettingsPage({ onBack }: Props) {
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto p-5">
+
+        {/* ── Usage & budgets ── */}
+        {tab === "usage" && (
+          <UsageDashboardSection onOpenSession={onOpenSession} onOpenJobLog={onOpenJobLog} />
+        )}
 
         {/* ── Endpoints ── */}
         {tab === "endpoints" && (
