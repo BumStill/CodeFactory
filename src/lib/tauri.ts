@@ -429,6 +429,9 @@ export interface Settings {
   /** One-way IM notifications for task terminals / turn errors / permission waits. Empty URL = off. */
   im_webhook_url?: string;
   im_webhook_format?: 'wecom' | 'feishu' | 'generic';
+  /** Shell isolation for the bash tool: docker wraps every command in a disposable container mounting only the project dir. */
+  sandbox_mode?: 'off' | 'docker';
+  sandbox_image?: string;
   /** Merge strategy for delivery at ThroughMerge+. Missing → "squash". */
   delivery_merge_method?: 'squash' | 'merge' | 'rebase';
   /** Extra repo-relative path prefixes excluded from delivery commits. */

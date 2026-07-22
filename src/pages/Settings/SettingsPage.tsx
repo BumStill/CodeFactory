@@ -452,6 +452,8 @@ export function SettingsPage({ onBack }: Props) {
     delivery_ceiling: NonNullable<Settings["delivery_ceiling"]>;
     im_webhook_url: string;
     im_webhook_format: NonNullable<Settings["im_webhook_format"]>;
+    sandbox_mode: NonNullable<Settings["sandbox_mode"]>;
+    sandbox_image: string;
   } | null>(null);
   const [generalSaved, setGeneralSaved] = useState(false);
 
@@ -490,6 +492,8 @@ export function SettingsPage({ onBack }: Props) {
       delivery_ceiling: settings.delivery_ceiling ?? "pr_only",
       im_webhook_url: settings.im_webhook_url ?? "",
       im_webhook_format: settings.im_webhook_format ?? "wecom",
+      sandbox_mode: settings.sandbox_mode ?? "off",
+      sandbox_image: settings.sandbox_image ?? "ubuntu:24.04",
     });
   }, [settings]);
 
@@ -602,6 +606,8 @@ export function SettingsPage({ onBack }: Props) {
       delivery_ceiling: generalDraft.delivery_ceiling,
       im_webhook_url: generalDraft.im_webhook_url.trim(),
       im_webhook_format: generalDraft.im_webhook_format,
+      sandbox_mode: generalDraft.sandbox_mode,
+      sandbox_image: generalDraft.sandbox_image.trim() || "ubuntu:24.04",
     } as Settings & { auto_create_pr: boolean });
 
     setGeneralSaved(true);
@@ -946,6 +952,41 @@ export function SettingsPage({ onBack }: Props) {
                   className="flex-1 rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
                   aria-label="IM Webhook 地址"
                 />
+              </div>
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-xs text-gray-500">命令沙箱</label>
+              <p className="text-[11px] leading-5 text-gray-600">
+                开启后,AI 执行的每条 shell 命令都在一次性 Docker
+                容器中运行,只挂载当前项目目录——本机其它文件对命令不可见。需要本机已安装并启动
+                Docker;项目目录需位于 Docker 文件共享范围内(默认包含用户目录)。
+              </p>
+              <div className="flex items-center gap-2">
+                <select
+                  value={generalDraft.sandbox_mode}
+                  onChange={(e) =>
+                    setGeneralDraft({
+                      ...generalDraft,
+                      sandbox_mode: e.target.value as NonNullable<Settings["sandbox_mode"]>,
+                    })
+                  }
+                  className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                >
+                  <option value="off">关闭(本机执行,默认)</option>
+                  <option value="docker">Docker 容器隔离</option>
+                </select>
+                {generalDraft.sandbox_mode === "docker" && (
+                  <input
+                    value={generalDraft.sandbox_image}
+                    onChange={(e) =>
+                      setGeneralDraft({ ...generalDraft, sandbox_image: e.target.value })
+                    }
+                    placeholder="ubuntu:24.04"
+                    className="w-44 rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                    aria-label="沙箱镜像"
+                  />
+                )}
               </div>
             </div>
 

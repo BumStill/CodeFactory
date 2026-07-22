@@ -64,6 +64,18 @@ pub enum ImWebhookFormat {
     Generic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    #[default]
+    Off,
+    Docker,
+}
+
+fn default_sandbox_image() -> String {
+    "ubuntu:24.04".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub endpoints: HashMap<String, Endpoint>,
@@ -120,6 +132,15 @@ pub struct Settings {
     /// Payload shape for `im_webhook_url`.
     #[serde(default)]
     pub im_webhook_format: ImWebhookFormat,
+    /// Shell-execution isolation for the bash tool. `Off` runs on the host
+    /// (historical behavior); `Docker` wraps every command in a disposable
+    /// container with ONLY the project directory mounted. Never silently
+    /// falls back to the host when the runtime is missing.
+    #[serde(default)]
+    pub sandbox_mode: SandboxMode,
+    /// Container image used when `sandbox_mode` is `Docker`.
+    #[serde(default = "default_sandbox_image")]
+    pub sandbox_image: String,
     /// Merge strategy used when the ceiling reaches `ThroughMerge`+.
     #[serde(default)]
     pub delivery_merge_method: MergeMethod,
@@ -529,6 +550,8 @@ impl Default for Settings {
             delivery_ceiling: DeliveryCeiling::PrOnly,
             im_webhook_url: String::new(),
             im_webhook_format: ImWebhookFormat::Wecom,
+            sandbox_mode: SandboxMode::Off,
+            sandbox_image: default_sandbox_image(),
             delivery_merge_method: MergeMethod::Squash,
             delivery_exclude_globs: Vec::new(),
             delivery_ci_timeout_secs: default_delivery_ci_timeout_secs(),
