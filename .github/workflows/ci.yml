@@ -113,7 +113,13 @@ jobs:
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $testExe) { throw "Rust test executable not found" }
           Write-Host "TEST_EXE=$($testExe.FullName)"
-          & dumpbin /dependents $testExe.FullName
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found" }
+          $dumpbin = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -find "VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found through vswhere" }
+          Write-Host "DUMPBIN=$dumpbin"
+          & $dumpbin /dependents $testExe.FullName
           if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with $LASTEXITCODE" }
           & $testExe.FullName __codefactory_loader_probe_no_test__ --exact
           if ($LASTEXITCODE -ne 0) { throw "loader probe failed with $LASTEXITCODE" }
