@@ -41,6 +41,39 @@ async function firstExecutable() {
 
 function assert(condition, message) { if (!condition) throw new Error(message); }
 
+async function assertHeatmapGeometry(grid, expectedCells, label) {
+  const cells = grid.getByRole("gridcell");
+  assert(await cells.count() === expectedCells, `${label} must render ${expectedCells} daily cells`);
+  const sizes = await cells.evaluateAll((elements) => elements.map((element) => {
+    const rect = element.getBoundingClientRect();
+    return { width: rect.width, height: rect.height };
+  }));
+  assert(
+    sizes.every(({ width, height }) => (
+      width >= 6
+      && width <= 16
+      && height >= 6
+      && height <= 16
+      && Math.abs(width - height) <= 1
+    )),
+    `${label} cells must stay compact squares: ${JSON.stringify(sizes.slice(0, 4))}`,
+  );
+  const box = await grid.boundingBox();
+  assert(box && box.height <= 120, `${label} grew too tall: ${JSON.stringify(box)}`);
+  return { cells, box };
+}
+
+async function assertNoDocumentOverflow(page, label) {
+  const dimensions = await page.evaluate(() => ({
+    innerWidth: window.innerWidth,
+    scrollWidth: document.documentElement.scrollWidth,
+  }));
+  assert(
+    dimensions.scrollWidth <= dimensions.innerWidth,
+    `${label} caused document horizontal overflow: ${JSON.stringify(dimensions)}`,
+  );
+}
+
 async function waitForServer(child) {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
@@ -107,6 +140,8 @@ async function run() {
     await page.goto(baseUrl, { waitUntil: "networkidle" });
 
     await page.getByRole("region", { name: "最近 28 天 Token 用量" }).waitFor();
+    const welcomeGrid = page.getByRole("grid", { name: "最近 28 天 Token 消耗" });
+    await assertHeatmapGeometry(welcomeGrid, 28, "1366px welcome heatmap");
     assert(await page.getByText("80K").isVisible(), "welcome today's total missing");
     assert(await page.getByText("订阅流量").isVisible(), "subscription semantics missing");
     assert(!await page.getByText(/实际费用 \$/).isVisible(), "subscription traffic exposed fake actual dollars");
@@ -114,7 +149,9 @@ async function run() {
 
     await page.getByRole("button", { name: "查看用量详情" }).click();
     await page.getByRole("region", { name: "用量与预算" }).waitFor();
-    assert(await page.getByRole("grid", { name: "Token 消耗地图，近 365 天" }).isVisible(), "365-day map missing");
+    const yearGrid = page.getByRole("grid", { name: "Token 消耗地图，近 365 天" });
+    assert(await yearGrid.isVisible(), "365-day map missing");
+    await assertHeatmapGeometry(yearGrid, 365, "365-day settings heatmap");
     assert(await page.getByLabel("2026-07-19，数据缺失").isVisible(), "missing state inaccessible");
     assert(await page.getByLabel(/2026-07-20，24K Tokens，历史回填/).isVisible(), "partial state inaccessible");
     assert(await page.getByLabel(/2026-07-22，80K Tokens.*今天/).isVisible(), "today state inaccessible");
@@ -133,17 +170,59 @@ async function run() {
     await page.getByRole("button", { name: "查看作业日志" }).first().click();
     assert(await page.getByRole("status").getByText("已打开作业日志：project-session/task-1").isVisible(), "job log handoff missing");
     await page.getByRole("button", { name: "近 90 天" }).click();
-    await page.getByRole("grid", { name: "Token 消耗地图，近 90 天" }).waitFor();
+    const ninetyDayGrid = page.getByRole("grid", { name: "Token 消耗地图，近 90 天" });
+    await ninetyDayGrid.waitFor();
+    await assertHeatmapGeometry(ninetyDayGrid, 90, "90-day settings heatmap");
     await page.getByRole("button", { name: "近 180 天" }).click();
-    await page.getByRole("grid", { name: "Token 消耗地图，近 180 天" }).waitFor();
+    const halfYearGrid = page.getByRole("grid", { name: "Token 消耗地图，近 180 天" });
+    await halfYearGrid.waitFor();
+    await assertHeatmapGeometry(halfYearGrid, 180, "180-day settings heatmap");
     await page.screenshot({ path: path.join(artifactDir, "wide-day-detail.png"), fullPage: true });
+
+    await page.setViewportSize({ width: 800, height: 600 });
+    await page.reload({ waitUntil: "networkidle" });
+    await page.getByRole("region", { name: "最近 28 天 Token 用量" }).waitFor();
+    await assertHeatmapGeometry(
+      page.getByRole("grid", { name: "最近 28 天 Token 消耗" }),
+      28,
+      "800px welcome heatmap",
+    );
+    const detailsButtonBox = await page.getByRole("button", { name: "查看用量详情" }).boundingBox();
+    assert(
+      detailsButtonBox && detailsButtonBox.y + detailsButtonBox.height <= 600,
+      `800px welcome details action fell below the viewport: ${JSON.stringify(detailsButtonBox)}`,
+    );
+    await assertNoDocumentOverflow(page, "800px welcome");
+    await page.screenshot({ path: path.join(artifactDir, "minimum-window-welcome.png"), fullPage: true });
+
+    await page.getByRole("button", { name: "查看用量详情" }).click();
+    await page.getByRole("region", { name: "用量与预算" }).waitFor();
+    const minimumYearGrid = page.getByRole("grid", { name: "Token 消耗地图，近 365 天" });
+    await assertHeatmapGeometry(minimumYearGrid, 365, "800px 365-day settings heatmap");
+    await assertNoDocumentOverflow(page, "800px settings");
+    const mapScroller = minimumYearGrid.locator("..");
+    const scrollState = await mapScroller.evaluate((element) => {
+      element.scrollLeft = element.scrollWidth;
+      return {
+        clientWidth: element.clientWidth,
+        scrollLeft: element.scrollLeft,
+        scrollWidth: element.scrollWidth,
+      };
+    });
+    assert(
+      scrollState.scrollWidth > scrollState.clientWidth && scrollState.scrollLeft > 0,
+      `365-day map must scroll inside its own container at 800px: ${JSON.stringify(scrollState)}`,
+    );
+    assert(await page.getByLabel(/2026-07-22，80K Tokens.*今天/).isVisible(), "today cell inaccessible after local map scroll");
+    assert(await page.getByRole("button", { name: "近 365 天" }).isVisible(), "range controls moved into map scroller");
+    assert(await page.getByLabel("地图图例").isVisible(), "map legend moved into map scroller");
+    await page.screenshot({ path: path.join(artifactDir, "minimum-window-settings.png"), fullPage: true });
 
     await page.setViewportSize({ width: 375, height: 812 });
     await page.reload({ waitUntil: "networkidle" });
     await page.getByRole("button", { name: "设置 / 用量与预算" }).click();
     await page.getByRole("region", { name: "用量与预算" }).waitFor();
-    const overflow = await page.evaluate(() => ({ width: window.innerWidth, scrollWidth: document.documentElement.scrollWidth }));
-    assert(overflow.scrollWidth <= overflow.width, `horizontal overflow: ${JSON.stringify(overflow)}`);
+    await assertNoDocumentOverflow(page, "375px settings");
     await page.getByRole("button", { name: "近 90 天" }).focus();
     await page.keyboard.press("Enter");
     await page.getByRole("grid", { name: "Token 消耗地图，近 90 天" }).waitFor();
@@ -156,7 +235,7 @@ async function run() {
       status: "pass",
       browser: executablePath,
       surfaces: ["new-session-28-day-summary", "settings-365-180-90-heatmap", "day-detail-job-log", "budget-threshold"],
-      viewports: ["1366x768", "375x812"],
+      viewports: ["1366x768", "800x600", "375x812"],
       billing_semantics: "subscription-no-fake-dollar",
       keyboard_paths: ["day-grid-enter", "range-button-enter"],
       artifact_dir: artifactDir,

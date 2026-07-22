@@ -14,9 +14,9 @@
 
 ## Current State
 
-- Current phase: Complete — Live in v1.58.0
-- Current checkpoint: CF-USAGE-R1..R22 已由 PR #160 合并；PR 与合并后 main CI、锁屏无关远端 GUI、刻意发版、Windows/macOS 构建、公开 DMG 二次下载与 GUI smoke 均通过，能力已随 v1.58.0 上线
-- Next owner: 产品运营按真实使用数据观察采集缺失率、预算触发与高消耗来源；后续增强不属于本次完成门禁
+- Current phase: Live regression hotfix in progress — v1.58.0 当前存在 Welcome 热力图严重拉伸缺陷
+- Current checkpoint: 真实用户数据页面复现单格 `159.625×159.625px`；根因为 `gridAutoColumns: minmax(..., 1fr)` 与 `aspect-square` 联合作用。失败优先的 Chrome geometry gate 已建立，源码修复后单格恢复为 10px，并在隔离 Tauri Dev App 验证 Welcome 与 365 天设置地图；尚未进入 `main` 或新发布产物
+- Next owner: 当前 Codex 任务负责把 hotfix 经 PR+CI 合并到 `main`，触发 patch release，并验证精确发布产物
 - Updated at: 2026-07-22
 
 ## Completed Items
@@ -41,6 +41,11 @@
 
 ## Remaining Items
 
+### v1.58.0 live regression hotfix
+
+- 将日期格固定几何修复提交 PR，完成 CI、合并与 patch release。
+- 在发布产物验证 Welcome 28 天缩略图和设置年度地图，不把源码/Chrome fixture 通过当成已上线。
+
 ### 后续增强（非本次首发门禁）
 
 - 模型、Endpoint、项目多维筛选及自定义起止日期。
@@ -48,11 +53,14 @@
 
 ## Blockers
 
-- 当前无 blocker。
+- 当前无外部 blocker；但 v1.58.0 live surface 有严重视觉缺陷，hotfix 发布完成前不得继续声称该地图 UI 正常。
 - 本机锁屏未要求用户解锁、未绕过 macOS 安全；headless 双视口、隔离 runtime、远端真实 GUI 和公开 macOS artifact smoke 共同补齐了验证链路。
 
 ## Evidence
 
+- Hotfix red evidence: 修复前 `pnpm test:usage:headless` 读取到 Welcome 单格 `159.625×159.625px`，按 6–16px 方形护栏失败。
+- Hotfix green evidence: `pnpm test:usage:headless` 在 1366×768、Tauri 最小窗口 800×600 和 375×812 通过；覆盖 28/90/180/365 天格子几何、地图内部横向滚动和整页无横向溢出。`pnpm test` 63 files / 267 tests、`pnpm build`、治理基线与 `git diff --check` 通过。
+- Hotfix real-App evidence: `/Applications/CodeFactoryTokenHeatmapDev.app` 从本 hotfix worktree、隔离 HOME/DB 和端口 1424 启动；真实 WebView 的 Welcome 28 天缩略图与设置 365 天地图均保持紧凑方格。验收后已关闭进程并将临时 App、数据目录和日志移入废纸篓。
 - Local evidence: `pnpm test` 63 files / 267 tests 全绿；`pnpm test:rust:fast` 430 passed / 6 ignored；`pnpm build`、`cargo check`、治理基线、长任务 validator 通过。
 - Local evidence: `pnpm test:usage:headless` 在 1366×768 与 375×812 通过，验证今日摘要、三种地图指标、zero/missing/today/over-budget、日期下钻、真实作业日志交接、预算与移动端按月列表；证据目录为系统临时目录 `codefactory-token-usage-headless`。
 - Local evidence: `/Applications/CodeFactoryUsageDev.app` 使用隔离 HOME/DB 启动；settings 为 `full_access=true, ask=[], deny=[]`；SQLite 存在四张用量/预算/迁移表，`usage-v1` 回执存在且 `PRAGMA integrity_check=ok`。
@@ -66,7 +74,7 @@
 - context scope: `src-tauri/src/agent/mod.rs`、`commands/costs.rs`、provider Usage、SQLite、`ContextUsageBar`、`CostDashboardSection`、Welcome、Settings、Profile 和现有作业日志 route。
 - assumptions: 首版本地单用户、逐 Provider 请求计量、Token 预算优先、无云端账单依赖；成本与任务质量分离。
 - review point: development 不得先画地图再补数据；QA 必须用工具多轮真实路径对账；release 必须验证 exact artifact 和旧库迁移。
-- validation result: 实现、本地验证、PR/CI、合并、刻意发版和精确公开产物验证全部完成；v1.58.0 当前为 `live`。
+- validation result: v1.58.0 原始交付链已完成，但真实用户页暴露热力图拉伸回归；hotfix 已完成源码、headless 与隔离 Tauri App 验证，进入 `main`、patch release 和精确公开产物验证前仍为 `not live`。
 
 ## Stop Boundary
 
