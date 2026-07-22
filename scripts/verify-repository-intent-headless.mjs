@@ -71,10 +71,16 @@ async function stopServer(child) {
 async function assertWorkspace(page, tag) {
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.getByRole("main", { name: "会话窗口" }).waitFor({ timeout: 10_000 });
+  const header = page.getByRole("banner", { name: "会话工具栏" });
+  await header.waitFor();
   assert(await page.getByText("会话执行详情", { exact: true }).isVisible(), `[${tag}] conversation execution detail missing`);
   assert(await page.getByText("在会话内执行仓库需求", { exact: true }).isVisible(), `[${tag}] delegated task missing`);
   assert((await page.getByTitle(/规范工作台/).count()) === 0, `[${tag}] specification workbench remains`);
   assert((await page.getByRole("button", { name: /规范|计划/ }).count()) === 0, `[${tag}] specification or plan button remains`);
+  for (const label of ["我的画像", "进化审查", "能力评测", "资源中心", "AI Coding OS"]) {
+    assert((await header.getByRole("button", { name: label }).count()) === 0, `[${tag}] ${label} remains in workspace toolbar`);
+  }
+  assert((await header.getByRole("button", { name: "设置" }).count()) === 1, `[${tag}] settings entry missing from workspace toolbar`);
   assert((await page.getByText("拆任务", { exact: true }).count()) === 0, `[${tag}] decomposition UI remains`);
   await page.screenshot({ path: path.join(artifactDir, `${tag}.png`), fullPage: true });
 }

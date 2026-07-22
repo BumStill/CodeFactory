@@ -188,6 +188,21 @@ describe("session-native task delegation", () => {
     expect(mocks.subscribe).toHaveBeenCalledWith("s1");
   });
 
+  it("keeps only session-critical actions in the workspace header", () => {
+    fakeTasksState.tasks = { s1: [] };
+    renderWorkspace();
+
+    const header = screen.getByRole("banner", { name: "会话工具栏" });
+    expect(within(header).getByRole("button", { name: "新建空白会话" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "Git 状态" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "检查点 0" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "设置" })).toBeInTheDocument();
+    for (const label of ["我的画像", "进化审查", "能力评测", "资源中心", "AI Coding OS"]) {
+      expect(within(header).queryByRole("button", { name: label })).not.toBeInTheDocument();
+    }
+    expect(within(header).queryByRole("group", { name: "主题" })).not.toBeInTheDocument();
+  });
+
   it("renders delegated execution inside the conversation, not the session rail", () => {
     fakeTasksState.tasks = { s1: [task()] };
     renderWorkspace();

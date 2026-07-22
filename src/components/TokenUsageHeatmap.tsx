@@ -23,7 +23,7 @@ export function formatUsageTokens(value: number): string {
 
 export type UsageHeatmapMetric = "tokens" | "budget" | "requests";
 
-function accessibleDay(day: UsageHeatmapDay, today: boolean, overBudget: boolean): string {
+export function usageDayAriaLabel(day: UsageHeatmapDay, today: boolean, overBudget: boolean): string {
   if (day.status === "missing") return `${day.local_date}，数据缺失`;
   const tokens = day.total_tokens ?? 0;
   const provenance = day.status === "partial" ? "历史回填，数据可能不完整" : "已记录";
@@ -123,7 +123,7 @@ export function TokenUsageHeatmap({
           const today = day.local_date === todayDate;
           const overBudget = dailyBudgetLimit > 0 && (day.total_tokens ?? 0) > dailyBudgetLimit;
           const metricValue = metricValues[index] ?? 0;
-          const label = accessibleDay(day, today, overBudget);
+          const label = usageDayAriaLabel(day, today, overBudget);
           return (
             <button
               type="button"

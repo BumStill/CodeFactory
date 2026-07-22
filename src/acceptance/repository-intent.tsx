@@ -149,11 +149,6 @@ createRoot(document.getElementById("root")!).render(
         onBackHome={() => {}}
         onOpenSettings={() => {}}
         onOpenSession={() => {}}
-        onOpenProfile={() => {}}
-        onOpenEvolution={() => {}}
-        onOpenBenchmarks={() => {}}
-        onOpenResources={() => {}}
-        onOpenControlPlane={() => {}}
       />
     </div>
   </React.StrictMode>,

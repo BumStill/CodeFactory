@@ -110,8 +110,24 @@ mockIPC((command, args) => {
 
 const { useSettingsStore } = await import("../stores/settings");
 useSettingsStore.setState({ settings });
+const { useChatStore } = await import("../stores/chat");
+useChatStore.setState({
+  sessions: [],
+  activeModel: "gpt-5.6-sol",
+  activeSession: {
+    id: "usage-acceptance-session",
+    title: "用量验收",
+    cwd: "/Users/leo/Projects/CodeFactory",
+    model_id: "gpt-5.6-sol",
+    created_at: 0,
+    updated_at: 0,
+    total_input_tokens: 0,
+    total_output_tokens: 0,
+    kind: "project",
+  },
+});
 const { UsageDashboardSection } = await import("../components/UsageDashboardSection");
-const { WelcomeUsageCard } = await import("../components/WelcomeUsageCard");
+const { WelcomeScreen } = await import("../components/WelcomeScreen");
 
 function AcceptancePage() {
   const [surface, setSurface] = useState<"welcome" | "settings">("welcome");
@@ -124,9 +140,8 @@ function AcceptancePage() {
         <button type="button" onClick={() => setSurface("settings")} className="rounded border border-border px-3 py-1.5 text-xs">设置 / 用量与预算</button>
       </nav>
       {surface === "welcome" ? (
-        <div className="mx-auto max-w-3xl space-y-3">
-          <h1 className="text-lg font-semibold">开始新会话</h1>
-          <WelcomeUsageCard anonymous={false} onOpenUsage={() => setSurface("settings")} />
+        <div className="mx-auto flex min-h-[calc(100vh-72px)] max-w-6xl">
+          <WelcomeScreen onOpenUsage={() => setSurface("settings")} />
         </div>
       ) : (
         <UsageDashboardSection

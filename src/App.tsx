@@ -18,7 +18,7 @@ export type AppView = "workspace" | "resources" | "settings" | "profile" | "cont
 
 export default function App() {
   const [view, setView] = useState<AppView>("workspace");
-  const [settingsInitialTab, setSettingsInitialTab] = useState<"usage" | undefined>();
+  const [settingsInitialTab, setSettingsInitialTab] = useState<"capabilities" | "usage" | undefined>();
   const [activeProject, setActiveProject] = useState<string | null>(null);
   const [workspaceTaskLogId, setWorkspaceTaskLogId] = useState<string | null>(null);
   const [evolutionCwd, setEvolutionCwd] = useState<string | null>(null);
@@ -75,7 +75,7 @@ export default function App() {
   };
 
   const openSettings = () => {
-    setSettingsInitialTab(undefined);
+    setSettingsInitialTab("capabilities");
     setView("settings");
   };
 
@@ -96,11 +96,6 @@ export default function App() {
           onOpenUsage={openUsage}
           onOpenSession={openProject}
           initialTaskLogId={workspaceTaskLogId}
-          onOpenResources={() => setView("resources")}
-          onOpenControlPlane={() => setView("control-plane")}
-          onOpenBenchmarks={() => setView("benchmarks")}
-          onOpenProfile={() => setView("profile")}
-          onOpenEvolution={openEvolution}
         />
       )}
 
@@ -115,6 +110,11 @@ export default function App() {
           initialTab={settingsInitialTab}
           onOpenSession={openProject}
           onOpenJobLog={openJobLog}
+          onOpenResources={() => setView("resources")}
+          onOpenControlPlane={() => setView("control-plane")}
+          onOpenBenchmarks={() => setView("benchmarks")}
+          onOpenProfile={() => setView("profile")}
+          onOpenEvolution={() => openEvolution()}
         />
       )}
 
