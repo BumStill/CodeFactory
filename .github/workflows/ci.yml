@@ -101,13 +101,13 @@ jobs:
       # reports it.
       - name: Build Rust tests
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/codefactory-cargo-test-target
+          CARGO_TARGET_DIR: src-tauri/target
         run: cargo test --manifest-path src-tauri/Cargo.toml --no-run --quiet
 
       - name: Diagnose and run Rust tests
         shell: pwsh
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/codefactory-cargo-test-target
+          CARGO_TARGET_DIR: src-tauri/target
         run: |
           $testExe = Get-ChildItem "$env:CARGO_TARGET_DIR/debug/deps/codefactory_lib-*.exe" |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -120,7 +120,13 @@ jobs:
           if (-not $dumpbin) { throw "dumpbin.exe not found through vswhere" }
           Write-Host "DUMPBIN=$dumpbin"
           & $dumpbin /dependents $testExe.FullName
-          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin dependents failed with $LASTEXITCODE" }
+          & $dumpbin /imports $testExe.FullName
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin imports failed with $LASTEXITCODE" }
+          $bcrypt = Join-Path $env:SystemRoot "System32\bcryptprimitives.dll"
+          Get-Item $bcrypt | Select-Object FullName,Length,@{Name="Version";Expression={$_.VersionInfo.FileVersion}} | Format-List
+          & $dumpbin /exports $bcrypt
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin exports failed with $LASTEXITCODE" }
           & $testExe.FullName __codefactory_loader_probe_no_test__ --exact
           if ($LASTEXITCODE -ne 0) { throw "loader probe failed with $LASTEXITCODE" }
           cargo test --manifest-path src-tauri/Cargo.toml --quiet
