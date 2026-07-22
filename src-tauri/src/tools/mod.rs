@@ -49,6 +49,10 @@ impl ToolOutput {
 
 pub struct ExecCtx {
     pub cwd: PathBuf,
+    // AppHandle pulls the Wry desktop runtime into any executable that owns
+    // ExecCtx. Unit-test harnesses do not run a Tauri app and must not link its
+    // Windows dialog entry points.
+    #[cfg(not(test))]
     pub app: Option<tauri::AppHandle>,
     pub db: Option<sqlx::SqlitePool>,
     pub session_id: Option<String>,
@@ -65,7 +69,6 @@ impl ExecCtx {
     pub fn new(cwd: PathBuf, db: Option<sqlx::SqlitePool>) -> Self {
         Self {
             cwd,
-            app: None,
             db,
             session_id: None,
             task_id: None,
