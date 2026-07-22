@@ -849,6 +849,7 @@ impl AgentLoop {
         let mut progress_tracker = ProgressTracker::new(8);
         let mut finalization_pending = false;
         let mut completion_recovery_attempts = 0_u32;
+        let mut delivery_claim_corrected = false;
         let mut require_tool_next = false;
         let max_iterations = self.mode.max_iterations();
         for iteration in 0..max_iterations {
@@ -1051,6 +1052,36 @@ impl AgentLoop {
             }
 
             if tool_calls.is_empty() {
+                // Facts over stale memory: if the reply claims the delivery
+                // channel is unusable while a logged-in gh CLI is actually
+                // available RIGHT NOW, correct it once and force the tool
+                // path (third field occurrence of this hallucination).
+                if !delivery_claim_corrected
+                    && claims_delivery_blocked(&text)
+                    && delivery::gh_cli_available()
+                {
+                    delivery_claim_corrected = true;
+                    let correction = delivery_claim_correction();
+                    self.persist_gate_message(&correction, "turn_notice").await?;
+                    self.app
+                        .emit(
+                            event_name,
+                            StreamEvent::CompletionGateAction {
+                                kind: "turn_notice".into(),
+                                detail: correction.clone(),
+                            },
+                        )
+                        .ok();
+                    messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: MessageContent::Text(correction),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                    });
+                    continue;
+                }
                 let evidence = completion_gate.evidence();
                 match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
                     CompletionFinalization::Recover(prompt) => {
@@ -2559,6 +2590,7 @@ impl AgentLoop {
         let mut progress_tracker = ProgressTracker::new(8);
         let mut finalization_pending = false;
         let mut completion_recovery_attempts = 0_u32;
+        let mut delivery_claim_corrected = false;
         let mut require_tool_next = false;
         let max_iterations = self.mode.max_iterations();
         for iteration in 0..max_iterations {
@@ -2712,6 +2744,29 @@ impl AgentLoop {
             }
 
             if tool_calls.is_empty() {
+                // Facts over stale memory — see the OpenAI loop for rationale.
+                if !delivery_claim_corrected
+                    && claims_delivery_blocked(&text)
+                    && delivery::gh_cli_available()
+                {
+                    delivery_claim_corrected = true;
+                    let correction = delivery_claim_correction();
+                    self.persist_gate_message(&correction, "turn_notice").await?;
+                    self.app
+                        .emit(
+                            event_name,
+                            StreamEvent::CompletionGateAction {
+                                kind: "turn_notice".into(),
+                                detail: correction.clone(),
+                            },
+                        )
+                        .ok();
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": [{ "type": "text", "text": correction }],
+                    }));
+                    continue;
+                }
                 let evidence = completion_gate.evidence();
                 match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
                     CompletionFinalization::Recover(prompt) => {
@@ -3390,6 +3445,43 @@ fn replayable_history(history: Vec<Message>) -> Vec<Message> {
         .into_iter()
         .filter(|m| m.completion_state.as_deref() != Some("turn_error"))
         .collect()
+}
+
+/// Does this reply claim the delivery channel is unusable (cannot open a
+/// PR / needs gh auth login / needs a token)? Deliberately narrow: it must
+/// pair an inability/imperative with a delivery-channel noun, and any text
+/// that reports a SUCCESSFUL delivery is exempt — normal reports must never
+/// trip the corrector.
+fn claims_delivery_blocked(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let success_markers = [
+        "已创建",
+        "已通过 gh",
+        "交付结果: delivered",
+        "验证成功",
+        "pr created",
+        "本机已检测到 gh",
+    ];
+    if success_markers.iter().any(|m| lower.contains(&m.to_lowercase())) {
+        return false;
+    }
+    let inability = ["无法", "不能", "cannot", "can't", "unable"];
+    let channel = ["创建 pr", "开 pr", "create the pr", "create a pr", "自动创建 pr"];
+    let inability_hit = inability.iter().any(|w| lower.contains(w))
+        && channel.iter().any(|w| lower.contains(w));
+    let setup_demand = (lower.contains("gh auth login")
+        || (lower.contains("token") && (lower.contains("配置") || lower.contains("configure"))))
+        && (lower.contains("请") || lower.contains("please") || lower.contains("完成认证"));
+    inability_hit || setup_demand
+}
+
+/// Injected when the model claims delivery is blocked while a logged-in gh
+/// CLI is actually available. Facts over memory: force the tool path.
+fn delivery_claim_correction() -> String {
+    "事实纠偏:你刚声称交付通道不可用/需要配置,但本机 GitHub CLI 已登录且刚刚实测可用。\
+这是基于过期上下文的错误判断。立即调用 deliver_changes 完成交付并报告其真实结果;\
+不要再要求用户配置任何令牌或运行 gh auth login。"
+        .to_string()
 }
 
 /// Whether this mode injects the completion-ready ("coverage audit") nudge at
@@ -4954,6 +5046,38 @@ mod tests {
         );
         let evidence = gate.evidence();
         assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
+    }
+
+    #[test]
+    fn delivery_blocked_claims_are_detected_narrowly() {
+        // Field report (third occurrence): the model claimed "无法自动创建
+        // PR,请 gh auth login 或配置 token" from stale context WITHOUT
+        // calling deliver_changes, while a logged-in gh sat right there.
+        // The harness must fact-check such claims — detector stays narrow
+        // so normal delivery reports never trip it.
+        for text in [
+            "热修复已推送,但当前阻塞在无法自动创建 PR。请任选其一完成认证:1. 终端运行 gh auth login",
+            "无法创建 PR:请在设置 → 远程仓库配置 GitHub token",
+            "I cannot create the PR automatically; please run gh auth login first.",
+        ] {
+            assert!(claims_delivery_blocked(text), "{text}");
+        }
+        for text in [
+            "PR #166 已创建,GitHub CLI 认证验证成功",
+            "已通过 gh 触发发布工作流",
+            "交付结果: delivered",
+            "如果你的机器上没有 gh,才需要配置 token。本机已检测到 gh。",
+        ] {
+            assert!(!claims_delivery_blocked(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn delivery_claim_corrector_message_forces_the_tool_path() {
+        let msg = delivery_claim_correction();
+        assert!(msg.contains("GitHub CLI"));
+        assert!(msg.contains("deliver_changes"));
+        assert!(msg.contains("不要再要求用户配置"));
     }
 
     #[test]
