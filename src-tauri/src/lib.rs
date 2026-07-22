@@ -352,6 +352,10 @@ pub fn run() {
             commands::costs::get_monthly_cost,
             commands::costs::get_costs_by_model,
             commands::costs::list_recent_cost_entries,
+            commands::costs::get_usage_dashboard,
+            commands::costs::get_usage_day_detail,
+            commands::costs::get_usage_budget_status,
+            commands::costs::get_session_usage,
         ])
         .run(tauri::generate_context!())
         .expect("error while running CodeFactory");

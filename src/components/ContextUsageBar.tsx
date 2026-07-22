@@ -10,10 +10,19 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "../lib/tauri";
 import { useChatStore } from "../stores/chat";
 
-interface CostSummary {
+interface UsageSummary {
   input_tokens: number;
   output_tokens: number;
-  cost_usd: number;
+  reasoning_tokens: number;
+  cached_tokens: number;
+  requests: number;
+  actual_cost_usd: number | null;
+  estimated_cost_usd: number | null;
+  cost_source: string;
+}
+
+interface DailyUsage {
+  summary: UsageSummary;
 }
 
 export function formatContextTokens(n: number): string {
@@ -34,25 +43,23 @@ export function ContextUsageBar({ sessionId }: Props) {
   const usage = useChatStore((s) => (sessionId ? s.runtime?.[sessionId]?.contextUsage ?? null : null));
   const toast = useChatStore((s) => (sessionId ? s.runtime?.[sessionId]?.compressionToast ?? null : null));
 
-  const [session, setSession] = useState<CostSummary | null>(null);
-  const [today, setToday] = useState<CostSummary | null>(null);
-  const [monthly, setMonthly] = useState<CostSummary | null>(null);
+  const [session, setSession] = useState<UsageSummary | null>(null);
+  const [today, setToday] = useState<UsageSummary | null>(null);
   const [showToast, setShowToast] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const [t, m] = await Promise.all([
-        invoke<CostSummary>("get_today_cost"),
-        invoke<CostSummary>("get_monthly_cost"),
-      ]);
-      setToday(t);
-      setMonthly(m);
+      const dashboard = await invoke<DailyUsage>("get_usage_dashboard", {
+        rangeDays: 1,
+        timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
+      });
+      setToday(dashboard.summary);
     } catch {
       // DB may not be ready
     }
     if (sessionId) {
       try {
-        setSession(await invoke<CostSummary>("get_session_cost", { sessionId }));
+        setSession(await invoke<UsageSummary>("get_session_usage", { sessionId }));
       } catch {
         setSession(null);
       }
@@ -66,7 +73,7 @@ export function ContextUsageBar({ sessionId }: Props) {
   useEffect(() => {
     let cancel = false;
     let unlisten: (() => void) | null = null;
-    listen<string>("token-usage-recorded", () => {
+    listen<string>("model-usage-recorded", () => {
       if (!cancel) refresh();
     }).then((fn) => {
       if (cancel) fn();
@@ -84,9 +91,8 @@ export function ContextUsageBar({ sessionId }: Props) {
 
   const sessionTok = session ? session.input_tokens + session.output_tokens : 0;
   const todayTok = today ? today.input_tokens + today.output_tokens : 0;
-  const monthCost = monthly?.cost_usd ?? 0;
   const hasUsage = usage && usage.limit > 0;
-  const hasTokens = sessionTok > 0 || todayTok > 0 || monthCost > 0.0001;
+  const hasTokens = sessionTok > 0 || todayTok > 0;
 
   // Hide entirely if there's nothing to show.
   if (!hasUsage && !hasTokens && !showToast) return null;
@@ -120,12 +126,15 @@ export function ContextUsageBar({ sessionId }: Props) {
               {formatContextTokens(todayTok)}
             </span>
           )}
-          {monthCost > 0.0001 && (
-            <span title="本月(估算)">
-              <span className="text-gray-600 mr-1">本月</span>
-              ${monthCost.toFixed(4)}
-            </span>
+          {today?.cost_source === "subscription" && <span title="ChatGPT 订阅流量">订阅</span>}
+          {today?.cost_source === "local" && <span title="本地模型流量">本地</span>}
+          {today?.cost_source === "provider_actual" && (today.actual_cost_usd ?? 0) > 0 && (
+            <span title="今日 Provider 实际费用">实际 ${(today.actual_cost_usd ?? 0).toFixed(4)}</span>
           )}
+          {(today?.cost_source === "model_price_estimate" || today?.cost_source === "legacy_estimate")
+            && (today.estimated_cost_usd ?? 0) > 0 && (
+              <span title="今日估算费用">估算 ${(today.estimated_cost_usd ?? 0).toFixed(4)}</span>
+            )}
         </div>
       )}
 
