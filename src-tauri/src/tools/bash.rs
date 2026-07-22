@@ -48,6 +48,54 @@ pub fn definition() -> ToolDefinition {
     }
 }
 
+/// Optional container isolation for shell commands (WorkBuddy-gap P0-2).
+pub mod sandbox {
+    use std::path::Path;
+
+    pub struct SandboxInvocation {
+        pub program: String,
+        pub args: Vec<String>,
+    }
+
+    pub const MISSING_DOCKER_ERROR: &str = "沙箱模式已开启,但找不到可用的 docker 运行时。\
+请安装/启动 Docker,或在设置中将沙箱模式改回 off。为保证隔离承诺,不会自动回退到本机执行。";
+
+    /// Build the docker invocation: disposable container, ONLY the project
+    /// directory mounted (rw, same absolute path so tool output paths stay
+    /// meaningful), workdir there, command via bash -lc. Network stays on —
+    /// builds need registries; the isolation goal is the filesystem.
+    pub fn docker_invocation(command: &str, cwd: &Path, image: &str) -> SandboxInvocation {
+        let cwd = cwd.to_string_lossy();
+        SandboxInvocation {
+            program: "docker".into(),
+            args: vec![
+                "run".into(),
+                "--rm".into(),
+                "--init".into(),
+                "-v".into(),
+                format!("{cwd}:{cwd}"),
+                "-w".into(),
+                cwd.to_string(),
+                image.to_string(),
+                "bash".into(),
+                "-lc".into(),
+                command.to_string(),
+            ],
+        }
+    }
+
+    /// Cheap liveness probe for the container runtime binary.
+    pub fn runtime_available(program: &str) -> bool {
+        std::process::Command::new(program)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+}
+
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     execute_inner(args, ctx, None).await
 }
@@ -88,13 +136,51 @@ async fn execute_inner(
     }
     let risk = policy.risk();
 
-    let shell = command_env::shell_invocation(&a.command);
-    let mut cmd = Command::new(shell.program).no_window();
-    cmd.args(shell.args)
-        .current_dir(&ctx.cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command_env::apply_developer_path(&mut cmd);
+    let sandbox_mode = ctx
+        .settings
+        .as_ref()
+        .map(|s| s.sandbox_mode)
+        .unwrap_or_default();
+    let mut launched_program = String::new();
+    let mut cmd = match sandbox_mode {
+        crate::config::settings::SandboxMode::Docker => {
+            if cfg!(windows) {
+                return Ok(ToolOutput::err(
+                    "沙箱模式暂不支持 Windows;请在设置中将沙箱模式改回 off。",
+                ));
+            }
+            if !sandbox::runtime_available("docker") {
+                return Ok(ToolOutput::err(sandbox::MISSING_DOCKER_ERROR));
+            }
+            let image = ctx
+                .settings
+                .as_ref()
+                .map(|s| s.sandbox_image.clone())
+                .unwrap_or_else(|| "ubuntu:24.04".into());
+            // Canonicalize before mounting: macOS paths like /tmp are
+            // symlinks, and Docker mounts the LINK path as an empty dir.
+            let mount_cwd = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
+            let inv = sandbox::docker_invocation(&a.command, &mount_cwd, &image);
+            launched_program = inv.program.clone();
+            let mut cmd = Command::new(inv.program).no_window();
+            cmd.args(inv.args)
+                .current_dir(&ctx.cwd)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd
+        }
+        crate::config::settings::SandboxMode::Off => {
+            let shell = command_env::shell_invocation(&a.command);
+            launched_program = shell.program.to_string();
+            let mut cmd = Command::new(shell.program).no_window();
+            cmd.args(shell.args)
+                .current_dir(&ctx.cwd)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command_env::apply_developer_path(&mut cmd);
+            cmd
+        }
+    };
 
     let timeout_secs =
         effective_command_timeout_sec(&a.command, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
@@ -108,7 +194,7 @@ async fn execute_inner(
         Err(ProcessOutputError::Unavailable | ProcessOutputError::Failed) => {
             Ok(ToolOutput::err(format!(
                 "Failed to execute shell '{}'. PATH={}",
-                shell.program,
+                launched_program,
                 std::env::var("PATH").unwrap_or_else(|_| "<unset>".into())
             )))
         }
@@ -147,6 +233,96 @@ fn append_audit(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn docker_invocation_mounts_only_the_project_directory() {
+        // WorkBuddy-gap P0-2: optional container isolation. The wrapper must
+        // mount ONLY the project dir (rw, same absolute path), set it as the
+        // workdir, and run the exact command via bash -lc. No home dir, no
+        // extra host mounts.
+        let inv = super::sandbox::docker_invocation(
+            "cargo test && printf done",
+            std::path::Path::new("/Users/leo/Projects/Demo"),
+            "ubuntu:24.04",
+        );
+        assert_eq!(inv.program, "docker");
+        let args = inv.args.join(" ");
+        assert!(args.starts_with("run --rm --init"));
+        assert!(args.contains("-v /Users/leo/Projects/Demo:/Users/leo/Projects/Demo"));
+        assert!(args.contains("-w /Users/leo/Projects/Demo"));
+        assert!(args.ends_with("ubuntu:24.04 bash -lc cargo test && printf done"));
+        // Exactly one volume mount.
+        assert_eq!(inv.args.iter().filter(|a| *a == "-v").count(), 1);
+    }
+
+    #[test]
+    fn sandbox_defaults_are_off_with_a_stock_image() {
+        let settings = crate::config::settings::Settings::default();
+        assert_eq!(
+            settings.sandbox_mode,
+            crate::config::settings::SandboxMode::Off
+        );
+        assert_eq!(settings.sandbox_image, "ubuntu:24.04");
+    }
+
+    /// Real-runtime smoke: only meaningful on a machine with docker; CI
+    /// runners without it skip. Runs a trivial command through the ACTUAL
+    /// docker wrapper and checks the output and that host paths don't leak
+    /// beyond the mounted project dir. Unix-only: Windows CI runners DO
+    /// ship docker, but sandbox mode itself reports unsupported there and
+    /// $HOME does not exist.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_sandbox_executes_a_real_command_when_docker_is_present() {
+        if !super::sandbox::runtime_available("docker") {
+            eprintln!("skipping docker sandbox smoke: docker not available");
+            return;
+        }
+        // Under $HOME so the path sits inside Docker Desktop's default
+        // file-sharing scope (paths outside it mount as EMPTY dirs — a
+        // documented limitation surfaced by this smoke's first version).
+        let home = std::env::var("HOME").expect("HOME set on unix");
+        let cwd = std::path::PathBuf::from(home)
+            .join(".cache")
+            .join(format!("cf-sandbox-smoke-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(cwd.join("probe.txt"), "sandboxed").unwrap();
+
+        let mut settings = crate::config::settings::Settings::default();
+        settings.sandbox_mode = crate::config::settings::SandboxMode::Docker;
+        let mut ctx = crate::tools::ExecCtx::new(cwd.clone(), None);
+        ctx.settings = Some(settings);
+
+        let host_home = std::env::var("HOME").expect("HOME set on unix");
+        let out = super::execute(
+            serde_json::json!({
+                "command": format!("cat probe.txt && ls {host_home} 2>/dev/null; true")
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("sandboxed"));
+        // Only the mount chain is visible in the container's view of the
+        // host home — real host content (e.g. the Projects tree) must not
+        // leak in.
+        assert!(
+            !out.content.contains("Projects"),
+            "host home content leaked into sandbox: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn missing_docker_is_a_hard_actionable_error_never_a_silent_host_fallback() {
+        // Falling back to the host would silently void the isolation the
+        // user opted into — the error must name the fix instead.
+        assert!(super::sandbox::MISSING_DOCKER_ERROR.contains("docker"));
+        assert!(super::sandbox::MISSING_DOCKER_ERROR.contains("沙箱"));
+        assert!(!super::sandbox::runtime_available("definitely-not-a-real-binary-xyz"));
+    }
+
     use super::*;
     use uuid::Uuid;
 

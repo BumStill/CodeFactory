@@ -863,6 +863,18 @@ impl TaskScheduler {
                         .map(|r| r.summary.clone())
                         .unwrap_or_else(|| prev_error.clone().unwrap_or_default());
 
+                    // One-way IM notification: the moments a human needs to
+                    // come back for. Fire-and-forget; failures only log.
+                    crate::notify::send(
+                        &settings,
+                        if hook_completed {
+                            crate::notify::NotifyEvent::TaskCompleted
+                        } else {
+                            crate::notify::NotifyEvent::TaskFailed
+                        },
+                        format!("{task_title}
+{}", hook_summary.chars().take(200).collect::<String>()),
+                    );
                     match final_outcome {
                         Some(result) if result.completed => {
                             let result_json =

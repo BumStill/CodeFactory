@@ -2,6 +2,7 @@
 pub mod bash;
 pub mod delivery;
 pub mod delegate_tasks;
+pub mod parallel;
 pub mod docx;
 pub mod edit;
 pub mod file_lock;
@@ -99,6 +100,7 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         xlsx::edit_definition(),
         delegate_tasks::definition(),
         delivery::definition(),
+        parallel::definition(),
     ]
 }
 
@@ -127,6 +129,7 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "edit_xlsx" => xlsx::execute_edit(args, ctx).await,
         "delegate_tasks" => delegate_tasks::execute(args, ctx).await,
         "deliver_changes" => delivery::execute(args, ctx).await,
+        "dispatch_parallel_tasks" => parallel::execute(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),
     }
 }

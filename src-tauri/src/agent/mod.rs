@@ -317,6 +317,14 @@ verify the outcome. The plan is the contract.\n\
    When you stop for a hard blocker: state it in ONE precise sentence,\n\
    tell the user EXACTLY what action unblocks you, then end.\n\
 \n\
+**PARALLEL FAN-OUT:**\n\
+When the plan contains several INDEPENDENT sub-jobs (auditing many\n\
+modules, migrating many files, researching directions) that do not edit\n\
+the same files, call `dispatch_parallel_tasks` once with self-contained\n\
+briefs instead of doing them serially — the scheduler runs them\n\
+concurrently under the user's parallelism cap. Keep sequential steps of\n\
+one change OUT of it.\n\
+\n\
 **HOW A TURN ENDS NATURALLY:**\n\
 - All acceptance criteria verified pass -> declare done with the\n\
   one-line evidence per criterion (the command run + the result)\n\
@@ -706,6 +714,24 @@ impl AgentLoop {
             .map(|message| message.content.clone())
             .unwrap_or_default();
         let mut messages = self.build_openai_messages(history, system_prompt);
+        // Proactive capability match: strip images BEFORE the first request
+        // when the model is KNOWN text-only, instead of burning a 400 round
+        // trip every turn. The reactive strip-and-retry stays as the net for
+        // unknown models and wrong guesses.
+        {
+            let settings = self.settings.read().await;
+            if !context::model_supports_vision(&settings, &self.endpoint_name, &self.model_id) {
+                let stripped = strip_image_parts(&mut messages);
+                if stripped > 0 {
+                    let notice = format!(
+                        "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
+占位文本;切换到支持图片的模型可恢复图片理解。"
+                    );
+                    self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
+                        .await?;
+                }
+            }
+        }
         let hook_runner = if self.anonymous {
             hooks::HookRunner::disabled(self.app.clone())
         } else {
@@ -1380,6 +1406,14 @@ impl AgentLoop {
                 },
             )
             .ok();
+        {
+            let settings = self.settings.read().await;
+            crate::notify::send(
+                &settings,
+                crate::notify::NotifyEvent::PermissionWaiting,
+                format!("工具 {} 正在等待你的批准", tc.function.name),
+            );
+        }
 
         let allow =
             await_permission_response(receiver, self.cancel.as_ref(), Duration::from_secs(600))
@@ -2115,6 +2149,33 @@ impl AgentLoop {
         Ok(())
     }
 
+    /// Persist a gate/system notice at most once per session (matched by a
+    /// stable `marker` substring) — proactive capability notices would
+    /// otherwise repeat on every turn because history is rebuilt each run.
+    async fn persist_gate_message_once(
+        &self,
+        marker: &str,
+        content: &str,
+        state: &str,
+    ) -> Result<()> {
+        if self.anonymous {
+            return Ok(());
+        }
+        let existing: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND completion_state = ? \
+             AND content LIKE ?",
+        )
+        .bind(&self.session_id)
+        .bind(state)
+        .bind(format!("%{marker}%"))
+        .fetch_one(&self.db)
+        .await?;
+        if existing.0 > 0 {
+            return Ok(());
+        }
+        self.persist_gate_message(content, state).await
+    }
+
     /// Tag a persisted assistant reply that the completion gate rejected so
     /// the UI collapses it instead of rendering yet another full
     /// near-duplicate answer (2026-07-16 session: seven of them).
@@ -2359,6 +2420,21 @@ impl AgentLoop {
             .map(|message| message.content.clone())
             .unwrap_or_default();
         let mut messages = self.build_anthropic_messages(history);
+        // Proactive capability match — see the OpenAI loop for rationale.
+        {
+            let settings = self.settings.read().await;
+            if !context::model_supports_vision(&settings, &self.endpoint_name, &self.model_id) {
+                let stripped = strip_image_values(&mut messages);
+                if stripped > 0 {
+                    let notice = format!(
+                        "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
+占位文本;切换到支持图片的模型可恢复图片理解。"
+                    );
+                    self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
+                        .await?;
+                }
+            }
+        }
         let hook_runner = if self.anonymous {
             hooks::HookRunner::disabled(self.app.clone())
         } else {
@@ -3997,6 +4073,7 @@ mod tests {
                     ReasoningEffort::Medium,
                     ReasoningEffort::Max,
                 ]),
+            supports_vision: None,
             },
             ReasoningEffort::High,
         );
@@ -4020,6 +4097,7 @@ mod tests {
                 effective_context_window_percent: None,
                 default_reasoning_effort: None,
                 supported_reasoning_efforts: None,
+                supports_vision: None,
             },
             ReasoningEffort::High,
         );
@@ -4048,6 +4126,7 @@ mod tests {
                     ReasoningEffort::High,
                     ReasoningEffort::XHigh,
                 ]),
+            supports_vision: None,
             },
             ReasoningEffort::Ultra,
         );
@@ -4075,6 +4154,7 @@ mod tests {
                     ReasoningEffort::Medium,
                     ReasoningEffort::High,
                 ]),
+            supports_vision: None,
             },
             ReasoningEffort::Max,
         );
@@ -4098,6 +4178,7 @@ mod tests {
                 effective_context_window_percent: None,
                 default_reasoning_effort: None,
                 supported_reasoning_efforts: None,
+                supports_vision: None,
             },
             ReasoningEffort::High,
         );
@@ -4125,6 +4206,7 @@ mod tests {
                     ReasoningEffort::Medium,
                     ReasoningEffort::High,
                 ]),
+            supports_vision: None,
             },
             ReasoningEffort::Ultra,
         );

@@ -52,6 +52,30 @@ pub struct McpServerConfig {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImWebhookFormat {
+    /// Enterprise WeChat group-bot markdown message.
+    #[default]
+    Wecom,
+    /// Feishu custom-bot text message.
+    Feishu,
+    /// Neutral JSON for self-hosted relays.
+    Generic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    #[default]
+    Off,
+    Docker,
+}
+
+fn default_sandbox_image() -> String {
+    "ubuntu:24.04".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub endpoints: HashMap<String, Endpoint>,
@@ -101,6 +125,22 @@ pub struct Settings {
     /// enough to break the "green build but no PR" stall.
     #[serde(default)]
     pub delivery_ceiling: DeliveryCeiling,
+    /// IM webhook for one-way notifications (task finished/failed, turn
+    /// errors, permission waits). Empty = disabled.
+    #[serde(default)]
+    pub im_webhook_url: String,
+    /// Payload shape for `im_webhook_url`.
+    #[serde(default)]
+    pub im_webhook_format: ImWebhookFormat,
+    /// Shell-execution isolation for the bash tool. `Off` runs on the host
+    /// (historical behavior); `Docker` wraps every command in a disposable
+    /// container with ONLY the project directory mounted. Never silently
+    /// falls back to the host when the runtime is missing.
+    #[serde(default)]
+    pub sandbox_mode: SandboxMode,
+    /// Container image used when `sandbox_mode` is `Docker`.
+    #[serde(default = "default_sandbox_image")]
+    pub sandbox_image: String,
     /// Merge strategy used when the ceiling reaches `ThroughMerge`+.
     #[serde(default)]
     pub delivery_merge_method: MergeMethod,
@@ -416,6 +456,10 @@ pub struct CustomModel {
     pub default_reasoning_effort: Option<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_reasoning_efforts: Option<Vec<ReasoningEffort>>,
+    /// Whether this model accepts image input. Explicit metadata wins over
+    /// the conservative name-based guess in `agent::context`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -504,6 +548,10 @@ impl Default for Settings {
             max_parallel_tasks: default_max_parallel_tasks(),
             subagent_isolation: SubagentIsolation::Shared,
             delivery_ceiling: DeliveryCeiling::PrOnly,
+            im_webhook_url: String::new(),
+            im_webhook_format: ImWebhookFormat::Wecom,
+            sandbox_mode: SandboxMode::Off,
+            sandbox_image: default_sandbox_image(),
             delivery_merge_method: MergeMethod::Squash,
             delivery_exclude_globs: Vec::new(),
             delivery_ci_timeout_secs: default_delivery_ci_timeout_secs(),
@@ -722,6 +770,7 @@ mod reasoning_effort_tests {
                     effective_context_window_percent: Some(95),
                     default_reasoning_effort: None,
                     supported_reasoning_efforts: None,
+                supports_vision: None,
                 }],
                 active_model: Some("gpt-5.5".into()),
             },

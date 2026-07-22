@@ -162,6 +162,36 @@ pub fn resolve_context_window(
     }
 }
 
+/// Whether `(endpoint, model)` accepts image input. Explicit CustomModel
+/// metadata wins; otherwise a conservative name-based guess: only families
+/// KNOWN to be text-only return false (deepseek chat/reasoner rejected
+/// images in production, 2026-07-21). Unknown models default to true — the
+/// reactive strip-and-retry remains the net for wrong guesses; proactively
+/// dropping images on a false negative would be worse than one failed
+/// round-trip.
+pub fn model_supports_vision(
+    settings: &Settings,
+    endpoint_name: &str,
+    model_id: &str,
+) -> bool {
+    if let Some(ep) = settings.endpoints.get(endpoint_name) {
+        for cm in &ep.custom_models {
+            if cm.id == model_id {
+                if let Some(explicit) = cm.supports_vision {
+                    return explicit;
+                }
+                break;
+            }
+        }
+    }
+    let id = model_id.to_lowercase();
+    let id = id.split('/').last().unwrap_or(&id);
+    if id.starts_with("deepseek") && !id.contains("vl") {
+        return false;
+    }
+    true
+}
+
 /// Best-effort context-length lookup from a model id string. Tuned for the
 /// providers our users actually hit. Update as new families ship.
 fn guess_context_from_name(model_id: &str) -> Option<u32> {
@@ -430,7 +460,7 @@ pub fn compress_if_needed(
 mod tests {
     use super::{
         compress_if_needed, estimate_prompt_tokens, estimate_tokens, guess_context_from_name as guess,
-        resolve_context_window,
+        model_supports_vision, resolve_context_window,
     };
     use crate::config::settings::{ApiStyle, CustomModel, Endpoint, Settings};
     use crate::openrouter::types::{ChatMessage, MessageContent};
@@ -570,6 +600,7 @@ mod tests {
             effective_context_window_percent: Some(95),
             default_reasoning_effort: None,
             supported_reasoning_efforts: None,
+            supports_vision: None,
         });
 
         let window = resolve_context_window(&settings, "chatgpt", "gpt-5.6-sol", None);
@@ -589,6 +620,7 @@ mod tests {
             effective_context_window_percent: Some(95),
             default_reasoning_effort: None,
             supported_reasoning_efforts: None,
+            supports_vision: None,
         });
 
         let window = resolve_context_window(&settings, "chatgpt", "gpt-5.6-sol", None);
@@ -649,6 +681,60 @@ mod tests {
         ] {
             assert!(!super::is_context_overflow(err), "{err}");
         }
+    }
+
+    #[test]
+    fn vision_capability_guess_is_conservative() {
+        // Only families KNOWN text-only return false (deepseek chat/reasoner
+        // rejected images in production on 2026-07-21); vision variants and
+        // unknown models default to true — the reactive strip-and-retry stays
+        // as the net for wrong guesses, and proactively dropping images on a
+        // false negative would be worse than one failed round-trip.
+        let settings = Settings::default();
+        assert!(!model_supports_vision(&settings, "any", "deepseek-v4-pro"));
+        assert!(!model_supports_vision(&settings, "any", "deepseek-reasoner"));
+        assert!(model_supports_vision(&settings, "any", "deepseek-vl2"));
+        assert!(model_supports_vision(&settings, "any", "gpt-5.6-sol"));
+        assert!(model_supports_vision(&settings, "any", "claude-opus-4-8"));
+        assert!(model_supports_vision(&settings, "any", "totally-unknown-model"));
+    }
+
+    #[test]
+    fn custom_model_vision_metadata_wins_over_the_guess() {
+        let mut settings = Settings::default();
+        settings.endpoints.insert(
+            "ep".into(),
+            Endpoint {
+                base_url: "https://example.com/v1".into(),
+                key_ref: None,
+                api_style: ApiStyle::Openai,
+                custom_models: vec![
+                    CustomModel {
+                        id: "deepseek-v4-pro".into(),
+                        name: None,
+                        context_length: None,
+                        max_context_length: None,
+                        effective_context_window_percent: None,
+                        default_reasoning_effort: None,
+                        supported_reasoning_efforts: None,
+                        supports_vision: Some(true),
+                    },
+                    CustomModel {
+                        id: "gpt-5.6-sol".into(),
+                        name: None,
+                        context_length: None,
+                        max_context_length: None,
+                        effective_context_window_percent: None,
+                        default_reasoning_effort: None,
+                        supported_reasoning_efforts: None,
+                        supports_vision: Some(false),
+                    },
+                ],
+                active_model: None,
+            },
+        );
+        assert!(model_supports_vision(&settings, "ep", "deepseek-v4-pro"));
+        assert!(!model_supports_vision(&settings, "ep", "gpt-5.6-sol"));
     }
 
     #[test]

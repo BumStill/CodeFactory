@@ -437,6 +437,7 @@ fn parse_codex_models(body: &str) -> Result<Vec<CustomModel>> {
             effective_context_window_percent: u8::try_from(model.effective_context_window_percent)
                 .ok()
                 .filter(|percent| (1..=100).contains(percent)),
+            supports_vision: None,
             default_reasoning_effort: model
                 .default_reasoning_level
                 .as_deref()
@@ -859,6 +860,7 @@ mod tests {
                 ReasoningEffort::Medium,
                 ReasoningEffort::High,
             ]),
+        supports_vision: None,
         }
     }
 
