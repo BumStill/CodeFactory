@@ -593,6 +593,24 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
     }
     let shell_test_command = has_shell_test_command(&lower);
     let structured_shell_assertion = has_structured_shell_assertion(&lower);
+    // Read-only gh queries against the authoritative remote (run/PR/check
+    // state) are verification — the third allowlist expansion (pnpm test →
+    // vitest/tsc → gh). Mutating gh subcommands (merge, workflow run,
+    // api -X POST) stay out of this lane.
+    let gh_read_only_verification = ["gh run view", "gh run list", "gh pr checks", "gh pr view"]
+        .iter()
+        .any(|w| lower.contains(w))
+        || (lower.contains("gh api")
+            && !lower.contains(" -x ")
+            && !lower.contains("--method")
+            && !lower.contains(" -f "));
+    if gh_read_only_verification
+        && !lower.contains("gh pr merge")
+        && !lower.contains("gh workflow run")
+    {
+        return ToolKind::Verification;
+    }
+
     if shell_test_command
         || structured_shell_assertion
         || contains_any(
@@ -5226,6 +5244,40 @@ mod tests {
             assert_eq!(
                 classify_command(command, 300_000),
                 ToolKind::Mutation,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn gh_read_only_queries_count_as_verification() {
+        // Week-audit finding: the model verified a hotfix end-to-end with
+        // eight `gh run view` / `gh pr checks` calls and the gate still
+        // rejected its report as "unverified" — the allowlist's third bite
+        // (pnpm test → vitest/tsc → gh). Read-only gh queries against the
+        // authoritative remote ARE verification.
+        for command in [
+            "gh run view 29917625521 --repo BumStill/CodeFactory --json status",
+            "gh run list --repo BumStill/CodeFactory --limit 5",
+            "gh pr checks 166 --repo BumStill/CodeFactory",
+            "gh pr view 166 --json statusCheckRollup",
+            "gh api repos/BumStill/CodeFactory/commits/abc/check-runs",
+        ] {
+            assert_eq!(
+                classify_command(command, 300_000),
+                ToolKind::Verification,
+                "{command}"
+            );
+        }
+        // Mutating gh subcommands must NOT ride the verification lane.
+        for command in [
+            "gh pr merge 166 --squash",
+            "gh workflow run auto-release.yml --ref main",
+            "gh api repos/x/y/dispatches -X POST",
+        ] {
+            assert_ne!(
+                classify_command(command, 300_000),
+                ToolKind::Verification,
                 "{command}"
             );
         }

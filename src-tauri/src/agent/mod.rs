@@ -2606,6 +2606,43 @@ impl AgentLoop {
                 // Same no-vision degradation as the OpenAI loop: strip image
                 // parts to placeholders and retry once instead of killing the
                 // turn on every replay of an image-bearing history.
+                // Transient provider saturation — see the OpenAI loop.
+                Err(e) if is_provider_overloaded(&e.to_string()) => {
+                    let notice = "模型服务过载,正在自动退避重试(最多 2 次)。".to_string();
+                    self.persist_gate_message_once("自动退避重试", &notice, "turn_notice")
+                        .await?;
+                    let mut last_err = e;
+                    let mut recovered = None;
+                    for delay in [20u64, 40] {
+                        if self.is_cancelled() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        match self
+                            .call_anthropic_transport(
+                                system_prompt,
+                                messages.clone(),
+                                active_tool_defs,
+                                required_tool_response,
+                                event_name,
+                            )
+                            .await
+                        {
+                            Ok(ok) => {
+                                recovered = Some(ok);
+                                break;
+                            }
+                            Err(next) if is_provider_overloaded(&next.to_string()) => {
+                                last_err = next;
+                            }
+                            Err(next) => return Err(next),
+                        }
+                    }
+                    match recovered {
+                        Some(resp) => resp,
+                        None => return Err(last_err),
+                    }
+                }
                 Err(e) if is_vision_rejection(&e.to_string()) => {
                     let stripped = strip_image_values(&mut messages);
                     if stripped == 0 {
@@ -3392,6 +3429,15 @@ fn replayable_history(history: Vec<Message>) -> Vec<Message> {
         .into_iter()
         .filter(|m| m.completion_state.as_deref() != Some("turn_error"))
         .collect()
+}
+
+/// Transient provider saturation worth a backoff retry instead of a dead
+/// turn. Distinct from capacity (context) and capability (vision) errors.
+fn is_provider_overloaded(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    ["overloaded", "try again later", "rate limit", "429", "503", "529"]
+        .iter()
+        .any(|w| lower.contains(w))
 }
 
 /// Whether this mode injects the completion-ready ("coverage audit") nudge at
@@ -5064,6 +5110,28 @@ mod tests {
         );
         let evidence = gate.evidence();
         assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
+    }
+
+    #[test]
+    fn provider_overload_is_detected_for_backoff_retry() {
+        // Week-audit finding: "Our servers are currently overloaded. Please
+        // try again later." killed the turn outright — a transient condition
+        // that deserves backoff, not death.
+        for err in [
+            "ChatGPT 后端返回错误:Our servers are currently overloaded. Please try again later.",
+            "429 rate limit exceeded",
+            "HTTP 503 Service Unavailable",
+            "upstream 529 overloaded",
+        ] {
+            assert!(is_provider_overloaded(err), "{err}");
+        }
+        for err in [
+            "Your input exceeds the context window of this model.",
+            "This model does not support image input",
+            "400 invalid request",
+        ] {
+            assert!(!is_provider_overloaded(err), "{err}");
+        }
     }
 
     #[test]
