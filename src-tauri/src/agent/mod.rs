@@ -849,6 +849,7 @@ impl AgentLoop {
         let mut progress_tracker = ProgressTracker::new(8);
         let mut finalization_pending = false;
         let mut completion_recovery_attempts = 0_u32;
+        let mut fact_check_used = false;
         let mut require_tool_next = false;
         let max_iterations = self.mode.max_iterations();
         for iteration in 0..max_iterations {
@@ -1051,6 +1052,34 @@ impl AgentLoop {
             }
 
             if tool_calls.is_empty() {
+                // Systemic fact-check: a tool-call-free reply asserting a
+                // machine-verifiable obstacle (delivery blocked / command
+                // missing / waiting on a checkable condition) gets ONE live
+                // probe-backed correction — facts over stale memory.
+                if !fact_check_used {
+                    if let Some(correction) = fact_check_reply(&text) {
+                        fact_check_used = true;
+                        self.persist_gate_message(&correction, "turn_notice").await?;
+                        self.app
+                            .emit(
+                                event_name,
+                                StreamEvent::CompletionGateAction {
+                                    kind: "turn_notice".into(),
+                                    detail: correction.clone(),
+                                },
+                            )
+                            .ok();
+                        messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: MessageContent::Text(correction),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
+                            reasoning_content: None,
+                        });
+                        continue;
+                    }
+                }
                 let evidence = completion_gate.evidence();
                 match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
                     CompletionFinalization::Recover(prompt) => {
@@ -2560,6 +2589,7 @@ impl AgentLoop {
         let mut progress_tracker = ProgressTracker::new(8);
         let mut finalization_pending = false;
         let mut completion_recovery_attempts = 0_u32;
+        let mut fact_check_used = false;
         let mut require_tool_next = false;
         let max_iterations = self.mode.max_iterations();
         for iteration in 0..max_iterations {
@@ -2750,6 +2780,27 @@ impl AgentLoop {
             }
 
             if tool_calls.is_empty() {
+                // Systemic fact-check — see the OpenAI loop for rationale.
+                if !fact_check_used {
+                    if let Some(correction) = fact_check_reply(&text) {
+                        fact_check_used = true;
+                        self.persist_gate_message(&correction, "turn_notice").await?;
+                        self.app
+                            .emit(
+                                event_name,
+                                StreamEvent::CompletionGateAction {
+                                    kind: "turn_notice".into(),
+                                    detail: correction.clone(),
+                                },
+                            )
+                            .ok();
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": [{ "type": "text", "text": correction }],
+                        }));
+                        continue;
+                    }
+                }
                 let evidence = completion_gate.evidence();
                 match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
                     CompletionFinalization::Recover(prompt) => {
@@ -3440,6 +3491,140 @@ fn is_provider_overloaded(error: &str) -> bool {
         .any(|w| lower.contains(w))
 }
 
+/// The self-recovery behavioral contract, appended to EVERY mode's system
+/// prompt. Systemic answer to the field pattern where the agent reported
+/// obstacles instead of attempting them ("无法自动创建 PR,请 gh auth
+/// login" from stale memory, while a logged-in gh sat right there — and the
+/// same shape for docker, tokens, and "回复继续" waits).
+const SELF_RECOVERY_CONTRACT: &str = "\
+# Self-recovery contract (all modes)\n\
+1. **VERIFY BEFORE ASSERTING.** Never state an environment fact from memory —\n\
+   tool presence, CLI login state, config existence, service reachability.\n\
+   Run the cheap probe first (`which x`, `gh auth status`, read the file).\n\
+   An assertion like \"X is not available\" without a probe in THIS turn is a\n\
+   contract violation; the harness fact-checks such claims and will correct you.\n\
+2. **TRY BEFORE ASKING.** On an obstacle, attempt at least two different\n\
+   approaches yourself (narrate each in one short sentence). Ask the user only\n\
+   after both fail, and include: what you verified, what you tried, the exact\n\
+   errors, and the smallest action only the user can take.\n\
+3. **POLL, DON'T PARK.** If the thing you are waiting for is machine-checkable\n\
+   (auth completed, file created, CI finished, config saved), poll for it with\n\
+   tools — never end the turn with \"完成后回复继续\" for a checkable condition.\n";
+
+/// Does this reply claim the delivery channel is unusable (cannot open a
+/// PR / needs gh auth login / needs a token)? Narrow: successful-delivery
+/// reports are exempt.
+fn claims_delivery_blocked(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let success_markers = [
+        "已创建",
+        "已通过 gh",
+        "交付结果: delivered",
+        "验证成功",
+        "pr created",
+    ];
+    if success_markers.iter().any(|m| lower.contains(&m.to_lowercase())) {
+        return false;
+    }
+    let inability = ["无法", "不能", "cannot", "can't", "unable"];
+    let channel = ["创建 pr", "开 pr", "create the pr", "create a pr", "自动创建 pr"];
+    let inability_hit = inability.iter().any(|w| lower.contains(w))
+        && channel.iter().any(|w| lower.contains(w));
+    let setup_demand = (lower.contains("gh auth login")
+        || (lower.contains("token") && (lower.contains("配置") || lower.contains("configure"))))
+        && (lower.contains("请") || lower.contains("please") || lower.contains("完成认证"));
+    inability_hit || setup_demand
+}
+
+/// Does this reply claim a specific command/CLI is missing? Returns the
+/// command name for a live probe. Narrow allowlist of tools we know how to
+/// probe; positive statements ("已通过 docker…") are exempt.
+fn claims_command_missing(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let missing_markers = [
+        "未安装",
+        "没有安装",
+        "不存在",
+        "找不到",
+        "not installed",
+        "command not found",
+        "not found",
+        "is missing",
+    ];
+    if !missing_markers.iter().any(|m| lower.contains(m)) {
+        return None;
+    }
+    for cmd in ["docker", "gh", "git", "node", "pnpm", "npm", "cargo", "python3"] {
+        if lower.contains(cmd) {
+            // The marker must plausibly refer to the command, not random prose.
+            return Some(cmd.to_string());
+        }
+    }
+    None
+}
+
+/// Live probe: does `cmd` resolve on PATH?
+fn command_exists(cmd: &str) -> bool {
+    which_available(cmd)
+}
+
+fn which_available(cmd: &str) -> bool {
+    std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Does this reply park on the user for a machine-checkable condition
+/// ("完成后回复继续 / 配置完成后告诉我")? Genuine preference questions
+/// ("回复 1 或 2") are not waits on checkable state.
+fn claims_wait_for_user_on_checkable(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let wait_markers = [
+        "完成后回复",
+        "完成后告诉我",
+        "配置好后回复",
+        "配置完成后告诉",
+        "reply \"continue\" once",
+        "let me know once",
+    ];
+    wait_markers.iter().any(|m| lower.contains(&m.to_lowercase()))
+}
+
+/// Fact-check a tool-call-free reply against live probes. Text detectors run
+/// first; probes run ONLY on a match, so ordinary turns pay nothing. Returns
+/// the correction to inject, or None when no verified-false claim is found.
+fn fact_check_reply(text: &str) -> Option<String> {
+    if claims_delivery_blocked(text) && delivery::gh_cli_available() {
+        return Some(
+            "事实纠偏:你刚声称交付通道不可用/需要配置,但本机 GitHub CLI 已登录且刚刚实测可用。\
+这是基于过期上下文的错误判断。立即调用 deliver_changes 完成交付并报告其真实结果;\
+不要再要求用户配置任何令牌或运行 gh auth login。"
+                .to_string(),
+        );
+    }
+    if let Some(cmd) = claims_command_missing(text) {
+        if command_exists(&cmd) {
+            return Some(format!(
+                "事实纠偏:你刚声称 `{cmd}` 不可用,但本机刚刚实测它存在于 PATH。\
+不要凭记忆断言环境状态;直接使用 `{cmd}` 继续当前工作。"
+            ));
+        }
+    }
+    if claims_wait_for_user_on_checkable(text) {
+        return Some(
+            "事实纠偏:你在等用户口头确认一个机器可检测的条件。按自救契约第 3 条,\
+用工具轮询该条件(例如探测认证状态/文件存在/CI 结论),满足后直接继续,\
+不要把可自动检测的等待交给用户。"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Whether this mode injects the completion-ready ("coverage audit") nudge at
 /// all. The nudge freezes the toolset for the following round, forcing the
 /// model to wrap up — an AUTONOMOUS-contract mechanism, where no user is
@@ -3922,7 +4107,7 @@ fn build_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
 /// conventions such as `/workspace` before its first tool call.
 fn base_system_prompt(mode: AgentMode, cwd: &Path) -> String {
     format!(
-        "{}\n\n{}\n\n# Repository-Owned Intent\n\
+        "{}\n\n{}\n\n{SELF_RECOVERY_CONTRACT}\n# Repository-Owned Intent\n\
          Long-lived requirements, specifications, architecture decisions, and acceptance criteria belong to ordinary versioned files in the repository, not to Agent memory or an app-owned specification database. Before non-trivial planning or implementation, inspect `AGENTS.md`, the README, and relevant existing files such as `docs/specs` or `docs/design`; follow the repository's own convention rather than creating `.codefactory/specs`; plans and delegated task state belong to the current conversation; do not direct the user to a separate specification or planning screen. When a durable decision changes, edit the repository document through normal file tools so it appears in the diff and travels with Git.\n\n# Product Self-Repair Context\n\
          When the user reports behavior of the running product and the selected repository is that product's codebase, treat it as a product bug you can fix here. Inspect and fix it in this repository; do not stop at explaining the issue or asking the user to switch contexts.\n\n# Working Directory\n\
          The project root and default tool working directory is:\n{}\n\
@@ -5132,6 +5317,86 @@ mod tests {
         ] {
             assert!(!is_provider_overloaded(err), "{err}");
         }
+    }
+
+    #[test]
+    fn self_recovery_contract_is_present_in_every_chat_mode() {
+        // Systemic fix for the "agent doesn't loop on obstacles" defect: the
+        // behavioral contract must bind ALL modes — verify-before-asserting
+        // environment state, try at least two approaches before asking, and
+        // never park on "回复继续" for conditions a tool can poll.
+        for mode in [AgentMode::Interactive, AgentMode::Execute, AgentMode::Autonomous] {
+            let prompt = base_system_prompt(mode, Path::new("/workspace"));
+            assert!(
+                prompt.contains("VERIFY BEFORE ASSERTING"),
+                "{mode:?} missing verify-before-asserting"
+            );
+            assert!(
+                prompt.contains("TRY BEFORE ASKING"),
+                "{mode:?} missing try-twice contract"
+            );
+            assert!(
+                prompt.contains("POLL, DON'T PARK"),
+                "{mode:?} missing poll-not-park contract"
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_blocked_claims_are_detected_narrowly() {
+        for text in [
+            "热修复已推送,但当前阻塞在无法自动创建 PR。请任选其一完成认证:1. 终端运行 gh auth login",
+            "无法创建 PR:请在设置 → 远程仓库配置 GitHub token",
+            "I cannot create the PR automatically; please run gh auth login first.",
+        ] {
+            assert!(claims_delivery_blocked(text), "{text}");
+        }
+        for text in [
+            "PR #166 已创建,GitHub CLI 认证验证成功",
+            "已通过 gh 触发发布工作流",
+            "交付结果: delivered",
+        ] {
+            assert!(!claims_delivery_blocked(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn command_missing_claims_are_detected_and_verified() {
+        assert_eq!(
+            claims_command_missing("docker 未安装,无法启用沙箱"),
+            Some("docker".to_string())
+        );
+        assert_eq!(
+            claims_command_missing("gh: command not found — please install the GitHub CLI"),
+            Some("gh".to_string())
+        );
+        assert_eq!(claims_command_missing("已通过 docker 启动容器"), None);
+        assert_eq!(claims_command_missing("正常回复,与命令无关"), None);
+        assert!(command_exists("git"));
+        assert!(!command_exists("definitely-not-a-real-binary-xyz"));
+    }
+
+    #[test]
+    fn wait_for_user_on_checkable_conditions_is_detected() {
+        assert!(claims_wait_for_user_on_checkable(
+            "完成后回复“继续”,我会立即创建 PR 并等待 Windows CI 终态。"
+        ));
+        assert!(claims_wait_for_user_on_checkable(
+            "配置完成后告诉我,我再继续交付。"
+        ));
+        assert!(!claims_wait_for_user_on_checkable(
+            "你希望优先做哪一项?回复 1 或 2。"
+        ));
+        assert!(!claims_wait_for_user_on_checkable("任务已完成。"));
+    }
+
+    #[test]
+    fn fact_check_reply_corrects_only_verified_false_claims() {
+        if command_exists("docker") {
+            let correction = fact_check_reply("docker 未安装,无法启用沙箱");
+            assert!(correction.is_some_and(|c| c.contains("docker")));
+        }
+        assert!(fact_check_reply("一切正常,任务完成。").is_none());
     }
 
     #[test]
