@@ -3320,13 +3320,12 @@ fn completion_recovery_requires_tool(_mode: AgentMode) -> bool {
 
 fn completion_recovery_attempts_after_tool_batch(
     attempts: u32,
-    material_evidence_progress: bool,
+    _material_evidence_progress: bool,
 ) -> u32 {
-    if material_evidence_progress {
-        0
-    } else {
-        attempts
-    }
+    // This is a total turn budget, not a "consecutive no progress" counter.
+    // Material progress may clear stagnation heuristics, but it must not grant
+    // a fresh set of rejected-final-response recovery rounds.
+    attempts
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3470,13 +3469,27 @@ fn strip_image_values(messages: &mut [serde_json::Value]) -> usize {
     stripped
 }
 
-/// History rows that may be replayed to the provider. Persisted turn-error
-/// notices are for the user and forensics only — replaying them would inject
-/// fake user turns the model never saw.
+/// History rows that may be replayed to the provider on a later user turn.
+/// Completion-review controls are persisted for UI recovery and forensics,
+/// but replaying them would inject obsolete framework instructions into a new
+/// request. The current run already holds its gate prompts in memory.
 fn replayable_history(history: Vec<Message>) -> Vec<Message> {
     history
         .into_iter()
-        .filter(|m| m.completion_state.as_deref() != Some("turn_error"))
+        .filter(|m| {
+            !matches!(
+                m.completion_state.as_deref(),
+                Some(
+                    "turn_error"
+                        | "turn_notice"
+                        | "gate_recovery"
+                        | "gate_ready"
+                        | "rejected_candidate"
+                        | "gate_blocked"
+                        | "gate_warning"
+                )
+            )
+        })
         .collect()
 }
 
@@ -4755,23 +4768,31 @@ mod tests {
     }
 
     #[test]
-    fn turn_error_records_are_excluded_from_provider_history() {
-        // A persisted turn-error notice is for the USER (and forensics); it
-        // must never be replayed to the model as a fake user turn.
+    fn internal_completion_artifacts_are_excluded_from_next_turn_provider_history() {
         let mut err = stored_message("user", "[回合错误] 400 no vision", None);
         err.completion_state = Some("turn_error".into());
-        let history = vec![
+        let mut recovery = stored_message("user", "The completion gate…", None);
+        recovery.completion_state = Some("gate_recovery".into());
+        let mut ready = stored_message("user", "Finalize now.", None);
+        ready.completion_state = Some("gate_ready".into());
+        let mut rejected = stored_message("assistant", "Done, but not verified.", None);
+        rejected.completion_state = Some("rejected_candidate".into());
+        let mut warning = stored_message("assistant", "Verification incomplete.", None);
+        warning.completion_state = Some("gate_warning".into());
+
+        let filtered = replayable_history(vec![
             stored_message("user", "hi", None),
             err,
+            recovery,
+            ready,
+            rejected,
+            warning,
             stored_message("assistant", "hello", None),
-        ];
-        let filtered = replayable_history(history);
+        ]);
+
         assert_eq!(filtered.len(), 2);
-        assert!(filtered.iter().all(|m| !m.content.contains("回合错误")));
-        // Gate artifacts (user-role turns the model really saw) stay in.
-        let mut gate = stored_message("user", "The completion gate…", None);
-        gate.completion_state = Some("gate_recovery".into());
-        assert_eq!(replayable_history(vec![gate]).len(), 1);
+        assert_eq!(filtered[0].content, "hi");
+        assert_eq!(filtered[1].content, "hello");
     }
 
     fn stored_message(role: &str, content: &str, tool_calls: Option<String>) -> Message {
@@ -5461,9 +5482,10 @@ mod tests {
     }
 
     #[test]
-    fn denied_tool_batch_does_not_reset_completion_recovery() {
+    fn completion_recovery_attempt_count_is_monotonic_across_tool_batches() {
         assert_eq!(completion_recovery_attempts_after_tool_batch(1, false), 1);
-        assert_eq!(completion_recovery_attempts_after_tool_batch(1, true), 0);
+        assert_eq!(completion_recovery_attempts_after_tool_batch(1, true), 1);
+        assert_eq!(completion_recovery_attempts_after_tool_batch(2, true), 2);
     }
 
     #[test]

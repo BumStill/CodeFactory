@@ -38,10 +38,22 @@ export interface UIMessage {
    *  model text is buffered only so a warning-released answer can be promoted. */
   internalReviewState?: "recovery" | "finalizing";
   internalReviewDraft?: string;
+  /** Safe user-facing progress for the bounded completion review. Raw gate
+   *  prompts, model drafts, commands, and tool arguments never enter it. */
+  reviewProgress?: ReviewProgressState;
   /** Turn timeline: narration and tool calls in arrival order. Only built
    *  during live streaming — hydrated history is already interleaved as
    *  separate rows. */
   segments?: TurnSegment[];
+}
+
+export interface ReviewProgressState {
+  phase: "recovering" | "finalizing" | "interrupted";
+  attempt: number;
+  limit: number;
+  reason: string;
+  currentStep: string;
+  updatedAt: number;
 }
 
 /** One slice of a streaming turn, in arrival order: narration text or a
@@ -113,7 +125,13 @@ export function reduceChatStreamEvent(
           } else {
             segments.push({ kind: "text", text: event.content });
           }
-          return { ...m, content: m.content + event.content, segments };
+          return {
+            ...m,
+            content: m.content + event.content,
+            segments,
+            reviewProgress:
+              m.internalReviewState === "finalizing" ? undefined : m.reviewProgress,
+          };
         }),
       };
 
@@ -122,7 +140,19 @@ export function reduceChatStreamEvent(
         return {
           ...state,
           messages: state.messages.map((m) =>
-            m.id === msgId ? { ...m, internalReviewDraft: "" } : m,
+            m.id === msgId
+              ? {
+                  ...m,
+                  internalReviewDraft: "",
+                  reviewProgress: m.reviewProgress
+                    ? {
+                        ...m.reviewProgress,
+                        currentStep: "正在运行验证或修复步骤",
+                        updatedAt: Date.now(),
+                      }
+                    : m.reviewProgress,
+                }
+              : m,
           ),
         };
       }
@@ -156,7 +186,18 @@ export function reduceChatStreamEvent(
           args: event.args,
         },
         messages: internalRecovery
-          ? state.messages
+          ? state.messages.map((m) =>
+              m.id === msgId && m.reviewProgress
+                ? {
+                    ...m,
+                    reviewProgress: {
+                      ...m.reviewProgress,
+                      currentStep: "正在等待你的工具授权",
+                      updatedAt: Date.now(),
+                    },
+                  }
+                : m,
+            )
           : upsertToolCall(state.messages, msgId, {
               id: event.tool_call_id,
               name: event.tool_name,
@@ -174,9 +215,19 @@ export function reduceChatStreamEvent(
           state.pendingPermission?.toolCallId === event.tool_call_id
             ? null
             : state.pendingPermission,
-        messages: state.messages.map((m) =>
-          m.id === msgId
-            ? {
+        messages: state.messages.map((m) => {
+          if (m.id !== msgId) return m;
+          if (m.internalReviewState === "recovery" && m.reviewProgress) {
+            return {
+              ...m,
+              reviewProgress: {
+                ...m.reviewProgress,
+                currentStep: event.is_error ? "步骤失败，正在收敛处理" : "正在评估步骤结果",
+                updatedAt: Date.now(),
+              },
+            };
+          }
+          return {
                 ...m,
                 toolCalls: (m.toolCalls ?? []).map((tc) =>
                   tc.id === event.tool_call_id
@@ -188,9 +239,8 @@ export function reduceChatStreamEvent(
                       }
                     : tc,
                 ),
-              }
-            : m,
-        ),
+              };
+        }),
       };
     }
 
@@ -203,7 +253,11 @@ export function reduceChatStreamEvent(
         outputTokenTotal: state.outputTokenTotal + event.output_tokens,
         messages: state.messages.map((m) =>
           m.id === msgId && m.durationMs == null
-            ? { ...m, durationMs: Math.max(0, endedAt - m.createdAt) }
+            ? {
+                ...m,
+                reviewProgress: undefined,
+                durationMs: Math.max(0, endedAt - m.createdAt),
+              }
             : m,
         ),
       };
@@ -227,6 +281,15 @@ export function reduceChatStreamEvent(
               gateActions: undefined,
               internalReviewState: undefined,
               internalReviewDraft: undefined,
+              reviewProgress: m.reviewProgress
+                ? {
+                    ...m.reviewProgress,
+                    phase: "interrupted",
+                    reason: "本次处理未能完成",
+                    currentStep: "执行在完成前中断",
+                    updatedAt: endedAt,
+                  }
+                : undefined,
               durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
             };
           }
@@ -289,9 +352,13 @@ export function reduceChatStreamEvent(
       if (event.kind === "recovery" || event.kind === "ready") {
         return {
           ...state,
-          messages: state.messages.map((m) =>
-            m.id === msgId
-              ? {
+          messages: state.messages.map((m) => {
+            if (m.id !== msgId) return m;
+            const attempt =
+              event.kind === "recovery"
+                ? Math.min((m.reviewProgress?.attempt ?? 0) + 1, 3)
+                : Math.max(m.reviewProgress?.attempt ?? 0, 1);
+            return {
                   ...m,
                   content: "",
                   toolCalls: [],
@@ -299,9 +366,22 @@ export function reduceChatStreamEvent(
                   gateActions: undefined,
                   internalReviewState: event.kind === "recovery" ? "recovery" : "finalizing",
                   internalReviewDraft: "",
-                }
-              : m,
-          ),
+                  reviewProgress: {
+                    phase: event.kind === "recovery" ? "recovering" : "finalizing",
+                    attempt,
+                    limit: 3,
+                    reason:
+                      event.kind === "recovery"
+                        ? "最终答复还缺少验证证据"
+                        : "验证证据已满足",
+                    currentStep:
+                      event.kind === "recovery"
+                        ? "正在补充验证"
+                        : "正在整理最终答复",
+                    updatedAt: Date.now(),
+                  },
+                };
+          }),
         };
       }
       if (event.kind === "warning") {
@@ -323,6 +403,7 @@ export function reduceChatStreamEvent(
               gateActions: [{ kind: "warning", detail: event.detail }],
               internalReviewState: undefined,
               internalReviewDraft: undefined,
+              reviewProgress: undefined,
             };
           }),
         };

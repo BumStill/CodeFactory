@@ -132,7 +132,9 @@ shared by the desktop Agent and headless evaluation runtime.
    exploration. A new real failure may open one new diagnostic, while only a
    successful mutation, closure of the failed check at the same or broader
    scope, or another material reduction in completion blockers resets this
-   recovery state. Failed tools, diagnostic reads, and unrelated green checks
+   diagnostic-stagnation state. It does not reset the per-turn cumulative
+   budget for rejected final-response recovery. Failed tools, diagnostic
+   reads, and unrelated green checks
    do not reset it. If the
    completion decision rejects a text-only final response, the next response
    must execute a bounded tool call that directly resolves a blocker unless a

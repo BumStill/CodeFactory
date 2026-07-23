@@ -32,7 +32,8 @@
 - AI Collaboration：context scope、assumptions、review point、validation result。
 
 ## Dev 实地验证权限基线
-- CodeFactory 的本地 Dev、隔离 wrapper、临时 app bundle 及其他等价验证环境，在执行真实主路径前默认先启用并保存“信任模式（完全放手）”；agent 自行完成权限设置和授权，不把普通工具确认交给用户。
+- CodeFactory 的本地 Dev、隔离 wrapper、临时 app bundle 及其他等价验证环境，在执行真实主路径前默认先启用并保存“信任模式（减少确认）”；agent 自行完成权限设置和授权，不把普通工具确认交给用户。
+- CodeFactory Dev 与隔离 wrapper 的普通真实主路径验证默认使用 DeepSeek v4 Flash；只有被测行为明确涉及其他 provider、model 或 ChatGPT 登录链路时才切换，并在证据中写明。
 - 只有验收目标本身是权限询问、拒绝、hook cancel 或权限绕过防护时，才临时切换到 ask/deny；该场景结束后恢复完全权限，并在证据中写明切换范围。
 - 完全权限只用于当前已授权任务内的产品工具调用，不扩大部署、外发消息、账号、支付、交易、数据删除等外部或高风险操作权限。
 - 并行任务存在时优先使用独立 identifier、数据目录和 app wrapper，避免改动或抢占其他任务的 Dev 环境。

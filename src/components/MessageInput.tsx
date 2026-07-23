@@ -452,7 +452,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
           disabled={!streaming && !submitReady}
           className="shrink-0 rounded-lg p-1.5 transition-colors disabled:opacity-30
             enabled:hover:bg-surface-4 text-accent disabled:text-gray-600"
-          title={streaming ? "取消生成" : "发送(Enter)"}
+          title={streaming ? "停止后续生成" : "发送(Enter)"}
         >
           {streaming ? (
             <Square size={16} />
@@ -464,6 +464,9 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
         </button>
       </div>
       <div className="mt-1 flex min-h-4 items-center gap-2 text-xs text-gray-700 select-none">
+        {streaming && (
+          <span>停止后续生成不会撤销已经完成的修改、提交或推送</span>
+        )}
         {guidanceState.kind === "success" && (
           <span aria-live="polite" className="flex items-center gap-1 text-green-700 dark:text-green-400">
             <Check size={11} /> 已加入下一任务
