@@ -40,12 +40,28 @@ Introduce `trait EventSink: Send + Sync { fn emit(&self, event: StreamEvent); }`
   unit-tests that the loop emits the expected sequence for a scripted turn — the
   first time the loop's event output is testable at all.
 
-### Slice 2 — headless `ExecCtx` / tools without `AppHandle`
-`ExecCtx.app` is already `Option`. Audit each tool: which genuinely need a UI
-channel (only the interactive secret prompt from `configure_git_remote`, which
-is reverted). Make the full `tools::dispatch` runnable with `app: None` +
-`EventSink`. Interactive-only tools degrade to a clear "not available headless"
-error (already the pattern).
+### Slice 2 — headless `ExecCtx` / tools without `AppHandle` ✅ (mostly pre-satisfied)
+**Finding (scouted 2026-07-23):** the groundwork was already in place. `ExecCtx.app`
+is `Option` and, under `#[cfg(not(test))]`, exactly ONE tool reads it —
+`delegate_tasks`, which spawns UI-session subagents (`app.state::<AppState>()` +
+`SchedulerHandles`) and legitimately cannot be headless; it already degrades with
+`"delegate_tasks is unavailable in this runtime"`. Every other tool
+(read/write/edit/glob/grep/bash/pptx/docx/xlsx/kb/skills/delivery) runs with
+`app: None`. So `tools::dispatch` is already headless-runnable.
+
+**What this slice ships:** a regression-guard contract test
+(`tools::headless_contract_tests`) that runs the core surface end-to-end
+(write→read→grep→bash) through an app-less `ExecCtx` — turning the implicit
+property into a guaranteed one so a future tool cannot silently break headless
+capability.
+
+**Deliberately NOT touched:** the `#[cfg(not(test))]` gates on `ExecCtx.app` and
+`delegate_tasks::execute`. They exist because an `AppHandle`-owning struct linked
+into the unit-test EXE reintroduces the Windows `STATUS_ENTRYPOINT_NOT_FOUND`
+loader failure (hotfix #166). Removing them is risky and unnecessary here; the
+headless runner is a `not(test)` binary that sets `app: None`. The real remaining
+friction those gates represent dissolves in **Slice 3**, when `AgentLoop` itself
+stops requiring a concrete `AppHandle`.
 
 ### Slice 3 — headless `AgentLoop::run_headless`
 A constructor/entry that builds an `AgentLoop` with a `CollectingEventSink`
