@@ -9,6 +9,7 @@ pub mod delivery;
 pub mod dispatch;
 pub mod hooks;
 pub mod journal;
+pub mod persistence;
 pub mod scheduler;
 pub mod sse_buffer;
 pub mod subagent;
@@ -19,7 +20,6 @@ pub mod worktree;
 
 pub use dispatch::decide_chat_mode;
 
-use chrono::Utc;
 use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
     build_completion_recovery_prompt, classify_command, completion_evidence_made_progress,
@@ -50,6 +50,9 @@ use crate::PendingPermissionMap;
 // Brings `DesktopToolBackend::execute`/`list_schemas` into method scope; the
 // concrete backend lives in `tool_backend`.
 use codefactory_agent_loop::tool::ToolBackend as _;
+// Brings the `Persistence` methods into scope for the inherent delegators; the
+// concrete `SqlitePersistence` lives in `persistence`.
+use codefactory_agent_loop::journal::Persistence as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionResponse {
@@ -2273,6 +2276,18 @@ impl AgentLoop {
         Ok((text_buf, tool_calls, usage, reasoning))
     }
 
+    /// Build the desktop persistence backend for this run. Cheap (clones the
+    /// pool handle + session id); the inherent persist_* helpers below delegate
+    /// to it so all message/trajectory writes — and the anonymous no-trace
+    /// guard — live in one place ([`persistence::SqlitePersistence`]).
+    fn persistence(&self) -> persistence::SqlitePersistence {
+        persistence::SqlitePersistence {
+            db: self.db.clone(),
+            session_id: self.session_id.clone(),
+            anonymous: self.anonymous,
+        }
+    }
+
     async fn persist_message(
         &self,
         role: &str,
@@ -2282,39 +2297,23 @@ impl AgentLoop {
         reasoning_content: Option<&str>,
         usage_request_id: Option<&str>,
     ) -> Result<Option<String>> {
-        // Anonymous runs never touch the DB — the assistant turn lives only in
-        // the in-memory `messages` vec for the rest of this run.
-        if self.anonymous {
-            return Ok(None);
-        }
-        let msg_id = Uuid::new_v4().to_string();
-        let now = Utc::now().timestamp_millis();
+        // Decompose Usage to the primitive token counts the trait carries, then
+        // delegate. Anonymous handling + the load-bearing `None` return live in
+        // the backend.
         let input_tok = usage.map(|u| u.prompt_tokens as i64);
         let output_tok = usage.map(|u| u.completion_tokens as i64);
-        let persisted_content = crate::trajectory::redact_derived_message_for_storage(content);
-        let persisted_reasoning =
-            reasoning_content.map(crate::trajectory::redact_derived_message_for_storage);
-        let tool_calls_json = tool_calls
-            .filter(|tcs| !tcs.is_empty())
-            .map(|tcs| crate::trajectory::redact_tool_calls_for_storage(tcs).unwrap_or_default());
-
-        sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, input_tokens, output_tokens, tool_calls, reasoning_content, usage_request_id, created_at) \
-             VALUES (?,?,?,?,?,?,?,?,?,?)",
-        )
-        .bind(&msg_id)
-        .bind(&self.session_id)
-        .bind(role)
-        .bind(persisted_content)
-        .bind(input_tok)
-        .bind(output_tok)
-        .bind(tool_calls_json)
-        .bind(persisted_reasoning)
-        .bind(usage_request_id)
-        .bind(now)
-        .execute(&self.db)
-        .await?;
-        Ok(Some(msg_id))
+        self.persistence()
+            .persist_message(
+                role,
+                content,
+                input_tok,
+                output_tok,
+                tool_calls,
+                reasoning_content,
+                usage_request_id,
+            )
+            .await
+            .map_err(persistence::to_app_error)
     }
 
     /// Persist an injected completion-gate instruction as a user-role turn so
@@ -2322,22 +2321,10 @@ impl AgentLoop {
     /// run, tagged via `completion_state` ("gate_recovery" | "gate_ready") so
     /// the UI renders it as a system notice instead of a user bubble.
     async fn persist_gate_message(&self, content: &str, state: &str) -> Result<()> {
-        if self.anonymous {
-            return Ok(());
-        }
-        sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, completion_state, created_at) \
-             VALUES (?,?,?,?,?,?)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&self.session_id)
-        .bind("user")
-        .bind(content)
-        .bind(state)
-        .bind(Utc::now().timestamp_millis())
-        .execute(&self.db)
-        .await?;
-        Ok(())
+        self.persistence()
+            .persist_gate_message(content, state)
+            .await
+            .map_err(persistence::to_app_error)
     }
 
     /// Persist a gate/system notice at most once per session (matched by a
@@ -2349,39 +2336,20 @@ impl AgentLoop {
         content: &str,
         state: &str,
     ) -> Result<()> {
-        if self.anonymous {
-            return Ok(());
-        }
-        let existing: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND completion_state = ? \
-             AND content LIKE ?",
-        )
-        .bind(&self.session_id)
-        .bind(state)
-        .bind(format!("%{marker}%"))
-        .fetch_one(&self.db)
-        .await?;
-        if existing.0 > 0 {
-            return Ok(());
-        }
-        self.persist_gate_message(content, state).await
+        self.persistence()
+            .persist_gate_message_once(marker, content, state)
+            .await
+            .map_err(persistence::to_app_error)
     }
 
     /// Tag a persisted assistant reply that the completion gate rejected so
     /// the UI collapses it instead of rendering yet another full
     /// near-duplicate answer (2026-07-16 session: seven of them).
     async fn mark_rejected_candidate(&self, message_id: Option<&str>) -> Result<()> {
-        let Some(message_id) = message_id else {
-            return Ok(());
-        };
-        if self.anonymous {
-            return Ok(());
-        }
-        sqlx::query("UPDATE messages SET completion_state='rejected_candidate' WHERE id=?")
-            .bind(message_id)
-            .execute(&self.db)
-            .await?;
-        Ok(())
+        self.persistence()
+            .mark_rejected_candidate(message_id)
+            .await
+            .map_err(persistence::to_app_error)
     }
 
     async fn record_tool_call_outcome(
@@ -2392,19 +2360,10 @@ impl AgentLoop {
         error: Option<&str>,
         duration_ms: u64,
     ) -> Result<()> {
-        if self.anonymous {
-            return Ok(());
-        }
-        crate::trajectory::record_terminal_tool_outcome(
-            &self.db,
-            &self.session_id,
-            &tool_call.id,
-            status,
-            result,
-            error,
-            duration_ms.min(i64::MAX as u64) as i64,
-        )
-        .await
+        self.persistence()
+            .record_tool_call_outcome(tool_call, status, result, error, duration_ms)
+            .await
+            .map_err(persistence::to_app_error)
     }
 
     fn build_openai_messages(
