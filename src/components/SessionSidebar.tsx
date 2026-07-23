@@ -10,11 +10,36 @@
 // Mental model: 快速任务 ≈ lightweight "cowork" chat, 项目 ≈ full "code"
 // project — both created and switched from this one rail.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, ChevronDown, Zap, Folder, EyeOff, Loader2, Pencil, Trash2, MoreHorizontal } from "lucide-react";
+import { Plus, Zap, Folder, EyeOff, Loader2, Pencil, Trash2, MoreHorizontal } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../stores/chat";
 import { formatRelativeTime } from "../lib/time";
 import type { Session } from "../lib/tauri";
+
+type SessionGroup = { label: "今天" | "昨天" | "过去 7 天" | "更早"; sessions: Session[] };
+
+function groupSessionsByRecency(sessions: Session[], now = Date.now()): SessionGroup[] {
+  const day = 24 * 60 * 60 * 1000;
+  const startToday = new Date(now);
+  startToday.setHours(0, 0, 0, 0);
+  const start = startToday.getTime();
+  const buckets: Record<SessionGroup["label"], Session[]> = {
+    "今天": [],
+    "昨天": [],
+    "过去 7 天": [],
+    "更早": [],
+  };
+  for (const session of sessions) {
+    const timestamp = session.updated_at > 10_000_000_000 ? session.updated_at : session.updated_at * 1000;
+    if (timestamp >= start) buckets["今天"].push(session);
+    else if (timestamp >= start - day) buckets["昨天"].push(session);
+    else if (timestamp >= start - 6 * day) buckets["过去 7 天"].push(session);
+    else buckets["更早"].push(session);
+  }
+  return (["今天", "昨天", "过去 7 天", "更早"] as const)
+    .map((label) => ({ label, sessions: buckets[label] }))
+    .filter((group) => group.sessions.length > 0);
+}
 
 interface SessionSidebarProps {
   /** The session currently open in the workspace (highlighted in the list). */
@@ -62,6 +87,7 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
     () => [...sessions, ...quickSessions].sort((a, b) => b.updated_at - a.updated_at),
     [sessions, quickSessions],
   );
+  const grouped = useMemo(() => groupSessionsByRecency(merged), [merged]);
   const draftActive = draftSession?.id === currentSessionId;
 
   const handleNewQuick = () => {
@@ -87,15 +113,16 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
 
   return (
     <div className="flex flex-col min-h-0 flex-1">
-      {/* ── "+ 新建" menu ─────────────────────────────────────────────── */}
-      <div className="relative p-2 border-b border-border" ref={menuRef}>
+      {/* ── Compact toolbar: one low-emphasis new-session entry. ──────── */}
+      <div className="relative flex h-10 shrink-0 items-center justify-between border-b border-border px-3" ref={menuRef}>
+        <span className="text-[11px] font-medium text-gray-400">会话</span>
         <button
           onClick={() => setMenuOpen((v) => !v)}
-          className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-accent px-2 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover"
+          aria-label="新建"
+          title="新建会话"
+          className="flex h-7 w-7 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
         >
-          <Plus size={13} />
-          新建
-          <ChevronDown size={12} className="opacity-80" />
+          <Plus size={15} />
         </button>
         {menuOpen && (
           <div className="absolute left-2 right-2 top-full z-50 mt-1 overflow-hidden rounded-lg border border-border bg-surface-2 shadow-xl">
@@ -127,49 +154,51 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
         )}
       </div>
 
-      {/* ── Unified recent-session list ───────────────────────────────── */}
-      <div className="flex-1 overflow-y-auto p-1.5">
-        <h2 className="px-1.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">
-          最近会话
-        </h2>
+      {/* ── Unified recent-session list grouped for fast scanning. ────── */}
+      <div className="flex-1 overflow-y-auto px-1.5 py-2">
         {draftActive && draftSession && (
           <button
             type="button"
             aria-current="page"
-            className="mb-1 flex w-full items-center gap-1.5 rounded-md border border-accent/40 bg-accent/15 px-2 py-2 text-left"
+            className="relative mb-1 flex min-h-10 w-full items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5 text-left before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded before:bg-accent"
           >
             {draftSession.mode === "quick" ? (
-              <Zap size={11} className="shrink-0 text-accent" />
+              <Zap size={12} className="shrink-0 text-accent" />
             ) : (
-              <Folder size={11} className="shrink-0 text-gray-500" />
+              <Folder size={12} className="shrink-0 text-gray-500" />
             )}
             <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-gray-100">
               {draftSession.mode === "quick" ? "新对话" : (draftSession.cwd?.split(/[/\\]/).pop() || "新项目")}
             </span>
-            <span className="shrink-0 rounded bg-accent/15 px-1 py-0.5 text-[8px] text-accent">
-              草稿
-            </span>
+            <span className="text-[9px] text-accent">草稿</span>
           </button>
         )}
         {merged.length === 0 && !draftActive ? (
-          <p className="px-1.5 py-6 text-center text-[11px] leading-relaxed text-gray-600">
-            还没有会话
-            <br />
-            <span className="text-gray-700">点上面「新建」开始</span>
+          <p className="px-2 py-8 text-center text-[11px] leading-relaxed text-gray-600">
+            还没有会话<br /><span className="text-gray-700">点击右上角「＋」开始</span>
           </p>
         ) : (
-          <ul className="space-y-0.5">
-            {merged.map((s) => (
-              <SessionRow
-                key={s.id}
-                session={s}
-                active={s.id === currentSessionId}
-                onClick={() => onOpenSession(s.id)}
-                onDelete={() => deleteSession(s.id)}
-                onRename={(t) => renameSession(s.id, t)}
-              />
+          <div className="space-y-2">
+            {grouped.map((group) => (
+              <section key={group.label} aria-labelledby={`session-group-${group.label}`}>
+                <h2 id={`session-group-${group.label}`} className="px-2 pb-0.5 text-[9px] font-medium tracking-wide text-gray-600">
+                  {group.label}
+                </h2>
+                <ul className="space-y-0.5">
+                  {group.sessions.map((session) => (
+                    <SessionRow
+                      key={session.id}
+                      session={session}
+                      active={session.id === currentSessionId}
+                      onClick={() => onOpenSession(session.id)}
+                      onDelete={() => deleteSession(session.id)}
+                      onRename={(title) => renameSession(session.id, title)}
+                    />
+                  ))}
+                </ul>
+              </section>
             ))}
-          </ul>
+          </div>
         )}
       </div>
     </div>
@@ -225,6 +254,7 @@ function SessionRow({
     <li>
       <div
         role="button"
+        data-session-row
         tabIndex={0}
         aria-current={active ? "page" : undefined}
         onClick={() => {
@@ -233,10 +263,10 @@ function SessionRow({
         onKeyDown={(e) => {
           if (!editing && e.key === "Enter") onClick();
         }}
-        className={`group w-full cursor-pointer rounded-md px-2 py-1.5 text-left transition-colors ${
+        className={`group relative min-h-10 w-full cursor-pointer rounded-md px-2 py-1.5 text-left transition-colors before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded ${
           active
-            ? "border border-accent/40 bg-accent/15"
-            : "border border-transparent hover:bg-surface-2"
+            ? "bg-surface-3 before:bg-accent"
+            : "before:bg-transparent hover:bg-surface-2"
         }`}
       >
         <div className="flex items-center gap-1.5">
@@ -287,7 +317,7 @@ function SessionRow({
                   setMenuOpen((v) => !v);
                 }}
                 className={`flex items-center rounded p-0.5 transition-opacity hover:bg-surface-3 hover:text-gray-200 ${
-                  menuOpen ? "text-gray-200 opacity-100" : "text-gray-500 opacity-70 group-hover:opacity-100"
+                  menuOpen ? "text-gray-200 opacity-100" : "text-gray-600 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
                 }`}
               >
                 <MoreHorizontal size={13} />
@@ -347,18 +377,11 @@ function SessionRow({
               </span>
             </span>
           )}
-          {!editing && !confirming && (
-            <span
-              className={`shrink-0 rounded px-1 py-0.5 text-[8px] ${
-                isQuick ? "bg-accent/15 text-accent" : "bg-surface-3 text-gray-500"
-              }`}
-            >
-              {isQuick ? "快速" : "项目"}
-            </span>
-          )}
         </div>
-        <div className="mt-0.5 pl-[18px] text-[9px] text-gray-600">
-          {formatRelativeTime(session.updated_at)}
+        <div className="mt-0.5 flex min-w-0 items-center gap-1 pl-[18px] text-[9px] text-gray-600">
+          {!isQuick && <span className="truncate">{session.cwd?.split(/[/\\]/).pop() || "项目"}</span>}
+          {!isQuick && <span aria-hidden="true">·</span>}
+          <span className="shrink-0">{formatRelativeTime(session.updated_at)}</span>
         </div>
       </div>
     </li>

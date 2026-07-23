@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Interaction tests for the Workspace SessionSidebar (Codex-style rail):
-// unified quick+project list with tags, newest-first order, active highlight,
+// unified quick+project list with time groups, newest-first order, active highlight,
 // in-place switching, and the "+ 新建" menu (quick / project). jsdom — no real
 // Tauri backend, so the chat store + tauri helpers + dialog are mocked.
 
@@ -60,14 +60,15 @@ describe("SessionSidebar", () => {
     mocks.loadQuickSessions.mockResolvedValue(undefined);
   });
 
-  it("renders a unified, newest-first list with quick/project tags", () => {
+  it("renders a flat, grouped, newest-first list without redundant type badges", () => {
     render(<SessionSidebar currentSessionId="p1" onOpenSession={() => {}} />);
     expect(screen.getByText("CodeFactory")).toBeInTheDocument();
     expect(screen.getByText("改图脚本")).toBeInTheDocument();
     expect(screen.getByText("记账 app")).toBeInTheDocument();
-    // one 快速 tag, two 项目 tags
-    expect(screen.getAllByText("快速")).toHaveLength(1);
-    expect(screen.getAllByText("项目")).toHaveLength(2);
+    expect(screen.getByText("会话")).toBeInTheDocument();
+    expect(screen.getByText("更早")).toBeInTheDocument();
+    expect(screen.queryByText("快速")).not.toBeInTheDocument();
+    expect(screen.queryByText("项目")).not.toBeInTheDocument();
     // order by updated_at desc: p1(300) > q1(200) > p2(100)
     const order = screen
       .getAllByRole("button")
@@ -131,7 +132,7 @@ describe("SessionSidebar", () => {
     expect(onOpen).not.toHaveBeenCalled();
   });
 
-  it("reveals a rename/delete menu from the always-visible ⋯ button", () => {
+  it("reveals rename/delete from a low-emphasis row action", () => {
     render(<SessionSidebar currentSessionId="p1" onOpenSession={() => {}} />);
     // The menu is closed until the kebab is clicked.
     expect(screen.queryByText("重命名")).not.toBeInTheDocument();

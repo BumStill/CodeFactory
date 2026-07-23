@@ -204,23 +204,29 @@ describe("session-native task delegation", () => {
     expect(within(header).queryByRole("group", { name: "主题" })).not.toBeInTheDocument();
   });
 
-  it("renders delegated execution inside the conversation, not the session rail", () => {
+  it("keeps delegated execution out of the conversation and opens it from a compact task activity control", async () => {
     fakeTasksState.tasks = { s1: [task()] };
     renderWorkspace();
 
     const conversation = screen.getByRole("main", { name: "会话窗口" });
-    const sessionRail = screen.getByRole("complementary", { name: "会话列表" });
-    expect(within(conversation).getByText("会话执行详情")).toBeInTheDocument();
-    expect(within(conversation).getByText("实现登录页")).toBeInTheDocument();
-    expect(within(sessionRail).queryByText("会话执行详情")).not.toBeInTheDocument();
+    expect(within(conversation).queryByText("会话执行详情")).not.toBeInTheDocument();
+    expect(within(conversation).queryByText("实现登录页")).not.toBeInTheDocument();
+
+    const activity = screen.getByRole("button", { name: "打开任务活动" });
+    expect(activity).toHaveTextContent("待处理 1");
+    await userEvent.click(activity);
+    const drawer = screen.getByRole("dialog", { name: "任务活动" });
+    expect(within(drawer).getByText("实现登录页")).toBeInTheDocument();
+    expect(screen.queryByText("会话执行详情")).not.toBeInTheDocument();
   });
 
-  it("keeps legacy spec provenance visible without reopening a spec product surface", () => {
+  it("keeps legacy spec provenance visible without reopening a spec product surface", async () => {
     fakeTasksState.tasks = {
       s1: [task({ spec_req_id: "CF-010", spec_title: "Token 成本仪表盘" })],
     };
     renderWorkspace();
 
+    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
     expect(screen.getByText("规范《Token 成本仪表盘》")).toBeInTheDocument();
     expect(screen.queryByTitle(/规范工作台/)).not.toBeInTheDocument();
   });
@@ -229,6 +235,7 @@ describe("session-native task delegation", () => {
     fakeTasksState.tasks = { s1: [task()] };
     renderWorkspace();
 
+    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
     await userEvent.click(screen.getByRole("button", { name: "继续" }));
     expect(mocks.start).toHaveBeenCalledWith("s1");
   });
@@ -238,6 +245,7 @@ describe("session-native task delegation", () => {
     fakeTasksState.running = { s1: true };
     renderWorkspace();
 
+    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
     await userEvent.click(screen.getByRole("button", { name: "停止" }));
     expect(mocks.cancel).toHaveBeenCalledWith("s1");
   });
@@ -261,6 +269,7 @@ describe("session-native task delegation", () => {
     };
     renderWorkspace();
 
+    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
     await userEvent.click(screen.getByRole("button", { name: "重试失败步骤" }));
     await waitFor(() => expect(mocks.retryFailedTasks).toHaveBeenCalledWith("s1"));
     expect(mocks.start).toHaveBeenCalledWith("s1");
@@ -285,6 +294,9 @@ describe("session-native task delegation", () => {
     };
     renderWorkspace();
 
+    expect(screen.getByRole("button", { name: "打开任务活动" })).toHaveTextContent("1 项需处理");
+    expect(screen.queryByText("模型/Provider")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
     expect(screen.getByText("模型/Provider")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "需在对话处理" })).toBeDisabled();
     expect(mocks.retryFailedTasks).not.toHaveBeenCalled();

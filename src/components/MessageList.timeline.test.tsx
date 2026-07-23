@@ -39,7 +39,7 @@ describe("MessageList turn timeline", () => {
     );
     const text = container.textContent ?? "";
     const first = text.indexOf("两类红灯都稳定复现了");
-    const tool = text.indexOf("bash");
+    const tool = text.indexOf("命令");
     const last = text.indexOf("最终总结");
     expect(first).toBeGreaterThanOrEqual(0);
     expect(tool).toBeGreaterThan(first);
@@ -84,4 +84,30 @@ describe("MessageList turn timeline", () => {
     fireEvent.click(toggle);
     expect(screen.getByText(/第 0 步叙述/)).toBeTruthy();
   });
+  it("groups consecutive successful commands after a turn settles but keeps failures visible", () => {
+    const grouped = msg({
+      content: "完成。",
+      segments: [
+        { kind: "tool", toolCallId: "ok-1" },
+        { kind: "tool", toolCallId: "ok-2" },
+        { kind: "tool", toolCallId: "ok-3" },
+        { kind: "tool", toolCallId: "bad" },
+        { kind: "text", text: "完成。" },
+      ],
+      toolCalls: [
+        { id: "ok-1", name: "read_file", args: JSON.stringify({ path: "a.ts" }), status: "done", result: "ok" },
+        { id: "ok-2", name: "edit_file", args: JSON.stringify({ path: "a.ts" }), status: "done", result: "ok" },
+        { id: "ok-3", name: "bash", args: JSON.stringify({ command: "npm test" }), status: "done", result: "ok" },
+        { id: "bad", name: "bash", args: JSON.stringify({ command: "npm run check" }), status: "error", isError: true, result: "check failed" },
+      ],
+    });
+
+    render(<MessageList messages={[grouped]} streaming={false} cwd={null} />);
+    expect(screen.getByRole("button", { name: "查看 3 个已完成操作" })).toBeInTheDocument();
+    expect(screen.getByText(/check failed/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /读取.*a.ts/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看 3 个已完成操作" }));
+    expect(screen.getByRole("button", { name: /读取.*a.ts/ })).toBeInTheDocument();
+  });
+
 });

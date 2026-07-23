@@ -79,9 +79,35 @@ async function assertWorkspace(page, tag) {
   assert((await header.getByRole("button", { name: "新建空白会话" }).count()) === 0, `[${tag}] duplicate header new-session action remains`);
   assert((await page.getByRole("button", { name: "新建", exact: true }).count()) === 1, `[${tag}] workspace must expose exactly one new-session menu`);
   assert((await header.getByRole("button", { name: "收起会话侧栏" }).count()) === 1, `[${tag}] collapse control missing`);
-  assert(await page.getByText("会话执行详情", { exact: true }).isVisible(), `[${tag}] conversation execution detail missing`);
-  assert(await page.getByText("在会话内执行仓库需求", { exact: true }).isVisible(), `[${tag}] delegated task missing`);
+  assert((await conversation.getByText("会话执行详情", { exact: true }).count()) === 0, `[${tag}] fixed execution detail remains in conversation`);
+  assert((await conversation.getByText("在会话内执行仓库需求", { exact: true }).count()) === 0, `[${tag}] delegated task leaked into conversation`);
   assert((await page.getByText("执行流", { exact: true }).count()) === 0, `[${tag}] execution stream should stay hidden in project sessions`);
+  const taskActivity = header.getByRole("button", { name: "打开任务活动" });
+  await taskActivity.waitFor();
+  const activityHeight = await taskActivity.evaluate((element) => element.getBoundingClientRect().height);
+  assert(activityHeight <= 30, `[${tag}] task activity control too tall: ${activityHeight}`);
+  await taskActivity.click();
+  const taskDrawer = page.getByRole("dialog", { name: "任务活动" });
+  await taskDrawer.waitFor();
+  assert(await taskDrawer.getByText("在会话内执行仓库需求", { exact: true }).isVisible(), `[${tag}] delegated task missing from drawer`);
+  await taskDrawer.getByRole("button", { name: "关闭任务活动" }).click();
+  await taskDrawer.waitFor({ state: "detached" });
+
+  const sessionRows = sidebar.locator("[data-session-row]");
+  assert((await sessionRows.count()) >= 10, `[${tag}] sidebar does not expose at least 10 sessions in the fixture`);
+  const rowHeights = await sessionRows.evaluateAll((rows) => rows.map((row) => row.getBoundingClientRect().height));
+  assert(rowHeights.every((height) => height <= 46), `[${tag}] sidebar row exceeds 46px: ${JSON.stringify(rowHeights)}`);
+
+  const completedGroup = conversation.getByRole("button", { name: "查看 3 个已完成操作" });
+  await completedGroup.waitFor();
+  const groupHeight = await completedGroup.evaluate((element) => element.getBoundingClientRect().height);
+  assert(groupHeight <= 30, `[${tag}] completed tool group too tall: ${groupHeight}`);
+  assert(await conversation.getByText("check failed", { exact: true }).isVisible(), `[${tag}] failed command reason is hidden`);
+  await completedGroup.click();
+  const compactCommand = conversation.getByRole("button", { name: /命令.*npm test/ });
+  await compactCommand.waitFor();
+  const commandHeight = await compactCommand.evaluate((element) => element.getBoundingClientRect().height);
+  assert(commandHeight <= 30, `[${tag}] compact command exceeds 30px: ${commandHeight}`);
   assert((await page.getByTitle(/规范工作台/).count()) === 0, `[${tag}] specification workbench remains`);
   assert((await page.getByRole("button", { name: /规范|计划/ }).count()) === 0, `[${tag}] specification or plan button remains`);
   for (const label of ["我的画像", "进化审查", "能力评测", "资源中心", "AI Coding OS"]) {
@@ -147,7 +173,7 @@ async function run() {
     const receipt = {
       status: "pass",
       browser: executablePath,
-      surfaces: ["workspace-header", "collapsible-session-sidebar", "conversation-execution-detail", "remote-issue-detail"],
+      surfaces: ["workspace-header", "task-activity-drawer", "dense-session-sidebar", "compact-tool-activity", "remote-issue-detail"],
       viewports: ["1366x768", "800x700 (configured minWidth)"],
       artifact_dir: artifactDir,
       interactive_desktop: "project picker reached; final Open action blocked by macOS lock",

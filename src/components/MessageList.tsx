@@ -10,6 +10,7 @@ import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import { RememberButton } from "./RememberButton";
 import { formatDuration, useNowTick } from "../lib/duration";
 import type { UIMessage } from "../stores/chat";
+import type { TurnSegment } from "../stores/chatEvents";
 
 interface Props {
   messages: UIMessage[];
@@ -228,6 +229,29 @@ export function MessageList({ messages, streaming, cwd, onUsePrompt, onOpenUsage
   );
 }
 
+function SuccessfulToolGroup({ tools }: { tools: NonNullable<UIMessage["toolCalls"]> }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="my-0.5 border-b border-border/60">
+      <button
+        type="button"
+        aria-label={`${open ? "收起" : "查看"} ${tools.length} 个已完成操作`}
+        onClick={() => setOpen((value) => !value)}
+        className="flex min-h-7 w-full items-center gap-1.5 px-2 text-left text-[11px] text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-400"
+      >
+        <Check size={11} className="text-green-600/70" />
+        <span>已完成 {tools.length} 个操作</span>
+        <ChevronDown size={11} className={`ml-auto transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && <div className="pl-3">{tools.map((tool) => <ToolCallCard key={tool.id} tc={tool} />)}</div>}
+    </div>
+  );
+}
+
+function isQuietSuccess(tool: NonNullable<UIMessage["toolCalls"]>[number] | undefined): boolean {
+  return Boolean(tool && tool.status === "done" && !tool.isError);
+}
+
 function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreamingTail: boolean; cwd: string | null }) {
   const isUser = msg.role === "user";
   // Must run unconditionally (before the early return) to satisfy the rules
@@ -326,6 +350,27 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
   const collapsible = timeline && timeline.length > COLLAPSE_THRESHOLD;
   const visibleFrom = collapsible && !showAllSteps ? timeline.length - TAIL_VISIBLE : 0;
   const hiddenSteps = collapsible && !showAllSteps ? visibleFrom : 0;
+  const groupedTimeline = timeline
+    ? timeline.reduce<Array<{ kind: "segment"; segment: TurnSegment; index: number } | { kind: "tools"; tools: NonNullable<UIMessage["toolCalls"]>; startIndex: number; endIndex: number }>>((items, segment, index) => {
+        if (segment.kind !== "tool") {
+          items.push({ kind: "segment", segment, index });
+          return items;
+        }
+        const tool = toolById.get(segment.toolCallId);
+        if (isStreamingTail || !isQuietSuccess(tool)) {
+          items.push({ kind: "segment", segment, index });
+          return items;
+        }
+        const last = items[items.length - 1];
+        if (last?.kind === "tools") {
+          last.tools.push(tool!);
+          last.endIndex = index;
+        } else {
+          items.push({ kind: "tools", tools: [tool!], startIndex: index, endIndex: index });
+        }
+        return items;
+      }, [])
+    : null;
 
   return (
     <div className="group text-sm text-gray-200 space-y-1.5">
@@ -340,7 +385,13 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
               {showAllSteps ? "收起早期步骤" : `前 ${hiddenSteps} 步(点击展开)`}
             </button>
           )}
-          {timeline.map((segment, index) => {
+          {groupedTimeline!.map((item, itemIndex) => {
+            if (item.kind === "tools") {
+              if (item.endIndex < visibleFrom && !showAllSteps) return null;
+              if (item.tools.length >= 3) return <SuccessfulToolGroup key={`tool-group-${itemIndex}`} tools={item.tools} />;
+              return item.tools.map((tool) => <ToolCallCard key={`tool-${tool.id}`} tc={tool} />);
+            }
+            const { segment, index } = item;
             if (index < visibleFrom && !showAllSteps) return null;
             if (segment.kind === "tool") {
               const tc = toolById.get(segment.toolCallId);
@@ -371,7 +422,26 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
           })}
         </>
       ) : (
-        msg.toolCalls?.map((tc) => <ToolCallCard key={tc.id} tc={tc} />)
+        <>
+          {(() => {
+            const tools = msg.toolCalls ?? [];
+            const items: Array<{ kind: "tools"; tools: typeof tools } | { kind: "tool"; tool: typeof tools[number] }> = [];
+            for (const tool of tools) {
+              if (!isStreamingTail && isQuietSuccess(tool)) {
+                const last = items[items.length - 1];
+                if (last?.kind === "tools") last.tools.push(tool);
+                else items.push({ kind: "tools", tools: [tool] });
+              } else {
+                items.push({ kind: "tool", tool });
+              }
+            }
+            return items.map((item, index) => {
+              if (item.kind === "tool") return <ToolCallCard key={item.tool.id} tc={item.tool} />;
+              if (item.tools.length >= 3) return <SuccessfulToolGroup key={`hydrated-tool-group-${index}`} tools={item.tools} />;
+              return item.tools.map((tool) => <ToolCallCard key={tool.id} tc={tool} />);
+            });
+          })()}
+        </>
       )}
       {msg.transportRetries?.map((retry, index) => (
         <div
