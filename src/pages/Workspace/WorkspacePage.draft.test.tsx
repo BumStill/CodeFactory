@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 const mocks = vi.hoisted(() => ({
   selectSession: vi.fn(),
@@ -81,19 +81,26 @@ describe("Workspace virtual draft", () => {
   beforeEach(() => {
     Object.values(mocks).forEach((mock) => mock.mockClear());
     try {
-      localStorage.setItem("cf.workspace.sidebarCollapsed", "1");
+      localStorage.removeItem("cf.workspace.sidebarCollapsed");
     } catch {
-      // Some local runners do not expose localStorage; the structural
-      // assertions below still prove there is no collapse control.
+      // Interaction assertions still cover runners without localStorage.
     }
   });
 
-  it("keeps the session rail permanently visible and the chat input enabled", async () => {
+  it("removes the duplicate header new action and lets the user collapse and restore the session rail", async () => {
     render(<WorkspacePage sessionId="draft-1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />);
 
+    expect(screen.queryByRole("button", { name: "新建空白会话" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "新建" })).toHaveLength(1);
     expect(screen.getByRole("complementary", { name: "会话列表" })).toBeInTheDocument();
     expect(screen.getByRole("main", { name: "会话窗口" })).toBeInTheDocument();
-    expect(screen.queryByTitle(/收起会话侧栏|展开侧栏/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "收起会话侧栏" }));
+    expect(screen.queryByRole("complementary", { name: "会话列表" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "展开会话侧栏" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "展开会话侧栏" }));
+    expect(screen.getByRole("complementary", { name: "会话列表" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "发送第一条消息" })).toBeEnabled();
     expect(screen.getAllByText("草稿").length).toBeGreaterThan(0);
     expect(screen.queryByText("不应出现检查点")).not.toBeInTheDocument();
