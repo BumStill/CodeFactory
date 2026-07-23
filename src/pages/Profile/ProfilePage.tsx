@@ -13,6 +13,7 @@ import {
   ShieldAlert,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { invoke } from "../../lib/tauri";
 import { useChatStore } from "../../stores/chat";
 import { useLearningStore, type LearningEvent } from "../../stores/learning";
@@ -760,7 +761,7 @@ export function SelfImprovementSection() {
       ) : (
         <div className="rounded-lg border border-border bg-surface-1 p-4">
           <div className="prose dark:prose-invert prose-sm max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
-            <ReactMarkdown>{proposal}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{proposal}</ReactMarkdown>
           </div>
         </div>
       )}

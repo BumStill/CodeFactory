@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
 import { Check, Copy, ChevronDown } from "lucide-react";
@@ -444,7 +445,7 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
                 data-segment="final"
                 className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
               >
-                <ReactMarkdown components={markdownComponents}>{segment.text}</ReactMarkdown>
+                <ReactMarkdown components={markdownComponents} remarkPlugins={[remarkGfm]}>{segment.text}</ReactMarkdown>
                 {isStreamingTail && <TypingDots />}
               </div>
             );
@@ -496,7 +497,7 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
         ))}
       {!timeline && msg.content && (
         <div className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
-          <ReactMarkdown components={markdownComponents}>{msg.content}</ReactMarkdown>
+          <ReactMarkdown components={markdownComponents} remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
           {isStreamingTail && <TypingDots />}
         </div>
       )}

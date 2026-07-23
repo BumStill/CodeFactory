@@ -87,4 +87,17 @@ describe("MessageList theme readability", () => {
     expect(screen.queryByText(/Thinking/)).toBeNull();
   });
 
+  it("renders GFM tables as HTML table elements, not raw pipe text", () => {
+    const { container } = render(
+      <MessageList
+        messages={[baseMsg({ content: "| A | B |\n| --- | --- |\n| 1 | 2 |" })]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+    expect(container.querySelector("table"), "expected <table> in rendered output").toBeTruthy();
+    expect(container.querySelector("th"), "expected <th> in rendered table").toBeTruthy();
+    expect(container.querySelector("th")?.textContent).toBe("A");
+  });
+
 });
