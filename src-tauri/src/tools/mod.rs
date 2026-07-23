@@ -209,3 +209,64 @@ pub fn unified_diff_for_path(path: &str, before: &str, after: &str) -> String {
 
     diff
 }
+
+#[cfg(test)]
+mod headless_contract_tests {
+    //! Keystone slice 2: the tool surface must run HEADLESS — through an
+    //! `ExecCtx` with no Tauri `AppHandle` — so the future headless product-
+    //! agent runner (slice 3) can drive the full toolset outside the desktop
+    //! shell. In `#[cfg(test)]` builds `ExecCtx` has no `app` field at all,
+    //! so `ExecCtx::new` here IS the app-less context. This test locks the
+    //! contract: adding an app-dependency to a core tool must fail here, not
+    //! silently break headless capability.
+
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn core_tool_surface_runs_end_to_end_without_an_app_handle() {
+        let dir = std::env::temp_dir().join(format!("cf-headless-tools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ExecCtx::new(dir.clone(), None);
+
+        // write_file
+        let out = dispatch(
+            "write_file",
+            json!({ "path": "note.txt", "content": "headless line one\nsecond" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!out.is_error, "write_file headless: {}", out.content);
+
+        // read_file sees it
+        let out = dispatch("read_file", json!({ "path": "note.txt" }), &ctx).await.unwrap();
+        assert!(!out.is_error, "read_file headless: {}", out.content);
+        assert!(out.content.contains("headless line one"));
+
+        // grep finds it
+        let out = dispatch(
+            "grep",
+            json!({ "pattern": "second", "path": "." }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!out.is_error, "grep headless: {}", out.content);
+
+        // bash runs
+        let out = dispatch("bash", json!({ "command": "echo headless-ok" }), &ctx).await.unwrap();
+        assert!(!out.is_error, "bash headless: {}", out.content);
+        assert!(out.content.contains("headless-ok"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_is_a_clean_error_not_a_panic_headless() {
+        let ctx = ExecCtx::new(std::env::temp_dir(), None);
+        let out = dispatch("no_such_tool", json!({}), &ctx).await.unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("Unknown tool"));
+    }
+}
