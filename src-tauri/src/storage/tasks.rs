@@ -261,6 +261,35 @@ pub async fn mark_task_cancelled(pool: &SqlitePool, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reset only the failed/cancelled tasks the user explicitly confirmed are ready to retry.
+pub async fn retry_selected_tasks(
+    pool: &SqlitePool,
+    session_id: &str,
+    task_ids: &[String],
+) -> Result<u64> {
+    if task_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = pool.begin().await?;
+    let mut changed = 0_u64;
+    for id in task_ids {
+        let result = sqlx::query(
+            "UPDATE task_runs \
+             SET status = 'pending', started_at = NULL, completed_at = NULL, error = NULL, \
+                 result = NULL, verification_results = NULL \
+             WHERE id = ? AND session_id = ? AND status IN ('failed', 'cancelled')",
+        )
+        .bind(id)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        changed += result.rows_affected();
+    }
+    tx.commit().await?;
+    Ok(changed)
+}
+
 pub async fn retry_failed_tasks(pool: &SqlitePool, session_id: &str) -> Result<u64> {
     let repairable_ids: Vec<String> = list_session_tasks(pool, session_id)
         .await?
@@ -414,7 +443,7 @@ pub fn classify_task_failure(task: &TaskRun) -> Option<TaskFailureAttribution> {
             kind: "model-provider".into(),
             label: "模型/Provider".into(),
             summary,
-            next_action: "修复 endpoint、API key、余额或模型 route 后再重试。".into(),
+            next_action: "打开模型设置，修复 endpoint、API key、余额或模型 route 后再重试。".into(),
             repairable: false,
             source: "error".into(),
         });
@@ -743,4 +772,36 @@ mod tests {
         assert_eq!(runtime_attr.kind, "shell-runtime");
         assert!(runtime_attr.next_action.contains("PATH"));
     }
+
+    #[tokio::test]
+    async fn explicit_retry_resets_only_selected_blockers_in_the_same_session() {
+        let pool = test_pool().await;
+        let mut provider = task("provider-1", "failed");
+        provider.error = Some("API key not found".into());
+        provider.verification_results = None;
+        insert_task(&pool, &provider).await.unwrap();
+        let mut other = task("provider-2", "failed");
+        other.error = Some("API key not found".into());
+        other.verification_results = None;
+        insert_task(&pool, &other).await.unwrap();
+        let completed = task("completed", "completed");
+        insert_task(&pool, &completed).await.unwrap();
+        let mut foreign = task("foreign", "failed");
+        foreign.session_id = "session-2".into();
+        insert_task(&pool, &foreign).await.unwrap();
+
+        let changed = retry_selected_tasks(
+            &pool,
+            "session-1",
+            &["provider-1".into(), "completed".into(), "foreign".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed, 1);
+        assert_eq!(get_task(&pool, "provider-1").await.unwrap().unwrap().status, "pending");
+        assert_eq!(get_task(&pool, "provider-2").await.unwrap().unwrap().status, "failed");
+        assert_eq!(get_task(&pool, "completed").await.unwrap().unwrap().status, "completed");
+        assert_eq!(get_task(&pool, "foreign").await.unwrap().unwrap().status, "failed");
+    }
+
 }

@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   start: vi.fn().mockResolvedValue(undefined),
   cancel: vi.fn().mockResolvedValue(undefined),
   retryFailedTasks: vi.fn().mockResolvedValue(1),
+  retryTasks: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock("../../lib/tauri", async (original) => {
@@ -71,7 +72,9 @@ vi.mock("../../components/GitStatusBar", () => ({
 vi.mock("../../components/CheckpointsPanel", () => ({ CheckpointsPanel: () => null }));
 vi.mock("../../components/WorkspaceDeliveryStatus", () => ({ WorkspaceDeliveryStatus: () => null }));
 vi.mock("../../components/MessageList", () => ({ MessageList: () => null }));
-vi.mock("../../components/MessageInput", () => ({ MessageInput: () => null }));
+vi.mock("../../components/MessageInput", () => ({
+  MessageInput: ({ pendingInsert }: { pendingInsert?: string }) => pendingInsert ? <div data-testid="pending-repair-prompt">{pendingInsert}</div> : null,
+}));
 vi.mock("../../components/PermissionDialog", () => ({ PermissionDialog: () => null }));
 vi.mock("../../components/ContextUsageBar", () => ({ ContextUsageBar: () => null }));
 vi.mock("../../stores/settings", () => ({
@@ -92,6 +95,7 @@ const fakeTasksState = {
   subscribe: mocks.subscribe,
   subscribeEvidence: vi.fn().mockResolvedValue(() => {}),
   retryFailedTasks: mocks.retryFailedTasks,
+  retryTasks: mocks.retryTasks,
   start: mocks.start,
   cancel: mocks.cancel,
 };
@@ -124,15 +128,18 @@ vi.mock("../../stores/skills", () => ({
 
 import { WorkspacePage } from "./WorkspacePage";
 
-const renderWorkspace = () =>
-  render(
-    <WorkspacePage
-      sessionId="s1"
-      onBackHome={() => {}}
-      onOpenSettings={() => {}}
-      onOpenSession={() => {}}
-    />,
-  );
+const renderWorkspace = (onOpenSettings = vi.fn()) =>
+  ({
+    onOpenSettings,
+    ...render(
+      <WorkspacePage
+        sessionId="s1"
+        onBackHome={() => {}}
+        onOpenSettings={onOpenSettings}
+        onOpenSession={() => {}}
+      />,
+    ),
+  });
 
 function task(overrides: Record<string, unknown> = {}) {
   return {
@@ -167,6 +174,7 @@ describe("session-native task delegation", () => {
     mocks.start.mockResolvedValue(undefined);
     mocks.cancel.mockResolvedValue(undefined);
     mocks.retryFailedTasks.mockResolvedValue(1);
+    mocks.retryTasks.mockResolvedValue(true);
     fakeTasksState.tasks = {};
     fakeTasksState.running = {};
     fakeTasksState.executionLog = {};
@@ -274,16 +282,16 @@ describe("session-native task delegation", () => {
     expect(mocks.start).toHaveBeenCalledWith("s1");
   });
 
-  it("does not blindly retry a provider failure", async () => {
+  it("turns a provider blocker into model settings plus an explicit retry", async () => {
     fakeTasksState.tasks = {
       s1: [
         task({
           status: "failed",
-          error: "HTTP 402 Insufficient Balance",
+          error: "API key not found for key_ref 'codefactory.endpoint.chatgpt'",
           failure_attribution: {
             kind: "model-provider",
             label: "模型/Provider",
-            summary: "HTTP 402 Insufficient Balance",
+            summary: "API key not found for key_ref 'codefactory.endpoint.chatgpt'",
             next_action: "修复 endpoint、API key 或余额后再重试。",
             repairable: false,
             source: "error",
@@ -291,15 +299,20 @@ describe("session-native task delegation", () => {
         }),
       ],
     };
-    renderWorkspace();
+    const onOpenSettings = vi.fn();
+    renderWorkspace(onOpenSettings);
 
-    expect(screen.getByRole("button", { name: "打开任务活动" })).toHaveTextContent("需要你处理");
-    expect(screen.queryByText("模型/Provider")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "打开任务活动" })).toHaveTextContent("模型配置待修复");
     await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
     expect(screen.getByText("模型/Provider")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "需在对话处理" })).toBeDisabled();
+
+    await userEvent.click(screen.getByRole("button", { name: "打开模型设置" }));
+    expect(onOpenSettings).toHaveBeenCalledWith("endpoints");
+
+    await userEvent.click(screen.getByRole("button", { name: "已修复，重试 1 项" }));
+    await waitFor(() => expect(mocks.retryTasks).toHaveBeenCalledWith("s1", ["task-1"]));
+    expect(mocks.start).toHaveBeenCalledWith("s1");
     expect(mocks.retryFailedTasks).not.toHaveBeenCalled();
-    expect(mocks.start).not.toHaveBeenCalled();
   });
   it("does not turn cancelled or completed task history into a persistent alert", () => {
     fakeTasksState.tasks = {
@@ -313,6 +326,29 @@ describe("session-native task delegation", () => {
     fakeTasksState.tasks = { s1: [task({ status: "failed", failure_attribution: { repairable: true } })] };
     renderWorkspace();
     expect(screen.getByRole("button", { name: "打开任务活动" })).toHaveTextContent("1 个步骤失败");
+  });
+
+  it("takes an unknown blocker back to chat with the task evidence prefilled", async () => {
+    fakeTasksState.tasks = {
+      s1: [task({
+        status: "failed",
+        error: "opaque worker crash 73",
+        failure_attribution: {
+          kind: "unknown",
+          label: "未分类",
+          summary: "opaque worker crash 73",
+          next_action: "回到对话继续诊断。",
+          repairable: false,
+          source: "error",
+        },
+      })],
+    };
+    renderWorkspace();
+    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
+    await userEvent.click(screen.getByRole("button", { name: "回到对话处理" }));
+    expect(screen.queryByRole("dialog", { name: "任务活动" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("pending-repair-prompt")).toHaveTextContent("实现登录页");
+    expect(screen.getByTestId("pending-repair-prompt")).toHaveTextContent("opaque worker crash 73");
   });
 
 });

@@ -11,13 +11,16 @@ vi.mock("./pages/Workspace/WorkspacePage", () => ({
     sessionId,
     initialTaskLogId,
     onOpenUsage,
+    onOpenSettings,
   }: {
     sessionId: string;
     initialTaskLogId?: string | null;
     onOpenUsage?: () => void;
+    onOpenSettings?: (tab?: "endpoints") => void;
   }) => (
     <main aria-label="会话工作区" data-session-id={sessionId} data-task-id={initialTaskLogId ?? ""}>
       <button onClick={onOpenUsage}>打开用量</button>
+      <button onClick={() => onOpenSettings?.("endpoints")}>修复模型配置</button>
     </main>
   ),
 }));
@@ -52,6 +55,14 @@ vi.mock("./stores/chat", () => ({
 vi.mock("./stores/chatgptCatalog", () => ({ syncChatGptCatalog: vi.fn() }));
 
 describe("App usage drill-down routing", () => {
+  it("opens endpoint settings directly from a provider repair action", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "修复模型配置" }));
+    expect(screen.getByRole("main", { name: "设置页" })).toHaveAttribute("data-tab", "endpoints");
+  });
+
   it("opens a real parent session and reveals the selected task log", async () => {
     const user = userEvent.setup();
     render(<App />);

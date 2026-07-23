@@ -43,7 +43,7 @@ interface WorkspacePageProps {
   /** Start another empty quick draft; kept under the legacy prop name so
    * existing embedders remain source-compatible while Home no longer exists. */
   onBackHome: () => void;
-  onOpenSettings: () => void;
+  onOpenSettings: (tab?: "capabilities" | "endpoints" | "permissions") => void;
   onOpenUsage?: () => void;
   /** Switch the workspace to another session in-place (from the sidebar). */
   onOpenSession: (id: string) => void;
@@ -132,7 +132,9 @@ export function WorkspacePage({
   const taskPendingCount = sessionTasks.filter((task) => task.status === "pending").length;
   const failedTasks = sessionTasks.filter((task) => task.status === "failed");
   const taskFailedCount = failedTasks.length;
-  const taskBlockedCount = failedTasks.filter((task) => task.failure_attribution?.repairable === false).length;
+  const blockedTasks = failedTasks.filter((task) => task.failure_attribution?.repairable === false);
+  const taskBlockedCount = blockedTasks.length;
+  const taskProviderBlockedCount = blockedTasks.filter((task) => task.failure_attribution?.kind === "model-provider").length;
   const taskActivityVisible = taskRunningCount + taskPendingCount + taskFailedCount > 0;
   const [taskActivityOpen, setTaskActivityOpen] = useState(Boolean(initialTaskLogId));
   const taskActivityButtonRef = useRef<HTMLButtonElement>(null);
@@ -293,7 +295,7 @@ export function WorkspacePage({
             <ListTodo size={12} />
             <span>
               {taskBlockedCount > 0
-                ? "需要你处理"
+                ? (taskProviderBlockedCount === taskBlockedCount ? "模型配置待修复" : "需要你处理")
                 : taskFailedCount > 0
                   ? `${taskFailedCount} 个步骤失败`
                   : taskRunningCount > 0
@@ -305,7 +307,7 @@ export function WorkspacePage({
           </button>
         )}
         <button
-          onClick={onOpenSettings}
+          onClick={() => onOpenSettings()}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
           title="设置"
           aria-label="设置"
@@ -371,6 +373,12 @@ export function WorkspacePage({
             <TasksColumn
               sessionId={sessionId}
               highlightedTaskId={initialTaskLogId}
+              onOpenSettings={onOpenSettings}
+              onRequestRepair={(task) => {
+                const evidence = task.error || task.failure_attribution?.summary || "未提供错误详情";
+                setPendingInsert(`请继续处理失败任务「${task.title}」。先诊断并修复根因，再重试该任务。\n\n失败证据：${evidence}`);
+                closeTaskActivity();
+              }}
               onClose={closeTaskActivity}
             />
           </section>
@@ -414,8 +422,14 @@ export function WorkspacePage({
 
 // Task decomposition is internal to the conversation; this panel only renders
 // the execution detail after the agent has delegated work.
-function TasksColumn({ sessionId, highlightedTaskId, onClose }: { sessionId: string; highlightedTaskId?: string | null; onClose: () => void }) {
-  const { tasks, running, start, cancel, retryFailedTasks } = useTasksStore();
+function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onRequestRepair, onClose }: {
+  sessionId: string;
+  highlightedTaskId?: string | null;
+  onOpenSettings: (tab: "endpoints" | "permissions") => void;
+  onRequestRepair: (task: TaskRun) => void;
+  onClose: () => void;
+}) {
+  const { tasks, running, start, cancel, retryFailedTasks, retryTasks } = useTasksStore();
   const sessionTasks: TaskRun[] = tasks[sessionId] ?? [];
   const isRunning = running[sessionId] ?? false;
   const pendingCount = sessionTasks.filter((task) => task.status === "pending").length;
@@ -425,9 +439,13 @@ function TasksColumn({ sessionId, highlightedTaskId, onClose }: { sessionId: str
   const repairableFailedCount = failedTasks.filter(
     (task) => task.failure_attribution?.repairable,
   ).length;
-  const blockedFailedCount = failedTasks.length - repairableFailedCount;
+  const blockedTasks = failedTasks.filter((task) => task.failure_attribution?.repairable === false);
+  const providerBlockedTasks = blockedTasks.filter((task) => task.failure_attribution?.kind === "model-provider");
+  const permissionBlockedTasks = blockedTasks.filter((task) => task.failure_attribution?.kind === "permission");
+  const conversationBlockedTasks = blockedTasks.filter((task) => !["model-provider", "permission"].includes(task.failure_attribution?.kind ?? "unknown"));
   const [startError, setStartError] = useState<string | null>(null);
   const [repairBusy, setRepairBusy] = useState(false);
+  const [blockedRetryBusy, setBlockedRetryBusy] = useState(false);
 
   const handleStart = async () => {
     setStartError(null);
@@ -436,6 +454,17 @@ function TasksColumn({ sessionId, highlightedTaskId, onClose }: { sessionId: str
   const handleCancel = async () => {
     try { await cancel(sessionId); } catch (error) { setStartError(String(error)); }
   };
+  const handleRetryBlocked = async (selected: TaskRun[]) => {
+    if (blockedRetryBusy || isRunning || selected.length === 0) return;
+    setBlockedRetryBusy(true);
+    setStartError(null);
+    try {
+      const retried = await retryTasks(sessionId, selected.map((task) => task.id));
+      if (retried > 0) await start(sessionId);
+    } catch (error) { setStartError(String(error)); }
+    finally { setBlockedRetryBusy(false); }
+  };
+
   const handleRepairFailed = async () => {
     if (repairBusy || isRunning || repairableFailedCount === 0) return;
     setRepairBusy(true);
@@ -461,24 +490,36 @@ function TasksColumn({ sessionId, highlightedTaskId, onClose }: { sessionId: str
           <X size={15} />
         </button>
       </div>
-      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-4 py-2">
-        <div className="flex items-center gap-2 text-[10px] text-gray-600">
+      <div className="flex shrink-0 flex-col gap-2 border-b border-border px-4 py-2">
+        <div className="flex flex-wrap items-center gap-2 text-[10px] text-gray-600">
           <span>已完成 {completedCount}</span><span>待执行 {pendingCount}</span>
           {runningCount > 0 && <span className="text-accent">执行中 {runningCount}</span>}
           {repairableFailedCount > 0 && <span className="text-amber-700 dark:text-amber-300">可重试 {repairableFailedCount}</span>}
-          {blockedFailedCount > 0 && <span className="text-red-700 dark:text-red-300">需要你 {blockedFailedCount}</span>}
+          {providerBlockedTasks.length > 0 && <span className="text-red-700 dark:text-red-300">模型配置 {providerBlockedTasks.length}</span>}
+          {permissionBlockedTasks.length > 0 && <span className="text-red-700 dark:text-red-300">权限配置 {permissionBlockedTasks.length}</span>}
+          {conversationBlockedTasks.length > 0 && <span className="text-red-700 dark:text-red-300">需要你 {conversationBlockedTasks.length}</span>}
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex flex-wrap items-center gap-1">
           {isRunning ? (
             <button onClick={() => void handleCancel()} className="flex items-center gap-1 rounded bg-red-500/10 px-2 py-1 text-[10px] text-red-700 hover:bg-red-500/20 dark:text-red-300"><Square size={9} />停止</button>
           ) : pendingCount > 0 ? (
             <button onClick={() => void handleStart()} className="flex items-center gap-1 rounded bg-accent px-2 py-1 text-[10px] text-white hover:bg-accent-hover"><Play size={9} />继续</button>
           ) : null}
-          {!isRunning && failedTasks.length > 0 && (
-            <button onClick={() => void handleRepairFailed()} disabled={repairBusy || repairableFailedCount === 0} className="flex items-center gap-1 rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-700 disabled:opacity-40 dark:text-amber-300" title={repairableFailedCount > 0 ? "重试可自动修复的失败步骤" : "失败原因需要先在对话里处理"}>
-              {repairBusy ? <Loader2 size={9} className="animate-spin" /> : <RefreshCw size={9} />}
-              {repairableFailedCount > 0 ? "重试失败步骤" : "需在对话处理"}
+          {!isRunning && repairableFailedCount > 0 && (
+            <button onClick={() => void handleRepairFailed()} disabled={repairBusy} className="flex items-center gap-1 rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-700 disabled:opacity-40 dark:text-amber-300" title="重试可自动修复的失败步骤">
+              {repairBusy ? <Loader2 size={9} className="animate-spin" /> : <RefreshCw size={9} />}重试失败步骤
             </button>
+          )}
+          {!isRunning && providerBlockedTasks.length > 0 && (
+            <><button onClick={() => onOpenSettings("endpoints")} className="rounded bg-accent/10 px-2 py-1 text-[10px] text-accent hover:bg-accent/20">打开模型设置</button>
+            <button aria-label={`已修复，重试 ${providerBlockedTasks.length} 项`} title={`重试：${providerBlockedTasks.map((task) => task.title).join("、")}`} onClick={() => void handleRetryBlocked(providerBlockedTasks)} disabled={blockedRetryBusy} className="flex items-center gap-1 rounded bg-emerald-500/10 px-2 py-1 text-[10px] text-emerald-700 disabled:opacity-40 dark:text-emerald-300"><RefreshCw size={9} />已修复，重试 {providerBlockedTasks.length} 项</button></>
+          )}
+          {!isRunning && permissionBlockedTasks.length > 0 && (
+            <><button onClick={() => onOpenSettings("permissions")} className="rounded bg-accent/10 px-2 py-1 text-[10px] text-accent hover:bg-accent/20">打开权限设置</button>
+            <button onClick={() => void handleRetryBlocked(permissionBlockedTasks)} disabled={blockedRetryBusy} className="rounded bg-emerald-500/10 px-2 py-1 text-[10px] text-emerald-700 disabled:opacity-40 dark:text-emerald-300">已授权，重试 {permissionBlockedTasks.length} 项</button></>
+          )}
+          {!isRunning && conversationBlockedTasks.length > 0 && (
+            <button onClick={() => onRequestRepair(conversationBlockedTasks[0])} className="rounded bg-accent/10 px-2 py-1 text-[10px] text-accent hover:bg-accent/20">回到对话处理</button>
           )}
         </div>
       </div>

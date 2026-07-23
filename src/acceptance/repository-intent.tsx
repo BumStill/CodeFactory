@@ -52,6 +52,33 @@ const delegatedTask: TaskRun = {
   spec_req_id: null,
   spec_title: null,
 } as TaskRun;
+const providerFailureTitles = [
+  "独立 UX 审查",
+  "浏览器视口 QA",
+  "任务抽屉独立审查",
+  "侧栏与命令层级审查",
+  "审查 GitHub 交付状态数据链",
+  "审查状态栏信息架构与窄屏",
+];
+const providerFailures: TaskRun[] = providerFailureTitles.map((title, index) => ({
+  ...delegatedTask,
+  id: `provider-failure-${index + 1}`,
+  title,
+  status: "failed",
+  started_at: "2026-07-23T00:00:00Z",
+  completed_at: "2026-07-23T00:01:00Z",
+  error: "API key not found for key_ref 'codefactory.endpoint.chatgpt'",
+  failure_attribution: {
+    kind: "model-provider",
+    label: "模型/Provider",
+    summary: "API key not found for key_ref 'codefactory.endpoint.chatgpt'",
+    next_action: "打开模型设置，修复 endpoint、API key、余额或模型 route 后再重试。",
+    repairable: false,
+    source: "error",
+  },
+}));
+const fixtureTasks = [delegatedTask, ...providerFailures];
+
 const remote: GitRemoteConfig = {
   id: "github",
   name: "GitHub",
@@ -75,11 +102,18 @@ const issue: RemoteIssue = {
 
 mockWindows("main");
 mockIPC(
-  (command) => {
+  (command, args) => {
     switch (command) {
+      case "get_settings": return settings;
       case "list_sessions": return sidebarSessions;
       case "list_quick_sessions": return [];
-      case "list_tasks": return [delegatedTask];
+      case "list_tasks": return fixtureTasks;
+      case "retry_tasks":
+        (window as typeof window & { __lastRetry?: unknown }).__lastRetry = args;
+        return providerFailures.length;
+      case "start_implementation":
+        (window as typeof window & { __implementationStarted?: boolean }).__implementationStarted = true;
+        return null;
       case "get_task_dependencies": return [];
       case "list_checkpoints": return [];
       case "list_learning_events": return [];
@@ -137,6 +171,7 @@ const { freshRuntime, useChatStore } = await import("../stores/chat");
 const { useSettingsStore, applyTheme } = await import("../stores/settings");
 const { useTasksStore } = await import("../stores/tasks");
 const { WorkspacePage } = await import("../pages/Workspace/WorkspacePage");
+const { SettingsPage } = await import("../pages/Settings/SettingsPage");
 
 const settings = {
   endpoints: {
@@ -189,20 +224,33 @@ useChatStore.setState({
   },
 });
 useTasksStore.setState({
-  tasks: { [sessionId]: [delegatedTask] },
+  tasks: { [sessionId]: fixtureTasks },
   running: { [sessionId]: false },
   executionLog: { [sessionId]: [] },
 });
 
-createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
+function AcceptanceApp() {
+  const [settingsTab, setSettingsTab] = React.useState<"endpoints" | "permissions" | null>(null);
+  return (
     <div className="h-screen">
-      <WorkspacePage
-        sessionId={sessionId}
-        onBackHome={() => {}}
-        onOpenSettings={() => {}}
-        onOpenSession={() => {}}
-      />
+      {settingsTab ? (
+        <SettingsPage onBack={() => setSettingsTab(null)} initialTab={settingsTab} />
+      ) : (
+        <WorkspacePage
+          sessionId={sessionId}
+          onBackHome={() => {}}
+          onOpenSettings={(tab) => {
+            const target = tab === "permissions" ? "permissions" : "endpoints";
+            (window as typeof window & { __settingsTab?: string }).__settingsTab = target;
+            setSettingsTab(target);
+          }}
+          onOpenSession={() => {}}
+        />
+      )}
     </div>
-  </React.StrictMode>,
+  );
+}
+
+createRoot(document.getElementById("root")!).render(
+  <React.StrictMode><AcceptanceApp /></React.StrictMode>,
 );
