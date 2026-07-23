@@ -67,6 +67,7 @@ tracing  = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 codefactory-agent-core = { path = "crates/agent-core" }
 codefactory-agent-loop = { path = "crates/agent-loop" }
+async-trait = "0.1"       # impl the agent-loop ToolBackend trait (DesktopToolBackend)
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
