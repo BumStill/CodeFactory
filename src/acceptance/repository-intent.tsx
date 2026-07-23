@@ -52,6 +52,16 @@ const delegatedTask: TaskRun = {
   spec_req_id: null,
   spec_title: null,
 } as TaskRun;
+const pendingAfterFailure: TaskRun = {
+  ...delegatedTask,
+  id: "pending-after-provider-failures",
+  title: "等待模型配置修复后的后续任务",
+  status: "pending",
+  started_at: null,
+  completed_at: null,
+  error: null,
+  failure_attribution: null,
+};
 const providerFailureTitles = [
   "独立 UX 审查",
   "浏览器视口 QA",
@@ -77,7 +87,7 @@ const providerFailures: TaskRun[] = providerFailureTitles.map((title, index) => 
     source: "error",
   },
 }));
-const fixtureTasks = [delegatedTask, ...providerFailures];
+const fixtureTasks = [delegatedTask, pendingAfterFailure, ...providerFailures];
 
 const remote: GitRemoteConfig = {
   id: "github",

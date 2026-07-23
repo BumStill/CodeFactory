@@ -499,11 +499,18 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onRequestRe
           {permissionBlockedTasks.length > 0 && <span className="text-red-700 dark:text-red-300">权限配置 {permissionBlockedTasks.length}</span>}
           {conversationBlockedTasks.length > 0 && <span className="text-red-700 dark:text-red-300">需要你 {conversationBlockedTasks.length}</span>}
         </div>
+        {!isRunning && pendingCount > 0 && (
+          <p className={`text-[10px] ${failedTasks.length > 0 ? "text-amber-700 dark:text-amber-300" : "text-gray-500"}`}>
+            {failedTasks.length > 0
+              ? `先处理失败项，再继续剩余 ${pendingCount} 项。`
+              : `执行已暂停，还有 ${pendingCount} 项等待执行。`}
+          </p>
+        )}
         <div className="flex flex-wrap items-center gap-1">
           {isRunning ? (
             <button onClick={() => void handleCancel()} className="flex items-center gap-1 rounded bg-red-500/10 px-2 py-1 text-[10px] text-red-700 hover:bg-red-500/20 dark:text-red-300"><Square size={9} />停止</button>
-          ) : pendingCount > 0 ? (
-            <button onClick={() => void handleStart()} className="flex items-center gap-1 rounded bg-accent px-2 py-1 text-[10px] text-white hover:bg-accent-hover"><Play size={9} />继续</button>
+          ) : pendingCount > 0 && failedTasks.length === 0 ? (
+            <button onClick={() => void handleStart()} className="flex items-center gap-1 rounded bg-accent px-2 py-1 text-[10px] text-white hover:bg-accent-hover"><Play size={9} />继续执行 {pendingCount} 项</button>
           ) : null}
           {!isRunning && repairableFailedCount > 0 && (
             <button onClick={() => void handleRepairFailed()} disabled={repairBusy} className="flex items-center gap-1 rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-700 disabled:opacity-40 dark:text-amber-300" title="重试可自动修复的失败步骤">

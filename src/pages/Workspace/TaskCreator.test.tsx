@@ -238,13 +238,41 @@ describe("session-native task delegation", () => {
     expect(screen.queryByTitle(/规范工作台/)).not.toBeInTheDocument();
   });
 
-  it("continues pending delegated work from the session detail", async () => {
+  it("names exactly how many pending tasks will continue", async () => {
     fakeTasksState.tasks = { s1: [task()] };
     renderWorkspace();
 
     await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
-    await userEvent.click(screen.getByRole("button", { name: "继续" }));
+    expect(screen.getByText("执行已暂停，还有 1 项等待执行。" )).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "继续执行 1 项" }));
     expect(mocks.start).toHaveBeenCalledWith("s1");
+  });
+
+  it("does not offer a generic continue action while a failure blocks pending work", async () => {
+    fakeTasksState.tasks = {
+      s1: [
+        task({ id: "pending-after-failure" }),
+        task({
+          id: "provider-blocker",
+          status: "failed",
+          error: "API key not found",
+          failure_attribution: {
+            kind: "model-provider",
+            label: "模型/Provider",
+            summary: "API key not found",
+            next_action: "打开模型设置后重试。",
+            repairable: false,
+            source: "error",
+          },
+        }),
+      ],
+    };
+    renderWorkspace();
+
+    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
+    expect(screen.queryByRole("button", { name: /继续执行/ })).not.toBeInTheDocument();
+    expect(screen.getByText("先处理失败项，再继续剩余 1 项。" )).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "打开模型设置" })).toBeEnabled();
   });
 
   it("stops a running delegated execution", async () => {

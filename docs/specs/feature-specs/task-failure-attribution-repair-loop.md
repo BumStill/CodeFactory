@@ -54,6 +54,8 @@ P-FR-2: 如果失败来自 provider/credential、权限或 shell runtime，UI �
 | six provider credential failures | drawer exposes endpoint settings and a user-confirmed retry for exactly the six selected failures; actions remain visible at the minimum viewport |
 | explicit selected retry | only selected failed/cancelled rows in the same session are reset; completed, unselected and foreign-session rows remain unchanged |
 | unknown blocker | drawer returns to the conversation with task title and error evidence prefilled |
+| paused pending tasks without failures | drawer explains how many tasks remain and labels the action `继续执行 N 项` |
+| pending tasks plus any failed task | drawer explains that failures must be handled first and hides the generic continue action |
 | assertion/test failure | classified as `test-failure` |
 | cancelled task | classified as `cancelled` |
 | old task without new persisted fields | list still loads and derives attribution from existing fields |

@@ -108,6 +108,8 @@ async function assertWorkspace(page, tag) {
   await taskDrawer.waitFor();
   assert(await taskDrawer.getByText("在会话内执行仓库需求", { exact: true }).isVisible(), `[${tag}] delegated task missing from drawer`);
   assert(await taskDrawer.getByText("模型配置 6", { exact: true }).isVisible(), `[${tag}] provider blocker count is not actionable`);
+  assert(await taskDrawer.getByText("先处理失败项，再继续剩余 2 项。", { exact: true }).isVisible(), `[${tag}] mixed failed/pending state has no clear explanation`);
+  assert((await taskDrawer.getByRole("button", { name: /继续执行/ }).count()) === 0, `[${tag}] generic continue action bypasses a failure blocker`);
   const settingsAction = taskDrawer.getByRole("button", { name: "打开模型设置" });
   const retryAction = taskDrawer.getByRole("button", { name: "已修复，重试 6 项" });
   await settingsAction.waitFor();
