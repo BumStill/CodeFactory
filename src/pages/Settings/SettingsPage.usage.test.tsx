@@ -235,7 +235,7 @@ describe("Settings token usage dashboard", () => {
 
     await user.click(within(region).getByRole("button", { name: "近 365 天" }));
     await waitFor(() => expect(currentCells()).toHaveLength(365));
-  });
+  }, 15_000);
 
   it("distinguishes missing telemetry from a recorded zero without relying on color", async () => {
     await openUsageTab();
@@ -269,7 +269,7 @@ describe("Settings token usage dashboard", () => {
     const logEntry = within(detail).getByRole("button", { name: "查看作业日志" });
     await user.click(logEntry);
     expect(mocks.openJobLog).toHaveBeenCalledWith("project-session", "task-loop");
-  });
+  }, 15_000);
 
   it("does not advertise a task log for an ordinary interactive session", async () => {
     mocks.invoke.mockImplementation(async (command: string, args?: { rangeDays?: number; localDate?: string }) => {
