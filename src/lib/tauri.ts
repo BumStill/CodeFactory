@@ -310,6 +310,25 @@ export function startBenchmarkProviderRun(
   });
 }
 
+export interface ModelConsistencySummary { model: string; run_id: string; total: number; passed: number; pass_rate: number; }
+export interface PairwiseConsistency { model_a: string; model_b: string; jaccard: number; both_passed: number; a_only: number; b_only: number; }
+export interface DivergentTask { task_name: string; per_model: Record<string, number>; spread: number; }
+export interface FailureBucket { model: string; failure_class: string; count: number; }
+export interface ConsistencyReport {
+  dataset: string; dataset_version: string;
+  models: ModelConsistencySummary[];
+  pairwise: PairwiseConsistency[];
+  divergent_tasks: DivergentTask[];
+  failure_distribution: FailureBucket[];
+  comparability_note: string;
+}
+
+export function benchmarkConsistencyReport(dataset: string, datasetVersion?: string): Promise<ConsistencyReport> {
+  return invoke<ConsistencyReport>("benchmark_consistency_report", {
+    request: { dataset, dataset_version: datasetVersion ?? null },
+  });
+}
+
 export function importBenchmarkResults(jobPath: string): Promise<ImportedBenchmarkRun> {
   return invoke<ImportedBenchmarkRun>("import_benchmark_results", {
     request: { job_path: jobPath },

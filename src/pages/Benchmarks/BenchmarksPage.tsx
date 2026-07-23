@@ -7,8 +7,10 @@ import {
   FileSearch,
   Play,
   RefreshCcw,
+  GitCompareArrows,
 } from "lucide-react";
 import {
+  benchmarkConsistencyReport,
   importBenchmarkResults,
   listBenchmarkProfiles,
   previewBenchmarkProviderBridge,
@@ -22,6 +24,7 @@ import type {
   BenchmarkProviderBridgeRequest,
   BenchmarkProviderRunResult,
   BenchmarkTrialRecord,
+  ConsistencyReport,
   ImportedBenchmarkRun,
 } from "../../lib/tauri";
 
@@ -152,6 +155,16 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
   const [imported, setImported] = useState<ImportedBenchmarkRun | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [consistency, setConsistency] = useState<ConsistencyReport | null>(null);
+
+  const loadConsistency = async () => {
+    setError(null);
+    try {
+      setConsistency(await benchmarkConsistencyReport("terminal-bench"));
+    } catch (err) {
+      setError(String(err));
+    }
+  };
 
   const bridgeRequest: BenchmarkProviderBridgeRequest = useMemo(() => ({
     profile_id: PROFILE_ID,
@@ -345,6 +358,23 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
         </section>
 
         <section className="space-y-3 border-t border-border pt-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2 text-xs font-medium text-gray-300">
+              <GitCompareArrows size={14} />
+              跨模型一致性 &amp; 失败分布(只读,基于已有基准数据)
+            </div>
+            <button
+              onClick={() => void loadConsistency()}
+              disabled={busy}
+              className="flex items-center gap-1 rounded border border-border px-2 py-1 text-[11px] text-gray-400 hover:text-gray-200 disabled:opacity-50"
+            >
+              <RefreshCcw size={12} /> 生成报告
+            </button>
+          </div>
+          <ConsistencyPanel report={consistency} />
+        </section>
+
+        <section className="space-y-3 border-t border-border pt-4">
           <div className="flex items-center gap-2 text-xs font-medium text-gray-300">
             <CircleCheck size={14} />
             Latest result
@@ -353,6 +383,81 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
           <TrialTable trials={imported?.trials || []} />
         </section>
       </main>
+    </div>
+  );
+}
+
+function ConsistencyPanel({ report }: { report: ConsistencyReport | null }) {
+  if (!report) {
+    return (
+      <div className="rounded border border-border bg-surface-0 px-3 py-4 text-center text-[11px] text-gray-600">
+        点击「生成报告」——对比同一数据集下不同模型的通过集合、失败分布与分歧任务。仅使用已导入的基准数据。
+      </div>
+    );
+  }
+  if (report.models.length === 0) {
+    return (
+      <div className="rounded border border-border bg-surface-0 px-3 py-4 text-center text-[11px] text-gray-600">
+        暂无可比较的基准数据(需要 comparable 标记的 {report.dataset} 运行)。{report.comparability_note}
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-3 text-[11px]">
+      <div className="flex flex-wrap gap-2">
+        {report.models.map((m) => (
+          <div key={m.model} className="rounded border border-border bg-surface-0 px-2 py-1.5">
+            <div className="font-medium text-gray-200">{m.model}</div>
+            <div className="text-gray-500">
+              通过 {m.passed}/{m.total} · {(m.pass_rate * 100).toFixed(0)}%
+            </div>
+          </div>
+        ))}
+      </div>
+      {report.pairwise.length > 0 && (
+        <div className="rounded border border-border bg-surface-0 p-2">
+          <div className="mb-1 text-gray-400">通过集合一致性(Jaccard)</div>
+          {report.pairwise.map((p) => (
+            <div key={`${p.model_a}-${p.model_b}`} className="flex justify-between text-gray-300">
+              <span>{p.model_a} ↔ {p.model_b}</span>
+              <span className="tabular-nums">
+                {(p.jaccard * 100).toFixed(0)}% · 仅一方 {p.a_only + p.b_only}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {report.divergent_tasks.length > 0 && (
+        <div className="rounded border border-amber-500/30 bg-amber-500/5 p-2">
+          <div className="mb-1 text-amber-700 dark:text-amber-300">
+            分歧任务(一个模型通过、另一个失败)— 最该先看的不一致
+          </div>
+          {report.divergent_tasks.slice(0, 12).map((d) => (
+            <div key={d.task_name} className="text-gray-300">
+              <span className="font-mono">{d.task_name}</span>{" "}
+              <span className="text-gray-500">
+                {Object.entries(d.per_model)
+                  .map(([m, r]) => `${m}:${r >= 1 ? "✓" : "✗"}`)
+                  .join(" ")}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {report.failure_distribution.length > 0 && (
+        <div className="rounded border border-border bg-surface-0 p-2">
+          <div className="mb-1 text-gray-400">失败分布</div>
+          {report.failure_distribution.map((f) => (
+            <div key={`${f.model}-${f.failure_class}`} className="flex justify-between text-gray-300">
+              <span>{f.model} · {f.failure_class}</span>
+              <span className="tabular-nums">{f.count}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {report.comparability_note && (
+        <div className="text-[10px] text-gray-600">{report.comparability_note}</div>
+      )}
     </div>
   );
 }
