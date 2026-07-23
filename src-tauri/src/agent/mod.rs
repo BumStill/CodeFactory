@@ -492,6 +492,19 @@ fn resolve_chatgpt_reasoning_effort(
         .unwrap_or(ReasoningEffort::Medium)
 }
 
+/// Read the per-session ChatGPT reasoning-effort override
+/// (`sessions.reasoning_effort`), or `None` when unset / no such session. The
+/// loop calls this once per round (keystone slice 4.4d) so the transport reads
+/// no DB; a mid-run change is picked up on the next round.
+async fn fetch_session_reasoning_effort(db: &SqlitePool, session_id: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT reasoning_effort FROM sessions WHERE id = ?")
+        .bind(session_id)
+        .fetch_one(db)
+        .await
+        .ok()
+        .flatten()
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum UsageSurface {
     #[default]
@@ -1065,11 +1078,22 @@ impl AgentLoop {
 
             let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
             let required_tool_response = require_tool_next && !finalization_pending;
+            // Resolve reasoning effort ONCE per round (keystone slice 4.4d) so
+            // the transport reads no DB; recomputed each iteration to keep a
+            // mid-run session-effort change taking effect next round. Empty for
+            // non-ChatGPT api styles, which ignore it. The two reactive retries
+            // below reuse this round's value.
+            let round_reasoning_effort: &str = if self.api_style == ApiStyle::Chatgpt {
+                self.resolve_round_reasoning_effort().await
+            } else {
+                ""
+            };
             let call_result = self
                 .call_openai_transport(
                     &messages,
                     active_tool_defs,
                     required_tool_response,
+                    round_reasoning_effort,
                 )
                 .await;
             let (text, tool_calls, usage, reasoning) = match call_result {
@@ -1108,6 +1132,7 @@ impl AgentLoop {
                         &messages,
                         active_tool_defs,
                         required_tool_response,
+                        round_reasoning_effort,
                     )
                     .await?
                 }
@@ -1129,6 +1154,7 @@ impl AgentLoop {
                         &messages,
                         active_tool_defs,
                         required_tool_response,
+                        round_reasoning_effort,
                     )
                     .await?
                 }
@@ -1728,15 +1754,36 @@ impl AgentLoop {
     /// the OpenAI-shaped ChatMessage history into Responses `instructions` +
     /// `input` items, parses the Responses SSE stream, and returns the same
     /// (text, tool_calls, usage, reasoning) contract as call_openai_model.
+    /// Resolve THIS round's ChatGPT reasoning effort: a per-session override
+    /// (`sessions.reasoning_effort`) wins, else the global `Settings` default.
+    /// The loop calls this once per round (keystone slice 4.4d), so a mid-run
+    /// change still takes effect on the next round — freshness preserved — while
+    /// the transport itself reads no DB.
+    async fn resolve_round_reasoning_effort(&self) -> &'static str {
+        // Re-read per round: a mid-run `sessions.reasoning_effort` change takes
+        // effect on the next round (freshness), pinned by
+        // `session_reasoning_effort_reflects_the_current_row`.
+        let session_effort = fetch_session_reasoning_effort(&self.db, &self.session_id).await;
+        let settings = self.settings.read().await;
+        resolve_chatgpt_reasoning_effort(
+            &settings,
+            &self.endpoint_name,
+            &self.model_id,
+            session_effort.as_deref(),
+        )
+        .as_str()
+    }
+
     async fn call_openai_transport(
         &self,
         messages: &[ChatMessage],
         tool_defs: &[ToolDefinition],
         require_tool: bool,
+        reasoning_effort: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         let first = match self.api_style {
             ApiStyle::Chatgpt => {
-                self.call_chatgpt_model(messages, tool_defs, require_tool)
+                self.call_chatgpt_model(messages, tool_defs, require_tool, reasoning_effort)
                     .await
             }
             _ => {
@@ -1752,7 +1799,7 @@ impl AgentLoop {
         }
         match self.api_style {
             ApiStyle::Chatgpt => {
-                self.call_chatgpt_model(messages, tool_defs, false)
+                self.call_chatgpt_model(messages, tool_defs, false, reasoning_effort)
                     .await
             }
             _ => {
@@ -1767,6 +1814,9 @@ impl AgentLoop {
         messages: &[ChatMessage],
         tool_defs: &[ToolDefinition],
         require_tool: bool,
+        // Pre-resolved by the loop once per round (keystone slice 4.4d), so this
+        // transport reads no DB — a step toward the DB-pure ModelTransport (4.5).
+        reasoning_effort: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         let finalization_response = tool_defs.is_empty();
 
@@ -1827,28 +1877,6 @@ impl AgentLoop {
             })
             .collect();
 
-        // Reasoning effort: a per-session override (sessions.reasoning_effort)
-        // wins; otherwise the global Settings default (which itself defaults to
-        // Medium for older configs).
-        let session_effort: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT reasoning_effort FROM sessions WHERE id = ?",
-        )
-        .bind(&self.session_id)
-        .fetch_one(&self.db)
-        .await
-        .ok()
-        .flatten();
-        let effort = {
-            let settings = self.settings.read().await;
-            resolve_chatgpt_reasoning_effort(
-                &settings,
-                &self.endpoint_name,
-                &self.model_id,
-                session_effort.as_deref(),
-            )
-            .as_str()
-        };
-
         let mut body = serde_json::json!({
             "model": self.model_id,
             "instructions": instructions,
@@ -1863,7 +1891,7 @@ impl AgentLoop {
             "parallel_tool_calls": false,
             "store": false,
             "stream": true,
-            "reasoning": { "effort": effort, "summary": "auto" },
+            "reasoning": { "effort": reasoning_effort, "summary": "auto" },
         });
         if !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(tools);
@@ -4195,6 +4223,42 @@ fn glob_match(pattern: &str, input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_reasoning_effort_reflects_the_current_row() {
+        // Freshness contract for slice 4.4d: the loop re-reads this per round via
+        // resolve_round_reasoning_effort, so a mid-run change to
+        // sessions.reasoning_effort is picked up on the NEXT round — hoisting the
+        // read out of the transport must not freeze it at run start.
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, reasoning_effort TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        // No row → None (unset override).
+        assert_eq!(fetch_session_reasoning_effort(&db, "s1").await, None);
+        sqlx::query("INSERT INTO sessions (id, reasoning_effort) VALUES ('s1', 'high')")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetch_session_reasoning_effort(&db, "s1").await.as_deref(),
+            Some("high")
+        );
+        // Change mid-run → the next read reflects it, not the stale value.
+        sqlx::query("UPDATE sessions SET reasoning_effort='low' WHERE id='s1'")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetch_session_reasoning_effort(&db, "s1").await.as_deref(),
+            Some("low")
+        );
+    }
 
     #[test]
     fn emit_transport_retry_maps_notice_fields_through_the_event_sink() {
