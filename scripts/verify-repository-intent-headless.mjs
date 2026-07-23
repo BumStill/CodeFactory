@@ -82,6 +82,23 @@ async function assertWorkspace(page, tag) {
   assert((await conversation.getByText("会话执行详情", { exact: true }).count()) === 0, `[${tag}] fixed execution detail remains in conversation`);
   assert((await conversation.getByText("在会话内执行仓库需求", { exact: true }).count()) === 0, `[${tag}] delegated task leaked into conversation`);
   assert((await page.getByText("执行流", { exact: true }).count()) === 0, `[${tag}] execution stream should stay hidden in project sessions`);
+  const localGit = header.getByRole("button", { name: "本地工作树" });
+  await localGit.waitFor();
+  assert(await localGit.getByText("codex/repo-owned-specs", { exact: true }).isVisible(), `[${tag}] current local branch missing`);
+  assert(await localGit.getByText("已同步", { exact: true }).isVisible(), `[${tag}] upstream sync state missing`);
+  const delivery = header.getByRole("button", { name: "会话交付状态" });
+  await delivery.waitFor();
+  for (const text of ["PR #175", "CI 通过", "已合并", "v1.63.0 已上线"]) {
+    assert(await delivery.getByText(text, { exact: true }).isVisible(), `[${tag}] delivery summary missing: ${text}`);
+  }
+  await delivery.click();
+  const deliveryDrawer = page.getByRole("dialog", { name: "交付详情" });
+  await deliveryDrawer.waitFor();
+  assert(await deliveryDrawer.getByText("feat/workspace-ui → main", { exact: true }).isVisible(), `[${tag}] PR branch relation missing`);
+  assert(await deliveryDrawer.getByText("3373a69", { exact: true }).isVisible(), `[${tag}] PR head SHA missing from GitHub CI step`);
+  await deliveryDrawer.getByRole("button", { name: "关闭交付详情" }).click();
+  await deliveryDrawer.waitFor({ state: "detached" });
+  assert((await header.getByRole("button", { name: /检查点|恢复/ }).count()) === 0, `[${tag}] checkpoint counter must not remain in header`);
   const taskActivity = header.getByRole("button", { name: "打开任务活动" });
   await taskActivity.waitFor();
   const activityHeight = await taskActivity.evaluate((element) => element.getBoundingClientRect().height);
@@ -158,6 +175,10 @@ async function run() {
     page.on("pageerror", (error) => pageErrors.push(error.stack ?? String(error)));
 
     await assertWorkspace(page, "wide-workspace");
+    await page.getByRole("banner", { name: "会话工具栏" }).getByRole("button", { name: "本地工作树" }).click();
+    const localGitDrawer = page.getByText("本地 Git", { exact: true });
+    await localGitDrawer.waitFor();
+    assert((await page.getByRole("button", { name: /恢复 \d+/ }).count()) === 0, "unchanged checkpoints should not create a recovery action");
     await page.getByTitle("远程仓库（问题与拉取请求）").click();
     await page.getByText("Repository-owned specification", { exact: true }).click();
     assert(await page.getByText("Keep durable product intent in ordinary versioned repository files.", { exact: true }).isVisible(), "remote Issue detail missing");
@@ -173,7 +194,7 @@ async function run() {
     const receipt = {
       status: "pass",
       browser: executablePath,
-      surfaces: ["workspace-header", "task-activity-drawer", "dense-session-sidebar", "compact-tool-activity", "remote-issue-detail"],
+      surfaces: ["workspace-header", "task-activity-drawer", "dense-session-sidebar", "compact-tool-activity", "local-git-drawer", "github-delivery-status", "remote-issue-detail"],
       viewports: ["1366x768", "800x700 (configured minWidth)"],
       artifact_dir: artifactDir,
       interactive_desktop: "project picker reached; final Open action blocked by macOS lock",

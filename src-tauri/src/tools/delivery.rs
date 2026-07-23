@@ -74,7 +74,46 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     )
     .await;
 
+    if let (Some(db), Some(session_id)) = (ctx.db.as_ref(), ctx.session_id.as_deref()) {
+        persist_delivery_ref(db, session_id, &outcome).await?;
+    }
+
     Ok(ToolOutput::ok(render_report(&outcome)))
+}
+
+async fn persist_delivery_ref(
+    db: &sqlx::SqlitePool,
+    session_id: &str,
+    outcome: &delivery::DeliveryOutcome,
+) -> Result<()> {
+    let (Some(branch), Some(pr_number), Some(pr_url)) = (
+        outcome.branch.as_deref(),
+        outcome.pr_number,
+        outcome.pr_url.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    let updated_at = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO session_delivery_refs
+            (session_id, branch, pr_number, pr_url, commit_sha, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+            branch=excluded.branch,
+            pr_number=excluded.pr_number,
+            pr_url=excluded.pr_url,
+            commit_sha=excluded.commit_sha,
+            updated_at=excluded.updated_at",
+    )
+    .bind(session_id)
+    .bind(branch)
+    .bind(pr_number as i64)
+    .bind(pr_url)
+    .bind(outcome.commit_sha.as_deref())
+    .bind(updated_at)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 /// Render a compact, model-readable report. Never `is_error` for a "blocked"
@@ -131,7 +170,12 @@ mod tests {
         DeliveryOutcome {
             steps: vec![StepResult {
                 step: "ci".into(),
-                status: if final_state == "blocked" { "blocked" } else { "ok" }.into(),
+                status: if final_state == "blocked" {
+                    "blocked"
+                } else {
+                    "ok"
+                }
+                .into(),
                 detail: "detail".into(),
             }],
             branch: Some("feature/x".into()),
@@ -157,5 +201,53 @@ mod tests {
     fn delivered_report_carries_no_attribution_warning() {
         let report = render_report(&outcome("delivered"));
         assert!(!report.contains("不得归因"));
+    }
+    #[tokio::test]
+    async fn session_delivery_reference_is_durable_and_replaced_by_latest_pr() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE session_delivery_refs (
+                session_id TEXT PRIMARY KEY, branch TEXT NOT NULL,
+                pr_number INTEGER NOT NULL, pr_url TEXT NOT NULL,
+                commit_sha TEXT, updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut first = outcome("delivered");
+        first.pr_number = Some(7);
+        first.pr_url = Some("https://github.com/acme/repo/pull/7".into());
+        first.commit_sha = Some("head-7".into());
+        persist_delivery_ref(&pool, "session-1", &first)
+            .await
+            .unwrap();
+
+        let mut latest = first.clone();
+        latest.branch = Some("feature/latest".into());
+        latest.pr_number = Some(8);
+        latest.pr_url = Some("https://github.com/acme/repo/pull/8".into());
+        latest.commit_sha = Some("head-8".into());
+        persist_delivery_ref(&pool, "session-1", &latest)
+            .await
+            .unwrap();
+
+        let row: (String, i64, String) = sqlx::query_as(
+            "SELECT branch, pr_number, commit_sha FROM session_delivery_refs WHERE session_id = ?",
+        )
+        .bind("session-1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, ("feature/latest".into(), 8, "head-8".into()));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_delivery_refs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

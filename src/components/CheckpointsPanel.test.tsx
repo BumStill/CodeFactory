@@ -30,7 +30,7 @@ const changesById: Record<string, Array<{ path: string; status: string }>> = {
   "cp-empty": [],
 };
 
-describe("CheckpointsPanel compact drawer", () => {
+describe("CheckpointsPanel recovery entry", () => {
   beforeEach(() => {
     mocks.invoke.mockReset();
     mocks.listen.mockReset();
@@ -50,7 +50,7 @@ describe("CheckpointsPanel compact drawer", () => {
     const user = userEvent.setup();
     render(<CheckpointsPanel sessionId="s1" />);
 
-    const trigger = await screen.findByRole("button", { name: "检查点 5" });
+    const trigger = await screen.findByRole("button", { name: "恢复 4" });
     expect(screen.queryByRole("heading", { name: "检查点" })).not.toBeInTheDocument();
 
     await user.click(trigger);
@@ -65,7 +65,7 @@ describe("CheckpointsPanel compact drawer", () => {
     expect(screen.queryByText("第四个有效检查点")).not.toBeInTheDocument();
     expect(screen.queryByText("没有文件差异")).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "查看全部 4 个有效检查点" }));
+    await user.click(screen.getByRole("button", { name: "查看最近 4 个有效检查点" }));
     expect(screen.getByText("第四个有效检查点")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "查看 1 个无差异检查点" }));
@@ -76,7 +76,7 @@ describe("CheckpointsPanel compact drawer", () => {
     const user = userEvent.setup();
     render(<CheckpointsPanel sessionId="s1" />);
 
-    await user.click(await screen.findByRole("button", { name: "检查点 5" }));
+    await user.click(await screen.findByRole("button", { name: "恢复 4" }));
     await screen.findByText("修复登录");
     await user.click(screen.getByRole("button", { name: "恢复检查点 修复登录" }));
 
@@ -87,4 +87,33 @@ describe("CheckpointsPanel compact drawer", () => {
       expect(mocks.invoke).toHaveBeenCalledWith("revert_checkpoint", { checkpointId: "cp-1" });
     });
   });
+  it("hides the recovery entry when no checkpoint differs from the worktree", async () => {
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_checkpoints") return Promise.resolve(checkpoints);
+      if (cmd === "checkpoint_changeset") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    render(<CheckpointsPanel sessionId="s1" />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("checkpoint_changeset", { checkpointId: "cp-empty" }));
+    expect(screen.queryByRole("button", { name: /恢复 \d+/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/检查点 5/)).not.toBeInTheDocument();
+  });
+
+  it("bounds recovery diff checks for long-running sessions", async () => {
+    const many = Array.from({ length: 36 }, (_, index) => ({
+      ...checkpoints[0],
+      id: `cp-${index}`,
+      git_sha: `sha-${index}`,
+      created_at: new Date(Date.UTC(2026, 6, 23, 12, 0, 0) - index * 1_000).toISOString(),
+    }));
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_checkpoints") return Promise.resolve(many);
+      if (cmd === "checkpoint_changeset") return Promise.resolve([{ path: "src/a.ts", status: "modified" }]);
+      return Promise.resolve(undefined);
+    });
+    render(<CheckpointsPanel sessionId="s1" />);
+    await screen.findByRole("button", { name: "恢复 12" });
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === "checkpoint_changeset")).toHaveLength(12);
+  });
+
 });

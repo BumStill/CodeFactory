@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: Apache-2.0
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import type { UIMessage } from "../stores/chat";
+
+const mocks = vi.hoisted(() => ({ invoke: vi.fn() }));
+vi.mock("../lib/tauri", async (original) => ({ ...(await original()), invoke: mocks.invoke }));
+import { WorkspaceDeliveryStatus, deliveryReferenceFromMessages } from "./WorkspaceDeliveryStatus";
+
+const delivered: UIMessage[] = [{
+  id: "m1",
+  role: "assistant",
+  content: "",
+  createdAt: 1,
+  toolCalls: [{
+    id: "d1",
+    name: "deliver_changes",
+    args: "{}",
+    status: "done",
+    result: "交付结果: delivered\n分支: feat/workspace-ui\n  ✅ pr: PR #175: https://github.com/acme/repo/pull/175\nPR: https://github.com/acme/repo/pull/175",
+  }],
+}];
+
+describe("WorkspaceDeliveryStatus", () => {
+  beforeEach(() => mocks.invoke.mockReset());
+
+  it("restores the session PR reference after the local worktree has returned to main", () => {
+    expect(deliveryReferenceFromMessages(delivered)).toEqual({ branch: "feat/workspace-ui", prNumber: 175 });
+  });
+
+  it("shows PR, CI, merge, and release as one delivery chain", async () => {
+    mocks.invoke.mockResolvedValue({
+      remote_available: true,
+      pr: {
+        number: 175,
+        title: "Improve workspace",
+        state: "merged",
+        draft: false,
+        head_branch: "feat/workspace-ui",
+        base_branch: "main",
+        head_sha: "abc",
+        merge_commit_sha: "def",
+        url: "https://github.com/acme/repo/pull/175",
+      },
+      ci_status: "success",
+      release: { tag: "v1.63.0", url: "https://github.com/acme/repo/releases/tag/v1.63.0", published_at: "2026-07-23T00:00:00Z" },
+      error: null,
+    });
+    render(<WorkspaceDeliveryStatus cwd="/repo" currentBranch="main" messages={delivered} />);
+
+    const status = await screen.findByRole("button", { name: "会话交付状态" });
+    expect(status).toHaveTextContent("PR #175");
+    expect(status).toHaveTextContent("CI 通过");
+    expect(status).toHaveTextContent("已合并");
+    expect(status).toHaveTextContent("v1.63.0 已上线");
+    expect(mocks.invoke).toHaveBeenCalledWith("workspace_delivery_status", {
+      cwd: "/repo",
+      branch: "feat/workspace-ui",
+      prNumber: 175,
+    });
+
+    await userEvent.click(status);
+    const drawer = screen.getByRole("dialog", { name: "交付详情" });
+    expect(drawer).toHaveTextContent("feat/workspace-ui → main");
+    expect(drawer).toHaveTextContent("6");
+  });
+
+  it("does not misreport an unavailable remote as no PR", async () => {
+    mocks.invoke.mockResolvedValue({
+      remote_available: false,
+      pr: null,
+      ci_status: "none",
+      release: null,
+      error: "not authenticated",
+    });
+    render(<WorkspaceDeliveryStatus cwd="/repo" currentBranch="feat/workspace-ui" messages={[]} />);
+    expect(await screen.findByRole("button", { name: "会话交付状态" })).toHaveTextContent("远程状态不可用");
+    expect(screen.queryByText("未关联 PR")).not.toBeInTheDocument();
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalled());
+  });
+});

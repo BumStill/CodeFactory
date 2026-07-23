@@ -88,6 +88,28 @@ mockIPC(
       case "get_endpoint_active_model": return session.model_id;
       case "list_git_remotes": return [remote];
       case "list_issues": return [issue];
+      case "workspace_delivery_status":
+        return {
+          remote_available: true,
+          pr: {
+            number: 175,
+            title: "Improve workspace status",
+            state: "merged",
+            draft: false,
+            head_branch: "feat/workspace-ui",
+            base_branch: "main",
+            head_sha: "3373a69963b1ef2a191f06dd1397be3ddf043435",
+            merge_commit_sha: "2c2af7728065520a73d93ef16376d738381eb42f",
+            url: "https://github.com/BumStill/CodeFactory/pull/175",
+          },
+          ci_status: "success",
+          release: {
+            tag: "v1.63.0",
+            url: "https://github.com/BumStill/CodeFactory/releases/tag/v1.63.0",
+            published_at: "2026-07-23T00:00:00Z",
+          },
+          error: null,
+        };
       case "git_status":
         return {
           branch: "codex/repo-owned-specs",

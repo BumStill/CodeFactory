@@ -26,6 +26,7 @@ interface Props {
 }
 
 const RECENT_LIMIT = 3;
+const CANDIDATE_LIMIT = 12;
 
 export function CheckpointsPanel({ sessionId }: Props) {
   const [checkpoints, setCheckpoints] = useState<CheckpointInfo[]>([]);
@@ -43,9 +44,19 @@ export function CheckpointsPanel({ sessionId }: Props) {
     }
     try {
       const list = await invoke<CheckpointInfo[]>("list_checkpoints", { sessionId });
-      const unique = dedupeBySnapshot(list);
+      // Recovery is an emergency affordance, not a full snapshot archive.
+      // Bound diff work so old conversations cannot fan out dozens of git calls.
+      const unique = dedupeBySnapshot(list).slice(0, CANDIDATE_LIMIT);
+      const results = await Promise.all(unique.map(async (checkpoint) => {
+        try {
+          const files = await invoke<CheckpointFileChange[]>("checkpoint_changeset", { checkpointId: checkpoint.id });
+          return [checkpoint.id, files] as const;
+        } catch {
+          return [checkpoint.id, [{ path: "", status: "modified" } as CheckpointFileChange]] as const;
+        }
+      }));
       setCheckpoints(unique);
-      setChanges({});
+      setChanges(Object.fromEntries(results));
     } catch {
       setCheckpoints([]);
       setChanges({});
@@ -69,26 +80,6 @@ export function CheckpointsPanel({ sessionId }: Props) {
     };
   }, [sessionId, refresh]);
 
-  useEffect(() => {
-    if (!open || checkpoints.length === 0) return;
-    let cancelled = false;
-    Promise.all(
-      checkpoints.map(async (checkpoint) => {
-        try {
-          const files = await invoke<CheckpointFileChange[]>("checkpoint_changeset", {
-            checkpointId: checkpoint.id,
-          });
-          return [checkpoint.id, files] as const;
-        } catch {
-          // Unknown is safer to retain than incorrectly hiding a recoverable snapshot.
-          return [checkpoint.id, [{ path: "", status: "modified" } as CheckpointFileChange]] as const;
-        }
-      }),
-    ).then((results) => {
-      if (!cancelled) setChanges(Object.fromEntries(results));
-    });
-    return () => { cancelled = true; };
-  }, [open, checkpoints]);
 
   const changed = useMemo(
     () => checkpoints.filter((checkpoint) => (changes[checkpoint.id]?.length ?? 0) > 0),
@@ -99,20 +90,21 @@ export function CheckpointsPanel({ sessionId }: Props) {
     [checkpoints, changes],
   );
   const visibleChanged = showAllChanged ? changed : changed.slice(0, RECENT_LIMIT);
+  const changesLoaded = checkpoints.length > 0 && checkpoints.every((checkpoint) => changes[checkpoint.id] !== undefined);
 
-  if (!sessionId) return null;
+  if (!sessionId || !changesLoaded || changed.length === 0) return null;
 
   return (
     <>
       <button
         onClick={() => setOpen(true)}
-        aria-label={`检查点 ${checkpoints.length}`}
-        title="查看自动检查点"
+        aria-label={`恢复 ${changed.length}`}
+        title="查看可恢复快照"
         className="inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-2 py-1 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
       >
         <History size={11} />
-        <span>检查点</span>
-        <span className="tabular-nums text-gray-600">{checkpoints.length}</span>
+        <span>恢复</span>
+        <span className="tabular-nums text-gray-600">{changed.length}</span>
       </button>
 
       {open && (
@@ -170,10 +162,10 @@ export function CheckpointsPanel({ sessionId }: Props) {
                     {!showAllChanged && changed.length > RECENT_LIMIT && (
                       <button
                         onClick={() => setShowAllChanged(true)}
-                        aria-label={`查看全部 ${changed.length} 个有效检查点`}
+                        aria-label={`查看最近 ${changed.length} 个有效检查点`}
                         className="mt-2 w-full rounded px-2 py-1.5 text-[11px] text-gray-500 hover:bg-surface-2 hover:text-gray-200"
                       >
-                        查看全部 {changed.length} 个有效检查点
+                        查看最近 {changed.length} 个有效检查点
                       </button>
                     )}
                   </section>
