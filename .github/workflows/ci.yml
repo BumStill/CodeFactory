@@ -102,6 +102,12 @@ jobs:
       - name: Cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml --quiet
 
+      # The root `cargo test` covers only the `codefactory` package. The shared
+      # tauri-free loop crate (keystone slice 4) is a separate workspace member,
+      # so test it explicitly — future slices move real loop logic here.
+      - name: Cargo test (agent-loop crate)
+        run: cargo test --manifest-path src-tauri/Cargo.toml -p codefactory-agent-loop --quiet
+
       - name: Evolution executable closed-loop smoke
         shell: pwsh
         run: |
