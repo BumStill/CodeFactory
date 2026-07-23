@@ -63,11 +63,34 @@ headless runner is a `not(test)` binary that sets `app: None`. The real remainin
 friction those gates represent dissolves in **Slice 3**, when `AgentLoop` itself
 stops requiring a concrete `AppHandle`.
 
-### Slice 3 — headless `AgentLoop::run_headless`
-A constructor/entry that builds an `AgentLoop` with a `CollectingEventSink`
-(or a streaming JSONL sink), `app: None`, an in-memory or file-backed history,
-no Tauri. Runs the SAME loop, SAME gate, SAME tools. Returns the final transcript
-+ event trace.
+### Slice 3 — headless `AgentLoop::new_headless` ✅ (shipped)
+The seam that makes the real loop constructible with no `AppHandle`.
+
+**What shipped:**
+- `AgentLoop.app` is now `Option<AppHandle>`; every remaining `AppHandle` use is
+  guarded — usage pings, hooks (`HookRunner::disabled_headless`), skills
+  (`enabled_user_skill_prompts` / `prompts_from_skill_dir`, user-skills only),
+  and `ExecCtx.app`. The emit path already went through `EventSink` (slice 1),
+  so `run()` itself needs no `app`.
+- `AgentLoop::new_headless(events: Arc<dyn EventSink>, …, mode)` — same fields as
+  `new_with_mode` minus `app` (set to `None`), events supplied by the caller
+  (a `CollectingEventSink` for eval, a JSONL sink for a CLI). It constructs no
+  `AppHandle` and calls no `AppHandle` method.
+- `--headless-smoke <receipt.json>` (`run_headless_smoke_cli`) — a release/CI
+  entry mirroring `--evolution-smoke`. It builds the real loop headless on the
+  **packaged binary** and asserts the full tool surface is reachable and the
+  event sink records. Wired into Windows CI, this proves the loader path #166
+  made fragile stays sound on the exact executable — safely, because it's a
+  `not(test)` binary, never the unit-test EXE.
+
+**Verification:** full Rust suite green (app-less skills helper + headless
+`HookRunner` unit tests run on every platform incl. Windows); `--headless-smoke`
+returns `{ok, tool_count:24, events_recorded:1, app_handle:"none"}` and exits 0.
+
+**Deferred to slice 4 (deliberately):** the live headless *turn* (calling `run()`
+end-to-end against a model / recorded fixture). Constructing a full `AgentLoop`
+inside a `#[cfg(test)]` unit test is avoided — that is the #166 trigger; the
+binary smoke is the right vehicle instead.
 
 ### Slice 4 — retire `agent-headless` fork / repoint its callers
 Once `run_headless` reaches parity, delete the 2759-line shell-only crate (or

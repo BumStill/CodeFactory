@@ -698,6 +698,24 @@ pub async fn delete_skill(id: String, app: AppHandle) -> Result<(), String> {
 /// The trimmed `system_prompt.md` body of every enabled skill, in list order.
 /// The agent loop wraps each into a budgeted context block (see
 /// `agent::context_budget`) rather than concatenating them unbounded.
+/// Assemble enabled-skill system prompts from a single skills directory —
+/// no `AppHandle` needed. The headless agent loop uses this (user skills
+/// only); the UI path merges builtin + user via [`enabled_skill_prompts`].
+pub fn prompts_from_skill_dir(dir: &Path) -> Vec<String> {
+    scan_skill_dir(&dir.to_path_buf(), "user")
+        .iter()
+        .filter(|s| s.enabled)
+        .filter_map(|s| std::fs::read_to_string(PathBuf::from(&s.path).join("system_prompt.md")).ok())
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Enabled USER-skill prompts, headless (no builtin skills, no `AppHandle`).
+pub async fn enabled_user_skill_prompts() -> Vec<String> {
+    prompts_from_skill_dir(&user_skills_dir())
+}
+
 pub async fn enabled_skill_prompts(app: &AppHandle) -> Vec<String> {
     let skills = match list_skills(app.clone()).await {
         Ok(s) => s,
@@ -1312,6 +1330,40 @@ pub async fn propose_skills_from_patterns(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn headless_skill_prompts_read_enabled_skills_from_a_dir_without_an_app() {
+        // Keystone slice 3: the agent loop assembles enabled-skill prompts.
+        // The UI path needs the AppHandle (builtin resource dir); a HEADLESS
+        // run has none, so it reads enabled USER skills from a dir directly.
+        let dir = std::env::temp_dir().join(format!("cf-headless-skills-{}", std::process::id()));
+        let on = dir.join("on-skill");
+        std::fs::create_dir_all(&on).unwrap();
+        std::fs::write(
+            on.join("manifest.json"),
+            r#"{"id":"on","name":"On","description":"d","version":"1.0.0","author":"a","tags":[],"enabled":true}"#,
+        )
+        .unwrap();
+        std::fs::write(on.join("system_prompt.md"), "  ENABLED PROMPT BODY  ").unwrap();
+
+        let off = dir.join("off-skill");
+        std::fs::create_dir_all(&off).unwrap();
+        std::fs::write(
+            off.join("manifest.json"),
+            r#"{"id":"off","name":"Off","description":"d","version":"1.0.0","author":"a","tags":[],"enabled":false}"#,
+        )
+        .unwrap();
+        std::fs::write(off.join("system_prompt.md"), "DISABLED PROMPT").unwrap();
+
+        let prompts = prompts_from_skill_dir(&dir);
+        assert_eq!(prompts, vec!["ENABLED PROMPT BODY".to_string()]);
+
+        // Missing dir → empty, never a panic.
+        assert!(prompts_from_skill_dir(std::path::Path::new("/definitely/not/here")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn scan_skill_roots_previews_openclaw_skills_and_marks_installed() {
         // One-click OpenClaw import (WorkBuddy-gap P2): scan known roots,
