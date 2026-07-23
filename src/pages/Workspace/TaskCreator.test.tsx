@@ -238,14 +238,13 @@ describe("session-native task delegation", () => {
     expect(screen.queryByTitle(/规范工作台/)).not.toBeInTheDocument();
   });
 
-  it("names exactly how many pending tasks will continue", async () => {
+  it("shows explanation text instead of a manual start button when tasks are pending without failures", async () => {
     fakeTasksState.tasks = { s1: [task()] };
     renderWorkspace();
 
     await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
     expect(screen.getByText("执行已暂停，还有 1 项等待执行。" )).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "继续执行 1 项" }));
-    expect(mocks.start).toHaveBeenCalledWith("s1");
+    expect(screen.getByText("任务已委派，由后台调度器自动执行；若长时间未开始请检查模型配置或重试委派。")).toBeInTheDocument();
   });
 
   it("does not offer a generic continue action while a failure blocks pending work", async () => {
