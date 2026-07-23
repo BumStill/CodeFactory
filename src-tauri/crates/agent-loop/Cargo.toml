@@ -12,5 +12,14 @@ license = "Apache-2.0"
 # the bin crate under #[cfg(not(test))] so the unit-test EXE never links Tauri
 # runtime entrypoints (STATUS_ENTRYPOINT_NOT_FOUND, #166).
 [dependencies]
+codefactory-agent-core = { path = "../agent-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# dyn-compatible async trait methods (native AFIT is not object-safe, and the
+# loop dispatches over Arc<dyn ToolBackend> / Arc<dyn ModelTransport>).
+async-trait = "0.1"
+
+[dev-dependencies]
+# The async trait tests exercise the object-safe seams. tokio graduates to a
+# real dependency when the loop body moves here (slice 4.6).
+tokio = { version = "1", features = ["macros", "rt"] }
