@@ -1,0 +1,16 @@
+[package]
+name = "codefactory-agent-loop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# Tauri-free shared agent-loop crate (keystone slice 4). Houses the wire types,
+# the EventSink abstraction, and — in later slices — the pluggable ToolBackend /
+# Persistence / ModelTransport traits and the single loop body that both the
+# desktop app and the Terminal-Bench headless sidecar drive. It MUST NOT depend
+# on tauri or on the `codefactory` bin crate: every AppHandle/pool owner stays in
+# the bin crate under #[cfg(not(test))] so the unit-test EXE never links Tauri
+# runtime entrypoints (STATUS_ENTRYPOINT_NOT_FOUND, #166).
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -389,6 +389,7 @@ dependencies = [
  "calamine",
  "chrono",
  "codefactory-agent-core",
+ "codefactory-agent-loop",
  "dashmap",
  "dirs 5.0.1",
  "futures-util",
@@ -442,6 +443,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "codefactory-agent-loop"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
