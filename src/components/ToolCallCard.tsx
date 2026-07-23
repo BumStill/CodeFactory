@@ -72,6 +72,31 @@ function styleForTool(name: string): ToolStyle {
   }
 }
 
+function toolLabel(name: string): string {
+  switch (name) {
+    case "bash":
+    case "exec": return "命令";
+    case "read_file":
+    case "read": return "读取";
+    case "write_file":
+    case "write": return "写入";
+    case "edit_file":
+    case "edit": return "编辑";
+    case "grep": return "搜索";
+    case "glob":
+    case "list_files": return "文件";
+    case "web_fetch":
+    case "fetch":
+    case "web_search": return "网络";
+    case "delegate_tasks":
+    case "spawn_subagent":
+    case "task": return "委派";
+    case "kb_search":
+    case "kb_get_chunk": return "知识";
+    default: return name;
+  }
+}
+
 // ── One-line summary of tool arguments (for collapsed view) ─────────────────
 function summarizeArgs(name: string, raw: string): string | null {
   try {
@@ -286,28 +311,35 @@ export function ToolCallCard({ tc }: Props) {
       <span className="w-3 h-3 rounded-full border border-accent animate-pulse shrink-0" />
     );
 
-  // Test-file edits get an amber border so the user can spot AI touching
-  // tests at a glance and double-check the justification.
-  const borderClass = isTestMod
-    ? "border-amber-500/60 bg-amber-500/5"
-    : "border-border bg-surface-2";
+  const needsAttention = tc.status !== "done" || Boolean(tc.isError);
+  const shellClass = needsAttention
+    ? tc.status === "error" || tc.status === "denied" || tc.isError
+      ? "rounded-md border border-red-500/25 bg-red-500/5"
+      : tc.status === "waiting_permission"
+        ? "rounded-md border border-amber-500/25 bg-amber-500/5"
+        : "rounded-md border border-accent/20 bg-accent/5"
+    : "border-b border-border/60";
 
   return (
-    <div className={`my-1 rounded border ${borderClass} text-xs`}>
+    <div className={`my-0.5 text-xs ${shellClass}`} data-tool-status={tc.status}>
       <button
-        className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-surface-3 transition-colors"
+        data-density={needsAttention ? "attention" : "compact"}
+        aria-label={`${toolLabel(tc.name)}${summary ? ` · ${summary}` : ""}`}
+        className={`flex min-h-7 w-full items-center gap-1.5 px-2 text-left transition-colors hover:bg-surface-3 ${
+          needsAttention ? "py-1" : "py-0.5"
+        }`}
         onClick={() => setOpen((o) => !o)}
       >
-        {open ? <ChevronDown size={12} className="text-gray-600 shrink-0" /> : <ChevronRight size={12} className="text-gray-600 shrink-0" />}
-        <Icon size={12} className={`${iconClass} shrink-0`} />
-        <span className="text-gray-300 font-mono shrink-0">{tc.name}</span>
+        {open ? <ChevronDown size={11} className="text-gray-600 shrink-0" /> : <ChevronRight size={11} className="text-gray-600 shrink-0" />}
+        <Icon size={11} className={`${needsAttention ? iconClass : "text-gray-600"} shrink-0`} />
+        <span className={`shrink-0 ${needsAttention ? "text-gray-300" : "text-gray-500"}`}>{toolLabel(tc.name)}</span>
         {isTestMod && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-800 dark:text-amber-300 font-medium shrink-0">
+          <span className="shrink-0 rounded bg-surface-3 px-1 py-0.5 text-[9px] font-medium text-gray-500">
             test
           </span>
         )}
         {summary && (
-          <span className="text-gray-500 font-mono truncate min-w-0">· {summary}</span>
+          <span className="min-w-0 truncate font-mono text-[11px] text-gray-600">· {summary}</span>
         )}
         <span className="ml-auto shrink-0">{statusIcon}</span>
       </button>
@@ -329,7 +361,7 @@ export function ToolCallCard({ tc }: Props) {
             }).catch(() => {})
           }
           title={`打开 ${filePath}`}
-          className="flex w-full items-center gap-1.5 border-t border-border px-3 py-1 text-left text-[11px] text-accent transition-colors hover:bg-surface-3"
+          className="ml-7 flex max-w-[calc(100%-1.75rem)] items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-[10px] text-accent transition-colors hover:bg-surface-3"
         >
           <ExternalLink size={11} className="shrink-0" />
           <span className="truncate font-mono">{basename(filePath)}</span>
@@ -338,7 +370,7 @@ export function ToolCallCard({ tc }: Props) {
       )}
 
       {open && (
-        <div className="border-t border-border px-3 py-2 space-y-2 font-mono">
+        <div className="border-t border-border px-2.5 py-1.5 space-y-1.5 font-mono">
           {tc.args && (
             <div>
               <div className="text-gray-500 mb-1">input</div>

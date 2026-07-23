@@ -23,6 +23,14 @@ const session: Session = {
   total_output_tokens: 0,
   kind: "project",
 };
+const sidebarSessions: Session[] = Array.from({ length: 12 }, (_, index) => ({
+  ...session,
+  id: index === 0 ? sessionId : `repository-session-${index}`,
+  title: index === 0 ? session.title : `会话 ${index + 1}`,
+  cwd: `${cwd}/project-${index + 1}`,
+  updated_at: Date.now() - index * 60 * 60 * 1000,
+}));
+
 const delegatedTask: TaskRun = {
   id: "delegated-task",
   session_id: sessionId,
@@ -69,7 +77,7 @@ mockWindows("main");
 mockIPC(
   (command) => {
     switch (command) {
-      case "list_sessions": return [session];
+      case "list_sessions": return sidebarSessions;
       case "list_quick_sessions": return [];
       case "list_tasks": return [delegatedTask];
       case "get_task_dependencies": return [];
@@ -128,12 +136,35 @@ const settings = {
 applyTheme(settings);
 useSettingsStore.setState({ settings });
 useChatStore.setState({
-  sessions: [session],
+  sessions: sidebarSessions,
   quickSessions: [],
   activeSession: session,
   draftSession: null,
   activeModel: session.model_id,
-  runtime: { [sessionId]: freshRuntime() },
+  runtime: {
+    [sessionId]: {
+      ...freshRuntime(),
+      messages: [{
+        id: "tool-density-message",
+        role: "assistant",
+        content: "已完成界面整理。",
+        createdAt: Date.now(),
+        segments: [
+          { kind: "tool", toolCallId: "read-1" },
+          { kind: "tool", toolCallId: "edit-1" },
+          { kind: "tool", toolCallId: "test-1" },
+          { kind: "tool", toolCallId: "failed-1" },
+          { kind: "text", text: "已完成界面整理。" },
+        ],
+        toolCalls: [
+          { id: "read-1", name: "read_file", args: JSON.stringify({ path: "src/App.tsx" }), status: "done", result: "ok" },
+          { id: "edit-1", name: "edit_file", args: JSON.stringify({ path: "src/App.tsx", old_string: "a", new_string: "b" }), status: "done", result: "ok" },
+          { id: "test-1", name: "bash", args: JSON.stringify({ command: "npm test" }), status: "done", result: "ok" },
+          { id: "failed-1", name: "bash", args: JSON.stringify({ command: "npm run check" }), status: "error", isError: true, result: "check failed" },
+        ],
+      }],
+    },
+  },
 });
 useTasksStore.setState({
   tasks: { [sessionId]: [delegatedTask] },

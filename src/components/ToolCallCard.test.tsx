@@ -66,4 +66,12 @@ describe("ToolCallCard — open generated file", () => {
     render(<ToolCallCard tc={tc({ isError: true, status: "error" })} />);
     expect(screen.queryByText("打开文件")).not.toBeInTheDocument();
   });
+  it("renders a successful command as a compact, low-emphasis activity row", () => {
+    const { container } = render(<ToolCallCard tc={tc({ name: "bash", args: JSON.stringify({ command: "npm test" }) })} />);
+    const row = screen.getByRole("button", { name: /命令.*npm test/ });
+    expect(row).toHaveAttribute("data-density", "compact");
+    expect(row).toHaveClass("min-h-7");
+    expect(container.firstElementChild).not.toHaveClass("bg-surface-2");
+  });
+
 });

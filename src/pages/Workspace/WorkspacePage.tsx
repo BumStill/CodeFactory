@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   BookOpen,
-  ChevronDown,
-  ChevronRight,
   Settings as SettingsIcon,
   PanelLeftClose,
   PanelLeftOpen,
@@ -16,6 +14,8 @@ import {
   Play,
   Square,
   EyeOff,
+  ListTodo,
+  X,
 } from "lucide-react";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
@@ -24,7 +24,6 @@ import { ModelPicker } from "../../components/ModelPicker";
 import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
-import { ExecutionStream } from "../../components/ExecutionStream";
 import { GitStatusBar } from "../../components/GitStatusBar";
 import { CheckpointsPanel } from "../../components/CheckpointsPanel";
 import { GitChangesPanel } from "../../components/GitChangesPanel";
@@ -119,13 +118,28 @@ export function WorkspacePage({
   // pending edit can't blur-commit onto the wrong session.
   useEffect(() => {
     setTitleEditing(false);
-  }, [sessionId]);
+    setTaskActivityOpen(Boolean(initialTaskLogId));
+  }, [initialTaskLogId, sessionId]);
   // Git / environment panel — surface the (previously unwired) git UI in the
   // right column: a branch/status bar + slide-out Changes / History / PR panels.
   const [gitPanel, setGitPanel] = useState<"changes" | "history" | "remote" | null>(null);
   const gitBranch = useGitStore((s) => s.status?.branch ?? "");
   const activeCwd = activeSession?.cwd ?? activeDraft?.cwd ?? null;
-  const projectTaskCount = useTasksStore((state) => state.tasks[sessionId]?.length ?? 0);
+  const projectTasks = useTasksStore((state) => state.tasks[sessionId]);
+  const sessionTasks = projectTasks ?? [];
+  const projectTaskCount = sessionTasks.length;
+  const taskRunningCount = sessionTasks.filter((task) => task.status === "running").length;
+  const taskPendingCount = sessionTasks.filter((task) => task.status === "pending").length;
+  const taskFailedCount = sessionTasks.filter(
+    (task) => task.status === "failed" || task.status === "cancelled",
+  ).length;
+  const taskActivityVisible = taskRunningCount + taskPendingCount + taskFailedCount > 0;
+  const [taskActivityOpen, setTaskActivityOpen] = useState(Boolean(initialTaskLogId));
+  const taskActivityButtonRef = useRef<HTMLButtonElement>(null);
+  const closeTaskActivity = () => {
+    setTaskActivityOpen(false);
+    requestAnimationFrame(() => taskActivityButtonRef.current?.focus());
+  };
   const loadProjectTasks = useTasksStore((state) => state.loadTasks);
   const subscribeProjectTasks = useTasksStore((state) => state.subscribe);
   const isProjectSession = Boolean(
@@ -142,6 +156,15 @@ export function WorkspacePage({
     void subscribeProjectTasks(sessionId).then((stop) => { unsubscribe = stop; });
     return () => { unsubscribe?.(); };
   }, [isProjectSession, loadProjectTasks, sessionId, subscribeProjectTasks]);
+
+  useEffect(() => {
+    if (!taskActivityOpen) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeTaskActivity();
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [taskActivityOpen]);
 
   useEffect(() => {
     // Draft IDs are reused by materialization. Once the first message creates
@@ -247,6 +270,33 @@ export function WorkspacePage({
           />
           {!activeDraft && <CheckpointsPanel sessionId={sessionId} />}
         </div>
+        {isProjectSession && taskActivityVisible && (
+          <button
+            ref={taskActivityButtonRef}
+            type="button"
+            onClick={() => setTaskActivityOpen(true)}
+            aria-label="打开任务活动"
+            className={`inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11px] transition-colors ${
+              taskFailedCount > 0
+                ? "bg-red-500/10 text-red-700 hover:bg-red-500/15 dark:text-red-300"
+                : taskRunningCount > 0
+                  ? "bg-accent/10 text-accent hover:bg-accent/15"
+                  : "text-gray-500 hover:bg-surface-3 hover:text-gray-300"
+            }`}
+            title="查看后台任务、验收结果和恢复操作"
+          >
+            <ListTodo size={12} />
+            <span>
+              {taskFailedCount > 0
+                ? `${taskFailedCount} 项需处理`
+                : taskRunningCount > 0
+                  ? `正在处理 ${taskRunningCount}`
+                  : taskPendingCount > 0
+                    ? `待处理 ${taskPendingCount}`
+                    : `任务 ${projectTaskCount}`}
+            </span>
+          </button>
+        )}
         <button
           onClick={onOpenSettings}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
@@ -267,12 +317,8 @@ export function WorkspacePage({
           </aside>
         )}
 
-        {/* ─── Center: conversation + its internal execution detail ─────── */}
+        {/* ─── Center: conversation remains the primary surface. ─────────── */}
         <main aria-label="会话窗口" className="flex-1 flex flex-col min-w-0">
-          {isProjectSession && projectTaskCount > 0 && (
-            <TasksColumn sessionId={sessionId} highlightedTaskId={initialTaskLogId} />
-          )}
-          {!activeDraft && !isProjectSession && <ExecutionStream sessionId={sessionId} />}
           <MessageList
             messages={messages}
             streaming={streaming}
@@ -300,6 +346,29 @@ export function WorkspacePage({
         </main>
 
       </div>
+
+      {taskActivityOpen && isProjectSession && projectTaskCount > 0 && (
+        <div
+          className="fixed inset-0 z-40 flex justify-end bg-black/20"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeTaskActivity();
+          }}
+        >
+          <section
+            role="dialog"
+            aria-label="任务活动"
+            aria-modal="true"
+            className="flex h-full w-[min(420px,92vw)] flex-col border-l border-border bg-surface-1 shadow-2xl"
+          >
+            <TasksColumn
+              sessionId={sessionId}
+              highlightedTaskId={initialTaskLogId}
+              onClose={closeTaskActivity}
+            />
+          </section>
+        </div>
+      )}
 
       {/* ── Git / environment slide-out panels (opened from the status bar) ─ */}
       {gitPanel === "changes" && <GitChangesPanel onClose={() => setGitPanel(null)} />}
@@ -331,7 +400,7 @@ export function WorkspacePage({
 
 // Task decomposition is internal to the conversation; this panel only renders
 // the execution detail after the agent has delegated work.
-function TasksColumn({ sessionId, highlightedTaskId }: { sessionId: string; highlightedTaskId?: string | null }) {
+function TasksColumn({ sessionId, highlightedTaskId, onClose }: { sessionId: string; highlightedTaskId?: string | null; onClose: () => void }) {
   const { tasks, running, start, cancel, retryFailedTasks } = useTasksStore();
   const sessionTasks: TaskRun[] = tasks[sessionId] ?? [];
   const isRunning = running[sessionId] ?? false;
@@ -347,7 +416,6 @@ function TasksColumn({ sessionId, highlightedTaskId }: { sessionId: string; high
   const blockedFailedCount = failedTasks.length - repairableFailedCount;
   const [startError, setStartError] = useState<string | null>(null);
   const [repairBusy, setRepairBusy] = useState(false);
-  const [collapsed, setCollapsed] = useState(false);
 
   const handleStart = async () => {
     setStartError(null);
@@ -371,39 +439,39 @@ function TasksColumn({ sessionId, highlightedTaskId }: { sessionId: string; high
   if (sessionTasks.length === 0) return null;
 
   return (
-    <div className={`flex shrink-0 flex-col border-t border-border ${collapsed ? "" : "max-h-[55%] min-h-0"}`}>
-      <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
-        <button onClick={() => setCollapsed((value) => !value)} className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500 transition-colors hover:text-gray-300" title={collapsed ? "展开执行详情" : "折叠执行详情"}>
-          {collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
-          <span title="对话根据需求自动委派的执行步骤">会话执行详情</span>
-          <span className="ml-0.5 text-gray-600">· {sessionTasks.length}</span>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex h-12 shrink-0 items-center justify-between border-b border-border px-4">
+        <div className="min-w-0">
+          <h2 className="text-sm font-medium text-gray-200">任务活动</h2>
+          <p className="text-[10px] text-gray-600">后台步骤、验收结果与恢复操作</p>
+        </div>
+        <button autoFocus type="button" onClick={onClose} aria-label="关闭任务活动" className="rounded p-1 text-gray-500 hover:bg-surface-3 hover:text-gray-200">
+          <X size={15} />
         </button>
+      </div>
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-4 py-2">
+        <div className="flex items-center gap-2 text-[10px] text-gray-600">
+          <span>完成 {completedCount}</span><span>待处理 {pendingCount}</span>
+          {runningCount > 0 && <span className="text-accent">运行中 {runningCount}</span>}
+          {repairableFailedCount > 0 && <span className="text-amber-700 dark:text-amber-300">可重试 {repairableFailedCount}</span>}
+          {blockedFailedCount > 0 && <span className="text-red-700 dark:text-red-300">需处理 {blockedFailedCount}</span>}
+        </div>
         <div className="flex items-center gap-1">
           {isRunning ? (
-            <button onClick={() => void handleCancel()} className="flex items-center gap-1 rounded bg-red-500/10 px-1.5 py-0.5 text-[10px] text-red-700 hover:bg-red-500/20 dark:text-red-300" title="停止当前会话的委派执行"><Square size={9} />停止</button>
+            <button onClick={() => void handleCancel()} className="flex items-center gap-1 rounded bg-red-500/10 px-2 py-1 text-[10px] text-red-700 hover:bg-red-500/20 dark:text-red-300"><Square size={9} />停止</button>
           ) : pendingCount > 0 ? (
-            <button onClick={() => void handleStart()} className="flex items-center gap-1 rounded bg-accent px-1.5 py-0.5 text-[10px] text-white hover:bg-accent-hover" title={`继续执行 ${pendingCount} 个待处理步骤`}><Play size={9} />继续</button>
+            <button onClick={() => void handleStart()} className="flex items-center gap-1 rounded bg-accent px-2 py-1 text-[10px] text-white hover:bg-accent-hover"><Play size={9} />继续</button>
           ) : null}
           {!isRunning && failedTasks.length > 0 && (
-            <button onClick={() => void handleRepairFailed()} disabled={repairBusy || repairableFailedCount === 0} className="flex items-center gap-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-700 disabled:opacity-40 dark:text-amber-300" title={repairableFailedCount > 0 ? "重试可自动修复的失败步骤" : "失败原因需要先在对话里处理"}>
+            <button onClick={() => void handleRepairFailed()} disabled={repairBusy || repairableFailedCount === 0} className="flex items-center gap-1 rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-700 disabled:opacity-40 dark:text-amber-300" title={repairableFailedCount > 0 ? "重试可自动修复的失败步骤" : "失败原因需要先在对话里处理"}>
               {repairBusy ? <Loader2 size={9} className="animate-spin" /> : <RefreshCw size={9} />}
               {repairableFailedCount > 0 ? "重试失败步骤" : "需在对话处理"}
             </button>
           )}
         </div>
       </div>
-      {!collapsed && (
-        <>
-          {startError && <div className="border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-[10px] text-red-700 dark:text-red-300">{startError}</div>}
-          <div className="flex items-center gap-2 border-b border-border px-3 py-1 text-[10px] text-gray-600">
-            <span>完成 {completedCount}</span><span>待处理 {pendingCount}</span>
-            {runningCount > 0 && <span className="text-accent">运行中 {runningCount}</span>}
-            {repairableFailedCount > 0 && <span className="text-amber-700 dark:text-amber-300">可重试 {repairableFailedCount}</span>}
-            {blockedFailedCount > 0 && <span className="text-red-700 dark:text-red-300">需处理 {blockedFailedCount}</span>}
-          </div>
-          <div className="flex-1 overflow-y-auto p-2"><ul className="space-y-0.5">{buildTaskTree(sessionTasks).map(({ task, depth }) => <TaskRow key={task.id} task={task} depth={depth} highlighted={task.id === highlightedTaskId} />)}</ul></div>
-        </>
-      )}
+      {startError && <div className="border-b border-red-500/20 bg-red-500/10 px-4 py-2 text-[10px] text-red-700 dark:text-red-300">{startError}</div>}
+      <div className="flex-1 overflow-y-auto p-3"><ul className="space-y-1">{buildTaskTree(sessionTasks).map(({ task, depth }) => <TaskRow key={task.id} task={task} depth={depth} highlighted={task.id === highlightedTaskId} />)}</ul></div>
     </div>
   );
 }
