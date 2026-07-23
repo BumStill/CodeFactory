@@ -12,6 +12,7 @@ pub mod journal;
 pub mod scheduler;
 pub mod sse_buffer;
 pub mod subagent;
+mod tool_backend;
 pub mod user_context;
 pub mod verification;
 pub mod worktree;
@@ -44,8 +45,11 @@ use crate::errors::Result;
 use crate::mcp::McpManager;
 use crate::openrouter::types::*;
 use crate::storage::Message;
-use crate::tools::{self, ExecCtx};
+use crate::tools::{self};
 use crate::PendingPermissionMap;
+// Brings `DesktopToolBackend::execute`/`list_schemas` into method scope; the
+// concrete backend lives in `tool_backend`.
+use codefactory_agent_loop::tool::ToolBackend as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionResponse {
@@ -1406,11 +1410,19 @@ impl AgentLoop {
                     continue;
                 }
 
-                let ctx = ExecCtx {
-                    cwd: self.cwd.clone(),
+                // Tool execution now flows through the shared ToolBackend seam
+                // (keystone slice 4.3): the desktop backend builds the ExecCtx
+                // and runs MCP-first / native-dispatch. Timing stays in the loop
+                // so it covers the fatal-error path exactly as before.
+                let tool_backend = tool_backend::DesktopToolBackend {
                     #[cfg(not(test))]
                     app: self.app.clone(),
-                    db: Some(self.db.clone()),
+                    db: self.db.clone(),
+                    mcp_manager: self.mcp_manager.clone(),
+                    settings: self.settings.clone(),
+                };
+                let tool_ctx = codefactory_agent_loop::tool::ToolCtx {
+                    working_directory: self.cwd.clone(),
                     session_id: Some(self.audit_session_id()),
                     task_id: self
                         .execution_context
@@ -1419,27 +1431,17 @@ impl AgentLoop {
                     knowledge_library_ids: knowledge_scope_for_tools(
                         self.execution_context.as_ref(),
                     ),
-                    settings: Some(self.settings.read().await.clone()),
+                    timeout_sec: None,
                 };
 
                 let tool_start = std::time::Instant::now();
-                // Check if this is an MCP tool
-                let mcp_server = self.mcp_manager.find_tool_server(&tc.function.name).await;
-                let output_result = if let Some(server_id) = mcp_server {
-                    match self
-                        .mcp_manager
-                        .call_tool(&server_id, &tc.function.name, args)
-                        .await
-                    {
-                        Ok(text) => Ok(tools::ToolOutput::ok(text)),
-                        Err(e) => Ok(tools::ToolOutput::err(format!("MCP error: {e}"))),
-                    }
-                } else {
-                    tools::dispatch(&tc.function.name, args, &ctx).await
-                };
+                let exec_result = tool_backend.execute(tc, &args, &tool_ctx).await;
                 let duration_ms = tool_start.elapsed().as_millis() as u64;
-                let output = match output_result {
-                    Ok(output) => output,
+                let output = match exec_result {
+                    Ok(result) => tools::ToolOutput {
+                        content: result.content,
+                        is_error: result.is_error,
+                    },
                     Err(error) => {
                         let error_text = error.to_string();
                         self.record_tool_call_outcome(
@@ -1450,7 +1452,7 @@ impl AgentLoop {
                             duration_ms,
                         )
                         .await?;
-                        return Err(error);
+                        return Err(crate::errors::AppError::Other(error_text));
                     }
                 };
                 self.record_tool_call_outcome(
@@ -3037,11 +3039,19 @@ impl AgentLoop {
                     continue;
                 }
 
-                let ctx = ExecCtx {
-                    cwd: self.cwd.clone(),
+                // Tool execution now flows through the shared ToolBackend seam
+                // (keystone slice 4.3): the desktop backend builds the ExecCtx
+                // and runs MCP-first / native-dispatch. Timing stays in the loop
+                // so it covers the fatal-error path exactly as before.
+                let tool_backend = tool_backend::DesktopToolBackend {
                     #[cfg(not(test))]
                     app: self.app.clone(),
-                    db: Some(self.db.clone()),
+                    db: self.db.clone(),
+                    mcp_manager: self.mcp_manager.clone(),
+                    settings: self.settings.clone(),
+                };
+                let tool_ctx = codefactory_agent_loop::tool::ToolCtx {
+                    working_directory: self.cwd.clone(),
                     session_id: Some(self.audit_session_id()),
                     task_id: self
                         .execution_context
@@ -3050,27 +3060,17 @@ impl AgentLoop {
                     knowledge_library_ids: knowledge_scope_for_tools(
                         self.execution_context.as_ref(),
                     ),
-                    settings: Some(self.settings.read().await.clone()),
+                    timeout_sec: None,
                 };
 
                 let tool_start = std::time::Instant::now();
-                // Check if this is an MCP tool
-                let mcp_server = self.mcp_manager.find_tool_server(&tc.function.name).await;
-                let output_result = if let Some(server_id) = mcp_server {
-                    match self
-                        .mcp_manager
-                        .call_tool(&server_id, &tc.function.name, args)
-                        .await
-                    {
-                        Ok(text) => Ok(tools::ToolOutput::ok(text)),
-                        Err(e) => Ok(tools::ToolOutput::err(format!("MCP error: {e}"))),
-                    }
-                } else {
-                    tools::dispatch(&tc.function.name, args, &ctx).await
-                };
+                let exec_result = tool_backend.execute(tc, &args, &tool_ctx).await;
                 let duration_ms = tool_start.elapsed().as_millis() as u64;
-                let output = match output_result {
-                    Ok(output) => output,
+                let output = match exec_result {
+                    Ok(result) => tools::ToolOutput {
+                        content: result.content,
+                        is_error: result.is_error,
+                    },
                     Err(error) => {
                         let error_text = error.to_string();
                         self.record_tool_call_outcome(
@@ -3081,7 +3081,7 @@ impl AgentLoop {
                             duration_ms,
                         )
                         .await?;
-                        return Err(error);
+                        return Err(crate::errors::AppError::Other(error_text));
                     }
                 };
                 self.record_tool_call_outcome(

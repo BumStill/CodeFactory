@@ -54,6 +54,25 @@ pub struct ToolInvocationResult {
     pub duration_ms: u64,
 }
 
+/// A fatal tool-execution failure that must ABORT the turn — distinct from a
+/// tool that ran and returned an error result (`is_error` on a
+/// [`ToolInvocationResult`], which the loop feeds back to the model). The
+/// desktop backend maps a `tools::dispatch` `Err` to this; the loop records it
+/// and propagates, preserving the pre-refactor "dispatch error ends the turn"
+/// behaviour. The message is carried verbatim.
+#[derive(Debug, Clone)]
+pub struct ToolError {
+    pub message: String,
+}
+
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ToolError {}
+
 /// Where and how the loop's tool calls execute.
 #[async_trait::async_trait]
 pub trait ToolBackend: Send + Sync {
@@ -62,10 +81,19 @@ pub trait ToolBackend: Send + Sync {
     /// exactly `[run_shell]`.
     async fn list_schemas(&self) -> Vec<ToolDefinition>;
 
-    /// Execute ONE model tool call. The delegating impl translates a `run_shell`
-    /// call → command string internally; the desktop impl does MCP-first /
-    /// native-dispatch fallback.
-    async fn execute(&self, call: &ToolCall, ctx: &ToolCtx) -> ToolInvocationResult;
+    /// Execute ONE model tool call. `args` is the already-parsed argument object
+    /// (the loop parses it once and reuses it for permissioning/hooks, so we
+    /// pass it in rather than re-parsing). The delegating impl translates a
+    /// `run_shell` call → command string internally; the desktop impl does
+    /// MCP-first / native-dispatch fallback. `Ok(result)` — the tool ran (even
+    /// if `result.is_error`); `Err(ToolError)` — a fatal failure that aborts
+    /// the turn.
+    async fn execute(
+        &self,
+        call: &ToolCall,
+        args: &serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolInvocationResult, ToolError>;
 }
 
 #[cfg(test)]
@@ -81,8 +109,18 @@ mod tests {
         async fn list_schemas(&self) -> Vec<ToolDefinition> {
             Vec::new()
         }
-        async fn execute(&self, call: &ToolCall, _ctx: &ToolCtx) -> ToolInvocationResult {
-            ToolInvocationResult {
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            _args: &serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolInvocationResult, ToolError> {
+            if call.function.name == "boom" {
+                return Err(ToolError {
+                    message: "fatal".into(),
+                });
+            }
+            Ok(ToolInvocationResult {
                 content: format!("stub:{}", call.function.name),
                 is_error: false,
                 command: call.function.name.clone(),
@@ -93,7 +131,7 @@ mod tests {
                 error: None,
                 next_working_directory: None,
                 duration_ms: 0,
-            }
+            })
         }
     }
 
@@ -109,8 +147,29 @@ mod tests {
                 arguments: "{}".into(),
             },
         };
-        let out = backend.execute(&call, &ToolCtx::default()).await;
+        let out = backend
+            .execute(&call, &serde_json::json!({}), &ToolCtx::default())
+            .await
+            .expect("stub ok");
         assert_eq!(out.content, "stub:run_shell");
         assert!(matches!(out.kind, ToolKind::ReadOnly));
+    }
+
+    #[tokio::test]
+    async fn fatal_tool_error_surfaces_as_err() {
+        let backend = StubBackend;
+        let call = ToolCall {
+            id: "c2".into(),
+            r#type: "function".into(),
+            function: crate::types::FunctionCall {
+                name: "boom".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let err = backend
+            .execute(&call, &serde_json::json!({}), &ToolCtx::default())
+            .await
+            .expect_err("boom is fatal");
+        assert_eq!(err.to_string(), "fatal");
     }
 }
