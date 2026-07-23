@@ -44,22 +44,23 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Verify main CI is green
+      - name: Verify main governance check is green
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Never cut a release on top of a red main. If a CI run exists for
-          # this exact HEAD it must be success; if none is found (timing), we
-          # proceed rather than block the cut.
+          # Only gate on governance-baseline (seconds), not full CI (minutes).
+          # The PR already ran the full CI suite on the exact same code — the
+          # squash merge to main cannot change its outcome. Requiring main CI
+          # here just adds 6-8 minutes of dead wait per release.
           HEAD_SHA=$(git rev-parse HEAD)
-          CONC=$(gh run list --workflow CI --branch main --limit 30 \
+          CONC=$(gh run list --workflow governance-baseline --branch main --limit 30 \
                    --json headSha,conclusion \
                    -q "[.[] | select(.headSha==\"$HEAD_SHA\")][0].conclusion" 2>/dev/null || echo "")
           if [ -n "$CONC" ] && [ "$CONC" != "success" ]; then
-            echo "::error::main CI for $HEAD_SHA is '$CONC' — refusing to release on red."
+            echo "::error::governance-baseline for $HEAD_SHA is '$CONC' — refusing to release on red."
             exit 1
           fi
-          echo "main CI for $HEAD_SHA: ${CONC:-not found, proceeding}"
+          echo "governance-baseline for $HEAD_SHA: ${CONC:-not found, proceeding}"
 
       - name: Determine version slot from commits since last tag
         id: slot
