@@ -9,6 +9,11 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SettingsPage } from "./SettingsPage";
 
+// This file renders the full Settings page and repeatedly materializes a
+// 365-cell accessible heatmap. Keep the acceptance assertions bounded while
+// allowing loaded CI workers more than Vitest's 5-second unit-test default.
+vi.setConfig({ testTimeout: 15_000 });
+
 const mocks = vi.hoisted(() => ({
   load: vi.fn(),
   save: vi.fn(),

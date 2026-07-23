@@ -5,7 +5,7 @@ import { ResourcesPage } from "./pages/Resources/ResourcesPage";
 import { ControlPlanePage } from "./pages/ControlPlane/ControlPlanePage";
 import { BenchmarksPage } from "./pages/Benchmarks/BenchmarksPage";
 import { EvolutionWorkbenchPage } from "./pages/Evolution/EvolutionWorkbenchPage";
-import { SettingsPage } from "./pages/Settings/SettingsPage";
+import { SettingsPage, type SettingsTab } from "./pages/Settings/SettingsPage";
 import { ProfilePage } from "./pages/Profile/ProfilePage";
 import { ToastContainer } from "./components/Toast";
 import { EvidenceViewer } from "./components/EvidenceViewer";
@@ -19,7 +19,7 @@ export type AppView = "workspace" | "resources" | "settings" | "profile" | "cont
 
 export default function App() {
   const [view, setView] = useState<AppView>("workspace");
-  const [settingsInitialTab, setSettingsInitialTab] = useState<"capabilities" | "usage" | undefined>();
+  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab | undefined>();
   const [activeProject, setActiveProject] = useState<string | null>(null);
   const [workspaceTaskLogId, setWorkspaceTaskLogId] = useState<string | null>(null);
   const [evolutionCwd, setEvolutionCwd] = useState<string | null>(null);
@@ -75,8 +75,10 @@ export default function App() {
     setView("evolution");
   };
 
-  const openSettings = () => {
-    setSettingsInitialTab("capabilities");
+  const openSettings = (tab?: SettingsTab) => {
+    // Keep this callback safe when legacy embedders pass it directly to
+    // onClick and React supplies a SyntheticEvent instead of a tab id.
+    setSettingsInitialTab(typeof tab === "string" ? tab : "capabilities");
     setView("settings");
   };
 

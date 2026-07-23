@@ -381,6 +381,16 @@ pub async fn cancel_implementation(
 }
 
 #[tauri::command]
+pub async fn retry_tasks(
+    session_id: String,
+    task_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<u64, AppError> {
+    let pool = state.db.read().await;
+    tasks::retry_selected_tasks(&pool, &session_id, &task_ids).await
+}
+
+#[tauri::command]
 pub async fn retry_failed_tasks(
     session_id: String,
     state: State<'_, AppState>,

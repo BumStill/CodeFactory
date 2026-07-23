@@ -131,6 +131,7 @@ interface TasksState {
   start: (sessionId: string, specReqId?: string, specTitle?: string) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
   retryFailedTasks: (sessionId: string) => Promise<number>;
+  retryTasks: (sessionId: string, taskIds: string[]) => Promise<number>;
   subscribe: (sessionId: string) => Promise<() => void>;
   subscribeEvidence: (sessionId: string) => Promise<() => void>;
   getTaskDependencies: (taskId: string) => Promise<string[]>;
@@ -213,6 +214,12 @@ export const useTasksStore = create<TasksState>((set, get) => ({
 
   retryFailedTasks: async (sessionId) => {
     const retried = await invoke<number>("retry_failed_tasks", { sessionId });
+    await get().loadTasks(sessionId);
+    return retried;
+  },
+
+  retryTasks: async (sessionId, taskIds) => {
+    const retried = await invoke<number>("retry_tasks", { sessionId, taskIds });
     await get().loadTasks(sessionId);
     return retried;
   },

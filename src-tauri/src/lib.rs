@@ -351,6 +351,7 @@ pub fn run() {
             commands::tasks::start_implementation,
             commands::tasks::cancel_implementation,
             commands::tasks::retry_failed_tasks,
+            commands::tasks::retry_tasks,
             commands::tasks::get_verification_results,
             commands::tasks::run_verification_now,
             commands::evidence::generate_evidence_pack,

@@ -107,8 +107,33 @@ async function assertWorkspace(page, tag) {
   const taskDrawer = page.getByRole("dialog", { name: "任务活动" });
   await taskDrawer.waitFor();
   assert(await taskDrawer.getByText("在会话内执行仓库需求", { exact: true }).isVisible(), `[${tag}] delegated task missing from drawer`);
-  await taskDrawer.getByRole("button", { name: "关闭任务活动" }).click();
-  await taskDrawer.waitFor({ state: "detached" });
+  assert(await taskDrawer.getByText("模型配置 6", { exact: true }).isVisible(), `[${tag}] provider blocker count is not actionable`);
+  assert(await taskDrawer.getByText("先处理失败项，再继续剩余 2 项。", { exact: true }).isVisible(), `[${tag}] mixed failed/pending state has no clear explanation`);
+  assert((await taskDrawer.getByRole("button", { name: /继续执行/ }).count()) === 0, `[${tag}] generic continue action bypasses a failure blocker`);
+  const settingsAction = taskDrawer.getByRole("button", { name: "打开模型设置" });
+  const retryAction = taskDrawer.getByRole("button", { name: "已修复，重试 6 项" });
+  await settingsAction.waitFor();
+  await retryAction.waitFor();
+  for (const action of [settingsAction, retryAction]) {
+    const box = await action.boundingBox();
+    assert(box && box.x >= 0 && box.x + box.width <= page.viewportSize().width, `[${tag}] blocker action overflows drawer: ${JSON.stringify(box)}`);
+  }
+  await settingsAction.click();
+  assert(await page.evaluate(() => window.__settingsTab) === "endpoints", `[${tag}] provider action did not target endpoint/API-key settings`);
+  await page.getByText("API 端点", { exact: true }).waitFor();
+  assert(await page.getByText("API 端点", { exact: true }).isVisible(), `[${tag}] endpoint settings page did not render`);
+  await page.locator("header button").first().click();
+  await taskActivity.waitFor();
+  await taskActivity.click();
+  const reopenedTaskDrawer = page.getByRole("dialog", { name: "任务活动" });
+  await reopenedTaskDrawer.waitFor();
+  await reopenedTaskDrawer.getByRole("button", { name: "已修复，重试 6 项" }).click();
+  await page.waitForFunction(() => window.__implementationStarted === true);
+  const retryArgs = await page.evaluate(() => window.__lastRetry);
+  assert(retryArgs?.sessionId === "repository-intent-session", `[${tag}] retry used the wrong session`);
+  assert(Array.isArray(retryArgs?.taskIds) && retryArgs.taskIds.length === 6, `[${tag}] retry did not select all six provider blockers`);
+  await reopenedTaskDrawer.getByRole("button", { name: "关闭任务活动" }).click();
+  await reopenedTaskDrawer.waitFor({ state: "detached" });
 
   const sessionRows = sidebar.locator("[data-session-row]");
   assert((await sessionRows.count()) >= 10, `[${tag}] sidebar does not expose at least 10 sessions in the fixture`);
@@ -194,7 +219,7 @@ async function run() {
     const receipt = {
       status: "pass",
       browser: executablePath,
-      surfaces: ["workspace-header", "task-activity-drawer", "dense-session-sidebar", "compact-tool-activity", "local-git-drawer", "github-delivery-status", "remote-issue-detail"],
+      surfaces: ["workspace-header", "task-activity-drawer", "actionable-provider-blockers", "dense-session-sidebar", "compact-tool-activity", "local-git-drawer", "github-delivery-status", "remote-issue-detail"],
       viewports: ["1366x768", "800x700 (configured minWidth)"],
       artifact_dir: artifactDir,
       interactive_desktop: "project picker reached; final Open action blocked by macOS lock",

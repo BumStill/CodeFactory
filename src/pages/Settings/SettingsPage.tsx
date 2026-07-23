@@ -15,9 +15,11 @@ import { CHATGPT_DEFAULT_MODEL, CHATGPT_ENDPOINT_KEY } from "../../lib/chatgptMo
 import { syncChatGptCatalog } from "../../stores/chatgptCatalog";
 import { UsageDashboardSection } from "../../components/UsageDashboardSection";
 
+export type SettingsTab = "capabilities" | "usage" | "endpoints" | "permissions" | "general" | "hooks" | "remotes" | "appearance" | "about";
+
 interface Props {
   onBack: () => void;
-  initialTab?: "usage" | "capabilities";
+  initialTab?: SettingsTab;
   onOpenSession?: (sessionId: string) => void;
   onOpenJobLog?: (sessionId: string, taskId: string) => void;
   onOpenProfile?: () => void;
@@ -27,7 +29,7 @@ interface Props {
   onOpenControlPlane?: () => void;
 }
 
-type Tab = "capabilities" | "usage" | "endpoints" | "permissions" | "general" | "hooks" | "remotes" | "appearance" | "about";
+type Tab = SettingsTab;
 const SHELL_OPTIONS =
   typeof navigator !== "undefined" && /Mac|Linux/.test(navigator.platform)
     ? ["zsh", "bash", "powershell", "cmd"]

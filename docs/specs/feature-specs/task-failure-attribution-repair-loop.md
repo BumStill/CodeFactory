@@ -15,12 +15,13 @@ Terminal-Bench 2.1 只能作为失败样本和能力评估输入，不允许把�
 | CF-FR-R3 | 不针对 bench 定制 | 分类规则只读取通用 task 字段：`status`、`error`、`result`、`verification_results`；不得读取 benchmark task name 或 Terminal-Bench artifact path | backend | unit test + code review grep | QA |
 | CF-FR-R4 | 用户能区分责任边界 | provider/credential、permission、shell runtime、test failure、verification failure、cancelled、unknown 必须分开展示 | backend + UI | fixture classification tests | QA |
 | CF-FR-R5 | 兼容旧数据 | 不要求 SQLite schema migration；旧 `task_runs` 读取后按现有字段派生 attribution | storage + Tauri serialization | cargo test + existing app DB smoke | development |
+| CF-FR-R6 | “需要我处理”必须可操作 | 不可自动修复项必须提供直达配置或带证据回到对话的动作；用户确认外部原因已修复后，可显式重试同一会话中选定失败项 | Workspace + Settings + task scheduler | Workspace UI test + selected-retry Rust test + real browser action check | development + QA |
 
 ## Primary User Path
 
-P-FR-1: 用户打开 CodeFactory，进入一个 project session。左侧任务列显示任务状态。如果某个任务失败或取消，系统在任务行下方显示失败归因标签和下一步建议。用户点击 `修复可修复项` 后，系统只把 `repairable=true` 的 failed/cancelled 任务重置为 pending 并启动同一 session 的执行；不可自动修复的 provider、权限或运行环境失败必须保持失败状态并提示用户先处理原因。任务重新运行后，状态、验证结果和 evidence pack 继续更新。
+P-FR-1: 用户打开 CodeFactory，进入一个 project session。左侧任务列显示任务状态。如果某个任务失败或取消，系统在任务行下方显示失败归因标签和下一步建议。用户点击 `修复可修复项` 后，系统只把 `repairable=true` 的 failed/cancelled 任务重置为 pending 并启动同一 session 的执行；不可自动修复的 provider、权限或运行环境失败必须保持失败状态并提示用户先处理原因，且提供对应设置入口或将失败证据带回对话；只有用户明确确认外部原因已修复后，才能把选定失败项重置为 pending 并重启同一 session。任务重新运行后，状态、验证结果和 evidence pack 继续更新。
 
-P-FR-2: 如果失败来自 provider/credential、权限或 shell runtime，UI 必须让用户看到这不是“模型不会写代码”的同类问题；下一步建议应指向充值/更换模型、授权、配置 PATH/依赖，而不是盲目重试代码。
+P-FR-2: 如果失败来自 provider/credential、权限或 shell runtime，UI 必须让用户看到这不是“模型不会写代码”的同类问题；下一步建议应指向充值/更换模型、授权、配置 PATH/依赖，而不是盲目重试代码。Provider 失败须直达“端点”设置，权限失败须直达“权限”设置，其他阻塞须将任务标题与错误证据预填回当前对话。修复后由用户点击“已修复，重试”触发选定项重试。
 
 ## Applicable Harnesses
 
@@ -49,7 +50,12 @@ P-FR-2: 如果失败来自 provider/credential、权限或 shell runtime，UI �
 | failed task with failed `verification_results` | classified as `verification`, UI shows `验收失败` and next action |
 | provider billing/credential error | classified as `model-provider`, marked not blindly repairable |
 | missing command or executable | classified as `shell-runtime` |
-| repair loop with mixed failed tasks | only `repairable=true` tasks are reset/re-run; provider/runtime/permission failures stay failed |
+| automatic repair loop with mixed failed tasks | only `repairable=true` tasks are reset/re-run; provider/runtime/permission failures stay failed |
+| six provider credential failures | drawer exposes endpoint settings and a user-confirmed retry for exactly the six selected failures; actions remain visible at the minimum viewport |
+| explicit selected retry | only selected failed/cancelled rows in the same session are reset; completed, unselected and foreign-session rows remain unchanged |
+| unknown blocker | drawer returns to the conversation with task title and error evidence prefilled |
+| paused pending tasks without failures | drawer explains how many tasks remain and labels the action `继续执行 N 项` |
+| pending tasks plus any failed task | drawer explains that failures must be handled first and hides the generic continue action |
 | assertion/test failure | classified as `test-failure` |
 | cancelled task | classified as `cancelled` |
 | old task without new persisted fields | list still loads and derives attribution from existing fields |
@@ -59,6 +65,6 @@ P-FR-2: 如果失败来自 provider/credential、权限或 shell runtime，UI �
 每次交付至少记录：
 
 - classifier unit test results。
-- Workspace UI test result。
+- Workspace UI test result（设置路由、显式重试、回到对话三条动作链）。
 - `pnpm build` 和治理基线结果。
 - 真实安装版或 dev app 主路径截图/观察：任务列中失败归因可见，临时验证数据已清理。
