@@ -2,6 +2,7 @@
 mod agent;
 mod ai_text;
 mod benchmark;
+mod benchmark_consistency;
 mod codex_auth;
 mod commands;
 mod config;
@@ -215,6 +216,7 @@ pub fn run() {
             commands::benchmark::preview_benchmark_provider_bridge,
             commands::benchmark::start_benchmark_provider_run,
             commands::benchmark::import_benchmark_results,
+            commands::benchmark::benchmark_consistency_report,
             commands::checkpoints::create_checkpoint,
             commands::checkpoints::list_checkpoints,
             commands::checkpoints::checkpoint_changeset,
