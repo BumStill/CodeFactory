@@ -7,7 +7,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace]
-members = [".", "crates/agent-core", "crates/agent-headless"]
+members = [".", "crates/agent-core", "crates/agent-loop", "crates/agent-headless"]
 resolver = "2"
 
 [lib]
@@ -66,6 +66,7 @@ getrandom = "0.2"          # PKCE verifier + CSRF state randomness (lighter than
 tracing  = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 codefactory-agent-core = { path = "crates/agent-core" }
+codefactory-agent-loop = { path = "crates/agent-loop" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
