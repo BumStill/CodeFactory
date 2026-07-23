@@ -115,3 +115,19 @@ jobs:
           if (-not $smoke.restart_reopen_observed) { throw "Evolution state was not verified after reopen" }
           if ($smoke.rollback_status -ne "rolled_back") { throw "Activation did not roll back" }
           if (-not $smoke.cleanup) { throw "Evolution smoke did not clean isolated state" }
+
+      # Keystone slice 3: prove the packaged Windows binary can construct the
+      # REAL AgentLoop headless (app: None) with the full tool surface — the
+      # loader path #166 made fragile. Runs on the actual executable, not the
+      # unit-test EXE, which is the safe place to exercise the headless seam.
+      - name: Headless AgentLoop construction smoke
+        shell: pwsh
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP "headless-smoke.json"
+          cargo run --manifest-path src-tauri/Cargo.toml -- --headless-smoke $receipt
+          if ($LASTEXITCODE -ne 0) { throw "Headless smoke exited $LASTEXITCODE" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if (-not $smoke.ok) { throw "Headless smoke did not report ok" }
+          if ($smoke.app_handle -ne "none") { throw "Headless smoke ran with an AppHandle" }
+          if ($smoke.tool_count -lt 1) { throw "Headless tool surface was empty" }
+          if ($smoke.events_recorded -ne 1) { throw "Headless event sink did not record" }

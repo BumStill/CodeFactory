@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -398,7 +398,10 @@ of suggestions, and the user just APPROVED it. Carry it out NOW.\n\
    and commits only real source files.";
 
 pub struct AgentLoop {
-    app: AppHandle,
+    /// None in a headless run (no Tauri frontend). Present for the desktop
+    /// app. Slice 1's EventSink already carries the UI stream; this remains
+    /// only for tools/hooks/skills that need the live app, all guarded.
+    app: Option<AppHandle>,
     events: std::sync::Arc<dyn events::EventSink>,
     db: SqlitePool,
     session_id: String,
@@ -586,7 +589,7 @@ impl AgentLoop {
         let events: std::sync::Arc<dyn events::EventSink> =
             std::sync::Arc::new(events::TauriEventSink::new(app.clone(), &session_id));
         Self {
-            app,
+            app: Some(app),
             events,
             db,
             session_id,
@@ -606,6 +609,157 @@ impl AgentLoop {
             anonymous: false,
             cancel: None,
         }
+    }
+
+    /// Build an agent loop with NO Tauri `AppHandle` — the headless seam
+    /// (keystone slice 3). This is the SAME loop, the SAME completion gate,
+    /// and the SAME tool surface as the desktop app; the only differences are
+    /// wholly guarded:
+    /// - events flow through the caller-supplied `events` sink (a
+    ///   [`events::CollectingEventSink`] for eval, or a streaming JSONL sink
+    ///   for a CLI) instead of the Tauri frontend;
+    /// - hooks are skipped entirely (`hook_runner` is `None`);
+    /// - skills come from the user skills dir only (no builtin/AppHandle);
+    /// - `delegate_tasks` degrades (it needs live UI sessions);
+    /// - usage-recorded UI pings are skipped.
+    ///
+    /// Every other tool (read/write/edit/glob/grep/bash/office/kb/delivery)
+    /// runs exactly as in the app. The headless runner is a `not(test)` binary
+    /// (see `--headless-smoke`), never the unit-test EXE.
+    ///
+    /// `#[cfg(not(test))]` is load-bearing, not cosmetic: this is the ONLY
+    /// crate-reachable path that constructs an `AgentLoop`. Every other
+    /// constructor is reached solely through private-module `#[tauri::command]`
+    /// handlers that the unit-test EXE's link graph dead-strips. If this stayed
+    /// in the test build, `run_headless_smoke_cli` (a crate-public root) would
+    /// force `AgentLoop` construction — which links the Tauri `AppHandle`
+    /// machinery — into `codefactory_lib-*.exe`, whose Windows loader then
+    /// aborts with `STATUS_ENTRYPOINT_NOT_FOUND` (0xc0000139) before any test
+    /// runs (hotfix #166). Gating it out of the test EXE costs nothing.
+    #[cfg(not(test))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_headless(
+        events: std::sync::Arc<dyn events::EventSink>,
+        db: SqlitePool,
+        session_id: String,
+        endpoint_name: String,
+        model_id: String,
+        base_url: String,
+        api_key: String,
+        api_style: ApiStyle,
+        cwd: PathBuf,
+        settings: Arc<RwLock<Settings>>,
+        pending_permissions: PendingPermissionMap,
+        mcp_manager: Arc<McpManager>,
+        execution_context: Option<AgentExecutionContext>,
+        mode: AgentMode,
+    ) -> Self {
+        Self {
+            app: None,
+            events,
+            db,
+            session_id,
+            endpoint_name,
+            model_id,
+            base_url,
+            api_key,
+            api_style,
+            cwd,
+            http: Client::new(),
+            settings,
+            pending_permissions,
+            mcp_manager,
+            execution_context,
+            mode,
+            usage_run_id: Uuid::new_v4().to_string(),
+            anonymous: false,
+            cancel: None,
+        }
+    }
+
+    /// Headless construction smoke (keystone slice 3). Release CI invokes this
+    /// on the exact packaged executable — the same pattern as
+    /// `--evolution-smoke` — to prove the REAL `AgentLoop` constructs and its
+    /// full tool surface is reachable with NO `AppHandle`. That is precisely
+    /// the Windows loader path #166 made fragile, and running it as a
+    /// `not(test)` binary (never the unit-test EXE) is the safe place to prove
+    /// it. Network-free: it builds the loop and validates the event-sink +
+    /// tool wiring; it does NOT call a model. The live headless *turn* is
+    /// slice 4's job.
+    ///
+    /// `#[cfg(not(test))]` because it constructs an `AgentLoop` (via
+    /// [`Self::new_headless`]); see that method for why the test EXE must not
+    /// link this path (#166).
+    #[cfg(not(test))]
+    pub async fn run_headless_smoke(output_path: &Path) -> Result<serde_json::Value> {
+        let smoke_id = Uuid::new_v4().to_string();
+        let root = std::env::temp_dir().join(format!("codefactory-headless-smoke-{smoke_id}"));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project)?;
+        let db_path = root.join("smoke.db");
+        let db_url = format!("sqlite:{}", db_path.display());
+        let pool = crate::storage::db::connect(&db_url).await?;
+
+        let sink = Arc::new(events::CollectingEventSink::new());
+        let sink_for_loop: Arc<dyn events::EventSink> = sink.clone();
+        let tool_count = tools::all_definitions().len();
+
+        // The load-bearing assertion: this constructs the real loop with
+        // `app: None`. If the packaged binary's loader could not resolve the
+        // headless path, this line would abort before returning.
+        let _agent = AgentLoop::new_headless(
+            sink_for_loop,
+            pool.clone(),
+            format!("headless-smoke-{smoke_id}"),
+            "smoke-endpoint".to_string(),
+            "smoke-model".to_string(),
+            "http://127.0.0.1:0".to_string(), // never dialed — construction only
+            "smoke-key".to_string(),
+            ApiStyle::Openai,
+            project.clone(),
+            Arc::new(RwLock::new(Settings::default())),
+            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            Arc::new(McpManager::new()),
+            None,
+            AgentMode::Autonomous,
+        );
+
+        // The loop owns this exact `sink` Arc; emitting proves the sink handed
+        // to the headless loop is a functioning `EventSink`. UFCS so the trait
+        // method resolves without importing the trait into module scope.
+        events::EventSink::emit(
+            sink.as_ref(),
+            StreamEvent::TextDelta {
+                content: "headless-smoke".into(),
+            },
+        );
+        let events_recorded = sink.events().len();
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        if tool_count == 0 {
+            return Err(crate::errors::AppError::Other(
+                "headless smoke: tool surface is empty".into(),
+            ));
+        }
+        if events_recorded != 1 {
+            return Err(crate::errors::AppError::Other(
+                "headless smoke: event sink did not record".into(),
+            ));
+        }
+
+        let receipt = serde_json::json!({
+            "ok": true,
+            "smoke": "headless-construction",
+            "tool_count": tool_count,
+            "events_recorded": events_recorded,
+            "app_handle": "none",
+        });
+        std::fs::write(
+            output_path,
+            serde_json::to_string_pretty(&receipt).unwrap_or_default(),
+        )?;
+        Ok(receipt)
     }
 
     async fn record_usage_event_for_round(&self, usage: &Usage, iteration: usize) {
@@ -669,9 +823,15 @@ impl AgentLoop {
         };
         match crate::commands::costs::record_usage_event(&self.db, event).await {
             Ok(true) => {
-                self.app.emit("model-usage-recorded", &self.session_id).ok();
+                if let Some(app) = &self.app {
+                    use tauri::Emitter;
+                    app.emit("model-usage-recorded", &self.session_id).ok();
+                }
                 // Compatibility for the existing footer during the migration.
-                self.app.emit("token-usage-recorded", &self.session_id).ok();
+                if let Some(app) = &self.app {
+                    use tauri::Emitter;
+                    app.emit("token-usage-recorded", &self.session_id).ok();
+                }
             }
             Ok(false) => {}
             Err(error) => tracing::warn!("failed to record request usage: {error}"),
@@ -739,7 +899,11 @@ impl AgentLoop {
         // See `agent::context_budget`.
         let cwd_str = self.cwd.to_string_lossy();
         let mut blocks = project_knowledge_blocks(&self.cwd);
-        for body in crate::commands::skills::enabled_skill_prompts(&self.app).await {
+        let skill_bodies = match &self.app {
+            Some(app) => crate::commands::skills::enabled_skill_prompts(app).await,
+            None => crate::commands::skills::enabled_user_skill_prompts().await,
+        };
+        for body in skill_bodies {
             blocks.push(context_budget::Block::new(
                 format!("---\n\n{body}"),
                 2,
@@ -822,11 +986,20 @@ impl AgentLoop {
                 }
             }
         }
-        let hook_runner = if self.anonymous {
-            hooks::HookRunner::disabled(self.app.clone())
-        } else {
-            let settings = self.settings.read().await;
-            hooks::HookRunner::from_settings(&settings, self.app.clone())
+        // Headless runs have no frontend and no hooks. Building `Option<_>`
+        // (None when `app` is absent) keeps `HookRunner` — which owns an
+        // `AppHandle` — constructed ONLY here, inside `run()`, which the
+        // unit-test EXE dead-strips. Never construct it in test code: an
+        // AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
+        // trips the Windows loader (`STATUS_ENTRYPOINT_NOT_FOUND`, #166).
+        let hook_runner: Option<hooks::HookRunner> = match &self.app {
+            None => None,
+            Some(app) => Some(if self.anonymous {
+                hooks::HookRunner::disabled(app.clone())
+            } else {
+                let settings = self.settings.read().await;
+                hooks::HookRunner::from_settings(&settings, app.clone())
+            }),
         };
 
         // Did we emit a terminal Done/Error this run? Used to guarantee the
@@ -1200,13 +1373,18 @@ impl AgentLoop {
                     continue;
                 }
 
-                // Pre-tool hook: may cancel
-                let pre_allowed = hook_runner
-                    .fire(hooks::HookEvent::PreTool {
-                        tool_name: tc.function.name.clone(),
-                        args: args.clone(),
-                    })
-                    .await;
+                // Pre-tool hook: may cancel. Headless (no hooks) always allows.
+                let pre_allowed = match &hook_runner {
+                    Some(runner) => {
+                        runner
+                            .fire(hooks::HookEvent::PreTool {
+                                tool_name: tc.function.name.clone(),
+                                args: args.clone(),
+                            })
+                            .await
+                    }
+                    None => true,
+                };
                 if !pre_allowed {
                     let content = "Tool call cancelled by hook.".to_string();
                     self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
@@ -1231,7 +1409,7 @@ impl AgentLoop {
                 let ctx = ExecCtx {
                     cwd: self.cwd.clone(),
                     #[cfg(not(test))]
-                    app: Some(self.app.clone()),
+                    app: self.app.clone(),
                     db: Some(self.db.clone()),
                     session_id: Some(self.audit_session_id()),
                     task_id: self
@@ -1303,14 +1481,16 @@ impl AgentLoop {
                 ) {
                     progress_prompt = Some(prompt);
                 }
-                // Post-tool hook
-                hook_runner
-                    .fire(hooks::HookEvent::PostTool {
-                        tool_name: tc.function.name.clone(),
-                        result: output.content.chars().take(500).collect(),
-                        duration_ms,
-                    })
-                    .await;
+                // Post-tool hook (skipped headless — no hooks).
+                if let Some(runner) = &hook_runner {
+                    runner
+                        .fire(hooks::HookEvent::PostTool {
+                            tool_name: tc.function.name.clone(),
+                            result: output.content.chars().take(500).collect(),
+                            duration_ms,
+                        })
+                        .await;
+                }
 
                 self.events.emit(StreamEvent::ToolResult {
                             tool_call_id: tc.id.clone(),
@@ -2440,11 +2620,20 @@ impl AgentLoop {
                 }
             }
         }
-        let hook_runner = if self.anonymous {
-            hooks::HookRunner::disabled(self.app.clone())
-        } else {
-            let settings = self.settings.read().await;
-            hooks::HookRunner::from_settings(&settings, self.app.clone())
+        // Headless runs have no frontend and no hooks. Building `Option<_>`
+        // (None when `app` is absent) keeps `HookRunner` — which owns an
+        // `AppHandle` — constructed ONLY here, inside `run()`, which the
+        // unit-test EXE dead-strips. Never construct it in test code: an
+        // AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
+        // trips the Windows loader (`STATUS_ENTRYPOINT_NOT_FOUND`, #166).
+        let hook_runner: Option<hooks::HookRunner> = match &self.app {
+            None => None,
+            Some(app) => Some(if self.anonymous {
+                hooks::HookRunner::disabled(app.clone())
+            } else {
+                let settings = self.settings.read().await;
+                hooks::HookRunner::from_settings(&settings, app.clone())
+            }),
         };
 
         // Did we emit a terminal Done/Error this run? Used to guarantee the
@@ -2818,13 +3007,18 @@ impl AgentLoop {
                     continue;
                 }
 
-                // Pre-tool hook: may cancel
-                let pre_allowed = hook_runner
-                    .fire(hooks::HookEvent::PreTool {
-                        tool_name: tc.function.name.clone(),
-                        args: args.clone(),
-                    })
-                    .await;
+                // Pre-tool hook: may cancel. Headless (no hooks) always allows.
+                let pre_allowed = match &hook_runner {
+                    Some(runner) => {
+                        runner
+                            .fire(hooks::HookEvent::PreTool {
+                                tool_name: tc.function.name.clone(),
+                                args: args.clone(),
+                            })
+                            .await
+                    }
+                    None => true,
+                };
                 if !pre_allowed {
                     let content = "Tool call cancelled by hook.".to_string();
                     self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
@@ -2846,7 +3040,7 @@ impl AgentLoop {
                 let ctx = ExecCtx {
                     cwd: self.cwd.clone(),
                     #[cfg(not(test))]
-                    app: Some(self.app.clone()),
+                    app: self.app.clone(),
                     db: Some(self.db.clone()),
                     session_id: Some(self.audit_session_id()),
                     task_id: self
@@ -2918,14 +3112,16 @@ impl AgentLoop {
                 ) {
                     progress_prompt = Some(prompt);
                 }
-                // Post-tool hook
-                hook_runner
-                    .fire(hooks::HookEvent::PostTool {
-                        tool_name: tc.function.name.clone(),
-                        result: output.content.chars().take(500).collect(),
-                        duration_ms,
-                    })
-                    .await;
+                // Post-tool hook (skipped headless — no hooks).
+                if let Some(runner) = &hook_runner {
+                    runner
+                        .fire(hooks::HookEvent::PostTool {
+                            tool_name: tc.function.name.clone(),
+                            result: output.content.chars().take(500).collect(),
+                            duration_ms,
+                        })
+                        .await;
+                }
 
                 self.events.emit(StreamEvent::ToolResult {
                             tool_call_id: tc.id.clone(),

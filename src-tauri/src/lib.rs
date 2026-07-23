@@ -129,6 +129,58 @@ pub fn run_evolution_smoke_cli() -> bool {
     }
 }
 
+/// Handle the release-only headless-construction smoke before Tauri
+/// initializes (keystone slice 3). Returns `false` for ordinary app startup
+/// and exits non-zero on smoke failure. Proves the packaged binary can build
+/// the real `AgentLoop` with no `AppHandle` — the Windows loader path #166
+/// made fragile — as a `not(test)` binary rather than the unit-test EXE.
+///
+/// `#[cfg(not(test))]`: as a crate-public root it would otherwise force
+/// `AgentLoop` construction (and its Tauri `AppHandle` machinery) into the
+/// unit-test EXE, whose Windows loader aborts with `STATUS_ENTRYPOINT_NOT_FOUND`
+/// (#166). The bin (`main.rs`) links the non-test lib, so it still sees this.
+#[cfg(not(test))]
+pub fn run_headless_smoke_cli() -> bool {
+    let mut args = std::env::args();
+    let _program = args.next();
+    let Some(flag) = args.next() else {
+        return false;
+    };
+    if flag != "--headless-smoke" {
+        return false;
+    }
+    let Some(output) = args.next() else {
+        eprintln!("usage: CodeFactory --headless-smoke <receipt.json>");
+        std::process::exit(2);
+    };
+    if args.next().is_some() {
+        eprintln!("usage: CodeFactory --headless-smoke <receipt.json>");
+        std::process::exit(2);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("Headless smoke could not start: {error}");
+            std::process::exit(1);
+        });
+    match runtime.block_on(agent::AgentLoop::run_headless_smoke(std::path::Path::new(
+        &output,
+    ))) {
+        Ok(receipt) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&receipt).unwrap_or_default()
+            );
+            true
+        }
+        Err(error) => {
+            eprintln!("Headless smoke failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(

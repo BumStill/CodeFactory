@@ -5,5 +5,8 @@ fn main() {
     if codefactory_lib::run_evolution_smoke_cli() {
         return;
     }
+    if codefactory_lib::run_headless_smoke_cli() {
+        return;
+    }
     codefactory_lib::run()
 }
