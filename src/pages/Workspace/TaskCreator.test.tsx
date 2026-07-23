@@ -193,7 +193,8 @@ describe("session-native task delegation", () => {
     renderWorkspace();
 
     const header = screen.getByRole("banner", { name: "会话工具栏" });
-    expect(within(header).getByRole("button", { name: "新建空白会话" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "收起会话侧栏" })).toBeInTheDocument();
+    expect(within(header).queryByRole("button", { name: "新建空白会话" })).not.toBeInTheDocument();
     expect(within(header).getByRole("button", { name: "Git 状态" })).toBeInTheDocument();
     expect(within(header).getByRole("button", { name: "检查点 0" })).toBeInTheDocument();
     expect(within(header).getByRole("button", { name: "设置" })).toBeInTheDocument();

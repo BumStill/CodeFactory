@@ -70,9 +70,15 @@ async function stopServer(child) {
 
 async function assertWorkspace(page, tag) {
   await page.goto(baseUrl, { waitUntil: "networkidle" });
-  await page.getByRole("main", { name: "会话窗口" }).waitFor({ timeout: 10_000 });
+  const conversation = page.getByRole("main", { name: "会话窗口" });
+  await conversation.waitFor({ timeout: 10_000 });
   const header = page.getByRole("banner", { name: "会话工具栏" });
+  const sidebar = page.getByRole("complementary", { name: "会话列表" });
   await header.waitFor();
+  await sidebar.waitFor();
+  assert((await header.getByRole("button", { name: "新建空白会话" }).count()) === 0, `[${tag}] duplicate header new-session action remains`);
+  assert((await page.getByRole("button", { name: "新建", exact: true }).count()) === 1, `[${tag}] workspace must expose exactly one new-session menu`);
+  assert((await header.getByRole("button", { name: "收起会话侧栏" }).count()) === 1, `[${tag}] collapse control missing`);
   assert(await page.getByText("会话执行详情", { exact: true }).isVisible(), `[${tag}] conversation execution detail missing`);
   assert(await page.getByText("在会话内执行仓库需求", { exact: true }).isVisible(), `[${tag}] delegated task missing`);
   assert((await page.getByTitle(/规范工作台/).count()) === 0, `[${tag}] specification workbench remains`);
@@ -82,6 +88,26 @@ async function assertWorkspace(page, tag) {
   }
   assert((await header.getByRole("button", { name: "设置" }).count()) === 1, `[${tag}] settings entry missing from workspace toolbar`);
   assert((await page.getByText("拆任务", { exact: true }).count()) === 0, `[${tag}] decomposition UI remains`);
+
+  const expandedWidth = await conversation.evaluate((element) => element.getBoundingClientRect().width);
+  await header.getByRole("button", { name: "收起会话侧栏" }).click();
+  await sidebar.waitFor({ state: "detached" });
+  assert((await header.getByRole("button", { name: "展开会话侧栏" }).count()) === 1, `[${tag}] restore control missing after collapse`);
+  const collapsedWidth = await conversation.evaluate((element) => element.getBoundingClientRect().width);
+  assert(collapsedWidth > expandedWidth, `[${tag}] conversation did not reclaim sidebar width: ${expandedWidth} -> ${collapsedWidth}`);
+  const collapsedOverflow = await page.evaluate(() => ({ width: innerWidth, scrollWidth: document.documentElement.scrollWidth }));
+  assert(collapsedOverflow.scrollWidth <= collapsedOverflow.width, `[${tag}] collapsed workspace horizontal overflow: ${JSON.stringify(collapsedOverflow)}`);
+  await page.screenshot({ path: path.join(artifactDir, `${tag}-collapsed.png`), fullPage: true });
+
+  await page.reload({ waitUntil: "networkidle" });
+  await page.getByRole("main", { name: "会话窗口" }).waitFor({ timeout: 10_000 });
+  assert((await page.getByRole("complementary", { name: "会话列表" }).count()) === 0, `[${tag}] collapsed state did not persist across reload`);
+  await page.getByRole("banner", { name: "会话工具栏" }).getByRole("button", { name: "展开会话侧栏" }).click();
+  await page.getByRole("complementary", { name: "会话列表" }).waitFor();
+  assert((await page.getByRole("button", { name: "新建", exact: true }).count()) === 1, `[${tag}] restored sidebar changed the single new-session entry contract`);
+  await page.reload({ waitUntil: "networkidle" });
+  await page.getByRole("complementary", { name: "会话列表" }).waitFor({ timeout: 10_000 });
+  assert((await page.getByRole("banner", { name: "会话工具栏" }).getByRole("button", { name: "收起会话侧栏" }).count()) === 1, `[${tag}] expanded state did not persist across reload`);
   await page.screenshot({ path: path.join(artifactDir, `${tag}.png`), fullPage: true });
 }
 
@@ -120,7 +146,7 @@ async function run() {
     const receipt = {
       status: "pass",
       browser: executablePath,
-      surfaces: ["workspace-header", "conversation-execution-detail", "remote-issue-detail"],
+      surfaces: ["workspace-header", "collapsible-session-sidebar", "conversation-execution-detail", "remote-issue-detail"],
       viewports: ["1366x768", "800x700 (configured minWidth)"],
       artifact_dir: artifactDir,
       interactive_desktop: "project picker reached; final Open action blocked by macOS lock",

@@ -6,7 +6,8 @@ import {
   ChevronDown,
   ChevronRight,
   Settings as SettingsIcon,
-  Plus,
+  PanelLeftClose,
+  PanelLeftOpen,
   RefreshCw,
   Circle,
   CheckCircle2,
@@ -83,6 +84,24 @@ export function WorkspacePage({
   const persistedRunActive = useTasksStore((state) => state.running[sessionId] ?? false);
   const autonomousRunActive = activeDraft ? false : persistedRunActive;
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("cf.workspace.sidebarCollapsed") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleSidebar = () => {
+    setSidebarCollapsed((collapsed) => {
+      const next = !collapsed;
+      try {
+        localStorage.setItem("cf.workspace.sidebarCollapsed", next ? "1" : "0");
+      } catch {
+        // Storage is optional; the current workspace still responds immediately.
+      }
+      return next;
+    });
+  };
   const guideNextStep = async (message: string) => {
     const trimmed = message.trim();
     if (!trimmed || activeDraft) return;
@@ -138,12 +157,14 @@ export function WorkspacePage({
       {/* ── Header ────────────────────────────────────────────────────────── */}
       <header aria-label="会话工具栏" className="flex items-center gap-3 px-3 py-1.5 border-b border-border bg-surface-1 shrink-0">
         <button
-          onClick={onBackHome}
+          onClick={toggleSidebar}
           className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-          title="新建空白会话"
-          aria-label="新建空白会话"
+          title={sidebarCollapsed ? "展开会话侧栏" : "收起会话侧栏"}
+          aria-label={sidebarCollapsed ? "展开会话侧栏" : "收起会话侧栏"}
+          aria-expanded={!sidebarCollapsed}
+          aria-controls="workspace-session-sidebar"
         >
-          <Plus size={14} />
+          {sidebarCollapsed ? <PanelLeftOpen size={14} /> : <PanelLeftClose size={14} />}
         </button>
         <div className="flex-1 min-w-0">
           <div className="text-sm font-medium text-gray-200 truncate flex items-center gap-2">
@@ -239,10 +260,12 @@ export function WorkspacePage({
       {/* ── Body: 3 columns ──────────────────────────────────────────────── */}
       <div className="flex-1 flex min-h-0">
 
-        {/* ─── Left: the session rail is a permanent part of the app shell. ─── */}
-        <aside aria-label="会话列表" className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col min-h-0">
-          <SessionSidebar currentSessionId={sessionId} onOpenSession={onOpenSession} />
-        </aside>
+        {/* ─── Left: collapsible session rail; the header control always restores it. ─── */}
+        {!sidebarCollapsed && (
+          <aside id="workspace-session-sidebar" aria-label="会话列表" className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col min-h-0">
+            <SessionSidebar currentSessionId={sessionId} onOpenSession={onOpenSession} />
+          </aside>
+        )}
 
         {/* ─── Center: conversation + its internal execution detail ─────── */}
         <main aria-label="会话窗口" className="flex-1 flex flex-col min-w-0">
