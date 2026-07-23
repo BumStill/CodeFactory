@@ -6,7 +6,6 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
 
 use super::{next_stream_item, StreamPoll};
 use crate::errors::Result;
@@ -44,8 +43,7 @@ pub async fn stream_anthropic(
     tools: &[ToolDefinition],
     require_tool: bool,
     cancel: Option<&Arc<AtomicBool>>,
-    app_handle: &AppHandle,
-    event_name: &str,
+    events: &dyn crate::agent::events::EventSink,
 ) -> Result<AnthropicResponse> {
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
 
@@ -176,14 +174,9 @@ pub async fn stream_anthropic(
                                 .to_string();
                             if !text.is_empty() {
                                 if !finalization_response {
-                                    app_handle
-                                        .emit(
-                                            event_name,
-                                            StreamEvent::TextDelta {
+                                    events.emit(StreamEvent::TextDelta {
                                                 content: text.clone(),
-                                            },
-                                        )
-                                        .ok();
+                                            });
                                 }
                                 text_buf.push_str(&text);
                             }
@@ -207,16 +200,11 @@ pub async fn stream_anthropic(
                         if let Some((id, name, args_json)) = tool_map.get(&current_block_idx) {
                             let args: serde_json::Value =
                                 serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-                            app_handle
-                                .emit(
-                                    event_name,
-                                    StreamEvent::ToolCallStart {
+                            events.emit(StreamEvent::ToolCallStart {
                                         id: id.clone(),
                                         name: name.clone(),
                                         args,
-                                    },
-                                )
-                                .ok();
+                                    });
                         }
                     }
                 }
@@ -263,14 +251,9 @@ pub async fn stream_anthropic(
     if finalization_response {
         text_buf = sanitize_completion_summary(&text_buf);
         tool_calls.clear();
-        app_handle
-            .emit(
-                event_name,
-                StreamEvent::TextDelta {
+        events.emit(StreamEvent::TextDelta {
                     content: text_buf.clone(),
-                },
-            )
-            .ok();
+                });
     }
 
     Ok(AnthropicResponse {
