@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod anthropic_client;
+pub mod events;
 pub mod attachments;
 pub mod checkpoint;
 pub mod context;
@@ -398,6 +399,7 @@ of suggestions, and the user just APPROVED it. Carry it out NOW.\n\
 
 pub struct AgentLoop {
     app: AppHandle,
+    events: std::sync::Arc<dyn events::EventSink>,
     db: SqlitePool,
     session_id: String,
     endpoint_name: String,
@@ -515,22 +517,14 @@ fn knowledge_scope_for_tools(
 }
 
 impl AgentLoop {
-    fn emit_transport_retry(
-        app: &AppHandle,
-        event_name: &str,
-        notice: crate::http_util::RetryNotice,
-    ) {
-        app.emit(
-            event_name,
-            StreamEvent::TransportRetry {
-                label: notice.label,
-                attempt: notice.attempt as u32,
-                max_attempts: notice.max_attempts as u32,
-                delay_ms: notice.delay.as_millis() as u64,
-                reason: notice.reason,
-            },
-        )
-        .ok();
+    fn emit_transport_retry(events: &dyn events::EventSink, notice: crate::http_util::RetryNotice) {
+        events.emit(StreamEvent::TransportRetry {
+            label: notice.label,
+            attempt: notice.attempt as u32,
+            max_attempts: notice.max_attempts as u32,
+            delay_ms: notice.delay.as_millis() as u64,
+            reason: notice.reason,
+        });
     }
 
     pub fn new(
@@ -589,8 +583,11 @@ impl AgentLoop {
         execution_context: Option<AgentExecutionContext>,
         mode: AgentMode,
     ) -> Self {
+        let events: std::sync::Arc<dyn events::EventSink> =
+            std::sync::Arc::new(events::TauriEventSink::new(app.clone(), &session_id));
         Self {
             app,
+            events,
             db,
             session_id,
             endpoint_name,
@@ -708,17 +705,12 @@ impl AgentLoop {
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
     }
 
-    fn emit_cancelled_done(&self, event_name: &str) {
+    fn emit_cancelled_done(&self) {
         tracing::info!("chat turn cancelled by user (session {})", self.session_id);
-        self.app
-            .emit(
-                event_name,
-                StreamEvent::Done {
+        self.events.emit(StreamEvent::Done {
                     input_tokens: 0,
                     output_tokens: 0,
-                },
-            )
-            .ok();
+                });
     }
 
     pub async fn run(&mut self, history: Vec<Message>) -> Result<()> {
@@ -736,7 +728,6 @@ impl AgentLoop {
             tool_defs
                 .retain(|d| d.function.name != "kb_search" && d.function.name != "kb_get_chunk");
         }
-        let event_name = format!("stream:{}", self.session_id);
         // Assemble the system prompt under ONE shared budget: the fixed base
         // persona (always kept), then project knowledge (memory/README/config),
         // enabled skills, and the user's preferences/learnings. Blocks render in
@@ -783,11 +774,11 @@ impl AgentLoop {
             // shape, tool loop, persistence, events). Only the per-round model
             // call differs — run_openai picks call_chatgpt_model when needed.
             ApiStyle::Openai | ApiStyle::Chatgpt => {
-                self.run_openai(history, &tool_defs, &event_name, &system_prompt)
+                self.run_openai(history, &tool_defs, &system_prompt)
                     .await
             }
             ApiStyle::Anthropic => {
-                self.run_anthropic(history, &tool_defs, &event_name, &system_prompt)
+                self.run_anthropic(history, &tool_defs, &system_prompt)
                     .await
             }
         }
@@ -804,7 +795,6 @@ impl AgentLoop {
         &mut self,
         history: Vec<Message>,
         tool_defs: &[ToolDefinition],
-        event_name: &str,
         system_prompt: &str,
     ) -> Result<()> {
         let completion_instruction = history
@@ -858,7 +848,7 @@ impl AgentLoop {
             // mid tool-call) so in-flight work isn't hard-killed. No-op unless
             // a cancel flag was attached (chat only) and has actually tripped.
             if self.is_cancelled() {
-                self.emit_cancelled_done(event_name);
+                self.emit_cancelled_done();
                 emitted_terminal = true;
                 break;
             }
@@ -887,15 +877,10 @@ impl AgentLoop {
             // the last possible boundary before every model request.
             messages = repair_openai_tool_protocol(compression.messages);
             if compression.compressed {
-                self.app
-                    .emit(
-                        event_name,
-                        StreamEvent::ContextCompressed {
+                self.events.emit(StreamEvent::ContextCompressed {
                             elided_count: compression.elided_count,
                             tokens_freed: compression.tokens_freed,
-                        },
-                    )
-                    .ok();
+                        });
             }
 
             let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
@@ -905,7 +890,6 @@ impl AgentLoop {
                     &messages,
                     active_tool_defs,
                     required_tool_response,
-                    event_name,
                 )
                 .await;
             let (text, tool_calls, usage, reasoning) = match call_result {
@@ -936,20 +920,14 @@ impl AgentLoop {
                         compression.elided_count, compression.tokens_freed
                     );
                     self.persist_gate_message(&notice, "turn_notice").await?;
-                    self.app
-                        .emit(
-                            event_name,
-                            StreamEvent::CompletionGateAction {
+                    self.events.emit(StreamEvent::CompletionGateAction {
                                 kind: "turn_notice".into(),
                                 detail: notice.clone(),
-                            },
-                        )
-                        .ok();
+                            });
                     self.call_openai_transport(
                         &messages,
                         active_tool_defs,
                         required_tool_response,
-                        event_name,
                     )
                     .await?
                 }
@@ -963,20 +941,14 @@ impl AgentLoop {
 如需图片理解,请切换回支持图片的模型。"
                     );
                     self.persist_gate_message(&notice, "turn_notice").await?;
-                    self.app
-                        .emit(
-                            event_name,
-                            StreamEvent::CompletionGateAction {
+                    self.events.emit(StreamEvent::CompletionGateAction {
                                 kind: "turn_notice".into(),
                                 detail: notice.clone(),
-                            },
-                        )
-                        .ok();
+                            });
                     self.call_openai_transport(
                         &messages,
                         active_tool_defs,
                         required_tool_response,
-                        event_name,
                     )
                     .await?
                 }
@@ -994,7 +966,7 @@ impl AgentLoop {
             }
 
             if self.is_cancelled() {
-                self.emit_cancelled_done(event_name);
+                self.emit_cancelled_done();
                 emitted_terminal = true;
                 break;
             }
@@ -1003,16 +975,11 @@ impl AgentLoop {
             // round-trip so the UI bar tracks actual usage, not just our
             // estimate. The estimate is only used to *trigger* compression.
             if let Some(u) = &usage {
-                self.app
-                    .emit(
-                        event_name,
-                        StreamEvent::ContextUsage {
+                self.events.emit(StreamEvent::ContextUsage {
                             used_tokens: u.prompt_tokens,
                             limit_tokens: context_limit,
                             max_limit_tokens: max_context_limit,
-                        },
-                    )
-                    .ok();
+                        });
             }
 
             // Persist assistant turn — include tool_calls AND reasoning_content
@@ -1060,15 +1027,10 @@ impl AgentLoop {
                     if let Some(correction) = fact_check_reply(&text) {
                         fact_check_used = true;
                         self.persist_gate_message(&correction, "turn_notice").await?;
-                        self.app
-                            .emit(
-                                event_name,
-                                StreamEvent::CompletionGateAction {
+                        self.events.emit(StreamEvent::CompletionGateAction {
                                     kind: "turn_notice".into(),
                                     detail: correction.clone(),
-                                },
-                            )
-                            .ok();
+                                });
                         messages.push(ChatMessage {
                             role: "user".into(),
                             content: MessageContent::Text(correction),
@@ -1091,15 +1053,10 @@ impl AgentLoop {
                         self.mark_rejected_candidate(assistant_message_id.as_deref())
                             .await?;
                         self.persist_gate_message(&prompt, "gate_recovery").await?;
-                        self.app
-                            .emit(
-                                event_name,
-                                StreamEvent::CompletionGateAction {
+                        self.events.emit(StreamEvent::CompletionGateAction {
                                     kind: "recovery".into(),
                                     detail: evidence.blockers.join("; "),
-                                },
-                            )
-                            .ok();
+                                });
                         messages.push(ChatMessage {
                             role: "user".into(),
                             content: MessageContent::Text(prompt),
@@ -1114,23 +1071,16 @@ impl AgentLoop {
                         // The reply stands — no folding, no Error. Persist a
                         // visible warning and fall through to the normal Done.
                         self.persist_gate_message(&warning, "gate_warning").await?;
-                        self.app
-                            .emit(
-                                event_name,
-                                StreamEvent::CompletionGateAction {
+                        self.events.emit(StreamEvent::CompletionGateAction {
                                     kind: "warning".into(),
                                     detail: warning.clone(),
-                                },
-                            )
-                            .ok();
+                                });
                     }
                     CompletionFinalization::Blocked(message) => {
                         self.mark_rejected_candidate(assistant_message_id.as_deref())
                             .await?;
                         self.persist_gate_message(&message, "gate_blocked").await?;
-                        self.app
-                            .emit(event_name, StreamEvent::Error { message })
-                            .ok();
+                        self.events.emit(StreamEvent::Error { message });
                         emitted_terminal = true;
                         break;
                     }
@@ -1144,15 +1094,10 @@ impl AgentLoop {
                     .as_ref()
                     .map(|u| (u.prompt_tokens, u.completion_tokens))
                     .unwrap_or((0, 0));
-                self.app
-                    .emit(
-                        &event_name,
-                        StreamEvent::Done {
+                self.events.emit(StreamEvent::Done {
                             input_tokens: done_in,
                             output_tokens: done_out,
-                        },
-                    )
-                    .ok();
+                        });
                 emitted_terminal = true;
                 break;
             }
@@ -1166,7 +1111,7 @@ impl AgentLoop {
                     cancelled_tool_suffix(self.cancel.as_ref(), &tool_calls, tool_index)
                 {
                     return self
-                        .finish_cancelled_tool_batch(event_name, remaining)
+                        .finish_cancelled_tool_batch(remaining)
                         .await;
                 }
                 let args: serde_json::Value =
@@ -1182,16 +1127,11 @@ impl AgentLoop {
                     None
                 };
 
-                self.app
-                    .emit(
-                        &event_name,
-                        StreamEvent::ToolCallStart {
+                self.events.emit(StreamEvent::ToolCallStart {
                             id: tc.id.clone(),
                             name: tc.function.name.clone(),
                             args: args.clone(),
-                        },
-                    )
-                    .ok();
+                        });
 
                 let permission_policy = {
                     let settings = self.settings.read().await;
@@ -1216,7 +1156,7 @@ impl AgentLoop {
                     match decision {
                         PermissionDecision::Allow => None,
                         PermissionDecision::Ask => {
-                            match self.request_permission(&event_name, tc, args.clone()).await {
+                            match self.request_permission(tc, args.clone()).await {
                                 PermissionResponse::Allow => None,
                                 PermissionResponse::Deny => Some(
                                     "Tool call denied by user. Please try a different approach."
@@ -1225,7 +1165,6 @@ impl AgentLoop {
                                 PermissionResponse::Cancelled => {
                                     return self
                                         .finish_cancelled_tool_batch(
-                                            &event_name,
                                             &tool_calls[tool_index..],
                                         )
                                         .await;
@@ -1244,17 +1183,12 @@ impl AgentLoop {
                 if let Some(content) = denial_content {
                     self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
                         .await?;
-                    self.app
-                        .emit(
-                            &event_name,
-                            StreamEvent::ToolResult {
+                    self.events.emit(StreamEvent::ToolResult {
                                 tool_call_id: tc.id.clone(),
                                 content: content.clone(),
                                 is_error: true,
                                 status: "denied".into(),
-                            },
-                        )
-                        .ok();
+                            });
                     result_messages.push(ChatMessage {
                         role: "tool".into(),
                         content: MessageContent::Text(content),
@@ -1277,17 +1211,12 @@ impl AgentLoop {
                     let content = "Tool call cancelled by hook.".to_string();
                     self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
                         .await?;
-                    self.app
-                        .emit(
-                            &event_name,
-                            StreamEvent::ToolResult {
+                    self.events.emit(StreamEvent::ToolResult {
                                 tool_call_id: tc.id.clone(),
                                 content: content.clone(),
                                 is_error: true,
                                 status: "denied".into(),
-                            },
-                        )
-                        .ok();
+                            });
                     result_messages.push(ChatMessage {
                         role: "tool".into(),
                         content: MessageContent::Text(content),
@@ -1383,10 +1312,7 @@ impl AgentLoop {
                     })
                     .await;
 
-                self.app
-                    .emit(
-                        &event_name,
-                        StreamEvent::ToolResult {
+                self.events.emit(StreamEvent::ToolResult {
                             tool_call_id: tc.id.clone(),
                             content: output.content.clone(),
                             is_error: output.is_error,
@@ -1395,9 +1321,7 @@ impl AgentLoop {
                             } else {
                                 "done".into()
                             },
-                        },
-                    )
-                    .ok();
+                        });
 
                 result_messages.push(ChatMessage {
                     role: "tool".into(),
@@ -1445,15 +1369,10 @@ impl AgentLoop {
                 finalization_pending = true;
                 self.persist_gate_message(build_completion_ready_prompt(), "gate_ready")
                     .await?;
-                self.app
-                    .emit(
-                        event_name,
-                        StreamEvent::CompletionGateAction {
+                self.events.emit(StreamEvent::CompletionGateAction {
                             kind: "ready".into(),
                             detail: String::new(),
-                        },
-                    )
-                    .ok();
+                        });
                 messages.push(ChatMessage {
                     role: "user".into(),
                     content: MessageContent::Text(build_completion_ready_prompt().to_string()),
@@ -1489,12 +1408,7 @@ impl AgentLoop {
                 self.mode.max_iterations(),
                 evidence.completed,
             );
-            self.app
-                .emit(
-                    &event_name,
-                    iteration_ceiling_terminal_event(&evidence, self.mode),
-                )
-                .ok();
+            self.events.emit(iteration_ceiling_terminal_event(&evidence, self.mode));
         }
 
         Ok(())
@@ -1502,7 +1416,6 @@ impl AgentLoop {
 
     async fn request_permission(
         &self,
-        event_name: &str,
         tc: &ToolCall,
         args: serde_json::Value,
     ) -> PermissionResponse {
@@ -1512,16 +1425,11 @@ impl AgentLoop {
             .await
             .insert(tc.id.clone(), sender);
 
-        self.app
-            .emit(
-                event_name,
-                StreamEvent::PermissionRequest {
+        self.events.emit(StreamEvent::PermissionRequest {
                     tool_call_id: tc.id.clone(),
                     tool_name: tc.function.name.clone(),
                     args,
-                },
-            )
-            .ok();
+                });
         {
             let settings = self.settings.read().await;
             crate::notify::send(
@@ -1540,7 +1448,6 @@ impl AgentLoop {
 
     async fn finish_cancelled_tool_batch(
         &self,
-        event_name: &str,
         remaining: &[ToolCall],
     ) -> Result<()> {
         let contents =
@@ -1549,38 +1456,23 @@ impl AgentLoop {
         for (index, (tc, content)) in remaining.iter().zip(contents).enumerate() {
             if index > 0 {
                 let args = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                self.app
-                    .emit(
-                        event_name,
-                        StreamEvent::ToolCallStart {
+                self.events.emit(StreamEvent::ToolCallStart {
                             id: tc.id.clone(),
                             name: tc.function.name.clone(),
                             args,
-                        },
-                    )
-                    .ok();
+                        });
             }
-            self.app
-                .emit(
-                    event_name,
-                    StreamEvent::ToolResult {
+            self.events.emit(StreamEvent::ToolResult {
                         tool_call_id: tc.id.clone(),
                         content: content.clone(),
                         is_error: true,
                         status: "cancelled".into(),
-                    },
-                )
-                .ok();
+                    });
         }
-        self.app
-            .emit(
-                event_name,
-                StreamEvent::Done {
+        self.events.emit(StreamEvent::Done {
                     input_tokens: 0,
                     output_tokens: 0,
-                },
-            )
-            .ok();
+                });
         Ok(())
     }
 
@@ -1656,15 +1548,14 @@ impl AgentLoop {
         messages: &[ChatMessage],
         tool_defs: &[ToolDefinition],
         require_tool: bool,
-        event_name: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         let first = match self.api_style {
             ApiStyle::Chatgpt => {
-                self.call_chatgpt_model(messages, tool_defs, require_tool, event_name)
+                self.call_chatgpt_model(messages, tool_defs, require_tool)
                     .await
             }
             _ => {
-                self.call_openai_model(messages, tool_defs, require_tool, event_name)
+                self.call_openai_model(messages, tool_defs, require_tool)
                     .await
             }
         };
@@ -1676,11 +1567,11 @@ impl AgentLoop {
         }
         match self.api_style {
             ApiStyle::Chatgpt => {
-                self.call_chatgpt_model(messages, tool_defs, false, event_name)
+                self.call_chatgpt_model(messages, tool_defs, false)
                     .await
             }
             _ => {
-                self.call_openai_model(messages, tool_defs, false, event_name)
+                self.call_openai_model(messages, tool_defs, false)
                     .await
             }
         }
@@ -1691,7 +1582,6 @@ impl AgentLoop {
         messages: &[ChatMessage],
         tool_defs: &[ToolDefinition],
         require_tool: bool,
-        event_name: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         let finalization_response = tool_defs.is_empty();
 
@@ -1811,7 +1701,7 @@ impl AgentLoop {
                 }
                 request
             },
-            |notice| Self::emit_transport_retry(&self.app, event_name, notice),
+            |notice| Self::emit_transport_retry(self.events.as_ref(), notice),
         )
         .await?;
         let status = response.status();
@@ -1860,14 +1750,9 @@ impl AgentLoop {
                         if let Some(d) = ev.get("delta").and_then(|v| v.as_str()) {
                             if !d.is_empty() {
                                 if !finalization_response {
-                                    self.app
-                                        .emit(
-                                            event_name,
-                                            StreamEvent::TextDelta {
+                                    self.events.emit(StreamEvent::TextDelta {
                                                 content: d.to_string(),
-                                            },
-                                        )
-                                        .ok();
+                                            });
                                 }
                                 text_buf.push_str(d);
                             }
@@ -1971,14 +1856,9 @@ impl AgentLoop {
         if finalization_response {
             text_buf = sanitize_completion_summary(&text_buf);
             tool_calls.clear();
-            self.app
-                .emit(
-                    event_name,
-                    StreamEvent::TextDelta {
+            self.events.emit(StreamEvent::TextDelta {
                         content: text_buf.clone(),
-                    },
-                )
-                .ok();
+                    });
         }
         let reasoning = if reasoning_buf.is_empty() {
             None
@@ -1993,7 +1873,6 @@ impl AgentLoop {
         messages: &[ChatMessage],
         tool_defs: &[ToolDefinition],
         require_tool: bool,
-        event_name: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         let finalization_response = tool_defs.is_empty();
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -2036,7 +1915,7 @@ impl AgentLoop {
                     .header("X-Title", "CodeFactory")
                     .json(&body)
             },
-            |notice| Self::emit_transport_retry(&self.app, event_name, notice),
+            |notice| Self::emit_transport_retry(self.events.as_ref(), notice),
         )
         .await?;
 
@@ -2060,7 +1939,7 @@ impl AgentLoop {
                             .header("X-Title", "CodeFactory")
                             .json(&body)
                     },
-                    |notice| Self::emit_transport_retry(&self.app, event_name, notice),
+                    |notice| Self::emit_transport_retry(self.events.as_ref(), notice),
                 )
                 .await?;
             } else {
@@ -2138,9 +2017,7 @@ impl AgentLoop {
                     let delta = choice.delta;
                     if let Some(t) = delta.content.filter(|s| !s.is_empty()) {
                         if !finalization_response {
-                            self.app
-                                .emit(&event_name, StreamEvent::TextDelta { content: t.clone() })
-                                .ok();
+                            self.events.emit(StreamEvent::TextDelta { content: t.clone() });
                         }
                         text_buf.push_str(&t);
                     }
@@ -2201,14 +2078,9 @@ impl AgentLoop {
         if finalization_response {
             text_buf = sanitize_completion_summary(&text_buf);
             tool_calls.clear();
-            self.app
-                .emit(
-                    &event_name,
-                    StreamEvent::TextDelta {
+            self.events.emit(StreamEvent::TextDelta {
                         content: text_buf.clone(),
-                    },
-                )
-                .ok();
+                    });
         }
 
         let reasoning = if reasoning_buf.is_empty() {
@@ -2505,7 +2377,6 @@ impl AgentLoop {
         messages: Vec<serde_json::Value>,
         tool_defs: &[ToolDefinition],
         require_tool: bool,
-        event_name: &str,
     ) -> Result<anthropic_client::AnthropicResponse> {
         let first = anthropic_client::stream_anthropic(
             &self.http,
@@ -2517,8 +2388,7 @@ impl AgentLoop {
             tool_defs,
             require_tool,
             self.cancel.as_ref(),
-            &self.app,
-            event_name,
+            self.events.as_ref(),
         )
         .await;
         let required_choice_unsupported = first.as_ref().err().is_some_and(|error| {
@@ -2537,8 +2407,7 @@ impl AgentLoop {
             tool_defs,
             false,
             self.cancel.as_ref(),
-            &self.app,
-            event_name,
+            self.events.as_ref(),
         )
         .await
     }
@@ -2547,7 +2416,6 @@ impl AgentLoop {
         &mut self,
         history: Vec<Message>,
         tool_defs: &[ToolDefinition],
-        event_name: &str,
         system_prompt: &str,
     ) -> Result<()> {
         let completion_instruction = history
@@ -2598,7 +2466,7 @@ impl AgentLoop {
             // mid tool-call) so in-flight work isn't hard-killed. No-op unless
             // a cancel flag was attached (chat only) and has actually tripped.
             if self.is_cancelled() {
-                self.emit_cancelled_done(event_name);
+                self.emit_cancelled_done();
                 emitted_terminal = true;
                 break;
             }
@@ -2628,7 +2496,6 @@ impl AgentLoop {
                     messages.clone(),
                     active_tool_defs,
                     required_tool_response,
-                    event_name,
                 )
                 .await;
             let resp = match first_attempt {
@@ -2654,7 +2521,6 @@ impl AgentLoop {
                                 messages.clone(),
                                 active_tool_defs,
                                 required_tool_response,
-                                event_name,
                             )
                             .await
                         {
@@ -2683,21 +2549,15 @@ impl AgentLoop {
 如需图片理解,请切换回支持图片的模型。"
                     );
                     self.persist_gate_message(&notice, "turn_notice").await?;
-                    self.app
-                        .emit(
-                            event_name,
-                            StreamEvent::CompletionGateAction {
+                    self.events.emit(StreamEvent::CompletionGateAction {
                                 kind: "turn_notice".into(),
                                 detail: notice.clone(),
-                            },
-                        )
-                        .ok();
+                            });
                     self.call_anthropic_transport(
                         system_prompt,
                         messages.clone(),
                         active_tool_defs,
                         required_tool_response,
-                        event_name,
                     )
                     .await?
                 }
@@ -2722,23 +2582,18 @@ impl AgentLoop {
             }
 
             if resp.cancelled || self.is_cancelled() {
-                self.emit_cancelled_done(event_name);
+                self.emit_cancelled_done();
                 emitted_terminal = true;
                 break;
             }
 
             // Emit context usage if Anthropic reported it (it sets 0 when missing)
             if resp.input_tokens > 0 {
-                self.app
-                    .emit(
-                        event_name,
-                        StreamEvent::ContextUsage {
+                self.events.emit(StreamEvent::ContextUsage {
                             used_tokens: resp.input_tokens.max(0) as u32,
                             limit_tokens: context_limit,
                             max_limit_tokens: max_context_limit,
-                        },
-                    )
-                    .ok();
+                        });
             }
 
             let text = resp.text;
@@ -2785,15 +2640,10 @@ impl AgentLoop {
                     if let Some(correction) = fact_check_reply(&text) {
                         fact_check_used = true;
                         self.persist_gate_message(&correction, "turn_notice").await?;
-                        self.app
-                            .emit(
-                                event_name,
-                                StreamEvent::CompletionGateAction {
+                        self.events.emit(StreamEvent::CompletionGateAction {
                                     kind: "turn_notice".into(),
                                     detail: correction.clone(),
-                                },
-                            )
-                            .ok();
+                                });
                         messages.push(serde_json::json!({
                             "role": "user",
                             "content": [{ "type": "text", "text": correction }],
@@ -2812,15 +2662,10 @@ impl AgentLoop {
                         self.mark_rejected_candidate(assistant_message_id.as_deref())
                             .await?;
                         self.persist_gate_message(&prompt, "gate_recovery").await?;
-                        self.app
-                            .emit(
-                                event_name,
-                                StreamEvent::CompletionGateAction {
+                        self.events.emit(StreamEvent::CompletionGateAction {
                                     kind: "recovery".into(),
                                     detail: evidence.blockers.join("; "),
-                                },
-                            )
-                            .ok();
+                                });
                         messages.push(serde_json::json!({
                             "role": "user",
                             "content": [{
@@ -2834,23 +2679,16 @@ impl AgentLoop {
                         // The reply stands — no folding, no Error. Persist a
                         // visible warning and fall through to the normal Done.
                         self.persist_gate_message(&warning, "gate_warning").await?;
-                        self.app
-                            .emit(
-                                event_name,
-                                StreamEvent::CompletionGateAction {
+                        self.events.emit(StreamEvent::CompletionGateAction {
                                     kind: "warning".into(),
                                     detail: warning.clone(),
-                                },
-                            )
-                            .ok();
+                                });
                     }
                     CompletionFinalization::Blocked(message) => {
                         self.mark_rejected_candidate(assistant_message_id.as_deref())
                             .await?;
                         self.persist_gate_message(&message, "gate_blocked").await?;
-                        self.app
-                            .emit(event_name, StreamEvent::Error { message })
-                            .ok();
+                        self.events.emit(StreamEvent::Error { message });
                         emitted_terminal = true;
                         break;
                     }
@@ -2859,15 +2697,10 @@ impl AgentLoop {
                 emitted_terminal = true;
                 let inp = resp.input_tokens;
                 let out = resp.output_tokens;
-                self.app
-                    .emit(
-                        event_name,
-                        StreamEvent::Done {
+                self.events.emit(StreamEvent::Done {
                             input_tokens: inp as u32,
                             output_tokens: out as u32,
-                        },
-                    )
-                    .ok();
+                        });
                 break;
             }
 
@@ -2901,23 +2734,18 @@ impl AgentLoop {
                     cancelled_tool_suffix(self.cancel.as_ref(), &tool_calls, tool_index)
                 {
                     return self
-                        .finish_cancelled_tool_batch(event_name, remaining)
+                        .finish_cancelled_tool_batch(remaining)
                         .await;
                 }
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.function.arguments).unwrap_or_default();
                 let completion_args = args.clone();
 
-                self.app
-                    .emit(
-                        event_name,
-                        StreamEvent::ToolCallStart {
+                self.events.emit(StreamEvent::ToolCallStart {
                             id: tc.id.clone(),
                             name: tc.function.name.clone(),
                             args: args.clone(),
-                        },
-                    )
-                    .ok();
+                        });
 
                 let bash_cmd = if tc.function.name == "bash" {
                     args.get("command")
@@ -2949,7 +2777,7 @@ impl AgentLoop {
                     match decision {
                         PermissionDecision::Allow => None,
                         PermissionDecision::Ask => {
-                            match self.request_permission(event_name, tc, args.clone()).await {
+                            match self.request_permission(tc, args.clone()).await {
                                 PermissionResponse::Allow => None,
                                 PermissionResponse::Deny => Some(
                                     "Tool call denied by user. Please try a different approach."
@@ -2958,7 +2786,6 @@ impl AgentLoop {
                                 PermissionResponse::Cancelled => {
                                     return self
                                         .finish_cancelled_tool_batch(
-                                            event_name,
                                             &tool_calls[tool_index..],
                                         )
                                         .await;
@@ -2977,17 +2804,12 @@ impl AgentLoop {
                 if let Some(content) = denial_content {
                     self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
                         .await?;
-                    self.app
-                        .emit(
-                            event_name,
-                            StreamEvent::ToolResult {
+                    self.events.emit(StreamEvent::ToolResult {
                                 tool_call_id: tc.id.clone(),
                                 content: content.clone(),
                                 is_error: true,
                                 status: "denied".into(),
-                            },
-                        )
-                        .ok();
+                            });
                     tool_result_blocks.push(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": tc.id,
@@ -3007,17 +2829,12 @@ impl AgentLoop {
                     let content = "Tool call cancelled by hook.".to_string();
                     self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
                         .await?;
-                    self.app
-                        .emit(
-                            event_name,
-                            StreamEvent::ToolResult {
+                    self.events.emit(StreamEvent::ToolResult {
                                 tool_call_id: tc.id.clone(),
                                 content: content.clone(),
                                 is_error: true,
                                 status: "denied".into(),
-                            },
-                        )
-                        .ok();
+                            });
                     tool_result_blocks.push(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": tc.id,
@@ -3110,10 +2927,7 @@ impl AgentLoop {
                     })
                     .await;
 
-                self.app
-                    .emit(
-                        event_name,
-                        StreamEvent::ToolResult {
+                self.events.emit(StreamEvent::ToolResult {
                             tool_call_id: tc.id.clone(),
                             content: output.content.clone(),
                             is_error: output.is_error,
@@ -3122,9 +2936,7 @@ impl AgentLoop {
                             } else {
                                 "done".into()
                             },
-                        },
-                    )
-                    .ok();
+                        });
 
                 tool_result_blocks.push(serde_json::json!({
                     "type": "tool_result",
@@ -3163,15 +2975,10 @@ impl AgentLoop {
                 finalization_pending = true;
                 self.persist_gate_message(build_completion_ready_prompt(), "gate_ready")
                     .await?;
-                self.app
-                    .emit(
-                        event_name,
-                        StreamEvent::CompletionGateAction {
+                self.events.emit(StreamEvent::CompletionGateAction {
                             kind: "ready".into(),
                             detail: String::new(),
-                        },
-                    )
-                    .ok();
+                        });
                 messages.push(serde_json::json!({
                     "role": "user",
                     "content": [{
@@ -3202,12 +3009,7 @@ impl AgentLoop {
                 self.mode.max_iterations(),
                 evidence.completed,
             );
-            self.app
-                .emit(
-                    event_name,
-                    iteration_ceiling_terminal_event(&evidence, self.mode),
-                )
-                .ok();
+            self.events.emit(iteration_ceiling_terminal_event(&evidence, self.mode));
         }
 
         Ok(())
@@ -4225,6 +4027,39 @@ fn glob_match(pattern: &str, input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emit_transport_retry_maps_notice_fields_through_the_event_sink() {
+        // Keystone slice 1: the loop now emits through `EventSink`, so its
+        // event output is testable without a Tauri AppHandle for the first
+        // time. Verify the transport-retry mapping via a collecting sink.
+        let sink = events::CollectingEventSink::new();
+        AgentLoop::emit_transport_retry(
+            &sink,
+            crate::http_util::RetryNotice {
+                label: "anthropic stream".into(),
+                attempt: 2,
+                max_attempts: 3,
+                delay: std::time::Duration::from_millis(300),
+                reason: "HTTP 503".into(),
+            },
+        );
+        let evs = sink.events();
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            StreamEvent::TransportRetry {
+                attempt,
+                max_attempts,
+                delay_ms,
+                reason,
+                ..
+            } => {
+                assert_eq!((*attempt, *max_attempts, *delay_ms), (2, 3, 300));
+                assert_eq!(reason, "HTTP 503");
+            }
+            other => panic!("expected TransportRetry, got {other:?}"),
+        }
+    }
 
     #[test]
     fn autonomous_empty_knowledge_scope_remains_explicitly_empty() {
