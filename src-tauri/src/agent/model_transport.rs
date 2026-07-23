@@ -25,6 +25,10 @@ use std::sync::Arc;
 use codefactory_agent_core::{provider_rejects_required_tool_choice, sanitize_completion_summary};
 use reqwest::Client;
 
+use codefactory_agent_loop::transport::{
+    ModelResponse, ModelTransport, RoundOptions, TransportError,
+};
+
 use super::events::EventSink;
 use super::{next_stream_item, openai_tool_controls, validate_openai_sse_completion, StreamPoll};
 use crate::config::settings::ApiStyle;
@@ -577,5 +581,63 @@ impl DesktopModelTransport {
             Some(reasoning_buf)
         };
         Ok((text_buf, tool_calls, usage, reasoning))
+    }
+}
+
+/// The agent-loop `ModelTransport` seam (keystone slice 4.5b). Wraps the
+/// inherent `call_openai_transport` (which the loop still calls directly until
+/// slice 4.6 switches it onto `complete`): maps the internal 4-tuple to
+/// [`ModelResponse`] and the bin's `AppError` to a fatal [`TransportError`]
+/// (message preserved verbatim). `RoundOptions` supplies the per-round
+/// `require_tool` + pre-resolved `reasoning_effort`; the sink and cancel handle
+/// are the transport's own fields, so `complete` needs neither as a param.
+#[async_trait::async_trait]
+impl ModelTransport for DesktopModelTransport {
+    async fn complete(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        opts: &RoundOptions,
+    ) -> std::result::Result<ModelResponse, TransportError> {
+        let (text, tool_calls, usage, reasoning) = self
+            .call_openai_transport(messages, tools, opts.require_tool, &opts.reasoning_effort)
+            .await
+            .map_err(|e| TransportError::Fatal(e.to_string()))?;
+        Ok(ModelResponse {
+            text,
+            tool_calls,
+            usage,
+            reasoning,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `DesktopModelTransport` owns no `AppHandle`, so it constructs from bare
+    //! handles in a test (#166-safe). We prove the `ModelTransport` trait is
+    //! satisfied and object-safe (`Arc<dyn ModelTransport>`); `complete` itself
+    //! is a network call, exercised end-to-end by the desktop app, not here.
+    use super::*;
+    use std::sync::Arc;
+
+    fn transport() -> DesktopModelTransport {
+        DesktopModelTransport {
+            http: Client::new(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            model_id: "m".into(),
+            session_id: "s".into(),
+            base_url: "http://127.0.0.1:0".into(),
+            api_key: "k".into(),
+            api_style: ApiStyle::Openai,
+            cancel: None,
+        }
+    }
+
+    #[test]
+    fn desktop_transport_is_object_safe_as_dyn_model_transport() {
+        // The shared loop (4.6) holds Arc<dyn ModelTransport>; prove the desktop
+        // impl coerces and constructs with no AppHandle.
+        let _t: Arc<dyn ModelTransport> = Arc::new(transport());
     }
 }
