@@ -1,49 +1,130 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Persistence + budget seams (keystone slice 4.2).
+//! Persistence + budget seams (keystone slice 4.2, refined in 4.4a).
 //!
 //! [`Persistence`] is a write-only journal so the loop never touches `sqlx`
 //! directly. The desktop `SqlitePersistence` owns the pool AND the `anonymous`
-//! flag — every method returns early when anonymous, moving the no-DB-trace
-//! guarantee from ~6 scattered `if self.anonymous` checks into one place. The
-//! sidecar's `NullPersistence` no-ops everything (the Python bridge owns
-//! `trajectory.json`).
+//! flag — every DB write returns early when anonymous, moving the scattered
+//! `if self.anonymous` checks into one place. The sidecar's `NullPersistence`
+//! no-ops everything.
 //!
-//! [`Budget`] abstracts the run's stopping condition — the desktop uses an
-//! iteration ceiling, the sidecar adds a wall-clock reserve.
+//! The method shapes mirror the desktop loop's real inherent helpers so two
+//! load-bearing properties survive by construction (see the adversarial map for
+//! slice 4.4):
+//! - [`Persistence::persist_message`] returns `Option<String>` — the id, or
+//!   `None` when NOT written (anonymous). Callers key `mark_rejected_candidate`
+//!   and tool-start off that id, so an anonymous impl MUST return `Ok(None)`.
+//! - [`Persistence::persist_message`] (redacted) and
+//!   [`Persistence::persist_gate_message`] (RAW) stay DISTINCT: gate content
+//!   (e.g. `gate_ready`) must byte-match the replayed provider turn, so it is
+//!   never blanket-redacted.
 //!
-//! These signatures are PROVISIONAL: nothing consumes them yet, so they firm
-//! up with zero call-site churn when the desktop impls (slice 4.4) and the
-//! loop body (slice 4.6) land. They exist now to lock the seam shape and prove
-//! object-safety early.
+//! NOT modelled here (deliberately): `turn_error` (written only in
+//! `commands/chat.rs`, not by any loop helper), and the three NON-DB anonymous
+//! guards (KB-tool strip, hook disabling) which stay literal in the loop —
+//! centralizing them here would silently re-enable KB tools / hooks in
+//! anonymous runs.
+//!
+//! [`Budget`] abstracts the run's stopping condition (iteration ceiling /
+//! wall-clock reserve). Consumed by the desktop impls in slice 4.4b-c.
 
-/// A single tool outcome as the loop hands it to the journal. Deliberately
-/// primitive so the trait carries no desktop-specific types.
-#[derive(Debug, Clone, Default)]
-pub struct JournaledTool {
-    pub request_id: String,
-    pub command: String,
-    pub status: String,
-    pub return_code: Option<i32>,
-    pub content: Option<String>,
-    pub duration_ms: u64,
+use crate::types::ToolCall;
+
+/// A persistence write failure. Best-effort from the loop's view; the desktop
+/// impl maps `sqlx`/app errors into this so the trait stays tauri-free.
+#[derive(Debug, Clone)]
+pub struct PersistError {
+    pub message: String,
 }
 
-/// Write-only persistence. All methods are best-effort from the loop's view;
-/// the desktop impl no-ops them when the run is anonymous.
+impl std::fmt::Display for PersistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PersistError {}
+
+pub type PersistResult<T> = Result<T, PersistError>;
+
+/// One `usage_events` row. Primitive/borrowed fields only — the bin decomposes
+/// its `Usage` into these so the trait carries no bin-specific type.
+#[derive(Debug, Clone)]
+pub struct UsageRow<'a> {
+    pub request_id: String,
+    pub session_id: &'a str,
+    pub task_id: Option<String>,
+    pub surface: &'a str,
+    pub provider: String,
+    pub endpoint: &'a str,
+    pub model: &'a str,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub cached_tokens: i64,
+    pub actual_cost_usd: Option<f64>,
+    pub cost_source: String,
+}
+
+/// Write-only persistence. Every method no-ops (returning the "not written"
+/// value) when the run is anonymous, inside the impl.
 #[async_trait::async_trait]
 pub trait Persistence: Send + Sync {
-    /// A user/assistant/tool message. `completion_state` tags gate boundaries
-    /// (`gate_recovery` / `gate_ready` / `rejected_candidate` / …).
-    async fn persist_message(&self, role: &str, content: &str, completion_state: Option<&str>);
+    /// A redacted user/assistant/tool message. Returns the new id, or `None`
+    /// when not written (anonymous) — the `None` is control-flow load-bearing.
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_message(
+        &self,
+        role: &str,
+        content: &str,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        tool_calls: Option<&[ToolCall]>,
+        reasoning_content: Option<&str>,
+        usage_request_id: Option<&str>,
+    ) -> PersistResult<Option<String>>;
 
-    /// Mark the most recent assistant draft as a rejected gate candidate.
-    async fn mark_rejected_candidate(&self);
+    /// A RAW (un-redacted) gate/notice row, role `user`, tagged with a
+    /// `completion_state` (`gate_recovery` / `gate_ready` / `gate_warning` /
+    /// `gate_blocked` / `turn_notice`). DISTINCT from `persist_message` so gate
+    /// content is never redacted.
+    async fn persist_gate_message(&self, content: &str, state: &str) -> PersistResult<()>;
 
-    /// Record one executed tool call for the trajectory.
-    async fn record_tool_call(&self, tool: &JournaledTool);
+    /// Dedup-by-marker wrapper around `persist_gate_message`; the anonymous
+    /// short-circuit sits BEFORE the dedup read so anonymous runs stay
+    /// read-free too.
+    async fn persist_gate_message_once(
+        &self,
+        marker: &str,
+        content: &str,
+        state: &str,
+    ) -> PersistResult<()>;
 
-    /// Record a usage/cost event for one provider round.
-    async fn record_usage(&self, input_tokens: u64, output_tokens: u64);
+    /// Collapse the most recent assistant draft to a rejected gate candidate
+    /// (`completion_state='rejected_candidate'`). No-ops on `None` id or
+    /// anonymous.
+    async fn mark_rejected_candidate(&self, message_id: Option<&str>) -> PersistResult<()>;
+
+    /// Record one terminal tool outcome into the trajectory.
+    async fn record_tool_call_outcome(
+        &self,
+        tool_call: &ToolCall,
+        status: &str,
+        result: Option<&str>,
+        error: Option<&str>,
+        duration_ms: u64,
+    ) -> PersistResult<()>;
+
+    /// Persist a cancelled tool batch. The per-item DB write is anonymous-gated;
+    /// the content strings are returned UNCONDITIONALLY (the event/UI path needs
+    /// them even in anonymous runs).
+    async fn persist_cancelled_tool_batch(
+        &self,
+        remaining: &[ToolCall],
+    ) -> PersistResult<Vec<String>>;
+
+    /// Insert one `usage_events` row. Returns `true` when a NEW row was written
+    /// (so the caller can gate its usage-recorded emits); anonymous → `Ok(false)`.
+    async fn record_usage(&self, row: UsageRow<'_>) -> PersistResult<bool>;
 }
 
 /// The run's stopping condition. `may_continue` is polled between rounds.
@@ -61,10 +142,55 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Persistence for NullPersistence {
-        async fn persist_message(&self, _r: &str, _c: &str, _s: Option<&str>) {}
-        async fn mark_rejected_candidate(&self) {}
-        async fn record_tool_call(&self, _t: &JournaledTool) {}
-        async fn record_usage(&self, _i: u64, _o: u64) {}
+        async fn persist_message(
+            &self,
+            _role: &str,
+            _content: &str,
+            _input_tokens: Option<i64>,
+            _output_tokens: Option<i64>,
+            _tool_calls: Option<&[ToolCall]>,
+            _reasoning_content: Option<&str>,
+            _usage_request_id: Option<&str>,
+        ) -> PersistResult<Option<String>> {
+            Ok(None)
+        }
+        async fn persist_gate_message(&self, _content: &str, _state: &str) -> PersistResult<()> {
+            Ok(())
+        }
+        async fn persist_gate_message_once(
+            &self,
+            _marker: &str,
+            _content: &str,
+            _state: &str,
+        ) -> PersistResult<()> {
+            Ok(())
+        }
+        async fn mark_rejected_candidate(&self, _id: Option<&str>) -> PersistResult<()> {
+            Ok(())
+        }
+        async fn record_tool_call_outcome(
+            &self,
+            _tc: &ToolCall,
+            _status: &str,
+            _result: Option<&str>,
+            _error: Option<&str>,
+            _duration_ms: u64,
+        ) -> PersistResult<()> {
+            Ok(())
+        }
+        async fn persist_cancelled_tool_batch(
+            &self,
+            remaining: &[ToolCall],
+        ) -> PersistResult<Vec<String>> {
+            // Content is returned even by the null impl — the UI path needs it.
+            Ok(remaining
+                .iter()
+                .map(|tc| format!("Cancelled: {}", tc.function.name))
+                .collect())
+        }
+        async fn record_usage(&self, _row: UsageRow<'_>) -> PersistResult<bool> {
+            Ok(false)
+        }
     }
 
     struct CeilingBudget(usize);
@@ -74,13 +200,74 @@ mod tests {
         }
     }
 
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "t".into(),
+            r#type: "function".into(),
+            function: crate::types::FunctionCall {
+                name: name.into(),
+                arguments: "{}".into(),
+            },
+        }
+    }
+
     #[tokio::test]
-    async fn persistence_and_budget_are_object_safe() {
+    async fn null_persistence_is_object_safe_and_never_writes() {
         let p: std::sync::Arc<dyn Persistence> = std::sync::Arc::new(NullPersistence);
-        p.persist_message("user", "hi", None).await;
-        p.record_tool_call(&JournaledTool::default()).await;
+        // persist_message returns None (the load-bearing anonymous sentinel).
+        assert_eq!(
+            p.persist_message("assistant", "hi", Some(1), Some(2), None, None, Some("r"))
+                .await
+                .unwrap(),
+            None
+        );
+        p.persist_gate_message("recover now", "gate_recovery")
+            .await
+            .unwrap();
+        p.mark_rejected_candidate(Some("m1")).await.unwrap();
+        p.record_tool_call_outcome(&call("bash"), "done", Some("ok"), None, 5)
+            .await
+            .unwrap();
+        // Cancelled content still comes back even from a no-op journal.
+        let cancelled = p
+            .persist_cancelled_tool_batch(&[call("read_file"), call("bash")])
+            .await
+            .unwrap();
+        assert_eq!(cancelled.len(), 2);
+        // record_usage reports "no new row" so a caller suppresses its emits.
+        assert!(!p.record_usage(usage_row("req-1")).await.unwrap());
+    }
+
+    fn usage_row(request_id: &str) -> UsageRow<'static> {
+        UsageRow {
+            request_id: request_id.to_string(),
+            session_id: "s1",
+            task_id: None,
+            surface: "interactive",
+            provider: "p".into(),
+            endpoint: "e",
+            model: "m",
+            input_tokens: 10,
+            output_tokens: 20,
+            reasoning_tokens: 0,
+            cached_tokens: 0,
+            actual_cost_usd: None,
+            cost_source: "unknown".into(),
+        }
+    }
+
+    #[test]
+    fn budget_ceiling_stops_at_the_limit() {
         let b: std::sync::Arc<dyn Budget> = std::sync::Arc::new(CeilingBudget(3));
         assert!(b.may_continue(2));
         assert!(!b.may_continue(3));
+    }
+
+    #[test]
+    fn persist_error_is_a_std_error() {
+        let e: Box<dyn std::error::Error> = Box::new(PersistError {
+            message: "db down".into(),
+        });
+        assert_eq!(e.to_string(), "db down");
     }
 }
