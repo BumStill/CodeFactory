@@ -11,7 +11,6 @@ import {
   CheckCircle2,
   Loader2,
   XCircle,
-  Play,
   Square,
   EyeOff,
   ListTodo,
@@ -447,10 +446,6 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onRequestRe
   const [repairBusy, setRepairBusy] = useState(false);
   const [blockedRetryBusy, setBlockedRetryBusy] = useState(false);
 
-  const handleStart = async () => {
-    setStartError(null);
-    try { await start(sessionId); } catch (error) { setStartError(String(error)); }
-  };
   const handleCancel = async () => {
     try { await cancel(sessionId); } catch (error) { setStartError(String(error)); }
   };
@@ -510,7 +505,7 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onRequestRe
           {isRunning ? (
             <button onClick={() => void handleCancel()} className="flex items-center gap-1 rounded bg-red-500/10 px-2 py-1 text-[10px] text-red-700 hover:bg-red-500/20 dark:text-red-300"><Square size={9} />停止</button>
           ) : pendingCount > 0 && failedTasks.length === 0 ? (
-            <button onClick={() => void handleStart()} className="flex items-center gap-1 rounded bg-accent px-2 py-1 text-[10px] text-white hover:bg-accent-hover"><Play size={9} />继续执行 {pendingCount} 项</button>
+            <span className="text-[10px] text-gray-500">任务已委派，由后台调度器自动执行；若长时间未开始请检查模型配置或重试委派。</span>
           ) : null}
           {!isRunning && repairableFailedCount > 0 && (
             <button onClick={() => void handleRepairFailed()} disabled={repairBusy} className="flex items-center gap-1 rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-700 disabled:opacity-40 dark:text-amber-300" title="重试可自动修复的失败步骤">

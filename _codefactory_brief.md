@@ -21,12 +21,12 @@ Session: 43ec91cc-9b2d-4213-b8a7-a1592acf8bc5
 ### Task 6 — 审查状态栏信息架构与窄屏
 只读审查当前分支的前端 UX 实现和测试，重点检查 src/components/GitStatusBar.tsx、WorkspaceDeliveryStatus.tsx、CheckpointsPanel.tsx、src/pages/Workspace/WorkspacePage.tsx 及对应测试。不要改文件。
 
+### Task 7 — 独立 UX 与动作链审查
+审查当前分支 fix/task-blocker-actions 的前端改动。重点检查 src/App.tsx、src/pages/Settings/SettingsPage.tsx、src/pages/Workspace/WorkspacePage.tsx、src/pages/Workspace/TaskCreator.test.tsx、src/acceptance/repository-intent.tsx 与 scripts/verify-repository-intent-headless.mjs。用户反馈是“需要我处理”抽屉没有可执行动作；实现目标是模型 Provider 失败提供打开 endpoints/API key 设置与显式重试，未知阻塞回到对话并预填证据。只读审查，不要编辑。
+
+### Task 8 — 独立重试边界审查
+审查当前分支 fix/task-blocker-actions 的后端和 store 改动。重点检查 src-tauri/src/storage/tasks.rs、src-tauri/src/commands/tasks.rs、src-tauri/src/lib.rs、src/stores/tasks.ts。只读审查单任务/多任务显式重试的数据安全、会话边界、状态约束和命令 wiring，不要编辑。
+
 ## Task Results
 
-
-
-### ❌ 审查 GitHub 交付状态数据链 — failed
-API key not found for key_ref 'codefactory.endpoint.chatgpt'
-
-### ❌ 审查状态栏信息架构与窄屏 — failed
-API key not found for key_ref 'codefactory.endpoint.chatgpt'
+_(will be updated as tasks complete)_
