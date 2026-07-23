@@ -272,7 +272,7 @@ export function WorkspacePage({
           {isProjectSession && projectTaskCount > 0 && (
             <TasksColumn sessionId={sessionId} highlightedTaskId={initialTaskLogId} />
           )}
-          {!activeDraft && <ExecutionStream sessionId={sessionId} />}
+          {!activeDraft && !isProjectSession && <ExecutionStream sessionId={sessionId} />}
           <MessageList
             messages={messages}
             streaming={streaming}
