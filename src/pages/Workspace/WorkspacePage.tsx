@@ -25,7 +25,7 @@ import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
 import { GitStatusBar } from "../../components/GitStatusBar";
-import { CheckpointsPanel } from "../../components/CheckpointsPanel";
+import { WorkspaceDeliveryStatus } from "../../components/WorkspaceDeliveryStatus";
 import { GitChangesPanel } from "../../components/GitChangesPanel";
 import { GitHistoryPanel } from "../../components/GitHistoryPanel";
 import { RemoteGitPanel } from "../../components/RemoteGitPanel";
@@ -130,9 +130,9 @@ export function WorkspacePage({
   const projectTaskCount = sessionTasks.length;
   const taskRunningCount = sessionTasks.filter((task) => task.status === "running").length;
   const taskPendingCount = sessionTasks.filter((task) => task.status === "pending").length;
-  const taskFailedCount = sessionTasks.filter(
-    (task) => task.status === "failed" || task.status === "cancelled",
-  ).length;
+  const failedTasks = sessionTasks.filter((task) => task.status === "failed");
+  const taskFailedCount = failedTasks.length;
+  const taskBlockedCount = failedTasks.filter((task) => task.failure_attribution?.repairable === false).length;
   const taskActivityVisible = taskRunningCount + taskPendingCount + taskFailedCount > 0;
   const [taskActivityOpen, setTaskActivityOpen] = useState(Boolean(initialTaskLogId));
   const taskActivityButtonRef = useRef<HTMLButtonElement>(null);
@@ -265,10 +265,15 @@ export function WorkspacePage({
           <GitStatusBar
             cwd={activeCwd}
             onOpenChanges={() => setGitPanel("changes")}
-            onOpenHistory={() => setGitPanel("history")}
-            onOpenRemote={() => setGitPanel("remote")}
           />
-          {!activeDraft && <CheckpointsPanel sessionId={sessionId} />}
+          {!activeDraft && (
+            <WorkspaceDeliveryStatus
+              cwd={activeCwd}
+              sessionId={sessionId}
+              currentBranch={gitBranch}
+              messages={messages}
+            />
+          )}
         </div>
         {isProjectSession && taskActivityVisible && (
           <button
@@ -287,13 +292,15 @@ export function WorkspacePage({
           >
             <ListTodo size={12} />
             <span>
-              {taskFailedCount > 0
-                ? `${taskFailedCount} 项需处理`
-                : taskRunningCount > 0
-                  ? `正在处理 ${taskRunningCount}`
-                  : taskPendingCount > 0
-                    ? `待处理 ${taskPendingCount}`
-                    : `任务 ${projectTaskCount}`}
+              {taskBlockedCount > 0
+                ? "需要你处理"
+                : taskFailedCount > 0
+                  ? `${taskFailedCount} 个步骤失败`
+                  : taskRunningCount > 0
+                    ? `正在执行 ${taskRunningCount}`
+                    : taskPendingCount > 0
+                      ? `待执行 ${taskPendingCount}`
+                      : `任务 ${projectTaskCount}`}
             </span>
           </button>
         )}
@@ -371,7 +378,14 @@ export function WorkspacePage({
       )}
 
       {/* ── Git / environment slide-out panels (opened from the status bar) ─ */}
-      {gitPanel === "changes" && <GitChangesPanel onClose={() => setGitPanel(null)} />}
+      {gitPanel === "changes" && (
+        <GitChangesPanel
+          sessionId={activeDraft ? null : sessionId}
+          onOpenHistory={() => setGitPanel("history")}
+          onOpenRemote={() => setGitPanel("remote")}
+          onClose={() => setGitPanel(null)}
+        />
+      )}
       {gitPanel === "history" && <GitHistoryPanel onClose={() => setGitPanel(null)} />}
       {gitPanel === "remote" && (
         <RemoteGitPanel
@@ -407,9 +421,7 @@ function TasksColumn({ sessionId, highlightedTaskId, onClose }: { sessionId: str
   const pendingCount = sessionTasks.filter((task) => task.status === "pending").length;
   const runningCount = sessionTasks.filter((task) => task.status === "running").length;
   const completedCount = sessionTasks.filter((task) => task.status === "completed").length;
-  const failedTasks = sessionTasks.filter(
-    (task) => task.status === "failed" || task.status === "cancelled",
-  );
+  const failedTasks = sessionTasks.filter((task) => task.status === "failed");
   const repairableFailedCount = failedTasks.filter(
     (task) => task.failure_attribution?.repairable,
   ).length;
@@ -451,10 +463,10 @@ function TasksColumn({ sessionId, highlightedTaskId, onClose }: { sessionId: str
       </div>
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-4 py-2">
         <div className="flex items-center gap-2 text-[10px] text-gray-600">
-          <span>完成 {completedCount}</span><span>待处理 {pendingCount}</span>
-          {runningCount > 0 && <span className="text-accent">运行中 {runningCount}</span>}
+          <span>已完成 {completedCount}</span><span>待执行 {pendingCount}</span>
+          {runningCount > 0 && <span className="text-accent">执行中 {runningCount}</span>}
           {repairableFailedCount > 0 && <span className="text-amber-700 dark:text-amber-300">可重试 {repairableFailedCount}</span>}
-          {blockedFailedCount > 0 && <span className="text-red-700 dark:text-red-300">需处理 {blockedFailedCount}</span>}
+          {blockedFailedCount > 0 && <span className="text-red-700 dark:text-red-300">需要你 {blockedFailedCount}</span>}
         </div>
         <div className="flex items-center gap-1">
           {isRunning ? (

@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect, useMemo, useState } from "react";
-import { X, FileText, Plus, Check, RefreshCw, GitCommit as GitCommitIcon } from "lucide-react";
+import { X, FileText, Plus, Check, RefreshCw, GitCommit as GitCommitIcon, History, GitPullRequest } from "lucide-react";
 import { useGitStore } from "../stores/git";
 import type { FileChange } from "../lib/tauri";
 import { DiffViewer } from "./DiffViewer";
+import { CheckpointsPanel } from "./CheckpointsPanel";
 
 interface Props {
   onClose: () => void;
+  onOpenHistory: () => void;
+  onOpenRemote: () => void;
+  sessionId: string | null;
 }
 
 type Group = "staged" | "unstaged" | "untracked";
@@ -17,8 +21,8 @@ interface Row {
   group: Group;
 }
 
-export function GitChangesPanel({ onClose }: Props) {
-  const { status, refreshStatus, stageFiles, commit, getFileDiff } = useGitStore();
+export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionId }: Props) {
+  const { status, branches, refreshStatus, refreshBranches, checkout, stageFiles, commit, getFileDiff } = useGitStore();
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [activeFile, setActiveFile] = useState<{ path: string; staged: boolean } | null>(null);
   const [diff, setDiff] = useState<string>("");
@@ -27,10 +31,11 @@ export function GitChangesPanel({ onClose }: Props) {
   const [commitMsg, setCommitMsg] = useState("");
   const [committing, setCommitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [switchingBranch, setSwitchingBranch] = useState(false);
 
   useEffect(() => {
-    refreshStatus();
-  }, [refreshStatus]);
+    void Promise.all([refreshStatus(), refreshBranches()]);
+  }, [refreshBranches, refreshStatus]);
 
   const rows: Row[] = useMemo(() => {
     if (!status) return [];
@@ -111,12 +116,23 @@ export function GitChangesPanel({ onClose }: Props) {
 
   const stagedCount = status?.staged.length ?? 0;
 
+  const handleBranchChange = async (target: string) => {
+    if (!target || target === status?.branch) return;
+    setSwitchingBranch(true);
+    setError(null);
+    try { await checkout(target); }
+    catch (cause) { setError(String(cause)); }
+    finally { setSwitchingBranch(false); }
+  };
+
   return (
     <div className="fixed right-0 top-0 bottom-0 z-40 w-[640px] max-w-[80vw] bg-surface-1 border-l border-border shadow-2xl flex flex-col">
       {/* Header */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0">
         <FileText size={14} className="text-gray-400" />
-        <span className="text-xs font-semibold text-gray-200 flex-1">变更</span>
+        <span className="text-xs font-semibold text-gray-200 flex-1">本地 Git</span>
+        <button onClick={onOpenHistory} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-gray-500 hover:bg-surface-3 hover:text-gray-200" title="提交历史"><History size={11} />历史</button>
+        <button onClick={onOpenRemote} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-gray-500 hover:bg-surface-3 hover:text-gray-200" title="远程仓库（问题与拉取请求）"><GitPullRequest size={11} />远程</button>
         <button
           onClick={() => refreshStatus()}
           className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors"
@@ -135,6 +151,20 @@ export function GitChangesPanel({ onClose }: Props) {
 
       {/* Action bar */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border bg-surface-2 shrink-0">
+        <label className="inline-flex items-center gap-1 text-[10px] text-gray-600">
+          分支
+          <select
+            aria-label="切换本地分支"
+            value={status?.branch ?? ""}
+            disabled={switchingBranch}
+            onChange={(event) => void handleBranchChange(event.target.value)}
+            className="max-w-40 rounded border border-border bg-surface-3 px-1.5 py-1 text-[11px] text-gray-300 outline-none focus:border-accent"
+          >
+            {branches.filter((branch) => !branch.is_remote || branch.is_current).map((branch) => (
+              <option key={`${branch.is_remote ? "r" : "l"}:${branch.name}`} value={branch.name}>{branch.name}</option>
+            ))}
+          </select>
+        </label>
         <button
           onClick={handleStageAll}
           disabled={rows.length === 0}
@@ -150,6 +180,7 @@ export function GitChangesPanel({ onClose }: Props) {
           暂存选中 ({selected.size})
         </button>
         <span className="flex-1" />
+        <CheckpointsPanel sessionId={sessionId} />
         <button
           onClick={() => setShowCommitModal(true)}
           disabled={stagedCount === 0}

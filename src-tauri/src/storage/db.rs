@@ -199,6 +199,21 @@ async fn table_exists(pool: &SqlitePool, table: &str) -> crate::errors::Result<b
 }
 
 async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
+    // Session → PR is durable product intent: the workspace may return to main
+    // after merge, while the conversation still needs to show its own delivery.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS session_delivery_refs (
+            session_id TEXT PRIMARY KEY,
+            branch TEXT NOT NULL,
+            pr_number INTEGER NOT NULL,
+            pr_url TEXT NOT NULL,
+            commit_sha TEXT,
+            updated_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     // ── Tables that historic ad-hoc migrations created — fresh installs
     //    miss them and the corresponding command modules would crash on
     //    first use. CREATE IF NOT EXISTS is a no-op on existing DBs.

@@ -394,6 +394,7 @@ pub fn run() {
             commands::git_remote::create_issue,
             commands::git_remote::list_prs,
             commands::git_remote::create_pr,
+            commands::git_remote::workspace_delivery_status,
             commands::git_remote::list_repos,
             commands::costs::get_session_cost,
             commands::costs::get_today_cost,

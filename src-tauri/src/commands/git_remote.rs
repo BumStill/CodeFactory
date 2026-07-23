@@ -2,12 +2,16 @@
 //! Tauri commands for remote Git collaboration (GitHub / GitLab).
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::Path;
+use std::process::Command;
 use tauri::State;
 use uuid::Uuid;
 
 use crate::config::settings::{self, GitProvider, GitRemoteConfig};
 use crate::git_remote::client::RemoteGitClient;
 use crate::git_remote::{RemoteIssue, RemotePR, RemoteRepo};
+use crate::util::no_window::NoWindow;
 use crate::AppState;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -52,7 +56,11 @@ fn remote_view(cfg: &GitRemoteConfig) -> GitRemoteView {
 
 fn make_client(cfg: &GitRemoteConfig) -> Result<RemoteGitClient, String> {
     let token = settings::resolve_git_remote_token(cfg).map_err(|e| e.to_string())?;
-    Ok(RemoteGitClient::new(&cfg.base_url, &token, cfg.provider.clone()))
+    Ok(RemoteGitClient::new(
+        &cfg.base_url,
+        &token,
+        cfg.provider.clone(),
+    ))
 }
 
 async fn find_remote(state: &AppState, remote_id: &str) -> Result<GitRemoteConfig, String> {
@@ -77,9 +85,7 @@ pub async fn github_cli_credential_status() -> GithubCliCredentialStatus {
 }
 
 #[tauri::command]
-pub async fn list_git_remotes(
-    state: State<'_, AppState>,
-) -> Result<Vec<GitRemoteView>, String> {
+pub async fn list_git_remotes(state: State<'_, AppState>) -> Result<Vec<GitRemoteView>, String> {
     let settings = state.settings.read().await;
     Ok(settings.git_remotes.iter().map(remote_view).collect())
 }
@@ -114,10 +120,7 @@ pub async fn add_git_remote(
 }
 
 #[tauri::command]
-pub async fn delete_git_remote(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn delete_git_remote(id: String, state: State<'_, AppState>) -> Result<(), String> {
     {
         let mut settings = state.settings.write().await;
         if let Some(remote) = settings.git_remotes.iter().find(|r| r.id == id) {
@@ -133,10 +136,7 @@ pub async fn delete_git_remote(
 
 /// Test connectivity — returns authenticated username.
 #[tauri::command]
-pub async fn test_git_remote(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+pub async fn test_git_remote(id: String, state: State<'_, AppState>) -> Result<String, String> {
     let cfg = find_remote(&state, &id).await?;
     let client = make_client(&cfg)?;
     let v = client.get("/user").await?;
@@ -167,8 +167,12 @@ pub async fn list_issues(
     let cfg = find_remote(&state, &remote_id).await?;
     let client = make_client(&cfg)?;
     match cfg.provider {
-        GitProvider::Github => crate::git_remote::github::list_issues(&client, &repo, &state_filter).await,
-        GitProvider::Gitlab => crate::git_remote::gitlab::list_issues(&client, &repo, &state_filter).await,
+        GitProvider::Github => {
+            crate::git_remote::github::list_issues(&client, &repo, &state_filter).await
+        }
+        GitProvider::Gitlab => {
+            crate::git_remote::gitlab::list_issues(&client, &repo, &state_filter).await
+        }
     }
 }
 
@@ -220,8 +224,12 @@ pub async fn list_prs(
     let cfg = find_remote(&state, &remote_id).await?;
     let client = make_client(&cfg)?;
     match cfg.provider {
-        GitProvider::Github => crate::git_remote::github::list_prs(&client, &repo, &state_filter).await,
-        GitProvider::Gitlab => crate::git_remote::gitlab::list_prs(&client, &repo, &state_filter).await,
+        GitProvider::Github => {
+            crate::git_remote::github::list_prs(&client, &repo, &state_filter).await
+        }
+        GitProvider::Gitlab => {
+            crate::git_remote::gitlab::list_prs(&client, &repo, &state_filter).await
+        }
     }
 }
 
@@ -240,12 +248,278 @@ pub async fn create_pr(
     let client = make_client(&cfg)?;
     match cfg.provider {
         GitProvider::Github => {
-            crate::git_remote::github::create_pr(&client, &repo, &title, &body, &head, &base, draft).await
+            crate::git_remote::github::create_pr(&client, &repo, &title, &body, &head, &base, draft)
+                .await
         }
         GitProvider::Gitlab => {
-            crate::git_remote::gitlab::create_pr(&client, &repo, &title, &body, &head, &base, draft).await
+            crate::git_remote::gitlab::create_pr(&client, &repo, &title, &body, &head, &base, draft)
+                .await
         }
     }
+}
+
+// ── Workspace delivery status ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceDeliveryPr {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    pub draft: bool,
+    pub head_branch: String,
+    pub base_branch: String,
+    pub head_sha: String,
+    pub merge_commit_sha: Option<String>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceRelease {
+    pub tag: String,
+    pub url: String,
+    pub published_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceDeliverySnapshot {
+    pub remote_available: bool,
+    pub pr: Option<WorkspaceDeliveryPr>,
+    pub ci_status: String,
+    pub release: Option<WorkspaceRelease>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryLookup<'a> {
+    Number(u64),
+    Branch(&'a str),
+}
+
+fn delivery_lookup(pr_number: u64, branch: &str) -> DeliveryLookup<'_> {
+    if pr_number > 0 {
+        DeliveryLookup::Number(pr_number)
+    } else {
+        DeliveryLookup::Branch(branch)
+    }
+}
+
+fn json_str(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn parse_github_delivery_pr(value: &Value) -> WorkspaceDeliveryPr {
+    let merged = value.get("merged_at").and_then(Value::as_str).is_some();
+    WorkspaceDeliveryPr {
+        number: value.get("number").and_then(Value::as_u64).unwrap_or(0),
+        title: json_str(value, "title"),
+        state: if merged {
+            "merged".into()
+        } else {
+            json_str(value, "state")
+        },
+        draft: value.get("draft").and_then(Value::as_bool).unwrap_or(false),
+        head_branch: value
+            .get("head")
+            .and_then(|v| v.get("ref"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into(),
+        base_branch: value
+            .get("base")
+            .and_then(|v| v.get("ref"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into(),
+        head_sha: value
+            .get("head")
+            .and_then(|v| v.get("sha"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into(),
+        merge_commit_sha: value
+            .get("merge_commit_sha")
+            .and_then(Value::as_str)
+            .map(String::from),
+        url: json_str(value, "html_url"),
+    }
+}
+
+fn compare_proves_release_contains_merge(status: &str) -> bool {
+    matches!(status, "ahead" | "identical")
+}
+
+fn github_owner_repo(cwd: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .no_window()
+        .arg("-C")
+        .arg(cwd)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .map_err(|error| format!("无法读取 Git origin: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let origin = String::from_utf8_lossy(&output.stdout);
+    let trimmed = origin.trim().trim_end_matches(".git");
+    let after_host = trimmed
+        .split_once("github.com")
+        .map(|(_, path)| path)
+        .ok_or_else(|| "当前 origin 不是 GitHub 仓库".to_string())?;
+    let parts: Vec<&str> = after_host
+        .trim_start_matches([':', '/'])
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return Err("无法从 origin 解析 GitHub owner/repo".into());
+    }
+    Ok(format!("{}/{}", parts[0], parts[1]))
+}
+
+async fn workspace_github_client(
+    cwd: &Path,
+    state: &AppState,
+) -> Result<(RemoteGitClient, String), String> {
+    let repo = github_owner_repo(cwd)?;
+    if let Some(token) = crate::util::github_cli::auth_token("github.com") {
+        return Ok((
+            RemoteGitClient::new("https://api.github.com", &token, GitProvider::Github),
+            repo,
+        ));
+    }
+    let settings = state.settings.read().await;
+    let remote = settings
+        .git_remotes
+        .iter()
+        .find(|remote| {
+            matches!(remote.provider, GitProvider::Github)
+                && remote.default_repo.as_deref() == Some(repo.as_str())
+        })
+        .or_else(|| {
+            settings
+                .git_remotes
+                .iter()
+                .find(|remote| matches!(remote.provider, GitProvider::Github))
+        })
+        .ok_or_else(|| {
+            "GitHub 远程状态不可用：请运行 gh auth login 或配置远程仓库 token".to_string()
+        })?;
+    let token = settings::resolve_git_remote_token(remote).map_err(|error| error.to_string())?;
+    Ok((
+        RemoteGitClient::new(&remote.base_url, &token, GitProvider::Github),
+        repo,
+    ))
+}
+
+async fn find_workspace_pr(
+    client: &RemoteGitClient,
+    repo: &str,
+    lookup: DeliveryLookup<'_>,
+) -> Result<Option<WorkspaceDeliveryPr>, String> {
+    let value = match lookup {
+        DeliveryLookup::Number(number) => {
+            client.get(&format!("/repos/{repo}/pulls/{number}")).await?
+        }
+        DeliveryLookup::Branch(branch) => {
+            if branch.is_empty() || matches!(branch, "main" | "master") {
+                return Ok(None);
+            }
+            let owner = repo.split('/').next().unwrap_or_default();
+            let list = client
+                .get(&format!("/repos/{repo}/pulls?state=all&head={owner}:{branch}&sort=updated&direction=desc&per_page=1"))
+                .await?;
+            let Some(value) = list.as_array().and_then(|items| items.first()).cloned() else {
+                return Ok(None);
+            };
+            value
+        }
+    };
+    Ok(Some(parse_github_delivery_pr(&value)))
+}
+
+#[tauri::command]
+pub async fn workspace_delivery_status(
+    cwd: String,
+    session_id: Option<String>,
+    branch: Option<String>,
+    pr_number: Option<u64>,
+    state: State<'_, AppState>,
+) -> Result<WorkspaceDeliverySnapshot, String> {
+    let stored = if let Some(session_id) = session_id.as_deref() {
+        let db = state.db.read().await.clone();
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT branch, pr_number FROM session_delivery_refs WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&db)
+        .await
+        .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+    let effective_branch = stored
+        .as_ref()
+        .map(|row| row.0.clone())
+        .or(branch)
+        .unwrap_or_default();
+    let effective_number = stored
+        .map(|row| row.1.max(0) as u64)
+        .or(pr_number)
+        .unwrap_or(0);
+    let (client, repo) = workspace_github_client(Path::new(&cwd), &state).await?;
+    let Some(pr) = find_workspace_pr(
+        &client,
+        &repo,
+        delivery_lookup(effective_number, &effective_branch),
+    )
+    .await?
+    else {
+        return Ok(WorkspaceDeliverySnapshot {
+            remote_available: true,
+            pr: None,
+            ci_status: "none".into(),
+            release: None,
+            error: None,
+        });
+    };
+
+    // CI belongs to the PR head commit, never to whichever branch is currently checked out.
+    let ci_status = crate::git_remote::github::ci_status(&client, &repo, &pr.head_sha).await?;
+    let release = if pr.state == "merged" {
+        if let (Some(merge_sha), Ok(latest)) = (
+            pr.merge_commit_sha.as_deref(),
+            client.get(&format!("/repos/{repo}/releases/latest")).await,
+        ) {
+            let tag = json_str(&latest, "tag_name");
+            let compare = client
+                .get(&format!("/repos/{repo}/compare/{merge_sha}...{tag}"))
+                .await;
+            compare
+                .ok()
+                .filter(|value| compare_proves_release_contains_merge(&json_str(value, "status")))
+                .map(|_| WorkspaceRelease {
+                    tag,
+                    url: json_str(&latest, "html_url"),
+                    published_at: json_str(&latest, "published_at"),
+                })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(WorkspaceDeliverySnapshot {
+        remote_available: true,
+        pr: Some(pr),
+        ci_status,
+        release,
+        error: None,
+    })
 }
 
 // ── Repo listing ──────────────────────────────────────────────────────────────
@@ -260,5 +534,47 @@ pub async fn list_repos(
     match cfg.provider {
         GitProvider::Github => crate::git_remote::github::list_repos(&client).await,
         GitProvider::Gitlab => crate::git_remote::gitlab::list_repos(&client).await,
+    }
+}
+
+#[cfg(test)]
+mod workspace_delivery_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn github_pr_snapshot_uses_head_sha_for_ci_and_real_merge_fields() {
+        let snapshot = parse_github_delivery_pr(&json!({
+            "number": 175,
+            "title": "Improve workspace",
+            "state": "closed",
+            "draft": false,
+            "html_url": "https://github.com/acme/repo/pull/175",
+            "head": { "ref": "feat/workspace-ui", "sha": "head123" },
+            "base": { "ref": "main" },
+            "merged_at": "2026-07-23T10:00:00Z",
+            "merge_commit_sha": "merge456"
+        }));
+        assert_eq!(snapshot.number, 175);
+        assert_eq!(snapshot.state, "merged");
+        assert_eq!(snapshot.head_sha, "head123");
+        assert_eq!(snapshot.merge_commit_sha.as_deref(), Some("merge456"));
+    }
+
+    #[test]
+    fn release_is_only_live_when_tag_contains_the_pr_merge_commit() {
+        assert!(compare_proves_release_contains_merge("ahead"));
+        assert!(compare_proves_release_contains_merge("identical"));
+        assert!(!compare_proves_release_contains_merge("behind"));
+        assert!(!compare_proves_release_contains_merge("diverged"));
+    }
+
+    #[test]
+    fn exact_pr_number_wins_over_current_branch_fallback() {
+        assert_eq!(delivery_lookup(175, "main"), DeliveryLookup::Number(175));
+        assert_eq!(
+            delivery_lookup(0, "feat/workspace-ui"),
+            DeliveryLookup::Branch("feat/workspace-ui")
+        );
     }
 }

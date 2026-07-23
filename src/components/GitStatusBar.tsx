@@ -1,204 +1,62 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useRef, useState } from "react";
-import { GitBranch as GitBranchIcon, ArrowUp, ArrowDown, Circle, History, GitCommitHorizontal, GitPullRequest } from "lucide-react";
+import { useEffect } from "react";
+import { ArrowDown, ArrowUp, Circle, GitBranch } from "lucide-react";
 import { useGitStore } from "../stores/git";
 
 interface Props {
   cwd: string | null;
   onOpenChanges: () => void;
-  onOpenHistory: () => void;
-  onOpenRemote?: () => void;
 }
 
-export function GitStatusBar({ cwd, onOpenChanges, onOpenHistory, onOpenRemote }: Props) {
-  const { status, branches, refreshing, lastRefresh, setCwd, refreshStatus, refreshBranches, checkout } = useGitStore();
-  const [branchPickerOpen, setBranchPickerOpen] = useState(false);
-  const [switchError, setSwitchError] = useState<string | null>(null);
-  const dropdownRef = useRef<HTMLDivElement>(null);
+/**
+ * One readable local-worktree summary. Remote delivery is deliberately kept in
+ * WorkspaceDeliveryStatus so returning to main never erases the session PR.
+ */
+export function GitStatusBar({ cwd, onOpenChanges }: Props) {
+  const { status, refreshing, setCwd, refreshStatus } = useGitStore();
 
-  // Sync cwd with store
-  useEffect(() => {
-    setCwd(cwd);
-  }, [cwd, setCwd]);
-
-  // Initial load + poll while document is visible
+  useEffect(() => { setCwd(cwd); }, [cwd, setCwd]);
   useEffect(() => {
     if (!cwd) return;
-    refreshStatus();
-    const id = setInterval(() => {
-      if (document.visibilityState === "visible") {
-        refreshStatus();
-      }
+    void refreshStatus();
+    const id = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshStatus();
     }, 5000);
-    return () => clearInterval(id);
+    return () => window.clearInterval(id);
   }, [cwd, refreshStatus]);
-
-  // Close dropdown on outside click
-  useEffect(() => {
-    if (!branchPickerOpen) return;
-    const handler = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setBranchPickerOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [branchPickerOpen]);
 
   if (!cwd) return null;
   if (status && !status.is_repo) {
-    return (
-      <div className="flex items-center gap-2 px-3 py-1 border-t border-border bg-surface-1 text-xs text-gray-700 select-none shrink-0">
-        <GitBranchIcon size={11} />
-        <span>不是 git 仓库</span>
-      </div>
-    );
+    return <span className="text-[11px] text-gray-600">不是 Git 仓库</span>;
   }
 
-  const dirty =
-    (status?.staged.length ?? 0) +
-    (status?.unstaged.length ?? 0) +
-    (status?.untracked.length ?? 0);
-
-  const handleOpenBranchPicker = async () => {
-    if (!branchPickerOpen) {
-      await refreshBranches();
-    }
-    setBranchPickerOpen((v) => !v);
-    setSwitchError(null);
-  };
-
-  const handleCheckout = async (target: string) => {
-    setSwitchError(null);
-    try {
-      await checkout(target);
-      setBranchPickerOpen(false);
-    } catch (e) {
-      setSwitchError(String(e));
-    }
-  };
+  const dirty = (status?.staged.length ?? 0) + (status?.unstaged.length ?? 0) + (status?.untracked.length ?? 0);
+  const branch = status?.branch ?? "…";
+  const syncLabel = !status
+    ? "正在读取"
+    : status.ahead === 0 && status.behind === 0
+      ? "已同步"
+      : null;
 
   return (
-    <div
-      aria-label="Git 状态"
-      className="flex items-center gap-2 rounded border border-border bg-surface-2 px-2 py-1 text-[11px] text-gray-500 shrink-0 select-none relative"
+    <button
+      type="button"
+      aria-label="本地工作树"
+      onClick={onOpenChanges}
+      className="inline-flex h-7 max-w-[270px] shrink-0 items-center gap-1.5 rounded-md border border-border bg-surface-2 px-2 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
+      title="查看本地变更、提交历史、分支和恢复点"
     >
-      {/* Branch */}
-      <div className="relative" ref={dropdownRef}>
-        <button
-          onClick={handleOpenBranchPicker}
-          className="flex items-center gap-1 hover:text-gray-300 transition-colors"
-          title="切换分支"
-        >
-          <GitBranchIcon size={11} />
-          <span className="truncate max-w-[100px]">{status?.branch ?? "…"}</span>
-        </button>
-        {branchPickerOpen && (
-          <div className="absolute top-full mt-1 right-0 z-30 w-64 rounded border border-border bg-surface-2 shadow-2xl py-1 max-h-72 overflow-y-auto">
-            {switchError && (
-              <div className="px-2 py-1 text-[11px] text-red-400 border-b border-border">
-                {switchError}
-              </div>
-            )}
-            {branches.length === 0 && (
-              <div className="px-2 py-1 text-[11px] text-gray-600">无分支</div>
-            )}
-            {branches.map((b) => (
-              <button
-                key={`${b.is_remote ? "r" : "l"}:${b.name}`}
-                onClick={() => handleCheckout(b.name)}
-                className={`w-full text-left px-2 py-1 text-xs flex items-center gap-1.5 hover:bg-surface-3 transition-colors ${
-                  b.is_current ? "text-accent" : b.is_remote ? "text-gray-600" : "text-gray-300"
-                }`}
-                title={b.upstream ?? b.name}
-              >
-                <GitBranchIcon size={10} />
-                <span className="flex-1 truncate">{b.name}</span>
-                {b.is_current && <span className="text-[10px]">当前</span>}
-                {b.is_remote && !b.is_current && <span className="text-[10px]">远程</span>}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Ahead/behind */}
-      {status && (status.ahead > 0 || status.behind > 0) && (
-        <span className="flex items-center gap-1 text-gray-500" title="领先 / 落后于上游">
-          {status.ahead > 0 && (
-            <span className="flex items-center gap-0.5">
-              <ArrowUp size={10} />
-              {status.ahead}
-            </span>
-          )}
-          {status.behind > 0 && (
-            <span className="flex items-center gap-0.5">
-              <ArrowDown size={10} />
-              {status.behind}
-            </span>
-          )}
+      <GitBranch size={12} className={refreshing ? "animate-pulse" : ""} />
+      <span className="max-w-[110px] truncate font-medium text-gray-300">{branch}</span><span aria-hidden="true"> · </span>
+      {dirty > 0 && (
+        <span className="inline-flex items-center gap-1 whitespace-nowrap">
+          <Circle size={7} className="fill-amber-500 text-amber-500" />
+          {dirty} 个本地变更
         </span>
       )}
-
-      {/* Dirty count */}
-      <button
-        onClick={onOpenChanges}
-        className="flex items-center gap-1 hover:text-gray-300 transition-colors"
-        title="显示变更"
-      >
-        {dirty > 0 ? (
-          <>
-            <Circle size={8} className="fill-red-400 text-red-400" />
-            <span>{dirty}</span>
-          </>
-        ) : (
-          <>
-            <Circle size={8} className="text-gray-700" />
-            <span className="text-gray-700">干净</span>
-          </>
-        )}
-      </button>
-
-      {/* History */}
-      <button
-        onClick={onOpenHistory}
-        className="flex items-center gap-1 hover:text-gray-300 transition-colors"
-        title="显示提交历史"
-      >
-        <History size={11} />
-      </button>
-
-      {/* Remote */}
-      {onOpenRemote && (
-        <button
-          onClick={onOpenRemote}
-          className="flex items-center gap-1 hover:text-gray-300 transition-colors"
-          title="远程仓库（问题与拉取请求）"
-        >
-          <GitPullRequest size={11} />
-        </button>
-      )}
-
-      <span className="flex-1" />
-
-      {/* Refreshed at */}
-      <span className="text-gray-700 text-[10px] flex items-center gap-1">
-        {refreshing ? (
-          <GitCommitHorizontal size={10} className="animate-pulse" />
-        ) : null}
-        {lastRefresh ? formatRelative(lastRefresh) : ""}
-      </span>
-    </div>
+      {syncLabel && <span className="whitespace-nowrap text-gray-600">{syncLabel}</span>}
+      {status && status.ahead > 0 && <span className="inline-flex items-center gap-0.5 whitespace-nowrap"><ArrowUp size={10} />领先 {status.ahead}</span>}
+      {status && status.behind > 0 && <span className="inline-flex items-center gap-0.5 whitespace-nowrap text-amber-600 dark:text-amber-400"><ArrowDown size={10} />落后 {status.behind}</span>}
+    </button>
   );
-}
-
-function formatRelative(ts: number): string {
-  const diff = Math.max(0, Date.now() - ts);
-  const sec = Math.floor(diff / 1000);
-  if (sec < 5) return "刚刚";
-  if (sec < 60) return `${sec} 秒前`;
-  const min = Math.floor(sec / 60);
-  if (min < 60) return `${min} 分钟前`;
-  const hr = Math.floor(min / 60);
-  return `${hr} 小时前`;
 }

@@ -68,9 +68,8 @@ vi.mock("../../components/ModelPicker", () => ({ ModelPicker: () => null }));
 vi.mock("../../components/GitStatusBar", () => ({
   GitStatusBar: () => <button aria-label="Git 状态">Git</button>,
 }));
-vi.mock("../../components/CheckpointsPanel", () => ({
-  CheckpointsPanel: () => <button aria-label="检查点 0">检查点 0</button>,
-}));
+vi.mock("../../components/CheckpointsPanel", () => ({ CheckpointsPanel: () => null }));
+vi.mock("../../components/WorkspaceDeliveryStatus", () => ({ WorkspaceDeliveryStatus: () => null }));
 vi.mock("../../components/MessageList", () => ({ MessageList: () => null }));
 vi.mock("../../components/MessageInput", () => ({ MessageInput: () => null }));
 vi.mock("../../components/PermissionDialog", () => ({ PermissionDialog: () => null }));
@@ -196,7 +195,7 @@ describe("session-native task delegation", () => {
     expect(within(header).getByRole("button", { name: "收起会话侧栏" })).toBeInTheDocument();
     expect(within(header).queryByRole("button", { name: "新建空白会话" })).not.toBeInTheDocument();
     expect(within(header).getByRole("button", { name: "Git 状态" })).toBeInTheDocument();
-    expect(within(header).getByRole("button", { name: "检查点 0" })).toBeInTheDocument();
+    expect(within(header).queryByRole("button", { name: /检查点|恢复/ })).not.toBeInTheDocument();
     expect(within(header).getByRole("button", { name: "设置" })).toBeInTheDocument();
     for (const label of ["我的画像", "进化审查", "能力评测", "资源中心", "AI Coding OS"]) {
       expect(within(header).queryByRole("button", { name: label })).not.toBeInTheDocument();
@@ -213,7 +212,7 @@ describe("session-native task delegation", () => {
     expect(within(conversation).queryByText("实现登录页")).not.toBeInTheDocument();
 
     const activity = screen.getByRole("button", { name: "打开任务活动" });
-    expect(activity).toHaveTextContent("待处理 1");
+    expect(activity).toHaveTextContent("待执行 1");
     await userEvent.click(activity);
     const drawer = screen.getByRole("dialog", { name: "任务活动" });
     expect(within(drawer).getByText("实现登录页")).toBeInTheDocument();
@@ -294,7 +293,7 @@ describe("session-native task delegation", () => {
     };
     renderWorkspace();
 
-    expect(screen.getByRole("button", { name: "打开任务活动" })).toHaveTextContent("1 项需处理");
+    expect(screen.getByRole("button", { name: "打开任务活动" })).toHaveTextContent("需要你处理");
     expect(screen.queryByText("模型/Provider")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
     expect(screen.getByText("模型/Provider")).toBeInTheDocument();
@@ -302,4 +301,18 @@ describe("session-native task delegation", () => {
     expect(mocks.retryFailedTasks).not.toHaveBeenCalled();
     expect(mocks.start).not.toHaveBeenCalled();
   });
+  it("does not turn cancelled or completed task history into a persistent alert", () => {
+    fakeTasksState.tasks = {
+      s1: [task({ id: "cancelled", status: "cancelled" }), task({ id: "done", status: "completed" })],
+    };
+    renderWorkspace();
+    expect(screen.queryByRole("button", { name: "打开任务活动" })).not.toBeInTheDocument();
+  });
+
+  it("labels a repairable active failure as a failed step, not a generic needs-attention count", () => {
+    fakeTasksState.tasks = { s1: [task({ status: "failed", failure_attribution: { repairable: true } })] };
+    renderWorkspace();
+    expect(screen.getByRole("button", { name: "打开任务活动" })).toHaveTextContent("1 个步骤失败");
+  });
+
 });
