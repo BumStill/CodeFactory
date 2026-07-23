@@ -180,8 +180,8 @@ pub fn is_approval(user_msg: &str) -> bool {
 pub fn decide_chat_mode(prev_assistant: Option<&str>, user_msg: &str) -> AgentMode {
     // A clear, imperative go-ahead executes even if our previous turn didn't end
     // with a question — models don't reliably emit "Ready to proceed?", so we
-    // don't make the contract hinge on it. (Trust mode bypasses this entirely
-    // and runs every turn as Execute; see send_message.)
+    // don't make the contract hinge on it. Permission policy is evaluated
+    // later and never changes this semantic mode.
     if is_strong_approval(user_msg) {
         return AgentMode::Execute;
     }

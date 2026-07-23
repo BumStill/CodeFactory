@@ -790,9 +790,9 @@ export function SettingsPage({
                 className="mt-0.5"
               />
               <span>
-                <span className="block text-xs font-medium text-gray-200">信任模式（完全放手）</span>
+                <span className="block text-xs font-medium text-gray-200">信任模式（减少确认）</span>
                 <span className="block text-xs leading-5 text-gray-500">
-                  开启后彻底放手：跳过所有权限确认，且不再先给方案、每条消息都直接执行到交付物。仅在完全信任的项目中使用。
+                  开启后减少常规工具确认；高风险与永久拒绝规则仍生效。它不会改变当前消息是分析还是执行。仅在信任的项目中使用。
                 </span>
               </span>
             </label>

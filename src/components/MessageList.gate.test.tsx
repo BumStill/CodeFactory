@@ -71,19 +71,22 @@ describe("MessageList completion-review isolation", () => {
     expect(container.querySelector(".justify-end")).toBeNull();
   });
 
-  it("does not expose live gate actions in the assistant timeline", () => {
+  it("shows safe recovery progress without exposing internal gate details", () => {
     const { container } = render(
       <MessageList
         messages={[
           msg({
             id: "streaming",
-            content: "正在处理用户要求。",
-            gateActions: [
-              {
-                kind: "recovery",
-                detail: "background services require a later successful bounded functional probe",
-              },
-            ],
+            content: "",
+            internalReviewState: "recovery",
+            reviewProgress: {
+              phase: "recovering",
+              attempt: 2,
+              limit: 3,
+              reason: "最终答复还缺少验证证据",
+              currentStep: "正在运行验证或修复步骤",
+              updatedAt: Date.now(),
+            },
           }),
         ]}
         streaming={true}
@@ -91,8 +94,10 @@ describe("MessageList completion-review isolation", () => {
       />,
     );
 
-    expect(screen.getByText(/正在处理用户要求/)).toBeTruthy();
-    expect(screen.queryByText(/完成度检查|background services require/)).toBeNull();
+    expect(screen.getByText("正在补充验证")).toBeTruthy();
+    expect(screen.getByText("第 2/3 次")).toBeTruthy();
+    expect(screen.getByText("正在运行验证或修复步骤")).toBeTruthy();
+    expect(screen.queryByText(/Thinking|background services require/)).toBeNull();
     expect(container.textContent).not.toContain("completion");
   });
 

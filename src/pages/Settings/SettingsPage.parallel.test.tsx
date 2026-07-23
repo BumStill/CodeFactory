@@ -164,6 +164,14 @@ describe("SettingsPage parallel-task controls", () => {
     }
   });
 
+  it("describes full access as permission policy rather than execution intent", async () => {
+    render(<SettingsPage onBack={() => {}} initialTab="permissions" />);
+
+    expect(await screen.findByText(/减少常规工具确认/)).toBeInTheDocument();
+    expect(screen.getByText(/不会改变当前消息是分析还是执行/)).toBeInTheDocument();
+    expect(screen.queryByText(/每条消息都直接执行到交付物/)).not.toBeInTheDocument();
+  });
+
   it("hydrates defaults for settings saved before the fields existed", async () => {
     await openGeneralTab();
 

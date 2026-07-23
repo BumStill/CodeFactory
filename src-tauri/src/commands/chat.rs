@@ -302,16 +302,16 @@ pub async fn send_message(
     let prev_assistant = history
         .iter()
         .rev()
-        .find(|m| m.role == "assistant")
+        .find(|m| m.role == "assistant" && m.completion_state.is_none())
         .map(|m| m.content.clone());
-    // 信任模式(完全放手):when the user has opted into full access, skip
-    // plan-first entirely and run every turn under the execute contract — they
-    // asked the agent to act, not to ask.
-    let mode = if settings.permissions.full_access {
-        crate::agent::AgentMode::Execute
-    } else {
-        crate::agent::decide_chat_mode(prev_assistant.as_deref(), &content)
-    };
+    // Full access is a permission policy only. It may reduce approval prompts
+    // after a tool is selected, but it must never turn a diagnostic question
+    // into an execute-contract turn.
+    let mode = select_chat_mode(
+        settings.permissions.full_access,
+        prev_assistant.as_deref(),
+        &content,
+    );
     tracing::info!("send_message: dispatch mode = {:?}", mode);
 
     let db = state.db.read().await.clone();
@@ -533,6 +533,14 @@ pub async fn send_message_anonymous(
     Ok(())
 }
 
+fn select_chat_mode(
+    _full_access: bool,
+    prev_assistant: Option<&str>,
+    content: &str,
+) -> crate::agent::AgentMode {
+    crate::agent::decide_chat_mode(prev_assistant, content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,5 +551,21 @@ mod tests {
         assert!(!endpoint_requires_api_key(&ApiStyle::Chatgpt));
         assert!(endpoint_requires_api_key(&ApiStyle::Openai));
         assert!(endpoint_requires_api_key(&ApiStyle::Anthropic));
+    }
+
+    #[test]
+    fn full_access_is_permission_only_and_does_not_override_chat_mode() {
+        assert_eq!(
+            select_chat_mode(true, None, "这是怎么了？"),
+            crate::agent::AgentMode::Interactive
+        );
+        assert_eq!(
+            select_chat_mode(false, None, "这是怎么了？"),
+            crate::agent::AgentMode::Interactive
+        );
+        assert_eq!(
+            select_chat_mode(true, Some("方案已经准备好。是否开始实施？"), "做吧"),
+            crate::agent::AgentMode::Execute
+        );
     }
 }

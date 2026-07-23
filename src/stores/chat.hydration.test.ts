@@ -289,4 +289,94 @@ describe("persisted chat hydration", () => {
     ]);
   });
 
+  it("hydrates an interrupted recovery as safe progress without raw prompts or tool args", () => {
+    const rows: Message[] = [
+      {
+        id: "user",
+        session_id: "session-1",
+        role: "user",
+        content: "完成这个修改。",
+        created_at: 1,
+      },
+      {
+        id: "recovery",
+        session_id: "session-1",
+        role: "user",
+        content: "The completion gate rejected the response: secret blocker details",
+        completion_state: "gate_recovery",
+        created_at: 2,
+      },
+      {
+        id: "internal-tool-turn",
+        session_id: "session-1",
+        role: "assistant",
+        content: "",
+        tool_calls: JSON.stringify([
+          {
+            id: "probe-1",
+            type: "function",
+            function: {
+              name: "bash",
+              arguments: "{\"command\":\"curl https://secret.example\"}",
+            },
+          },
+        ]),
+        created_at: 3,
+      },
+    ];
+
+    const hydrated = dbMessagesToUI(rows);
+    expect(hydrated).toHaveLength(2);
+    expect(hydrated[1]).toEqual(
+      expect.objectContaining({
+        role: "assistant",
+        content: "",
+        reviewProgress: expect.objectContaining({
+          phase: "interrupted",
+          attempt: 1,
+          limit: 3,
+          currentStep: "执行在完成前中断",
+        }),
+      }),
+    );
+    expect(JSON.stringify(hydrated)).not.toMatch(/secret blocker|curl|secret\.example/);
+  });
+
+  it("attaches a persisted verification warning to the final answer", () => {
+    const rows: Message[] = [
+      {
+        id: "user",
+        session_id: "session-1",
+        role: "user",
+        content: "完成并验证。",
+        created_at: 1,
+      },
+      {
+        id: "answer",
+        session_id: "session-1",
+        role: "assistant",
+        content: "已完成，但一项端到端验证不可用。",
+        created_at: 2,
+      },
+      {
+        id: "warning",
+        session_id: "session-1",
+        role: "user",
+        content: "⚠ 以上回复未经完整验证：端到端环境不可用。",
+        completion_state: "gate_warning",
+        created_at: 3,
+      },
+    ];
+
+    const hydrated = dbMessagesToUI(rows);
+    expect(hydrated).toHaveLength(2);
+    expect(hydrated[1].content).toBe("已完成，但一项端到端验证不可用。");
+    expect(hydrated[1].gateActions).toEqual([
+      {
+        kind: "warning",
+        detail: "⚠ 以上回复未经完整验证：端到端环境不可用。",
+      },
+    ]);
+  });
+
 });

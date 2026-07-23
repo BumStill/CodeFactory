@@ -514,11 +514,14 @@ where
                 },
             )
             .await?;
-        } else if completion_evidence_made_progress(
-            &completion_evidence_before_tool_batch,
-            &gate.evidence(),
-        ) {
-            completion_recovery_attempts = 0;
+        } else {
+            completion_recovery_attempts = completion_recovery_attempts_after_tool_batch(
+                completion_recovery_attempts,
+                completion_evidence_made_progress(
+                    &completion_evidence_before_tool_batch,
+                    &gate.evidence(),
+                ),
+            );
         }
         if let Some(prompt) = progress_prompt {
             messages.push(json!({"role": "user", "content": prompt}));
@@ -1052,6 +1055,13 @@ fn should_finish_after_model_error(wall_time: Option<(u64, u64)>, outcome_count:
     outcome_count > 0 && remaining <= (total / 15).max(60)
 }
 
+fn completion_recovery_attempts_after_tool_batch(
+    attempts: u32,
+    _material_evidence_progress: bool,
+) -> u32 {
+    attempts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,6 +1070,12 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use tokio::io::BufReader;
+
+    #[test]
+    fn successful_tool_batch_does_not_reopen_text_recovery() {
+        assert_eq!(completion_recovery_attempts_after_tool_batch(1, true), 1);
+        assert_eq!(completion_recovery_attempts_after_tool_batch(1, false), 1);
+    }
 
     #[test]
     fn protocol_output_uses_exact_bridge_schema() {

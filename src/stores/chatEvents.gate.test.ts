@@ -57,6 +57,12 @@ describe("completion gate stream events", () => {
         segments: [],
         internalReviewState: "recovery",
         internalReviewDraft: "",
+        reviewProgress: expect.objectContaining({
+          phase: "recovering",
+          attempt: 1,
+          limit: 3,
+          currentStep: "正在补充验证",
+        }),
       }),
     );
     expect(next.messages[0].gateActions).toBeUndefined();
@@ -80,6 +86,12 @@ describe("completion gate stream events", () => {
     );
     expect(toolStarted.messages[0].toolCalls).toEqual([]);
     expect(toolStarted.messages[0].internalReviewDraft).toBe("");
+    expect(toolStarted.messages[0].reviewProgress).toEqual(expect.objectContaining({
+      phase: "recovering",
+      attempt: 1,
+      limit: 3,
+      currentStep: "正在运行验证或修复步骤",
+    }));
   });
 
   it("clears verification chatter at ready so only the final reply follows", () => {
@@ -107,6 +119,12 @@ describe("completion gate stream events", () => {
       "assistant-1",
     );
     expect(state.messages[0].internalReviewState).toBe("finalizing");
+    expect(state.messages[0].reviewProgress).toEqual(expect.objectContaining({
+      phase: "finalizing",
+      attempt: 1,
+      limit: 3,
+      currentStep: "正在整理最终答复",
+    }));
     const finalState = reduceChatStreamEvent(
       state,
       { type: "text_delta", content: "已完成：拆任务已内置到当前会话。" },
@@ -187,6 +205,13 @@ describe("completion gate stream events", () => {
     expect(next.messages[0].segments).toEqual([
       { kind: "text", text: "本次处理未能完成，请重试。" },
     ]);
+    expect(next.messages[0].reviewProgress).toEqual(
+      expect.objectContaining({
+        phase: "interrupted",
+        reason: "本次处理未能完成",
+        currentStep: "执行在完成前中断",
+      }),
+    );
     expect(next.messages[0].content).not.toMatch(/Completion|probe|Error/);
   });
 

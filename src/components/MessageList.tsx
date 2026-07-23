@@ -320,6 +320,7 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
   const showThinkingHint =
     isStreamingTail &&
     !msg.content &&
+    !msg.reviewProgress &&
     (!msg.toolCalls || msg.toolCalls.length === 0) &&
     (!msg.transportRetries || msg.transportRetries.length === 0);
   // Show Remember only once streaming has settled — a half-written
@@ -374,6 +375,34 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
 
   return (
     <div className="group text-sm text-gray-200 space-y-1.5">
+      {msg.reviewProgress && (
+        <div
+          role="status"
+          className="w-fit min-w-56 rounded-lg border border-sky-500/20 bg-sky-500/[0.06] px-3 py-2"
+        >
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-xs font-medium text-sky-700 dark:text-sky-300">
+              {msg.reviewProgress.phase === "recovering"
+                ? "正在补充验证"
+                : msg.reviewProgress.phase === "finalizing"
+                  ? "正在整理结果"
+                  : "执行已中断"}
+            </span>
+            <span className="text-[10px] tabular-nums text-gray-500">
+              第 {msg.reviewProgress.attempt}/{msg.reviewProgress.limit} 次
+            </span>
+          </div>
+          <div className="mt-1 text-[11px] text-gray-500">
+            {msg.reviewProgress.currentStep}
+          </div>
+          <div className="mt-1 flex items-center justify-between gap-4 text-[10px] text-gray-600">
+            <span>{msg.reviewProgress.reason}</span>
+            <span>
+              最近活动 · {formatDuration(Math.max(0, nowMs - msg.reviewProgress.updatedAt))}前
+            </span>
+          </div>
+        </div>
+      )}
       {timeline ? (
         <>
           {collapsible && (
