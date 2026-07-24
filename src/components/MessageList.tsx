@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { UrlTransform } from "react-markdown";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
-import { Check, Copy, ChevronDown } from "lucide-react";
+import { Check, Copy, ChevronDown, ChevronUp } from "lucide-react";
 import { ToolCallCard } from "./ToolCallCard";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
@@ -24,6 +24,11 @@ interface Props {
   /** Called when the user picks an example prompt from the welcome screen. */
   onUsePrompt?: (text: string) => void;
   onOpenUsage?: () => void;
+  conversationKey?: string | null;
+  hasOlderHistory?: boolean;
+  loadingOlderHistory?: boolean;
+  historyTruncated?: boolean;
+  onLoadOlder?: () => Promise<void>;
 }
 
 // ── Shiki singleton ──────────────────────────────────────────────────────────
@@ -211,19 +216,46 @@ function TypingDots() {
 }
 
 // ── Main component ───────────────────────────────────────────────────────────
-export function MessageList({ messages, streaming, cwd, onUsePrompt, onOpenUsage }: Props) {
-  // Use the first message's id as the conversation identity. Different
-  // sessions have different first messages → the scroll hook treats it as a
-  // session change and re-pins to the bottom. Empty list → null (fine; no
-  // scroller rendered anyway).
-  const conversationKey = messages[0]?.id ?? null;
+export function MessageList({
+  messages,
+  streaming,
+  cwd,
+  onUsePrompt,
+  onOpenUsage,
+  conversationKey,
+  hasOlderHistory = false,
+  loadingOlderHistory = false,
+  historyTruncated = false,
+  onLoadOlder,
+}: Props) {
+  const resolvedConversationKey = conversationKey ?? messages[0]?.id ?? null;
   const contentSignal = messages.length === 0
     ? null
     : `${messages.length}:${messages[messages.length - 1]?.id ?? ""}`;
-  const { scrollerRef, pinned, hasNewContent, jumpToBottom } = useStickyAutoScroll(
-    conversationKey,
-    contentSignal,
-  );
+  const {
+    scrollerRef,
+    pinned,
+    hasNewContent,
+    jumpToBottom,
+    prepareForPrepend,
+  } = useStickyAutoScroll(resolvedConversationKey, contentSignal);
+  const conversationKeyRef = useRef(resolvedConversationKey);
+  conversationKeyRef.current = resolvedConversationKey;
+  const loadOlder = useCallback(async () => {
+    const expectedConversationKey = conversationKeyRef.current;
+    const anchor = prepareForPrepend();
+    await onLoadOlder?.();
+    requestAnimationFrame(() => {
+      if (
+        conversationKeyRef.current !== expectedConversationKey ||
+        !anchor ||
+        scrollerRef.current !== anchor.element
+      ) {
+        return;
+      }
+      anchor.restore();
+    });
+  }, [onLoadOlder, prepareForPrepend, scrollerRef]);
 
   if (messages.length === 0) {
     return <WelcomeScreen onUsePrompt={onUsePrompt} onOpenUsage={onOpenUsage} />;
@@ -243,13 +275,35 @@ export function MessageList({ messages, streaming, cwd, onUsePrompt, onOpenUsage
         ref={scrollerRef}
         className="absolute inset-0 overflow-y-auto px-4 py-4 space-y-5"
       >
+        {hasOlderHistory && (
+          <div className="flex justify-center">
+            <button
+              type="button"
+              onClick={() => void loadOlder()}
+              disabled={streaming || loadingOlderHistory}
+              className="flex items-center gap-1 rounded-full border border-border bg-surface-2 px-2.5 py-1 text-[11px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <ChevronUp size={12} />
+              {loadingOlderHistory ? "正在加载更早记录" : "加载更早记录"}
+            </button>
+          </div>
+        )}
+        {historyTruncated && (
+          <div
+            role="status"
+            className="mx-auto max-w-xl rounded-md border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-center text-[11px] text-amber-800 dark:text-amber-200/80"
+          >
+            为保持超长会话可用，部分超大历史内容仅显示预览或分段加载；完整原始记录仍保存在本机。
+          </div>
+        )}
         {visible.map((msg) => (
-          <MessageRow
-            key={msg.id}
-            msg={msg}
-            isStreamingTail={streaming && msg.id === lastAssistantId}
-            cwd={cwd ?? null}
-          />
+          <div key={msg.id} data-message-row={msg.id}>
+            <MessageRow
+              msg={msg}
+              isStreamingTail={streaming && msg.id === lastAssistantId}
+              cwd={cwd ?? null}
+            />
+          </div>
         ))}
       </div>
 
@@ -298,7 +352,7 @@ function isQuietSuccess(tool: NonNullable<UIMessage["toolCalls"]>[number] | unde
   return Boolean(tool && tool.status === "done" && !tool.isError);
 }
 
-function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreamingTail: boolean; cwd: string | null }) {
+const MessageRow = memo(function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreamingTail: boolean; cwd: string | null }) {
   const isUser = msg.role === "user";
   // Must run unconditionally (before the early return) to satisfy the rules
   // of hooks. Only the live streaming tail arms the 1s ticker; for every
@@ -563,4 +617,4 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
       )}
     </div>
   );
-}
+});

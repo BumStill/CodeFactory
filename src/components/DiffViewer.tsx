@@ -20,10 +20,11 @@ export interface ParsedDiffResult {
 
 interface Props {
   output: string;
+  parsed?: ParsedDiffResult;
 }
 
-export function DiffViewer({ output }: Props) {
-  const parsed = parseUnifiedDiffResult(output);
+export function DiffViewer({ output, parsed: parsedResult }: Props) {
+  const parsed = parsedResult ?? parseUnifiedDiffResult(output);
   if (parsed.files.length === 0) return null;
 
   return (

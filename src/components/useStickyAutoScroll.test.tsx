@@ -22,6 +22,7 @@ interface HarnessHandle {
   pinned: () => boolean;
   hasNewContent: () => boolean;
   jumpToBottom: () => void;
+  prepareForPrepend: ReturnType<typeof useStickyAutoScroll>["prepareForPrepend"];
 }
 
 function Harness(props: {
@@ -30,7 +31,13 @@ function Harness(props: {
   pinnedRef: { current: boolean };
   hasNewContentRef: { current: boolean };
 }) {
-  const { scrollerRef, pinned, hasNewContent, jumpToBottom } = useStickyAutoScroll(props.conversationKey);
+  const {
+    scrollerRef,
+    pinned,
+    hasNewContent,
+    jumpToBottom,
+    prepareForPrepend,
+  } = useStickyAutoScroll(props.conversationKey);
   // Mirror live state so the test handle returns up-to-date values across
   // re-renders (not stale closures captured at first render).
   props.pinnedRef.current = pinned;
@@ -45,6 +52,7 @@ function Harness(props: {
         pinned: () => props.pinnedRef.current,
         hasNewContent: () => props.hasNewContentRef.current,
         jumpToBottom,
+        prepareForPrepend,
       });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -108,7 +116,13 @@ function DelayedHarness(props: {
   pinnedRef: { current: boolean };
   hasNewContentRef: { current: boolean };
 }) {
-  const { scrollerRef, pinned, hasNewContent, jumpToBottom } = useStickyAutoScroll(props.conversationKey);
+  const {
+    scrollerRef,
+    pinned,
+    hasNewContent,
+    jumpToBottom,
+    prepareForPrepend,
+  } = useStickyAutoScroll(props.conversationKey);
   props.pinnedRef.current = pinned;
   props.hasNewContentRef.current = hasNewContent;
 
@@ -119,6 +133,7 @@ function DelayedHarness(props: {
         pinned: () => props.pinnedRef.current,
         hasNewContent: () => props.hasNewContentRef.current,
         jumpToBottom,
+        prepareForPrepend,
       });
     }
   }, [props.showScroller, props.conversationKey, jumpToBottom, props, scrollerRef]);
@@ -129,6 +144,50 @@ function DelayedHarness(props: {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 describe("useStickyAutoScroll", () => {
+  it("preserves the reading anchor when older history is prepended", async () => {
+    const { handle } = renderHarness("long-session");
+    setLayout(handle.scroller, {
+      scrollHeight: 4000,
+      clientHeight: 600,
+      scrollTop: 0,
+    });
+    await flushAsync();
+
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", {
+        value: 1200,
+        configurable: true,
+        writable: true,
+      });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.pinned()).toBe(false);
+
+    const anchor = handle.prepareForPrepend();
+    expect(anchor).not.toBeNull();
+
+    // Eight older turns add 1,500 px above the current viewport. The DOM
+    // mutation must not snap the reader to the live tail or claim that the
+    // persisted history is fresh streaming content.
+    setLayout(handle.scroller, { scrollHeight: 5500 });
+    await act(async () => {
+      const older = document.createElement("div");
+      older.textContent = "eight older persisted turns";
+      handle.scroller.prepend(older);
+    });
+    await flushAsync();
+    expect(handle.scroller.scrollTop).toBe(1200);
+    expect(handle.hasNewContent()).toBe(false);
+
+    await act(async () => {
+      anchor?.restore();
+    });
+
+    expect(handle.scroller.scrollTop).toBe(2700);
+    expect(handle.pinned()).toBe(false);
+    expect(handle.hasNewContent()).toBe(false);
+  });
+
   it("attaches growth tracking when an initially empty conversation mounts its scroller later", async () => {
     let handle: HarnessHandle | null = null;
     const pinnedRef = { current: true };
