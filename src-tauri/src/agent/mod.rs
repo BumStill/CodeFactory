@@ -846,17 +846,17 @@ impl AgentLoop {
         } else {
             (self.endpoint_name.clone(), None, "unknown".to_string())
         };
-        let event = crate::commands::costs::UsageEventInput {
+        let row = codefactory_agent_loop::journal::UsageRow {
             request_id: self.usage_request_id(iteration),
-            session_id: self.session_id.clone(),
+            session_id: &self.session_id,
             task_id: self
                 .execution_context
                 .as_ref()
                 .and_then(|context| context.task_id.clone()),
-            surface: surface.to_string(),
+            surface,
             provider,
-            endpoint: self.endpoint_name.clone(),
-            model: self.model_id.clone(),
+            endpoint: &self.endpoint_name,
+            model: &self.model_id,
             input_tokens: usage.prompt_tokens as i64,
             output_tokens: usage.completion_tokens as i64,
             reasoning_tokens: usage
@@ -868,22 +868,14 @@ impl AgentLoop {
                 .as_ref()
                 .map_or(0, |details| details.cached_tokens as i64),
             actual_cost_usd,
-            estimated_cost_usd: None,
             cost_source,
-            created_at: None,
         };
-        match crate::commands::costs::record_usage_event(&self.db, event).await {
-            Ok(true) => {
-                if let Some(app) = &self.app {
-                    use tauri::Emitter;
-                    app.emit("model-usage-recorded", &self.session_id).ok();
-                }
-                // Compatibility for the existing footer during the migration.
-                if let Some(app) = &self.app {
-                    use tauri::Emitter;
-                    app.emit("token-usage-recorded", &self.session_id).ok();
-                }
-            }
+        // Persist through the Persistence seam; the desktop cost-UI refresh
+        // (model-usage-recorded / token-usage-recorded, now inside
+        // TauriEventSink::usage_recorded) fires ONLY on a newly-written row —
+        // keystone slice 4.6 usage seam, no raw AppHandle in the loop.
+        match self.persistence().record_usage(row).await {
+            Ok(true) => self.events.usage_recorded(&self.session_id),
             Ok(false) => {}
             Err(error) => tracing::warn!("failed to record request usage: {error}"),
         }
