@@ -9,7 +9,10 @@ pub mod delivery;
 pub mod dispatch;
 pub mod hooks;
 pub mod journal;
+mod context_policy;
+mod lifecycle_hooks;
 pub mod model_transport;
+mod permission_gateway;
 pub mod persistence;
 pub mod scheduler;
 pub mod sse_buffer;
@@ -23,10 +26,9 @@ pub use dispatch::decide_chat_mode;
 
 use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
-    build_completion_recovery_prompt, classify_command, completion_evidence_made_progress,
-    evaluate_budget_command_in_directory, provider_rejects_required_tool_choice,
-    should_prompt_budget_convergence, CompletionEvidence,
-    CompletionGate, PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
+    completion_evidence_made_progress, provider_rejects_required_tool_choice,
+    should_prompt_budget_convergence, CompletionEvidence, CompletionGate, ProgressTracker,
+    ToolOutcome,
 };
 use futures_util::{Stream, StreamExt};
 use reqwest::Client;
@@ -54,6 +56,51 @@ use codefactory_agent_loop::tool::ToolBackend as _;
 // Brings the `Persistence` methods into scope for the inherent delegators; the
 // concrete `SqlitePersistence` lives in `persistence`.
 use codefactory_agent_loop::journal::Persistence as _;
+// Brings the `ContextPolicy` methods into scope; `DesktopContextPolicy` lives in
+// `context_policy`. `LifecycleHooks`/`NoOpHooks` are imported by name (used as a
+// `dyn` type + built directly); `DesktopLifecycleHooks` lives in `lifecycle_hooks`.
+use codefactory_agent_loop::services::ContextPolicy as _;
+use codefactory_agent_loop::services::{LifecycleHooks, NoOpHooks};
+// `PermissionGateway` brings `.authorize()` into scope; `PermissionOutcome` is
+// matched at the call sites. `DesktopPermissionGateway` lives in
+// `permission_gateway`; the pure `decide_permission` stays a free fn below.
+use codefactory_agent_loop::services::{PermissionGateway as _, PermissionOutcome};
+// The loop drives the model round through the `ModelTransport::complete()` seam
+// (slice 4.6 sub-step 7): `RoundOptions` carries require-tool + reasoning effort,
+// `ModelResponse` is the provider-independent answer. `TransportError` crosses
+// back as `AppError` via the `From` impl in `errors` (message verbatim).
+use codefactory_agent_loop::transport::{ModelResponse, ModelTransport as _, RoundOptions};
+// The pure completion-gate mode policy moved to agent-loop (slice 4.6 sub-step
+// 1). Pure fns are re-used directly; the mode-taking fns keep thin AgentMode
+// wrappers below that map to `FinalizationPolicy`, so call sites + #135/#136
+// tests are unchanged.
+use codefactory_agent_loop::policy::{
+    self, active_tool_definitions, completion_command_and_kind,
+    completion_recovery_attempts_after_tool_batch, openai_tool_controls, CompletionFinalization,
+};
+use codefactory_agent_loop::run::FinalizationPolicy;
+
+/// Desktop `AgentMode` → the loop crate's `FinalizationPolicy`.
+fn finalization_policy(mode: AgentMode) -> FinalizationPolicy {
+    match mode {
+        AgentMode::Interactive | AgentMode::Execute => FinalizationPolicy::ReleaseWithWarning,
+        AgentMode::Autonomous => FinalizationPolicy::BlockOnIncomplete,
+    }
+}
+
+/// Rejected-final-response recovery budget per run (was `completion_recovery_limit`).
+fn recovery_limit_for(mode: AgentMode) -> u32 {
+    match mode {
+        AgentMode::Interactive | AgentMode::Execute => 3,
+        AgentMode::Autonomous => 1,
+    }
+}
+
+/// Whether the autonomous round budget constrains model tools this run.
+/// Interactive is uncapped; Execute + Autonomous apply the wall budget.
+fn wall_budget_applies(mode: AgentMode) -> bool {
+    !matches!(mode, AgentMode::Interactive)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionResponse {
@@ -639,7 +686,7 @@ impl AgentLoop {
     /// - events flow through the caller-supplied `events` sink (a
     ///   [`events::CollectingEventSink`] for eval, or a streaming JSONL sink
     ///   for a CLI) instead of the Tauri frontend;
-    /// - hooks are skipped entirely (`hook_runner` is `None`);
+    /// - hooks are skipped entirely (`NoOpHooks` when `app` is absent);
     /// - skills come from the user skills dir only (no builtin/AppHandle);
     /// - `delegate_tasks` degrades (it needs live UI sessions);
     /// - usage-recorded UI pings are skipped.
@@ -816,17 +863,17 @@ impl AgentLoop {
         } else {
             (self.endpoint_name.clone(), None, "unknown".to_string())
         };
-        let event = crate::commands::costs::UsageEventInput {
+        let row = codefactory_agent_loop::journal::UsageRow {
             request_id: self.usage_request_id(iteration),
-            session_id: self.session_id.clone(),
+            session_id: &self.session_id,
             task_id: self
                 .execution_context
                 .as_ref()
                 .and_then(|context| context.task_id.clone()),
-            surface: surface.to_string(),
+            surface,
             provider,
-            endpoint: self.endpoint_name.clone(),
-            model: self.model_id.clone(),
+            endpoint: &self.endpoint_name,
+            model: &self.model_id,
             input_tokens: usage.prompt_tokens as i64,
             output_tokens: usage.completion_tokens as i64,
             reasoning_tokens: usage
@@ -838,22 +885,14 @@ impl AgentLoop {
                 .as_ref()
                 .map_or(0, |details| details.cached_tokens as i64),
             actual_cost_usd,
-            estimated_cost_usd: None,
             cost_source,
-            created_at: None,
         };
-        match crate::commands::costs::record_usage_event(&self.db, event).await {
-            Ok(true) => {
-                if let Some(app) = &self.app {
-                    use tauri::Emitter;
-                    app.emit("model-usage-recorded", &self.session_id).ok();
-                }
-                // Compatibility for the existing footer during the migration.
-                if let Some(app) = &self.app {
-                    use tauri::Emitter;
-                    app.emit("token-usage-recorded", &self.session_id).ok();
-                }
-            }
+        // Persist through the Persistence seam; the desktop cost-UI refresh
+        // (model-usage-recorded / token-usage-recorded, now inside
+        // TauriEventSink::usage_recorded) fires ONLY on a newly-written row —
+        // keystone slice 4.6 usage seam, no raw AppHandle in the loop.
+        match self.persistence().record_usage(row).await {
+            Ok(true) => self.events.usage_recorded(&self.session_id),
             Ok(false) => {}
             Err(error) => tracing::warn!("failed to record request usage: {error}"),
         }
@@ -989,34 +1028,34 @@ impl AgentLoop {
         // when the model is KNOWN text-only, instead of burning a 400 round
         // trip every turn. The reactive strip-and-retry stays as the net for
         // unknown models and wrong guesses.
-        {
-            let settings = self.settings.read().await;
-            if !context::model_supports_vision(&settings, &self.endpoint_name, &self.model_id) {
-                let stripped = strip_image_parts(&mut messages);
-                if stripped > 0 {
-                    let notice = format!(
-                        "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
+        if !self.context_policy().supports_vision().await {
+            let stripped = strip_image_parts(&mut messages);
+            if stripped > 0 {
+                let notice = format!(
+                    "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
 占位文本;切换到支持图片的模型可恢复图片理解。"
-                    );
-                    self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
-                        .await?;
-                }
+                );
+                self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
+                    .await?;
             }
         }
-        // Headless runs have no frontend and no hooks. Building `Option<_>`
-        // (None when `app` is absent) keeps `HookRunner` — which owns an
-        // `AppHandle` — constructed ONLY here, inside `run()`, which the
-        // unit-test EXE dead-strips. Never construct it in test code: an
-        // AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
+        // Headless runs have no frontend and no hooks: `NoOpHooks` when `app`
+        // is absent, else `DesktopLifecycleHooks` wrapping a `HookRunner` —
+        // which owns an `AppHandle` — constructed ONLY here, inside `run()`,
+        // which the unit-test EXE dead-strips. Never construct it in test code:
+        // an AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
         // trips the Windows loader (`STATUS_ENTRYPOINT_NOT_FOUND`, #166).
-        let hook_runner: Option<hooks::HookRunner> = match &self.app {
-            None => None,
-            Some(app) => Some(if self.anonymous {
-                hooks::HookRunner::disabled(app.clone())
-            } else {
-                let settings = self.settings.read().await;
-                hooks::HookRunner::from_settings(&settings, app.clone())
-            }),
+        let hooks: std::sync::Arc<dyn LifecycleHooks> = match &self.app {
+            None => std::sync::Arc::new(NoOpHooks),
+            Some(app) => {
+                let runner = if self.anonymous {
+                    hooks::HookRunner::disabled(app.clone())
+                } else {
+                    let settings = self.settings.read().await;
+                    hooks::HookRunner::from_settings(&settings, app.clone())
+                };
+                std::sync::Arc::new(lifecycle_hooks::DesktopLifecycleHooks { runner })
+            }
         };
 
         // Did we emit a terminal Done/Error this run? Used to guarantee the
@@ -1046,17 +1085,9 @@ impl AgentLoop {
             // Estimate prompt tokens before sending. If we're over 75% of the
             // model's window, elide oversized tool results from the older
             // half. Notify the UI so the user knows what happened.
-            let (context_limit, max_context_limit) = {
-                let settings = self.settings.read().await;
-                let window = context::resolve_context_window(
-                    &settings,
-                    &self.endpoint_name,
-                    &self.model_id,
-                    None,
-                );
-                let estimated = context::estimate_prompt_tokens(&messages, system_prompt);
-                (window.select_limit(estimated), window.max_limit)
-            };
+            let estimated = context::estimate_prompt_tokens(&messages, system_prompt);
+            let (context_limit, max_context_limit) =
+                self.context_policy().context_window(estimated).await;
             let compression = context::compress_if_needed(
                 std::mem::take(&mut messages),
                 system_prompt,
@@ -1075,26 +1106,25 @@ impl AgentLoop {
 
             let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
             let required_tool_response = require_tool_next && !finalization_pending;
-            // Resolve reasoning effort ONCE per round (keystone slice 4.4d) so
-            // the transport reads no DB; recomputed each iteration to keep a
-            // mid-run session-effort change taking effect next round. Empty for
-            // non-ChatGPT api styles, which ignore it. The two reactive retries
-            // below reuse this round's value.
-            let round_reasoning_effort: &str = if self.api_style == ApiStyle::Chatgpt {
-                self.resolve_round_reasoning_effort().await
-            } else {
-                ""
+            // Resolve reasoning effort ONCE per round via ContextPolicy (slice
+            // 4.6): it re-reads db+settings each round (freshness) and returns ""
+            // for non-ChatGPT styles, so the transport reads no DB. Held in
+            // `round_options` so the two reactive retries below reuse this round's
+            // value.
+            let round_options = RoundOptions {
+                require_tool: required_tool_response,
+                reasoning_effort: self.context_policy().round_reasoning_effort().await,
             };
             let call_result = self
                 .model_transport()
-                .call_openai_transport(
-                    &messages,
-                    active_tool_defs,
-                    required_tool_response,
-                    round_reasoning_effort,
-                )
+                .complete(&messages, active_tool_defs, &round_options)
                 .await;
-            let (text, tool_calls, usage, reasoning) = match call_result {
+            let ModelResponse {
+                text,
+                tool_calls,
+                usage,
+                reasoning,
+            } = match call_result {
                 Ok(ok) => ok,
                 // The active model rejects image input (e.g. the user switched
                 // the session to a no-vision model with image attachments in
@@ -1114,7 +1144,7 @@ impl AgentLoop {
                         emergency_limit,
                     );
                     if !compression.compressed {
-                        return Err(e);
+                        return Err(e.into());
                     }
                     messages = repair_openai_tool_protocol(compression.messages);
                     let notice = format!(
@@ -1127,18 +1157,13 @@ impl AgentLoop {
                                 detail: notice.clone(),
                             });
                     self.model_transport()
-                        .call_openai_transport(
-                            &messages,
-                            active_tool_defs,
-                            required_tool_response,
-                            round_reasoning_effort,
-                        )
+                        .complete(&messages, active_tool_defs, &round_options)
                         .await?
                 }
                 Err(e) if is_vision_rejection(&e.to_string()) => {
                     let stripped = strip_image_parts(&mut messages);
                     if stripped == 0 {
-                        return Err(e);
+                        return Err(e.into());
                     }
                     let notice = format!(
                         "已自动移除历史中的 {stripped} 张图片后重试:当前模型不支持图片输入。\
@@ -1150,15 +1175,10 @@ impl AgentLoop {
                                 detail: notice.clone(),
                             });
                     self.model_transport()
-                        .call_openai_transport(
-                            &messages,
-                            active_tool_defs,
-                            required_tool_response,
-                            round_reasoning_effort,
-                        )
+                        .complete(&messages, active_tool_defs, &round_options)
                         .await?
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             };
             finalization_pending = false;
             require_tool_next = false;
@@ -1211,16 +1231,10 @@ impl AgentLoop {
                 };
             if let Some(message_id) = assistant_message_id.as_deref() {
                 for tc in &tool_calls {
-                    let args = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                    crate::trajectory::record_tool_call_started(
-                        &self.db,
-                        &self.session_id,
-                        message_id,
-                        &tc.id,
-                        &tc.function.name,
-                        &args,
-                    )
-                    .await?;
+                    self.persistence()
+                        .record_tool_call_started(message_id, tc)
+                        .await
+                        .map_err(persistence::to_app_error)?;
                 }
             }
 
@@ -1341,14 +1355,6 @@ impl AgentLoop {
                             args: args.clone(),
                         });
 
-                let permission_policy = {
-                    let settings = self.settings.read().await;
-                    settings.permissions.clone()
-                };
-
-                let decision =
-                    decide_permission(&permission_policy, &tc.function.name, bash_cmd.as_deref());
-
                 let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
                 let completion_evidence = completion_gate.evidence();
                 let denial_content = if let Some(content) = autonomous_budget_denial(
@@ -1361,29 +1367,17 @@ impl AgentLoop {
                 ) {
                     Some(content)
                 } else {
-                    match decision {
-                        PermissionDecision::Allow => None,
-                        PermissionDecision::Ask => {
-                            match self.request_permission(tc, args.clone()).await {
-                                PermissionResponse::Allow => None,
-                                PermissionResponse::Deny => Some(
-                                    "Tool call denied by user. Please try a different approach."
-                                        .to_string(),
-                                ),
-                                PermissionResponse::Cancelled => {
-                                    return self
-                                        .finish_cancelled_tool_batch(
-                                            &tool_calls[tool_index..],
-                                        )
-                                        .await;
-                                }
-                            }
-                        }
-                        PermissionDecision::Deny(reason) => {
-                            tracing::warn!("Tool '{}' denied: {reason}", tc.function.name);
-                            Some(format!(
-                                "Tool call denied: {reason}. Please try a different approach."
-                            ))
+                    match self
+                        .permission_gateway()
+                        .authorize(tc, &args, bash_cmd.as_deref())
+                        .await
+                    {
+                        PermissionOutcome::Allow => None,
+                        PermissionOutcome::Deny(content) => Some(content),
+                        PermissionOutcome::Cancelled => {
+                            return self
+                                .finish_cancelled_tool_batch(&tool_calls[tool_index..])
+                                .await;
                         }
                     }
                 };
@@ -1409,17 +1403,7 @@ impl AgentLoop {
                 }
 
                 // Pre-tool hook: may cancel. Headless (no hooks) always allows.
-                let pre_allowed = match &hook_runner {
-                    Some(runner) => {
-                        runner
-                            .fire(hooks::HookEvent::PreTool {
-                                tool_name: tc.function.name.clone(),
-                                args: args.clone(),
-                            })
-                            .await
-                    }
-                    None => true,
-                };
+                let pre_allowed = hooks.pre_tool(&tc.function.name, &args).await;
                 if !pre_allowed {
                     let content = "Tool call cancelled by hook.".to_string();
                     self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
@@ -1515,15 +1499,10 @@ impl AgentLoop {
                     progress_prompt = Some(prompt);
                 }
                 // Post-tool hook (skipped headless — no hooks).
-                if let Some(runner) = &hook_runner {
-                    runner
-                        .fire(hooks::HookEvent::PostTool {
-                            tool_name: tc.function.name.clone(),
-                            result: output.content.chars().take(500).collect(),
-                            duration_ms,
-                        })
-                        .await;
-                }
+                let post_result: String = output.content.chars().take(500).collect();
+                hooks
+                    .post_tool(&tc.function.name, &post_result, duration_ms)
+                    .await;
 
                 self.events.emit(StreamEvent::ToolResult {
                             tool_call_id: tc.id.clone(),
@@ -1627,38 +1606,6 @@ impl AgentLoop {
         Ok(())
     }
 
-    async fn request_permission(
-        &self,
-        tc: &ToolCall,
-        args: serde_json::Value,
-    ) -> PermissionResponse {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.pending_permissions
-            .lock()
-            .await
-            .insert(tc.id.clone(), sender);
-
-        self.events.emit(StreamEvent::PermissionRequest {
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.function.name.clone(),
-                    args,
-                });
-        {
-            let settings = self.settings.read().await;
-            crate::notify::send(
-                &settings,
-                crate::notify::NotifyEvent::PermissionWaiting,
-                format!("工具 {} 正在等待你的批准", tc.function.name),
-            );
-        }
-
-        let allow =
-            await_permission_response(receiver, self.cancel.as_ref(), Duration::from_secs(600))
-                .await;
-        self.pending_permissions.lock().await.remove(&tc.id);
-        allow
-    }
-
     async fn finish_cancelled_tool_batch(
         &self,
         remaining: &[ToolCall],
@@ -1750,30 +1697,33 @@ impl AgentLoop {
         }
     }
 
-    /// Per-round model call against the ChatGPT backend **Responses API**
-    /// (subscription). Self-resolves the OAuth access token (refreshing as
-    /// needed) via `codex_auth`, so no API key is threaded through. Translates
-    /// the OpenAI-shaped ChatMessage history into Responses `instructions` +
-    /// `input` items, parses the Responses SSE stream, and returns the same
-    /// (text, tool_calls, usage, reasoning) contract as call_openai_model.
-    /// Resolve THIS round's ChatGPT reasoning effort: a per-session override
-    /// (`sessions.reasoning_effort`) wins, else the global `Settings` default.
-    /// The loop calls this once per round (keystone slice 4.4d), so a mid-run
-    /// change still takes effect on the next round — freshness preserved — while
-    /// the transport itself reads no DB.
-    async fn resolve_round_reasoning_effort(&self) -> &'static str {
-        // Re-read per round: a mid-run `sessions.reasoning_effort` change takes
-        // effect on the next round (freshness), pinned by
-        // `session_reasoning_effort_reflects_the_current_row`.
-        let session_effort = fetch_session_reasoning_effort(&self.db, &self.session_id).await;
-        let settings = self.settings.read().await;
-        resolve_chatgpt_reasoning_effort(
-            &settings,
-            &self.endpoint_name,
-            &self.model_id,
-            session_effort.as_deref(),
-        )
-        .as_str()
+    /// Build the desktop context policy for this run (keystone slice 4.6). Reads
+    /// the live `Settings`/db each round through the trait; owns no `AppHandle`.
+    /// Absorbs the old `resolve_round_reasoning_effort` (per-round freshness: a
+    /// mid-run `sessions.reasoning_effort` change takes effect next round) plus
+    /// the `supports_vision`/`context_window` reads.
+    fn context_policy(&self) -> context_policy::DesktopContextPolicy {
+        context_policy::DesktopContextPolicy {
+            settings: self.settings.clone(),
+            db: self.db.clone(),
+            session_id: self.session_id.clone(),
+            endpoint_name: self.endpoint_name.clone(),
+            model_id: self.model_id.clone(),
+            api_style: self.api_style.clone(),
+        }
+    }
+
+    /// Build the desktop permission gateway for this run (keystone slice 4.6).
+    /// Clones only `Arc` handles — settings, the event sink, the shared
+    /// pending-permission map, and the SAME cancel `Arc` — and owns no
+    /// `AppHandle`. Reads the live policy and prompts the frontend on `Ask`.
+    fn permission_gateway(&self) -> permission_gateway::DesktopPermissionGateway {
+        permission_gateway::DesktopPermissionGateway {
+            settings: self.settings.clone(),
+            events: self.events.clone(),
+            pending_permissions: self.pending_permissions.clone(),
+            cancel: self.cancel.clone(),
+        }
     }
 
     /// Build the desktop model transport for this run (keystone slice 4.5a).
@@ -1793,7 +1743,6 @@ impl AgentLoop {
             cancel: self.cancel.clone(),
         }
     }
-
 
     /// Build the desktop persistence backend for this run. Cheap (clones the
     /// pool handle + session id); the inherent persist_* helpers below delegate
@@ -2082,34 +2031,34 @@ impl AgentLoop {
         let fact_check_instruction = effective_fact_check_instruction(&history);
         let mut messages = self.build_anthropic_messages(history);
         // Proactive capability match — see the OpenAI loop for rationale.
-        {
-            let settings = self.settings.read().await;
-            if !context::model_supports_vision(&settings, &self.endpoint_name, &self.model_id) {
-                let stripped = strip_image_values(&mut messages);
-                if stripped > 0 {
-                    let notice = format!(
-                        "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
+        if !self.context_policy().supports_vision().await {
+            let stripped = strip_image_values(&mut messages);
+            if stripped > 0 {
+                let notice = format!(
+                    "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
 占位文本;切换到支持图片的模型可恢复图片理解。"
-                    );
-                    self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
-                        .await?;
-                }
+                );
+                self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
+                    .await?;
             }
         }
-        // Headless runs have no frontend and no hooks. Building `Option<_>`
-        // (None when `app` is absent) keeps `HookRunner` — which owns an
-        // `AppHandle` — constructed ONLY here, inside `run()`, which the
-        // unit-test EXE dead-strips. Never construct it in test code: an
-        // AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
+        // Headless runs have no frontend and no hooks: `NoOpHooks` when `app`
+        // is absent, else `DesktopLifecycleHooks` wrapping a `HookRunner` —
+        // which owns an `AppHandle` — constructed ONLY here, inside `run()`,
+        // which the unit-test EXE dead-strips. Never construct it in test code:
+        // an AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
         // trips the Windows loader (`STATUS_ENTRYPOINT_NOT_FOUND`, #166).
-        let hook_runner: Option<hooks::HookRunner> = match &self.app {
-            None => None,
-            Some(app) => Some(if self.anonymous {
-                hooks::HookRunner::disabled(app.clone())
-            } else {
-                let settings = self.settings.read().await;
-                hooks::HookRunner::from_settings(&settings, app.clone())
-            }),
+        let hooks: std::sync::Arc<dyn LifecycleHooks> = match &self.app {
+            None => std::sync::Arc::new(NoOpHooks),
+            Some(app) => {
+                let runner = if self.anonymous {
+                    hooks::HookRunner::disabled(app.clone())
+                } else {
+                    let settings = self.settings.read().await;
+                    hooks::HookRunner::from_settings(&settings, app.clone())
+                };
+                std::sync::Arc::new(lifecycle_hooks::DesktopLifecycleHooks { runner })
+            }
         };
 
         // Did we emit a terminal Done/Error this run? Used to guarantee the
@@ -2207,7 +2156,7 @@ impl AgentLoop {
                 Err(e) if is_vision_rejection(&e.to_string()) => {
                     let stripped = strip_image_values(&mut messages);
                     if stripped == 0 {
-                        return Err(e);
+                        return Err(e.into());
                     }
                     let notice = format!(
                         "已自动移除历史中的 {stripped} 张图片后重试:当前模型不支持图片输入。\
@@ -2286,16 +2235,10 @@ impl AgentLoop {
             };
             if let Some(message_id) = assistant_message_id.as_deref() {
                 for tc in &tool_calls {
-                    let args = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                    crate::trajectory::record_tool_call_started(
-                        &self.db,
-                        &self.session_id,
-                        message_id,
-                        &tc.id,
-                        &tc.function.name,
-                        &args,
-                    )
-                    .await?;
+                    self.persistence()
+                        .record_tool_call_started(message_id, tc)
+                        .await
+                        .map_err(persistence::to_app_error)?;
                 }
             }
 
@@ -2422,13 +2365,6 @@ impl AgentLoop {
                     None
                 };
 
-                let permission_policy = {
-                    let settings = self.settings.read().await;
-                    settings.permissions.clone()
-                };
-                let decision =
-                    decide_permission(&permission_policy, &tc.function.name, bash_cmd.as_deref());
-
                 let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
                 let completion_evidence = completion_gate.evidence();
                 let denial_content = if let Some(content) = autonomous_budget_denial(
@@ -2441,29 +2377,17 @@ impl AgentLoop {
                 ) {
                     Some(content)
                 } else {
-                    match decision {
-                        PermissionDecision::Allow => None,
-                        PermissionDecision::Ask => {
-                            match self.request_permission(tc, args.clone()).await {
-                                PermissionResponse::Allow => None,
-                                PermissionResponse::Deny => Some(
-                                    "Tool call denied by user. Please try a different approach."
-                                        .to_string(),
-                                ),
-                                PermissionResponse::Cancelled => {
-                                    return self
-                                        .finish_cancelled_tool_batch(
-                                            &tool_calls[tool_index..],
-                                        )
-                                        .await;
-                                }
-                            }
-                        }
-                        PermissionDecision::Deny(reason) => {
-                            tracing::warn!("Tool '{}' denied: {reason}", tc.function.name);
-                            Some(format!(
-                                "Tool call denied: {reason}. Please try a different approach."
-                            ))
+                    match self
+                        .permission_gateway()
+                        .authorize(tc, &args, bash_cmd.as_deref())
+                        .await
+                    {
+                        PermissionOutcome::Allow => None,
+                        PermissionOutcome::Deny(content) => Some(content),
+                        PermissionOutcome::Cancelled => {
+                            return self
+                                .finish_cancelled_tool_batch(&tool_calls[tool_index..])
+                                .await;
                         }
                     }
                 };
@@ -2486,17 +2410,7 @@ impl AgentLoop {
                 }
 
                 // Pre-tool hook: may cancel. Headless (no hooks) always allows.
-                let pre_allowed = match &hook_runner {
-                    Some(runner) => {
-                        runner
-                            .fire(hooks::HookEvent::PreTool {
-                                tool_name: tc.function.name.clone(),
-                                args: args.clone(),
-                            })
-                            .await
-                    }
-                    None => true,
-                };
+                let pre_allowed = hooks.pre_tool(&tc.function.name, &args).await;
                 if !pre_allowed {
                     let content = "Tool call cancelled by hook.".to_string();
                     self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
@@ -2589,15 +2503,10 @@ impl AgentLoop {
                     progress_prompt = Some(prompt);
                 }
                 // Post-tool hook (skipped headless — no hooks).
-                if let Some(runner) = &hook_runner {
-                    runner
-                        .fire(hooks::HookEvent::PostTool {
-                            tool_name: tc.function.name.clone(),
-                            result: output.content.chars().take(500).collect(),
-                            duration_ms,
-                        })
-                        .await;
-                }
+                let post_result: String = output.content.chars().take(500).collect();
+                hooks
+                    .post_tool(&tc.function.name, &post_result, duration_ms)
+                    .await;
 
                 self.events.emit(StreamEvent::ToolResult {
                             tool_call_id: tc.id.clone(),
@@ -2688,31 +2597,6 @@ impl AgentLoop {
     }
 }
 
-fn openai_tool_controls(
-    tool_defs: &[ToolDefinition],
-    require_tool: bool,
-) -> (Option<Vec<ToolDefinition>>, serde_json::Value) {
-    if tool_defs.is_empty() {
-        (None, serde_json::json!("none"))
-    } else {
-        (
-            Some(tool_defs.to_vec()),
-            serde_json::json!(if require_tool { "required" } else { "auto" }),
-        )
-    }
-}
-
-fn active_tool_definitions(
-    tool_defs: &[ToolDefinition],
-    finalization_pending: bool,
-) -> &[ToolDefinition] {
-    if finalization_pending {
-        &[]
-    } else {
-        tool_defs
-    }
-}
-
 fn validate_openai_sse_completion(
     saw_terminal_marker: bool,
     pending_bytes: usize,
@@ -2734,90 +2618,15 @@ fn validate_openai_sse_completion(
     Ok(())
 }
 
-fn completion_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (String, ToolKind) {
-    let command = args
-        .get("command")
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-        .or_else(|| {
-            let pattern = args
-                .get("pattern")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let path = args
-                .get("path")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let base = match (pattern.is_empty(), path.is_empty()) {
-                (false, false) => Some(format!("{tool_name} {pattern} {path}")),
-                (false, true) => Some(format!("{tool_name} {pattern} .")),
-                (true, false) => Some(format!("{tool_name} {path}")),
-                (true, true) => None,
-            }?;
-            let glob = args
-                .get("glob")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.is_empty());
-            Some(match glob {
-                Some(glob) => format!("{base} --glob {glob}"),
-                None => base,
-            })
-        })
-        .unwrap_or_else(|| tool_name.to_owned());
-    let kind = if tool_name == "bash" {
-        classify_command(&command, 300_000)
-    } else if tool_name.starts_with("write_")
-        || tool_name.starts_with("edit_")
-        || matches!(tool_name, "write_file" | "edit_file" | "delegate_tasks")
-    {
-        ToolKind::Mutation
-    } else {
-        ToolKind::ReadOnly
-    };
-    (command, kind)
-}
-
 /// How many times one run may reject a tool-call-free final response and ask
 /// the model to resolve concrete completion blockers. User-facing chat gets
 /// three bounded, tool-required recovery opportunities: enough to survive an
 /// incidental shell/precondition mistake without restoring the historical
 /// unbounded near-duplicate loop. Autonomous attempts stay single-shot because
 /// the scheduler can respawn them with a fresh evidence brief.
-fn completion_recovery_limit(mode: AgentMode) -> u32 {
-    match mode {
-        AgentMode::Interactive | AgentMode::Execute => 3,
-        AgentMode::Autonomous => 1,
-    }
-}
 
 fn completion_recovery_requires_tool(_mode: AgentMode) -> bool {
     true
-}
-
-fn completion_recovery_attempts_after_tool_batch(
-    attempts: u32,
-    _material_evidence_progress: bool,
-) -> u32 {
-    // This is a total turn budget, not a "consecutive no progress" counter.
-    // Material progress may clear stagnation heuristics, but it must not grant
-    // a fresh set of rejected-final-response recovery rounds.
-    attempts
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum CompletionFinalization {
-    Complete,
-    Recover(String),
-    /// Chat surfaces after recovery exhaustion: the model's reply is the best
-    /// available answer — release it, but persist this human-readable warning
-    /// so the user knows verification is incomplete. Never an Error, never
-    /// internal-contract wording (2026-07-21 field report: an untranslated
-    /// "Completion blocked…rerun every unresolved failed check" killed the
-    /// turn and hid the reply).
-    ReleaseWithWarning(String),
-    /// Unattended Autonomous runs only — the scheduler treats this as an
-    /// incomplete attempt and respawns.
-    Blocked(String),
 }
 
 fn completion_finalization(
@@ -2825,53 +2634,20 @@ fn completion_finalization(
     attempts: u32,
     mode: AgentMode,
 ) -> CompletionFinalization {
-    if evidence.completed {
-        return CompletionFinalization::Complete;
-    }
-    if attempts < completion_recovery_limit(mode) {
-        return CompletionFinalization::Recover(build_completion_recovery_prompt(evidence));
-    }
-    match mode {
-        AgentMode::Autonomous => {
-            CompletionFinalization::Blocked(completion_blocked_message(evidence))
-        }
-        AgentMode::Interactive | AgentMode::Execute => {
-            CompletionFinalization::ReleaseWithWarning(unverified_release_warning(evidence))
-        }
-    }
+    policy::completion_finalization(
+        evidence,
+        attempts,
+        finalization_policy(mode),
+        recovery_limit_for(mode),
+    )
 }
 
 /// User-facing warning when a chat turn ends without complete verification.
 /// Chinese, plain language, no gate terminology; the raw blocker list goes
 /// to the log only.
-fn unverified_release_warning(evidence: &CompletionEvidence) -> String {
-    tracing::info!(
-        "releasing chat turn with unverified blockers: {}",
-        evidence.blockers.join("; ")
-    );
-    "⚠ 以上回复未经完整验证:本轮修改后仍有检查未复验(或失败未复跑)。\
-结论可能不完整;回复「继续验证」可让我补齐。"
-        .to_string()
-}
-
-fn completion_blocked_message(evidence: &CompletionEvidence) -> String {
-    format!(
-        "Completion blocked because required verification is still missing: {}",
-        evidence.blockers.join("; ")
-    )
-}
 
 fn iteration_ceiling_terminal_event(evidence: &CompletionEvidence, mode: AgentMode) -> StreamEvent {
-    if evidence.completed || !matches!(mode, AgentMode::Autonomous) {
-        StreamEvent::Done {
-            input_tokens: 0,
-            output_tokens: 0,
-        }
-    } else {
-        StreamEvent::Error {
-            message: completion_blocked_message(evidence),
-        }
-    }
+    policy::iteration_ceiling_terminal_event(evidence, finalization_policy(mode))
 }
 
 fn completion_recovery_prompt(
@@ -2879,12 +2655,12 @@ fn completion_recovery_prompt(
     attempts: u32,
     mode: AgentMode,
 ) -> Option<String> {
-    match completion_finalization(evidence, attempts, mode) {
-        CompletionFinalization::Recover(prompt) => Some(prompt),
-        CompletionFinalization::Complete
-        | CompletionFinalization::ReleaseWithWarning(_)
-        | CompletionFinalization::Blocked(_) => None,
-    }
+    policy::completion_recovery_prompt(
+        evidence,
+        attempts,
+        finalization_policy(mode),
+        recovery_limit_for(mode),
+    )
 }
 
 /// Placeholder inserted in place of an image part when the active model
@@ -3417,7 +3193,7 @@ fn fact_check_reply(
 /// announcing its next step, which reads as the assistant stalling. With the
 /// user present, the user decides when the work is finished.
 fn completion_ready_applies(mode: AgentMode) -> bool {
-    matches!(mode, AgentMode::Autonomous)
+    policy::completion_ready_applies(finalization_policy(mode))
 }
 
 fn autonomous_budget_denial(
@@ -3428,26 +3204,14 @@ fn autonomous_budget_denial(
     args: &serde_json::Value,
     working_directory: &Path,
 ) -> Option<String> {
-    let (command, kind) = completion_command_and_kind(tool_name, args);
-    // Interactive chat is not constrained by the autonomous round budget, but
-    // deterministic completion invariants still apply to model-generated tools.
-    let effective_remaining = if mode == AgentMode::Interactive {
-        u32::MAX
-    } else {
-        remaining_model_rounds
-    };
-    match evaluate_budget_command_in_directory(
-        effective_remaining,
+    policy::autonomous_budget_denial(
+        wall_budget_applies(mode),
+        remaining_model_rounds,
         evidence,
-        &command,
-        &kind,
-        working_directory.to_str(),
-    ) {
-        PolicyDecision::Allow => None,
-        PolicyDecision::Deny { reason, .. } => Some(format!(
-            "Tool call denied by completion policy: {reason}. Resolve the current completion blocker or finalize."
-        )),
-    }
+        tool_name,
+        args,
+        working_directory,
+    )
 }
 
 fn record_completion_outcome(
@@ -4007,6 +3771,9 @@ fn glob_match(pattern: &str, input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `completion_command_and_kind` (and its `ToolKind` result) moved to
+    // agent-loop in slice 4.6; this test still exercises it via the re-export.
+    use codefactory_agent_core::ToolKind;
 
     #[tokio::test]
     async fn session_reasoning_effort_reflects_the_current_row() {

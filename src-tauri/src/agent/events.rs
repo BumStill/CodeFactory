@@ -33,4 +33,13 @@ impl EventSink for TauriEventSink {
         use tauri::Emitter;
         self.app.emit(&self.event_name, event).ok();
     }
+
+    fn usage_recorded(&self, session_id: &str) {
+        // Fire the cost-UI refresh events (moved here from the loop in slice 4.6
+        // so the loop needs no `AppHandle`). Both fire for footer compatibility
+        // during the migration. Best-effort — a closed window never fails a turn.
+        use tauri::Emitter;
+        self.app.emit("model-usage-recorded", session_id).ok();
+        self.app.emit("token-usage-recorded", session_id).ok();
+    }
 }

@@ -129,14 +129,18 @@ fn openai_and_anthropic_persist_usage_before_terminal_tool_branch() {
             "openai",
             "    async fn run_openai(",
             // End marker: the first method after run_openai. (call_openai_transport
-            // moved to model_transport.rs in slice 4.5a; request_permission is now
+            // moved to model_transport.rs in slice 4.5a and request_permission to
+            // permission_gateway.rs in slice 4.6; finish_cancelled_tool_batch is now
             // the tight bound of the run_openai section.)
-            "    async fn request_permission(",
+            "    async fn finish_cancelled_tool_batch(",
         ),
         (
             "anthropic",
             "    async fn run_anthropic(",
-            "\n}\n\nfn openai_tool_controls(",
+            // End marker: the first free fn after run_anthropic. (openai_tool_controls
+            // moved to agent-loop in slice 4.6; validate_openai_sse_completion is now
+            // the tight bound of the run_anthropic section.)
+            "\n}\n\nfn validate_openai_sse_completion(",
         ),
     ] {
         let section = source
@@ -171,15 +175,21 @@ fn completed_usage_is_persisted_before_post_response_cancellation() {
             "openai",
             "    async fn run_openai(",
             // End marker: the first method after run_openai. (call_openai_transport
-            // moved to model_transport.rs in slice 4.5a; request_permission is now
+            // moved to model_transport.rs in slice 4.5a and request_permission to
+            // permission_gateway.rs in slice 4.6; finish_cancelled_tool_batch is now
             // the tight bound of the run_openai section.)
-            "    async fn request_permission(",
-            "let (text, tool_calls, usage, reasoning) = match call_result",
+            "    async fn finish_cancelled_tool_batch(",
+            // The round's model answer (a `ModelResponse` destructure since slice
+            // 4.6 sub-step 7 switched the loop onto `ModelTransport::complete`).
+            "} = match call_result",
         ),
         (
             "anthropic",
             "    async fn run_anthropic(",
-            "\n}\n\nfn openai_tool_controls(",
+            // End marker: the first free fn after run_anthropic. (openai_tool_controls
+            // moved to agent-loop in slice 4.6; validate_openai_sse_completion is now
+            // the tight bound of the run_anthropic section.)
+            "\n}\n\nfn validate_openai_sse_completion(",
             "let resp = match first_attempt",
         ),
     ] {

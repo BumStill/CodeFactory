@@ -13,6 +13,54 @@
 
 use codefactory_agent_core::CompletionEvidence;
 
+use crate::journal::PersistError;
+use crate::tool::ToolError;
+use crate::transport::TransportError;
+
+/// The error `run_agent_loop` returns (keystone slice 4.6). Every arm's
+/// `Display` is the underlying error verbatim, so a desktop adapter can map it
+/// to `AppError::Other(e.to_string())` byte-for-byte, and the loop's
+/// context-overflow / vision greps (which read a `TransportError`'s verbatim
+/// `Display`) still work through the `Transport` arm. The loop body switches its
+/// transport calls onto `complete()` in slice 4.6 sub-step 7; `run_agent_loop`
+/// starts returning this in sub-step 8.
+#[derive(Debug)]
+pub enum LoopError {
+    Transport(TransportError),
+    Persist(PersistError),
+    Tool(ToolError),
+}
+
+impl std::fmt::Display for LoopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoopError::Transport(e) => write!(f, "{e}"),
+            LoopError::Persist(e) => write!(f, "{e}"),
+            LoopError::Tool(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for LoopError {}
+
+impl From<TransportError> for LoopError {
+    fn from(e: TransportError) -> Self {
+        LoopError::Transport(e)
+    }
+}
+
+impl From<PersistError> for LoopError {
+    fn from(e: PersistError) -> Self {
+        LoopError::Persist(e)
+    }
+}
+
+impl From<ToolError> for LoopError {
+    fn from(e: ToolError) -> Self {
+        LoopError::Tool(e)
+    }
+}
+
 /// How the loop finalizes a turn. Desktop maps `AgentMode`; the sidecar adds a
 /// `Benchmark` arm that must reproduce its 2-way completed/recovery branch
 /// byte-for-byte (hardest-problem #2).
@@ -67,6 +115,28 @@ mod tests {
             FinalizationPolicy::BlockOnIncomplete,
             FinalizationPolicy::Benchmark
         );
+    }
+
+    #[test]
+    fn loop_error_display_is_the_underlying_message_verbatim() {
+        // Verbatim through every arm so a desktop adapter's
+        // `AppError::Other(e.to_string())` and the loop's context-overflow /
+        // vision greps (which read the Transport arm's Display) stay byte-correct.
+        let t: LoopError = TransportError::Fatal("context length exceeded".into()).into();
+        assert!(matches!(t, LoopError::Transport(_)));
+        assert_eq!(t.to_string(), "context length exceeded");
+
+        let p: LoopError = PersistError {
+            message: "db is locked".into(),
+        }
+        .into();
+        assert_eq!(p.to_string(), "db is locked");
+
+        let tool: LoopError = ToolError {
+            message: "unknown tool".into(),
+        }
+        .into();
+        assert_eq!(tool.to_string(), "unknown tool");
     }
 
     #[test]

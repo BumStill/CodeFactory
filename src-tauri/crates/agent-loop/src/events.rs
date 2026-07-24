@@ -15,6 +15,13 @@ use crate::types::StreamEvent;
 /// behind an `Arc` shared across the loop's async tasks.
 pub trait EventSink: Send + Sync {
     fn emit(&self, event: StreamEvent);
+
+    /// A usage row was just persisted (`Persistence::record_usage` returned a
+    /// NEW row). The desktop `TauriEventSink` overrides this to refresh its cost
+    /// UI (`model-usage-recorded` / `token-usage-recorded`); every other sink —
+    /// headless, collecting — keeps the defaulted no-op. Keystone slice 4.6:
+    /// the loop calls this instead of touching a raw `AppHandle`.
+    fn usage_recorded(&self, _session_id: &str) {}
 }
 
 /// Test / headless sink: records every event in order for assertion. Tauri-free,

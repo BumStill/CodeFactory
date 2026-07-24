@@ -104,6 +104,15 @@ pub trait Persistence: Send + Sync {
     /// anonymous.
     async fn mark_rejected_candidate(&self, message_id: Option<&str>) -> PersistResult<()>;
 
+    /// Record that a tool call was STARTED (paired with the persisted assistant
+    /// message). The impl parses `tool_call.function.arguments` internally. No-op
+    /// when anonymous.
+    async fn record_tool_call_started(
+        &self,
+        message_id: &str,
+        tool_call: &ToolCall,
+    ) -> PersistResult<()>;
+
     /// Record one terminal tool outcome into the trajectory.
     async fn record_tool_call_outcome(
         &self,
@@ -166,6 +175,13 @@ mod tests {
             Ok(())
         }
         async fn mark_rejected_candidate(&self, _id: Option<&str>) -> PersistResult<()> {
+            Ok(())
+        }
+        async fn record_tool_call_started(
+            &self,
+            _message_id: &str,
+            _tool_call: &ToolCall,
+        ) -> PersistResult<()> {
             Ok(())
         }
         async fn record_tool_call_outcome(
