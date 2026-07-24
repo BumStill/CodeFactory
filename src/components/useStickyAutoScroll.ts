@@ -106,6 +106,36 @@ export function useStickyAutoScroll(
     lastSetScrollTop.current = el.scrollTop;
   }, []);
 
+  const prepareForPrepend = useCallback(() => {
+    const element = scrollerRef.current;
+    if (!element) return null;
+    const previousHeight = element.scrollHeight;
+    const previousTop = element.scrollTop;
+
+    // Prepending is programmatic history navigation, not new tail content.
+    // Detach before React commits the older rows so MutationObserver cannot
+    // snap to bottom or light the "new content" badge for those rows.
+    pinnedRef.current = false;
+    setPinned(false);
+    newContentBaseline.current = Number.POSITIVE_INFINITY;
+
+    return {
+      element,
+      restore: () => {
+        if (scrollerRef.current !== element) return;
+        const nextTop =
+          previousTop + Math.max(0, element.scrollHeight - previousHeight);
+        programmaticScrollTo(nextTop);
+        lastUserScrollTop.current = element.scrollTop;
+        newContentBaseline.current = element.scrollHeight;
+        pinLossBottom.current = Math.max(
+          0,
+          element.scrollHeight - element.clientHeight,
+        );
+      },
+    };
+  }, [programmaticScrollTo]);
+
   const stickToBottomIfPinned = useCallback(() => {
     const el = scrollerRef.current;
     if (!el || !pinnedRef.current) return;
@@ -228,6 +258,11 @@ export function useStickyAutoScroll(
     prevKeyRef.current = conversationKey;
     if (!scrollerRef.current) return;
     pinnedRef.current = true;
+    newContentBaseline.current = scrollerRef.current.scrollHeight;
+    pinLossBottom.current = Math.max(
+      0,
+      scrollerRef.current.scrollHeight - scrollerRef.current.clientHeight,
+    );
     setPinned(true);
     requestAnimationFrame(() => {
       stickToBottomIfPinned();
@@ -256,5 +291,11 @@ export function useStickyAutoScroll(
     }
   }, [conversationKey]);
 
-  return { scrollerRef, pinned, hasNewContent, jumpToBottom };
+  return {
+    scrollerRef,
+    pinned,
+    hasNewContent,
+    jumpToBottom,
+    prepareForPrepend,
+  };
 }

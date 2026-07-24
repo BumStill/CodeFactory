@@ -71,12 +71,20 @@ export function WorkspacePage({
   const {
     activeSession, draftSession,
     selectSession, sendOrQueue, cancelStream, removeFromQueue,
-    respondPermission, exitAnonymous, renameSession,
+    respondPermission, exitAnonymous, renameSession, loadOlderMessages,
   } = useChatStore();
   const activeDraft = draftSession?.id === sessionId ? draftSession : null;
   // Per-session chat state for the ACTIVE session. Background sessions keep
   // streaming into their own buckets; here we render the active one's slice.
-  const { messages, streaming, queue, pendingPermission } = useChatStore(activeRuntime);
+  const {
+    messages,
+    streaming,
+    queue,
+    pendingPermission,
+    hasOlderHistory,
+    loadingOlderHistory,
+    historyTruncated,
+  } = useChatStore(activeRuntime);
   const isAnonymous = activeSession?.kind === "anonymous";
   const settings = useSettingsStore((state) => state.settings);
   const persistedRunActive = useTasksStore((state) => state.running[sessionId] ?? false);
@@ -170,7 +178,7 @@ export function WorkspacePage({
   useEffect(() => {
     // Draft IDs are reused by materialization. Once the first message creates
     // the real session, activeSession already contains that same ID; calling
-    // selectSession here would reload get_messages and race the live stream.
+    // selectSession here would reload persisted history and race the live stream.
     if (activeDraft || activeSession?.id === sessionId) return;
     void selectSession(sessionId);
   }, [activeDraft, activeSession?.id, selectSession, sessionId]);
@@ -331,6 +339,11 @@ export function WorkspacePage({
             messages={messages}
             streaming={streaming}
             cwd={activeCwd}
+            conversationKey={activeSession?.id ?? activeDraft?.id ?? sessionId}
+            hasOlderHistory={hasOlderHistory}
+            loadingOlderHistory={loadingOlderHistory}
+            historyTruncated={historyTruncated}
+            onLoadOlder={loadOlderMessages}
             onUsePrompt={(text) => setPendingInsert(text)}
             onOpenUsage={onOpenUsage}
           />

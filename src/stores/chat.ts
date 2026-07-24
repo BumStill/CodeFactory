@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "zustand";
 import { invoke, onStream, onSessionUpdated, sendMessageAnonymous } from "../lib/tauri";
-import type { Message, Session, StreamEvent, ModelInfo, ReasoningEffort, AnonTurn } from "../lib/tauri";
+import type {
+  Message,
+  MessagePage,
+  Session,
+  StreamEvent,
+  ModelInfo,
+  ReasoningEffort,
+  AnonTurn,
+} from "../lib/tauri";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   markPermissionResponse,
@@ -45,6 +53,20 @@ export const QUEUE_MAX = 5;
 export interface SessionRuntime extends ChatEventState {
   /** Messages waiting to fire after THIS session's current stream finishes. */
   queue: QueuedMessage[];
+  /** Raw persisted rows already loaded for this bounded history window. */
+  persistedMessages: Message[];
+  /** Stable SQLite rowid cursor for the next older real-user-turn page. */
+  historyBeforeRowid: number | null;
+  hasOlderHistory: boolean;
+  loadingOlderHistory: boolean;
+  /** At least one loaded page was split or previewed by a safety budget. */
+  historyTruncated: boolean;
+  /** Guards async history refreshes from overwriting a newer live turn. */
+  revision: number;
+  /** Unique owner of the current history request; avoids stale cleanup ABA. */
+  historyRequestId: number;
+  /** Frontend-only notices that must survive persisted history hydration. */
+  localMessages: UIMessage[];
 }
 
 /** Shared read-only default returned by the selector when a session has no
@@ -58,10 +80,26 @@ const EMPTY_RUNTIME: SessionRuntime = {
   contextUsage: null,
   compressionToast: null,
   queue: [],
+  persistedMessages: [],
+  historyBeforeRowid: null,
+  hasOlderHistory: false,
+  loadingOlderHistory: false,
+  historyTruncated: false,
+  revision: 0,
+  historyRequestId: 0,
+  localMessages: [],
 };
 
 /** A fresh, independent runtime bucket (its own arrays). */
-export function freshRuntime(messages: UIMessage[] = []): SessionRuntime {
+export function freshRuntime(
+  messages: UIMessage[] = [],
+  history: Partial<
+    Pick<
+      SessionRuntime,
+      "persistedMessages" | "historyBeforeRowid" | "hasOlderHistory" | "historyTruncated"
+    >
+  > = {},
+): SessionRuntime {
   return {
     messages,
     streaming: false,
@@ -71,6 +109,14 @@ export function freshRuntime(messages: UIMessage[] = []): SessionRuntime {
     contextUsage: null,
     compressionToast: null,
     queue: [],
+    persistedMessages: history.persistedMessages ?? [],
+    historyBeforeRowid: history.historyBeforeRowid ?? null,
+    hasOlderHistory: history.hasOlderHistory ?? false,
+    loadingOlderHistory: false,
+    historyTruncated: history.historyTruncated ?? false,
+    revision: 0,
+    historyRequestId: 0,
+    localMessages: [],
   };
 }
 
@@ -94,6 +140,7 @@ interface ChatStore {
   loadQuickSessions: () => Promise<void>;
   createSession: (cwd: string, model: string) => Promise<Session>;
   selectSession: (id: string) => Promise<void>;
+  loadOlderMessages: () => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
   /** Send to `sessionId` (default: the active session). Targeting lets the
@@ -126,6 +173,7 @@ interface ChatStore {
   _unlistenSessionUpdated: Record<string, UnlistenFn | undefined>;
   _streamingMsgId: Record<string, string | undefined>;
   _draftMaterialization: Promise<Session> | null;
+  _selectionRequestId: number;
 }
 
 /** Selector: the active session's runtime slice (or the empty default). Use as
@@ -153,6 +201,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   _unlistenSessionUpdated: {},
   _streamingMsgId: {},
   _draftMaterialization: null,
+  _selectionRequestId: 0,
 
   beginQuickDraft: () => {
     const draft: DraftSession = {
@@ -162,7 +211,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       modelId: get().activeModel,
       text: "",
     };
-    set({ activeSession: null, draftSession: draft });
+    set((state) => ({
+      activeSession: null,
+      draftSession: draft,
+      _selectionRequestId: state._selectionRequestId + 1,
+    }));
     return draft;
   },
 
@@ -174,7 +227,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       modelId: get().activeModel,
       text: "",
     };
-    set({ activeSession: null, draftSession: draft });
+    set((state) => ({
+      activeSession: null,
+      draftSession: draft,
+      _selectionRequestId: state._selectionRequestId + 1,
+    }));
     return draft;
   },
 
@@ -213,24 +270,190 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const cur = get().activeSession;
     if (cur?.id === id && cur.kind === "anonymous") return;
 
+    const requestId = get()._selectionRequestId + 1;
+    set({ _selectionRequestId: requestId });
     const session = await invoke<Session>("get_session", { sessionId: id });
+    if (get()._selectionRequestId !== requestId) return;
 
-    // If this session is mid-stream it already owns a live bucket + listener —
-    // foreground it WITHOUT reloading (a reload would clobber the in-flight
-    // buffer and drop the live tail).
-    if (get().runtime[id]?.streaming) {
-      set({ activeSession: session, activeModel: session.model_id });
+    // A frontend bucket can remain stuck at streaming=true after the backend
+    // has already persisted its final reply. Ask the runtime authority before
+    // deciding whether re-selection should preserve a genuinely live buffer or
+    // recover from the persisted tail.
+    let staleStreamingRevision: number | null = null;
+    const selectedRuntime = get().runtime[id];
+    if (selectedRuntime?.streaming) {
+      const backendRunning = await invoke<boolean>("is_chat_running", {
+        sessionId: id,
+      });
+      if (get()._selectionRequestId !== requestId) return;
+      if (backendRunning) {
+        set({ activeSession: session, activeModel: session.model_id });
+        return;
+      }
+      staleStreamingRevision = selectedRuntime.revision;
+    }
+
+    // Load a fresh snapshot for an idle session or a stale streaming bucket.
+    const page = await invoke<MessagePage>("get_message_page", {
+      sessionId: id,
+      beforeRowid: null,
+      userTurnLimit: 8,
+    });
+    if (get()._selectionRequestId !== requestId) return;
+    let recoveredStaleStream = false;
+    set((s) => {
+      const currentRuntime = s.runtime[id];
+      // A background event may have started this session while its page was
+      // crossing the bridge. Never replace a newly-live bucket with hydration.
+      if (
+        currentRuntime?.streaming &&
+        (
+          staleStreamingRevision == null ||
+          currentRuntime.revision !== staleStreamingRevision
+        )
+      ) {
+        return {
+          activeSession: session,
+          draftSession: null,
+          activeModel: session.model_id,
+        };
+      }
+      const localMessages =
+        staleStreamingRevision != null ? currentRuntime?.localMessages ?? [] : [];
+      const hydrated = freshRuntime(
+        [...dbMessagesToUI(page.messages), ...localMessages],
+        {
+          persistedMessages: page.messages,
+          historyBeforeRowid: page.next_before_rowid ?? null,
+          hasOlderHistory: page.has_more,
+          historyTruncated: page.truncated ?? false,
+        },
+      );
+      if (staleStreamingRevision != null && currentRuntime) {
+        hydrated.queue = currentRuntime.queue;
+        hydrated.localMessages = localMessages;
+        recoveredStaleStream = currentRuntime.streaming;
+      }
+      const streamingMsgIds = { ...s._streamingMsgId };
+      if (recoveredStaleStream) delete streamingMsgIds[id];
+      return {
+        activeSession: session,
+        draftSession: null,
+        activeModel: session.model_id,
+        runtime: {
+          ...s.runtime,
+          [id]: hydrated,
+        },
+        _streamingMsgId: streamingMsgIds,
+      };
+    });
+    if (recoveredStaleStream) {
+      drainNextQueuedMessage(id, set, get);
+    }
+  },
+
+  loadOlderMessages: async () => {
+    const id = get().activeSession?.id;
+    if (!id) return;
+    const current = get().runtime[id];
+    if (
+      !current ||
+      current.streaming ||
+      current.loadingOlderHistory ||
+      !current.hasOlderHistory ||
+      current.historyBeforeRowid == null
+    ) {
       return;
     }
 
-    // Otherwise load a fresh snapshot and (re)seed this session's bucket.
-    const msgs = await invoke<Message[]>("get_messages", { sessionId: id });
-    set((s) => ({
-      activeSession: session,
-      draftSession: null,
-      activeModel: session.model_id,
-      runtime: { ...s.runtime, [id]: freshRuntime(dbMessagesToUI(msgs)) },
-    }));
+    const expectedRevision = current.revision;
+    const requestId = current.historyRequestId + 1;
+    const beforeRowid = current.historyBeforeRowid;
+    set((s) => {
+      const runtime = s.runtime[id];
+      if (!runtime || runtime.revision !== expectedRevision) return {};
+      return {
+        runtime: {
+          ...s.runtime,
+          [id]: {
+            ...runtime,
+            loadingOlderHistory: true,
+            historyRequestId: requestId,
+          },
+        },
+      };
+    });
+
+    try {
+      const [page, latestPage] = await Promise.all([
+        invoke<MessagePage>("get_message_page", {
+          sessionId: id,
+          beforeRowid,
+          userTurnLimit: 8,
+        }),
+        // The user may have completed a live turn after this history bucket
+        // was first hydrated. Refresh the persisted tail only on this explicit
+        // history action; the revision guard below prevents a late response
+        // from overwriting a newly-started stream.
+        invoke<MessagePage>("get_message_page", {
+          sessionId: id,
+          beforeRowid: null,
+          userTurnLimit: 8,
+        }),
+      ]);
+      set((s) => {
+        const runtime = s.runtime[id];
+        if (!runtime || runtime.historyRequestId !== requestId) return {};
+        if (
+          runtime.streaming ||
+          runtime.revision !== expectedRevision ||
+          s.activeSession?.id !== id
+        ) {
+          return {
+            runtime: {
+              ...s.runtime,
+              [id]: { ...runtime, loadingOlderHistory: false },
+            },
+          };
+        }
+        const persistedMessages = mergePersistedMessages(
+          page.messages,
+          mergePersistedMessages(runtime.persistedMessages, latestPage.messages),
+        );
+        return {
+          runtime: {
+            ...s.runtime,
+            [id]: {
+              ...runtime,
+              messages: [
+                ...dbMessagesToUI(persistedMessages),
+                ...runtime.localMessages,
+              ],
+              persistedMessages,
+              historyBeforeRowid: page.next_before_rowid ?? null,
+              hasOlderHistory: page.has_more,
+              loadingOlderHistory: false,
+              historyTruncated:
+                runtime.historyTruncated ||
+                (page.truncated ?? false) ||
+                (latestPage.truncated ?? false),
+              revision: runtime.revision + 1,
+            },
+          },
+        };
+      });
+    } catch {
+      set((s) => {
+        const runtime = s.runtime[id];
+        if (!runtime || runtime.historyRequestId !== requestId) return {};
+        return {
+          runtime: {
+            ...s.runtime,
+            [id]: { ...runtime, loadingOlderHistory: false },
+          },
+        };
+      });
+    }
   },
 
   deleteSession: async (id) => {
@@ -327,7 +550,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       return {
         runtime: {
           ...s.runtime,
-          [id]: { ...prev, messages: [...prev.messages, userMsg, assistantMsg], streaming: true },
+          [id]: {
+            ...prev,
+            messages: [...prev.messages, userMsg, assistantMsg],
+            streaming: true,
+            revision: prev.revision + 1,
+          },
         },
         _streamingMsgId: { ...s._streamingMsgId, [id]: assistantMsgId },
       };
@@ -361,6 +589,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                 m.id === assistantMsgId ? { ...m, content: `Error: ${String(e)}` } : m,
               ),
               streaming: false,
+              revision: prev.revision + 1,
             },
           },
         };
@@ -610,7 +839,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       return {
         runtime: {
           ...s.runtime,
-          [id]: { ...prev, ...markPermissionResponse(prev, pending.toolCallId, allow) },
+          [id]: {
+            ...prev,
+            ...markPermissionResponse(prev, pending.toolCallId, allow),
+            revision: prev.revision + 1,
+          },
         },
       };
     });
@@ -627,7 +860,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     };
     set((s) => {
       const prev = s.runtime[id] ?? freshRuntime();
-      return { runtime: { ...s.runtime, [id]: { ...prev, messages: [...prev.messages, msg] } } };
+      return {
+        runtime: {
+          ...s.runtime,
+          [id]: {
+            ...prev,
+            messages: [...prev.messages, msg],
+            localMessages: [...prev.localMessages, msg],
+            revision: prev.revision + 1,
+          },
+        },
+      };
     });
   },
 
@@ -643,6 +886,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           [id]: {
             ...prev,
             messages: [],
+            persistedMessages: [],
+            historyBeforeRowid: null,
+            hasOlderHistory: false,
+            loadingOlderHistory: false,
+            historyTruncated: false,
+            revision: prev.revision + 1,
+            historyRequestId: prev.historyRequestId + 1,
+            localMessages: [],
             inputTokenTotal: 0,
             outputTokenTotal: 0,
             pendingPermission: null,
@@ -699,7 +950,16 @@ function handleStreamEvent(
     const prev = s.runtime[sessionId];
     if (!prev) return {};
     const reduced = reduceChatStreamEvent(prev, event, msgId);
-    return { runtime: { ...s.runtime, [sessionId]: { ...prev, ...reduced } } };
+    return {
+      runtime: {
+        ...s.runtime,
+        [sessionId]: {
+          ...prev,
+          ...reduced,
+          revision: prev.revision + 1,
+        },
+      },
+    };
   });
 
   // Queue drain — fire this session's next queued message as soon as its
@@ -746,6 +1006,20 @@ function handleStreamEvent(
       }
     }
   }
+}
+
+function mergePersistedMessages(
+  older: Message[],
+  newer: Message[],
+): Message[] {
+  const seen = new Set<string>();
+  const merged: Message[] = [];
+  for (const message of [...older, ...newer]) {
+    if (seen.has(message.id)) continue;
+    seen.add(message.id);
+    merged.push(message);
+  }
+  return merged;
 }
 
 interface PersistedToolCall {
