@@ -21,6 +21,8 @@ tracing = "0.1"
 async-trait = "0.1"
 
 [dev-dependencies]
-# The async trait tests exercise the object-safe seams. tokio graduates to a
-# real dependency when the loop body moves here (slice 4.6).
+# The async trait tests exercise the object-safe seams. `run_agent_loop` (slice
+# 4.6b) drives everything through `.await` on trait objects + `std::time`, so it
+# needs no runtime `tokio::` API — tokio stays a dev-dependency (the caller
+# supplies the runtime), keeping the crate runtime-agnostic.
 tokio = { version = "1", features = ["macros", "rt"] }

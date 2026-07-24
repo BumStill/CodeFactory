@@ -993,70 +993,12 @@ impl AgentLoop {
         tool_defs: &[ToolDefinition],
         system_prompt: &str,
     ) -> Result<()> {
-        // Seam handles bound once and reused for the whole run (keystone slice
-        // 4.6b): behaviour-identical to per-call construction — each concrete
-        // seam re-reads live Settings/db inside its own methods. In the shared
-        // loop these arrive as `svc` trait objects; here they wrap the desktop
-        // builders. The `hooks`/`tool_backend` handles (which own an AppHandle)
-        // are still built further down, inside this dead-stripped fn (#166).
-        let events = self.events.clone();
-        let transport = self.model_transport();
-        let context_policy = self.context_policy();
-        let permission = self.permission_gateway();
-        let fact_checker = fact_checker::DesktopFactChecker { mode: self.mode };
-        // Mode → policy scalars resolved once (keystone slice 4.6b): the shared
-        // loop takes these as RunConfig fields, so the body names no `AgentMode`.
-        let finalization = finalization_policy(self.mode);
-        let recovery_limit = recovery_limit_for(self.mode);
-        let wall_budget = wall_budget_applies(self.mode);
-        let cancel = self.cancel.clone();
-        let session_id = self.session_id.clone();
-        // Execution-context scalars pre-derived once (keystone slice 4.6b): they
-        // are constant for the run, so hoisting is behaviour-preserving and the
-        // body never names `self.execution_context`/`self.cwd`/`self.usage_run_id`.
-        let cwd = self.cwd.clone();
-        let audit_session_id = self.audit_session_id();
-        let task_id = self
-            .execution_context
-            .as_ref()
-            .and_then(|ctx| ctx.task_id.clone());
-        let knowledge_library_ids = knowledge_scope_for_tools(self.execution_context.as_ref());
-        let usage_run_id = self.usage_run_id.clone();
-        // Built ONCE per run (keystone slice 4.6b): it holds only cloned handles,
-        // no per-tool-call state, so hoisting out of the tool loop is
-        // behaviour-preserving. Owns an `AppHandle` (`#[cfg(not(test))] app`), so
-        // it is constructed only here in the dead-stripped fn (#166).
-        let tool_backend = tool_backend::DesktopToolBackend {
-            #[cfg(not(test))]
-            app: self.app.clone(),
-            db: self.db.clone(),
-            mcp_manager: self.mcp_manager.clone(),
-            settings: self.settings.clone(),
-        };
-        let completion_instruction = latest_user_instruction(&history);
-        let fact_check_instruction = effective_fact_check_instruction(&history);
-        let mut messages = self.build_openai_messages(history, system_prompt);
-        // Proactive capability match: strip images BEFORE the first request
-        // when the model is KNOWN text-only, instead of burning a 400 round
-        // trip every turn. The reactive strip-and-retry stays as the net for
-        // unknown models and wrong guesses.
-        if !context_policy.supports_vision().await {
-            let stripped = strip_image_parts(&mut messages);
-            if stripped > 0 {
-                let notice = format!(
-                    "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
-占位文本;切换到支持图片的模型可恢复图片理解。"
-                );
-                self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
-                    .await?;
-            }
-        }
-        // Headless runs have no frontend and no hooks: `NoOpHooks` when `app`
-        // is absent, else `DesktopLifecycleHooks` wrapping a `HookRunner` —
-        // which owns an `AppHandle` — constructed ONLY here, inside `run()`,
-        // which the unit-test EXE dead-strips. Never construct it in test code:
-        // an AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
-        // trips the Windows loader (`STATUS_ENTRYPOINT_NOT_FOUND`, #166).
+        // Desktop adapter for the shared `run_agent_loop` (keystone slice 4.6b):
+        // build the per-turn inputs, the run config, and the capability services,
+        // then drive the one shared loop. The `AppHandle`-owning handles
+        // (`HookRunner`, `DesktopToolBackend`) are constructed ONLY here — inside
+        // this `run()`-reached fn the unit-test EXE dead-strips (#166) — and
+        // erased into `Arc<dyn …>` so `run_agent_loop` links no tauri.
         let hooks: std::sync::Arc<dyn LifecycleHooks> = match &self.app {
             None => std::sync::Arc::new(NoOpHooks),
             Some(app) => {
@@ -1069,545 +1011,63 @@ impl AgentLoop {
                 std::sync::Arc::new(lifecycle_hooks::DesktopLifecycleHooks { runner })
             }
         };
-
-        // Did we emit a terminal Done/Error this run? Used to guarantee the
-        // stream always closes even if the loop runs to its iteration ceiling.
-        let mut emitted_terminal = false;
-        let mut completion_gate =
-            CompletionGate::new_for_instruction(false, &completion_instruction);
-        let mut completion_sequence = 0_u64;
-        let mut last_completion_nudge_sequence = None;
-        let mut progress_tracker = ProgressTracker::new(8);
-        let mut finalization_pending = false;
-        let mut completion_recovery_attempts = 0_u32;
-        let mut fact_check_used = false;
-        let mut require_tool_next = false;
-        let max_iterations = self.mode.max_iterations();
-        for iteration in 0..max_iterations {
-            // Cooperative cancellation: if the user hit "stop" for this chat
-            // turn, end the stream cleanly between rounds. Checked here (not
-            // mid tool-call) so in-flight work isn't hard-killed. No-op unless
-            // a cancel flag was attached (chat only) and has actually tripped.
-            if is_cancelled(cancel.as_ref()) {
-                tracing::info!("chat turn cancelled by user (session {session_id})");
-                events.emit(StreamEvent::Done {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                });
-                emitted_terminal = true;
-                break;
-            }
-            // ── Context-window management ────────────────────────────────────
-            // Estimate prompt tokens before sending. If we're over 75% of the
-            // model's window, elide oversized tool results from the older
-            // half. Notify the UI so the user knows what happened.
-            let estimated = context::estimate_prompt_tokens(&messages, system_prompt);
-            let (context_limit, max_context_limit) =
-                context_policy.context_window(estimated).await;
-            let compression = context::compress_if_needed(
-                std::mem::take(&mut messages),
-                system_prompt,
-                context_limit,
-            );
-            // Storage repair is not enough: context compression can change the
-            // final provider payload. Enforce the OpenAI tool-call protocol at
-            // the last possible boundary before every model request.
-            messages = repair_openai_tool_protocol(compression.messages);
-            if compression.compressed {
-                events.emit(StreamEvent::ContextCompressed {
-                            elided_count: compression.elided_count,
-                            tokens_freed: compression.tokens_freed,
-                        });
-            }
-
-            let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
-            let required_tool_response = require_tool_next && !finalization_pending;
-            // Resolve reasoning effort ONCE per round via ContextPolicy (slice
-            // 4.6): it re-reads db+settings each round (freshness) and returns ""
-            // for non-ChatGPT styles, so the transport reads no DB. Held in
-            // `round_options` so the two reactive retries below reuse this round's
-            // value.
-            let round_options = RoundOptions {
-                require_tool: required_tool_response,
-                reasoning_effort: context_policy.round_reasoning_effort().await,
-            };
-            let call_result = transport
-                .complete(&messages, active_tool_defs, &round_options)
-                .await;
-            let ModelResponse {
-                text,
-                tool_calls,
-                usage,
-                reasoning,
-            } = match call_result {
-                Ok(ok) => ok,
-                // The active model rejects image input (e.g. the user switched
-                // the session to a no-vision model with image attachments in
-                // history). Strip images to placeholders and retry ONCE —
-                // otherwise every「继续」replays the same history and dies the
-                // same death (2026-07-21 field report).
-                // Provider says the prompt is over the window: the resolved
-                // window metadata or the token estimate was wrong. Emergency-
-                // compress against a reduced budget and retry ONCE — a killed
-                // turn on a replayable history dies identically on every
-                //「继续」(2026-07-21: three context-window deaths in one day).
-                Err(e) if context::is_context_overflow(&e.to_string()) => {
-                    let emergency_limit = (context_limit / 5).max(1) * 4;
-                    let compression = context::compress_if_needed(
-                        std::mem::take(&mut messages),
-                        system_prompt,
-                        emergency_limit,
-                    );
-                    if !compression.compressed {
-                        return Err(e.into());
-                    }
-                    messages = repair_openai_tool_protocol(compression.messages);
-                    let notice = format!(
-                        "上下文超出模型窗口,已压缩 {} 条历史(约释放 {} tokens)后重试。",
-                        compression.elided_count, compression.tokens_freed
-                    );
-                    self.persist_gate_message(&notice, "turn_notice").await?;
-                    events.emit(StreamEvent::CompletionGateAction {
-                                kind: "turn_notice".into(),
-                                detail: notice.clone(),
-                            });
-                    transport
-                        .complete(&messages, active_tool_defs, &round_options)
-                        .await?
-                }
-                Err(e) if is_vision_rejection(&e.to_string()) => {
-                    let stripped = strip_image_parts(&mut messages);
-                    if stripped == 0 {
-                        return Err(e.into());
-                    }
-                    let notice = format!(
-                        "已自动移除历史中的 {stripped} 张图片后重试:当前模型不支持图片输入。\
-如需图片理解,请切换回支持图片的模型。"
-                    );
-                    self.persist_gate_message(&notice, "turn_notice").await?;
-                    events.emit(StreamEvent::CompletionGateAction {
-                                kind: "turn_notice".into(),
-                                detail: notice.clone(),
-                            });
-                    transport
-                        .complete(&messages, active_tool_defs, &round_options)
-                        .await?
-                }
-                Err(e) => return Err(e.into()),
-            };
-            finalization_pending = false;
-            require_tool_next = false;
-
-            // The provider request has completed. Persist already-consumed
-            // Usage before honoring a cancellation that arrived in flight.
-            let usage_request_id = usage_request_id(&usage_run_id, iteration);
-            if let Some(round_usage) = usage.as_ref() {
-                self.record_usage_event_for_round(round_usage, iteration)
-                    .await;
-            }
-
-            if is_cancelled(cancel.as_ref()) {
-                tracing::info!("chat turn cancelled by user (session {session_id})");
-                events.emit(StreamEvent::Done {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                });
-                emitted_terminal = true;
-                break;
-            }
-
-            // Emit real (provider-reported) context-usage right after each
-            // round-trip so the UI bar tracks actual usage, not just our
-            // estimate. The estimate is only used to *trigger* compression.
-            if let Some(u) = &usage {
-                events.emit(StreamEvent::ContextUsage {
-                            used_tokens: u.prompt_tokens,
-                            limit_tokens: context_limit,
-                            max_limit_tokens: max_context_limit,
-                        });
-            }
-
-            // Persist assistant turn — include tool_calls AND reasoning_content
-            // so history reconstructs faithfully. Reasoning replay is required
-            // by DeepSeek's reasoner family.
-            let assistant_message_id =
-                if !text.is_empty() || !tool_calls.is_empty() || reasoning.is_some() {
-                    self.persist_message(
-                        "assistant",
-                        &text,
-                        usage.as_ref(),
-                        if tool_calls.is_empty() {
-                            None
-                        } else {
-                            Some(&tool_calls)
-                        },
-                        reasoning.as_deref(),
-                        Some(&usage_request_id),
-                    )
-                    .await?
-                } else {
-                    None
-                };
-            if let Some(message_id) = assistant_message_id.as_deref() {
-                for tc in &tool_calls {
-                    self.persistence()
-                        .record_tool_call_started(message_id, tc)
-                        .await
-                        .map_err(persistence::to_app_error)?;
-                }
-            }
-
-            if tool_calls.is_empty() {
-                // Systemic fact-check: a tool-call-free reply asserting a
-                // machine-verifiable obstacle (delivery blocked / command
-                // missing / waiting on a checkable condition) gets ONE live
-                // probe-backed correction — facts over stale memory.
-                if !fact_check_used {
-                    if let Some(correction) =
-                        fact_checker.fact_check(&text, &fact_check_instruction)
-                    {
-                        fact_check_used = true;
-                        self.persist_gate_message(&correction, "turn_notice").await?;
-                        events.emit(StreamEvent::CompletionGateAction {
-                                    kind: "turn_notice".into(),
-                                    detail: correction.clone(),
-                                });
-                        messages.push(ChatMessage {
-                            role: "user".into(),
-                            content: MessageContent::Text(correction),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                            reasoning_content: None,
-                        });
-                        continue;
-                    }
-                }
-                let evidence = completion_gate.evidence();
-                match policy::completion_finalization(&evidence, completion_recovery_attempts, finalization, recovery_limit) {
-                    CompletionFinalization::Recover(prompt) => {
-                        completion_recovery_attempts += 1;
-                        require_tool_next = true;
-                        // Make the rejection visible instead of silently looping:
-                        // collapse the rejected candidate in the UI, persist the
-                        // injected instruction so rebuilt history stays faithful.
-                        self.mark_rejected_candidate(assistant_message_id.as_deref())
-                            .await?;
-                        self.persist_gate_message(&prompt, "gate_recovery").await?;
-                        events.emit(StreamEvent::CompletionGateAction {
-                                    kind: "recovery".into(),
-                                    detail: evidence.blockers.join("; "),
-                                });
-                        messages.push(ChatMessage {
-                            role: "user".into(),
-                            content: MessageContent::Text(prompt),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                            reasoning_content: None,
-                        });
-                        continue;
-                    }
-                    CompletionFinalization::ReleaseWithWarning(warning) => {
-                        // The reply stands — no folding, no Error. Persist a
-                        // visible warning and fall through to the normal Done.
-                        self.persist_gate_message(&warning, "gate_warning").await?;
-                        events.emit(StreamEvent::CompletionGateAction {
-                                    kind: "warning".into(),
-                                    detail: warning.clone(),
-                                });
-                    }
-                    CompletionFinalization::Blocked(message) => {
-                        self.mark_rejected_candidate(assistant_message_id.as_deref())
-                            .await?;
-                        self.persist_gate_message(&message, "gate_blocked").await?;
-                        events.emit(StreamEvent::Error { message });
-                        emitted_terminal = true;
-                        break;
-                    }
-                    CompletionFinalization::Complete => {}
-                }
-                // Always emit a terminal Done so the frontend's `streaming`
-                // flag clears — even when the provider omitted usage on the
-                // final turn. Previously Done was gated behind `usage`, so a
-                // missing usage left the chat hung "running" forever.
-                let (done_in, done_out) = usage
-                    .as_ref()
-                    .map(|u| (u.prompt_tokens, u.completion_tokens))
-                    .unwrap_or((0, 0));
-                events.emit(StreamEvent::Done {
-                            input_tokens: done_in,
-                            output_tokens: done_out,
-                        });
-                emitted_terminal = true;
-                break;
-            }
-
-            let mut result_messages = Vec::new();
-            let mut progress_prompt = None;
-            let completion_evidence_before_tool_batch = completion_gate.evidence();
-
-            for (tool_index, tc) in tool_calls.iter().enumerate() {
-                if let Some(remaining) =
-                    cancelled_tool_suffix(cancel.as_ref(), &tool_calls, tool_index)
-                {
-                    return self
-                        .finish_cancelled_tool_batch(remaining)
-                        .await;
-                }
-                let args: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                let completion_args = args.clone();
-
-                // Extract bash command for finer-grained permission matching
-                let bash_cmd = if tc.function.name == "bash" {
-                    args.get("command")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                };
-
-                events.emit(StreamEvent::ToolCallStart {
-                            id: tc.id.clone(),
-                            name: tc.function.name.clone(),
-                            args: args.clone(),
-                        });
-
-                let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
-                let completion_evidence = completion_gate.evidence();
-                let denial_content = if let Some(content) = policy::autonomous_budget_denial(
-                    wall_budget,
-                    remaining,
-                    &completion_evidence,
-                    &tc.function.name,
-                    &args,
-                    &cwd,
-                ) {
-                    Some(content)
-                } else {
-                    match permission
-                        .authorize(tc, &args, bash_cmd.as_deref())
-                        .await
-                    {
-                        PermissionOutcome::Allow => None,
-                        PermissionOutcome::Deny(content) => Some(content),
-                        PermissionOutcome::Cancelled => {
-                            return self
-                                .finish_cancelled_tool_batch(&tool_calls[tool_index..])
-                                .await;
-                        }
-                    }
-                };
-
-                if let Some(content) = denial_content {
-                    self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
-                        .await?;
-                    events.emit(StreamEvent::ToolResult {
-                                tool_call_id: tc.id.clone(),
-                                content: content.clone(),
-                                is_error: true,
-                                status: "denied".into(),
-                            });
-                    result_messages.push(ChatMessage {
-                        role: "tool".into(),
-                        content: MessageContent::Text(content),
-                        tool_calls: None,
-                        tool_call_id: Some(tc.id.clone()),
-                        name: Some(tc.function.name.clone()),
-                        reasoning_content: None,
-                    });
-                    continue;
-                }
-
-                // Pre-tool hook: may cancel. Headless (no hooks) always allows.
-                let pre_allowed = hooks.pre_tool(&tc.function.name, &args).await;
-                if !pre_allowed {
-                    let content = "Tool call cancelled by hook.".to_string();
-                    self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
-                        .await?;
-                    events.emit(StreamEvent::ToolResult {
-                                tool_call_id: tc.id.clone(),
-                                content: content.clone(),
-                                is_error: true,
-                                status: "denied".into(),
-                            });
-                    result_messages.push(ChatMessage {
-                        role: "tool".into(),
-                        content: MessageContent::Text(content),
-                        tool_calls: None,
-                        tool_call_id: Some(tc.id.clone()),
-                        name: Some(tc.function.name.clone()),
-                        reasoning_content: None,
-                    });
-                    continue;
-                }
-
-                // Tool execution flows through the shared ToolBackend seam
-                // (keystone slice 4.3): the desktop backend builds the ExecCtx
-                // and runs MCP-first / native-dispatch. Timing stays in the loop
-                // so it covers the fatal-error path exactly as before. The backend
-                // is the run-scoped `tool_backend` hoisted above (slice 4.6b).
-                let tool_ctx = codefactory_agent_loop::tool::ToolCtx {
-                    working_directory: cwd.clone(),
-                    session_id: Some(audit_session_id.clone()),
-                    task_id: task_id.clone(),
-                    knowledge_library_ids: knowledge_library_ids.clone(),
-                    timeout_sec: None,
-                };
-
-                let tool_start = std::time::Instant::now();
-                let exec_result = tool_backend.execute(tc, &args, &tool_ctx).await;
-                let duration_ms = tool_start.elapsed().as_millis() as u64;
-                let output = match exec_result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let error_text = error.to_string();
-                        self.record_tool_call_outcome(
-                            tc,
-                            "error",
-                            None,
-                            Some(&error_text),
-                            duration_ms,
-                        )
-                        .await?;
-                        return Err(crate::errors::AppError::Other(error_text));
-                    }
-                };
-                self.record_tool_call_outcome(
-                    tc,
-                    if output.is_error { "error" } else { "done" },
-                    if output.is_error {
-                        None
-                    } else {
-                        Some(&output.content)
-                    },
-                    if output.is_error {
-                        Some(&output.content)
-                    } else {
-                        None
-                    },
-                    duration_ms,
-                )
-                .await?;
-
-                if let Some(prompt) = record_completion_outcome(
-                    &mut completion_gate,
-                    &mut progress_tracker,
-                    &mut completion_sequence,
-                    &cwd,
-                    &tc.function.name,
-                    &completion_args,
-                    &output.content,
-                    output.is_error,
-                ) {
-                    progress_prompt = Some(prompt);
-                }
-                // Post-tool hook (skipped headless — no hooks).
-                let post_result: String = output.content.chars().take(500).collect();
-                hooks
-                    .post_tool(&tc.function.name, &post_result, duration_ms)
-                    .await;
-
-                events.emit(StreamEvent::ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            content: output.content.clone(),
-                            is_error: output.is_error,
-                            status: if output.is_error {
-                                "error".into()
-                            } else {
-                                "done".into()
-                            },
-                        });
-
-                result_messages.push(ChatMessage {
-                    role: "tool".into(),
-                    content: MessageContent::Text(output.content),
-                    tool_calls: None,
-                    tool_call_id: Some(tc.id.clone()),
-                    name: Some(tc.function.name.clone()),
-                    reasoning_content: None,
-                });
-            }
-
-            completion_recovery_attempts = completion_recovery_attempts_after_tool_batch(
-                completion_recovery_attempts,
-                completion_evidence_made_progress(
-                    &completion_evidence_before_tool_batch,
-                    &completion_gate.evidence(),
-                ),
-            );
-
-            messages.push(ChatMessage {
-                role: "assistant".into(),
-                content: MessageContent::Text(text),
-                tool_calls: Some(tool_calls),
-                tool_call_id: None,
-                name: None,
-                reasoning_content: reasoning,
-            });
-            messages.extend(result_messages);
-            if let Some(prompt) = progress_prompt {
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: MessageContent::Text(prompt),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    reasoning_content: None,
-                });
-            }
-            let evidence = completion_gate.evidence();
-            if policy::completion_ready_applies(finalization)
-                && evidence.completed
-                && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
-            {
-                last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
-                finalization_pending = true;
-                self.persist_gate_message(build_completion_ready_prompt(), "gate_ready")
-                    .await?;
-                events.emit(StreamEvent::CompletionGateAction {
-                            kind: "ready".into(),
-                            detail: String::new(),
-                        });
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: MessageContent::Text(build_completion_ready_prompt().to_string()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    reasoning_content: None,
-                });
-            } else if wall_budget {
-                let remaining = max_iterations.saturating_sub(iteration + 1);
-                if should_prompt_budget_convergence(remaining as u32) {
-                    messages.push(ChatMessage {
-                        role: "user".into(),
-                        content: MessageContent::Text(build_budget_convergence_prompt(
-                            remaining as u32,
-                            &evidence,
-                        )),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        name: None,
-                        reasoning_content: None,
-                    });
-                }
-            }
-        }
-
-        // Safety net: close the stream when every round used tools, but preserve
-        // completion truth instead of converting an exhausted loop into success.
-        if !emitted_terminal {
-            let evidence = completion_gate.evidence();
-            tracing::warn!(
-                "agent loop hit the iteration ceiling ({}) without a terminal turn; completed={}",
-                max_iterations,
-                evidence.completed,
-            );
-            events.emit(policy::iteration_ceiling_terminal_event(&evidence, finalization));
-        }
-
+        let tool_backend = tool_backend::DesktopToolBackend {
+            #[cfg(not(test))]
+            app: self.app.clone(),
+            db: self.db.clone(),
+            mcp_manager: self.mcp_manager.clone(),
+            settings: self.settings.clone(),
+        };
+        let completion_instruction = latest_user_instruction(&history);
+        let fact_check_instruction = effective_fact_check_instruction(&history);
+        let messages = self.build_openai_messages(history, system_prompt);
+        let inputs = codefactory_agent_loop::run::LoopInputs {
+            messages,
+            system_prompt: system_prompt.to_string(),
+            tool_defs: tool_defs.to_vec(),
+            completion_instruction,
+            fact_check_instruction,
+            audit_session_id: self.audit_session_id(),
+            knowledge_library_ids: knowledge_scope_for_tools(self.execution_context.as_ref()),
+            cancel: self.cancel.clone(),
+        };
+        let config = codefactory_agent_loop::run::RunConfig {
+            finalization: finalization_policy(self.mode),
+            gate_benchmark: false,
+            progress_window: 8,
+            recovery_limit: recovery_limit_for(self.mode),
+            max_iterations: self.mode.max_iterations(),
+            wall_budget_applies: wall_budget_applies(self.mode),
+            session_id: self.session_id.clone(),
+            endpoint_name: self.endpoint_name.clone(),
+            model_id: self.model_id.clone(),
+            base_url: self.base_url.clone(),
+            usage_run_id: self.usage_run_id.clone(),
+            surface: self
+                .execution_context
+                .as_ref()
+                .map_or(UsageSurface::Interactive, |c| c.usage_surface)
+                .as_str()
+                .to_string(),
+            task_id: self.execution_context.as_ref().and_then(|c| c.task_id.clone()),
+            anonymous: self.anonymous,
+            is_chatgpt: self.api_style == ApiStyle::Chatgpt,
+            cwd: self.cwd.clone(),
+        };
+        let svc = codefactory_agent_loop::run::LoopServices {
+            transport: std::sync::Arc::new(self.model_transport()),
+            tools: std::sync::Arc::new(tool_backend),
+            persistence: std::sync::Arc::new(self.persistence()),
+            events: self.events.clone(),
+            budget: std::sync::Arc::new(codefactory_agent_loop::journal::NullBudget),
+            permission: std::sync::Arc::new(self.permission_gateway()),
+            hooks,
+            context_policy: std::sync::Arc::new(self.context_policy()),
+            fact_checker: std::sync::Arc::new(fact_checker::DesktopFactChecker { mode: self.mode }),
+        };
+        // The desktop discards the returned RunOutcome (Done already emitted via
+        // the sink); LoopError maps to AppError::Other verbatim (message-identical).
+        codefactory_agent_loop::run::run_agent_loop(inputs, config, svc).await?;
         Ok(())
     }
 

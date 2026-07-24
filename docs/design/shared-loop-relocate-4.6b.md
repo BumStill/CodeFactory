@@ -1,5 +1,16 @@
 # Slice 4.6b — relocate the loop body into `agent-loop::run_agent_loop`
 
+> **SHIPPED.** All 18 sub-steps landed. The openai loop body physically lives in
+> `agent-loop::run::run_agent_loop(inputs, config, svc) -> Result<RunOutcome,
+> LoopError>`; `AgentLoop::run_openai` is now an 83-line adapter that builds the
+> inputs/config/services (constructing the two `AppHandle` owners — `HookRunner`,
+> `DesktopToolBackend` — only there, #166) and discards the returned `RunOutcome`.
+> `cargo tree -p codefactory-agent-loop` links **no tauri**. Zero behaviour
+> change: 477 lib + 25 agent-loop + 132 agent-core tests green, incl. #135/#136,
+> cancellation, vision/overflow retries, and the usage-ordering source-text
+> acceptance tests (openai case repointed to `run.rs`). `run_anthropic` untouched
+> (slice 4.7); the sidecar wires onto `run_agent_loop` in a later slice.
+
 Design from workflow `wf_ddc87d7d` (4 mapper agents + 1 synthesis architect, max-effort).
 Physically lifts the desktop `AgentLoop::run_openai` body (~596 lines,
 `src-tauri/src/agent/mod.rs`) into a tauri-free

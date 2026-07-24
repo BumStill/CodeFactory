@@ -40,4 +40,15 @@ impl From<codefactory_agent_loop::transport::TransportError> for AppError {
     }
 }
 
+/// `run_agent_loop`'s `LoopError` crosses back to the desktop adapter as
+/// `AppError::Other` with the underlying message verbatim (keystone slice 4.6b):
+/// every `LoopError` arm's Display is the raw message (Transport/Persist/Tool),
+/// and `to_app_error` already mapped `PersistError` to `Other(message)`, so the
+/// adapter's `to_string()` is byte-identical to the old inline error.
+impl From<codefactory_agent_loop::run::LoopError> for AppError {
+    fn from(e: codefactory_agent_loop::run::LoopError) -> Self {
+        AppError::Other(e.to_string())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, AppError>;
