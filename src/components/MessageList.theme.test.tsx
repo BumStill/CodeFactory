@@ -8,8 +8,12 @@
 // inline code) don't sneak back in. Each test below corresponds to a real
 // visual bug we shipped in v0.5.1 and want to prevent regressing.
 
-import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, vi } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
+
+const convertFileSrcMock = vi.hoisted(() => vi.fn((path: string) => `asset://localhost/${encodeURIComponent(path)}`));
+vi.mock("@tauri-apps/api/core", () => ({ convertFileSrc: convertFileSrcMock }));
+
 import { MessageList } from "./MessageList";
 import type { UIMessage } from "../stores/chatEvents";
 
@@ -100,6 +104,32 @@ describe("MessageList theme readability", () => {
     expect(container.querySelector("th")?.textContent).toBe("A");
   });
 
+  it("renders grouped successful tools without full-width divider lines", () => {
+    const { container } = render(
+      <MessageList
+        messages={[
+          baseMsg({
+            role: "assistant",
+            content: "",
+            toolCalls: [
+              { id: "t1", name: "read_file", args: JSON.stringify({ path: "a.ts" }), result: "ok", status: "done", isError: false },
+              { id: "t2", name: "read_file", args: JSON.stringify({ path: "b.ts" }), result: "ok", status: "done", isError: false },
+              { id: "t3", name: "bash", args: JSON.stringify({ command: "git status" }), result: "ok", status: "done", isError: false },
+            ],
+          }),
+        ]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+    const group = screen.getByRole("button", { name: /查看 3 个已完成操作/ }).parentElement;
+    const classes = group?.className.split(/\s+/) ?? [];
+    expect(classes).not.toContain("border-b");
+    expect(group?.className).toMatch(/rounded/);
+    expect(group?.className).toMatch(/border-border\/30/);
+    expect(container.querySelector("[data-tool-group='success']"), "expected a low-emphasis success group").toBeTruthy();
+  });
+
   it("renders markdown image links as visible image previews", () => {
     const { container } = render(
       <MessageList
@@ -110,8 +140,23 @@ describe("MessageList theme readability", () => {
     );
     const image = container.querySelector("img[alt='image.png']");
     expect(image, "expected markdown image to render as <img>").toBeTruthy();
-    expect(image).toHaveAttribute("src", "file:///proj/.codefactory/attachments/image.png");
+    expect(convertFileSrcMock).toHaveBeenCalledWith("/proj/.codefactory/attachments/image.png");
+    expect(image).toHaveAttribute("src", "asset://localhost/%2Fproj%2F.codefactory%2Fattachments%2Fimage.png");
     expect(image?.className).toMatch(/max-h-80/);
+  });
+
+  it("shows a visible fallback if an attached image preview fails to load", () => {
+    render(
+      <MessageList
+        messages={[baseMsg({ content: "![broken.png](file:///proj/.codefactory/attachments/broken.png)" })]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+    const image = screen.getByRole("img", { name: "broken.png" });
+    fireEvent.error(image);
+    expect(screen.getByText("图片预览失败")).toBeInTheDocument();
+    expect(screen.getByText("broken.png")).toBeInTheDocument();
   });
 
 });

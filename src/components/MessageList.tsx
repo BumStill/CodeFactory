@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { UrlTransform } from "react-markdown";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
@@ -102,6 +103,39 @@ const allowedLocalImageUrl: UrlTransform = (value, key, node): string => {
   return defaultUrlTransform(value);
 };
 
+function previewImageSrc(src: string | undefined): string {
+  if (!src) return "";
+  if (src.startsWith("file://")) return convertFileSrc(src.slice("file://".length));
+  if (/^\/|^[A-Za-z]:[\\/]/.test(src)) return convertFileSrc(src);
+  return src;
+}
+
+function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
+  const [failed, setFailed] = useState(false);
+  const label = alt || "图片附件";
+  const previewSrc = previewImageSrc(src);
+  if (failed) {
+    return (
+      <span className="my-2 inline-flex max-w-full items-center gap-2 rounded-lg border border-dashed border-border/70 bg-surface-2 px-3 py-2 text-xs text-gray-500 align-top">
+        <span className="font-medium text-gray-400">图片预览失败</span>
+        <span className="max-w-[220px] truncate font-mono text-[11px]">{label}</span>
+      </span>
+    );
+  }
+  return (
+    <span className="my-2 inline-block max-w-full align-top">
+      <img
+        src={previewSrc}
+        alt={label}
+        className="max-h-80 max-w-full rounded-lg border border-border bg-surface-2 object-contain"
+        loading="lazy"
+        onError={() => setFailed(true)}
+      />
+      {alt && <span className="mt-1 block text-[10px] text-gray-500">{alt}</span>}
+    </span>
+  );
+}
+
 // ── Rich markdown component overrides ────────────────────────────────────────
 const markdownComponents: Components = {
   code({ className, children, ...props }) {
@@ -155,17 +189,7 @@ const markdownComponents: Components = {
   td: ({ children }) => (
     <td className="border border-border px-2 py-1 text-gray-300">{children}</td>
   ),
-  img: ({ src, alt }) => (
-    <span className="my-2 inline-block max-w-full align-top">
-      <img
-        src={src ?? ""}
-        alt={alt ?? "图片附件"}
-        className="max-h-80 max-w-full rounded-lg border border-border bg-surface-2 object-contain"
-        loading="lazy"
-      />
-      {alt && <span className="mt-1 block text-[10px] text-gray-500">{alt}</span>}
-    </span>
-  ),
+  img: ({ src, alt }) => <MarkdownImage src={src} alt={alt} />,
   a: ({ children, href }) => (
     <a href={href} target="_blank" rel="noreferrer" className="text-accent hover:underline">
       {children}
@@ -254,7 +278,7 @@ export function MessageList({ messages, streaming, cwd, onUsePrompt, onOpenUsage
 function SuccessfulToolGroup({ tools }: { tools: NonNullable<UIMessage["toolCalls"]> }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="my-0.5 border-b border-border/60">
+    <div data-tool-group="success" className="my-1 rounded-lg border border-border/30 bg-surface-1/35 px-1 py-0.5">
       <button
         type="button"
         aria-label={`${open ? "收起" : "查看"} ${tools.length} 个已完成操作`}
