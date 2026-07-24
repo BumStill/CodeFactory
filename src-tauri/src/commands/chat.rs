@@ -89,6 +89,68 @@ pub async fn cancel_chat(session_id: String, state: State<'_, AppState>) -> Resu
 }
 
 #[tauri::command]
+pub async fn is_chat_running(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<bool, AppError> {
+    Ok(state.chat_cancels.lock().await.contains_key(&session_id))
+}
+
+async fn clear_chat_running_if_current(
+    chat_cancels: &crate::ChatCancelMap,
+    session_id: &str,
+    completed_flag: &Arc<AtomicBool>,
+) {
+    let mut flags = chat_cancels.lock().await;
+    if flags
+        .get(session_id)
+        .is_some_and(|current| Arc::ptr_eq(current, completed_flag))
+    {
+        flags.remove(session_id);
+    }
+}
+
+struct ChatRunningSetupGuard {
+    chat_cancels: crate::ChatCancelMap,
+    session_id: String,
+    flag: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl ChatRunningSetupGuard {
+    fn new(
+        chat_cancels: crate::ChatCancelMap,
+        session_id: String,
+        flag: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            chat_cancels,
+            session_id,
+            flag,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ChatRunningSetupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let chat_cancels = self.chat_cancels.clone();
+        let session_id = self.session_id.clone();
+        let flag = self.flag.clone();
+        tokio::spawn(async move {
+            clear_chat_running_if_current(&chat_cancels, &session_id, &flag).await;
+        });
+    }
+}
+
+#[tauri::command]
 pub async fn send_message(
     app: AppHandle,
     session_id: String,
@@ -105,6 +167,11 @@ pub async fn send_message(
         .lock()
         .await
         .insert(session_id.clone(), cancel_flag.clone());
+    let mut running_setup_guard = ChatRunningSetupGuard::new(
+        state.chat_cancels.clone(),
+        session_id.clone(),
+        cancel_flag.clone(),
+    );
 
     let settings = state.settings.read().await.clone();
 
@@ -324,6 +391,8 @@ pub async fn send_message(
     let app_clone = app.clone();
     let event_name = format!("stream:{}", session_id);
     let session_id_clone = session_id.clone();
+    let chat_cancels = state.chat_cancels.clone();
+    let tracked_cancel_flag = cancel_flag.clone();
     tokio::spawn(async move {
         let db_for_error = db.clone();
         let session_for_error = session_id_clone.clone();
@@ -384,7 +453,14 @@ pub async fn send_message(
                 )
                 .ok();
         }
+        clear_chat_running_if_current(
+            &chat_cancels,
+            &session_for_error,
+            &tracked_cancel_flag,
+        )
+        .await;
     });
+    running_setup_guard.disarm();
 
     Ok(())
 }
@@ -443,6 +519,11 @@ pub async fn send_message_anonymous(
         .lock()
         .await
         .insert(session_id.clone(), cancel_flag.clone());
+    let mut running_setup_guard = ChatRunningSetupGuard::new(
+        state.chat_cancels.clone(),
+        session_id.clone(),
+        cancel_flag.clone(),
+    );
 
     let settings = state.settings.read().await.clone();
 
@@ -498,7 +579,10 @@ pub async fn send_message_anonymous(
     let app_clone = app.clone();
     let event_name = format!("stream:{}", session_id);
     let session_id_clone = session_id.clone();
+    let chat_cancels = state.chat_cancels.clone();
+    let tracked_cancel_flag = cancel_flag.clone();
     tokio::spawn(async move {
+        let completed_session_id = session_id_clone.clone();
         // `.anonymous()` disables every DB write + cost record in the loop.
         let mut agent = AgentLoop::new(
             app,
@@ -528,7 +612,14 @@ pub async fn send_message_anonymous(
                 )
                 .ok();
         }
+        clear_chat_running_if_current(
+            &chat_cancels,
+            &completed_session_id,
+            &tracked_cancel_flag,
+        )
+        .await;
     });
+    running_setup_guard.disarm();
 
     Ok(())
 }
@@ -545,6 +636,70 @@ fn select_chat_mode(
 mod tests {
     use super::*;
     use crate::config::settings::ApiStyle;
+
+    #[tokio::test]
+    async fn completed_chat_only_clears_its_own_running_flag() {
+        let flags: crate::ChatCancelMap =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let completed = Arc::new(AtomicBool::new(false));
+        let replacement = Arc::new(AtomicBool::new(false));
+        flags
+            .lock()
+            .await
+            .insert("session".into(), replacement.clone());
+
+        clear_chat_running_if_current(&flags, "session", &completed).await;
+        assert!(Arc::ptr_eq(
+            flags.lock().await.get("session").unwrap(),
+            &replacement,
+        ));
+
+        clear_chat_running_if_current(&flags, "session", &replacement).await;
+        assert!(!flags.lock().await.contains_key("session"));
+    }
+
+    #[tokio::test]
+    async fn failed_setup_guard_clears_only_the_flag_it_registered() {
+        let flags: crate::ChatCancelMap =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let failed_setup = Arc::new(AtomicBool::new(false));
+        flags
+            .lock()
+            .await
+            .insert("failed".into(), failed_setup.clone());
+
+        {
+            let _guard =
+                ChatRunningSetupGuard::new(flags.clone(), "failed".into(), failed_setup);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while flags.lock().await.contains_key("failed") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("setup cleanup should remove the failed run");
+
+        let stale_setup = Arc::new(AtomicBool::new(false));
+        let replacement = Arc::new(AtomicBool::new(false));
+        flags
+            .lock()
+            .await
+            .insert("replaced".into(), stale_setup.clone());
+        {
+            let _guard =
+                ChatRunningSetupGuard::new(flags.clone(), "replaced".into(), stale_setup);
+            flags
+                .lock()
+                .await
+                .insert("replaced".into(), replacement.clone());
+        }
+        tokio::task::yield_now().await;
+        assert!(Arc::ptr_eq(
+            flags.lock().await.get("replaced").unwrap(),
+            &replacement,
+        ));
+    }
 
     #[test]
     fn chatgpt_endpoint_never_looks_up_an_endpoint_api_key() {

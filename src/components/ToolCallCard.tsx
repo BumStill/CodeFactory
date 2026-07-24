@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useState } from "react";
+import { memo, useMemo, useState } from "react";
 import {
   ChevronDown, ChevronRight,
   AlertCircle, Ban, CheckCircle, ShieldQuestion,
@@ -171,12 +171,36 @@ function isTestPathFromArgs(toolName: string, raw: string): boolean {
 /** First non-empty line of a tool result, capped for the collapsed-card
  *  error summary. */
 function firstNonEmptyLine(raw: string): string {
-  const line = raw
-    .split("\n")
-    .map((l) => l.trim())
-    .find((l) => l.length > 0);
-  const text = line ?? "";
-  return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+  let cursor = 0;
+  while (cursor < raw.length) {
+    const code = raw.charCodeAt(cursor);
+    if (code === 10) {
+      cursor += 1;
+      continue;
+    }
+    if (code === 13 || code === 32 || code === 9) {
+      cursor += 1;
+      continue;
+    }
+
+    // Inspect at most the visible summary plus one character. `split`/`trim`
+    // would allocate proportional to a multi-megabyte failed tool result even
+    // while its card is collapsed.
+    const probeEnd = Math.min(raw.length, cursor + 201);
+    const newline = raw.indexOf("\n", cursor);
+    const lineEnd =
+      newline >= 0 && newline < probeEnd ? newline : probeEnd;
+    let visibleEnd = Math.min(lineEnd, cursor + 200);
+    while (visibleEnd > cursor) {
+      const trailing = raw.charCodeAt(visibleEnd - 1);
+      if (trailing !== 13 && trailing !== 32 && trailing !== 9) break;
+      visibleEnd -= 1;
+    }
+    const truncated = lineEnd > cursor + 200 ||
+      (newline < 0 && raw.length > cursor + 200);
+    return `${raw.slice(cursor, visibleEnd)}${truncated ? "…" : ""}`;
+  }
+  return "";
 }
 
 function basename(path: string | undefined): string {
@@ -286,15 +310,21 @@ function KnowledgeSourcesList({ sources }: { sources: KnowledgeSource[] }) {
   );
 }
 
-export function ToolCallCard({ tc }: Props) {
+export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
   const [open, setOpen] = useState(false);
-  const parsedDiff = tc.result == null ? null : parseUnifiedDiffResult(tc.result);
+  const parsedDiff = useMemo(
+    () => (open && tc.result != null ? parseUnifiedDiffResult(tc.result) : null),
+    [open, tc.result],
+  );
   const hasDiff = (parsedDiff?.files.length ?? 0) > 0;
 
   const { icon: Icon, iconClass } = styleForTool(tc.name);
   const summary = summarizeArgs(tc.name, tc.args ?? "");
   const isTestMod = isTestPathFromArgs(tc.name, tc.args ?? "");
-  const knowledgeSources = parseKnowledgeSources(tc.name, tc.result);
+  const knowledgeSources = useMemo(
+    () => (open ? parseKnowledgeSources(tc.name, tc.result) : []),
+    [open, tc.name, tc.result],
+  );
   const cwd = useChatStore((s) => s.activeSession?.cwd);
   const filePath = generatedFilePath(tc);
 
@@ -385,7 +415,7 @@ export function ToolCallCard({ tc }: Props) {
               {knowledgeSources.length > 0 && !tc.isError ? (
                 <KnowledgeSourcesList sources={knowledgeSources} />
               ) : hasDiff ? (
-                <DiffViewer output={tc.result} />
+                <DiffViewer output={tc.result} parsed={parsedDiff ?? undefined} />
               ) : (
                 <pre className={`whitespace-pre-wrap break-all ${tc.isError ? "text-red-700 dark:text-red-300" : "text-gray-300"}`}>
                   {tc.result.slice(0, 2000)}
@@ -398,7 +428,7 @@ export function ToolCallCard({ tc }: Props) {
       )}
     </div>
   );
-}
+});
 
 function formatArgs(raw: string): string {
   try {

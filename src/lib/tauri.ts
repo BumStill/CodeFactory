@@ -88,6 +88,13 @@ export interface Message {
   created_at: number;
 }
 
+export interface MessagePage {
+  messages: Message[];
+  has_more: boolean;
+  next_before_rowid?: number | null;
+  truncated?: boolean;
+}
+
 export interface ModelInfo {
   id: string;
   name: string;

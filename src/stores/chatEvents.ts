@@ -101,6 +101,28 @@ export interface ChatEventState {
   compressionToast: CompressionToast | null;
 }
 
+function findMessageById(messages: UIMessage[], msgId: string): UIMessage | undefined {
+  const tail = messages[messages.length - 1];
+  if (tail?.id === msgId) return tail;
+  return messages.find((message) => message.id === msgId);
+}
+
+function updateMessageById(
+  messages: UIMessage[],
+  msgId: string,
+  update: (message: UIMessage) => UIMessage,
+): UIMessage[] {
+  const tailIndex = messages.length - 1;
+  const index =
+    tailIndex >= 0 && messages[tailIndex].id === msgId
+      ? tailIndex
+      : messages.findIndex((message) => message.id === msgId);
+  if (index < 0) return messages;
+  const next = messages.slice();
+  next[index] = update(messages[index]);
+  return next;
+}
+
 export function reduceChatStreamEvent(
   state: ChatEventState,
   event: StreamEvent,
@@ -110,8 +132,7 @@ export function reduceChatStreamEvent(
     case "text_delta":
       return {
         ...state,
-        messages: state.messages.map((m) => {
-          if (m.id !== msgId) return m;
+        messages: updateMessageById(state.messages, msgId, (m) => {
           if (m.internalReviewState === "recovery") {
             return {
               ...m,
@@ -136,48 +157,43 @@ export function reduceChatStreamEvent(
       };
 
     case "tool_call_start":
-      if (state.messages.some((m) => m.id === msgId && m.internalReviewState === "recovery")) {
+      if (findMessageById(state.messages, msgId)?.internalReviewState === "recovery") {
         return {
           ...state,
-          messages: state.messages.map((m) =>
-            m.id === msgId
+          messages: updateMessageById(state.messages, msgId, (m) => ({
+            ...m,
+            internalReviewDraft: "",
+            reviewProgress: m.reviewProgress
               ? {
-                  ...m,
-                  internalReviewDraft: "",
-                  reviewProgress: m.reviewProgress
-                    ? {
-                        ...m.reviewProgress,
-                        currentStep: "正在运行验证或修复步骤",
-                        updatedAt: Date.now(),
-                      }
-                    : m.reviewProgress,
+                  ...m.reviewProgress,
+                  currentStep: "正在运行验证或修复步骤",
+                  updatedAt: Date.now(),
                 }
-              : m,
-          ),
+              : m.reviewProgress,
+          })),
         };
       }
       return {
         ...state,
-        messages: upsertToolCall(state.messages, msgId, {
-          id: event.id,
-          name: event.name,
-          args: formatToolArgs(event.args),
-          status: "running",
-        }).map((m) => {
-          if (m.id !== msgId) return m;
-          const segments = m.segments ?? [];
+        messages: updateMessageById(state.messages, msgId, (m) => {
+          const withTool = upsertToolCallOnMessage(m, {
+            id: event.id,
+            name: event.name,
+            args: formatToolArgs(event.args),
+            status: "running",
+          });
+          const segments = withTool.segments ?? [];
           // Re-announced ids (permission flow) must not duplicate the segment.
           if (segments.some((s) => s.kind === "tool" && s.toolCallId === event.id)) {
-            return m;
+            return withTool;
           }
-          return { ...m, segments: [...segments, { kind: "tool", toolCallId: event.id }] };
+          return { ...withTool, segments: [...segments, { kind: "tool", toolCallId: event.id }] };
         }),
       };
 
     case "permission_request": {
-      const internalRecovery = state.messages.some(
-        (m) => m.id === msgId && m.internalReviewState === "recovery",
-      );
+      const internalRecovery =
+        findMessageById(state.messages, msgId)?.internalReviewState === "recovery";
       return {
         ...state,
         pendingPermission: {
@@ -186,8 +202,8 @@ export function reduceChatStreamEvent(
           args: event.args,
         },
         messages: internalRecovery
-          ? state.messages.map((m) =>
-              m.id === msgId && m.reviewProgress
+          ? updateMessageById(state.messages, msgId, (m) =>
+              m.reviewProgress
                 ? {
                     ...m,
                     reviewProgress: {
@@ -215,8 +231,7 @@ export function reduceChatStreamEvent(
           state.pendingPermission?.toolCallId === event.tool_call_id
             ? null
             : state.pendingPermission,
-        messages: state.messages.map((m) => {
-          if (m.id !== msgId) return m;
+        messages: updateMessageById(state.messages, msgId, (m) => {
           if (m.internalReviewState === "recovery" && m.reviewProgress) {
             return {
               ...m,
@@ -251,8 +266,8 @@ export function reduceChatStreamEvent(
         streaming: false,
         inputTokenTotal: state.inputTokenTotal + event.input_tokens,
         outputTokenTotal: state.outputTokenTotal + event.output_tokens,
-        messages: state.messages.map((m) =>
-          m.id === msgId && m.durationMs == null
+        messages: updateMessageById(state.messages, msgId, (m) =>
+          m.durationMs == null
             ? {
                 ...m,
                 reviewProgress: undefined,
@@ -269,8 +284,7 @@ export function reduceChatStreamEvent(
         ...state,
         streaming: false,
         pendingPermission: null,
-        messages: state.messages.map((m) => {
-          if (m.id !== msgId) return m;
+        messages: updateMessageById(state.messages, msgId, (m) => {
           if (m.internalReviewState) {
             const content = "本次处理未能完成，请重试。";
             return {
@@ -325,23 +339,19 @@ export function reduceChatStreamEvent(
     case "transport_retry":
       return {
         ...state,
-        messages: state.messages.map((m) =>
-          m.id === msgId
-            ? {
-                ...m,
-                transportRetries: [
-                  ...(m.transportRetries ?? []),
-                  {
-                    label: event.label,
-                    attempt: event.attempt,
-                    maxAttempts: event.max_attempts,
-                    delayMs: event.delay_ms,
-                    reason: event.reason,
-                  },
-                ],
-              }
-            : m,
-        ),
+        messages: updateMessageById(state.messages, msgId, (m) => ({
+          ...m,
+          transportRetries: [
+            ...(m.transportRetries ?? []),
+            {
+              label: event.label,
+              attempt: event.attempt,
+              maxAttempts: event.max_attempts,
+              delayMs: event.delay_ms,
+              reason: event.reason,
+            },
+          ],
+        })),
       };
 
     case "completion_gate_action":
@@ -352,8 +362,7 @@ export function reduceChatStreamEvent(
       if (event.kind === "recovery" || event.kind === "ready") {
         return {
           ...state,
-          messages: state.messages.map((m) => {
-            if (m.id !== msgId) return m;
+          messages: updateMessageById(state.messages, msgId, (m) => {
             const attempt =
               event.kind === "recovery"
                 ? Math.min((m.reviewProgress?.attempt ?? 0) + 1, 3)
@@ -387,8 +396,7 @@ export function reduceChatStreamEvent(
       if (event.kind === "warning") {
         return {
           ...state,
-          messages: state.messages.map((m) => {
-            if (m.id !== msgId) return m;
+          messages: updateMessageById(state.messages, msgId, (m) => {
             const finalText =
               m.internalReviewState === "recovery"
                 ? (m.internalReviewDraft ?? "")
@@ -411,17 +419,13 @@ export function reduceChatStreamEvent(
       if (event.kind === "turn_notice") {
         return {
           ...state,
-          messages: state.messages.map((m) =>
-            m.id === msgId
-              ? {
-                  ...m,
-                  gateActions: [
-                    ...(m.gateActions ?? []),
-                    { kind: "turn_notice", detail: event.detail },
-                  ],
-                }
-              : m,
-          ),
+          messages: updateMessageById(state.messages, msgId, (m) => ({
+            ...m,
+            gateActions: [
+              ...(m.gateActions ?? []),
+              { kind: "turn_notice", detail: event.detail },
+            ],
+          })),
         };
       }
       return state;
@@ -464,17 +468,23 @@ function upsertToolCall(
   msgId: string,
   toolCall: ToolCallState,
 ): UIMessage[] {
-  return messages.map((m) => {
-    if (m.id !== msgId) return m;
-    const existing = m.toolCalls ?? [];
-    const found = existing.some((tc) => tc.id === toolCall.id);
-    return {
-      ...m,
-      toolCalls: found
-        ? existing.map((tc) => (tc.id === toolCall.id ? { ...tc, ...toolCall } : tc))
-        : [...existing, toolCall],
-    };
-  });
+  return updateMessageById(messages, msgId, (message) =>
+    upsertToolCallOnMessage(message, toolCall),
+  );
+}
+
+function upsertToolCallOnMessage(
+  message: UIMessage,
+  toolCall: ToolCallState,
+): UIMessage {
+  const existing = message.toolCalls ?? [];
+  const found = existing.some((tc) => tc.id === toolCall.id);
+  return {
+    ...message,
+    toolCalls: found
+      ? existing.map((tc) => (tc.id === toolCall.id ? { ...tc, ...toolCall } : tc))
+      : [...existing, toolCall],
+  };
 }
 
 export function formatToolArgs(args: unknown): string {
