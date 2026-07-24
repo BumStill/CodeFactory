@@ -828,76 +828,47 @@ impl AgentLoop {
         Ok(receipt)
     }
 
-    async fn record_usage_event_for_round(&self, usage: &Usage, iteration: usize) {
-        if self.anonymous || (usage.prompt_tokens == 0 && usage.completion_tokens == 0) {
-            return;
-        }
-        let surface = self
-            .execution_context
-            .as_ref()
-            .map_or(UsageSurface::Interactive, |context| context.usage_surface)
-            .as_str();
-        let local_endpoint = {
-            let base = self.base_url.to_ascii_lowercase();
-            base.contains("127.0.0.1")
-                || base.contains("localhost")
-                || base.contains("0.0.0.0")
-                || base.starts_with("http://[::1]")
-        };
-        let (provider, actual_cost_usd, cost_source) = if self.api_style == ApiStyle::Chatgpt {
-            ("chatgpt".to_string(), None, "subscription".to_string())
-        } else if local_endpoint {
-            (self.endpoint_name.clone(), None, "local".to_string())
-        } else if let Some(cost) = usage
-            .cost
-            .filter(|value| value.is_finite() && *value >= 0.0)
-        {
-            let provider = if self.base_url.contains("openrouter.ai") {
-                "openrouter".to_string()
-            } else {
-                self.endpoint_name.clone()
-            };
-            (provider, Some(cost), "provider_actual".to_string())
-        } else {
-            (self.endpoint_name.clone(), None, "unknown".to_string())
-        };
-        let row = codefactory_agent_loop::journal::UsageRow {
-            request_id: self.usage_request_id(iteration),
-            session_id: &self.session_id,
+    /// Per-run identity for the shared usage recorder. Pre-derives the surface
+    /// (`&str`) and `is_chatgpt` bool so `ApiStyle`/`UsageSurface` never cross
+    /// into agent-loop (keystone slice 4.6b).
+    fn usage_identity(&self) -> codefactory_agent_loop::run::UsageIdentity {
+        codefactory_agent_loop::run::UsageIdentity {
+            session_id: self.session_id.clone(),
+            endpoint_name: self.endpoint_name.clone(),
+            model_id: self.model_id.clone(),
+            base_url: self.base_url.clone(),
+            usage_run_id: self.usage_run_id.clone(),
+            surface: self
+                .execution_context
+                .as_ref()
+                .map_or(UsageSurface::Interactive, |context| context.usage_surface)
+                .as_str()
+                .to_string(),
             task_id: self
                 .execution_context
                 .as_ref()
                 .and_then(|context| context.task_id.clone()),
-            surface,
-            provider,
-            endpoint: &self.endpoint_name,
-            model: &self.model_id,
-            input_tokens: usage.prompt_tokens as i64,
-            output_tokens: usage.completion_tokens as i64,
-            reasoning_tokens: usage
-                .completion_tokens_details
-                .as_ref()
-                .map_or(0, |details| details.reasoning_tokens as i64),
-            cached_tokens: usage
-                .prompt_tokens_details
-                .as_ref()
-                .map_or(0, |details| details.cached_tokens as i64),
-            actual_cost_usd,
-            cost_source,
-        };
-        // Persist through the Persistence seam; the desktop cost-UI refresh
-        // (model-usage-recorded / token-usage-recorded, now inside
-        // TauriEventSink::usage_recorded) fires ONLY on a newly-written row —
-        // keystone slice 4.6 usage seam, no raw AppHandle in the loop.
-        match self.persistence().record_usage(row).await {
-            Ok(true) => self.events.usage_recorded(&self.session_id),
-            Ok(false) => {}
-            Err(error) => tracing::warn!("failed to record request usage: {error}"),
+            anonymous: self.anonymous,
+            is_chatgpt: self.api_style == ApiStyle::Chatgpt,
         }
     }
 
+    async fn record_usage_event_for_round(&self, usage: &Usage, iteration: usize) {
+        // Delegates to the shared recorder (keystone slice 4.6b); run_anthropic
+        // still calls this method, and the openai loop keeps the call-site symbol
+        // (`record_usage_event…`) that the usage-ordering source-text tests grep.
+        codefactory_agent_loop::run::record_usage_event_for_round(
+            &self.persistence(),
+            self.events.as_ref(),
+            &self.usage_identity(),
+            usage,
+            iteration,
+        )
+        .await;
+    }
+
     fn usage_request_id(&self, iteration: usize) -> String {
-        format!("{}:{iteration}", self.usage_run_id)
+        codefactory_agent_loop::run::usage_request_id(&self.usage_run_id, iteration)
     }
 
     /// Mark this loop as an anonymous/ephemeral run: disables ALL DB
@@ -1019,6 +990,27 @@ impl AgentLoop {
         tool_defs: &[ToolDefinition],
         system_prompt: &str,
     ) -> Result<()> {
+        // Seam handles bound once and reused for the whole run (keystone slice
+        // 4.6b): behaviour-identical to per-call construction — each concrete
+        // seam re-reads live Settings/db inside its own methods. In the shared
+        // loop these arrive as `svc` trait objects; here they wrap the desktop
+        // builders. The `hooks`/`tool_backend` handles (which own an AppHandle)
+        // are still built further down, inside this dead-stripped fn (#166).
+        let events = self.events.clone();
+        let transport = self.model_transport();
+        let context_policy = self.context_policy();
+        let permission = self.permission_gateway();
+        // Built ONCE per run (keystone slice 4.6b): it holds only cloned handles,
+        // no per-tool-call state, so hoisting out of the tool loop is
+        // behaviour-preserving. Owns an `AppHandle` (`#[cfg(not(test))] app`), so
+        // it is constructed only here in the dead-stripped fn (#166).
+        let tool_backend = tool_backend::DesktopToolBackend {
+            #[cfg(not(test))]
+            app: self.app.clone(),
+            db: self.db.clone(),
+            mcp_manager: self.mcp_manager.clone(),
+            settings: self.settings.clone(),
+        };
         let completion_instruction = latest_user_instruction(&history);
         let fact_check_instruction = effective_fact_check_instruction(&history);
         let mut messages = self.build_openai_messages(history, system_prompt);
@@ -1026,7 +1018,7 @@ impl AgentLoop {
         // when the model is KNOWN text-only, instead of burning a 400 round
         // trip every turn. The reactive strip-and-retry stays as the net for
         // unknown models and wrong guesses.
-        if !self.context_policy().supports_vision().await {
+        if !context_policy.supports_vision().await {
             let stripped = strip_image_parts(&mut messages);
             if stripped > 0 {
                 let notice = format!(
@@ -1085,7 +1077,7 @@ impl AgentLoop {
             // half. Notify the UI so the user knows what happened.
             let estimated = context::estimate_prompt_tokens(&messages, system_prompt);
             let (context_limit, max_context_limit) =
-                self.context_policy().context_window(estimated).await;
+                context_policy.context_window(estimated).await;
             let compression = context::compress_if_needed(
                 std::mem::take(&mut messages),
                 system_prompt,
@@ -1096,7 +1088,7 @@ impl AgentLoop {
             // the last possible boundary before every model request.
             messages = repair_openai_tool_protocol(compression.messages);
             if compression.compressed {
-                self.events.emit(StreamEvent::ContextCompressed {
+                events.emit(StreamEvent::ContextCompressed {
                             elided_count: compression.elided_count,
                             tokens_freed: compression.tokens_freed,
                         });
@@ -1111,10 +1103,9 @@ impl AgentLoop {
             // value.
             let round_options = RoundOptions {
                 require_tool: required_tool_response,
-                reasoning_effort: self.context_policy().round_reasoning_effort().await,
+                reasoning_effort: context_policy.round_reasoning_effort().await,
             };
-            let call_result = self
-                .model_transport()
+            let call_result = transport
                 .complete(&messages, active_tool_defs, &round_options)
                 .await;
             let ModelResponse {
@@ -1150,11 +1141,11 @@ impl AgentLoop {
                         compression.elided_count, compression.tokens_freed
                     );
                     self.persist_gate_message(&notice, "turn_notice").await?;
-                    self.events.emit(StreamEvent::CompletionGateAction {
+                    events.emit(StreamEvent::CompletionGateAction {
                                 kind: "turn_notice".into(),
                                 detail: notice.clone(),
                             });
-                    self.model_transport()
+                    transport
                         .complete(&messages, active_tool_defs, &round_options)
                         .await?
                 }
@@ -1168,11 +1159,11 @@ impl AgentLoop {
 如需图片理解,请切换回支持图片的模型。"
                     );
                     self.persist_gate_message(&notice, "turn_notice").await?;
-                    self.events.emit(StreamEvent::CompletionGateAction {
+                    events.emit(StreamEvent::CompletionGateAction {
                                 kind: "turn_notice".into(),
                                 detail: notice.clone(),
                             });
-                    self.model_transport()
+                    transport
                         .complete(&messages, active_tool_defs, &round_options)
                         .await?
                 }
@@ -1199,7 +1190,7 @@ impl AgentLoop {
             // round-trip so the UI bar tracks actual usage, not just our
             // estimate. The estimate is only used to *trigger* compression.
             if let Some(u) = &usage {
-                self.events.emit(StreamEvent::ContextUsage {
+                events.emit(StreamEvent::ContextUsage {
                             used_tokens: u.prompt_tokens,
                             limit_tokens: context_limit,
                             max_limit_tokens: max_context_limit,
@@ -1247,7 +1238,7 @@ impl AgentLoop {
                     {
                         fact_check_used = true;
                         self.persist_gate_message(&correction, "turn_notice").await?;
-                        self.events.emit(StreamEvent::CompletionGateAction {
+                        events.emit(StreamEvent::CompletionGateAction {
                                     kind: "turn_notice".into(),
                                     detail: correction.clone(),
                                 });
@@ -1273,7 +1264,7 @@ impl AgentLoop {
                         self.mark_rejected_candidate(assistant_message_id.as_deref())
                             .await?;
                         self.persist_gate_message(&prompt, "gate_recovery").await?;
-                        self.events.emit(StreamEvent::CompletionGateAction {
+                        events.emit(StreamEvent::CompletionGateAction {
                                     kind: "recovery".into(),
                                     detail: evidence.blockers.join("; "),
                                 });
@@ -1291,7 +1282,7 @@ impl AgentLoop {
                         // The reply stands — no folding, no Error. Persist a
                         // visible warning and fall through to the normal Done.
                         self.persist_gate_message(&warning, "gate_warning").await?;
-                        self.events.emit(StreamEvent::CompletionGateAction {
+                        events.emit(StreamEvent::CompletionGateAction {
                                     kind: "warning".into(),
                                     detail: warning.clone(),
                                 });
@@ -1300,7 +1291,7 @@ impl AgentLoop {
                         self.mark_rejected_candidate(assistant_message_id.as_deref())
                             .await?;
                         self.persist_gate_message(&message, "gate_blocked").await?;
-                        self.events.emit(StreamEvent::Error { message });
+                        events.emit(StreamEvent::Error { message });
                         emitted_terminal = true;
                         break;
                     }
@@ -1314,7 +1305,7 @@ impl AgentLoop {
                     .as_ref()
                     .map(|u| (u.prompt_tokens, u.completion_tokens))
                     .unwrap_or((0, 0));
-                self.events.emit(StreamEvent::Done {
+                events.emit(StreamEvent::Done {
                             input_tokens: done_in,
                             output_tokens: done_out,
                         });
@@ -1347,7 +1338,7 @@ impl AgentLoop {
                     None
                 };
 
-                self.events.emit(StreamEvent::ToolCallStart {
+                events.emit(StreamEvent::ToolCallStart {
                             id: tc.id.clone(),
                             name: tc.function.name.clone(),
                             args: args.clone(),
@@ -1365,8 +1356,7 @@ impl AgentLoop {
                 ) {
                     Some(content)
                 } else {
-                    match self
-                        .permission_gateway()
+                    match permission
                         .authorize(tc, &args, bash_cmd.as_deref())
                         .await
                     {
@@ -1383,7 +1373,7 @@ impl AgentLoop {
                 if let Some(content) = denial_content {
                     self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
                         .await?;
-                    self.events.emit(StreamEvent::ToolResult {
+                    events.emit(StreamEvent::ToolResult {
                                 tool_call_id: tc.id.clone(),
                                 content: content.clone(),
                                 is_error: true,
@@ -1406,7 +1396,7 @@ impl AgentLoop {
                     let content = "Tool call cancelled by hook.".to_string();
                     self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
                         .await?;
-                    self.events.emit(StreamEvent::ToolResult {
+                    events.emit(StreamEvent::ToolResult {
                                 tool_call_id: tc.id.clone(),
                                 content: content.clone(),
                                 is_error: true,
@@ -1423,17 +1413,11 @@ impl AgentLoop {
                     continue;
                 }
 
-                // Tool execution now flows through the shared ToolBackend seam
+                // Tool execution flows through the shared ToolBackend seam
                 // (keystone slice 4.3): the desktop backend builds the ExecCtx
                 // and runs MCP-first / native-dispatch. Timing stays in the loop
-                // so it covers the fatal-error path exactly as before.
-                let tool_backend = tool_backend::DesktopToolBackend {
-                    #[cfg(not(test))]
-                    app: self.app.clone(),
-                    db: self.db.clone(),
-                    mcp_manager: self.mcp_manager.clone(),
-                    settings: self.settings.clone(),
-                };
+                // so it covers the fatal-error path exactly as before. The backend
+                // is the run-scoped `tool_backend` hoisted above (slice 4.6b).
                 let tool_ctx = codefactory_agent_loop::tool::ToolCtx {
                     working_directory: self.cwd.clone(),
                     session_id: Some(self.audit_session_id()),
@@ -1451,10 +1435,7 @@ impl AgentLoop {
                 let exec_result = tool_backend.execute(tc, &args, &tool_ctx).await;
                 let duration_ms = tool_start.elapsed().as_millis() as u64;
                 let output = match exec_result {
-                    Ok(result) => tools::ToolOutput {
-                        content: result.content,
-                        is_error: result.is_error,
-                    },
+                    Ok(result) => result,
                     Err(error) => {
                         let error_text = error.to_string();
                         self.record_tool_call_outcome(
@@ -1503,7 +1484,7 @@ impl AgentLoop {
                     .post_tool(&tc.function.name, &post_result, duration_ms)
                     .await;
 
-                self.events.emit(StreamEvent::ToolResult {
+                events.emit(StreamEvent::ToolResult {
                             tool_call_id: tc.id.clone(),
                             content: output.content.clone(),
                             is_error: output.is_error,
@@ -1560,7 +1541,7 @@ impl AgentLoop {
                 finalization_pending = true;
                 self.persist_gate_message(build_completion_ready_prompt(), "gate_ready")
                     .await?;
-                self.events.emit(StreamEvent::CompletionGateAction {
+                events.emit(StreamEvent::CompletionGateAction {
                             kind: "ready".into(),
                             detail: String::new(),
                         });
@@ -1599,7 +1580,7 @@ impl AgentLoop {
                 self.mode.max_iterations(),
                 evidence.completed,
             );
-            self.events.emit(iteration_ceiling_terminal_event(&evidence, self.mode));
+            events.emit(iteration_ceiling_terminal_event(&evidence, self.mode));
         }
 
         Ok(())

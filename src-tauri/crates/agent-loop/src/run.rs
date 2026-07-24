@@ -16,10 +16,11 @@ use std::sync::Arc;
 
 use codefactory_agent_core::CompletionEvidence;
 
-use crate::journal::PersistError;
+use crate::events::EventSink;
+use crate::journal::{Persistence, PersistError, UsageRow};
 use crate::tool::ToolError;
 use crate::transport::TransportError;
-use crate::types::ToolCall;
+use crate::types::{ToolCall, Usage};
 
 /// The suffix of `tool_calls` from `start` onward when the run is cancelled,
 /// else `None`. The load is `SeqCst` — cooperative cancellation depends on it,
@@ -33,6 +34,101 @@ pub fn cancelled_tool_suffix<'a>(
     cancel
         .is_some_and(|flag| flag.load(Ordering::SeqCst))
         .then(|| &tool_calls[start..])
+}
+
+/// Whether the run's shared cancel flag is set (`SeqCst`). Cooperative
+/// cancellation depends on the ordering + the flag being the SAME `Arc` shared
+/// with the transport and permission gateway.
+pub fn is_cancelled(cancel: Option<&Arc<AtomicBool>>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::SeqCst))
+}
+
+/// The stable request id for a round's usage row: `"{usage_run_id}:{iteration}"`.
+/// ONE formula source ties the assistant-message row and the usage row so the
+/// INSERT-OR-IGNORE idempotency (retry/resume) keys identically.
+pub fn usage_request_id(usage_run_id: &str, iteration: usize) -> String {
+    format!("{usage_run_id}:{iteration}")
+}
+
+/// The per-run identity a usage row needs, pre-derived by the surface so the
+/// shared usage recorder carries no bin types (`ApiStyle`/`UsageSurface` stay in
+/// the bin — `is_chatgpt`/`surface` arrive as a bool/String).
+#[derive(Debug, Clone)]
+pub struct UsageIdentity {
+    pub session_id: String,
+    pub endpoint_name: String,
+    pub model_id: String,
+    pub base_url: String,
+    pub usage_run_id: String,
+    pub surface: String,
+    pub task_id: Option<String>,
+    pub anonymous: bool,
+    pub is_chatgpt: bool,
+}
+
+/// Assemble + persist one round's usage row, and fire the cost-UI ping ONLY on a
+/// newly-written row. Anonymous runs and (0,0)-token rounds are skipped BEFORE
+/// assembly. Cost/provider derivation: ChatGPT → subscription, local endpoint →
+/// local, a finite provider cost → provider_actual, else unknown. Moved out of
+/// the bin loop (keystone slice 4.6b) so both the desktop method and the shared
+/// loop share ONE implementation.
+pub async fn record_usage_event_for_round(
+    persistence: &dyn Persistence,
+    events: &dyn EventSink,
+    identity: &UsageIdentity,
+    usage: &Usage,
+    iteration: usize,
+) {
+    if identity.anonymous || (usage.prompt_tokens == 0 && usage.completion_tokens == 0) {
+        return;
+    }
+    let local_endpoint = {
+        let base = identity.base_url.to_ascii_lowercase();
+        base.contains("127.0.0.1")
+            || base.contains("localhost")
+            || base.contains("0.0.0.0")
+            || base.starts_with("http://[::1]")
+    };
+    let (provider, actual_cost_usd, cost_source) = if identity.is_chatgpt {
+        ("chatgpt".to_string(), None, "subscription".to_string())
+    } else if local_endpoint {
+        (identity.endpoint_name.clone(), None, "local".to_string())
+    } else if let Some(cost) = usage.cost.filter(|value| value.is_finite() && *value >= 0.0) {
+        let provider = if identity.base_url.contains("openrouter.ai") {
+            "openrouter".to_string()
+        } else {
+            identity.endpoint_name.clone()
+        };
+        (provider, Some(cost), "provider_actual".to_string())
+    } else {
+        (identity.endpoint_name.clone(), None, "unknown".to_string())
+    };
+    let row = UsageRow {
+        request_id: usage_request_id(&identity.usage_run_id, iteration),
+        session_id: &identity.session_id,
+        task_id: identity.task_id.clone(),
+        surface: &identity.surface,
+        provider,
+        endpoint: &identity.endpoint_name,
+        model: &identity.model_id,
+        input_tokens: usage.prompt_tokens as i64,
+        output_tokens: usage.completion_tokens as i64,
+        reasoning_tokens: usage
+            .completion_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.reasoning_tokens as i64),
+        cached_tokens: usage
+            .prompt_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens as i64),
+        actual_cost_usd,
+        cost_source,
+    };
+    match persistence.record_usage(row).await {
+        Ok(true) => events.usage_recorded(&identity.session_id),
+        Ok(false) => {}
+        Err(error) => tracing::warn!("failed to record request usage: {error}"),
+    }
 }
 
 /// The error `run_agent_loop` returns (keystone slice 4.6). Every arm's
