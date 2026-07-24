@@ -14,6 +14,18 @@ NOT byte-safe. Fallback: if step 8's byte-verification is shaky, stop after
 step 7 (the loop stays in `mod.rs` but drives entirely through the new seams —
 still tauri-free-ready, zero behaviour change; relocate later).
 
+> **Decision (shipped): the step-7 fallback was taken deliberately.** 4.6 ships
+> as sub-steps 1–7 — the loop now drives entirely through all eight capability
+> seams (transport/tools/persistence/events/budget/permissions/hooks/context),
+> zero behaviour change, tauri-free-**ready**. A scan of the residual `run_openai`
+> body showed the "physical move" is much larger than a `~40-line adapter`: 7+
+> AgentLoop inherent methods (`record_tool_call_outcome`, `persist_gate_message`,
+> `mark_rejected_candidate`, `emit_cancelled_done`, `usage_request_id`,
+> `build_openai_messages`, `audit_session_id`) plus `self.app`/`self.mcp_manager`/
+> `self.execution_context` are still bin-coupled and must be seam-routed FIRST.
+> That relocate becomes its own follow-up slice **4.6b** (see sub-step 8), not
+> rushed at the tail of this one.
+
 ## Target shape
 ```rust
 // agent-loop/src/run.rs
@@ -103,8 +115,10 @@ the two `*-usage-recorded` events, only on `Persistence::record_usage` Ok(true))
   underlying verbatim; run_agent_loop returns it in step 8). Anthropic transport
   untouched (4.7). Retargeted the openai usage-acceptance response marker to
   `} = match call_result`. 476 lib + 19 agent-loop tests green.
-- **8 ⏳** the FINAL relocate: move the residual body into `run_agent_loop`.
-  Verify locally with
+- **8 ⏳ → deferred to slice 4.6b** the FINAL relocate: move the residual body
+  into `run_agent_loop`. Deliberately split out (see the Decision note above) —
+  needs the 7+ residual inherent methods seam-routed first. 4.6 SHIPS at
+  sub-step 7. Verify locally with
   `cargo test --lib -- --skip gh_cli_remote_reads_real_ci_status` (that one smoke
   needs HEAD pushed). One PR + one release when the branch is complete (or the
   step-7 fallback).
@@ -134,10 +148,13 @@ the two `*-usage-recorded` events, only on `Persistence::record_usage` Ok(true))
    introduce `LoopError`. Keep the overflow/vision arms mutating `messages` and
    grepping `e.to_string()` (TransportError Display is verbatim). `From<TransportError>
    for AppError` bridges the error back (Other, message verbatim).
-8. **FINAL relocate** — move the residual body (996-1627) into `run_agent_loop`;
-   reduce `AgentLoop::run_openai` to a ~40-line adapter; graduate agent-loop `tokio`
-   from dev-dep to real dep. Verify full suite + bin + smoke, then cut ONE
-   validation release.
+8. ⏭️ **FINAL relocate → slice 4.6b** — move the residual body into `run_agent_loop`;
+   reduce `AgentLoop::run_openai` to an adapter; graduate agent-loop `tokio` from
+   dev-dep to real dep. Deferred (Decision note): the residual body still couples
+   to 7+ inherent methods (`record_tool_call_outcome`, `persist_gate_message`,
+   `mark_rejected_candidate`, `emit_cancelled_done`, `usage_request_id`,
+   `build_openai_messages`, `audit_session_id`) + `self.app` — each must be
+   seam-routed before the move is byte-safe. Its own PR + validation release.
 
 ## Byte-identical invariants (must not regress)
 - Transport error greps stay correct because `TransportError::Display` is verbatim.
