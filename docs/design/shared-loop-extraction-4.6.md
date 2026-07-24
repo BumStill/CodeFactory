@@ -58,6 +58,21 @@ Plus: `EventSink::usage_recorded(session_id)` defaulted no-op (TauriEventSink em
 the two `*-usage-recorded` events, only on `Persistence::record_usage` Ok(true));
 `Persistence::record_tool_call_started` (absorbs a stray raw-pool write).
 
+## Progress (branch `claude/keystone-slice46-shared-loop`, pushed)
+- **1 ✅** (ebc801f) mode-policy → `agent-loop::policy`, re-parameterized by
+  `FinalizationPolicy`; thin `AgentMode` wrappers in mod.rs; #135/#136 gate tests
+  byte-identical; 4 new policy tests.
+- **2 ✅** (84a6a51) usage seam: `EventSink::usage_recorded` (TauriEventSink emits
+  the 2 cost events) + `record_usage_event_for_round` through `Persistence::record_usage`.
+- **3 ✅** (1a08902) `Persistence::record_tool_call_started` absorbs the last raw
+  `self.db` write in the loops.
+- **4–8 ⏳** the large phase: ContextPolicy / LifecycleHooks / PermissionGateway
+  (new capability traits + desktop impls), transport→`complete()`, and the
+  651-line physical relocate. Verify locally with
+  `cargo test --lib -- --skip gh_cli_remote_reads_real_ci_status` (that one smoke
+  needs HEAD pushed). One PR + one release when the branch is complete (or the
+  step-7 fallback).
+
 ## The 8 sub-steps (one branch; verify each with the full suite; physical move last)
 1. **Mode-policy move.** Move the 9 pure fns (`completion_finalization`,
    `active_tool_definitions`, `openai_tool_controls`, recovery-limit/attempts,
