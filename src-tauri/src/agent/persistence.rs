@@ -96,13 +96,22 @@ impl Persistence for SqlitePersistence {
         if self.anonymous {
             return Ok(());
         }
+        // Runtime notices are internal provenance, not new user intent. Gate
+        // recovery/ready prompts remain user-shaped because they reconstruct
+        // the control messages the provider saw; turn notices are explicitly
+        // excluded from replay and must not masquerade as user-authored rows.
+        let role = if state == "turn_notice" {
+            "system"
+        } else {
+            "user"
+        };
         sqlx::query(
             "INSERT INTO messages (id, session_id, role, content, completion_state, created_at) \
              VALUES (?,?,?,?,?,?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(&self.session_id)
-        .bind("user")
+        .bind(role)
         .bind(content)
         .bind(state)
         .bind(Utc::now().timestamp_millis())
@@ -280,6 +289,27 @@ mod tests {
         .unwrap();
         assert_eq!(content, "recover: verify then finish"); // RAW, not redacted
         assert_eq!(state, "gate_recovery");
+    }
+
+    #[tokio::test]
+    async fn turn_notice_is_persisted_as_internal_system_provenance() {
+        let db = pool().await;
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: false,
+        };
+        p.persist_gate_message("runtime correction", "turn_notice")
+            .await
+            .unwrap();
+        let (role, state): (String, String) = sqlx::query_as(
+            "SELECT role, completion_state FROM messages WHERE session_id='s1'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(role, "system");
+        assert_eq!(state, "turn_notice");
     }
 
     #[tokio::test]

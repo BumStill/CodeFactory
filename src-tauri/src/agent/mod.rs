@@ -1011,12 +1011,8 @@ impl AgentLoop {
         tool_defs: &[ToolDefinition],
         system_prompt: &str,
     ) -> Result<()> {
-        let completion_instruction = history
-            .iter()
-            .rev()
-            .find(|message| message.role == "user")
-            .map(|message| message.content.clone())
-            .unwrap_or_default();
+        let completion_instruction = latest_user_instruction(&history);
+        let fact_check_instruction = effective_fact_check_instruction(&history);
         let mut messages = self.build_openai_messages(history, system_prompt);
         // Proactive capability match: strip images BEFORE the first request
         // when the model is KNOWN text-only, instead of burning a 400 round
@@ -1244,7 +1240,9 @@ impl AgentLoop {
                 // missing / waiting on a checkable condition) gets ONE live
                 // probe-backed correction — facts over stale memory.
                 if !fact_check_used {
-                    if let Some(correction) = fact_check_reply(&text) {
+                    if let Some(correction) =
+                        fact_check_reply(&text, &fact_check_instruction, self.mode)
+                    {
                         fact_check_used = true;
                         self.persist_gate_message(&correction, "turn_notice").await?;
                         self.events.emit(StreamEvent::CompletionGateAction {
@@ -1821,10 +1819,10 @@ impl AgentLoop {
             .map_err(persistence::to_app_error)
     }
 
-    /// Persist an injected completion-gate instruction as a user-role turn so
-    /// rebuilt provider history matches what the model actually saw in this
-    /// run, tagged via `completion_state` ("gate_recovery" | "gate_ready") so
-    /// the UI renders it as a system notice instead of a user bubble.
+    /// Persist completion-gate controls with explicit provenance. Recovery and
+    /// ready prompts remain provider-shaped user rows; `turn_notice` rows are
+    /// stored as system messages because they are runtime observations, not a
+    /// new user objective. Every row stays tagged via `completion_state`.
     async fn persist_gate_message(&self, content: &str, state: &str) -> Result<()> {
         self.persistence()
             .persist_gate_message(content, state)
@@ -2064,12 +2062,8 @@ impl AgentLoop {
         tool_defs: &[ToolDefinition],
         system_prompt: &str,
     ) -> Result<()> {
-        let completion_instruction = history
-            .iter()
-            .rev()
-            .find(|message| message.role == "user")
-            .map(|message| message.content.clone())
-            .unwrap_or_default();
+        let completion_instruction = latest_user_instruction(&history);
+        let fact_check_instruction = effective_fact_check_instruction(&history);
         let mut messages = self.build_anthropic_messages(history);
         // Proactive capability match — see the OpenAI loop for rationale.
         if !self.context_policy().supports_vision().await {
@@ -2286,7 +2280,9 @@ impl AgentLoop {
             if tool_calls.is_empty() {
                 // Systemic fact-check — see the OpenAI loop for rationale.
                 if !fact_check_used {
-                    if let Some(correction) = fact_check_reply(&text) {
+                    if let Some(correction) =
+                        fact_check_reply(&text, &fact_check_instruction, self.mode)
+                    {
                         fact_check_used = true;
                         self.persist_gate_message(&correction, "turn_notice").await?;
                         self.events.emit(StreamEvent::CompletionGateAction {
@@ -2803,6 +2799,51 @@ fn replayable_history(history: Vec<Message>) -> Vec<Message> {
         .collect()
 }
 
+/// The active objective comes only from a real user-authored row. Older
+/// releases persisted internal `turn_notice` controls with role=user; ignore
+/// every completion-state row so those legacy notices cannot become the next
+/// turn's completion instruction even before a database migration or reload.
+fn latest_user_instruction(history: &[Message]) -> String {
+    history
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && message.completion_state.is_none())
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
+}
+
+/// Fact checking follows the effective objective, not just the latest row.
+/// A short approval ("做吧", "继续", "go ahead") inherits the immediately
+/// preceding assistant proposal, matching the same dispatch semantics that
+/// moved the turn into Execute mode. Internal completion-state rows never
+/// participate in that inheritance.
+fn effective_fact_check_instruction(history: &[Message]) -> String {
+    let Some((user_index, user_message)) = history
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| message.role == "user" && message.completion_state.is_none())
+    else {
+        return String::new();
+    };
+
+    if !dispatch::is_approval(&user_message.content) {
+        return user_message.content.clone();
+    }
+
+    let previous_proposal = history[..user_index]
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant" && message.completion_state.is_none())
+        .map(|message| message.content.trim())
+        .filter(|content| !content.is_empty());
+
+    match previous_proposal {
+        Some(proposal) => format!("{proposal}\n\n用户批准：{}", user_message.content),
+        None => user_message.content.clone(),
+    }
+}
+
 /// Transient provider saturation worth a backoff retry instead of a dead
 /// turn. Distinct from capacity (context) and capability (vision) errors.
 fn is_provider_overloaded(error: &str) -> bool {
@@ -2832,11 +2873,121 @@ const SELF_RECOVERY_CONTRACT: &str = "\
    (auth completed, file created, CI finished, config saved), poll for it with\n\
    tools — never end the turn with \"完成后回复继续\" for a checkable condition.\n";
 
+/// Candidate assertion units for fact checking.
+///
+/// Fact checks must never combine unrelated words from separate paragraphs,
+/// quoted material, or fenced examples into a new claim. A field failure on
+/// 2026-07-24 did exactly that: "请检查模型配置" near the top of a product
+/// analysis plus "GitHub token 不可用" in a later Agent example was read as
+/// "please configure a GitHub token", hijacking the answer into delivery.
+fn strip_inline_non_assertive_spans(line: &str) -> String {
+    let mut stripped = String::with_capacity(line.len());
+    let mut quote_end = None;
+    let chars = line.chars().collect::<Vec<_>>();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if let Some(end) = quote_end {
+            if ch == end {
+                quote_end = None;
+            }
+            continue;
+        }
+        quote_end = match ch {
+            '`' => Some('`'),
+            '"' => Some('"'),
+            '\'' if (index == 0 || !chars[index - 1].is_alphanumeric())
+                && chars[index + 1..].contains(&'\'') =>
+            {
+                Some('\'')
+            }
+            '“' => Some('”'),
+            '‘' => Some('’'),
+            '「' => Some('」'),
+            '『' => Some('』'),
+            '《' => Some('》'),
+            _ => {
+                stripped.push(ch);
+                None
+            }
+        };
+    }
+    stripped
+}
+
+fn fact_claim_units(text: &str) -> Vec<String> {
+    let mut units = Vec::new();
+    let mut in_fenced_code = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fenced_code = !in_fenced_code;
+            continue;
+        }
+        if in_fenced_code
+            || trimmed.is_empty()
+            || trimmed.starts_with('>')
+            || (trimmed.starts_with('|') && trimmed.ends_with('|'))
+        {
+            continue;
+        }
+        let assertive = strip_inline_non_assertive_spans(trimmed);
+        units.extend(
+            assertive
+                .split(|ch| matches!(ch, '。' | '！' | '？' | '!' | '?' | '；' | ';'))
+                .map(str::trim)
+                .filter(|unit| !unit.is_empty())
+                .map(str::to_string),
+        );
+    }
+    units
+}
+
+/// User intent keeps quoted UI labels and inline tool names because they may
+/// be the action itself ("点击“创建 PR”", "调用 `deliver_changes`"). Candidate
+/// fact parsing strips those spans instead, since a reply may merely quote an
+/// error. Fenced examples and blockquotes remain excluded on both paths.
+fn intent_units(text: &str) -> Vec<String> {
+    let mut units = Vec::new();
+    let mut in_fenced_code = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fenced_code = !in_fenced_code;
+            continue;
+        }
+        if in_fenced_code || trimmed.is_empty() || trimmed.starts_with('>') {
+            continue;
+        }
+        units.extend(
+            trimmed
+                .split(|ch| matches!(ch, '。' | '！' | '？' | '!' | '?' | '；' | ';'))
+                .map(str::trim)
+                .filter(|unit| !unit.is_empty())
+                .map(str::to_string),
+        );
+    }
+    units
+}
+
+fn is_example_or_hypothesis(unit: &str) -> bool {
+    let lower = unit.to_lowercase();
+    [
+        "示例",
+        "例如",
+        "比如",
+        "假设",
+        "方案示意",
+        "example",
+        "for example",
+        "e.g.",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 /// Does this reply claim the delivery channel is unusable (cannot open a
-/// PR / needs gh auth login / needs a token)? Narrow: successful-delivery
-/// reports are exempt.
+/// PR / needs gh auth login / needs a token)? Each match must be local to one
+/// assertion unit; successful-delivery reports and examples are exempt.
 fn claims_delivery_blocked(text: &str) -> bool {
-    let lower = text.to_lowercase();
     let success_markers = [
         "已创建",
         "已通过 gh",
@@ -2844,17 +2995,29 @@ fn claims_delivery_blocked(text: &str) -> bool {
         "验证成功",
         "pr created",
     ];
-    if success_markers.iter().any(|m| lower.contains(&m.to_lowercase())) {
-        return false;
-    }
     let inability = ["无法", "不能", "cannot", "can't", "unable"];
     let channel = ["创建 pr", "开 pr", "create the pr", "create a pr", "自动创建 pr"];
-    let inability_hit = inability.iter().any(|w| lower.contains(w))
-        && channel.iter().any(|w| lower.contains(w));
-    let setup_demand = (lower.contains("gh auth login")
-        || (lower.contains("token") && (lower.contains("配置") || lower.contains("configure"))))
-        && (lower.contains("请") || lower.contains("please") || lower.contains("完成认证"));
-    inability_hit || setup_demand
+    fact_claim_units(text).into_iter().any(|unit| {
+        if is_example_or_hypothesis(&unit) {
+            return false;
+        }
+        let lower = unit.to_lowercase();
+        if success_markers
+            .iter()
+            .any(|marker| lower.contains(&marker.to_lowercase()))
+        {
+            return false;
+        }
+        let inability_hit = inability.iter().any(|word| lower.contains(word))
+            && channel.iter().any(|word| lower.contains(word));
+        let setup_demand = (lower.contains("gh auth login")
+            || (lower.contains("token")
+                && (lower.contains("配置") || lower.contains("configure"))))
+            && (lower.contains("请")
+                || lower.contains("please")
+                || lower.contains("完成认证"));
+        inability_hit || setup_demand
+    })
 }
 
 /// Does this reply claim a specific command/CLI is missing? Returns the
@@ -2915,17 +3078,145 @@ fn claims_wait_for_user_on_checkable(text: &str) -> bool {
     wait_markers.iter().any(|m| lower.contains(&m.to_lowercase()))
 }
 
-/// Fact-check a tool-call-free reply against live probes. Text detectors run
-/// first; probes run ONLY on a match, so ordinary turns pay nothing. Returns
-/// the correction to inject, or None when no verified-false claim is found.
-fn fact_check_reply(text: &str) -> Option<String> {
-    if claims_delivery_blocked(text) && delivery::gh_cli_available() {
-        return Some(
-            "事实纠偏:你刚声称交付通道不可用/需要配置,但本机 GitHub CLI 已登录且刚刚实测可用。\
+fn instruction_requests_delivery(instruction: &str) -> bool {
+    let request_markers = [
+        "请",
+        "立即",
+        "现在",
+        "继续",
+        "直接",
+        "帮我",
+        "开始",
+        "完成",
+        "然后",
+        "并",
+        "please",
+        "go ahead",
+        "continue",
+        "then",
+    ];
+    let delivery_actions = [
+        "deliver_changes",
+        "提交并推送",
+        "提交改动",
+        "提交这些",
+        "推送分支",
+        "推送改动",
+        "创建 pr",
+        "开 pr",
+        "开个 pr",
+        "合并 pr",
+        "发版",
+        "发布版本",
+        "完成交付",
+        "继续交付",
+        "交付改动",
+        "交付当前",
+        "commit and push",
+        "push the branch",
+        "push these changes",
+        "create a pr",
+        "open a pr",
+        "open the pr",
+        "merge the pr",
+        "ship the changes",
+    ];
+    let analysis_markers = [
+        "分析",
+        "解释",
+        "为什么",
+        "是什么",
+        "是否",
+        "怎么",
+        "如何",
+        "评估",
+        "review",
+        "explain",
+        "why",
+        "how",
+    ];
+    let execution_bridges = [
+        "立即",
+        "直接",
+        "然后",
+        "再",
+        "接着",
+        "完成后",
+        "分析并提交",
+        "检查并提交",
+        "修改并提交",
+        "go ahead",
+        "then",
+    ];
+
+    intent_units(instruction).into_iter().any(|unit| {
+        if is_example_or_hypothesis(&unit) {
+            return false;
+        }
+        let lower = unit.to_lowercase();
+        let asks_analysis = analysis_markers
+            .iter()
+            .any(|marker| lower.contains(marker));
+        if asks_analysis
+            && !execution_bridges
+                .iter()
+                .any(|bridge| lower.contains(bridge))
+        {
+            return false;
+        }
+        delivery_actions
+            .iter()
+            .any(|action| lower.contains(action))
+            && request_markers
+                .iter()
+                .any(|marker| lower.contains(marker))
+    })
+}
+
+fn delivery_fact_check_applies(mode: AgentMode, instruction: &str) -> bool {
+    !matches!(mode, AgentMode::Interactive) && instruction_requests_delivery(instruction)
+}
+
+fn delivery_fact_check_correction(
+    text: &str,
+    completion_instruction: &str,
+    mode: AgentMode,
+    gh_cli_available: bool,
+) -> Option<String> {
+    if !delivery_fact_check_applies(mode, completion_instruction)
+        || !claims_delivery_blocked(text)
+        || !gh_cli_available
+    {
+        return None;
+    }
+    Some(
+        "事实纠偏:你刚声称交付通道不可用/需要配置,但本机 GitHub CLI 已登录且刚刚实测可用。\
 这是基于过期上下文的错误判断。立即调用 deliver_changes 完成交付并报告其真实结果;\
 不要再要求用户配置任何令牌或运行 gh auth login。"
-                .to_string(),
-        );
+            .to_string(),
+    )
+}
+
+/// Fact-check a tool-call-free reply against live probes. Text detectors run
+/// only for execution turns; an interactive analysis must finish as an answer,
+/// never as a hidden correction loop. Probes run ONLY on a text match, so
+/// ordinary execution turns pay nothing. Delivery corrections additionally
+/// require a user instruction that explicitly asks for delivery.
+fn fact_check_reply(
+    text: &str,
+    completion_instruction: &str,
+    mode: AgentMode,
+) -> Option<String> {
+    if matches!(mode, AgentMode::Interactive) {
+        return None;
+    }
+    if let Some(correction) = delivery_fact_check_correction(
+        text,
+        completion_instruction,
+        mode,
+        delivery::gh_cli_available(),
+    ) {
+        return Some(correction);
     }
     if let Some(cmd) = claims_command_missing(text) {
         if command_exists(&cmd) {
@@ -4132,6 +4423,52 @@ mod tests {
         assert_eq!(filtered[1].content, "hello");
     }
 
+    #[test]
+    fn latest_user_instruction_ignores_legacy_user_role_turn_notices() {
+        let real_user = stored_message(
+            "user",
+            "仔细分析待执行入口，不要扩展成无关的交付任务。",
+            None,
+        );
+        let mut legacy_notice = stored_message(
+            "user",
+            "事实纠偏：立即调用 deliver_changes 完成交付。",
+            None,
+        );
+        legacy_notice.completion_state = Some("turn_notice".into());
+
+        assert_eq!(
+            latest_user_instruction(&[real_user, legacy_notice]),
+            "仔细分析待执行入口，不要扩展成无关的交付任务。"
+        );
+    }
+
+    #[test]
+    fn fact_check_instruction_inherits_an_approved_delivery_proposal() {
+        let proposal = stored_message(
+            "assistant",
+            "方案已经准备好：提交并推送当前改动，然后创建 PR。是否开始实施？",
+            None,
+        );
+        let approval = stored_message("user", "做吧", None);
+        let inherited = effective_fact_check_instruction(&[proposal, approval]);
+
+        assert!(instruction_requests_delivery(&inherited), "{inherited}");
+    }
+
+    #[test]
+    fn fact_check_instruction_does_not_invent_delivery_for_plain_continuation() {
+        let analysis = stored_message(
+            "assistant",
+            "待执行入口应该只在用户有可操作事项时出现。",
+            None,
+        );
+        let continuation = stored_message("user", "继续", None);
+        let inherited = effective_fact_check_instruction(&[analysis, continuation]);
+
+        assert!(!instruction_requests_delivery(&inherited), "{inherited}");
+    }
+
     fn stored_message(role: &str, content: &str, tool_calls: Option<String>) -> Message {
         Message {
             id: Uuid::new_v4().to_string(),
@@ -4744,6 +5081,12 @@ mod tests {
             "PR #166 已创建,GitHub CLI 认证验证成功",
             "已通过 gh 触发发布工作流",
             "交付结果: delivered",
+            "任务已委派，若长时间未开始请检查模型配置。\n\nAgent B：检查发布流程\n原因：GitHub token 不可用",
+            "产品方案示例：无法创建 PR，请在设置中配置 GitHub token。",
+            "界面现在展示错误文案：“无法创建 PR，请在设置中配置 GitHub token”。",
+            "文案应为 `无法创建 PR，请在设置中配置 GitHub token`。",
+            "界面展示 '无法创建 PR，请在设置中配置 GitHub token' 作为错误文案。",
+            "| 场景 | 示例文案 |\n| --- | --- |\n| 未认证 | 无法创建 PR，请在设置中配置 GitHub token |",
         ] {
             assert!(!claims_delivery_blocked(text), "{text}");
         }
@@ -4782,10 +5125,93 @@ mod tests {
     #[test]
     fn fact_check_reply_corrects_only_verified_false_claims() {
         if command_exists("docker") {
-            let correction = fact_check_reply("docker 未安装,无法启用沙箱");
+            let correction = fact_check_reply(
+                "docker 未安装,无法启用沙箱",
+                "请运行 Docker 构建并修复失败。",
+                AgentMode::Execute,
+            );
             assert!(correction.is_some_and(|c| c.contains("docker")));
         }
-        assert!(fact_check_reply("一切正常,任务完成。").is_none());
+        assert!(
+            fact_check_reply(
+                "一切正常,任务完成。",
+                "请完成当前修改。",
+                AgentMode::Execute,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn fact_check_cannot_redirect_an_interactive_analysis_turn() {
+        let blocked_claim =
+            "无法创建 PR：请在设置中配置 GitHub token，然后我才能继续。";
+        for analysis_instruction in [
+            "仔细分析一下待执行入口，我觉得应该做成后台任务结果或子 agent 展示。",
+            "请分析提交并推送流程是否合理，不要实际执行。",
+            "如何设计创建 PR 和发布版本的状态展示？",
+        ] {
+            assert!(
+                fact_check_reply(
+                    blocked_claim,
+                    analysis_instruction,
+                    AgentMode::Interactive,
+                )
+                .is_none(),
+                "{analysis_instruction}"
+            );
+        }
+        for unrelated_candidate in [
+            "方案示例：docker 未安装时应展示环境错误。",
+            "认证完成后回复继续，我再介绍后续产品流程。",
+        ] {
+            assert!(
+                fact_check_reply(
+                    unrelated_candidate,
+                    "请分析待执行状态的产品表达。",
+                    AgentMode::Interactive,
+                )
+                .is_none(),
+                "{unrelated_candidate}"
+            );
+        }
+
+        if delivery::gh_cli_available() {
+            for delivery_instruction in [
+                "请提交并推送当前改动，然后创建 PR。",
+                "请分析失败原因，然后提交改动并创建 PR。",
+            ] {
+                assert!(
+                    fact_check_reply(
+                        blocked_claim,
+                        delivery_instruction,
+                        AgentMode::Execute,
+                    )
+                    .is_some_and(|correction| correction.contains("deliver_changes")),
+                    "{delivery_instruction}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_fact_check_positive_path_is_deterministic_without_local_gh() {
+        for delivery_instruction in [
+            "请提交并推送当前改动，然后创建 PR。",
+            "请点击“创建 PR”并继续。",
+            "请调用 `deliver_changes` 完成交付。",
+        ] {
+            let correction = delivery_fact_check_correction(
+                "无法创建 PR：请在设置中配置 GitHub token，然后我才能继续。",
+                delivery_instruction,
+                AgentMode::Execute,
+                true,
+            );
+            assert!(
+                correction.is_some_and(|text| text.contains("deliver_changes")),
+                "{delivery_instruction}"
+            );
+        }
     }
 
     #[test]
