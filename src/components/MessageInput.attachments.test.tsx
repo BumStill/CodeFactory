@@ -19,7 +19,9 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 
 const invokeMock = vi.hoisted(() => vi.fn());
+const convertFileSrcMock = vi.hoisted(() => vi.fn((path: string) => `asset://localhost/${encodeURIComponent(path)}`));
 vi.mock("../lib/tauri", () => ({ invoke: invokeMock }));
+vi.mock("@tauri-apps/api/core", () => ({ convertFileSrc: convertFileSrcMock }));
 
 import { MessageInput } from "./MessageInput";
 
@@ -46,6 +48,7 @@ function makeImageFile(): File {
 describe("MessageInput attachments", () => {
   beforeEach(() => {
     invokeMock.mockReset();
+    convertFileSrcMock.mockClear();
   });
 
   it("paste of an image file invokes save_chat_attachment and shows an image preview", async () => {
@@ -69,7 +72,8 @@ describe("MessageInput attachments", () => {
     ));
     // The attachment tray shows a real preview, not just a filename chip.
     const preview = await screen.findByRole("img", { name: "screenshot.png" });
-    expect(preview).toHaveAttribute("src", "file:///proj/.codefactory/attachments/x.png");
+    expect(convertFileSrcMock).toHaveBeenCalledWith("/proj/.codefactory/attachments/x.png");
+    expect(preview).toHaveAttribute("src", "asset://localhost/%2Fproj%2F.codefactory%2Fattachments%2Fx.png");
     expect(screen.getByText("screenshot.png")).toBeInTheDocument();
   });
 

@@ -8,6 +8,7 @@ import {
   type ParsedSlashCommand,
 } from "../stores/slashCommands";
 import { invoke } from "../lib/tauri";
+import { convertFileSrc } from "@tauri-apps/api/core";
 
 interface SkillSlashCommand {
   name: string;
@@ -39,7 +40,8 @@ function isImageAttachment(name: string): boolean {
   return IMAGE_EXTS.includes(extOf(name));
 }
 function attachmentImageSrc(path: string): string {
-  return path.startsWith("file://") ? path : `file://${path}`;
+  const localPath = path.startsWith("file://") ? path.slice("file://".length) : path;
+  return convertFileSrc(localPath);
 }
 
 interface Props {

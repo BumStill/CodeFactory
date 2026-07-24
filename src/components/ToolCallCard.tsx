@@ -318,7 +318,7 @@ export function ToolCallCard({ tc }: Props) {
       : tc.status === "waiting_permission"
         ? "rounded-md border border-amber-500/25 bg-amber-500/5"
         : "rounded-md border border-accent/20 bg-accent/5"
-    : "border-b border-border/60";
+    : "rounded-md border border-border/25 bg-surface-1/30 shadow-none";
 
   return (
     <div className={`my-0.5 text-xs ${shellClass}`} data-tool-status={tc.status}>
