@@ -20,6 +20,27 @@ pub trait ContextPolicy: Send + Sync {
     async fn round_reasoning_effort(&self) -> String;
 }
 
+/// Tool lifecycle callbacks the loop fires around each tool call. Desktop wraps
+/// the user's configured `HookRunner`; headless uses [`NoOpHooks`], which allows
+/// every tool and records nothing. Both default to allow/no-op so a partial impl
+/// degrades safely.
+#[async_trait::async_trait]
+pub trait LifecycleHooks: Send + Sync {
+    /// Fired before a tool runs; returning `false` cancels the call.
+    async fn pre_tool(&self, _tool_name: &str, _args: &serde_json::Value) -> bool {
+        true
+    }
+    /// Fired after a tool completes (fire-and-forget; the result is already
+    /// truncated by the caller).
+    async fn post_tool(&self, _tool_name: &str, _result: &str, _duration_ms: u64) {}
+}
+
+/// Headless/no-op hooks: every tool is allowed, nothing is recorded. Owns no
+/// `AppHandle`, so the sidecar and the unit-test EXE can construct it freely.
+pub struct NoOpHooks;
+
+impl LifecycleHooks for NoOpHooks {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,5 +66,13 @@ mod tests {
         assert_eq!(p.context_window(1_000).await, (100_000, 200_000));
         assert!(!p.supports_vision().await);
         assert!(p.round_reasoning_effort().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn noop_hooks_allow_all_and_are_object_safe() {
+        let h: std::sync::Arc<dyn LifecycleHooks> = std::sync::Arc::new(NoOpHooks);
+        assert!(h.pre_tool("bash", &serde_json::json!({"cmd": "ls"})).await);
+        // post_tool is fire-and-forget: it must simply not panic.
+        h.post_tool("bash", "output", 12).await;
     }
 }

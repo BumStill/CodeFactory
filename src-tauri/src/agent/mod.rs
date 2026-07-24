@@ -10,6 +10,7 @@ pub mod dispatch;
 pub mod hooks;
 pub mod journal;
 mod context_policy;
+mod lifecycle_hooks;
 pub mod model_transport;
 pub mod persistence;
 pub mod scheduler;
@@ -55,8 +56,10 @@ use codefactory_agent_loop::tool::ToolBackend as _;
 // concrete `SqlitePersistence` lives in `persistence`.
 use codefactory_agent_loop::journal::Persistence as _;
 // Brings the `ContextPolicy` methods into scope; `DesktopContextPolicy` lives in
-// `context_policy`.
+// `context_policy`. `LifecycleHooks`/`NoOpHooks` are imported by name (used as a
+// `dyn` type + built directly); `DesktopLifecycleHooks` lives in `lifecycle_hooks`.
 use codefactory_agent_loop::services::ContextPolicy as _;
+use codefactory_agent_loop::services::{LifecycleHooks, NoOpHooks};
 // The pure completion-gate mode policy moved to agent-loop (slice 4.6 sub-step
 // 1). Pure fns are re-used directly; the mode-taking fns keep thin AgentMode
 // wrappers below that map to `FinalizationPolicy`, so call sites + #135/#136
@@ -673,7 +676,7 @@ impl AgentLoop {
     /// - events flow through the caller-supplied `events` sink (a
     ///   [`events::CollectingEventSink`] for eval, or a streaming JSONL sink
     ///   for a CLI) instead of the Tauri frontend;
-    /// - hooks are skipped entirely (`hook_runner` is `None`);
+    /// - hooks are skipped entirely (`NoOpHooks` when `app` is absent);
     /// - skills come from the user skills dir only (no builtin/AppHandle);
     /// - `delegate_tasks` degrades (it needs live UI sessions);
     /// - usage-recorded UI pings are skipped.
@@ -1030,20 +1033,23 @@ impl AgentLoop {
                     .await?;
             }
         }
-        // Headless runs have no frontend and no hooks. Building `Option<_>`
-        // (None when `app` is absent) keeps `HookRunner` — which owns an
-        // `AppHandle` — constructed ONLY here, inside `run()`, which the
-        // unit-test EXE dead-strips. Never construct it in test code: an
-        // AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
+        // Headless runs have no frontend and no hooks: `NoOpHooks` when `app`
+        // is absent, else `DesktopLifecycleHooks` wrapping a `HookRunner` —
+        // which owns an `AppHandle` — constructed ONLY here, inside `run()`,
+        // which the unit-test EXE dead-strips. Never construct it in test code:
+        // an AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
         // trips the Windows loader (`STATUS_ENTRYPOINT_NOT_FOUND`, #166).
-        let hook_runner: Option<hooks::HookRunner> = match &self.app {
-            None => None,
-            Some(app) => Some(if self.anonymous {
-                hooks::HookRunner::disabled(app.clone())
-            } else {
-                let settings = self.settings.read().await;
-                hooks::HookRunner::from_settings(&settings, app.clone())
-            }),
+        let hooks: std::sync::Arc<dyn LifecycleHooks> = match &self.app {
+            None => std::sync::Arc::new(NoOpHooks),
+            Some(app) => {
+                let runner = if self.anonymous {
+                    hooks::HookRunner::disabled(app.clone())
+                } else {
+                    let settings = self.settings.read().await;
+                    hooks::HookRunner::from_settings(&settings, app.clone())
+                };
+                std::sync::Arc::new(lifecycle_hooks::DesktopLifecycleHooks { runner })
+            }
         };
 
         // Did we emit a terminal Done/Error this run? Used to guarantee the
@@ -1415,17 +1421,7 @@ impl AgentLoop {
                 }
 
                 // Pre-tool hook: may cancel. Headless (no hooks) always allows.
-                let pre_allowed = match &hook_runner {
-                    Some(runner) => {
-                        runner
-                            .fire(hooks::HookEvent::PreTool {
-                                tool_name: tc.function.name.clone(),
-                                args: args.clone(),
-                            })
-                            .await
-                    }
-                    None => true,
-                };
+                let pre_allowed = hooks.pre_tool(&tc.function.name, &args).await;
                 if !pre_allowed {
                     let content = "Tool call cancelled by hook.".to_string();
                     self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
@@ -1521,15 +1517,10 @@ impl AgentLoop {
                     progress_prompt = Some(prompt);
                 }
                 // Post-tool hook (skipped headless — no hooks).
-                if let Some(runner) = &hook_runner {
-                    runner
-                        .fire(hooks::HookEvent::PostTool {
-                            tool_name: tc.function.name.clone(),
-                            result: output.content.chars().take(500).collect(),
-                            duration_ms,
-                        })
-                        .await;
-                }
+                let post_result: String = output.content.chars().take(500).collect();
+                hooks
+                    .post_tool(&tc.function.name, &post_result, duration_ms)
+                    .await;
 
                 self.events.emit(StreamEvent::ToolResult {
                             tool_call_id: tc.id.clone(),
@@ -2092,20 +2083,23 @@ impl AgentLoop {
                     .await?;
             }
         }
-        // Headless runs have no frontend and no hooks. Building `Option<_>`
-        // (None when `app` is absent) keeps `HookRunner` — which owns an
-        // `AppHandle` — constructed ONLY here, inside `run()`, which the
-        // unit-test EXE dead-strips. Never construct it in test code: an
-        // AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
+        // Headless runs have no frontend and no hooks: `NoOpHooks` when `app`
+        // is absent, else `DesktopLifecycleHooks` wrapping a `HookRunner` —
+        // which owns an `AppHandle` — constructed ONLY here, inside `run()`,
+        // which the unit-test EXE dead-strips. Never construct it in test code:
+        // an AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
         // trips the Windows loader (`STATUS_ENTRYPOINT_NOT_FOUND`, #166).
-        let hook_runner: Option<hooks::HookRunner> = match &self.app {
-            None => None,
-            Some(app) => Some(if self.anonymous {
-                hooks::HookRunner::disabled(app.clone())
-            } else {
-                let settings = self.settings.read().await;
-                hooks::HookRunner::from_settings(&settings, app.clone())
-            }),
+        let hooks: std::sync::Arc<dyn LifecycleHooks> = match &self.app {
+            None => std::sync::Arc::new(NoOpHooks),
+            Some(app) => {
+                let runner = if self.anonymous {
+                    hooks::HookRunner::disabled(app.clone())
+                } else {
+                    let settings = self.settings.read().await;
+                    hooks::HookRunner::from_settings(&settings, app.clone())
+                };
+                std::sync::Arc::new(lifecycle_hooks::DesktopLifecycleHooks { runner })
+            }
         };
 
         // Did we emit a terminal Done/Error this run? Used to guarantee the
@@ -2474,17 +2468,7 @@ impl AgentLoop {
                 }
 
                 // Pre-tool hook: may cancel. Headless (no hooks) always allows.
-                let pre_allowed = match &hook_runner {
-                    Some(runner) => {
-                        runner
-                            .fire(hooks::HookEvent::PreTool {
-                                tool_name: tc.function.name.clone(),
-                                args: args.clone(),
-                            })
-                            .await
-                    }
-                    None => true,
-                };
+                let pre_allowed = hooks.pre_tool(&tc.function.name, &args).await;
                 if !pre_allowed {
                     let content = "Tool call cancelled by hook.".to_string();
                     self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
@@ -2577,15 +2561,10 @@ impl AgentLoop {
                     progress_prompt = Some(prompt);
                 }
                 // Post-tool hook (skipped headless — no hooks).
-                if let Some(runner) = &hook_runner {
-                    runner
-                        .fire(hooks::HookEvent::PostTool {
-                            tool_name: tc.function.name.clone(),
-                            result: output.content.chars().take(500).collect(),
-                            duration_ms,
-                        })
-                        .await;
-                }
+                let post_result: String = output.content.chars().take(500).collect();
+                hooks
+                    .post_tool(&tc.function.name, &post_result, duration_ms)
+                    .await;
 
                 self.events.emit(StreamEvent::ToolResult {
                             tool_call_id: tc.id.clone(),

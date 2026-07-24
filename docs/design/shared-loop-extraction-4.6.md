@@ -74,9 +74,15 @@ the two `*-usage-recorded` events, only on `Persistence::record_usage` Ok(true))
   (api_style gate folded in). Anthropic `context_window` stays inline — it uses
   `default_limit`, not `select_limit(estimated)`, so it waits for 4.7. 470 lib +
   16 agent-loop tests green; vision-strip + reasoning-freshness pins hold.
-- **5–8 ⏳** the large phase: LifecycleHooks / PermissionGateway (new capability
-  traits + desktop impls), transport→`complete()`, and the 651-line physical
-  relocate. Verify locally with
+- **5 ✅** `LifecycleHooks` (`agent-loop/services.rs`, defaulted allow/no-op) +
+  `NoOpHooks` (headless, no `AppHandle`) + `DesktopLifecycleHooks`
+  (`src/agent/lifecycle_hooks.rs`, wraps `HookRunner`, built only in the
+  dead-stripped loops like the old `Option<HookRunner>`). Both loops' build +
+  PreTool `match` + PostTool `if let` collapse to `hooks.pre_tool`/`post_tool`.
+  470 lib + 17 agent-loop tests green (added `noop_hooks_allow_all…`).
+- **6–8 ⏳** the large phase: PermissionGateway (new capability trait + desktop
+  impl), transport→`complete()`, and the 651-line physical relocate. Verify
+  locally with
   `cargo test --lib -- --skip gh_cli_remote_reads_real_ci_status` (that one smoke
   needs HEAD pushed). One PR + one release when the branch is complete (or the
   step-7 fallback).
@@ -97,7 +103,7 @@ the two `*-usage-recorded` events, only on `Persistence::record_usage` Ok(true))
 4. ✅ **`ContextPolicy`** + `DesktopContextPolicy` — replace `supports_vision`,
    `context_window`, `round_reasoning_effort`. Verify vision-strip + reasoning
    freshness tests. (Anthropic `context_window` deferred to 4.7 — `default_limit`.)
-5. **`LifecycleHooks`** + `DesktopLifecycleHooks` + `NoOpHooks` — replace the
+5. ✅ **`LifecycleHooks`** + `DesktopLifecycleHooks` + `NoOpHooks` — replace the
    `hook_runner` Option/match.
 6. **`PermissionGateway`** + `DesktopPermissionGateway` — fold `decide_permission`
    + `request_permission`. The fiddliest step (denial strings, Cancelled→
