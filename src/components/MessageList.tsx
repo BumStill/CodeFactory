@@ -188,7 +188,11 @@ export function MessageList({ messages, streaming, cwd, onUsePrompt, onOpenUsage
     return <WelcomeScreen onUsePrompt={onUsePrompt} onOpenUsage={onOpenUsage} />;
   }
 
-  const visible = messages.filter((m) => m.role !== "tool" && m.role !== "system");
+  const visible = messages.filter(
+    (m) =>
+      m.role !== "tool" &&
+      (m.role !== "system" || m.completionState === "turn_notice"),
+  );
   const lastAssistantId =
     [...visible].reverse().find((m) => m.role === "assistant")?.id ?? null;
 

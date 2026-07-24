@@ -218,7 +218,7 @@ describe("MessageList completion-review isolation", () => {
         messages={[
           msg({
             id: "notice",
-            role: "user",
+            role: "system",
             content: "已自动移除历史中的图片后重试:当前模型不支持图片输入。",
             completionState: "turn_notice",
           }),

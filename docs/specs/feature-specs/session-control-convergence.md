@@ -16,6 +16,7 @@
 | CF-SCC-R10 | 前台恢复耗尽后必须发出可见终态和 `Done`；不得继续隐藏执行或把第 4 次拒绝变成新的恢复循环 | Rust event sequence + frontend stream unit |
 | CF-SCC-R11 | 取消文案明确表示停止后续生成，不自动回滚已提交、已推送或已执行的外部状态 | component + real app |
 | CF-SCC-R12 | PR+CI、真实 CodeFactory App 和精确发布产物验证前保持 `not live` | evidence pack |
+| CF-SCC-R13 | 自动事实纠偏只允许进入执行型回合；交付类纠偏还必须核对当前用户明确要求的交付动作。检测不得跨段拼接示例、引用或假设中的关键词，不得把分析/设计回答改写成 `deliver_changes` 等无关执行。内部 `turn_notice` 必须保留可审计的 system 来源，不能冒充新的用户目标 | Rust failure-first regression + exact field-session replay + real app |
 
 ## Primary User Paths
 
@@ -31,9 +32,20 @@
 
 用户切换会话或重启 App 后，进行中的会话不把内部 prompt 当成用户消息，也不重新展示被拒绝草稿；历史活动被折叠为简洁恢复摘要，最终回答与警告保持可读。
 
+### 自纠偏边界
+
+当候选回复声称当前用户要求的交付动作因认证、工具或可检测条件受阻时，系统可以在同一回合发起一次有证据的纠偏。检测必须同时满足：
+
+- 当前回合是 Execute 或 Autonomous 等执行型模式；Interactive 分析回答直接结束，不启动隐藏纠偏循环；
+- 当前用户目标本身明确涉及提交、推送、PR、发布或交付；
+- 阻塞主张与认证/配置要求出现在同一句或同一局部语境；
+- 示例、代码块、引用和假设性方案不作为当前阻塞事实。
+
+若当前目标是分析、设计、解释或诊断，自纠偏不得注入 `deliver_changes`、不得继续无关工具链，也不得让已经完成的正确回答降级为折叠步骤。
+
 ## Applicable Harnesses
 
-- Spec Harness：CF-SCC-R1..R12。
+- Spec Harness：CF-SCC-R1..R13。
 - Compatibility Harness：旧 settings、旧 completion state、旧会话 hydration。
 - Viewport Harness：1366×768、800×600 下状态卡与输入区不重叠。
 - Observation Harness：真实 App 中 Full access 诊断、Execute 恢复和取消路径。
