@@ -100,4 +100,18 @@ describe("MessageList theme readability", () => {
     expect(container.querySelector("th")?.textContent).toBe("A");
   });
 
+  it("renders markdown image links as visible image previews", () => {
+    const { container } = render(
+      <MessageList
+        messages={[baseMsg({ content: "![image.png](file:///proj/.codefactory/attachments/image.png)" })]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+    const image = container.querySelector("img[alt='image.png']");
+    expect(image, "expected markdown image to render as <img>").toBeTruthy();
+    expect(image).toHaveAttribute("src", "file:///proj/.codefactory/attachments/image.png");
+    expect(image?.className).toMatch(/max-h-80/);
+  });
+
 });

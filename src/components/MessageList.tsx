@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import type { UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
@@ -96,6 +97,11 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   );
 }
 
+const allowedLocalImageUrl: UrlTransform = (value, key, node): string => {
+  if (node.tagName === "img" && key === "src" && value.startsWith("file://")) return value;
+  return defaultUrlTransform(value);
+};
+
 // ── Rich markdown component overrides ────────────────────────────────────────
 const markdownComponents: Components = {
   code({ className, children, ...props }) {
@@ -148,6 +154,17 @@ const markdownComponents: Components = {
   ),
   td: ({ children }) => (
     <td className="border border-border px-2 py-1 text-gray-300">{children}</td>
+  ),
+  img: ({ src, alt }) => (
+    <span className="my-2 inline-block max-w-full align-top">
+      <img
+        src={src ?? ""}
+        alt={alt ?? "图片附件"}
+        className="max-h-80 max-w-full rounded-lg border border-border bg-surface-2 object-contain"
+        loading="lazy"
+      />
+      {alt && <span className="mt-1 block text-[10px] text-gray-500">{alt}</span>}
+    </span>
   ),
   a: ({ children, href }) => (
     <a href={href} target="_blank" rel="noreferrer" className="text-accent hover:underline">
@@ -449,7 +466,7 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
                 data-segment="final"
                 className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
               >
-                <ReactMarkdown components={markdownComponents} remarkPlugins={[remarkGfm]}>{segment.text}</ReactMarkdown>
+                <ReactMarkdown components={markdownComponents} remarkPlugins={[remarkGfm]} urlTransform={allowedLocalImageUrl}>{segment.text}</ReactMarkdown>
                 {isStreamingTail && <TypingDots />}
               </div>
             );
@@ -501,7 +518,7 @@ function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreaming
         ))}
       {!timeline && msg.content && (
         <div className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
-          <ReactMarkdown components={markdownComponents} remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+          <ReactMarkdown components={markdownComponents} remarkPlugins={[remarkGfm]} urlTransform={allowedLocalImageUrl}>{msg.content}</ReactMarkdown>
           {isStreamingTail && <TypingDots />}
         </div>
       )}
