@@ -152,6 +152,27 @@ impl Persistence for SqlitePersistence {
         Ok(())
     }
 
+    async fn record_tool_call_started(
+        &self,
+        message_id: &str,
+        tool_call: &ToolCall,
+    ) -> PersistResult<()> {
+        if self.anonymous {
+            return Ok(());
+        }
+        let args = serde_json::from_str(&tool_call.function.arguments).unwrap_or_default();
+        crate::trajectory::record_tool_call_started(
+            &self.db,
+            &self.session_id,
+            message_id,
+            &tool_call.id,
+            &tool_call.function.name,
+            &args,
+        )
+        .await
+        .map_err(perr)
+    }
+
     async fn record_tool_call_outcome(
         &self,
         tool_call: &ToolCall,

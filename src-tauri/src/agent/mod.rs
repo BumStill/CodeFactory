@@ -1237,16 +1237,10 @@ impl AgentLoop {
                 };
             if let Some(message_id) = assistant_message_id.as_deref() {
                 for tc in &tool_calls {
-                    let args = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                    crate::trajectory::record_tool_call_started(
-                        &self.db,
-                        &self.session_id,
-                        message_id,
-                        &tc.id,
-                        &tc.function.name,
-                        &args,
-                    )
-                    .await?;
+                    self.persistence()
+                        .record_tool_call_started(message_id, tc)
+                        .await
+                        .map_err(persistence::to_app_error)?;
                 }
             }
 
@@ -2313,16 +2307,10 @@ impl AgentLoop {
             };
             if let Some(message_id) = assistant_message_id.as_deref() {
                 for tc in &tool_calls {
-                    let args = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                    crate::trajectory::record_tool_call_started(
-                        &self.db,
-                        &self.session_id,
-                        message_id,
-                        &tc.id,
-                        &tc.function.name,
-                        &args,
-                    )
-                    .await?;
+                    self.persistence()
+                        .record_tool_call_started(message_id, tc)
+                        .await
+                        .map_err(persistence::to_app_error)?;
                 }
             }
 
