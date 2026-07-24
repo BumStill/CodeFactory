@@ -23,10 +23,9 @@ pub use dispatch::decide_chat_mode;
 
 use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
-    build_completion_recovery_prompt, classify_command, completion_evidence_made_progress,
-    evaluate_budget_command_in_directory, provider_rejects_required_tool_choice,
-    should_prompt_budget_convergence, CompletionEvidence,
-    CompletionGate, PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
+    completion_evidence_made_progress, provider_rejects_required_tool_choice,
+    should_prompt_budget_convergence, CompletionEvidence, CompletionGate, ProgressTracker,
+    ToolOutcome,
 };
 use futures_util::{Stream, StreamExt};
 use reqwest::Client;
@@ -54,6 +53,37 @@ use codefactory_agent_loop::tool::ToolBackend as _;
 // Brings the `Persistence` methods into scope for the inherent delegators; the
 // concrete `SqlitePersistence` lives in `persistence`.
 use codefactory_agent_loop::journal::Persistence as _;
+// The pure completion-gate mode policy moved to agent-loop (slice 4.6 sub-step
+// 1). Pure fns are re-used directly; the mode-taking fns keep thin AgentMode
+// wrappers below that map to `FinalizationPolicy`, so call sites + #135/#136
+// tests are unchanged.
+use codefactory_agent_loop::policy::{
+    self, active_tool_definitions, completion_command_and_kind,
+    completion_recovery_attempts_after_tool_batch, openai_tool_controls, CompletionFinalization,
+};
+use codefactory_agent_loop::run::FinalizationPolicy;
+
+/// Desktop `AgentMode` → the loop crate's `FinalizationPolicy`.
+fn finalization_policy(mode: AgentMode) -> FinalizationPolicy {
+    match mode {
+        AgentMode::Interactive | AgentMode::Execute => FinalizationPolicy::ReleaseWithWarning,
+        AgentMode::Autonomous => FinalizationPolicy::BlockOnIncomplete,
+    }
+}
+
+/// Rejected-final-response recovery budget per run (was `completion_recovery_limit`).
+fn recovery_limit_for(mode: AgentMode) -> u32 {
+    match mode {
+        AgentMode::Interactive | AgentMode::Execute => 3,
+        AgentMode::Autonomous => 1,
+    }
+}
+
+/// Whether the autonomous round budget constrains model tools this run.
+/// Interactive is uncapped; Execute + Autonomous apply the wall budget.
+fn wall_budget_applies(mode: AgentMode) -> bool {
+    !matches!(mode, AgentMode::Interactive)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionResponse {
@@ -1796,7 +1826,6 @@ impl AgentLoop {
         }
     }
 
-
     /// Build the desktop persistence backend for this run. Cheap (clones the
     /// pool handle + session id); the inherent persist_* helpers below delegate
     /// to it so all message/trajectory writes — and the anonymous no-trace
@@ -2692,31 +2721,6 @@ impl AgentLoop {
     }
 }
 
-fn openai_tool_controls(
-    tool_defs: &[ToolDefinition],
-    require_tool: bool,
-) -> (Option<Vec<ToolDefinition>>, serde_json::Value) {
-    if tool_defs.is_empty() {
-        (None, serde_json::json!("none"))
-    } else {
-        (
-            Some(tool_defs.to_vec()),
-            serde_json::json!(if require_tool { "required" } else { "auto" }),
-        )
-    }
-}
-
-fn active_tool_definitions(
-    tool_defs: &[ToolDefinition],
-    finalization_pending: bool,
-) -> &[ToolDefinition] {
-    if finalization_pending {
-        &[]
-    } else {
-        tool_defs
-    }
-}
-
 fn validate_openai_sse_completion(
     saw_terminal_marker: bool,
     pending_bytes: usize,
@@ -2738,90 +2742,15 @@ fn validate_openai_sse_completion(
     Ok(())
 }
 
-fn completion_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (String, ToolKind) {
-    let command = args
-        .get("command")
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-        .or_else(|| {
-            let pattern = args
-                .get("pattern")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let path = args
-                .get("path")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let base = match (pattern.is_empty(), path.is_empty()) {
-                (false, false) => Some(format!("{tool_name} {pattern} {path}")),
-                (false, true) => Some(format!("{tool_name} {pattern} .")),
-                (true, false) => Some(format!("{tool_name} {path}")),
-                (true, true) => None,
-            }?;
-            let glob = args
-                .get("glob")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.is_empty());
-            Some(match glob {
-                Some(glob) => format!("{base} --glob {glob}"),
-                None => base,
-            })
-        })
-        .unwrap_or_else(|| tool_name.to_owned());
-    let kind = if tool_name == "bash" {
-        classify_command(&command, 300_000)
-    } else if tool_name.starts_with("write_")
-        || tool_name.starts_with("edit_")
-        || matches!(tool_name, "write_file" | "edit_file" | "delegate_tasks")
-    {
-        ToolKind::Mutation
-    } else {
-        ToolKind::ReadOnly
-    };
-    (command, kind)
-}
-
 /// How many times one run may reject a tool-call-free final response and ask
 /// the model to resolve concrete completion blockers. User-facing chat gets
 /// three bounded, tool-required recovery opportunities: enough to survive an
 /// incidental shell/precondition mistake without restoring the historical
 /// unbounded near-duplicate loop. Autonomous attempts stay single-shot because
 /// the scheduler can respawn them with a fresh evidence brief.
-fn completion_recovery_limit(mode: AgentMode) -> u32 {
-    match mode {
-        AgentMode::Interactive | AgentMode::Execute => 3,
-        AgentMode::Autonomous => 1,
-    }
-}
 
 fn completion_recovery_requires_tool(_mode: AgentMode) -> bool {
     true
-}
-
-fn completion_recovery_attempts_after_tool_batch(
-    attempts: u32,
-    _material_evidence_progress: bool,
-) -> u32 {
-    // This is a total turn budget, not a "consecutive no progress" counter.
-    // Material progress may clear stagnation heuristics, but it must not grant
-    // a fresh set of rejected-final-response recovery rounds.
-    attempts
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum CompletionFinalization {
-    Complete,
-    Recover(String),
-    /// Chat surfaces after recovery exhaustion: the model's reply is the best
-    /// available answer — release it, but persist this human-readable warning
-    /// so the user knows verification is incomplete. Never an Error, never
-    /// internal-contract wording (2026-07-21 field report: an untranslated
-    /// "Completion blocked…rerun every unresolved failed check" killed the
-    /// turn and hid the reply).
-    ReleaseWithWarning(String),
-    /// Unattended Autonomous runs only — the scheduler treats this as an
-    /// incomplete attempt and respawns.
-    Blocked(String),
 }
 
 fn completion_finalization(
@@ -2829,53 +2758,20 @@ fn completion_finalization(
     attempts: u32,
     mode: AgentMode,
 ) -> CompletionFinalization {
-    if evidence.completed {
-        return CompletionFinalization::Complete;
-    }
-    if attempts < completion_recovery_limit(mode) {
-        return CompletionFinalization::Recover(build_completion_recovery_prompt(evidence));
-    }
-    match mode {
-        AgentMode::Autonomous => {
-            CompletionFinalization::Blocked(completion_blocked_message(evidence))
-        }
-        AgentMode::Interactive | AgentMode::Execute => {
-            CompletionFinalization::ReleaseWithWarning(unverified_release_warning(evidence))
-        }
-    }
+    policy::completion_finalization(
+        evidence,
+        attempts,
+        finalization_policy(mode),
+        recovery_limit_for(mode),
+    )
 }
 
 /// User-facing warning when a chat turn ends without complete verification.
 /// Chinese, plain language, no gate terminology; the raw blocker list goes
 /// to the log only.
-fn unverified_release_warning(evidence: &CompletionEvidence) -> String {
-    tracing::info!(
-        "releasing chat turn with unverified blockers: {}",
-        evidence.blockers.join("; ")
-    );
-    "⚠ 以上回复未经完整验证:本轮修改后仍有检查未复验(或失败未复跑)。\
-结论可能不完整;回复「继续验证」可让我补齐。"
-        .to_string()
-}
-
-fn completion_blocked_message(evidence: &CompletionEvidence) -> String {
-    format!(
-        "Completion blocked because required verification is still missing: {}",
-        evidence.blockers.join("; ")
-    )
-}
 
 fn iteration_ceiling_terminal_event(evidence: &CompletionEvidence, mode: AgentMode) -> StreamEvent {
-    if evidence.completed || !matches!(mode, AgentMode::Autonomous) {
-        StreamEvent::Done {
-            input_tokens: 0,
-            output_tokens: 0,
-        }
-    } else {
-        StreamEvent::Error {
-            message: completion_blocked_message(evidence),
-        }
-    }
+    policy::iteration_ceiling_terminal_event(evidence, finalization_policy(mode))
 }
 
 fn completion_recovery_prompt(
@@ -2883,12 +2779,12 @@ fn completion_recovery_prompt(
     attempts: u32,
     mode: AgentMode,
 ) -> Option<String> {
-    match completion_finalization(evidence, attempts, mode) {
-        CompletionFinalization::Recover(prompt) => Some(prompt),
-        CompletionFinalization::Complete
-        | CompletionFinalization::ReleaseWithWarning(_)
-        | CompletionFinalization::Blocked(_) => None,
-    }
+    policy::completion_recovery_prompt(
+        evidence,
+        attempts,
+        finalization_policy(mode),
+        recovery_limit_for(mode),
+    )
 }
 
 /// Placeholder inserted in place of an image part when the active model
@@ -3126,7 +3022,7 @@ fn fact_check_reply(text: &str) -> Option<String> {
 /// announcing its next step, which reads as the assistant stalling. With the
 /// user present, the user decides when the work is finished.
 fn completion_ready_applies(mode: AgentMode) -> bool {
-    matches!(mode, AgentMode::Autonomous)
+    policy::completion_ready_applies(finalization_policy(mode))
 }
 
 fn autonomous_budget_denial(
@@ -3137,26 +3033,14 @@ fn autonomous_budget_denial(
     args: &serde_json::Value,
     working_directory: &Path,
 ) -> Option<String> {
-    let (command, kind) = completion_command_and_kind(tool_name, args);
-    // Interactive chat is not constrained by the autonomous round budget, but
-    // deterministic completion invariants still apply to model-generated tools.
-    let effective_remaining = if mode == AgentMode::Interactive {
-        u32::MAX
-    } else {
-        remaining_model_rounds
-    };
-    match evaluate_budget_command_in_directory(
-        effective_remaining,
+    policy::autonomous_budget_denial(
+        wall_budget_applies(mode),
+        remaining_model_rounds,
         evidence,
-        &command,
-        &kind,
-        working_directory.to_str(),
-    ) {
-        PolicyDecision::Allow => None,
-        PolicyDecision::Deny { reason, .. } => Some(format!(
-            "Tool call denied by completion policy: {reason}. Resolve the current completion blocker or finalize."
-        )),
-    }
+        tool_name,
+        args,
+        working_directory,
+    )
 }
 
 fn record_completion_outcome(
@@ -3716,6 +3600,9 @@ fn glob_match(pattern: &str, input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `completion_command_and_kind` (and its `ToolKind` result) moved to
+    // agent-loop in slice 4.6; this test still exercises it via the re-export.
+    use codefactory_agent_core::ToolKind;
 
     #[tokio::test]
     async fn session_reasoning_effort_reflects_the_current_row() {

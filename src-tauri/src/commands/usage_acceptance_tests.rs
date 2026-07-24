@@ -136,7 +136,10 @@ fn openai_and_anthropic_persist_usage_before_terminal_tool_branch() {
         (
             "anthropic",
             "    async fn run_anthropic(",
-            "\n}\n\nfn openai_tool_controls(",
+            // End marker: the first free fn after run_anthropic. (openai_tool_controls
+            // moved to agent-loop in slice 4.6; validate_openai_sse_completion is now
+            // the tight bound of the run_anthropic section.)
+            "\n}\n\nfn validate_openai_sse_completion(",
         ),
     ] {
         let section = source
@@ -179,7 +182,10 @@ fn completed_usage_is_persisted_before_post_response_cancellation() {
         (
             "anthropic",
             "    async fn run_anthropic(",
-            "\n}\n\nfn openai_tool_controls(",
+            // End marker: the first free fn after run_anthropic. (openai_tool_controls
+            // moved to agent-loop in slice 4.6; validate_openai_sse_completion is now
+            // the tight bound of the run_anthropic section.)
+            "\n}\n\nfn validate_openai_sse_completion(",
             "let resp = match first_attempt",
         ),
     ] {

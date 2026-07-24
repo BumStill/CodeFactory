@@ -22,6 +22,7 @@
 
 pub mod events;
 pub mod journal;
+pub mod policy;
 pub mod run;
 pub mod tool;
 pub mod transport;
