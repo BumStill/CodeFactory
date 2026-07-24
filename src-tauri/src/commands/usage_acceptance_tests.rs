@@ -213,7 +213,7 @@ fn completed_usage_is_persisted_before_post_response_cancellation() {
                 .expect("missing anthropic post-response cancellation")
         } else {
             after_response
-                .find("if self.is_cancelled()")
+                .find("if is_cancelled(cancel.as_ref())")
                 .expect("missing openai post-response cancellation")
         };
 

@@ -10,6 +10,7 @@ pub mod dispatch;
 pub mod hooks;
 pub mod journal;
 mod context_policy;
+mod fact_checker;
 mod lifecycle_hooks;
 pub mod model_transport;
 mod permission_gateway;
@@ -63,6 +64,8 @@ use codefactory_agent_loop::services::{LifecycleHooks, NoOpHooks};
 // matched at the call sites. `DesktopPermissionGateway` lives in
 // `permission_gateway`; the pure `decide_permission` stays a free fn below.
 use codefactory_agent_loop::services::{PermissionGateway as _, PermissionOutcome};
+// Brings `.fact_check()` into scope; `DesktopFactChecker` lives in `fact_checker`.
+use codefactory_agent_loop::services::FactChecker as _;
 // The loop drives the model round through the `ModelTransport::complete()` seam
 // (slice 4.6 sub-step 7): `RoundOptions` carries require-tool + reasoning effort,
 // `ModelResponse` is the provider-independent answer. `TransportError` crosses
@@ -70,7 +73,7 @@ use codefactory_agent_loop::services::{PermissionGateway as _, PermissionOutcome
 use codefactory_agent_loop::transport::{ModelResponse, ModelTransport as _, RoundOptions};
 // Pure loop helpers relocated to agent-loop (keystone slice 4.6b); re-imported so
 // both provider loops + the bin unit tests keep the unqualified names.
-use codefactory_agent_loop::run::cancelled_tool_suffix;
+use codefactory_agent_loop::run::{cancelled_tool_suffix, is_cancelled, usage_request_id};
 use codefactory_agent_loop::protocol::{
     is_vision_rejection, repair_openai_tool_protocol, strip_image_parts, strip_image_values,
 };
@@ -1000,6 +1003,25 @@ impl AgentLoop {
         let transport = self.model_transport();
         let context_policy = self.context_policy();
         let permission = self.permission_gateway();
+        let fact_checker = fact_checker::DesktopFactChecker { mode: self.mode };
+        // Mode → policy scalars resolved once (keystone slice 4.6b): the shared
+        // loop takes these as RunConfig fields, so the body names no `AgentMode`.
+        let finalization = finalization_policy(self.mode);
+        let recovery_limit = recovery_limit_for(self.mode);
+        let wall_budget = wall_budget_applies(self.mode);
+        let cancel = self.cancel.clone();
+        let session_id = self.session_id.clone();
+        // Execution-context scalars pre-derived once (keystone slice 4.6b): they
+        // are constant for the run, so hoisting is behaviour-preserving and the
+        // body never names `self.execution_context`/`self.cwd`/`self.usage_run_id`.
+        let cwd = self.cwd.clone();
+        let audit_session_id = self.audit_session_id();
+        let task_id = self
+            .execution_context
+            .as_ref()
+            .and_then(|ctx| ctx.task_id.clone());
+        let knowledge_library_ids = knowledge_scope_for_tools(self.execution_context.as_ref());
+        let usage_run_id = self.usage_run_id.clone();
         // Built ONCE per run (keystone slice 4.6b): it holds only cloned handles,
         // no per-tool-call state, so hoisting out of the tool loop is
         // behaviour-preserving. Owns an `AppHandle` (`#[cfg(not(test))] app`), so
@@ -1066,8 +1088,12 @@ impl AgentLoop {
             // turn, end the stream cleanly between rounds. Checked here (not
             // mid tool-call) so in-flight work isn't hard-killed. No-op unless
             // a cancel flag was attached (chat only) and has actually tripped.
-            if self.is_cancelled() {
-                self.emit_cancelled_done();
+            if is_cancelled(cancel.as_ref()) {
+                tracing::info!("chat turn cancelled by user (session {session_id})");
+                events.emit(StreamEvent::Done {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                });
                 emitted_terminal = true;
                 break;
             }
@@ -1174,14 +1200,18 @@ impl AgentLoop {
 
             // The provider request has completed. Persist already-consumed
             // Usage before honoring a cancellation that arrived in flight.
-            let usage_request_id = self.usage_request_id(iteration);
+            let usage_request_id = usage_request_id(&usage_run_id, iteration);
             if let Some(round_usage) = usage.as_ref() {
                 self.record_usage_event_for_round(round_usage, iteration)
                     .await;
             }
 
-            if self.is_cancelled() {
-                self.emit_cancelled_done();
+            if is_cancelled(cancel.as_ref()) {
+                tracing::info!("chat turn cancelled by user (session {session_id})");
+                events.emit(StreamEvent::Done {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                });
                 emitted_terminal = true;
                 break;
             }
@@ -1234,7 +1264,7 @@ impl AgentLoop {
                 // probe-backed correction — facts over stale memory.
                 if !fact_check_used {
                     if let Some(correction) =
-                        fact_check_reply(&text, &fact_check_instruction, self.mode)
+                        fact_checker.fact_check(&text, &fact_check_instruction)
                     {
                         fact_check_used = true;
                         self.persist_gate_message(&correction, "turn_notice").await?;
@@ -1254,10 +1284,10 @@ impl AgentLoop {
                     }
                 }
                 let evidence = completion_gate.evidence();
-                match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
+                match policy::completion_finalization(&evidence, completion_recovery_attempts, finalization, recovery_limit) {
                     CompletionFinalization::Recover(prompt) => {
                         completion_recovery_attempts += 1;
-                        require_tool_next = completion_recovery_requires_tool(self.mode);
+                        require_tool_next = true;
                         // Make the rejection visible instead of silently looping:
                         // collapse the rejected candidate in the UI, persist the
                         // injected instruction so rebuilt history stays faithful.
@@ -1319,7 +1349,7 @@ impl AgentLoop {
 
             for (tool_index, tc) in tool_calls.iter().enumerate() {
                 if let Some(remaining) =
-                    cancelled_tool_suffix(self.cancel.as_ref(), &tool_calls, tool_index)
+                    cancelled_tool_suffix(cancel.as_ref(), &tool_calls, tool_index)
                 {
                     return self
                         .finish_cancelled_tool_batch(remaining)
@@ -1346,13 +1376,13 @@ impl AgentLoop {
 
                 let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
                 let completion_evidence = completion_gate.evidence();
-                let denial_content = if let Some(content) = autonomous_budget_denial(
-                    self.mode,
+                let denial_content = if let Some(content) = policy::autonomous_budget_denial(
+                    wall_budget,
                     remaining,
                     &completion_evidence,
                     &tc.function.name,
                     &args,
-                    &self.cwd,
+                    &cwd,
                 ) {
                     Some(content)
                 } else {
@@ -1419,15 +1449,10 @@ impl AgentLoop {
                 // so it covers the fatal-error path exactly as before. The backend
                 // is the run-scoped `tool_backend` hoisted above (slice 4.6b).
                 let tool_ctx = codefactory_agent_loop::tool::ToolCtx {
-                    working_directory: self.cwd.clone(),
-                    session_id: Some(self.audit_session_id()),
-                    task_id: self
-                        .execution_context
-                        .as_ref()
-                        .and_then(|ctx| ctx.task_id.clone()),
-                    knowledge_library_ids: knowledge_scope_for_tools(
-                        self.execution_context.as_ref(),
-                    ),
+                    working_directory: cwd.clone(),
+                    session_id: Some(audit_session_id.clone()),
+                    task_id: task_id.clone(),
+                    knowledge_library_ids: knowledge_library_ids.clone(),
                     timeout_sec: None,
                 };
 
@@ -1470,7 +1495,7 @@ impl AgentLoop {
                     &mut completion_gate,
                     &mut progress_tracker,
                     &mut completion_sequence,
-                    &self.cwd,
+                    &cwd,
                     &tc.function.name,
                     &completion_args,
                     &output.content,
@@ -1533,7 +1558,7 @@ impl AgentLoop {
                 });
             }
             let evidence = completion_gate.evidence();
-            if completion_ready_applies(self.mode)
+            if policy::completion_ready_applies(finalization)
                 && evidence.completed
                 && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
             {
@@ -1553,7 +1578,7 @@ impl AgentLoop {
                     name: None,
                     reasoning_content: None,
                 });
-            } else if self.mode != AgentMode::Interactive {
+            } else if wall_budget {
                 let remaining = max_iterations.saturating_sub(iteration + 1);
                 if should_prompt_budget_convergence(remaining as u32) {
                     messages.push(ChatMessage {
@@ -1577,10 +1602,10 @@ impl AgentLoop {
             let evidence = completion_gate.evidence();
             tracing::warn!(
                 "agent loop hit the iteration ceiling ({}) without a terminal turn; completed={}",
-                self.mode.max_iterations(),
+                max_iterations,
                 evidence.completed,
             );
-            events.emit(iteration_ceiling_terminal_event(&evidence, self.mode));
+            events.emit(policy::iteration_ceiling_terminal_event(&evidence, finalization));
         }
 
         Ok(())
