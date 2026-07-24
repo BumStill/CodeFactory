@@ -80,9 +80,20 @@ the two `*-usage-recorded` events, only on `Persistence::record_usage` Ok(true))
   dead-stripped loops like the old `Option<HookRunner>`). Both loops' build +
   PreTool `match` + PostTool `if let` collapse to `hooks.pre_tool`/`post_tool`.
   470 lib + 17 agent-loop tests green (added `noop_hooks_allow_all…`).
-- **6–8 ⏳** the large phase: PermissionGateway (new capability trait + desktop
-  impl), transport→`complete()`, and the 651-line physical relocate. Verify
-  locally with
+- **6 ✅** `PermissionGateway` + `PermissionOutcome` (agent-loop) +
+  `AllowAllPermissions` (headless, allow-all) + `DesktopPermissionGateway`
+  (`src/agent/permission_gateway.rs`, owns Arc handles only — no `AppHandle`, so
+  no cfg gating). Folds `decide_permission` (stays a directly-tested free fn the
+  gateway calls via `super::`) + `request_permission` (moved verbatim). Both
+  loops' `let permission_policy`/`decision` + the `match decision` block collapse
+  to `match self.permission_gateway().authorize(tc, &args, bash_cmd).await`; the
+  Cancelled arm still returns `finish_cancelled_tool_batch` (which stays on the
+  loop — it needs the batch remainder). Denial strings + warn byte-identical;
+  `decide_permission` is pure so its now-lazy call is unobservable. Retargeted
+  the usage-acceptance source-text end marker to `finish_cancelled_tool_batch`
+  (request_permission left mod.rs). 470 lib + 18 agent-loop tests green.
+- **7–8 ⏳** the large phase: transport→`complete()` + `LoopError`, and the
+  651-line physical relocate. Verify locally with
   `cargo test --lib -- --skip gh_cli_remote_reads_real_ci_status` (that one smoke
   needs HEAD pushed). One PR + one release when the branch is complete (or the
   step-7 fallback).
@@ -105,7 +116,7 @@ the two `*-usage-recorded` events, only on `Persistence::record_usage` Ok(true))
    freshness tests. (Anthropic `context_window` deferred to 4.7 — `default_limit`.)
 5. ✅ **`LifecycleHooks`** + `DesktopLifecycleHooks` + `NoOpHooks` — replace the
    `hook_runner` Option/match.
-6. **`PermissionGateway`** + `DesktopPermissionGateway` — fold `decide_permission`
+6. ✅ **`PermissionGateway`** + `DesktopPermissionGateway` — fold `decide_permission`
    + `request_permission`. The fiddliest step (denial strings, Cancelled→
    `finish_cancelled_tool_batch`, pending_permissions atomicity).
 7. **Transport switch** — the 3 call sites + 2 retry arms → `ModelTransport::complete`;

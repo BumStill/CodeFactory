@@ -129,9 +129,10 @@ fn openai_and_anthropic_persist_usage_before_terminal_tool_branch() {
             "openai",
             "    async fn run_openai(",
             // End marker: the first method after run_openai. (call_openai_transport
-            // moved to model_transport.rs in slice 4.5a; request_permission is now
+            // moved to model_transport.rs in slice 4.5a and request_permission to
+            // permission_gateway.rs in slice 4.6; finish_cancelled_tool_batch is now
             // the tight bound of the run_openai section.)
-            "    async fn request_permission(",
+            "    async fn finish_cancelled_tool_batch(",
         ),
         (
             "anthropic",
@@ -174,9 +175,10 @@ fn completed_usage_is_persisted_before_post_response_cancellation() {
             "openai",
             "    async fn run_openai(",
             // End marker: the first method after run_openai. (call_openai_transport
-            // moved to model_transport.rs in slice 4.5a; request_permission is now
+            // moved to model_transport.rs in slice 4.5a and request_permission to
+            // permission_gateway.rs in slice 4.6; finish_cancelled_tool_batch is now
             // the tight bound of the run_openai section.)
-            "    async fn request_permission(",
+            "    async fn finish_cancelled_tool_batch(",
             "let (text, tool_calls, usage, reasoning) = match call_result",
         ),
         (

@@ -12,6 +12,7 @@ pub mod journal;
 mod context_policy;
 mod lifecycle_hooks;
 pub mod model_transport;
+mod permission_gateway;
 pub mod persistence;
 pub mod scheduler;
 pub mod sse_buffer;
@@ -60,6 +61,10 @@ use codefactory_agent_loop::journal::Persistence as _;
 // `dyn` type + built directly); `DesktopLifecycleHooks` lives in `lifecycle_hooks`.
 use codefactory_agent_loop::services::ContextPolicy as _;
 use codefactory_agent_loop::services::{LifecycleHooks, NoOpHooks};
+// `PermissionGateway` brings `.authorize()` into scope; `PermissionOutcome` is
+// matched at the call sites. `DesktopPermissionGateway` lives in
+// `permission_gateway`; the pure `decide_permission` stays a free fn below.
+use codefactory_agent_loop::services::{PermissionGateway as _, PermissionOutcome};
 // The pure completion-gate mode policy moved to agent-loop (slice 4.6 sub-step
 // 1). Pure fns are re-used directly; the mode-taking fns keep thin AgentMode
 // wrappers below that map to `FinalizationPolicy`, so call sites + #135/#136
@@ -1351,14 +1356,6 @@ impl AgentLoop {
                             args: args.clone(),
                         });
 
-                let permission_policy = {
-                    let settings = self.settings.read().await;
-                    settings.permissions.clone()
-                };
-
-                let decision =
-                    decide_permission(&permission_policy, &tc.function.name, bash_cmd.as_deref());
-
                 let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
                 let completion_evidence = completion_gate.evidence();
                 let denial_content = if let Some(content) = autonomous_budget_denial(
@@ -1371,29 +1368,17 @@ impl AgentLoop {
                 ) {
                     Some(content)
                 } else {
-                    match decision {
-                        PermissionDecision::Allow => None,
-                        PermissionDecision::Ask => {
-                            match self.request_permission(tc, args.clone()).await {
-                                PermissionResponse::Allow => None,
-                                PermissionResponse::Deny => Some(
-                                    "Tool call denied by user. Please try a different approach."
-                                        .to_string(),
-                                ),
-                                PermissionResponse::Cancelled => {
-                                    return self
-                                        .finish_cancelled_tool_batch(
-                                            &tool_calls[tool_index..],
-                                        )
-                                        .await;
-                                }
-                            }
-                        }
-                        PermissionDecision::Deny(reason) => {
-                            tracing::warn!("Tool '{}' denied: {reason}", tc.function.name);
-                            Some(format!(
-                                "Tool call denied: {reason}. Please try a different approach."
-                            ))
+                    match self
+                        .permission_gateway()
+                        .authorize(tc, &args, bash_cmd.as_deref())
+                        .await
+                    {
+                        PermissionOutcome::Allow => None,
+                        PermissionOutcome::Deny(content) => Some(content),
+                        PermissionOutcome::Cancelled => {
+                            return self
+                                .finish_cancelled_tool_batch(&tool_calls[tool_index..])
+                                .await;
                         }
                     }
                 };
@@ -1622,38 +1607,6 @@ impl AgentLoop {
         Ok(())
     }
 
-    async fn request_permission(
-        &self,
-        tc: &ToolCall,
-        args: serde_json::Value,
-    ) -> PermissionResponse {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.pending_permissions
-            .lock()
-            .await
-            .insert(tc.id.clone(), sender);
-
-        self.events.emit(StreamEvent::PermissionRequest {
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.function.name.clone(),
-                    args,
-                });
-        {
-            let settings = self.settings.read().await;
-            crate::notify::send(
-                &settings,
-                crate::notify::NotifyEvent::PermissionWaiting,
-                format!("工具 {} 正在等待你的批准", tc.function.name),
-            );
-        }
-
-        let allow =
-            await_permission_response(receiver, self.cancel.as_ref(), Duration::from_secs(600))
-                .await;
-        self.pending_permissions.lock().await.remove(&tc.id);
-        allow
-    }
-
     async fn finish_cancelled_tool_batch(
         &self,
         remaining: &[ToolCall],
@@ -1758,6 +1711,19 @@ impl AgentLoop {
             endpoint_name: self.endpoint_name.clone(),
             model_id: self.model_id.clone(),
             api_style: self.api_style.clone(),
+        }
+    }
+
+    /// Build the desktop permission gateway for this run (keystone slice 4.6).
+    /// Clones only `Arc` handles — settings, the event sink, the shared
+    /// pending-permission map, and the SAME cancel `Arc` — and owns no
+    /// `AppHandle`. Reads the live policy and prompts the frontend on `Ask`.
+    fn permission_gateway(&self) -> permission_gateway::DesktopPermissionGateway {
+        permission_gateway::DesktopPermissionGateway {
+            settings: self.settings.clone(),
+            events: self.events.clone(),
+            pending_permissions: self.pending_permissions.clone(),
+            cancel: self.cancel.clone(),
         }
     }
 
@@ -2400,13 +2366,6 @@ impl AgentLoop {
                     None
                 };
 
-                let permission_policy = {
-                    let settings = self.settings.read().await;
-                    settings.permissions.clone()
-                };
-                let decision =
-                    decide_permission(&permission_policy, &tc.function.name, bash_cmd.as_deref());
-
                 let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
                 let completion_evidence = completion_gate.evidence();
                 let denial_content = if let Some(content) = autonomous_budget_denial(
@@ -2419,29 +2378,17 @@ impl AgentLoop {
                 ) {
                     Some(content)
                 } else {
-                    match decision {
-                        PermissionDecision::Allow => None,
-                        PermissionDecision::Ask => {
-                            match self.request_permission(tc, args.clone()).await {
-                                PermissionResponse::Allow => None,
-                                PermissionResponse::Deny => Some(
-                                    "Tool call denied by user. Please try a different approach."
-                                        .to_string(),
-                                ),
-                                PermissionResponse::Cancelled => {
-                                    return self
-                                        .finish_cancelled_tool_batch(
-                                            &tool_calls[tool_index..],
-                                        )
-                                        .await;
-                                }
-                            }
-                        }
-                        PermissionDecision::Deny(reason) => {
-                            tracing::warn!("Tool '{}' denied: {reason}", tc.function.name);
-                            Some(format!(
-                                "Tool call denied: {reason}. Please try a different approach."
-                            ))
+                    match self
+                        .permission_gateway()
+                        .authorize(tc, &args, bash_cmd.as_deref())
+                        .await
+                    {
+                        PermissionOutcome::Allow => None,
+                        PermissionOutcome::Deny(content) => Some(content),
+                        PermissionOutcome::Cancelled => {
+                            return self
+                                .finish_cancelled_tool_batch(&tool_calls[tool_index..])
+                                .await;
                         }
                     }
                 };

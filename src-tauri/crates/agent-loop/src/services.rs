@@ -41,6 +41,50 @@ pub struct NoOpHooks;
 
 impl LifecycleHooks for NoOpHooks {}
 
+/// The loop's per-tool authorization outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionOutcome {
+    /// Run the tool.
+    Allow,
+    /// Skip the tool; feed this content back to the model as the tool result.
+    Deny(String),
+    /// The user cancelled while a prompt was pending: the loop finishes the
+    /// remaining tool batch as cancelled and stops.
+    Cancelled,
+}
+
+/// Decides whether a tool call may run, prompting the user when the policy
+/// requires it. Desktop reads the live permission policy and, on `Ask`, emits a
+/// prompt to the frontend and waits (or observes a cancellation); headless
+/// auto-allows ([`AllowAllPermissions`]) since there is no user and the eval
+/// sandbox is the boundary.
+#[async_trait::async_trait]
+pub trait PermissionGateway: Send + Sync {
+    /// `bash_command` is the extracted shell command (for finer-grained
+    /// matching), if the call is a `bash` invocation.
+    async fn authorize(
+        &self,
+        tool_call: &crate::types::ToolCall,
+        args: &serde_json::Value,
+        bash_command: Option<&str>,
+    ) -> PermissionOutcome;
+}
+
+/// Headless permission gateway: every tool is allowed. Owns no `AppHandle`.
+pub struct AllowAllPermissions;
+
+#[async_trait::async_trait]
+impl PermissionGateway for AllowAllPermissions {
+    async fn authorize(
+        &self,
+        _tool_call: &crate::types::ToolCall,
+        _args: &serde_json::Value,
+        _bash_command: Option<&str>,
+    ) -> PermissionOutcome {
+        PermissionOutcome::Allow
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +118,23 @@ mod tests {
         assert!(h.pre_tool("bash", &serde_json::json!({"cmd": "ls"})).await);
         // post_tool is fire-and-forget: it must simply not panic.
         h.post_tool("bash", "output", 12).await;
+    }
+
+    #[tokio::test]
+    async fn allow_all_permissions_allow_and_are_object_safe() {
+        let g: std::sync::Arc<dyn PermissionGateway> = std::sync::Arc::new(AllowAllPermissions);
+        let tc = crate::types::ToolCall {
+            id: "t".into(),
+            r#type: "function".into(),
+            function: crate::types::FunctionCall {
+                name: "bash".into(),
+                arguments: "{}".into(),
+            },
+        };
+        assert_eq!(
+            g.authorize(&tc, &serde_json::json!({"command": "rm -rf /"}), Some("rm -rf /"))
+                .await,
+            PermissionOutcome::Allow
+        );
     }
 }
