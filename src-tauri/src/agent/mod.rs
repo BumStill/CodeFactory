@@ -65,6 +65,11 @@ use codefactory_agent_loop::services::{LifecycleHooks, NoOpHooks};
 // matched at the call sites. `DesktopPermissionGateway` lives in
 // `permission_gateway`; the pure `decide_permission` stays a free fn below.
 use codefactory_agent_loop::services::{PermissionGateway as _, PermissionOutcome};
+// The loop drives the model round through the `ModelTransport::complete()` seam
+// (slice 4.6 sub-step 7): `RoundOptions` carries require-tool + reasoning effort,
+// `ModelResponse` is the provider-independent answer. `TransportError` crosses
+// back as `AppError` via the `From` impl in `errors` (message verbatim).
+use codefactory_agent_loop::transport::{ModelResponse, ModelTransport as _, RoundOptions};
 // The pure completion-gate mode policy moved to agent-loop (slice 4.6 sub-step
 // 1). Pure fns are re-used directly; the mode-taking fns keep thin AgentMode
 // wrappers below that map to `FinalizationPolicy`, so call sites + #135/#136
@@ -1103,19 +1108,23 @@ impl AgentLoop {
             let required_tool_response = require_tool_next && !finalization_pending;
             // Resolve reasoning effort ONCE per round via ContextPolicy (slice
             // 4.6): it re-reads db+settings each round (freshness) and returns ""
-            // for non-ChatGPT styles, so the transport reads no DB. The two
-            // reactive retries below reuse this round's value.
-            let round_reasoning_effort = self.context_policy().round_reasoning_effort().await;
+            // for non-ChatGPT styles, so the transport reads no DB. Held in
+            // `round_options` so the two reactive retries below reuse this round's
+            // value.
+            let round_options = RoundOptions {
+                require_tool: required_tool_response,
+                reasoning_effort: self.context_policy().round_reasoning_effort().await,
+            };
             let call_result = self
                 .model_transport()
-                .call_openai_transport(
-                    &messages,
-                    active_tool_defs,
-                    required_tool_response,
-                    &round_reasoning_effort,
-                )
+                .complete(&messages, active_tool_defs, &round_options)
                 .await;
-            let (text, tool_calls, usage, reasoning) = match call_result {
+            let ModelResponse {
+                text,
+                tool_calls,
+                usage,
+                reasoning,
+            } = match call_result {
                 Ok(ok) => ok,
                 // The active model rejects image input (e.g. the user switched
                 // the session to a no-vision model with image attachments in
@@ -1135,7 +1144,7 @@ impl AgentLoop {
                         emergency_limit,
                     );
                     if !compression.compressed {
-                        return Err(e);
+                        return Err(e.into());
                     }
                     messages = repair_openai_tool_protocol(compression.messages);
                     let notice = format!(
@@ -1148,18 +1157,13 @@ impl AgentLoop {
                                 detail: notice.clone(),
                             });
                     self.model_transport()
-                        .call_openai_transport(
-                            &messages,
-                            active_tool_defs,
-                            required_tool_response,
-                            &round_reasoning_effort,
-                        )
+                        .complete(&messages, active_tool_defs, &round_options)
                         .await?
                 }
                 Err(e) if is_vision_rejection(&e.to_string()) => {
                     let stripped = strip_image_parts(&mut messages);
                     if stripped == 0 {
-                        return Err(e);
+                        return Err(e.into());
                     }
                     let notice = format!(
                         "已自动移除历史中的 {stripped} 张图片后重试:当前模型不支持图片输入。\
@@ -1171,15 +1175,10 @@ impl AgentLoop {
                                 detail: notice.clone(),
                             });
                     self.model_transport()
-                        .call_openai_transport(
-                            &messages,
-                            active_tool_defs,
-                            required_tool_response,
-                            &round_reasoning_effort,
-                        )
+                        .complete(&messages, active_tool_defs, &round_options)
                         .await?
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             };
             finalization_pending = false;
             require_tool_next = false;
@@ -2157,7 +2156,7 @@ impl AgentLoop {
                 Err(e) if is_vision_rejection(&e.to_string()) => {
                     let stripped = strip_image_values(&mut messages);
                     if stripped == 0 {
-                        return Err(e);
+                        return Err(e.into());
                     }
                     let notice = format!(
                         "已自动移除历史中的 {stripped} 张图片后重试:当前模型不支持图片输入。\

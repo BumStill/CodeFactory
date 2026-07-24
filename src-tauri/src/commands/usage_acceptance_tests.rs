@@ -179,7 +179,9 @@ fn completed_usage_is_persisted_before_post_response_cancellation() {
             // permission_gateway.rs in slice 4.6; finish_cancelled_tool_batch is now
             // the tight bound of the run_openai section.)
             "    async fn finish_cancelled_tool_batch(",
-            "let (text, tool_calls, usage, reasoning) = match call_result",
+            // The round's model answer (a `ModelResponse` destructure since slice
+            // 4.6 sub-step 7 switched the loop onto `ModelTransport::complete`).
+            "} = match call_result",
         ),
         (
             "anthropic",

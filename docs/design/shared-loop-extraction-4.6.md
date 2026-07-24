@@ -92,8 +92,19 @@ the two `*-usage-recorded` events, only on `Persistence::record_usage` Ok(true))
   `decide_permission` is pure so its now-lazy call is unobservable. Retargeted
   the usage-acceptance source-text end marker to `finish_cancelled_tool_batch`
   (request_permission left mod.rs). 470 lib + 18 agent-loop tests green.
-- **7–8 ⏳** the large phase: transport→`complete()` + `LoopError`, and the
-  651-line physical relocate. Verify locally with
+- **7 ✅** transport→`complete()`: the openai loop's main call + both reactive
+  retries now go through `ModelTransport::complete(&messages, tools,
+  &RoundOptions{require_tool, reasoning_effort})` returning `ModelResponse`
+  (destructured in place); `TransportError` crosses back as
+  `AppError::Other(e.to_string())` via a new `From` in `errors.rs` (message
+  verbatim, so the overflow/vision `e.to_string()` greps and all Display-only
+  consumers are byte-identical — no consumer reads the variant). Added the
+  forward-looking `LoopError{Transport,Persist,Tool}` to agent-loop (Display =
+  underlying verbatim; run_agent_loop returns it in step 8). Anthropic transport
+  untouched (4.7). Retargeted the openai usage-acceptance response marker to
+  `} = match call_result`. 476 lib + 19 agent-loop tests green.
+- **8 ⏳** the FINAL relocate: move the residual body into `run_agent_loop`.
+  Verify locally with
   `cargo test --lib -- --skip gh_cli_remote_reads_real_ci_status` (that one smoke
   needs HEAD pushed). One PR + one release when the branch is complete (or the
   step-7 fallback).
@@ -119,9 +130,10 @@ the two `*-usage-recorded` events, only on `Persistence::record_usage` Ok(true))
 6. ✅ **`PermissionGateway`** + `DesktopPermissionGateway` — fold `decide_permission`
    + `request_permission`. The fiddliest step (denial strings, Cancelled→
    `finish_cancelled_tool_batch`, pending_permissions atomicity).
-7. **Transport switch** — the 3 call sites + 2 retry arms → `ModelTransport::complete`;
+7. ✅ **Transport switch** — the 3 call sites + 2 retry arms → `ModelTransport::complete`;
    introduce `LoopError`. Keep the overflow/vision arms mutating `messages` and
-   grepping `e.to_string()` (TransportError Display is verbatim).
+   grepping `e.to_string()` (TransportError Display is verbatim). `From<TransportError>
+   for AppError` bridges the error back (Other, message verbatim).
 8. **FINAL relocate** — move the residual body (996-1627) into `run_agent_loop`;
    reduce `AgentLoop::run_openai` to a ~40-line adapter; graduate agent-loop `tokio`
    from dev-dep to real dep. Verify full suite + bin + smoke, then cut ONE
