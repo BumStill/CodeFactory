@@ -11,11 +11,29 @@
 //!
 //! Provisional: nothing consumes these yet (the loop body lands in slice 4.6).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use codefactory_agent_core::CompletionEvidence;
 
 use crate::journal::PersistError;
 use crate::tool::ToolError;
 use crate::transport::TransportError;
+use crate::types::ToolCall;
+
+/// The suffix of `tool_calls` from `start` onward when the run is cancelled,
+/// else `None`. The load is `SeqCst` — cooperative cancellation depends on it,
+/// and index-0 vs index-N of the returned slice drives the cancelled-vs-skipped
+/// message split. Shared by both provider loops (keystone slice 4.6b).
+pub fn cancelled_tool_suffix<'a>(
+    cancel: Option<&Arc<AtomicBool>>,
+    tool_calls: &'a [ToolCall],
+    start: usize,
+) -> Option<&'a [ToolCall]> {
+    cancel
+        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        .then(|| &tool_calls[start..])
+}
 
 /// The error `run_agent_loop` returns (keystone slice 4.6). Every arm's
 /// `Display` is the underlying error verbatim, so a desktop adapter can map it

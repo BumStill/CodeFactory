@@ -28,12 +28,10 @@ use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
     completion_evidence_made_progress, provider_rejects_required_tool_choice,
     should_prompt_budget_convergence, CompletionEvidence, CompletionGate, ProgressTracker,
-    ToolOutcome,
 };
 use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -70,13 +68,20 @@ use codefactory_agent_loop::services::{PermissionGateway as _, PermissionOutcome
 // `ModelResponse` is the provider-independent answer. `TransportError` crosses
 // back as `AppError` via the `From` impl in `errors` (message verbatim).
 use codefactory_agent_loop::transport::{ModelResponse, ModelTransport as _, RoundOptions};
+// Pure loop helpers relocated to agent-loop (keystone slice 4.6b); re-imported so
+// both provider loops + the bin unit tests keep the unqualified names.
+use codefactory_agent_loop::run::cancelled_tool_suffix;
+use codefactory_agent_loop::protocol::{
+    is_vision_rejection, repair_openai_tool_protocol, strip_image_parts, strip_image_values,
+};
 // The pure completion-gate mode policy moved to agent-loop (slice 4.6 sub-step
 // 1). Pure fns are re-used directly; the mode-taking fns keep thin AgentMode
 // wrappers below that map to `FinalizationPolicy`, so call sites + #135/#136
 // tests are unchanged.
 use codefactory_agent_loop::policy::{
     self, active_tool_definitions, completion_command_and_kind,
-    completion_recovery_attempts_after_tool_batch, openai_tool_controls, CompletionFinalization,
+    completion_recovery_attempts_after_tool_batch, openai_tool_controls, record_completion_outcome,
+    CompletionFinalization,
 };
 use codefactory_agent_loop::run::FinalizationPolicy;
 
@@ -151,15 +156,8 @@ async fn await_permission_response(
     }
 }
 
-fn cancelled_tool_suffix<'a>(
-    cancel: Option<&Arc<AtomicBool>>,
-    tool_calls: &'a [ToolCall],
-    start: usize,
-) -> Option<&'a [ToolCall]> {
-    cancel
-        .is_some_and(|flag| flag.load(Ordering::SeqCst))
-        .then(|| &tool_calls[start..])
-}
+// `cancelled_tool_suffix` moved to `agent-loop::run` (keystone slice 4.6b) and is
+// re-imported below so both provider loops keep the unqualified name.
 
 /// Tool-call iteration ceiling for INTERACTIVE chat. Conservative
 /// because every iteration is a user-visible turn — letting it run too
@@ -786,7 +784,7 @@ impl AgentLoop {
             ApiStyle::Openai,
             project.clone(),
             Arc::new(RwLock::new(Settings::default())),
-            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             Arc::new(McpManager::new()),
             None,
             AgentMode::Autonomous,
@@ -1494,7 +1492,8 @@ impl AgentLoop {
                     &self.cwd,
                     &tc.function.name,
                     &completion_args,
-                    &output,
+                    &output.content,
+                    output.is_error,
                 ) {
                     progress_prompt = Some(prompt);
                 }
@@ -2498,7 +2497,8 @@ impl AgentLoop {
                     &self.cwd,
                     &tc.function.name,
                     &completion_args,
-                    &output,
+                    &output.content,
+                    output.is_error,
                 ) {
                     progress_prompt = Some(prompt);
                 }
@@ -2664,62 +2664,9 @@ fn completion_recovery_prompt(
 }
 
 /// Placeholder inserted in place of an image part when the active model
-/// rejects vision input. Visible to the model (so it knows an image existed)
-/// and stable for the strip functions' idempotence checks.
-const IMAGE_STRIPPED_PLACEHOLDER: &str = "[图片已省略:当前模型不支持图片输入]";
-
-/// Does this provider error mean "the model can't accept image input"?
-/// Deliberately narrow: capability wording only, never generic failures —
-/// a false positive would silently drop the user's images on a transient
-/// error, so unknown errors must stay unmatched and surface as-is.
-fn is_vision_rejection(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    ["image", "vision", "multimodal"]
-        .iter()
-        .any(|needle| lower.contains(needle))
-        && !lower.contains("rate limit")
-}
-
-/// Replace image parts in OpenAI-shaped messages with a text placeholder.
-/// Returns how many were stripped (0 = nothing to do → do not retry again).
-fn strip_image_parts(messages: &mut [ChatMessage]) -> usize {
-    let mut stripped = 0;
-    for message in messages.iter_mut() {
-        if let MessageContent::Parts(parts) = &mut message.content {
-            for part in parts.iter_mut() {
-                if part.r#type == "image_url" {
-                    part.r#type = "text".into();
-                    part.text = Some(IMAGE_STRIPPED_PLACEHOLDER.to_string());
-                    part.image_url = None;
-                    stripped += 1;
-                }
-            }
-        }
-    }
-    stripped
-}
-
-/// Same as [`strip_image_parts`] for the Anthropic-shaped JSON message array
-/// (`type: "image"` blocks and any `image_url` compatibility parts).
-fn strip_image_values(messages: &mut [serde_json::Value]) -> usize {
-    let mut stripped = 0;
-    for message in messages.iter_mut() {
-        let Some(parts) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
-            continue;
-        };
-        for part in parts.iter_mut() {
-            let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if kind == "image" || kind == "image_url" {
-                *part = serde_json::json!({
-                    "type": "text",
-                    "text": IMAGE_STRIPPED_PLACEHOLDER,
-                });
-                stripped += 1;
-            }
-        }
-    }
-    stripped
-}
+// `IMAGE_STRIPPED_PLACEHOLDER`, `is_vision_rejection`, `strip_image_parts`,
+// `strip_image_values` moved to `agent-loop::protocol` (keystone slice 4.6b),
+// re-imported at the top so both loops + the bin unit tests keep the names.
 
 /// History rows that may be replayed to the provider on a later user turn.
 /// Completion-review controls are persisted for UI recovery and forensics,
@@ -3214,35 +3161,9 @@ fn autonomous_budget_denial(
     )
 }
 
-fn record_completion_outcome(
-    gate: &mut CompletionGate,
-    progress: &mut ProgressTracker,
-    sequence: &mut u64,
-    working_directory: &Path,
-    tool_name: &str,
-    args: &serde_json::Value,
-    output: &tools::ToolOutput,
-) -> Option<String> {
-    *sequence += 1;
-    let (command, kind) = completion_command_and_kind(tool_name, args);
-    let outcome = ToolOutcome {
-        request_id: format!("desktop-tool-{sequence}"),
-        command,
-        working_directory: Some(working_directory.to_string_lossy().into_owned()),
-        kind,
-        sequence: *sequence,
-        started_at_ms: 0,
-        finished_at_ms: 0,
-        return_code: Some(if output.is_error { 1 } else { 0 }),
-        stdout: output.content.clone(),
-        stderr: String::new(),
-        error: output.is_error.then(|| output.content.clone()),
-        semantic_failure: false,
-    }
-    .with_detected_semantic_failure();
-    gate.record(&outcome);
-    progress.record(&outcome)
-}
+// `record_completion_outcome` moved to `agent-loop::policy` (keystone slice
+// 4.6b), its `&tools::ToolOutput` param flattened to `(content, is_error)`.
+// Re-imported below; both loops pass `&output.content, output.is_error`.
 
 /// Convert an MCP tool descriptor into the OpenAI-compatible ToolDefinition format.
 fn mcp_tool_to_definition(tool: &crate::mcp::McpTool) -> ToolDefinition {
@@ -3380,72 +3301,8 @@ fn repair_incomplete_tool_history(history: Vec<Message>) -> Vec<Message> {
     repaired
 }
 
-fn repair_openai_tool_protocol(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    fn synthetic_tool_message(tool_call_id: String) -> ChatMessage {
-        ChatMessage {
-            role: "tool".into(),
-            content: MessageContent::Text(
-                "Tool result unavailable in persisted history; continue from current workspace state."
-                    .into(),
-            ),
-            tool_calls: None,
-            tool_call_id: Some(tool_call_id),
-            name: None,
-            reasoning_content: None,
-        }
-    }
-
-    fn append_missing_results(repaired: &mut Vec<ChatMessage>, pending: &mut Vec<String>) {
-        repaired.extend(pending.drain(..).map(synthetic_tool_message));
-    }
-
-    let mut repaired = Vec::with_capacity(messages.len());
-    let mut pending_tool_calls: Vec<String> = Vec::new();
-
-    for mut message in messages {
-        if message.role != "tool" && !pending_tool_calls.is_empty() {
-            append_missing_results(&mut repaired, &mut pending_tool_calls);
-        }
-
-        if message.role == "tool" {
-            let Some(tool_call_id) = message.tool_call_id.as_deref() else {
-                continue;
-            };
-            let Some(index) = pending_tool_calls
-                .iter()
-                .position(|pending| pending == tool_call_id)
-            else {
-                continue;
-            };
-            pending_tool_calls.remove(index);
-            repaired.push(message);
-            continue;
-        }
-
-        if message.role == "assistant" {
-            if let Some(tool_calls) = message.tool_calls.as_mut() {
-                let mut seen_ids = HashSet::new();
-                tool_calls.retain(|tool_call| {
-                    !tool_call.id.trim().is_empty() && seen_ids.insert(tool_call.id.clone())
-                });
-                if tool_calls.is_empty() {
-                    message.tool_calls = None;
-                }
-            }
-            pending_tool_calls = message
-                .tool_calls
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .map(|tool_call| tool_call.id.clone())
-                .collect();
-        }
-        repaired.push(message);
-    }
-
-    append_missing_results(&mut repaired, &mut pending_tool_calls);
-    repaired
-}
+// `repair_openai_tool_protocol` moved to `agent-loop::protocol` (keystone slice
+// 4.6b), re-imported at the top so both loops + the bin unit tests keep the name.
 
 /// Read at most `max_chars` UTF-8 chars from a file, appending "…" if truncated.
 fn read_file_capped(path: &Path, max_chars: usize) -> Option<String> {
@@ -4700,7 +4557,7 @@ mod tests {
             Path::new("/workspace"),
             "write_file",
             &serde_json::json!({"path": "src/example.rs", "content": "fn main() {}"}),
-            &tools::ToolOutput::ok("written"),
+            "written", false,
         );
         assert!(!gate.evidence().completed);
 
@@ -4711,7 +4568,7 @@ mod tests {
             Path::new("/workspace"),
             "bash",
             &serde_json::json!({"command": "cargo test"}),
-            &tools::ToolOutput::ok("test result: ok"),
+            "test result: ok", false,
         );
         assert!(gate.evidence().completed);
     }
@@ -4729,7 +4586,7 @@ mod tests {
             Path::new("/workspace"),
             "write_file",
             &serde_json::json!({"path": "src/app.rs", "content": "fixed"}),
-            &tools::ToolOutput::ok("written"),
+            "written", false,
         );
         record_completion_outcome(
             &mut gate,
@@ -4740,7 +4597,7 @@ mod tests {
             &serde_json::json!({
                 "command": "status=0; grep -n stale src/app.rs || status=$?; test \"$status\" -le 1"
             }),
-            &tools::ToolOutput::err("zsh:1: read-only variable: status"),
+            "zsh:1: read-only variable: status", true,
         );
 
         let failed = gate.evidence();
@@ -4757,7 +4614,7 @@ mod tests {
             Path::new("/workspace"),
             "bash",
             &serde_json::json!({"command": "cargo test"}),
-            &tools::ToolOutput::ok("test result: ok. 1 passed; 0 failed"),
+            "test result: ok. 1 passed; 0 failed", false,
         );
 
         let recovered = gate.evidence();
@@ -4783,7 +4640,7 @@ mod tests {
             Path::new("/workspace"),
             "write_file",
             &serde_json::json!({"path": "result.txt", "content": "candidate"}),
-            &tools::ToolOutput::ok("written"),
+            "written", false,
         );
         let evidence = gate.evidence();
 
@@ -4831,7 +4688,7 @@ mod tests {
             Path::new("/workspace"),
             "write_file",
             &serde_json::json!({"path": "src/worker.rs", "content": "candidate"}),
-            &tools::ToolOutput::ok("written"),
+            "written", false,
         );
         record_completion_outcome(
             &mut gate,
@@ -4840,7 +4697,7 @@ mod tests {
             Path::new("/workspace"),
             "bash",
             &serde_json::json!({"command": "cargo test worker::tests::behavior"}),
-            &tools::ToolOutput::err("assertion failed"),
+            "assertion failed", true,
         );
         record_completion_outcome(
             &mut gate,
@@ -4849,7 +4706,7 @@ mod tests {
             Path::new("/workspace"),
             "read_file",
             &serde_json::json!({"path": "src/worker.rs"}),
-            &tools::ToolOutput::ok("candidate"),
+            "candidate", false,
         );
         let evidence = gate.evidence();
 
@@ -4892,7 +4749,7 @@ mod tests {
             Path::new("/workspace"),
             "write_file",
             &serde_json::json!({"path": "tool", "content": "implementation"}),
-            &tools::ToolOutput::ok("written"),
+            "written", false,
         );
         record_completion_outcome(
             &mut gate,
@@ -4903,7 +4760,7 @@ mod tests {
             &serde_json::json!({
                 "command": "test \"$(./tool 3)\" = 9 && test \"$(./tool 5)\" = 25"
             }),
-            &tools::ToolOutput::ok("examples passed"),
+            "examples passed", false,
         );
 
         let smoke = gate.evidence();
@@ -4918,7 +4775,7 @@ mod tests {
             Path::new("/workspace"),
             "bash",
             &serde_json::json!({"command": "test \"$(./tool 7)\" = 49"}),
-            &tools::ToolOutput::ok("independent case passed"),
+            "independent case passed", false,
         );
         let completed = gate.evidence();
         assert_eq!(completed.last_independent_verification_sequence, Some(3));
@@ -4942,9 +4799,7 @@ mod tests {
             &serde_json::json!({
                 "command": "set -e\nprintf '== agent injection ==\\n'; sed -n '445,500p' src-tauri/src/agent/mod.rs"
             }),
-            &tools::ToolOutput::ok(
-                "Err(e) => Ok(tools::ToolOutput::err(format!(\"MCP error: {e}\")))",
-            ),
+            "Err(e) => Ok(tools::ToolOutput::err(format!(\"MCP error: {e}\")))", false,
         );
         let evidence = gate.evidence();
         assert!(
@@ -4963,7 +4818,7 @@ mod tests {
             &serde_json::json!({
                 "command": "pnpm exec vitest run src/pages/Workspace/TaskCreator.test.tsx"
             }),
-            &tools::ToolOutput::ok("Test Files  2 passed (2)"),
+            "Test Files  2 passed (2)", false,
         );
         let evidence = gate.evidence();
         assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
@@ -5304,7 +5159,7 @@ mod tests {
             &serde_json::json!({
                 "command": "nohup ./server >server.log 2>&1 & echo $! >server.pid"
             }),
-            &tools::ToolOutput::ok("started"),
+            "started", false,
         );
         assert!(!gate.evidence().completed);
 
@@ -5317,7 +5172,7 @@ mod tests {
             &serde_json::json!({
                 "command": "timeout 10 curl --fail http://127.0.0.1:8080/health"
             }),
-            &tools::ToolOutput::ok("healthy"),
+            "healthy", false,
         );
         assert!(gate.evidence().completed);
     }
@@ -5567,7 +5422,7 @@ mod tests {
                 "old_string": "rt.old_value(value)",
                 "new_string": "rt.new_value(value)"
             }),
-            &tools::ToolOutput::ok("Edited /workspace/compatdemo/service.py"),
+            "Edited /workspace/compatdemo/service.py", false,
         );
 
         let evidence = gate.evidence();
