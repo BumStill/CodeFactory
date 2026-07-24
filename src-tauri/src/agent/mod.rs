@@ -983,6 +983,7 @@ impl AgentLoop {
         system_prompt: &str,
     ) -> Result<()> {
         let completion_instruction = latest_user_instruction(&history);
+        let fact_check_instruction = effective_fact_check_instruction(&history);
         let mut messages = self.build_openai_messages(history, system_prompt);
         // Proactive capability match: strip images BEFORE the first request
         // when the model is KNOWN text-only, instead of burning a 400 round
@@ -1230,7 +1231,7 @@ impl AgentLoop {
                 // probe-backed correction — facts over stale memory.
                 if !fact_check_used {
                     if let Some(correction) =
-                        fact_check_reply(&text, &completion_instruction, self.mode)
+                        fact_check_reply(&text, &fact_check_instruction, self.mode)
                     {
                         fact_check_used = true;
                         self.persist_gate_message(&correction, "turn_notice").await?;
@@ -2078,6 +2079,7 @@ impl AgentLoop {
         system_prompt: &str,
     ) -> Result<()> {
         let completion_instruction = latest_user_instruction(&history);
+        let fact_check_instruction = effective_fact_check_instruction(&history);
         let mut messages = self.build_anthropic_messages(history);
         // Proactive capability match — see the OpenAI loop for rationale.
         {
@@ -2301,7 +2303,7 @@ impl AgentLoop {
                 // Systemic fact-check — see the OpenAI loop for rationale.
                 if !fact_check_used {
                     if let Some(correction) =
-                        fact_check_reply(&text, &completion_instruction, self.mode)
+                        fact_check_reply(&text, &fact_check_instruction, self.mode)
                     {
                         fact_check_used = true;
                         self.persist_gate_message(&correction, "turn_notice").await?;
@@ -2980,6 +2982,38 @@ fn latest_user_instruction(history: &[Message]) -> String {
         .unwrap_or_default()
 }
 
+/// Fact checking follows the effective objective, not just the latest row.
+/// A short approval ("做吧", "继续", "go ahead") inherits the immediately
+/// preceding assistant proposal, matching the same dispatch semantics that
+/// moved the turn into Execute mode. Internal completion-state rows never
+/// participate in that inheritance.
+fn effective_fact_check_instruction(history: &[Message]) -> String {
+    let Some((user_index, user_message)) = history
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| message.role == "user" && message.completion_state.is_none())
+    else {
+        return String::new();
+    };
+
+    if !dispatch::is_approval(&user_message.content) {
+        return user_message.content.clone();
+    }
+
+    let previous_proposal = history[..user_index]
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant" && message.completion_state.is_none())
+        .map(|message| message.content.trim())
+        .filter(|content| !content.is_empty());
+
+    match previous_proposal {
+        Some(proposal) => format!("{proposal}\n\n用户批准：{}", user_message.content),
+        None => user_message.content.clone(),
+    }
+}
+
 /// Transient provider saturation worth a backoff retry instead of a dead
 /// turn. Distinct from capacity (context) and capability (vision) errors.
 fn is_provider_overloaded(error: &str) -> bool {
@@ -3016,7 +3050,72 @@ const SELF_RECOVERY_CONTRACT: &str = "\
 /// 2026-07-24 did exactly that: "请检查模型配置" near the top of a product
 /// analysis plus "GitHub token 不可用" in a later Agent example was read as
 /// "please configure a GitHub token", hijacking the answer into delivery.
-fn fact_claim_units(text: &str) -> Vec<&str> {
+fn strip_inline_non_assertive_spans(line: &str) -> String {
+    let mut stripped = String::with_capacity(line.len());
+    let mut quote_end = None;
+    let chars = line.chars().collect::<Vec<_>>();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if let Some(end) = quote_end {
+            if ch == end {
+                quote_end = None;
+            }
+            continue;
+        }
+        quote_end = match ch {
+            '`' => Some('`'),
+            '"' => Some('"'),
+            '\'' if (index == 0 || !chars[index - 1].is_alphanumeric())
+                && chars[index + 1..].contains(&'\'') =>
+            {
+                Some('\'')
+            }
+            '“' => Some('”'),
+            '‘' => Some('’'),
+            '「' => Some('」'),
+            '『' => Some('』'),
+            '《' => Some('》'),
+            _ => {
+                stripped.push(ch);
+                None
+            }
+        };
+    }
+    stripped
+}
+
+fn fact_claim_units(text: &str) -> Vec<String> {
+    let mut units = Vec::new();
+    let mut in_fenced_code = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fenced_code = !in_fenced_code;
+            continue;
+        }
+        if in_fenced_code
+            || trimmed.is_empty()
+            || trimmed.starts_with('>')
+            || (trimmed.starts_with('|') && trimmed.ends_with('|'))
+        {
+            continue;
+        }
+        let assertive = strip_inline_non_assertive_spans(trimmed);
+        units.extend(
+            assertive
+                .split(|ch| matches!(ch, '。' | '！' | '？' | '!' | '?' | '；' | ';'))
+                .map(str::trim)
+                .filter(|unit| !unit.is_empty())
+                .map(str::to_string),
+        );
+    }
+    units
+}
+
+/// User intent keeps quoted UI labels and inline tool names because they may
+/// be the action itself ("点击“创建 PR”", "调用 `deliver_changes`"). Candidate
+/// fact parsing strips those spans instead, since a reply may merely quote an
+/// error. Fenced examples and blockquotes remain excluded on both paths.
+fn intent_units(text: &str) -> Vec<String> {
     let mut units = Vec::new();
     let mut in_fenced_code = false;
     for line in text.lines() {
@@ -3032,7 +3131,8 @@ fn fact_claim_units(text: &str) -> Vec<&str> {
             trimmed
                 .split(|ch| matches!(ch, '。' | '！' | '？' | '!' | '?' | '；' | ';'))
                 .map(str::trim)
-                .filter(|unit| !unit.is_empty()),
+                .filter(|unit| !unit.is_empty())
+                .map(str::to_string),
         );
     }
     units
@@ -3068,7 +3168,7 @@ fn claims_delivery_blocked(text: &str) -> bool {
     let inability = ["无法", "不能", "cannot", "can't", "unable"];
     let channel = ["创建 pr", "开 pr", "create the pr", "create a pr", "自动创建 pr"];
     fact_claim_units(text).into_iter().any(|unit| {
-        if is_example_or_hypothesis(unit) {
+        if is_example_or_hypothesis(&unit) {
             return false;
         }
         let lower = unit.to_lowercase();
@@ -3219,8 +3319,8 @@ fn instruction_requests_delivery(instruction: &str) -> bool {
         "then",
     ];
 
-    fact_claim_units(instruction).into_iter().any(|unit| {
-        if is_example_or_hypothesis(unit) {
+    intent_units(instruction).into_iter().any(|unit| {
+        if is_example_or_hypothesis(&unit) {
             return false;
         }
         let lower = unit.to_lowercase();
@@ -3247,6 +3347,26 @@ fn delivery_fact_check_applies(mode: AgentMode, instruction: &str) -> bool {
     !matches!(mode, AgentMode::Interactive) && instruction_requests_delivery(instruction)
 }
 
+fn delivery_fact_check_correction(
+    text: &str,
+    completion_instruction: &str,
+    mode: AgentMode,
+    gh_cli_available: bool,
+) -> Option<String> {
+    if !delivery_fact_check_applies(mode, completion_instruction)
+        || !claims_delivery_blocked(text)
+        || !gh_cli_available
+    {
+        return None;
+    }
+    Some(
+        "事实纠偏:你刚声称交付通道不可用/需要配置,但本机 GitHub CLI 已登录且刚刚实测可用。\
+这是基于过期上下文的错误判断。立即调用 deliver_changes 完成交付并报告其真实结果;\
+不要再要求用户配置任何令牌或运行 gh auth login。"
+            .to_string(),
+    )
+}
+
 /// Fact-check a tool-call-free reply against live probes. Text detectors run
 /// only for execution turns; an interactive analysis must finish as an answer,
 /// never as a hidden correction loop. Probes run ONLY on a text match, so
@@ -3260,16 +3380,13 @@ fn fact_check_reply(
     if matches!(mode, AgentMode::Interactive) {
         return None;
     }
-    if delivery_fact_check_applies(mode, completion_instruction)
-        && claims_delivery_blocked(text)
-        && delivery::gh_cli_available()
-    {
-        return Some(
-            "事实纠偏:你刚声称交付通道不可用/需要配置,但本机 GitHub CLI 已登录且刚刚实测可用。\
-这是基于过期上下文的错误判断。立即调用 deliver_changes 完成交付并报告其真实结果;\
-不要再要求用户配置任何令牌或运行 gh auth login。"
-                .to_string(),
-        );
+    if let Some(correction) = delivery_fact_check_correction(
+        text,
+        completion_instruction,
+        mode,
+        delivery::gh_cli_available(),
+    ) {
+        return Some(correction);
     }
     if let Some(cmd) = claims_command_missing(text) {
         if command_exists(&cmd) {
@@ -4505,6 +4622,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fact_check_instruction_inherits_an_approved_delivery_proposal() {
+        let proposal = stored_message(
+            "assistant",
+            "方案已经准备好：提交并推送当前改动，然后创建 PR。是否开始实施？",
+            None,
+        );
+        let approval = stored_message("user", "做吧", None);
+        let inherited = effective_fact_check_instruction(&[proposal, approval]);
+
+        assert!(instruction_requests_delivery(&inherited), "{inherited}");
+    }
+
+    #[test]
+    fn fact_check_instruction_does_not_invent_delivery_for_plain_continuation() {
+        let analysis = stored_message(
+            "assistant",
+            "待执行入口应该只在用户有可操作事项时出现。",
+            None,
+        );
+        let continuation = stored_message("user", "继续", None);
+        let inherited = effective_fact_check_instruction(&[analysis, continuation]);
+
+        assert!(!instruction_requests_delivery(&inherited), "{inherited}");
+    }
+
     fn stored_message(role: &str, content: &str, tool_calls: Option<String>) -> Message {
         Message {
             id: Uuid::new_v4().to_string(),
@@ -5119,6 +5262,10 @@ mod tests {
             "交付结果: delivered",
             "任务已委派，若长时间未开始请检查模型配置。\n\nAgent B：检查发布流程\n原因：GitHub token 不可用",
             "产品方案示例：无法创建 PR，请在设置中配置 GitHub token。",
+            "界面现在展示错误文案：“无法创建 PR，请在设置中配置 GitHub token”。",
+            "文案应为 `无法创建 PR，请在设置中配置 GitHub token`。",
+            "界面展示 '无法创建 PR，请在设置中配置 GitHub token' 作为错误文案。",
+            "| 场景 | 示例文案 |\n| --- | --- |\n| 未认证 | 无法创建 PR，请在设置中配置 GitHub token |",
         ] {
             assert!(!claims_delivery_blocked(text), "{text}");
         }
@@ -5223,6 +5370,26 @@ mod tests {
                     "{delivery_instruction}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn delivery_fact_check_positive_path_is_deterministic_without_local_gh() {
+        for delivery_instruction in [
+            "请提交并推送当前改动，然后创建 PR。",
+            "请点击“创建 PR”并继续。",
+            "请调用 `deliver_changes` 完成交付。",
+        ] {
+            let correction = delivery_fact_check_correction(
+                "无法创建 PR：请在设置中配置 GitHub token，然后我才能继续。",
+                delivery_instruction,
+                AgentMode::Execute,
+                true,
+            );
+            assert!(
+                correction.is_some_and(|text| text.contains("deliver_changes")),
+                "{delivery_instruction}"
+            );
         }
     }
 

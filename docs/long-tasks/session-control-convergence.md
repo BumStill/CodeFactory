@@ -33,6 +33,7 @@
 - [x] 复盘 2026-07-24 现场会话：正确分析答案完成后，`turn_notice` 因跨段拼接“请检查模型配置”和示例“GitHub token 不可用”而错误注入 `deliver_changes`。
 - [x] CF-SCC-R13 失败先行：精确现场文本、同句示例、分析意图、明确交付意图和旧 `role=user` notice 均有 Rust 回归。
 - [x] 自动事实纠偏只进入执行型回合；交付纠偏再经过局部事实单元 + 当前用户交付意图双门禁。`turn_notice` 改存 system 来源，旧脏数据也不会成为下一回合用户目标。
+- [x] 合并前独立复审补齐行内引号/反引号/Markdown 表格排除、批准短语继承上一轮交付方案，以及不依赖本机 `gh` 的确定性正向测试；复审确认无剩余 P1。
 - [x] 隔离 `CodeFactoryTurnNoticeDev` 真实 App hydration 验证：用户问题和正确助手答案保持正常层级，system `turn_notice` 显示为居中运行时提示，不伪装成用户气泡；测试会话、进程组和 1420 端口已清理。
 
 ## Remaining Items
@@ -47,7 +48,7 @@
 ## Evidence
 
 - Local evidence: 2026-07-23 正式 App SQLite 中 15:00 后存在 4 条 `gate_recovery`、4 条 `rejected_candidate`、56 次工具调用；CodeFactory 进程与 provider 连接持续活跃。
-- Test evidence: R13 失败先行后，`pnpm test` 68 files / 294 tests、`pnpm build`、`pnpm exec tsc --noEmit`、`pnpm test:rust:fast --lib` 474 passed / 6 ignored、治理基线和 `git diff --check` 通过。
+- Test evidence: R13 失败先行后，`pnpm test` 68 files / 294 tests、`pnpm build`、`pnpm exec tsc --noEmit`、`pnpm test:rust:fast --lib` 477 passed / 6 ignored、治理基线和 `git diff --check` 通过。
 - Real App evidence: `CodeFactoryDev` 中信任模式显示“减少确认，不改变分析/执行意图”；独立持久化 recovery 会话显示紧凑的“执行已中断 / 第 1/3 次 / 未收到最终答复 / 最近活动”状态卡，未显示内部英文 gate prompt、命令或参数。R13 隔离 Dev 会话显示原始用户问题、正确助手正文和居中 system 运行时提示三层来源；没有出现第二个用户气泡或“前 N 步”折叠。
 - Release evidence: PR https://github.com/BumStill/CodeFactory/pull/183 merged；main CI run 29994718058 passed；Auto Release run 29995215300 生成 v1.64.2；Release run 29995236008 全绿；GitHub Latest 指向 https://github.com/BumStill/CodeFactory/releases/tag/v1.64.2，6 个资产与 `latest.json` 的 Windows/macOS 路由、签名均可公开下载。
 - Blocking evidence: R13 真实 Dev App 调用 DeepSeek 时返回 HTTP 401；隔离 Dev 没有有效 provider 凭据，未复制或迁移正式 App 凭据。真实模型往返和发布安装产物仍待后续证据，当前修复保持 `not live`。
