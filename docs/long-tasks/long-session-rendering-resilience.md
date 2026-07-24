@@ -14,9 +14,9 @@
 
 ## Current State
 
-- Current phase: 精确候选进入 PR 与发布链。
-- Current checkpoint: 有界分页、完整 DTO 桥接预算、增量 reducer、折叠卡惰性解析、并发请求门禁与 prepend 滚动锚点已经实现；全量自动化、生产构建和治理基线绿色，原故障 SQLite 隔离副本已在 Dev App 恢复可交互。
-- Next owner: 提交 PR，等待 CI、合并、刻意发版与公开安装包复验。
+- Current phase: 已完成并发布。
+- Current checkpoint: PR #197 已合并，main 精确 SHA CI 绿色，v1.64.11 已公开发布；原故障 SQLite 隔离副本 Dev App、双平台 release 构建、发布前后 macOS DMG smoke 和本机匿名下载复验均通过。
+- Next owner: None.
 - Updated at: 2026-07-24
 
 ## Completed Items
@@ -41,8 +41,8 @@
 - [x] 补齐 selection race、分页/stream race、local notice、prepend anchor 与兼容矩阵回归。
 - [x] 全量自动化、build、治理基线和原故障等比例隔离 Dev App 验收。
 - [x] 三个独立子 agent 完成架构、测试和 QA 复审，未发现 release blocker。
-- [ ] PR+CI、合并。
-- [ ] 刻意发版和公开安装产物真实 App 验收。
+- [x] PR #197 全绿合并，合并提交 `84b91b2a5fd4650e17578cb6aa07bd8f54c57803` 的 main CI 通过。
+- [x] v1.64.11 刻意发版，Windows/macOS 构建、平台 smoke、公开 DMG 回下载和真实窗口验证通过。
 
 ## Blockers
 
@@ -52,8 +52,8 @@
 
 - Local evidence: 正式 CodeFactory v1.64.8 进程 86951 与 WebContent 86962；SQLite session `43ec91cc-9b2d-4213-b8a7-a1592acf8bc5`；最终回复已落库但窗口未刷新。
 - Test evidence: 最终本地候选前端 72 files / 312 tests；Rust 483 passed / 0 failed / 6 ignored；`pnpm build`、TypeScript、治理基线和 `git diff --check` 通过。
-- Real App evidence: 原故障 SQLite 隔离副本在候选 Dev App 中最新 final 可见、可上翻；WebContent 稳态约 222.4 MB、峰值约 582.7 MB、静置 CPU 0–1.2%。最终并发/桥接边界补丁后本机锁屏，按仓库约束不要求用户解锁，改由精确 SHA 自动化、GitHub macOS 构建产物 smoke 和公开安装包验证继续收口。
-- Release evidence: `not live`.
+- Real App evidence: 原故障 SQLite 隔离副本在候选 Dev App 中最新 final 可见、可上翻；WebContent 稳态约 222.4 MB、峰值约 582.7 MB、静置 CPU 0–1.2%。精确 release 提交的 DMG 在 GitHub runner 发布前后两次通过安装级 smoke；本机从公开 URL 无认证下载后再次通过 bundle/version/arm64、闭环 receipt 和真实 1200×800 窗口稳定性验证。
+- Release evidence: `live`；[PR #197](https://github.com/BumStill/CodeFactory/pull/197)；[main CI](https://github.com/BumStill/CodeFactory/actions/runs/30087779079)；[v1.64.11 release](https://github.com/BumStill/CodeFactory/releases/tag/v1.64.11)；[release workflow](https://github.com/BumStill/CodeFactory/actions/runs/30088206979)。公开 DMG SHA-256 `6845480013932f0b7d89fc852cdb71b25e43b06461e5a05758006ae43f015f03` 与 GitHub asset digest 一致，内置 build SHA 为 `51c81c61af44758c8f26230a44cf9e4e8ccbed66`，`latest.json` 指向 1.64.11 的 darwin/windows 更新资产。
 - Blocking evidence: none.
 
 ## AI Collaboration
@@ -61,10 +61,11 @@
 - context scope: `get_messages`、SQLite row ordering、`dbMessagesToUI`、Zustand runtime、stream reducer、MessageList、ToolCallCard、sticky scroll、发布验证。
 - assumptions: 原始历史不得删除；旧 hydration 语义保持；首版优先有界分页和惰性解析，不引入第三方虚拟列表。
 - review point: 三个独立子 agent 分别审查分页架构、稳定红灯测试和真实 App UX/性能门槛。
-- validation result: 现场根因、实现、自动化和隔离 Dev App 性能证据已验证；PR、CI、公开发布与发布 App 证据待补。
+- validation result: 现场根因、实现、自动化、隔离 Dev App 性能、PR/main CI、双平台 release、公开更新清单和发布 App 证据全部验证通过。
 
 ## Stop Boundary
 
 - 不在设计或单元测试后停止。
 - 不在 PR 创建、CI 绿色、合并或 release workflow 启动后停止。
 - 只有公开安装产物的真实超长会话路径通过，或有明确外部 blocker，才允许停止。
+- Satisfied at: 2026-07-24，v1.64.11 公开安装产物验证通过。
