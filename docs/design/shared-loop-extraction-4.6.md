@@ -66,9 +66,17 @@ the two `*-usage-recorded` events, only on `Persistence::record_usage` Ok(true))
   the 2 cost events) + `record_usage_event_for_round` through `Persistence::record_usage`.
 - **3 ✅** (1a08902) `Persistence::record_tool_call_started` absorbs the last raw
   `self.db` write in the loops.
-- **4–8 ⏳** the large phase: ContextPolicy / LifecycleHooks / PermissionGateway
-  (new capability traits + desktop impls), transport→`complete()`, and the
-  651-line physical relocate. Verify locally with
+- **4 ✅** `ContextPolicy` (`agent-loop/services.rs`, `u32` window to match
+  `context::ContextWindow`) + `DesktopContextPolicy` (`src/agent/context_policy.rs`,
+  no `AppHandle` — settings lock + pool + config identity only, reads via `super::`).
+  Rewires openai `context_window`/`round_reasoning_effort` and BOTH loops'
+  `supports_vision`. The old `resolve_round_reasoning_effort` body moved verbatim
+  (api_style gate folded in). Anthropic `context_window` stays inline — it uses
+  `default_limit`, not `select_limit(estimated)`, so it waits for 4.7. 470 lib +
+  16 agent-loop tests green; vision-strip + reasoning-freshness pins hold.
+- **5–8 ⏳** the large phase: LifecycleHooks / PermissionGateway (new capability
+  traits + desktop impls), transport→`complete()`, and the 651-line physical
+  relocate. Verify locally with
   `cargo test --lib -- --skip gh_cli_remote_reads_real_ci_status` (that one smoke
   needs HEAD pushed). One PR + one release when the branch is complete (or the
   step-7 fallback).
@@ -86,9 +94,9 @@ the two `*-usage-recorded` events, only on `Persistence::record_usage` Ok(true))
    `record_usage_event_for_round` through `Persistence::record_usage`, gate the two
    emits on `Ok(true)`. Keep the call before the cancel check (usage-ordering tests).
 3. **`record_tool_call_started`** — replace the stray `self.db` write.
-4. **`ContextPolicy`** + `DesktopContextPolicy` — replace `supports_vision`,
+4. ✅ **`ContextPolicy`** + `DesktopContextPolicy` — replace `supports_vision`,
    `context_window`, `round_reasoning_effort`. Verify vision-strip + reasoning
-   freshness tests.
+   freshness tests. (Anthropic `context_window` deferred to 4.7 — `default_limit`.)
 5. **`LifecycleHooks`** + `DesktopLifecycleHooks` + `NoOpHooks` — replace the
    `hook_runner` Option/match.
 6. **`PermissionGateway`** + `DesktopPermissionGateway` — fold `decide_permission`

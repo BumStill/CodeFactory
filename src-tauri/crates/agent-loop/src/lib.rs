@@ -24,6 +24,7 @@ pub mod events;
 pub mod journal;
 pub mod policy;
 pub mod run;
+pub mod services;
 pub mod tool;
 pub mod transport;
 pub mod types;

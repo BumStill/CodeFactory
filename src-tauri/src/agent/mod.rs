@@ -9,6 +9,7 @@ pub mod delivery;
 pub mod dispatch;
 pub mod hooks;
 pub mod journal;
+mod context_policy;
 pub mod model_transport;
 pub mod persistence;
 pub mod scheduler;
@@ -53,6 +54,9 @@ use codefactory_agent_loop::tool::ToolBackend as _;
 // Brings the `Persistence` methods into scope for the inherent delegators; the
 // concrete `SqlitePersistence` lives in `persistence`.
 use codefactory_agent_loop::journal::Persistence as _;
+// Brings the `ContextPolicy` methods into scope; `DesktopContextPolicy` lives in
+// `context_policy`.
+use codefactory_agent_loop::services::ContextPolicy as _;
 // The pure completion-gate mode policy moved to agent-loop (slice 4.6 sub-step
 // 1). Pure fns are re-used directly; the mode-taking fns keep thin AgentMode
 // wrappers below that map to `FinalizationPolicy`, so call sites + #135/#136
@@ -1015,18 +1019,15 @@ impl AgentLoop {
         // when the model is KNOWN text-only, instead of burning a 400 round
         // trip every turn. The reactive strip-and-retry stays as the net for
         // unknown models and wrong guesses.
-        {
-            let settings = self.settings.read().await;
-            if !context::model_supports_vision(&settings, &self.endpoint_name, &self.model_id) {
-                let stripped = strip_image_parts(&mut messages);
-                if stripped > 0 {
-                    let notice = format!(
-                        "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
+        if !self.context_policy().supports_vision().await {
+            let stripped = strip_image_parts(&mut messages);
+            if stripped > 0 {
+                let notice = format!(
+                    "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
 占位文本;切换到支持图片的模型可恢复图片理解。"
-                    );
-                    self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
-                        .await?;
-                }
+                );
+                self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
+                    .await?;
             }
         }
         // Headless runs have no frontend and no hooks. Building `Option<_>`
@@ -1072,17 +1073,9 @@ impl AgentLoop {
             // Estimate prompt tokens before sending. If we're over 75% of the
             // model's window, elide oversized tool results from the older
             // half. Notify the UI so the user knows what happened.
-            let (context_limit, max_context_limit) = {
-                let settings = self.settings.read().await;
-                let window = context::resolve_context_window(
-                    &settings,
-                    &self.endpoint_name,
-                    &self.model_id,
-                    None,
-                );
-                let estimated = context::estimate_prompt_tokens(&messages, system_prompt);
-                (window.select_limit(estimated), window.max_limit)
-            };
+            let estimated = context::estimate_prompt_tokens(&messages, system_prompt);
+            let (context_limit, max_context_limit) =
+                self.context_policy().context_window(estimated).await;
             let compression = context::compress_if_needed(
                 std::mem::take(&mut messages),
                 system_prompt,
@@ -1101,23 +1094,18 @@ impl AgentLoop {
 
             let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
             let required_tool_response = require_tool_next && !finalization_pending;
-            // Resolve reasoning effort ONCE per round (keystone slice 4.4d) so
-            // the transport reads no DB; recomputed each iteration to keep a
-            // mid-run session-effort change taking effect next round. Empty for
-            // non-ChatGPT api styles, which ignore it. The two reactive retries
-            // below reuse this round's value.
-            let round_reasoning_effort: &str = if self.api_style == ApiStyle::Chatgpt {
-                self.resolve_round_reasoning_effort().await
-            } else {
-                ""
-            };
+            // Resolve reasoning effort ONCE per round via ContextPolicy (slice
+            // 4.6): it re-reads db+settings each round (freshness) and returns ""
+            // for non-ChatGPT styles, so the transport reads no DB. The two
+            // reactive retries below reuse this round's value.
+            let round_reasoning_effort = self.context_policy().round_reasoning_effort().await;
             let call_result = self
                 .model_transport()
                 .call_openai_transport(
                     &messages,
                     active_tool_defs,
                     required_tool_response,
-                    round_reasoning_effort,
+                    &round_reasoning_effort,
                 )
                 .await;
             let (text, tool_calls, usage, reasoning) = match call_result {
@@ -1157,7 +1145,7 @@ impl AgentLoop {
                             &messages,
                             active_tool_defs,
                             required_tool_response,
-                            round_reasoning_effort,
+                            &round_reasoning_effort,
                         )
                         .await?
                 }
@@ -1180,7 +1168,7 @@ impl AgentLoop {
                             &messages,
                             active_tool_defs,
                             required_tool_response,
-                            round_reasoning_effort,
+                            &round_reasoning_effort,
                         )
                         .await?
                 }
@@ -1768,30 +1756,20 @@ impl AgentLoop {
         }
     }
 
-    /// Per-round model call against the ChatGPT backend **Responses API**
-    /// (subscription). Self-resolves the OAuth access token (refreshing as
-    /// needed) via `codex_auth`, so no API key is threaded through. Translates
-    /// the OpenAI-shaped ChatMessage history into Responses `instructions` +
-    /// `input` items, parses the Responses SSE stream, and returns the same
-    /// (text, tool_calls, usage, reasoning) contract as call_openai_model.
-    /// Resolve THIS round's ChatGPT reasoning effort: a per-session override
-    /// (`sessions.reasoning_effort`) wins, else the global `Settings` default.
-    /// The loop calls this once per round (keystone slice 4.4d), so a mid-run
-    /// change still takes effect on the next round — freshness preserved — while
-    /// the transport itself reads no DB.
-    async fn resolve_round_reasoning_effort(&self) -> &'static str {
-        // Re-read per round: a mid-run `sessions.reasoning_effort` change takes
-        // effect on the next round (freshness), pinned by
-        // `session_reasoning_effort_reflects_the_current_row`.
-        let session_effort = fetch_session_reasoning_effort(&self.db, &self.session_id).await;
-        let settings = self.settings.read().await;
-        resolve_chatgpt_reasoning_effort(
-            &settings,
-            &self.endpoint_name,
-            &self.model_id,
-            session_effort.as_deref(),
-        )
-        .as_str()
+    /// Build the desktop context policy for this run (keystone slice 4.6). Reads
+    /// the live `Settings`/db each round through the trait; owns no `AppHandle`.
+    /// Absorbs the old `resolve_round_reasoning_effort` (per-round freshness: a
+    /// mid-run `sessions.reasoning_effort` change takes effect next round) plus
+    /// the `supports_vision`/`context_window` reads.
+    fn context_policy(&self) -> context_policy::DesktopContextPolicy {
+        context_policy::DesktopContextPolicy {
+            settings: self.settings.clone(),
+            db: self.db.clone(),
+            session_id: self.session_id.clone(),
+            endpoint_name: self.endpoint_name.clone(),
+            model_id: self.model_id.clone(),
+            api_style: self.api_style.clone(),
+        }
     }
 
     /// Build the desktop model transport for this run (keystone slice 4.5a).
@@ -2103,18 +2081,15 @@ impl AgentLoop {
             .unwrap_or_default();
         let mut messages = self.build_anthropic_messages(history);
         // Proactive capability match — see the OpenAI loop for rationale.
-        {
-            let settings = self.settings.read().await;
-            if !context::model_supports_vision(&settings, &self.endpoint_name, &self.model_id) {
-                let stripped = strip_image_values(&mut messages);
-                if stripped > 0 {
-                    let notice = format!(
-                        "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
+        if !self.context_policy().supports_vision().await {
+            let stripped = strip_image_values(&mut messages);
+            if stripped > 0 {
+                let notice = format!(
+                    "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
 占位文本;切换到支持图片的模型可恢复图片理解。"
-                    );
-                    self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
-                        .await?;
-                }
+                );
+                self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
+                    .await?;
             }
         }
         // Headless runs have no frontend and no hooks. Building `Option<_>`
