@@ -123,19 +123,23 @@ async fn fresh_and_historical_databases_receive_request_level_usage_schema() {
 
 #[test]
 fn openai_and_anthropic_persist_usage_before_terminal_tool_branch() {
-    let source = include_str!("../agent/mod.rs");
-    for (provider, start, end) in [
+    // The openai loop body physically moved to `agent-loop::run_agent_loop`
+    // (keystone slice 4.6b); anthropic still lives in the bin's mod.rs — so the
+    // acceptance source is selected per provider.
+    let mod_src = include_str!("../agent/mod.rs");
+    let run_src = include_str!("../../crates/agent-loop/src/run.rs");
+    for (provider, source, start, end) in [
         (
             "openai",
-            "    async fn run_openai(",
-            // End marker: the first method after run_openai. (call_openai_transport
-            // moved to model_transport.rs in slice 4.5a and request_permission to
-            // permission_gateway.rs in slice 4.6; finish_cancelled_tool_batch is now
-            // the tight bound of the run_openai section.)
-            "    async fn finish_cancelled_tool_batch(",
+            run_src,
+            "pub async fn run_agent_loop(",
+            // End marker: the first item after run_agent_loop (the private
+            // RunOutcome helper).
+            "\nfn run_outcome_for_terminal(",
         ),
         (
             "anthropic",
+            mod_src,
             "    async fn run_anthropic(",
             // End marker: the first free fn after run_anthropic. (openai_tool_controls
             // moved to agent-loop in slice 4.6; validate_openai_sse_completion is now
@@ -169,22 +173,23 @@ fn openai_and_anthropic_persist_usage_before_terminal_tool_branch() {
 
 #[test]
 fn completed_usage_is_persisted_before_post_response_cancellation() {
-    let source = include_str!("../agent/mod.rs");
-    for (provider, start, end, response_marker) in [
+    // openai body moved to agent-loop::run_agent_loop (slice 4.6b); anthropic
+    // stays in mod.rs — source selected per provider.
+    let mod_src = include_str!("../agent/mod.rs");
+    let run_src = include_str!("../../crates/agent-loop/src/run.rs");
+    for (provider, source, start, end, response_marker) in [
         (
             "openai",
-            "    async fn run_openai(",
-            // End marker: the first method after run_openai. (call_openai_transport
-            // moved to model_transport.rs in slice 4.5a and request_permission to
-            // permission_gateway.rs in slice 4.6; finish_cancelled_tool_batch is now
-            // the tight bound of the run_openai section.)
-            "    async fn finish_cancelled_tool_batch(",
+            run_src,
+            "pub async fn run_agent_loop(",
+            "\nfn run_outcome_for_terminal(",
             // The round's model answer (a `ModelResponse` destructure since slice
             // 4.6 sub-step 7 switched the loop onto `ModelTransport::complete`).
             "} = match call_result",
         ),
         (
             "anthropic",
+            mod_src,
             "    async fn run_anthropic(",
             // End marker: the first free fn after run_anthropic. (openai_tool_controls
             // moved to agent-loop in slice 4.6; validate_openai_sse_completion is now
@@ -213,7 +218,7 @@ fn completed_usage_is_persisted_before_post_response_cancellation() {
                 .expect("missing anthropic post-response cancellation")
         } else {
             after_response
-                .find("if self.is_cancelled()")
+                .find("if is_cancelled(cancel.as_ref())")
                 .expect("missing openai post-response cancellation")
         };
 

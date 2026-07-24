@@ -143,6 +143,17 @@ pub trait Budget: Send + Sync {
     fn may_continue(&self, iteration: usize) -> bool;
 }
 
+/// Always permits another round — the desktop loop bounds itself with the
+/// iteration ceiling (`for iteration in 0..max_iterations`), so it carries this
+/// for the shared `LoopServices` contract without consuming it (slice 4.6b).
+pub struct NullBudget;
+
+impl Budget for NullBudget {
+    fn may_continue(&self, _iteration: usize) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

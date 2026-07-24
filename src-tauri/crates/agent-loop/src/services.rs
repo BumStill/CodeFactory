@@ -85,6 +85,24 @@ impl PermissionGateway for AllowAllPermissions {
     }
 }
 
+/// Mid-loop fact-check of the model's reply against the turn's instruction,
+/// returning a correction to inject as the next round's prompt (or `None`).
+/// Sync on purpose — the desktop impl probes the machine (PATH / `gh`
+/// availability) synchronously, exactly as the inline call did. Headless
+/// ([`NoOpFactChecker`]) never corrects.
+pub trait FactChecker: Send + Sync {
+    fn fact_check(&self, reply: &str, instruction: &str) -> Option<String>;
+}
+
+/// Headless fact checker: never corrects.
+pub struct NoOpFactChecker;
+
+impl FactChecker for NoOpFactChecker {
+    fn fact_check(&self, _reply: &str, _instruction: &str) -> Option<String> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +136,12 @@ mod tests {
         assert!(h.pre_tool("bash", &serde_json::json!({"cmd": "ls"})).await);
         // post_tool is fire-and-forget: it must simply not panic.
         h.post_tool("bash", "output", 12).await;
+    }
+
+    #[test]
+    fn noop_fact_checker_never_corrects_and_is_object_safe() {
+        let f: std::sync::Arc<dyn FactChecker> = std::sync::Arc::new(NoOpFactChecker);
+        assert_eq!(f.fact_check("the sky is green", "verify claims"), None);
     }
 
     #[tokio::test]

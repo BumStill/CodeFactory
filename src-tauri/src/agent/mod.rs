@@ -10,6 +10,7 @@ pub mod dispatch;
 pub mod hooks;
 pub mod journal;
 mod context_policy;
+mod fact_checker;
 mod lifecycle_hooks;
 pub mod model_transport;
 mod permission_gateway;
@@ -28,12 +29,10 @@ use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
     completion_evidence_made_progress, provider_rejects_required_tool_choice,
     should_prompt_budget_convergence, CompletionEvidence, CompletionGate, ProgressTracker,
-    ToolOutcome,
 };
 use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -65,18 +64,27 @@ use codefactory_agent_loop::services::{LifecycleHooks, NoOpHooks};
 // matched at the call sites. `DesktopPermissionGateway` lives in
 // `permission_gateway`; the pure `decide_permission` stays a free fn below.
 use codefactory_agent_loop::services::{PermissionGateway as _, PermissionOutcome};
+// Brings `.fact_check()` into scope; `DesktopFactChecker` lives in `fact_checker`.
+use codefactory_agent_loop::services::FactChecker as _;
 // The loop drives the model round through the `ModelTransport::complete()` seam
 // (slice 4.6 sub-step 7): `RoundOptions` carries require-tool + reasoning effort,
 // `ModelResponse` is the provider-independent answer. `TransportError` crosses
 // back as `AppError` via the `From` impl in `errors` (message verbatim).
 use codefactory_agent_loop::transport::{ModelResponse, ModelTransport as _, RoundOptions};
+// Pure loop helpers relocated to agent-loop (keystone slice 4.6b); re-imported so
+// both provider loops + the bin unit tests keep the unqualified names.
+use codefactory_agent_loop::run::{cancelled_tool_suffix, is_cancelled, usage_request_id};
+use codefactory_agent_loop::protocol::{
+    is_vision_rejection, repair_openai_tool_protocol, strip_image_parts, strip_image_values,
+};
 // The pure completion-gate mode policy moved to agent-loop (slice 4.6 sub-step
 // 1). Pure fns are re-used directly; the mode-taking fns keep thin AgentMode
 // wrappers below that map to `FinalizationPolicy`, so call sites + #135/#136
 // tests are unchanged.
 use codefactory_agent_loop::policy::{
     self, active_tool_definitions, completion_command_and_kind,
-    completion_recovery_attempts_after_tool_batch, openai_tool_controls, CompletionFinalization,
+    completion_recovery_attempts_after_tool_batch, openai_tool_controls, record_completion_outcome,
+    CompletionFinalization,
 };
 use codefactory_agent_loop::run::FinalizationPolicy;
 
@@ -151,15 +159,8 @@ async fn await_permission_response(
     }
 }
 
-fn cancelled_tool_suffix<'a>(
-    cancel: Option<&Arc<AtomicBool>>,
-    tool_calls: &'a [ToolCall],
-    start: usize,
-) -> Option<&'a [ToolCall]> {
-    cancel
-        .is_some_and(|flag| flag.load(Ordering::SeqCst))
-        .then(|| &tool_calls[start..])
-}
+// `cancelled_tool_suffix` moved to `agent-loop::run` (keystone slice 4.6b) and is
+// re-imported below so both provider loops keep the unqualified name.
 
 /// Tool-call iteration ceiling for INTERACTIVE chat. Conservative
 /// because every iteration is a user-visible turn — letting it run too
@@ -786,7 +787,7 @@ impl AgentLoop {
             ApiStyle::Openai,
             project.clone(),
             Arc::new(RwLock::new(Settings::default())),
-            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             Arc::new(McpManager::new()),
             None,
             AgentMode::Autonomous,
@@ -830,76 +831,47 @@ impl AgentLoop {
         Ok(receipt)
     }
 
-    async fn record_usage_event_for_round(&self, usage: &Usage, iteration: usize) {
-        if self.anonymous || (usage.prompt_tokens == 0 && usage.completion_tokens == 0) {
-            return;
-        }
-        let surface = self
-            .execution_context
-            .as_ref()
-            .map_or(UsageSurface::Interactive, |context| context.usage_surface)
-            .as_str();
-        let local_endpoint = {
-            let base = self.base_url.to_ascii_lowercase();
-            base.contains("127.0.0.1")
-                || base.contains("localhost")
-                || base.contains("0.0.0.0")
-                || base.starts_with("http://[::1]")
-        };
-        let (provider, actual_cost_usd, cost_source) = if self.api_style == ApiStyle::Chatgpt {
-            ("chatgpt".to_string(), None, "subscription".to_string())
-        } else if local_endpoint {
-            (self.endpoint_name.clone(), None, "local".to_string())
-        } else if let Some(cost) = usage
-            .cost
-            .filter(|value| value.is_finite() && *value >= 0.0)
-        {
-            let provider = if self.base_url.contains("openrouter.ai") {
-                "openrouter".to_string()
-            } else {
-                self.endpoint_name.clone()
-            };
-            (provider, Some(cost), "provider_actual".to_string())
-        } else {
-            (self.endpoint_name.clone(), None, "unknown".to_string())
-        };
-        let row = codefactory_agent_loop::journal::UsageRow {
-            request_id: self.usage_request_id(iteration),
-            session_id: &self.session_id,
+    /// Per-run identity for the shared usage recorder. Pre-derives the surface
+    /// (`&str`) and `is_chatgpt` bool so `ApiStyle`/`UsageSurface` never cross
+    /// into agent-loop (keystone slice 4.6b).
+    fn usage_identity(&self) -> codefactory_agent_loop::run::UsageIdentity {
+        codefactory_agent_loop::run::UsageIdentity {
+            session_id: self.session_id.clone(),
+            endpoint_name: self.endpoint_name.clone(),
+            model_id: self.model_id.clone(),
+            base_url: self.base_url.clone(),
+            usage_run_id: self.usage_run_id.clone(),
+            surface: self
+                .execution_context
+                .as_ref()
+                .map_or(UsageSurface::Interactive, |context| context.usage_surface)
+                .as_str()
+                .to_string(),
             task_id: self
                 .execution_context
                 .as_ref()
                 .and_then(|context| context.task_id.clone()),
-            surface,
-            provider,
-            endpoint: &self.endpoint_name,
-            model: &self.model_id,
-            input_tokens: usage.prompt_tokens as i64,
-            output_tokens: usage.completion_tokens as i64,
-            reasoning_tokens: usage
-                .completion_tokens_details
-                .as_ref()
-                .map_or(0, |details| details.reasoning_tokens as i64),
-            cached_tokens: usage
-                .prompt_tokens_details
-                .as_ref()
-                .map_or(0, |details| details.cached_tokens as i64),
-            actual_cost_usd,
-            cost_source,
-        };
-        // Persist through the Persistence seam; the desktop cost-UI refresh
-        // (model-usage-recorded / token-usage-recorded, now inside
-        // TauriEventSink::usage_recorded) fires ONLY on a newly-written row —
-        // keystone slice 4.6 usage seam, no raw AppHandle in the loop.
-        match self.persistence().record_usage(row).await {
-            Ok(true) => self.events.usage_recorded(&self.session_id),
-            Ok(false) => {}
-            Err(error) => tracing::warn!("failed to record request usage: {error}"),
+            anonymous: self.anonymous,
+            is_chatgpt: self.api_style == ApiStyle::Chatgpt,
         }
     }
 
+    async fn record_usage_event_for_round(&self, usage: &Usage, iteration: usize) {
+        // Delegates to the shared recorder (keystone slice 4.6b); run_anthropic
+        // still calls this method, and the openai loop keeps the call-site symbol
+        // (`record_usage_event…`) that the usage-ordering source-text tests grep.
+        codefactory_agent_loop::run::record_usage_event_for_round(
+            &self.persistence(),
+            self.events.as_ref(),
+            &self.usage_identity(),
+            usage,
+            iteration,
+        )
+        .await;
+    }
+
     fn usage_request_id(&self, iteration: usize) -> String {
-        format!("{}:{iteration}", self.usage_run_id)
+        codefactory_agent_loop::run::usage_request_id(&self.usage_run_id, iteration)
     }
 
     /// Mark this loop as an anonymous/ephemeral run: disables ALL DB
@@ -1021,30 +993,12 @@ impl AgentLoop {
         tool_defs: &[ToolDefinition],
         system_prompt: &str,
     ) -> Result<()> {
-        let completion_instruction = latest_user_instruction(&history);
-        let fact_check_instruction = effective_fact_check_instruction(&history);
-        let mut messages = self.build_openai_messages(history, system_prompt);
-        // Proactive capability match: strip images BEFORE the first request
-        // when the model is KNOWN text-only, instead of burning a 400 round
-        // trip every turn. The reactive strip-and-retry stays as the net for
-        // unknown models and wrong guesses.
-        if !self.context_policy().supports_vision().await {
-            let stripped = strip_image_parts(&mut messages);
-            if stripped > 0 {
-                let notice = format!(
-                    "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
-占位文本;切换到支持图片的模型可恢复图片理解。"
-                );
-                self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
-                    .await?;
-            }
-        }
-        // Headless runs have no frontend and no hooks: `NoOpHooks` when `app`
-        // is absent, else `DesktopLifecycleHooks` wrapping a `HookRunner` —
-        // which owns an `AppHandle` — constructed ONLY here, inside `run()`,
-        // which the unit-test EXE dead-strips. Never construct it in test code:
-        // an AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
-        // trips the Windows loader (`STATUS_ENTRYPOINT_NOT_FOUND`, #166).
+        // Desktop adapter for the shared `run_agent_loop` (keystone slice 4.6b):
+        // build the per-turn inputs, the run config, and the capability services,
+        // then drive the one shared loop. The `AppHandle`-owning handles
+        // (`HookRunner`, `DesktopToolBackend`) are constructed ONLY here — inside
+        // this `run()`-reached fn the unit-test EXE dead-strips (#166) — and
+        // erased into `Arc<dyn …>` so `run_agent_loop` links no tauri.
         let hooks: std::sync::Arc<dyn LifecycleHooks> = match &self.app {
             None => std::sync::Arc::new(NoOpHooks),
             Some(app) => {
@@ -1057,552 +1011,63 @@ impl AgentLoop {
                 std::sync::Arc::new(lifecycle_hooks::DesktopLifecycleHooks { runner })
             }
         };
-
-        // Did we emit a terminal Done/Error this run? Used to guarantee the
-        // stream always closes even if the loop runs to its iteration ceiling.
-        let mut emitted_terminal = false;
-        let mut completion_gate =
-            CompletionGate::new_for_instruction(false, &completion_instruction);
-        let mut completion_sequence = 0_u64;
-        let mut last_completion_nudge_sequence = None;
-        let mut progress_tracker = ProgressTracker::new(8);
-        let mut finalization_pending = false;
-        let mut completion_recovery_attempts = 0_u32;
-        let mut fact_check_used = false;
-        let mut require_tool_next = false;
-        let max_iterations = self.mode.max_iterations();
-        for iteration in 0..max_iterations {
-            // Cooperative cancellation: if the user hit "stop" for this chat
-            // turn, end the stream cleanly between rounds. Checked here (not
-            // mid tool-call) so in-flight work isn't hard-killed. No-op unless
-            // a cancel flag was attached (chat only) and has actually tripped.
-            if self.is_cancelled() {
-                self.emit_cancelled_done();
-                emitted_terminal = true;
-                break;
-            }
-            // ── Context-window management ────────────────────────────────────
-            // Estimate prompt tokens before sending. If we're over 75% of the
-            // model's window, elide oversized tool results from the older
-            // half. Notify the UI so the user knows what happened.
-            let estimated = context::estimate_prompt_tokens(&messages, system_prompt);
-            let (context_limit, max_context_limit) =
-                self.context_policy().context_window(estimated).await;
-            let compression = context::compress_if_needed(
-                std::mem::take(&mut messages),
-                system_prompt,
-                context_limit,
-            );
-            // Storage repair is not enough: context compression can change the
-            // final provider payload. Enforce the OpenAI tool-call protocol at
-            // the last possible boundary before every model request.
-            messages = repair_openai_tool_protocol(compression.messages);
-            if compression.compressed {
-                self.events.emit(StreamEvent::ContextCompressed {
-                            elided_count: compression.elided_count,
-                            tokens_freed: compression.tokens_freed,
-                        });
-            }
-
-            let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
-            let required_tool_response = require_tool_next && !finalization_pending;
-            // Resolve reasoning effort ONCE per round via ContextPolicy (slice
-            // 4.6): it re-reads db+settings each round (freshness) and returns ""
-            // for non-ChatGPT styles, so the transport reads no DB. Held in
-            // `round_options` so the two reactive retries below reuse this round's
-            // value.
-            let round_options = RoundOptions {
-                require_tool: required_tool_response,
-                reasoning_effort: self.context_policy().round_reasoning_effort().await,
-            };
-            let call_result = self
-                .model_transport()
-                .complete(&messages, active_tool_defs, &round_options)
-                .await;
-            let ModelResponse {
-                text,
-                tool_calls,
-                usage,
-                reasoning,
-            } = match call_result {
-                Ok(ok) => ok,
-                // The active model rejects image input (e.g. the user switched
-                // the session to a no-vision model with image attachments in
-                // history). Strip images to placeholders and retry ONCE —
-                // otherwise every「继续」replays the same history and dies the
-                // same death (2026-07-21 field report).
-                // Provider says the prompt is over the window: the resolved
-                // window metadata or the token estimate was wrong. Emergency-
-                // compress against a reduced budget and retry ONCE — a killed
-                // turn on a replayable history dies identically on every
-                //「继续」(2026-07-21: three context-window deaths in one day).
-                Err(e) if context::is_context_overflow(&e.to_string()) => {
-                    let emergency_limit = (context_limit / 5).max(1) * 4;
-                    let compression = context::compress_if_needed(
-                        std::mem::take(&mut messages),
-                        system_prompt,
-                        emergency_limit,
-                    );
-                    if !compression.compressed {
-                        return Err(e.into());
-                    }
-                    messages = repair_openai_tool_protocol(compression.messages);
-                    let notice = format!(
-                        "上下文超出模型窗口,已压缩 {} 条历史(约释放 {} tokens)后重试。",
-                        compression.elided_count, compression.tokens_freed
-                    );
-                    self.persist_gate_message(&notice, "turn_notice").await?;
-                    self.events.emit(StreamEvent::CompletionGateAction {
-                                kind: "turn_notice".into(),
-                                detail: notice.clone(),
-                            });
-                    self.model_transport()
-                        .complete(&messages, active_tool_defs, &round_options)
-                        .await?
-                }
-                Err(e) if is_vision_rejection(&e.to_string()) => {
-                    let stripped = strip_image_parts(&mut messages);
-                    if stripped == 0 {
-                        return Err(e.into());
-                    }
-                    let notice = format!(
-                        "已自动移除历史中的 {stripped} 张图片后重试:当前模型不支持图片输入。\
-如需图片理解,请切换回支持图片的模型。"
-                    );
-                    self.persist_gate_message(&notice, "turn_notice").await?;
-                    self.events.emit(StreamEvent::CompletionGateAction {
-                                kind: "turn_notice".into(),
-                                detail: notice.clone(),
-                            });
-                    self.model_transport()
-                        .complete(&messages, active_tool_defs, &round_options)
-                        .await?
-                }
-                Err(e) => return Err(e.into()),
-            };
-            finalization_pending = false;
-            require_tool_next = false;
-
-            // The provider request has completed. Persist already-consumed
-            // Usage before honoring a cancellation that arrived in flight.
-            let usage_request_id = self.usage_request_id(iteration);
-            if let Some(round_usage) = usage.as_ref() {
-                self.record_usage_event_for_round(round_usage, iteration)
-                    .await;
-            }
-
-            if self.is_cancelled() {
-                self.emit_cancelled_done();
-                emitted_terminal = true;
-                break;
-            }
-
-            // Emit real (provider-reported) context-usage right after each
-            // round-trip so the UI bar tracks actual usage, not just our
-            // estimate. The estimate is only used to *trigger* compression.
-            if let Some(u) = &usage {
-                self.events.emit(StreamEvent::ContextUsage {
-                            used_tokens: u.prompt_tokens,
-                            limit_tokens: context_limit,
-                            max_limit_tokens: max_context_limit,
-                        });
-            }
-
-            // Persist assistant turn — include tool_calls AND reasoning_content
-            // so history reconstructs faithfully. Reasoning replay is required
-            // by DeepSeek's reasoner family.
-            let assistant_message_id =
-                if !text.is_empty() || !tool_calls.is_empty() || reasoning.is_some() {
-                    self.persist_message(
-                        "assistant",
-                        &text,
-                        usage.as_ref(),
-                        if tool_calls.is_empty() {
-                            None
-                        } else {
-                            Some(&tool_calls)
-                        },
-                        reasoning.as_deref(),
-                        Some(&usage_request_id),
-                    )
-                    .await?
-                } else {
-                    None
-                };
-            if let Some(message_id) = assistant_message_id.as_deref() {
-                for tc in &tool_calls {
-                    self.persistence()
-                        .record_tool_call_started(message_id, tc)
-                        .await
-                        .map_err(persistence::to_app_error)?;
-                }
-            }
-
-            if tool_calls.is_empty() {
-                // Systemic fact-check: a tool-call-free reply asserting a
-                // machine-verifiable obstacle (delivery blocked / command
-                // missing / waiting on a checkable condition) gets ONE live
-                // probe-backed correction — facts over stale memory.
-                if !fact_check_used {
-                    if let Some(correction) =
-                        fact_check_reply(&text, &fact_check_instruction, self.mode)
-                    {
-                        fact_check_used = true;
-                        self.persist_gate_message(&correction, "turn_notice").await?;
-                        self.events.emit(StreamEvent::CompletionGateAction {
-                                    kind: "turn_notice".into(),
-                                    detail: correction.clone(),
-                                });
-                        messages.push(ChatMessage {
-                            role: "user".into(),
-                            content: MessageContent::Text(correction),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                            reasoning_content: None,
-                        });
-                        continue;
-                    }
-                }
-                let evidence = completion_gate.evidence();
-                match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
-                    CompletionFinalization::Recover(prompt) => {
-                        completion_recovery_attempts += 1;
-                        require_tool_next = completion_recovery_requires_tool(self.mode);
-                        // Make the rejection visible instead of silently looping:
-                        // collapse the rejected candidate in the UI, persist the
-                        // injected instruction so rebuilt history stays faithful.
-                        self.mark_rejected_candidate(assistant_message_id.as_deref())
-                            .await?;
-                        self.persist_gate_message(&prompt, "gate_recovery").await?;
-                        self.events.emit(StreamEvent::CompletionGateAction {
-                                    kind: "recovery".into(),
-                                    detail: evidence.blockers.join("; "),
-                                });
-                        messages.push(ChatMessage {
-                            role: "user".into(),
-                            content: MessageContent::Text(prompt),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                            reasoning_content: None,
-                        });
-                        continue;
-                    }
-                    CompletionFinalization::ReleaseWithWarning(warning) => {
-                        // The reply stands — no folding, no Error. Persist a
-                        // visible warning and fall through to the normal Done.
-                        self.persist_gate_message(&warning, "gate_warning").await?;
-                        self.events.emit(StreamEvent::CompletionGateAction {
-                                    kind: "warning".into(),
-                                    detail: warning.clone(),
-                                });
-                    }
-                    CompletionFinalization::Blocked(message) => {
-                        self.mark_rejected_candidate(assistant_message_id.as_deref())
-                            .await?;
-                        self.persist_gate_message(&message, "gate_blocked").await?;
-                        self.events.emit(StreamEvent::Error { message });
-                        emitted_terminal = true;
-                        break;
-                    }
-                    CompletionFinalization::Complete => {}
-                }
-                // Always emit a terminal Done so the frontend's `streaming`
-                // flag clears — even when the provider omitted usage on the
-                // final turn. Previously Done was gated behind `usage`, so a
-                // missing usage left the chat hung "running" forever.
-                let (done_in, done_out) = usage
-                    .as_ref()
-                    .map(|u| (u.prompt_tokens, u.completion_tokens))
-                    .unwrap_or((0, 0));
-                self.events.emit(StreamEvent::Done {
-                            input_tokens: done_in,
-                            output_tokens: done_out,
-                        });
-                emitted_terminal = true;
-                break;
-            }
-
-            let mut result_messages = Vec::new();
-            let mut progress_prompt = None;
-            let completion_evidence_before_tool_batch = completion_gate.evidence();
-
-            for (tool_index, tc) in tool_calls.iter().enumerate() {
-                if let Some(remaining) =
-                    cancelled_tool_suffix(self.cancel.as_ref(), &tool_calls, tool_index)
-                {
-                    return self
-                        .finish_cancelled_tool_batch(remaining)
-                        .await;
-                }
-                let args: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                let completion_args = args.clone();
-
-                // Extract bash command for finer-grained permission matching
-                let bash_cmd = if tc.function.name == "bash" {
-                    args.get("command")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                };
-
-                self.events.emit(StreamEvent::ToolCallStart {
-                            id: tc.id.clone(),
-                            name: tc.function.name.clone(),
-                            args: args.clone(),
-                        });
-
-                let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
-                let completion_evidence = completion_gate.evidence();
-                let denial_content = if let Some(content) = autonomous_budget_denial(
-                    self.mode,
-                    remaining,
-                    &completion_evidence,
-                    &tc.function.name,
-                    &args,
-                    &self.cwd,
-                ) {
-                    Some(content)
-                } else {
-                    match self
-                        .permission_gateway()
-                        .authorize(tc, &args, bash_cmd.as_deref())
-                        .await
-                    {
-                        PermissionOutcome::Allow => None,
-                        PermissionOutcome::Deny(content) => Some(content),
-                        PermissionOutcome::Cancelled => {
-                            return self
-                                .finish_cancelled_tool_batch(&tool_calls[tool_index..])
-                                .await;
-                        }
-                    }
-                };
-
-                if let Some(content) = denial_content {
-                    self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
-                        .await?;
-                    self.events.emit(StreamEvent::ToolResult {
-                                tool_call_id: tc.id.clone(),
-                                content: content.clone(),
-                                is_error: true,
-                                status: "denied".into(),
-                            });
-                    result_messages.push(ChatMessage {
-                        role: "tool".into(),
-                        content: MessageContent::Text(content),
-                        tool_calls: None,
-                        tool_call_id: Some(tc.id.clone()),
-                        name: Some(tc.function.name.clone()),
-                        reasoning_content: None,
-                    });
-                    continue;
-                }
-
-                // Pre-tool hook: may cancel. Headless (no hooks) always allows.
-                let pre_allowed = hooks.pre_tool(&tc.function.name, &args).await;
-                if !pre_allowed {
-                    let content = "Tool call cancelled by hook.".to_string();
-                    self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
-                        .await?;
-                    self.events.emit(StreamEvent::ToolResult {
-                                tool_call_id: tc.id.clone(),
-                                content: content.clone(),
-                                is_error: true,
-                                status: "denied".into(),
-                            });
-                    result_messages.push(ChatMessage {
-                        role: "tool".into(),
-                        content: MessageContent::Text(content),
-                        tool_calls: None,
-                        tool_call_id: Some(tc.id.clone()),
-                        name: Some(tc.function.name.clone()),
-                        reasoning_content: None,
-                    });
-                    continue;
-                }
-
-                // Tool execution now flows through the shared ToolBackend seam
-                // (keystone slice 4.3): the desktop backend builds the ExecCtx
-                // and runs MCP-first / native-dispatch. Timing stays in the loop
-                // so it covers the fatal-error path exactly as before.
-                let tool_backend = tool_backend::DesktopToolBackend {
-                    #[cfg(not(test))]
-                    app: self.app.clone(),
-                    db: self.db.clone(),
-                    mcp_manager: self.mcp_manager.clone(),
-                    settings: self.settings.clone(),
-                };
-                let tool_ctx = codefactory_agent_loop::tool::ToolCtx {
-                    working_directory: self.cwd.clone(),
-                    session_id: Some(self.audit_session_id()),
-                    task_id: self
-                        .execution_context
-                        .as_ref()
-                        .and_then(|ctx| ctx.task_id.clone()),
-                    knowledge_library_ids: knowledge_scope_for_tools(
-                        self.execution_context.as_ref(),
-                    ),
-                    timeout_sec: None,
-                };
-
-                let tool_start = std::time::Instant::now();
-                let exec_result = tool_backend.execute(tc, &args, &tool_ctx).await;
-                let duration_ms = tool_start.elapsed().as_millis() as u64;
-                let output = match exec_result {
-                    Ok(result) => tools::ToolOutput {
-                        content: result.content,
-                        is_error: result.is_error,
-                    },
-                    Err(error) => {
-                        let error_text = error.to_string();
-                        self.record_tool_call_outcome(
-                            tc,
-                            "error",
-                            None,
-                            Some(&error_text),
-                            duration_ms,
-                        )
-                        .await?;
-                        return Err(crate::errors::AppError::Other(error_text));
-                    }
-                };
-                self.record_tool_call_outcome(
-                    tc,
-                    if output.is_error { "error" } else { "done" },
-                    if output.is_error {
-                        None
-                    } else {
-                        Some(&output.content)
-                    },
-                    if output.is_error {
-                        Some(&output.content)
-                    } else {
-                        None
-                    },
-                    duration_ms,
-                )
-                .await?;
-
-                if let Some(prompt) = record_completion_outcome(
-                    &mut completion_gate,
-                    &mut progress_tracker,
-                    &mut completion_sequence,
-                    &self.cwd,
-                    &tc.function.name,
-                    &completion_args,
-                    &output,
-                ) {
-                    progress_prompt = Some(prompt);
-                }
-                // Post-tool hook (skipped headless — no hooks).
-                let post_result: String = output.content.chars().take(500).collect();
-                hooks
-                    .post_tool(&tc.function.name, &post_result, duration_ms)
-                    .await;
-
-                self.events.emit(StreamEvent::ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            content: output.content.clone(),
-                            is_error: output.is_error,
-                            status: if output.is_error {
-                                "error".into()
-                            } else {
-                                "done".into()
-                            },
-                        });
-
-                result_messages.push(ChatMessage {
-                    role: "tool".into(),
-                    content: MessageContent::Text(output.content),
-                    tool_calls: None,
-                    tool_call_id: Some(tc.id.clone()),
-                    name: Some(tc.function.name.clone()),
-                    reasoning_content: None,
-                });
-            }
-
-            completion_recovery_attempts = completion_recovery_attempts_after_tool_batch(
-                completion_recovery_attempts,
-                completion_evidence_made_progress(
-                    &completion_evidence_before_tool_batch,
-                    &completion_gate.evidence(),
-                ),
-            );
-
-            messages.push(ChatMessage {
-                role: "assistant".into(),
-                content: MessageContent::Text(text),
-                tool_calls: Some(tool_calls),
-                tool_call_id: None,
-                name: None,
-                reasoning_content: reasoning,
-            });
-            messages.extend(result_messages);
-            if let Some(prompt) = progress_prompt {
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: MessageContent::Text(prompt),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    reasoning_content: None,
-                });
-            }
-            let evidence = completion_gate.evidence();
-            if completion_ready_applies(self.mode)
-                && evidence.completed
-                && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
-            {
-                last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
-                finalization_pending = true;
-                self.persist_gate_message(build_completion_ready_prompt(), "gate_ready")
-                    .await?;
-                self.events.emit(StreamEvent::CompletionGateAction {
-                            kind: "ready".into(),
-                            detail: String::new(),
-                        });
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: MessageContent::Text(build_completion_ready_prompt().to_string()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    reasoning_content: None,
-                });
-            } else if self.mode != AgentMode::Interactive {
-                let remaining = max_iterations.saturating_sub(iteration + 1);
-                if should_prompt_budget_convergence(remaining as u32) {
-                    messages.push(ChatMessage {
-                        role: "user".into(),
-                        content: MessageContent::Text(build_budget_convergence_prompt(
-                            remaining as u32,
-                            &evidence,
-                        )),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        name: None,
-                        reasoning_content: None,
-                    });
-                }
-            }
-        }
-
-        // Safety net: close the stream when every round used tools, but preserve
-        // completion truth instead of converting an exhausted loop into success.
-        if !emitted_terminal {
-            let evidence = completion_gate.evidence();
-            tracing::warn!(
-                "agent loop hit the iteration ceiling ({}) without a terminal turn; completed={}",
-                self.mode.max_iterations(),
-                evidence.completed,
-            );
-            self.events.emit(iteration_ceiling_terminal_event(&evidence, self.mode));
-        }
-
+        let tool_backend = tool_backend::DesktopToolBackend {
+            #[cfg(not(test))]
+            app: self.app.clone(),
+            db: self.db.clone(),
+            mcp_manager: self.mcp_manager.clone(),
+            settings: self.settings.clone(),
+        };
+        let completion_instruction = latest_user_instruction(&history);
+        let fact_check_instruction = effective_fact_check_instruction(&history);
+        let messages = self.build_openai_messages(history, system_prompt);
+        let inputs = codefactory_agent_loop::run::LoopInputs {
+            messages,
+            system_prompt: system_prompt.to_string(),
+            tool_defs: tool_defs.to_vec(),
+            completion_instruction,
+            fact_check_instruction,
+            audit_session_id: self.audit_session_id(),
+            knowledge_library_ids: knowledge_scope_for_tools(self.execution_context.as_ref()),
+            cancel: self.cancel.clone(),
+        };
+        let config = codefactory_agent_loop::run::RunConfig {
+            finalization: finalization_policy(self.mode),
+            gate_benchmark: false,
+            progress_window: 8,
+            recovery_limit: recovery_limit_for(self.mode),
+            max_iterations: self.mode.max_iterations(),
+            wall_budget_applies: wall_budget_applies(self.mode),
+            session_id: self.session_id.clone(),
+            endpoint_name: self.endpoint_name.clone(),
+            model_id: self.model_id.clone(),
+            base_url: self.base_url.clone(),
+            usage_run_id: self.usage_run_id.clone(),
+            surface: self
+                .execution_context
+                .as_ref()
+                .map_or(UsageSurface::Interactive, |c| c.usage_surface)
+                .as_str()
+                .to_string(),
+            task_id: self.execution_context.as_ref().and_then(|c| c.task_id.clone()),
+            anonymous: self.anonymous,
+            is_chatgpt: self.api_style == ApiStyle::Chatgpt,
+            cwd: self.cwd.clone(),
+        };
+        let svc = codefactory_agent_loop::run::LoopServices {
+            transport: std::sync::Arc::new(self.model_transport()),
+            tools: std::sync::Arc::new(tool_backend),
+            persistence: std::sync::Arc::new(self.persistence()),
+            events: self.events.clone(),
+            budget: std::sync::Arc::new(codefactory_agent_loop::journal::NullBudget),
+            permission: std::sync::Arc::new(self.permission_gateway()),
+            hooks,
+            context_policy: std::sync::Arc::new(self.context_policy()),
+            fact_checker: std::sync::Arc::new(fact_checker::DesktopFactChecker { mode: self.mode }),
+        };
+        // The desktop discards the returned RunOutcome (Done already emitted via
+        // the sink); LoopError maps to AppError::Other verbatim (message-identical).
+        codefactory_agent_loop::run::run_agent_loop(inputs, config, svc).await?;
         Ok(())
     }
 
@@ -2498,7 +1963,8 @@ impl AgentLoop {
                     &self.cwd,
                     &tc.function.name,
                     &completion_args,
-                    &output,
+                    &output.content,
+                    output.is_error,
                 ) {
                     progress_prompt = Some(prompt);
                 }
@@ -2664,62 +2130,9 @@ fn completion_recovery_prompt(
 }
 
 /// Placeholder inserted in place of an image part when the active model
-/// rejects vision input. Visible to the model (so it knows an image existed)
-/// and stable for the strip functions' idempotence checks.
-const IMAGE_STRIPPED_PLACEHOLDER: &str = "[图片已省略:当前模型不支持图片输入]";
-
-/// Does this provider error mean "the model can't accept image input"?
-/// Deliberately narrow: capability wording only, never generic failures —
-/// a false positive would silently drop the user's images on a transient
-/// error, so unknown errors must stay unmatched and surface as-is.
-fn is_vision_rejection(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    ["image", "vision", "multimodal"]
-        .iter()
-        .any(|needle| lower.contains(needle))
-        && !lower.contains("rate limit")
-}
-
-/// Replace image parts in OpenAI-shaped messages with a text placeholder.
-/// Returns how many were stripped (0 = nothing to do → do not retry again).
-fn strip_image_parts(messages: &mut [ChatMessage]) -> usize {
-    let mut stripped = 0;
-    for message in messages.iter_mut() {
-        if let MessageContent::Parts(parts) = &mut message.content {
-            for part in parts.iter_mut() {
-                if part.r#type == "image_url" {
-                    part.r#type = "text".into();
-                    part.text = Some(IMAGE_STRIPPED_PLACEHOLDER.to_string());
-                    part.image_url = None;
-                    stripped += 1;
-                }
-            }
-        }
-    }
-    stripped
-}
-
-/// Same as [`strip_image_parts`] for the Anthropic-shaped JSON message array
-/// (`type: "image"` blocks and any `image_url` compatibility parts).
-fn strip_image_values(messages: &mut [serde_json::Value]) -> usize {
-    let mut stripped = 0;
-    for message in messages.iter_mut() {
-        let Some(parts) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
-            continue;
-        };
-        for part in parts.iter_mut() {
-            let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if kind == "image" || kind == "image_url" {
-                *part = serde_json::json!({
-                    "type": "text",
-                    "text": IMAGE_STRIPPED_PLACEHOLDER,
-                });
-                stripped += 1;
-            }
-        }
-    }
-    stripped
-}
+// `IMAGE_STRIPPED_PLACEHOLDER`, `is_vision_rejection`, `strip_image_parts`,
+// `strip_image_values` moved to `agent-loop::protocol` (keystone slice 4.6b),
+// re-imported at the top so both loops + the bin unit tests keep the names.
 
 /// History rows that may be replayed to the provider on a later user turn.
 /// Completion-review controls are persisted for UI recovery and forensics,
@@ -3214,35 +2627,9 @@ fn autonomous_budget_denial(
     )
 }
 
-fn record_completion_outcome(
-    gate: &mut CompletionGate,
-    progress: &mut ProgressTracker,
-    sequence: &mut u64,
-    working_directory: &Path,
-    tool_name: &str,
-    args: &serde_json::Value,
-    output: &tools::ToolOutput,
-) -> Option<String> {
-    *sequence += 1;
-    let (command, kind) = completion_command_and_kind(tool_name, args);
-    let outcome = ToolOutcome {
-        request_id: format!("desktop-tool-{sequence}"),
-        command,
-        working_directory: Some(working_directory.to_string_lossy().into_owned()),
-        kind,
-        sequence: *sequence,
-        started_at_ms: 0,
-        finished_at_ms: 0,
-        return_code: Some(if output.is_error { 1 } else { 0 }),
-        stdout: output.content.clone(),
-        stderr: String::new(),
-        error: output.is_error.then(|| output.content.clone()),
-        semantic_failure: false,
-    }
-    .with_detected_semantic_failure();
-    gate.record(&outcome);
-    progress.record(&outcome)
-}
+// `record_completion_outcome` moved to `agent-loop::policy` (keystone slice
+// 4.6b), its `&tools::ToolOutput` param flattened to `(content, is_error)`.
+// Re-imported below; both loops pass `&output.content, output.is_error`.
 
 /// Convert an MCP tool descriptor into the OpenAI-compatible ToolDefinition format.
 fn mcp_tool_to_definition(tool: &crate::mcp::McpTool) -> ToolDefinition {
@@ -3380,72 +2767,8 @@ fn repair_incomplete_tool_history(history: Vec<Message>) -> Vec<Message> {
     repaired
 }
 
-fn repair_openai_tool_protocol(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    fn synthetic_tool_message(tool_call_id: String) -> ChatMessage {
-        ChatMessage {
-            role: "tool".into(),
-            content: MessageContent::Text(
-                "Tool result unavailable in persisted history; continue from current workspace state."
-                    .into(),
-            ),
-            tool_calls: None,
-            tool_call_id: Some(tool_call_id),
-            name: None,
-            reasoning_content: None,
-        }
-    }
-
-    fn append_missing_results(repaired: &mut Vec<ChatMessage>, pending: &mut Vec<String>) {
-        repaired.extend(pending.drain(..).map(synthetic_tool_message));
-    }
-
-    let mut repaired = Vec::with_capacity(messages.len());
-    let mut pending_tool_calls: Vec<String> = Vec::new();
-
-    for mut message in messages {
-        if message.role != "tool" && !pending_tool_calls.is_empty() {
-            append_missing_results(&mut repaired, &mut pending_tool_calls);
-        }
-
-        if message.role == "tool" {
-            let Some(tool_call_id) = message.tool_call_id.as_deref() else {
-                continue;
-            };
-            let Some(index) = pending_tool_calls
-                .iter()
-                .position(|pending| pending == tool_call_id)
-            else {
-                continue;
-            };
-            pending_tool_calls.remove(index);
-            repaired.push(message);
-            continue;
-        }
-
-        if message.role == "assistant" {
-            if let Some(tool_calls) = message.tool_calls.as_mut() {
-                let mut seen_ids = HashSet::new();
-                tool_calls.retain(|tool_call| {
-                    !tool_call.id.trim().is_empty() && seen_ids.insert(tool_call.id.clone())
-                });
-                if tool_calls.is_empty() {
-                    message.tool_calls = None;
-                }
-            }
-            pending_tool_calls = message
-                .tool_calls
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .map(|tool_call| tool_call.id.clone())
-                .collect();
-        }
-        repaired.push(message);
-    }
-
-    append_missing_results(&mut repaired, &mut pending_tool_calls);
-    repaired
-}
+// `repair_openai_tool_protocol` moved to `agent-loop::protocol` (keystone slice
+// 4.6b), re-imported at the top so both loops + the bin unit tests keep the name.
 
 /// Read at most `max_chars` UTF-8 chars from a file, appending "…" if truncated.
 fn read_file_capped(path: &Path, max_chars: usize) -> Option<String> {
@@ -4700,7 +4023,7 @@ mod tests {
             Path::new("/workspace"),
             "write_file",
             &serde_json::json!({"path": "src/example.rs", "content": "fn main() {}"}),
-            &tools::ToolOutput::ok("written"),
+            "written", false,
         );
         assert!(!gate.evidence().completed);
 
@@ -4711,7 +4034,7 @@ mod tests {
             Path::new("/workspace"),
             "bash",
             &serde_json::json!({"command": "cargo test"}),
-            &tools::ToolOutput::ok("test result: ok"),
+            "test result: ok", false,
         );
         assert!(gate.evidence().completed);
     }
@@ -4729,7 +4052,7 @@ mod tests {
             Path::new("/workspace"),
             "write_file",
             &serde_json::json!({"path": "src/app.rs", "content": "fixed"}),
-            &tools::ToolOutput::ok("written"),
+            "written", false,
         );
         record_completion_outcome(
             &mut gate,
@@ -4740,7 +4063,7 @@ mod tests {
             &serde_json::json!({
                 "command": "status=0; grep -n stale src/app.rs || status=$?; test \"$status\" -le 1"
             }),
-            &tools::ToolOutput::err("zsh:1: read-only variable: status"),
+            "zsh:1: read-only variable: status", true,
         );
 
         let failed = gate.evidence();
@@ -4757,7 +4080,7 @@ mod tests {
             Path::new("/workspace"),
             "bash",
             &serde_json::json!({"command": "cargo test"}),
-            &tools::ToolOutput::ok("test result: ok. 1 passed; 0 failed"),
+            "test result: ok. 1 passed; 0 failed", false,
         );
 
         let recovered = gate.evidence();
@@ -4783,7 +4106,7 @@ mod tests {
             Path::new("/workspace"),
             "write_file",
             &serde_json::json!({"path": "result.txt", "content": "candidate"}),
-            &tools::ToolOutput::ok("written"),
+            "written", false,
         );
         let evidence = gate.evidence();
 
@@ -4831,7 +4154,7 @@ mod tests {
             Path::new("/workspace"),
             "write_file",
             &serde_json::json!({"path": "src/worker.rs", "content": "candidate"}),
-            &tools::ToolOutput::ok("written"),
+            "written", false,
         );
         record_completion_outcome(
             &mut gate,
@@ -4840,7 +4163,7 @@ mod tests {
             Path::new("/workspace"),
             "bash",
             &serde_json::json!({"command": "cargo test worker::tests::behavior"}),
-            &tools::ToolOutput::err("assertion failed"),
+            "assertion failed", true,
         );
         record_completion_outcome(
             &mut gate,
@@ -4849,7 +4172,7 @@ mod tests {
             Path::new("/workspace"),
             "read_file",
             &serde_json::json!({"path": "src/worker.rs"}),
-            &tools::ToolOutput::ok("candidate"),
+            "candidate", false,
         );
         let evidence = gate.evidence();
 
@@ -4892,7 +4215,7 @@ mod tests {
             Path::new("/workspace"),
             "write_file",
             &serde_json::json!({"path": "tool", "content": "implementation"}),
-            &tools::ToolOutput::ok("written"),
+            "written", false,
         );
         record_completion_outcome(
             &mut gate,
@@ -4903,7 +4226,7 @@ mod tests {
             &serde_json::json!({
                 "command": "test \"$(./tool 3)\" = 9 && test \"$(./tool 5)\" = 25"
             }),
-            &tools::ToolOutput::ok("examples passed"),
+            "examples passed", false,
         );
 
         let smoke = gate.evidence();
@@ -4918,7 +4241,7 @@ mod tests {
             Path::new("/workspace"),
             "bash",
             &serde_json::json!({"command": "test \"$(./tool 7)\" = 49"}),
-            &tools::ToolOutput::ok("independent case passed"),
+            "independent case passed", false,
         );
         let completed = gate.evidence();
         assert_eq!(completed.last_independent_verification_sequence, Some(3));
@@ -4942,9 +4265,7 @@ mod tests {
             &serde_json::json!({
                 "command": "set -e\nprintf '== agent injection ==\\n'; sed -n '445,500p' src-tauri/src/agent/mod.rs"
             }),
-            &tools::ToolOutput::ok(
-                "Err(e) => Ok(tools::ToolOutput::err(format!(\"MCP error: {e}\")))",
-            ),
+            "Err(e) => Ok(tools::ToolOutput::err(format!(\"MCP error: {e}\")))", false,
         );
         let evidence = gate.evidence();
         assert!(
@@ -4963,7 +4284,7 @@ mod tests {
             &serde_json::json!({
                 "command": "pnpm exec vitest run src/pages/Workspace/TaskCreator.test.tsx"
             }),
-            &tools::ToolOutput::ok("Test Files  2 passed (2)"),
+            "Test Files  2 passed (2)", false,
         );
         let evidence = gate.evidence();
         assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
@@ -5304,7 +4625,7 @@ mod tests {
             &serde_json::json!({
                 "command": "nohup ./server >server.log 2>&1 & echo $! >server.pid"
             }),
-            &tools::ToolOutput::ok("started"),
+            "started", false,
         );
         assert!(!gate.evidence().completed);
 
@@ -5317,7 +4638,7 @@ mod tests {
             &serde_json::json!({
                 "command": "timeout 10 curl --fail http://127.0.0.1:8080/health"
             }),
-            &tools::ToolOutput::ok("healthy"),
+            "healthy", false,
         );
         assert!(gate.evidence().completed);
     }
@@ -5567,7 +4888,7 @@ mod tests {
                 "old_string": "rt.old_value(value)",
                 "new_string": "rt.new_value(value)"
             }),
-            &tools::ToolOutput::ok("Edited /workspace/compatdemo/service.py"),
+            "Edited /workspace/compatdemo/service.py", false,
         );
 
         let evidence = gate.evidence();

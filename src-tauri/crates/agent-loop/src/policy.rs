@@ -18,9 +18,46 @@ use crate::run::FinalizationPolicy;
 use crate::types::{StreamEvent, ToolDefinition};
 use codefactory_agent_core::{
     build_completion_recovery_prompt, classify_command, evaluate_budget_command_in_directory,
-    CompletionEvidence, PolicyDecision, ToolKind,
+    CompletionEvidence, CompletionGate, PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
 };
 use std::path::Path;
+
+/// Record one completed tool call against the completion gate + progress tracker
+/// and return the progress-nudge prompt (if any). Moved out of the bin loop
+/// (keystone slice 4.6b) with its `tools::ToolOutput` param flattened to
+/// `(content, is_error)` — the only two fields it ever read — so it carries no
+/// bin type. Timestamps stay 0 and `return_code` still derives from `is_error`.
+#[allow(clippy::too_many_arguments)]
+pub fn record_completion_outcome(
+    gate: &mut CompletionGate,
+    progress: &mut ProgressTracker,
+    sequence: &mut u64,
+    working_directory: &Path,
+    tool_name: &str,
+    args: &serde_json::Value,
+    content: &str,
+    is_error: bool,
+) -> Option<String> {
+    *sequence += 1;
+    let (command, kind) = completion_command_and_kind(tool_name, args);
+    let outcome = ToolOutcome {
+        request_id: format!("desktop-tool-{sequence}"),
+        command,
+        working_directory: Some(working_directory.to_string_lossy().into_owned()),
+        kind,
+        sequence: *sequence,
+        started_at_ms: 0,
+        finished_at_ms: 0,
+        return_code: Some(if is_error { 1 } else { 0 }),
+        stdout: content.to_string(),
+        stderr: String::new(),
+        error: is_error.then(|| content.to_string()),
+        semantic_failure: false,
+    }
+    .with_detected_semantic_failure();
+    gate.record(&outcome);
+    progress.record(&outcome)
+}
 
 /// The four-way finalization decision for a tool-call-free "final" response.
 #[derive(Debug, PartialEq, Eq)]
