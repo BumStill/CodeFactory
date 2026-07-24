@@ -38,6 +38,9 @@ function extOf(name: string): string {
 function isImageAttachment(name: string): boolean {
   return IMAGE_EXTS.includes(extOf(name));
 }
+function attachmentImageSrc(path: string): string {
+  return path.startsWith("file://") ? path : `file://${path}`;
+}
 
 interface Props {
   onSend: (text: string) => void;
@@ -353,28 +356,57 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
           ))}
         </div>
       )}
-      {/* Attachment chips — shown above the textarea, removable per chip */}
+      {/* Attachment previews — images show thumbnails; documents stay as chips. */}
       {(attachments.length > 0 || uploading || attachError) && (
-        <div className="mb-2 flex flex-wrap gap-1.5 items-center">
+        <div className="mb-2 flex flex-wrap items-end gap-2">
           {attachments.map((a) => (
-            <span
-              key={a.id}
-              className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-surface-3 border border-border text-[11px] text-gray-300"
-              title={a.path}
-            >
-              <Paperclip size={10} className="text-accent" />
-              <span className="truncate max-w-[160px]">{a.name}</span>
-              <span className="text-gray-600 text-[10px]">
-                {(a.sizeBytes / 1024).toFixed(0)}KB
-              </span>
-              <button
-                onClick={() => removeAttachment(a.id)}
-                className="text-gray-500 hover:text-red-400"
-                title="移除"
+            isImageAttachment(a.name) ? (
+              <figure
+                key={a.id}
+                className="group relative overflow-hidden rounded-xl border border-border bg-surface-3 p-1 shadow-sm"
+                title={a.path}
               >
-                <X size={10} />
-              </button>
-            </span>
+                <img
+                  src={attachmentImageSrc(a.path)}
+                  alt={a.name}
+                  className="block h-20 w-28 rounded-lg bg-surface-2 object-cover"
+                />
+                <figcaption className="mt-1 flex max-w-28 items-center gap-1 text-[10px] text-gray-400">
+                  <span className="truncate">{a.name}</span>
+                  <span className="shrink-0 text-gray-600">{(a.sizeBytes / 1024).toFixed(0)}KB</span>
+                </figcaption>
+                <button
+                  type="button"
+                  onClick={() => removeAttachment(a.id)}
+                  className="absolute right-1 top-1 rounded-full bg-surface-0/80 p-0.5 text-gray-400 opacity-90 transition-colors hover:bg-red-500/20 hover:text-red-300"
+                  title="移除"
+                  aria-label={`移除 ${a.name}`}
+                >
+                  <X size={11} />
+                </button>
+              </figure>
+            ) : (
+              <span
+                key={a.id}
+                className="inline-flex items-center gap-1.5 rounded-full border border-border bg-surface-3 px-2 py-0.5 text-[11px] text-gray-300"
+                title={a.path}
+              >
+                <Paperclip size={10} className="text-accent" />
+                <span className="max-w-[160px] truncate">{a.name}</span>
+                <span className="text-[10px] text-gray-600">
+                  {(a.sizeBytes / 1024).toFixed(0)}KB
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removeAttachment(a.id)}
+                  className="text-gray-500 hover:text-red-400"
+                  title="移除"
+                  aria-label={`移除 ${a.name}`}
+                >
+                  <X size={10} />
+                </button>
+              </span>
+            )
           ))}
           {uploading && (
             <span className="inline-flex items-center gap-1 text-[11px] text-gray-500">
