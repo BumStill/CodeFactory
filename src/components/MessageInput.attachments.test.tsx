@@ -48,7 +48,7 @@ describe("MessageInput attachments", () => {
     invokeMock.mockReset();
   });
 
-  it("paste of an image file invokes save_chat_attachment and shows a chip", async () => {
+  it("paste of an image file invokes save_chat_attachment and shows an image preview", async () => {
     invokeMock.mockResolvedValue({ path: "/proj/.codefactory/attachments/x.png", name: "x.png", size_bytes: 4 });
     setup();
     const textarea = screen.getByRole("textbox");
@@ -67,9 +67,10 @@ describe("MessageInput attachments", () => {
       "save_chat_attachment",
       expect.objectContaining({ cwd: "/proj", filename: "screenshot.png" }),
     ));
-    // The chip shows the ORIGINAL filename (the on-disk name is a uuid), so we
-    // assert the pasted file's name rather than save_chat_attachment's return.
-    expect(await screen.findByText("screenshot.png")).toBeInTheDocument();
+    // The attachment tray shows a real preview, not just a filename chip.
+    const preview = await screen.findByRole("img", { name: "screenshot.png" });
+    expect(preview).toHaveAttribute("src", "file:///proj/.codefactory/attachments/x.png");
+    expect(screen.getByText("screenshot.png")).toBeInTheDocument();
   });
 
   it("paste with no cwd shows an error and does NOT invoke save", () => {
