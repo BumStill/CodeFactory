@@ -53,6 +53,8 @@ describe("MessageList turn timeline", () => {
     const steps = container.querySelectorAll("[data-segment='step']");
     expect(steps.length).toBe(1);
     expect(steps[0].textContent).toContain("两类红灯都稳定复现了");
+    expect(steps[0]).toHaveClass("text-[15px]", "leading-6");
+    expect(steps[0]).not.toHaveClass("text-[13px]", "border-l");
     const finals = container.querySelectorAll("[data-segment='final']");
     expect(finals.length).toBe(1);
     expect(finals[0].textContent).toContain("最终总结");
@@ -80,9 +82,17 @@ describe("MessageList turn timeline", () => {
     expect(screen.queryByText(/第 0 步叙述/)).toBeNull();
     // …behind a summary toggle, while the tail stays visible.
     expect(screen.getByText(/收尾总结/)).toBeTruthy();
-    const toggle = screen.getByText(/前 \d+ 步/);
+    const toggle = screen.getByRole("button", {
+      name: /展开较早的执行过程，共 \d+ 条/,
+    });
+    expect(toggle).toHaveTextContent("展开较早的执行过程");
+    expect(toggle).not.toHaveTextContent(/前 \d+ 步|点击展开/);
+    expect(toggle).not.toHaveClass("border");
     fireEvent.click(toggle);
     expect(screen.getByText(/第 0 步叙述/)).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "收起较早的执行过程" }),
+    ).toBeInTheDocument();
   });
   it("groups consecutive successful commands after a turn settles but keeps failures visible", () => {
     const grouped = msg({

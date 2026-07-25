@@ -174,7 +174,7 @@ describe("MessageList theme readability", () => {
     expect(screen.getAllByText(/用时/)).toHaveLength(1);
   });
 
-  it("uses a readable two-level type scale for operational narration and elapsed time", () => {
+  it("keeps operational narration at body size while elapsed time stays auxiliary", () => {
     render(
       <MessageList
         messages={[
@@ -193,7 +193,7 @@ describe("MessageList theme readability", () => {
       />,
     );
 
-    expect(screen.getByText("Checking the workspace.")).toHaveClass("text-[13px]");
+    expect(screen.getByText("Checking the workspace.")).toHaveClass("text-[15px]");
     expect(screen.getByText(/运行中/)).toHaveClass("text-[11px]");
   });
 
