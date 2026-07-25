@@ -25,11 +25,8 @@ pub mod worktree;
 
 pub use dispatch::decide_chat_mode;
 
-use codefactory_agent_core::{
-    build_budget_convergence_prompt, build_completion_ready_prompt,
-    completion_evidence_made_progress, provider_rejects_required_tool_choice,
-    should_prompt_budget_convergence, CompletionEvidence, CompletionGate, ProgressTracker,
-};
+#[cfg(test)]
+use codefactory_agent_core::CompletionEvidence;
 use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use sqlx::SqlitePool;
@@ -49,43 +46,35 @@ use crate::openrouter::types::*;
 use crate::storage::Message;
 use crate::tools::{self};
 use crate::PendingPermissionMap;
-// Brings `DesktopToolBackend::execute`/`list_schemas` into method scope; the
-// concrete backend lives in `tool_backend`.
-use codefactory_agent_loop::tool::ToolBackend as _;
 // Brings the `Persistence` methods into scope for the inherent delegators; the
 // concrete `SqlitePersistence` lives in `persistence`.
 use codefactory_agent_loop::journal::Persistence as _;
-// Brings the `ContextPolicy` methods into scope; `DesktopContextPolicy` lives in
-// `context_policy`. `LifecycleHooks`/`NoOpHooks` are imported by name (used as a
-// `dyn` type + built directly); `DesktopLifecycleHooks` lives in `lifecycle_hooks`.
-use codefactory_agent_loop::services::ContextPolicy as _;
+// `LifecycleHooks`/`NoOpHooks` are imported by name (used as a `dyn` type + built
+// directly); `DesktopLifecycleHooks` lives in `lifecycle_hooks`.
 use codefactory_agent_loop::services::{LifecycleHooks, NoOpHooks};
-// `PermissionGateway` brings `.authorize()` into scope; `PermissionOutcome` is
-// matched at the call sites. `DesktopPermissionGateway` lives in
-// `permission_gateway`; the pure `decide_permission` stays a free fn below.
-use codefactory_agent_loop::services::{PermissionGateway as _, PermissionOutcome};
-// Pure loop helpers relocated to agent-loop (keystone slice 4.6b); re-imported so
-// run_anthropic + the bin unit tests keep the unqualified names. (run_openai's
-// transport/fact-check/cancel helpers now live inside run_agent_loop, so those
-// imports moved there with the body — slice 4.6b.)
-use codefactory_agent_loop::run::cancelled_tool_suffix;
-use codefactory_agent_loop::protocol::{is_vision_rejection, strip_image_values};
+// After slice 4.7 BOTH provider loops live in `run_agent_loop`; the bin is a thin
+// adapter, so most loop-body helpers (gate/prompt/tool/transport/protocol fns)
+// are referenced only inside agent-loop now. The mode-policy AgentMode wrappers
+// below still delegate to `policy::`, and several fns are exercised by bin unit
+// tests that stayed here — those imports are `#[cfg(test)]`-gated.
+use codefactory_agent_loop::policy::openai_tool_controls;
+#[cfg(test)]
+use codefactory_agent_loop::policy::{self, CompletionFinalization};
+#[cfg(test)]
 use codefactory_agent_loop::context::is_provider_overloaded;
-// Test-only: these fns moved to agent-loop (slice 4.6/4.6b) but their bin unit
-// tests stayed here; run_openai (which used them in production) is now the
-// adapter, so outside tests the bin no longer references them.
 #[cfg(test)]
-use codefactory_agent_loop::policy::completion_command_and_kind;
+use codefactory_agent_loop::run::cancelled_tool_suffix;
 #[cfg(test)]
-use codefactory_agent_loop::protocol::{repair_openai_tool_protocol, strip_image_parts};
-// The pure completion-gate mode policy moved to agent-loop (slice 4.6 sub-step
-// 1). Pure fns are re-used directly; the mode-taking fns keep thin AgentMode
-// wrappers below that map to `FinalizationPolicy`, so call sites + #135/#136
-// tests are unchanged.
 use codefactory_agent_loop::policy::{
-    self, active_tool_definitions, completion_recovery_attempts_after_tool_batch,
-    openai_tool_controls, record_completion_outcome, CompletionFinalization,
+    active_tool_definitions, completion_command_and_kind,
+    completion_recovery_attempts_after_tool_batch, record_completion_outcome,
 };
+#[cfg(test)]
+use codefactory_agent_loop::protocol::{
+    is_vision_rejection, repair_openai_tool_protocol, strip_image_parts,
+};
+#[cfg(test)]
+use codefactory_agent_core::{CompletionGate, ProgressTracker};
 use codefactory_agent_loop::run::FinalizationPolicy;
 
 /// Desktop `AgentMode` → the loop crate's `FinalizationPolicy`.
@@ -987,18 +976,25 @@ impl AgentLoop {
             .unwrap_or_else(|| self.session_id.clone())
     }
 
-    async fn run_openai(
+    /// Desktop adapter for the shared `run_agent_loop` (keystone slice 4.6b,
+    /// generalized to both providers in 4.7): build the per-turn inputs, the run
+    /// config, and the capability services, then drive the ONE shared loop. The
+    /// `AppHandle`-owning handles (`HookRunner`, `DesktopToolBackend`) are
+    /// constructed ONLY here — inside this `run()`-reached fn the unit-test EXE
+    /// dead-strips (#166) — and erased into `Arc<dyn …>` so `run_agent_loop`
+    /// links no tauri. The three flags are the ONLY per-provider difference:
+    /// OpenAI/ChatGPT = (compress, no-backoff, expand-window); Anthropic =
+    /// (no-compress, backoff, flat-window). The transport itself dispatches on
+    /// `self.api_style` inside `complete()`.
+    async fn run_via_agent_loop(
         &mut self,
         history: Vec<Message>,
         tool_defs: &[ToolDefinition],
         system_prompt: &str,
+        context_compression: bool,
+        overload_backoff: bool,
+        expand_context_window: bool,
     ) -> Result<()> {
-        // Desktop adapter for the shared `run_agent_loop` (keystone slice 4.6b):
-        // build the per-turn inputs, the run config, and the capability services,
-        // then drive the one shared loop. The `AppHandle`-owning handles
-        // (`HookRunner`, `DesktopToolBackend`) are constructed ONLY here — inside
-        // this `run()`-reached fn the unit-test EXE dead-strips (#166) — and
-        // erased into `Arc<dyn …>` so `run_agent_loop` links no tauri.
         let hooks: std::sync::Arc<dyn LifecycleHooks> = match &self.app {
             None => std::sync::Arc::new(NoOpHooks),
             Some(app) => {
@@ -1038,8 +1034,8 @@ impl AgentLoop {
             recovery_limit: recovery_limit_for(self.mode),
             max_iterations: self.mode.max_iterations(),
             wall_budget_applies: wall_budget_applies(self.mode),
-            context_compression: true,
-            overload_backoff: false,
+            context_compression,
+            overload_backoff,
             session_id: self.session_id.clone(),
             endpoint_name: self.endpoint_name.clone(),
             model_id: self.model_id.clone(),
@@ -1064,13 +1060,38 @@ impl AgentLoop {
             budget: std::sync::Arc::new(codefactory_agent_loop::journal::NullBudget),
             permission: std::sync::Arc::new(self.permission_gateway()),
             hooks,
-            context_policy: std::sync::Arc::new(self.context_policy(true)),
+            context_policy: std::sync::Arc::new(self.context_policy(expand_context_window)),
             fact_checker: std::sync::Arc::new(fact_checker::DesktopFactChecker { mode: self.mode }),
         };
         // The desktop discards the returned RunOutcome (Done already emitted via
         // the sink); LoopError maps to AppError::Other verbatim (message-identical).
         codefactory_agent_loop::run::run_agent_loop(inputs, config, svc).await?;
         Ok(())
+    }
+
+    /// OpenAI/ChatGPT: compress history, no overload backoff, expandable window.
+    async fn run_openai(
+        &mut self,
+        history: Vec<Message>,
+        tool_defs: &[ToolDefinition],
+        system_prompt: &str,
+    ) -> Result<()> {
+        self.run_via_agent_loop(history, tool_defs, system_prompt, true, false, true)
+            .await
+    }
+
+    /// Anthropic (keystone slice 4.7): NO compression (it never elides), reactive
+    /// overload backoff, flat `default_limit` context window. The transport's
+    /// `complete()` converts canonical `ChatMessage` ↔ the Anthropic wire at the
+    /// edge, so this drives the SAME shared loop as OpenAI.
+    async fn run_anthropic(
+        &mut self,
+        history: Vec<Message>,
+        tool_defs: &[ToolDefinition],
+        system_prompt: &str,
+    ) -> Result<()> {
+        self.run_via_agent_loop(history, tool_defs, system_prompt, false, true, false)
+            .await
     }
 
     async fn finish_cancelled_tool_batch(
@@ -1374,696 +1395,6 @@ impl AgentLoop {
 
     // ── Anthropic-specific helpers ────────────────────────────────────────────
 
-    /// Build the Anthropic `messages` array from stored history.
-    /// System prompt is passed separately; tool results use `user` role
-    /// with `tool_result` content blocks.
-    fn build_anthropic_messages(&self, history: Vec<Message>) -> Vec<serde_json::Value> {
-        let mut msgs: Vec<serde_json::Value> = Vec::new();
-
-        for m in repair_incomplete_tool_history(replayable_history(history)) {
-            match m.role.as_str() {
-                "tool" => {
-                    let (tool_call_id, content) = parse_tool_message_content(&m.content);
-                    msgs.push(serde_json::json!({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": tool_call_id,
-                            "content": content,
-                        }]
-                    }));
-                }
-                "assistant" => {
-                    // Reconstruct content array: text + tool_use blocks
-                    let tool_calls: Vec<ToolCall> = m
-                        .tool_calls
-                        .as_deref()
-                        .and_then(|s| serde_json::from_str(s).ok())
-                        .unwrap_or_default();
-
-                    let mut content_blocks: Vec<serde_json::Value> = Vec::new();
-                    if !m.content.is_empty() {
-                        content_blocks.push(serde_json::json!({
-                            "type": "text",
-                            "text": m.content,
-                        }));
-                    }
-                    for tc in &tool_calls {
-                        let input: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or(serde_json::json!({}));
-                        content_blocks.push(serde_json::json!({
-                            "type": "tool_use",
-                            "id": tc.id,
-                            "name": tc.function.name,
-                            "input": input,
-                        }));
-                    }
-                    if content_blocks.is_empty() {
-                        content_blocks.push(serde_json::json!({ "type": "text", "text": "" }));
-                    }
-                    msgs.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": content_blocks,
-                    }));
-                }
-                "system" => {
-                    // System is passed as a top-level param, skip inline.
-                }
-                _ => {
-                    // user messages — convert markdown file:// image links
-                    // to Anthropic vision content blocks when present.
-                    let blocks = attachments::extract_anthropic_blocks(&m.content);
-                    let content = if blocks.is_empty() {
-                        serde_json::Value::String(m.content)
-                    } else {
-                        serde_json::Value::Array(blocks)
-                    };
-                    msgs.push(serde_json::json!({
-                        "role": m.role,
-                        "content": content,
-                    }));
-                }
-            }
-        }
-        msgs
-    }
-
-    async fn call_anthropic_transport(
-        &self,
-        system_prompt: &str,
-        messages: Vec<serde_json::Value>,
-        tool_defs: &[ToolDefinition],
-        require_tool: bool,
-    ) -> Result<anthropic_client::AnthropicResponse> {
-        let first = anthropic_client::stream_anthropic(
-            &self.http,
-            &self.base_url,
-            &self.api_key,
-            &self.model_id,
-            system_prompt,
-            messages.clone(),
-            tool_defs,
-            require_tool,
-            self.cancel.as_ref(),
-            self.events.as_ref(),
-        )
-        .await;
-        let required_choice_unsupported = first.as_ref().err().is_some_and(|error| {
-            require_tool && provider_rejects_required_tool_choice(&error.to_string())
-        });
-        if !required_choice_unsupported {
-            return first;
-        }
-        anthropic_client::stream_anthropic(
-            &self.http,
-            &self.base_url,
-            &self.api_key,
-            &self.model_id,
-            system_prompt,
-            messages,
-            tool_defs,
-            false,
-            self.cancel.as_ref(),
-            self.events.as_ref(),
-        )
-        .await
-    }
-
-    async fn run_anthropic(
-        &mut self,
-        history: Vec<Message>,
-        tool_defs: &[ToolDefinition],
-        system_prompt: &str,
-    ) -> Result<()> {
-        let completion_instruction = latest_user_instruction(&history);
-        let fact_check_instruction = effective_fact_check_instruction(&history);
-        let mut messages = self.build_anthropic_messages(history);
-        // Proactive capability match — see the OpenAI loop for rationale.
-        if !self.context_policy(false).supports_vision().await {
-            let stripped = strip_image_values(&mut messages);
-            if stripped > 0 {
-                let notice = format!(
-                    "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
-占位文本;切换到支持图片的模型可恢复图片理解。"
-                );
-                self.persist_gate_message_once("已在发送前", &notice, "turn_notice")
-                    .await?;
-            }
-        }
-        // Headless runs have no frontend and no hooks: `NoOpHooks` when `app`
-        // is absent, else `DesktopLifecycleHooks` wrapping a `HookRunner` —
-        // which owns an `AppHandle` — constructed ONLY here, inside `run()`,
-        // which the unit-test EXE dead-strips. Never construct it in test code:
-        // an AppHandle-owning struct instantiated in `codefactory_lib-*.exe`
-        // trips the Windows loader (`STATUS_ENTRYPOINT_NOT_FOUND`, #166).
-        let hooks: std::sync::Arc<dyn LifecycleHooks> = match &self.app {
-            None => std::sync::Arc::new(NoOpHooks),
-            Some(app) => {
-                let runner = if self.anonymous {
-                    hooks::HookRunner::disabled(app.clone())
-                } else {
-                    let settings = self.settings.read().await;
-                    hooks::HookRunner::from_settings(&settings, app.clone())
-                };
-                std::sync::Arc::new(lifecycle_hooks::DesktopLifecycleHooks { runner })
-            }
-        };
-
-        // Did we emit a terminal Done/Error this run? Used to guarantee the
-        // stream always closes even if the loop runs to its iteration ceiling.
-        let mut emitted_terminal = false;
-        let mut completion_gate =
-            CompletionGate::new_for_instruction(false, &completion_instruction);
-        let mut completion_sequence = 0_u64;
-        let mut last_completion_nudge_sequence = None;
-        let mut progress_tracker = ProgressTracker::new(8);
-        let mut finalization_pending = false;
-        let mut completion_recovery_attempts = 0_u32;
-        let mut fact_check_used = false;
-        let mut require_tool_next = false;
-        let max_iterations = self.mode.max_iterations();
-        for iteration in 0..max_iterations {
-            // Cooperative cancellation: if the user hit "stop" for this chat
-            // turn, end the stream cleanly between rounds. Checked here (not
-            // mid tool-call) so in-flight work isn't hard-killed. No-op unless
-            // a cancel flag was attached (chat only) and has actually tripped.
-            if self.is_cancelled() {
-                self.emit_cancelled_done();
-                emitted_terminal = true;
-                break;
-            }
-            // We don't run elision compression on the Anthropic path because
-            // its messages are serde_json::Value-shaped, not ChatMessage.
-            // The OpenAI path is the primary one for now (OpenRouter,
-            // DeepSeek, local models). We do still report context usage
-            // when Anthropic returns input_tokens, so the UI bar stays
-            // accurate. TODO: port elision to work on Value-shaped messages
-            // for Anthropic users.
-            let (context_limit, max_context_limit) = {
-                let settings = self.settings.read().await;
-                let window = context::resolve_context_window(
-                    &settings,
-                    &self.endpoint_name,
-                    &self.model_id,
-                    None,
-                );
-                (window.default_limit, window.max_limit)
-            };
-
-            let active_tool_defs = active_tool_definitions(tool_defs, finalization_pending);
-            let required_tool_response = require_tool_next && !finalization_pending;
-            let first_attempt = self
-                .call_anthropic_transport(
-                    system_prompt,
-                    messages.clone(),
-                    active_tool_defs,
-                    required_tool_response,
-                )
-                .await;
-            let resp = match first_attempt {
-                Ok(resp) => resp,
-                // Same no-vision degradation as the OpenAI loop: strip image
-                // parts to placeholders and retry once instead of killing the
-                // turn on every replay of an image-bearing history.
-                // Transient provider saturation — see the OpenAI loop.
-                Err(e) if is_provider_overloaded(&e.to_string()) => {
-                    let notice = "模型服务过载,正在自动退避重试(最多 2 次)。".to_string();
-                    self.persist_gate_message_once("自动退避重试", &notice, "turn_notice")
-                        .await?;
-                    let mut last_err = e;
-                    let mut recovered = None;
-                    for delay in [20u64, 40] {
-                        if self.is_cancelled() {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                        match self
-                            .call_anthropic_transport(
-                                system_prompt,
-                                messages.clone(),
-                                active_tool_defs,
-                                required_tool_response,
-                            )
-                            .await
-                        {
-                            Ok(ok) => {
-                                recovered = Some(ok);
-                                break;
-                            }
-                            Err(next) if is_provider_overloaded(&next.to_string()) => {
-                                last_err = next;
-                            }
-                            Err(next) => return Err(next),
-                        }
-                    }
-                    match recovered {
-                        Some(resp) => resp,
-                        None => return Err(last_err),
-                    }
-                }
-                Err(e) if is_vision_rejection(&e.to_string()) => {
-                    let stripped = strip_image_values(&mut messages);
-                    if stripped == 0 {
-                        return Err(e.into());
-                    }
-                    let notice = format!(
-                        "已自动移除历史中的 {stripped} 张图片后重试:当前模型不支持图片输入。\
-如需图片理解,请切换回支持图片的模型。"
-                    );
-                    self.persist_gate_message(&notice, "turn_notice").await?;
-                    self.events.emit(StreamEvent::CompletionGateAction {
-                                kind: "turn_notice".into(),
-                                detail: notice.clone(),
-                            });
-                    self.call_anthropic_transport(
-                        system_prompt,
-                        messages.clone(),
-                        active_tool_defs,
-                        required_tool_response,
-                    )
-                    .await?
-                }
-                Err(e) => return Err(e),
-            };
-            finalization_pending = false;
-            require_tool_next = false;
-
-            let usage_request_id = self.usage_request_id(iteration);
-            if resp.input_tokens > 0 || resp.output_tokens > 0 {
-                let round_usage = Usage {
-                    prompt_tokens: resp.input_tokens.max(0) as u32,
-                    completion_tokens: resp.output_tokens.max(0) as u32,
-                    total_tokens: resp.input_tokens.saturating_add(resp.output_tokens).max(0)
-                        as u32,
-                    cost: None,
-                    prompt_tokens_details: None,
-                    completion_tokens_details: None,
-                };
-                self.record_usage_event_for_round(&round_usage, iteration)
-                    .await;
-            }
-
-            if resp.cancelled || self.is_cancelled() {
-                self.emit_cancelled_done();
-                emitted_terminal = true;
-                break;
-            }
-
-            // Emit context usage if Anthropic reported it (it sets 0 when missing)
-            if resp.input_tokens > 0 {
-                self.events.emit(StreamEvent::ContextUsage {
-                            used_tokens: resp.input_tokens.max(0) as u32,
-                            limit_tokens: context_limit,
-                            max_limit_tokens: max_context_limit,
-                        });
-            }
-
-            let text = resp.text;
-            let tool_calls = resp.tool_calls;
-
-            // Persist assistant turn (Anthropic path — no separate reasoning
-            // stream; Claude's extended thinking goes via the same `content`
-            // for tool use turns)
-            let assistant_message_id = if !text.is_empty() || !tool_calls.is_empty() {
-                self.persist_message(
-                    "assistant",
-                    &text,
-                    None,
-                    if tool_calls.is_empty() {
-                        None
-                    } else {
-                        Some(&tool_calls)
-                    },
-                    None,
-                    Some(&usage_request_id),
-                )
-                .await?
-            } else {
-                None
-            };
-            if let Some(message_id) = assistant_message_id.as_deref() {
-                for tc in &tool_calls {
-                    self.persistence()
-                        .record_tool_call_started(message_id, tc)
-                        .await
-                        .map_err(persistence::to_app_error)?;
-                }
-            }
-
-            if tool_calls.is_empty() {
-                // Systemic fact-check — see the OpenAI loop for rationale.
-                if !fact_check_used {
-                    if let Some(correction) =
-                        fact_check_reply(&text, &fact_check_instruction, self.mode)
-                    {
-                        fact_check_used = true;
-                        self.persist_gate_message(&correction, "turn_notice").await?;
-                        self.events.emit(StreamEvent::CompletionGateAction {
-                                    kind: "turn_notice".into(),
-                                    detail: correction.clone(),
-                                });
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": [{ "type": "text", "text": correction }],
-                        }));
-                        continue;
-                    }
-                }
-                let evidence = completion_gate.evidence();
-                match completion_finalization(&evidence, completion_recovery_attempts, self.mode) {
-                    CompletionFinalization::Recover(prompt) => {
-                        completion_recovery_attempts += 1;
-                        require_tool_next = completion_recovery_requires_tool(self.mode);
-                        // Make the rejection visible instead of silently looping:
-                        // collapse the rejected candidate in the UI, persist the
-                        // injected instruction so rebuilt history stays faithful.
-                        self.mark_rejected_candidate(assistant_message_id.as_deref())
-                            .await?;
-                        self.persist_gate_message(&prompt, "gate_recovery").await?;
-                        self.events.emit(StreamEvent::CompletionGateAction {
-                                    kind: "recovery".into(),
-                                    detail: evidence.blockers.join("; "),
-                                });
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": [{
-                                "type": "text",
-                                "text": prompt,
-                            }],
-                        }));
-                        continue;
-                    }
-                    CompletionFinalization::ReleaseWithWarning(warning) => {
-                        // The reply stands — no folding, no Error. Persist a
-                        // visible warning and fall through to the normal Done.
-                        self.persist_gate_message(&warning, "gate_warning").await?;
-                        self.events.emit(StreamEvent::CompletionGateAction {
-                                    kind: "warning".into(),
-                                    detail: warning.clone(),
-                                });
-                    }
-                    CompletionFinalization::Blocked(message) => {
-                        self.mark_rejected_candidate(assistant_message_id.as_deref())
-                            .await?;
-                        self.persist_gate_message(&message, "gate_blocked").await?;
-                        self.events.emit(StreamEvent::Error { message });
-                        emitted_terminal = true;
-                        break;
-                    }
-                    CompletionFinalization::Complete => {}
-                }
-                emitted_terminal = true;
-                let inp = resp.input_tokens;
-                let out = resp.output_tokens;
-                self.events.emit(StreamEvent::Done {
-                            input_tokens: inp as u32,
-                            output_tokens: out as u32,
-                        });
-                break;
-            }
-
-            // Build assistant message with tool_use blocks for Anthropic
-            let mut assistant_content: Vec<serde_json::Value> = Vec::new();
-            if !text.is_empty() {
-                assistant_content.push(serde_json::json!({ "type": "text", "text": text }));
-            }
-            for tc in &tool_calls {
-                let input: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
-                assistant_content.push(serde_json::json!({
-                    "type": "tool_use",
-                    "id": tc.id,
-                    "name": tc.function.name,
-                    "input": input,
-                }));
-            }
-            messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": assistant_content,
-            }));
-
-            // Execute tools and collect tool_result blocks
-            let mut tool_result_blocks: Vec<serde_json::Value> = Vec::new();
-            let mut progress_prompt = None;
-            let completion_evidence_before_tool_batch = completion_gate.evidence();
-
-            for (tool_index, tc) in tool_calls.iter().enumerate() {
-                if let Some(remaining) =
-                    cancelled_tool_suffix(self.cancel.as_ref(), &tool_calls, tool_index)
-                {
-                    return self
-                        .finish_cancelled_tool_batch(remaining)
-                        .await;
-                }
-                let args: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                let completion_args = args.clone();
-
-                self.events.emit(StreamEvent::ToolCallStart {
-                            id: tc.id.clone(),
-                            name: tc.function.name.clone(),
-                            args: args.clone(),
-                        });
-
-                let bash_cmd = if tc.function.name == "bash" {
-                    args.get("command")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                };
-
-                let remaining = max_iterations.saturating_sub(iteration + 1) as u32;
-                let completion_evidence = completion_gate.evidence();
-                let denial_content = if let Some(content) = autonomous_budget_denial(
-                    self.mode,
-                    remaining,
-                    &completion_evidence,
-                    &tc.function.name,
-                    &args,
-                    &self.cwd,
-                ) {
-                    Some(content)
-                } else {
-                    match self
-                        .permission_gateway()
-                        .authorize(tc, &args, bash_cmd.as_deref())
-                        .await
-                    {
-                        PermissionOutcome::Allow => None,
-                        PermissionOutcome::Deny(content) => Some(content),
-                        PermissionOutcome::Cancelled => {
-                            return self
-                                .finish_cancelled_tool_batch(&tool_calls[tool_index..])
-                                .await;
-                        }
-                    }
-                };
-
-                if let Some(content) = denial_content {
-                    self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
-                        .await?;
-                    self.events.emit(StreamEvent::ToolResult {
-                                tool_call_id: tc.id.clone(),
-                                content: content.clone(),
-                                is_error: true,
-                                status: "denied".into(),
-                            });
-                    tool_result_blocks.push(serde_json::json!({
-                        "type": "tool_result",
-                        "tool_use_id": tc.id,
-                        "content": content,
-                    }));
-                    continue;
-                }
-
-                // Pre-tool hook: may cancel. Headless (no hooks) always allows.
-                let pre_allowed = hooks.pre_tool(&tc.function.name, &args).await;
-                if !pre_allowed {
-                    let content = "Tool call cancelled by hook.".to_string();
-                    self.record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
-                        .await?;
-                    self.events.emit(StreamEvent::ToolResult {
-                                tool_call_id: tc.id.clone(),
-                                content: content.clone(),
-                                is_error: true,
-                                status: "denied".into(),
-                            });
-                    tool_result_blocks.push(serde_json::json!({
-                        "type": "tool_result",
-                        "tool_use_id": tc.id,
-                        "content": content,
-                    }));
-                    continue;
-                }
-
-                // Tool execution now flows through the shared ToolBackend seam
-                // (keystone slice 4.3): the desktop backend builds the ExecCtx
-                // and runs MCP-first / native-dispatch. Timing stays in the loop
-                // so it covers the fatal-error path exactly as before.
-                let tool_backend = tool_backend::DesktopToolBackend {
-                    #[cfg(not(test))]
-                    app: self.app.clone(),
-                    db: self.db.clone(),
-                    mcp_manager: self.mcp_manager.clone(),
-                    settings: self.settings.clone(),
-                };
-                let tool_ctx = codefactory_agent_loop::tool::ToolCtx {
-                    working_directory: self.cwd.clone(),
-                    session_id: Some(self.audit_session_id()),
-                    task_id: self
-                        .execution_context
-                        .as_ref()
-                        .and_then(|ctx| ctx.task_id.clone()),
-                    knowledge_library_ids: knowledge_scope_for_tools(
-                        self.execution_context.as_ref(),
-                    ),
-                    timeout_sec: None,
-                };
-
-                let tool_start = std::time::Instant::now();
-                let exec_result = tool_backend.execute(tc, &args, &tool_ctx).await;
-                let duration_ms = tool_start.elapsed().as_millis() as u64;
-                let output = match exec_result {
-                    Ok(result) => tools::ToolOutput {
-                        content: result.content,
-                        is_error: result.is_error,
-                    },
-                    Err(error) => {
-                        let error_text = error.to_string();
-                        self.record_tool_call_outcome(
-                            tc,
-                            "error",
-                            None,
-                            Some(&error_text),
-                            duration_ms,
-                        )
-                        .await?;
-                        return Err(crate::errors::AppError::Other(error_text));
-                    }
-                };
-                self.record_tool_call_outcome(
-                    tc,
-                    if output.is_error { "error" } else { "done" },
-                    if output.is_error {
-                        None
-                    } else {
-                        Some(&output.content)
-                    },
-                    if output.is_error {
-                        Some(&output.content)
-                    } else {
-                        None
-                    },
-                    duration_ms,
-                )
-                .await?;
-
-                if let Some(prompt) = record_completion_outcome(
-                    &mut completion_gate,
-                    &mut progress_tracker,
-                    &mut completion_sequence,
-                    &self.cwd,
-                    &tc.function.name,
-                    &completion_args,
-                    &output.content,
-                    output.is_error,
-                ) {
-                    progress_prompt = Some(prompt);
-                }
-                // Post-tool hook (skipped headless — no hooks).
-                let post_result: String = output.content.chars().take(500).collect();
-                hooks
-                    .post_tool(&tc.function.name, &post_result, duration_ms)
-                    .await;
-
-                self.events.emit(StreamEvent::ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            content: output.content.clone(),
-                            is_error: output.is_error,
-                            status: if output.is_error {
-                                "error".into()
-                            } else {
-                                "done".into()
-                            },
-                        });
-
-                tool_result_blocks.push(serde_json::json!({
-                    "type": "tool_result",
-                    "tool_use_id": tc.id,
-                    "content": output.content,
-                }));
-            }
-
-            completion_recovery_attempts = completion_recovery_attempts_after_tool_batch(
-                completion_recovery_attempts,
-                completion_evidence_made_progress(
-                    &completion_evidence_before_tool_batch,
-                    &completion_gate.evidence(),
-                ),
-            );
-
-            // Append a single user message with all tool_result blocks
-            if !tool_result_blocks.is_empty() {
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": tool_result_blocks,
-                }));
-            }
-            if let Some(prompt) = progress_prompt {
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": [{"type": "text", "text": prompt}],
-                }));
-            }
-            let evidence = completion_gate.evidence();
-            if completion_ready_applies(self.mode)
-                && evidence.completed
-                && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
-            {
-                last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
-                finalization_pending = true;
-                self.persist_gate_message(build_completion_ready_prompt(), "gate_ready")
-                    .await?;
-                self.events.emit(StreamEvent::CompletionGateAction {
-                            kind: "ready".into(),
-                            detail: String::new(),
-                        });
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "text",
-                        "text": build_completion_ready_prompt(),
-                    }],
-                }));
-            } else if self.mode != AgentMode::Interactive {
-                let remaining = max_iterations.saturating_sub(iteration + 1);
-                if should_prompt_budget_convergence(remaining as u32) {
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": [{
-                            "type": "text",
-                            "text": build_budget_convergence_prompt(remaining as u32, &evidence),
-                        }],
-                    }));
-                }
-            }
-        }
-
-        // Safety net: see run_openai. Close the stream without treating
-        // incomplete completion evidence as success.
-        if !emitted_terminal {
-            let evidence = completion_gate.evidence();
-            tracing::warn!(
-                "agent loop hit the iteration ceiling ({}) without a terminal turn; completed={}",
-                self.mode.max_iterations(),
-                evidence.completed,
-            );
-            self.events.emit(iteration_ceiling_terminal_event(&evidence, self.mode));
-        }
-
-        Ok(())
-    }
 }
 
 fn validate_openai_sse_completion(
@@ -2094,10 +1425,16 @@ fn validate_openai_sse_completion(
 /// unbounded near-duplicate loop. Autonomous attempts stay single-shot because
 /// the scheduler can respawn them with a fresh evidence brief.
 
+// Test-only since slice 4.7: both loops call `policy::` directly with the
+// resolved scalars; these AgentMode wrappers stay to pin the mode→policy map.
+#[cfg(test)]
 fn completion_recovery_requires_tool(_mode: AgentMode) -> bool {
     true
 }
 
+// Test-only since slice 4.7: both loops call `policy::` directly with the
+// resolved scalars; these AgentMode wrappers stay to pin the mode→policy map.
+#[cfg(test)]
 fn completion_finalization(
     evidence: &CompletionEvidence,
     attempts: u32,
@@ -2115,10 +1452,16 @@ fn completion_finalization(
 /// Chinese, plain language, no gate terminology; the raw blocker list goes
 /// to the log only.
 
+// Test-only since slice 4.7: both loops call `policy::` directly with the
+// resolved scalars; these AgentMode wrappers stay to pin the mode→policy map.
+#[cfg(test)]
 fn iteration_ceiling_terminal_event(evidence: &CompletionEvidence, mode: AgentMode) -> StreamEvent {
     policy::iteration_ceiling_terminal_event(evidence, finalization_policy(mode))
 }
 
+// Test-only since slice 4.7: both loops call `policy::` directly with the
+// resolved scalars; these AgentMode wrappers stay to pin the mode→policy map.
+#[cfg(test)]
 fn completion_recovery_prompt(
     evidence: &CompletionEvidence,
     attempts: u32,
@@ -2604,10 +1947,16 @@ fn fact_check_reply(
 /// done"; firing it mid-task forcibly ends the turn while the model is
 /// announcing its next step, which reads as the assistant stalling. With the
 /// user present, the user decides when the work is finished.
+// Test-only since slice 4.7: both loops call `policy::` directly with the
+// resolved scalars; these AgentMode wrappers stay to pin the mode→policy map.
+#[cfg(test)]
 fn completion_ready_applies(mode: AgentMode) -> bool {
     policy::completion_ready_applies(finalization_policy(mode))
 }
 
+// Test-only since slice 4.7: both loops call `policy::` directly with the
+// resolved scalars; these AgentMode wrappers stay to pin the mode→policy map.
+#[cfg(test)]
 fn autonomous_budget_denial(
     mode: AgentMode,
     remaining_model_rounds: u32,
@@ -3644,23 +2993,6 @@ mod tests {
         }
         // Idempotent: second pass strips nothing.
         assert_eq!(strip_image_parts(&mut messages), 0);
-    }
-
-    #[test]
-    fn strip_image_values_handles_anthropic_shaped_content() {
-        let mut messages = vec![serde_json::json!({
-            "role": "user",
-            "content": [
-                { "type": "text", "text": "截图如下" },
-                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" } },
-                { "type": "image_url", "image_url": { "url": "data:image/png;base64,BBBB" } },
-            ],
-        })];
-        let stripped = strip_image_values(&mut messages);
-        assert_eq!(stripped, 2);
-        let parts = messages[0]["content"].as_array().unwrap();
-        assert!(parts.iter().all(|p| p["type"] == "text"));
-        assert_eq!(strip_image_values(&mut messages), 0);
     }
 
     #[test]

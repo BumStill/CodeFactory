@@ -1,5 +1,15 @@
 # Slice 4.7 — Anthropic canonicalization
 
+> **SHIPPED.** All 8 sub-steps landed. `run_anthropic` is now a 3-line wrapper
+> over the shared `run_via_agent_loop` adapter — the same one `run_openai` uses —
+> differing only in `(context_compression=false, overload_backoff=true,
+> expand_context_window=false)`. The ~690-line Value loop body,
+> `build_anthropic_messages`, and `call_anthropic_transport` are DELETED; the
+> `Value`↔wire conversion lives in `chat_messages_to_anthropic` inside the
+> transport edge, golden-pinned by 10 unit tests. **ONE loop now serves OpenAI,
+> ChatGPT, and Anthropic.** 487 lib + 25 agent-loop tests green. Post-ship: run a
+> real Claude round-trip (multi-tool turn, image turn) — see Open risks.
+
 Design from workflow `wf_b4d1af51` (4 mapper agents + synthesis, max-effort). The
 **hardest** slice and the **one deliberately non-transparent** change of the
 unified-agent-loop refactor. Converts `AgentLoop::run_anthropic` (~1200 lines,
