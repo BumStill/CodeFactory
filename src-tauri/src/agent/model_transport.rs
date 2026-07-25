@@ -612,6 +612,127 @@ impl ModelTransport for DesktopModelTransport {
     }
 }
 
+/// Convert canonical `ChatMessage` history into the Anthropic wire shape
+/// (keystone slice 4.7): returns the extracted top-level `system` string and the
+/// `messages` array. The INVERSE of the old `build_anthropic_messages` plus the
+/// live tool_result batching — the single representation boundary for Anthropic,
+/// EDGE-only (`run_agent_loop` never sees `Value`).
+///
+/// - a leading `role:"system"` ChatMessage → the `system` string (not emitted);
+/// - a maximal run of consecutive `role:"tool"` ChatMessages → ONE
+///   `{role:"user", content:[tool_result…]}` (the deliberate non-transparent
+///   merge — matches the live loop's already-batched shape);
+/// - assistant → text block if non-empty, then `tool_use` blocks
+///   (`input = from_str(args).unwrap_or({})`); empty-both → `[{text:""}]`;
+/// - user `Text` → a bare JSON string; user `Parts` → `[text | image]` blocks,
+///   `image_url` data-URLs split back to `{type:image, source:{base64,…}}`.
+#[allow(dead_code)]
+fn chat_messages_to_anthropic(
+    messages: &[codefactory_agent_loop::types::ChatMessage],
+) -> (String, Vec<serde_json::Value>) {
+    use codefactory_agent_loop::types::MessageContent;
+    let mut system = String::new();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        let m = &messages[i];
+        match m.role.as_str() {
+            "system" => {
+                system = super::AgentLoop::content_to_text(&m.content);
+                i += 1;
+            }
+            "tool" => {
+                // Merge the maximal run of consecutive tool messages into ONE
+                // user message of N tool_result blocks (never absorb a following
+                // non-tool message).
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                while i < messages.len() && messages[i].role == "tool" {
+                    let tm = &messages[i];
+                    blocks.push(serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": tm.tool_call_id.clone().unwrap_or_default(),
+                        "content": super::AgentLoop::content_to_text(&tm.content),
+                    }));
+                    i += 1;
+                }
+                out.push(serde_json::json!({ "role": "user", "content": blocks }));
+            }
+            "assistant" => {
+                let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+                let text = super::AgentLoop::content_to_text(&m.content);
+                if !text.is_empty() {
+                    content_blocks.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+                for tc in m.tool_calls.as_deref().unwrap_or_default() {
+                    let input: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or(serde_json::json!({}));
+                    content_blocks.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "input": input,
+                    }));
+                }
+                if content_blocks.is_empty() {
+                    content_blocks.push(serde_json::json!({ "type": "text", "text": "" }));
+                }
+                out.push(serde_json::json!({ "role": "assistant", "content": content_blocks }));
+                i += 1;
+            }
+            _ => {
+                let content = match &m.content {
+                    MessageContent::Text(s) => serde_json::Value::String(s.clone()),
+                    MessageContent::Parts(parts) => {
+                        let blocks: Vec<serde_json::Value> = parts
+                            .iter()
+                            .map(|p| {
+                                if p.r#type == "image_url" {
+                                    let url =
+                                        p.image_url.as_ref().map(|u| u.url.as_str()).unwrap_or("");
+                                    match parse_data_url(url) {
+                                        Some((media_type, data)) => serde_json::json!({
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": media_type,
+                                                "data": data,
+                                            },
+                                        }),
+                                        // Defensive: a non-data image_url (raw http)
+                                        // is never produced by attachments today, but
+                                        // must degrade without corrupting the request.
+                                        None => serde_json::json!({
+                                            "type": "image",
+                                            "source": { "type": "url", "url": url },
+                                        }),
+                                    }
+                                } else {
+                                    serde_json::json!({
+                                        "type": "text",
+                                        "text": p.text.clone().unwrap_or_default(),
+                                    })
+                                }
+                            })
+                            .collect();
+                        serde_json::Value::Array(blocks)
+                    }
+                };
+                out.push(serde_json::json!({ "role": m.role, "content": content }));
+                i += 1;
+            }
+        }
+    }
+    (system, out)
+}
+
+/// Split a `data:<media_type>;base64,<data>` URL into `(media_type, data)`.
+#[allow(dead_code)]
+fn parse_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (media_type, data) = rest.split_once(";base64,")?;
+    Some((media_type.to_string(), data.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     //! `DesktopModelTransport` owns no `AppHandle`, so it constructs from bare
@@ -619,6 +740,167 @@ mod tests {
     //! satisfied and object-safe (`Arc<dyn ModelTransport>`); `complete` itself
     //! is a network call, exercised end-to-end by the desktop app, not here.
     use super::*;
+    use codefactory_agent_loop::types::{
+        ChatMessage, ContentPart, FunctionCall, ImageUrl, MessageContent, ToolCall,
+    };
+    use serde_json::json;
+
+    // ── chat_messages_to_anthropic golden pins (keystone slice 4.7 step 4) ──
+    // The Anthropic representation switch is fully pinned HERE, before it is
+    // wired, so any drift in the edge conversion fails a unit test.
+
+    fn cm(role: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: MessageContent::Text(text.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        }
+    }
+    fn tool_cm(id: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".into(),
+            content: MessageContent::Text(content.into()),
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+            name: None,
+            reasoning_content: None,
+        }
+    }
+    fn call(id: &str, name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn edge_extracts_leading_system_and_emits_no_system_message() {
+        let (system, msgs) = chat_messages_to_anthropic(&[cm("system", "you are helpful"), cm("user", "hi")]);
+        assert_eq!(system, "you are helpful");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "hi");
+    }
+
+    #[test]
+    fn edge_assistant_text_only() {
+        let (_, msgs) = chat_messages_to_anthropic(&[cm("assistant", "hello")]);
+        assert_eq!(msgs[0]["content"], json!([{"type":"text","text":"hello"}]));
+    }
+
+    #[test]
+    fn edge_assistant_tool_only_has_no_text_block() {
+        let mut a = cm("assistant", "");
+        a.tool_calls = Some(vec![call("t1", "bash", r#"{"cmd":"ls"}"#)]);
+        let (_, msgs) = chat_messages_to_anthropic(&[a]);
+        assert_eq!(
+            msgs[0]["content"],
+            json!([{"type":"tool_use","id":"t1","name":"bash","input":{"cmd":"ls"}}])
+        );
+    }
+
+    #[test]
+    fn edge_assistant_text_then_tool_preserves_order() {
+        let mut a = cm("assistant", "running it");
+        a.tool_calls = Some(vec![call("t1", "bash", r#"{"cmd":"ls"}"#)]);
+        let (_, msgs) = chat_messages_to_anthropic(&[a]);
+        assert_eq!(
+            msgs[0]["content"],
+            json!([
+                {"type":"text","text":"running it"},
+                {"type":"tool_use","id":"t1","name":"bash","input":{"cmd":"ls"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn edge_assistant_empty_both_gets_placeholder_text_block() {
+        let (_, msgs) = chat_messages_to_anthropic(&[cm("assistant", "")]);
+        assert_eq!(msgs[0]["content"], json!([{"type":"text","text":""}]));
+    }
+
+    #[test]
+    fn edge_malformed_tool_args_become_empty_object() {
+        let mut a = cm("assistant", "");
+        a.tool_calls = Some(vec![call("t1", "bash", "not json")]);
+        let (_, msgs) = chat_messages_to_anthropic(&[a]);
+        assert_eq!(msgs[0]["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn edge_merges_consecutive_tool_results_into_one_user_message() {
+        // THE deliberate non-transparent merge: N tool rows → ONE user message
+        // of N tool_result blocks (matches the live loop's batched shape).
+        let (_, msgs) = chat_messages_to_anthropic(&[tool_cm("t1", "ok1"), tool_cm("t2", "ok2")]);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(
+            msgs[0]["content"],
+            json!([
+                {"type":"tool_result","tool_use_id":"t1","content":"ok1"},
+                {"type":"tool_result","tool_use_id":"t2","content":"ok2"},
+            ])
+        );
+    }
+
+    #[test]
+    fn edge_tool_run_then_user_progress_stays_two_user_messages() {
+        // The merge must NEVER absorb a following non-tool message.
+        let (_, msgs) = chat_messages_to_anthropic(&[tool_cm("t1", "ok"), cm("user", "continue")]);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            msgs[0]["content"],
+            json!([{"type":"tool_result","tool_use_id":"t1","content":"ok"}])
+        );
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "continue");
+    }
+
+    #[test]
+    fn edge_user_image_data_url_becomes_base64_source() {
+        let user = ChatMessage {
+            role: "user".into(),
+            content: MessageContent::Parts(vec![
+                ContentPart {
+                    r#type: "text".into(),
+                    text: Some("look".into()),
+                    image_url: None,
+                },
+                ContentPart {
+                    r#type: "image_url".into(),
+                    text: None,
+                    image_url: Some(ImageUrl {
+                        url: "data:image/png;base64,AAAB".into(),
+                    }),
+                },
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+        let (_, msgs) = chat_messages_to_anthropic(&[user]);
+        assert_eq!(
+            msgs[0]["content"],
+            json!([
+                {"type":"text","text":"look"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAB"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn edge_user_text_is_a_bare_json_string() {
+        let (_, msgs) = chat_messages_to_anthropic(&[cm("user", "just text")]);
+        assert_eq!(msgs[0]["content"], serde_json::Value::String("just text".into()));
+    }
     use std::sync::Arc;
 
     fn transport() -> DesktopModelTransport {
