@@ -71,7 +71,45 @@ describe("ToolCallCard — open generated file", () => {
     const row = screen.getByRole("button", { name: /命令.*npm test/ });
     expect(row).toHaveAttribute("data-density", "compact");
     expect(row).toHaveClass("min-h-7");
-    expect(container.firstElementChild).not.toHaveClass("bg-surface-2");
+    expect(container.firstElementChild).toHaveClass("text-[13px]");
+    expect(row).not.toHaveClass("w-full");
+    expect(container.firstElementChild).not.toHaveClass("border");
+    expect(container.firstElementChild).not.toHaveClass("bg-surface-1/30");
+  });
+
+  it.each([
+    ["running", "border-l-2", "bg-accent/[0.025]"],
+    ["waiting_permission", "border-l-2", "bg-amber-500/[0.025]"],
+    ["error", "border-l", "bg-transparent"],
+  ] as const)("uses a quiet left status rail instead of a full frame for %s", (status, rail, tone) => {
+    const { container } = render(
+      <ToolCallCard
+        tc={tc({
+          status,
+          isError: status === "error",
+          result: status === "error" ? "failed first line\nfull detail" : undefined,
+        })}
+      />,
+    );
+    expect(container.firstElementChild).toHaveClass(rail, tone);
+    expect(container.firstElementChild).not.toHaveClass("border");
+  });
+
+  it("keeps collapsed failure detail readable without stretching into a full-width alert card", () => {
+    render(
+      <ToolCallCard
+        tc={tc({
+          name: "bash",
+          args: JSON.stringify({ command: "false" }),
+          status: "error",
+          isError: true,
+          result: "[shell-audit] cwd=/a/very/long/path exit_code=1 risk=low",
+        })}
+      />,
+    );
+    const detail = screen.getByText(/\[shell-audit]/);
+    expect(detail).toHaveClass("max-w-[56ch]", "text-[13px]");
+    expect(detail).not.toHaveClass("border-t");
   });
 
 });

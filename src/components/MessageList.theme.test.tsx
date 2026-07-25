@@ -104,7 +104,7 @@ describe("MessageList theme readability", () => {
     expect(container.querySelector("th")?.textContent).toBe("A");
   });
 
-  it("renders grouped successful tools without full-width divider lines", () => {
+  it("renders grouped successful tools as an unframed conversational activity line", () => {
     const { container } = render(
       <MessageList
         messages={[
@@ -125,9 +125,76 @@ describe("MessageList theme readability", () => {
     const group = screen.getByRole("button", { name: /查看 3 个已完成操作/ }).parentElement;
     const classes = group?.className.split(/\s+/) ?? [];
     expect(classes).not.toContain("border-b");
-    expect(group?.className).toMatch(/rounded/);
-    expect(group?.className).toMatch(/border-border\/30/);
+    expect(classes).not.toContain("border");
+    expect(group?.className).not.toMatch(/bg-surface/);
     expect(container.querySelector("[data-tool-group='success']"), "expected a low-emphasis success group").toBeTruthy();
+  });
+
+  it("keeps persisted assistant/tool rounds close and reserves metadata for the settled answer", () => {
+    const { container } = render(
+      <MessageList
+        messages={[
+          baseMsg({ id: "u1", role: "user", content: "修复并验证", createdAt: 1 }),
+          baseMsg({
+            id: "a1",
+            content: "已保存检查点，接下来继续验证。",
+            createdAt: 2,
+            durationMs: 1_000,
+          }),
+          baseMsg({
+            id: "a2",
+            content: "接着运行聚焦测试。",
+            createdAt: 3,
+            durationMs: 2_000,
+            toolCalls: [
+              { id: "t2", name: "bash", args: JSON.stringify({ command: "pnpm test" }), result: "ok", status: "done" },
+            ],
+          }),
+          baseMsg({
+            id: "a3",
+            content: "修复完成，测试通过。",
+            createdAt: 4,
+            durationMs: 3_000,
+          }),
+        ]}
+        streaming={false}
+        cwd="/project"
+      />,
+    );
+
+    expect(container.querySelector("[data-message-row='a1']")).toHaveAttribute(
+      "data-message-flow",
+      "turn-start",
+    );
+    expect(container.querySelector("[data-message-row='a2']")).toHaveAttribute(
+      "data-message-flow",
+      "turn-continuation",
+    );
+    expect(screen.getAllByText("Remember")).toHaveLength(1);
+    expect(screen.getAllByText(/用时/)).toHaveLength(1);
+  });
+
+  it("uses a readable two-level type scale for operational narration and elapsed time", () => {
+    render(
+      <MessageList
+        messages={[
+          baseMsg({
+            id: "assistant-live",
+            content: "done",
+            createdAt: Date.now() - 2_000,
+            segments: [
+              { kind: "text", text: "Checking the workspace." },
+              { kind: "text", text: "done" },
+            ],
+          }),
+        ]}
+        streaming
+        cwd={null}
+      />,
+    );
+
+    expect(screen.getByText("Checking the workspace.")).toHaveClass("text-[13px]");
+    expect(screen.getByText(/运行中/)).toHaveClass("text-[11px]");
   });
 
   it("renders markdown image links as visible image previews", () => {

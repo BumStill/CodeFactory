@@ -77,50 +77,6 @@ pub fn extract_openai_parts(text: &str) -> Vec<ContentPart> {
     parts
 }
 
-/// Anthropic shape: returns a Vec of JSON values, mixing
-///   { "type": "text", "text": "..." }
-/// and
-///   { "type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."} }
-pub fn extract_anthropic_blocks(text: &str) -> Vec<serde_json::Value> {
-    let mut blocks: Vec<serde_json::Value> = Vec::new();
-    let mut cursor = 0usize;
-    let mut had_image = false;
-
-    for (start, end, path) in find_file_image_links(text) {
-        if let Some((media_type, b64)) = read_as_base64(&path) {
-            let prose = &text[cursor..start];
-            if !prose.trim().is_empty() {
-                blocks.push(serde_json::json!({
-                    "type": "text",
-                    "text": prose,
-                }));
-            }
-            blocks.push(serde_json::json!({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": media_type,
-                    "data": b64,
-                }
-            }));
-            cursor = end;
-            had_image = true;
-        }
-    }
-
-    if !had_image {
-        return Vec::new();
-    }
-    let tail = &text[cursor..];
-    if !tail.trim().is_empty() {
-        blocks.push(serde_json::json!({
-            "type": "text",
-            "text": tail,
-        }));
-    }
-    blocks
-}
-
 /// Find every `![alt](file:///path)` occurrence with an image extension.
 /// Returns (start_byte, end_byte, path) tuples in source order.
 ///
@@ -322,16 +278,4 @@ mod tests {
         assert_eq!(parsed[0].2, "/var/x.png");
     }
 
-    #[test]
-    fn anthropic_shape_matches_spec() {
-        let path = write_temp_png();
-        let msg = format!("![scr](file://{})", path);
-        let blocks = extract_anthropic_blocks(&msg);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0]["type"], "image");
-        assert_eq!(blocks[0]["source"]["type"], "base64");
-        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
-        assert!(blocks[0]["source"]["data"].as_str().unwrap().len() > 0);
-        std::fs::remove_file(&path).ok();
-    }
 }

@@ -30,11 +30,6 @@ fn perr<E: std::fmt::Display>(e: E) -> PersistError {
     }
 }
 
-/// Convert a `PersistError` back into the bin's error type for the inherent
-/// delegators. The user-facing message is preserved verbatim.
-pub(super) fn to_app_error(e: PersistError) -> crate::errors::AppError {
-    crate::errors::AppError::Other(e.message)
-}
 
 /// In-process persistence for the desktop app. Owns the pool + session + the
 /// `anonymous` no-trace flag. No `AppHandle` (#166).

@@ -37,6 +37,7 @@ use std::process::Command;
 use serde::Serialize;
 
 use crate::config::settings::{DeliveryCeiling, MergeMethod};
+use crate::util::command_env;
 use crate::util::no_window::NoWindow;
 
 /// Untracked path prefixes/exact-names never included in a delivery commit,
@@ -157,9 +158,23 @@ pub trait DeliveryRemote {
 
 // ── Local git helper ────────────────────────────────────────────────────────
 
+/// Build a `Command` for a developer CLI (`gh`/`git`) with the absolute binary
+/// resolved and the augmented developer PATH applied. GUI-launched apps on macOS
+/// do NOT inherit the login-shell PATH, so spawning a bare program name fails
+/// even when `gh` is installed and authenticated (Homebrew puts it in
+/// `/opt/homebrew/bin`, absent from the app's PATH). Resolving the absolute path
+/// makes the spawn work, and the augmented PATH lets `gh` find `git`. Mirrors
+/// `util::github_cli::gh_command`; the root cause of "deliver_changes gh PATH
+/// blocked" even though the CLI works from a terminal. EVERY production spawn of
+/// gh/git in this module MUST go through here (pinned by a source-text test).
+fn dev_command(program: &str) -> Command {
+    let mut command = Command::new(command_env::resolve_developer_command(program)).no_window();
+    command_env::apply_developer_path_std(&mut command);
+    command
+}
+
 fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        .no_window()
+    let out = dev_command("git")
         .arg("-C")
         .arg(cwd)
         .args(args)
@@ -262,8 +277,7 @@ pub fn stage_scoped(root: &Path, extra: &[String]) -> Result<Vec<String>, String
 
 fn has_staged_changes(root: &Path) -> bool {
     // `diff --cached --quiet` exits 1 when something is staged.
-    Command::new("git")
-        .no_window()
+    dev_command("git")
         .arg("-C")
         .arg(root)
         .args(["diff", "--cached", "--quiet"])
@@ -676,8 +690,7 @@ pub fn gh_cli_available() -> bool {
 }
 
 fn gh_auth_status(bin: &str) -> bool {
-    Command::new(bin)
-        .no_window()
+    dev_command(bin)
         .args(["auth", "status"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -779,8 +792,7 @@ pub fn gh_remote_for(cwd: &Path) -> Option<GhCliRemote> {
 
 impl GhCliRemote {
     fn gh(&self, args: &[String]) -> Result<String, String> {
-        let out = Command::new("gh")
-            .no_window()
+        let out = dev_command("gh")
             .current_dir(&self.cwd)
             .args(args)
             .output()
@@ -1065,6 +1077,31 @@ impl DeliveryRemote for GithubRemote {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_gh_git_spawns_go_through_dev_command() {
+        // Regression (the "deliver_changes gh PATH blocked" report): a bare
+        // `Command::new` on a program NAME fails to spawn in a GUI-launched app
+        // on macOS — it doesn't inherit the login-shell PATH, so `/opt/homebrew/
+        // bin/gh` is invisible even when gh is installed + authenticated. Every
+        // PRODUCTION spawn MUST resolve the absolute path via `dev_command`; only
+        // #[cfg(test)] code (which runs with cargo's full env) may use bare names.
+        let src = include_str!("delivery.rs");
+        let production = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("delivery.rs has a production section");
+        for bad in [
+            "Command::new(\"gh\")",
+            "Command::new(\"git\")",
+            "Command::new(bin)",
+        ] {
+            assert!(
+                !production.contains(bad),
+                "production delivery code must spawn via dev_command(), not `{bad}`"
+            );
+        }
+    }
 
     fn make_repo(tag: &str) -> PathBuf {
         // The repo lives one level under a unique per-test parent, so

@@ -44,27 +44,6 @@ pub fn strip_image_parts(messages: &mut [ChatMessage]) -> usize {
     stripped
 }
 
-/// Same as [`strip_image_parts`] for the Anthropic-shaped JSON message array
-/// (`type: "image"` blocks and any `image_url` compatibility parts).
-pub fn strip_image_values(messages: &mut [serde_json::Value]) -> usize {
-    let mut stripped = 0;
-    for message in messages.iter_mut() {
-        let Some(parts) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
-            continue;
-        };
-        for part in parts.iter_mut() {
-            let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if kind == "image" || kind == "image_url" {
-                *part = serde_json::json!({
-                    "type": "text",
-                    "text": IMAGE_STRIPPED_PLACEHOLDER,
-                });
-                stripped += 1;
-            }
-        }
-    }
-    stripped
-}
 
 /// Repair a compressed/replayed OpenAI history so it satisfies the strict
 /// tool-call protocol: every `assistant` tool_call must be followed by a matching

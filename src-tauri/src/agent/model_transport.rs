@@ -591,6 +591,89 @@ impl DesktopModelTransport {
 /// (message preserved verbatim). `RoundOptions` supplies the per-round
 /// `require_tool` + pre-resolved `reasoning_effort`; the sink and cancel handle
 /// are the transport's own fields, so `complete` needs neither as a param.
+impl DesktopModelTransport {
+    /// One Anthropic round (keystone slice 4.7): convert canonical `ChatMessage`
+    /// history to the Anthropic wire at the edge, run `stream_anthropic`, and
+    /// apply the required→auto tool-choice fallback (moved here from
+    /// `AgentLoop::call_anthropic_transport` so the shared loop, which only calls
+    /// `complete`, keeps it). `reasoning_effort` is ignored for Anthropic.
+    async fn call_anthropic_model(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        require_tool: bool,
+    ) -> Result<super::anthropic_client::AnthropicResponse> {
+        let (system, wire_messages) = chat_messages_to_anthropic(messages);
+        let first = super::anthropic_client::stream_anthropic(
+            &self.http,
+            &self.base_url,
+            &self.api_key,
+            &self.model_id,
+            &system,
+            wire_messages.clone(),
+            tools,
+            require_tool,
+            self.cancel.as_ref(),
+            self.events.as_ref(),
+        )
+        .await;
+        let required_choice_unsupported = first.as_ref().err().is_some_and(|error| {
+            require_tool && provider_rejects_required_tool_choice(&error.to_string())
+        });
+        if !required_choice_unsupported {
+            return first;
+        }
+        super::anthropic_client::stream_anthropic(
+            &self.http,
+            &self.base_url,
+            &self.api_key,
+            &self.model_id,
+            &system,
+            wire_messages,
+            tools,
+            false,
+            self.cancel.as_ref(),
+            self.events.as_ref(),
+        )
+        .await
+    }
+}
+
+/// Map the Anthropic streamed answer onto the provider-independent
+/// `ModelResponse` (keystone slice 4.7). Usage is gated on `(input>0||output>0)`
+/// — the same guard `record_usage_event_for_round` uses; `reasoning` is `None`
+/// (Anthropic thinking is neither requested nor parsed); `tool_calls` are
+/// cleared on cancel for parity with the OpenAI path (unobservable — the loop
+/// breaks first); the per-response `cancelled` bool is dropped (cancellation
+/// flows through the shared `Arc`).
+fn anthropic_response_to_model_response(
+    resp: super::anthropic_client::AnthropicResponse,
+) -> ModelResponse {
+    let usage = (resp.input_tokens > 0 || resp.output_tokens > 0).then(|| {
+        let input = resp.input_tokens.max(0) as u32;
+        let output = resp.output_tokens.max(0) as u32;
+        codefactory_agent_loop::types::Usage {
+            prompt_tokens: input,
+            completion_tokens: output,
+            total_tokens: input + output,
+            cost: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        }
+    });
+    let tool_calls = if resp.cancelled {
+        Vec::new()
+    } else {
+        resp.tool_calls
+    };
+    ModelResponse {
+        text: resp.text,
+        tool_calls,
+        usage,
+        reasoning: None,
+    }
+}
+
 #[async_trait::async_trait]
 impl ModelTransport for DesktopModelTransport {
     async fn complete(
@@ -599,17 +682,149 @@ impl ModelTransport for DesktopModelTransport {
         tools: &[ToolDefinition],
         opts: &RoundOptions,
     ) -> std::result::Result<ModelResponse, TransportError> {
-        let (text, tool_calls, usage, reasoning) = self
-            .call_openai_transport(messages, tools, opts.require_tool, &opts.reasoning_effort)
-            .await
-            .map_err(|e| TransportError::Fatal(e.to_string()))?;
-        Ok(ModelResponse {
-            text,
-            tool_calls,
-            usage,
-            reasoning,
-        })
+        // Dispatch on the provider dialect. The OpenAI path's `_ =>` would
+        // silently mis-route Anthropic to call_openai_model — MUST branch here.
+        match self.api_style {
+            ApiStyle::Anthropic => {
+                let resp = self
+                    .call_anthropic_model(messages, tools, opts.require_tool)
+                    .await
+                    .map_err(|e| TransportError::Fatal(e.to_string()))?;
+                Ok(anthropic_response_to_model_response(resp))
+            }
+            _ => {
+                let (text, tool_calls, usage, reasoning) = self
+                    .call_openai_transport(messages, tools, opts.require_tool, &opts.reasoning_effort)
+                    .await
+                    .map_err(|e| TransportError::Fatal(e.to_string()))?;
+                Ok(ModelResponse {
+                    text,
+                    tool_calls,
+                    usage,
+                    reasoning,
+                })
+            }
+        }
     }
+}
+
+/// Convert canonical `ChatMessage` history into the Anthropic wire shape
+/// (keystone slice 4.7): returns the extracted top-level `system` string and the
+/// `messages` array. The INVERSE of the old `build_anthropic_messages` plus the
+/// live tool_result batching — the single representation boundary for Anthropic,
+/// EDGE-only (`run_agent_loop` never sees `Value`).
+///
+/// - a leading `role:"system"` ChatMessage → the `system` string (not emitted);
+/// - a maximal run of consecutive `role:"tool"` ChatMessages → ONE
+///   `{role:"user", content:[tool_result…]}` (the deliberate non-transparent
+///   merge — matches the live loop's already-batched shape);
+/// - assistant → text block if non-empty, then `tool_use` blocks
+///   (`input = from_str(args).unwrap_or({})`); empty-both → `[{text:""}]`;
+/// - user `Text` → a bare JSON string; user `Parts` → `[text | image]` blocks,
+///   `image_url` data-URLs split back to `{type:image, source:{base64,…}}`.
+fn chat_messages_to_anthropic(
+    messages: &[codefactory_agent_loop::types::ChatMessage],
+) -> (String, Vec<serde_json::Value>) {
+    use codefactory_agent_loop::types::MessageContent;
+    let mut system = String::new();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        let m = &messages[i];
+        match m.role.as_str() {
+            "system" => {
+                system = super::AgentLoop::content_to_text(&m.content);
+                i += 1;
+            }
+            "tool" => {
+                // Merge the maximal run of consecutive tool messages into ONE
+                // user message of N tool_result blocks (never absorb a following
+                // non-tool message).
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                while i < messages.len() && messages[i].role == "tool" {
+                    let tm = &messages[i];
+                    blocks.push(serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": tm.tool_call_id.clone().unwrap_or_default(),
+                        "content": super::AgentLoop::content_to_text(&tm.content),
+                    }));
+                    i += 1;
+                }
+                out.push(serde_json::json!({ "role": "user", "content": blocks }));
+            }
+            "assistant" => {
+                let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+                let text = super::AgentLoop::content_to_text(&m.content);
+                if !text.is_empty() {
+                    content_blocks.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+                for tc in m.tool_calls.as_deref().unwrap_or_default() {
+                    let input: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or(serde_json::json!({}));
+                    content_blocks.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "input": input,
+                    }));
+                }
+                if content_blocks.is_empty() {
+                    content_blocks.push(serde_json::json!({ "type": "text", "text": "" }));
+                }
+                out.push(serde_json::json!({ "role": "assistant", "content": content_blocks }));
+                i += 1;
+            }
+            _ => {
+                let content = match &m.content {
+                    MessageContent::Text(s) => serde_json::Value::String(s.clone()),
+                    MessageContent::Parts(parts) => {
+                        let blocks: Vec<serde_json::Value> = parts
+                            .iter()
+                            .map(|p| {
+                                if p.r#type == "image_url" {
+                                    let url =
+                                        p.image_url.as_ref().map(|u| u.url.as_str()).unwrap_or("");
+                                    match parse_data_url(url) {
+                                        Some((media_type, data)) => serde_json::json!({
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": media_type,
+                                                "data": data,
+                                            },
+                                        }),
+                                        // Defensive: a non-data image_url (raw http)
+                                        // is never produced by attachments today, but
+                                        // must degrade without corrupting the request.
+                                        None => serde_json::json!({
+                                            "type": "image",
+                                            "source": { "type": "url", "url": url },
+                                        }),
+                                    }
+                                } else {
+                                    serde_json::json!({
+                                        "type": "text",
+                                        "text": p.text.clone().unwrap_or_default(),
+                                    })
+                                }
+                            })
+                            .collect();
+                        serde_json::Value::Array(blocks)
+                    }
+                };
+                out.push(serde_json::json!({ "role": m.role, "content": content }));
+                i += 1;
+            }
+        }
+    }
+    (system, out)
+}
+
+/// Split a `data:<media_type>;base64,<data>` URL into `(media_type, data)`.
+fn parse_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (media_type, data) = rest.split_once(";base64,")?;
+    Some((media_type.to_string(), data.to_string()))
 }
 
 #[cfg(test)]
@@ -619,6 +834,203 @@ mod tests {
     //! satisfied and object-safe (`Arc<dyn ModelTransport>`); `complete` itself
     //! is a network call, exercised end-to-end by the desktop app, not here.
     use super::*;
+    use codefactory_agent_loop::types::{
+        ChatMessage, ContentPart, FunctionCall, ImageUrl, MessageContent, ToolCall,
+    };
+    use serde_json::json;
+
+    // ── chat_messages_to_anthropic golden pins (keystone slice 4.7 step 4) ──
+    // The Anthropic representation switch is fully pinned HERE, before it is
+    // wired, so any drift in the edge conversion fails a unit test.
+
+    fn cm(role: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: MessageContent::Text(text.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        }
+    }
+    fn tool_cm(id: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".into(),
+            content: MessageContent::Text(content.into()),
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+            name: None,
+            reasoning_content: None,
+        }
+    }
+    fn call(id: &str, name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn edge_extracts_leading_system_and_emits_no_system_message() {
+        let (system, msgs) = chat_messages_to_anthropic(&[cm("system", "you are helpful"), cm("user", "hi")]);
+        assert_eq!(system, "you are helpful");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "hi");
+    }
+
+    #[test]
+    fn edge_assistant_text_only() {
+        let (_, msgs) = chat_messages_to_anthropic(&[cm("assistant", "hello")]);
+        assert_eq!(msgs[0]["content"], json!([{"type":"text","text":"hello"}]));
+    }
+
+    #[test]
+    fn edge_assistant_tool_only_has_no_text_block() {
+        let mut a = cm("assistant", "");
+        a.tool_calls = Some(vec![call("t1", "bash", r#"{"cmd":"ls"}"#)]);
+        let (_, msgs) = chat_messages_to_anthropic(&[a]);
+        assert_eq!(
+            msgs[0]["content"],
+            json!([{"type":"tool_use","id":"t1","name":"bash","input":{"cmd":"ls"}}])
+        );
+    }
+
+    #[test]
+    fn edge_assistant_text_then_tool_preserves_order() {
+        let mut a = cm("assistant", "running it");
+        a.tool_calls = Some(vec![call("t1", "bash", r#"{"cmd":"ls"}"#)]);
+        let (_, msgs) = chat_messages_to_anthropic(&[a]);
+        assert_eq!(
+            msgs[0]["content"],
+            json!([
+                {"type":"text","text":"running it"},
+                {"type":"tool_use","id":"t1","name":"bash","input":{"cmd":"ls"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn edge_assistant_empty_both_gets_placeholder_text_block() {
+        let (_, msgs) = chat_messages_to_anthropic(&[cm("assistant", "")]);
+        assert_eq!(msgs[0]["content"], json!([{"type":"text","text":""}]));
+    }
+
+    #[test]
+    fn edge_malformed_tool_args_become_empty_object() {
+        let mut a = cm("assistant", "");
+        a.tool_calls = Some(vec![call("t1", "bash", "not json")]);
+        let (_, msgs) = chat_messages_to_anthropic(&[a]);
+        assert_eq!(msgs[0]["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn edge_merges_consecutive_tool_results_into_one_user_message() {
+        // THE deliberate non-transparent merge: N tool rows → ONE user message
+        // of N tool_result blocks (matches the live loop's batched shape).
+        let (_, msgs) = chat_messages_to_anthropic(&[tool_cm("t1", "ok1"), tool_cm("t2", "ok2")]);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(
+            msgs[0]["content"],
+            json!([
+                {"type":"tool_result","tool_use_id":"t1","content":"ok1"},
+                {"type":"tool_result","tool_use_id":"t2","content":"ok2"},
+            ])
+        );
+    }
+
+    #[test]
+    fn edge_tool_run_then_user_progress_stays_two_user_messages() {
+        // The merge must NEVER absorb a following non-tool message.
+        let (_, msgs) = chat_messages_to_anthropic(&[tool_cm("t1", "ok"), cm("user", "continue")]);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            msgs[0]["content"],
+            json!([{"type":"tool_result","tool_use_id":"t1","content":"ok"}])
+        );
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "continue");
+    }
+
+    #[test]
+    fn edge_user_image_data_url_becomes_base64_source() {
+        let user = ChatMessage {
+            role: "user".into(),
+            content: MessageContent::Parts(vec![
+                ContentPart {
+                    r#type: "text".into(),
+                    text: Some("look".into()),
+                    image_url: None,
+                },
+                ContentPart {
+                    r#type: "image_url".into(),
+                    text: None,
+                    image_url: Some(ImageUrl {
+                        url: "data:image/png;base64,AAAB".into(),
+                    }),
+                },
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+        let (_, msgs) = chat_messages_to_anthropic(&[user]);
+        assert_eq!(
+            msgs[0]["content"],
+            json!([
+                {"type":"text","text":"look"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAB"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn edge_user_text_is_a_bare_json_string() {
+        let (_, msgs) = chat_messages_to_anthropic(&[cm("user", "just text")]);
+        assert_eq!(msgs[0]["content"], serde_json::Value::String("just text".into()));
+    }
+
+    #[test]
+    fn anthropic_response_maps_usage_reasoning_and_cancel() {
+        use crate::agent::anthropic_client::AnthropicResponse;
+        // input/output>0 → Some usage; reasoning always None; tool_calls kept.
+        let mr = anthropic_response_to_model_response(AnthropicResponse {
+            text: "hi".into(),
+            tool_calls: vec![call("t1", "bash", "{}")],
+            input_tokens: 5,
+            output_tokens: 7,
+            cancelled: false,
+        });
+        assert_eq!(mr.text, "hi");
+        assert_eq!(mr.tool_calls.len(), 1);
+        assert!(mr.reasoning.is_none());
+        let u = mr.usage.expect("usage present when tokens > 0");
+        assert_eq!((u.prompt_tokens, u.completion_tokens, u.total_tokens), (5, 7, 12));
+        // (0,0) tokens → None (matches the record_usage guard).
+        let none = anthropic_response_to_model_response(AnthropicResponse {
+            text: String::new(),
+            tool_calls: vec![],
+            input_tokens: 0,
+            output_tokens: 0,
+            cancelled: false,
+        });
+        assert!(none.usage.is_none());
+        // cancelled → tool_calls cleared (OpenAI parity, unobservable).
+        let cancelled = anthropic_response_to_model_response(AnthropicResponse {
+            text: String::new(),
+            tool_calls: vec![call("t1", "bash", "{}")],
+            input_tokens: 1,
+            output_tokens: 1,
+            cancelled: true,
+        });
+        assert!(cancelled.tool_calls.is_empty());
+    }
     use std::sync::Arc;
 
     fn transport() -> DesktopModelTransport {
