@@ -556,10 +556,21 @@ const MessageRow = memo(function MessageRow({
           {collapsible && (
             <button
               type="button"
+              aria-expanded={showAllSteps}
+              aria-label={
+                showAllSteps
+                  ? "收起较早的执行过程"
+                  : `展开较早的执行过程，共 ${hiddenSteps} 条`
+              }
               onClick={() => setShowAllSteps((v) => !v)}
-              className="text-[11px] text-gray-500 hover:text-gray-300 border border-surface-3 rounded px-2 py-0.5"
+              className="inline-flex min-h-7 items-center gap-1 rounded-md px-1.5 text-[13px] leading-5 text-gray-500 transition-colors hover:bg-surface-3/55 hover:text-gray-300"
             >
-              {showAllSteps ? "收起早期步骤" : `前 ${hiddenSteps} 步(点击展开)`}
+              <ChevronDown
+                size={13}
+                aria-hidden="true"
+                className={`transition-transform ${showAllSteps ? "" : "-rotate-90"}`}
+              />
+              {showAllSteps ? "收起较早的执行过程" : "展开较早的执行过程"}
             </button>
           )}
           {groupedTimeline!.map((item, itemIndex) => {
@@ -580,7 +591,7 @@ const MessageRow = memo(function MessageRow({
                 <div
                   key={`seg-${index}`}
                   data-segment="step"
-                  className="border-l border-surface-3 pl-2.5 py-0.5 text-[13px] leading-5 text-gray-400 whitespace-pre-wrap"
+                  className="py-0.5 text-[15px] leading-6 text-gray-300 whitespace-pre-wrap"
                 >
                   {segment.text}
                 </div>
