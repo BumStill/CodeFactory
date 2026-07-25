@@ -64,12 +64,31 @@ catastrophic. `true` ⇒ different history ⇒ guaranteed score change. Only a
 `ContextCompactor` seam preserves the semantics — and even then (c) remains.
 
 ## Recommended decomposition (each independently green)
-1. **4.8a** — sidecar internal module split (protocol/transport/compaction/policy),
-   zero behaviour change, all 27 tokio tests unchanged. Diffable baseline.
-2. **4.8b** — sidecar adopts the traits **behind its own loop**, one at a time.
-   Retires most of (a) with near-zero eval risk. *(Caveat: the transport step is
-   subtler than it looks — today's loop echoes the provider `message` Value
-   verbatim, so a `ModelResponse` return already imposes (c1).)*
+1. **4.8a ✅ SHIPPED** (PR #205) — sidecar internal module split
+   (protocol/transport/compaction/policy), zero behaviour change, the 28-test
+   tokio suite byte-for-byte unchanged (596 production lines moved out, 12
+   `mod`/`use` lines in). Diffable baseline for everything below.
+2. **4.8b — RE-SCOPED after attempting it: fold into 4.8c.** The "adopt the
+   traits behind its own loop" idea works for the desktop (whose loop is already
+   shared) but NOT here — the sidecar's parts only become detachable once the
+   loop is shared. Verified in code:
+   - `PermissionGateway` — **blocked**. The decision reads
+     `progress_tracker.read_only_exhausted()`/`mutation_seen()`, `wall_time`,
+     `gate.evidence()` and `cwd`; the trait only passes
+     `(tool_call, args, bash_command)`. Needs seams b3/b4/b5 first.
+   - `SidecarTransport` — **imposes (c1) immediately**: today's loop echoes the
+     provider `message` Value verbatim, so returning a typed `ModelResponse`
+     changes the payload before anything else does.
+   - `NullPersistence` — **ceremony**: the sidecar never persists.
+   - `JsonlEventSink` — **low value**: its outputs (`tool_request`/
+     `usage_snapshot`/`finished`) are not `StreamEvent`s.
+   - `WallClockBudget` — clean, but a single small rule on its own.
+   The one piece with real forward value is **`DelegatingToolBackend`** (the
+   JSONL tool round-trip behind `execute()`), and it requires converting
+   `&mut stdin/stdout` to `Arc<Mutex<…>>` through all of `run()` — an I/O
+   ownership restructure of a governance-tracked binary whose failure modes
+   (deadlock, reordered output lines) the 28 tests may not catch. Do it as its
+   own focused change, not as a tail-end step.
 3. **4.8c** — add each `run_agent_loop` seam separately, verified against the
    DESKTOP suite. **b2 and b5 deserve their own PRs.**
 4. **4.8d** — differential harness before the flip: run both loops against the
