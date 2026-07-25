@@ -1,4 +1,6 @@
 /** @type {import('tailwindcss').Config} */
+const themeColor = (name) => `rgb(var(${name}) / <alpha-value>)`;
+
 export default {
   content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
   darkMode: ["selector", '[data-theme="dark"]'],
@@ -11,28 +13,28 @@ export default {
       colors: {
         // Surface palette — driven by CSS vars, theme-aware
         surface: {
-          0: "var(--surface-0)",
-          1: "var(--surface-1)",
-          2: "var(--surface-2)",
-          3: "var(--surface-3)",
-          4: "var(--surface-4)",
+          0: themeColor("--surface-0"),
+          1: themeColor("--surface-1"),
+          2: themeColor("--surface-2"),
+          3: themeColor("--surface-3"),
+          4: themeColor("--surface-4"),
         },
-        border: "var(--border-color)",
-        accent: "var(--accent-color)",
-        "accent-hover": "var(--accent-hover-color)",
+        border: themeColor("--border-color"),
+        accent: themeColor("--accent-color"),
+        "accent-hover": themeColor("--accent-hover-color"),
         // Override gray shades with CSS vars so every existing text-gray-* /
         // bg-gray-* class automatically flips between light and dark themes.
         // The semantic mapping inverts the scale: in light mode gray-200 is
         // near-black (readable on white), in dark mode it's near-white.
         gray: {
-          100: "var(--gray-100)",
-          200: "var(--gray-200)",
-          300: "var(--gray-300)",
-          400: "var(--gray-400)",
-          500: "var(--gray-500)",
-          600: "var(--gray-600)",
-          700: "var(--gray-700)",
-          900: "var(--gray-900)",
+          100: themeColor("--gray-100"),
+          200: themeColor("--gray-200"),
+          300: themeColor("--gray-300"),
+          400: themeColor("--gray-400"),
+          500: themeColor("--gray-500"),
+          600: themeColor("--gray-600"),
+          700: themeColor("--gray-700"),
+          900: themeColor("--gray-900"),
         },
       },
       keyframes: {

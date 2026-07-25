@@ -10,7 +10,7 @@
 //! pin behaviour byte-for-byte.
 //!
 //! Mapping (desktop): Interactive/Execute → `ReleaseWithWarning`, recovery 3,
-//! `wall_budget_applies=false`(Interactive)/true(Execute); Autonomous →
+//! `wall_budget_applies=false`; Autonomous →
 //! `BlockOnIncomplete`, recovery 1, wall budget on. The `Benchmark` arm serves
 //! the sidecar (4.8) and is never produced on the desktop path.
 
@@ -135,6 +135,65 @@ pub fn iteration_ceiling_terminal_event(
             message: completion_blocked_message(evidence),
         }
     }
+}
+
+/// The per-segment round count remains an internal checkpoint cadence, never a
+/// task-level completion boundary for chat. Two full segments without material
+/// completion-evidence progress are enough to stop an accidental tool loop,
+/// while a productive run automatically receives another segment.
+pub const MAX_STALLED_CHAT_SEGMENTS: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentCheckpointDecision {
+    /// Completion evidence is satisfied; the tools-disabled checkpoint response
+    /// becomes the final user-facing answer.
+    Complete,
+    /// Persist the checkpoint summary and automatically open the next segment.
+    Continue,
+    /// Stop a demonstrably stalled loop with a visible, resumable notice.
+    Pause(String),
+    /// Non-chat policies retain their existing terminal ceiling semantics.
+    Terminal,
+}
+
+pub fn segment_checkpoint_decision(
+    evidence: &CompletionEvidence,
+    policy: FinalizationPolicy,
+    material_progress: bool,
+    stalled_segments_before: u32,
+) -> SegmentCheckpointDecision {
+    if evidence.completed {
+        return SegmentCheckpointDecision::Complete;
+    }
+    if !matches!(policy, FinalizationPolicy::ReleaseWithWarning) {
+        return SegmentCheckpointDecision::Terminal;
+    }
+    if material_progress || stalled_segments_before + 1 < MAX_STALLED_CHAT_SEGMENTS {
+        return SegmentCheckpointDecision::Continue;
+    }
+    SegmentCheckpointDecision::Pause(
+        "连续两个执行段未取得可验证进展，已停止自动重试以避免原地循环。\
+当前进度已保存；修正阻塞条件后回复「继续执行」即可从这里恢复。"
+            .to_string(),
+    )
+}
+
+/// Force one tools-disabled response at a segment checkpoint. It is a natural
+/// assistant progress update, not an internal status card, and is persisted as
+/// ordinary assistant history before the next segment starts.
+pub fn segment_checkpoint_summary_prompt(evidence: &CompletionEvidence) -> String {
+    let blockers = if evidence.blockers.is_empty() {
+        "尚无结构化 blocker；请根据刚完成的工具结果判断下一步。".to_string()
+    } else {
+        evidence.blockers.join("; ")
+    };
+    format!(
+        "这是内部连续执行检查点，不是任务轮次上限，也不是让用户接手。\
+请用简洁自然的对话说明已经完成的具体进展、当前验证状态和紧接着要做的动作。\
+当前结构化阻塞：{blockers}。\
+除非验收条件确实已经满足，否则不得宣称任务完成、不得要求用户回复继续；\
+明确说明你将自动继续执行。此轮禁用工具，只输出进度总结。"
+    )
 }
 
 pub fn completion_recovery_prompt(
@@ -282,7 +341,12 @@ mod tests {
     #[test]
     fn finalization_completes_when_evidence_is_done() {
         assert_eq!(
-            completion_finalization(&evidence(true, &[]), 0, FinalizationPolicy::ReleaseWithWarning, 3),
+            completion_finalization(
+                &evidence(true, &[]),
+                0,
+                FinalizationPolicy::ReleaseWithWarning,
+                3
+            ),
             CompletionFinalization::Complete
         );
     }
@@ -291,16 +355,31 @@ mod tests {
     fn finalization_recovers_under_the_limit_then_diverges_by_policy() {
         // Under the recovery limit → Recover regardless of policy.
         assert!(matches!(
-            completion_finalization(&evidence(false, &["x"]), 0, FinalizationPolicy::BlockOnIncomplete, 1),
+            completion_finalization(
+                &evidence(false, &["x"]),
+                0,
+                FinalizationPolicy::BlockOnIncomplete,
+                1
+            ),
             CompletionFinalization::Recover(_)
         ));
         // At the limit: BlockOnIncomplete → Blocked, ReleaseWithWarning → warning.
         assert!(matches!(
-            completion_finalization(&evidence(false, &["x"]), 1, FinalizationPolicy::BlockOnIncomplete, 1),
+            completion_finalization(
+                &evidence(false, &["x"]),
+                1,
+                FinalizationPolicy::BlockOnIncomplete,
+                1
+            ),
             CompletionFinalization::Blocked(_)
         ));
         assert!(matches!(
-            completion_finalization(&evidence(false, &["x"]), 3, FinalizationPolicy::ReleaseWithWarning, 3),
+            completion_finalization(
+                &evidence(false, &["x"]),
+                3,
+                FinalizationPolicy::ReleaseWithWarning,
+                3
+            ),
             CompletionFinalization::ReleaseWithWarning(_)
         ));
     }
@@ -308,18 +387,60 @@ mod tests {
     #[test]
     fn ceiling_errors_only_when_blocking_on_incomplete() {
         assert!(matches!(
-            iteration_ceiling_terminal_event(&evidence(false, &["x"]), FinalizationPolicy::BlockOnIncomplete),
+            iteration_ceiling_terminal_event(
+                &evidence(false, &["x"]),
+                FinalizationPolicy::BlockOnIncomplete
+            ),
             StreamEvent::Error { .. }
         ));
         assert!(matches!(
-            iteration_ceiling_terminal_event(&evidence(false, &["x"]), FinalizationPolicy::ReleaseWithWarning),
+            iteration_ceiling_terminal_event(
+                &evidence(false, &["x"]),
+                FinalizationPolicy::ReleaseWithWarning
+            ),
             StreamEvent::Done { .. }
         ));
     }
 
     #[test]
+    fn chat_checkpoint_is_an_automatic_continuation_not_a_terminal_done() {
+        let decision = segment_checkpoint_decision(
+            &evidence(false, &["verification still pending"]),
+            FinalizationPolicy::ReleaseWithWarning,
+            true,
+            0,
+        );
+        assert_eq!(decision, SegmentCheckpointDecision::Continue);
+
+        let summary_prompt =
+            segment_checkpoint_summary_prompt(&evidence(false, &["verification still pending"]));
+        assert!(summary_prompt.contains("自动继续"));
+        assert!(summary_prompt.contains("不得宣称任务完成"));
+    }
+
+    #[test]
+    fn chat_checkpoint_only_pauses_after_repeated_no_progress() {
+        let decision = segment_checkpoint_decision(
+            &evidence(false, &["same blocker"]),
+            FinalizationPolicy::ReleaseWithWarning,
+            false,
+            MAX_STALLED_CHAT_SEGMENTS - 1,
+        );
+        let SegmentCheckpointDecision::Pause(notice) = decision else {
+            panic!("repeated stalled chat segments must persist a resumable pause");
+        };
+        assert!(notice.contains("连续"));
+        assert!(notice.contains("进度已保存"));
+        assert!(notice.contains("继续执行"));
+    }
+
+    #[test]
     fn ready_nudge_skips_the_release_with_warning_surface() {
-        assert!(!completion_ready_applies(FinalizationPolicy::ReleaseWithWarning));
-        assert!(completion_ready_applies(FinalizationPolicy::BlockOnIncomplete));
+        assert!(!completion_ready_applies(
+            FinalizationPolicy::ReleaseWithWarning
+        ));
+        assert!(completion_ready_applies(
+            FinalizationPolicy::BlockOnIncomplete
+        ));
     }
 }

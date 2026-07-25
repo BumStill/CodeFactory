@@ -268,12 +268,23 @@ export function MessageList({
   );
   const lastAssistantId =
     [...visible].reverse().find((m) => m.role === "assistant")?.id ?? null;
+  const lastAssistantIdsByUserTurn = new Set<string>();
+  let pendingLastAssistantId: string | null = null;
+  for (const message of visible) {
+    if (message.role === "user") {
+      if (pendingLastAssistantId) lastAssistantIdsByUserTurn.add(pendingLastAssistantId);
+      pendingLastAssistantId = null;
+    } else if (message.role === "assistant") {
+      pendingLastAssistantId = message.id;
+    }
+  }
+  if (pendingLastAssistantId) lastAssistantIdsByUserTurn.add(pendingLastAssistantId);
 
   return (
     <div className="relative flex-1 min-h-0">
       <div
         ref={scrollerRef}
-        className="absolute inset-0 overflow-y-auto px-4 py-4 space-y-5"
+        className="absolute inset-0 overflow-y-auto px-4 py-4"
       >
         {hasOlderHistory && (
           <div className="flex justify-center">
@@ -296,15 +307,38 @@ export function MessageList({
             为保持超长会话可用，部分超大历史内容仅显示预览或分段加载；完整原始记录仍保存在本机。
           </div>
         )}
-        {visible.map((msg) => (
-          <div key={msg.id} data-message-row={msg.id}>
+        {visible.map((msg, index) => {
+          const previous = visible[index - 1];
+          const messageFlow =
+            msg.role === "user"
+              ? "user-turn"
+              : previous?.role === "assistant"
+                ? "turn-continuation"
+                : "turn-start";
+          const spacing =
+            index === 0
+              ? ""
+              : msg.role === "user"
+                ? "mt-6"
+                : messageFlow === "turn-continuation"
+                  ? "mt-1"
+                  : "mt-3";
+          return (
+          <div
+            key={msg.id}
+            data-message-row={msg.id}
+            data-message-flow={messageFlow}
+            className={spacing}
+          >
             <MessageRow
               msg={msg}
               isStreamingTail={streaming && msg.id === lastAssistantId}
+              isLastAssistantInUserTurn={lastAssistantIdsByUserTurn.has(msg.id)}
               cwd={cwd ?? null}
             />
           </div>
-        ))}
+          );
+        })}
       </div>
 
       {!pinned && (
@@ -332,18 +366,18 @@ export function MessageList({
 function SuccessfulToolGroup({ tools }: { tools: NonNullable<UIMessage["toolCalls"]> }) {
   const [open, setOpen] = useState(false);
   return (
-    <div data-tool-group="success" className="my-1 rounded-lg border border-border/30 bg-surface-1/35 px-1 py-0.5">
+    <div data-tool-group="success" className="my-0.5 w-fit max-w-full">
       <button
         type="button"
         aria-label={`${open ? "收起" : "查看"} ${tools.length} 个已完成操作`}
         onClick={() => setOpen((value) => !value)}
-        className="flex min-h-7 w-full items-center gap-1.5 px-2 text-left text-[11px] text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-400"
+        className="inline-flex min-h-7 max-w-full items-center gap-1.5 rounded-md px-1.5 text-left text-[13px] text-gray-600 transition-colors hover:bg-surface-3/55 hover:text-gray-400"
       >
-        <Check size={11} className="text-green-600/70" />
+        <Check size={12} className="text-green-600/70" />
         <span>已完成 {tools.length} 个操作</span>
-        <ChevronDown size={11} className={`ml-auto transition-transform ${open ? "rotate-180" : ""}`} />
+        <ChevronDown size={12} className={`ml-auto transition-transform ${open ? "rotate-180" : ""}`} />
       </button>
-      {open && <div className="pl-3">{tools.map((tool) => <ToolCallCard key={tool.id} tc={tool} />)}</div>}
+      {open && <div className="ml-2 border-l border-border/40 pl-2">{tools.map((tool) => <ToolCallCard key={tool.id} tc={tool} />)}</div>}
     </div>
   );
 }
@@ -352,7 +386,17 @@ function isQuietSuccess(tool: NonNullable<UIMessage["toolCalls"]>[number] | unde
   return Boolean(tool && tool.status === "done" && !tool.isError);
 }
 
-const MessageRow = memo(function MessageRow({ msg, isStreamingTail, cwd }: { msg: UIMessage; isStreamingTail: boolean; cwd: string | null }) {
+const MessageRow = memo(function MessageRow({
+  msg,
+  isStreamingTail,
+  isLastAssistantInUserTurn,
+  cwd,
+}: {
+  msg: UIMessage;
+  isStreamingTail: boolean;
+  isLastAssistantInUserTurn: boolean;
+  cwd: string | null;
+}) {
   const isUser = msg.role === "user";
   // Must run unconditionally (before the early return) to satisfy the rules
   // of hooks. Only the live streaming tail arms the 1s ticker; for every
@@ -423,18 +467,6 @@ const MessageRow = memo(function MessageRow({ msg, isStreamingTail, cwd }: { msg
     !msg.reviewProgress &&
     (!msg.toolCalls || msg.toolCalls.length === 0) &&
     (!msg.transportRetries || msg.transportRetries.length === 0);
-  // Show Remember only once streaming has settled — a half-written
-  // message isn't worth saving as a fact.
-  const showRemember = !!cwd && !isStreamingTail && !!msg.content;
-
-  // Per-turn duration: ticks live (off `createdAt`) while this is the
-  // streaming tail, then shows the frozen total once the turn settled.
-  const durationLabel = isStreamingTail
-    ? formatDuration(Math.max(0, nowMs - msg.createdAt))
-    : msg.durationMs != null
-      ? formatDuration(msg.durationMs)
-      : null;
-
   // Turn timeline: when segments exist (live-streamed turns), render
   // narration and tool cards in ARRIVAL order — mid-turn narration as light
   // step lines, only the final segment as full prose. Without segments
@@ -445,6 +477,22 @@ const MessageRow = memo(function MessageRow({ msg, isStreamingTail, cwd }: { msg
   const lastTextIndex = timeline
     ? timeline.reduce((acc, s, i) => (s.kind === "text" ? i : acc), -1)
     : -1;
+  // Hydrated tool rounds are intermediate assistant narration, not separate
+  // answers. Only a tool-free hydrated answer (or a live timeline ending in
+  // prose) owns settled metadata such as Remember and elapsed time.
+  const isSettledAnswer =
+    !isStreamingTail &&
+    isLastAssistantInUserTurn &&
+    !!msg.content &&
+    (timeline
+      ? lastTextIndex === timeline.length - 1
+      : !msg.toolCalls || msg.toolCalls.length === 0);
+  const showRemember = !!cwd && isSettledAnswer;
+  const durationLabel = isStreamingTail
+    ? formatDuration(Math.max(0, nowMs - msg.createdAt))
+    : isSettledAnswer && msg.durationMs != null
+      ? formatDuration(msg.durationMs)
+      : null;
   // Long turns: collapse everything before the visible tail window.
   const COLLAPSE_THRESHOLD = 10;
   const TAIL_VISIBLE = 4;
@@ -532,7 +580,7 @@ const MessageRow = memo(function MessageRow({ msg, isStreamingTail, cwd }: { msg
                 <div
                   key={`seg-${index}`}
                   data-segment="step"
-                  className="border-l-2 border-surface-3 pl-2.5 py-0.5 text-[12px] leading-relaxed text-gray-400 whitespace-pre-wrap"
+                  className="border-l border-surface-3 pl-2.5 py-0.5 text-[13px] leading-5 text-gray-400 whitespace-pre-wrap"
                 >
                   {segment.text}
                 </div>
@@ -606,7 +654,7 @@ const MessageRow = memo(function MessageRow({ msg, isStreamingTail, cwd }: { msg
         </div>
       )}
       {durationLabel && (
-        <div className="text-[10px] text-gray-600 tabular-nums select-none">
+        <div className="text-[11px] text-gray-600 tabular-nums select-none">
           {isStreamingTail ? `运行中 · ${durationLabel}` : `用时 ${durationLabel}`}
         </div>
       )}

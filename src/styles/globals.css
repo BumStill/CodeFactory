@@ -5,24 +5,25 @@
 /* ── Theme variables ────────────────────────────────────────────────────────── */
 
 [data-theme="dark"] {
-  --surface-0: #0d0d0d;
-  --surface-1: #111111;
-  --surface-2: #161616;
-  --surface-3: #1a1a1a;
-  --surface-4: #222222;
-  --border-color: #2a2a2a;
-  --accent-color: #3b82f6;
-  --accent-hover-color: #2563eb;
+  /* RGB channels let Tailwind's `/opacity` modifiers remain theme-aware. */
+  --surface-0: 13 13 13;
+  --surface-1: 17 17 17;
+  --surface-2: 22 22 22;
+  --surface-3: 26 26 26;
+  --surface-4: 34 34 34;
+  --border-color: 42 42 42;
+  --accent-color: 59 130 246;
+  --accent-hover-color: 37 99 235;
 
   /* Gray scale — Tailwind default values, unchanged for dark mode */
-  --gray-100: #f3f4f6;
-  --gray-200: #e5e7eb;
-  --gray-300: #d1d5db;
-  --gray-400: #9ca3af;
-  --gray-500: #6b7280;
-  --gray-600: #4b5563;
-  --gray-700: #374151;
-  --gray-900: #111827;
+  --gray-100: 243 244 246;
+  --gray-200: 229 231 235;
+  --gray-300: 209 213 219;
+  --gray-400: 156 163 175;
+  --gray-500: 107 114 128;
+  --gray-600: 75 85 99;
+  --gray-700: 55 65 81;
+  --gray-900: 17 24 39;
 
   --scrollbar-thumb: #2a2a2a;
   --scrollbar-thumb-hover: #3a3a3a;
@@ -33,14 +34,14 @@
 }
 
 [data-theme="light"] {
-  --surface-0: #f0f0f0;
-  --surface-1: #f8f8f8;
-  --surface-2: #ffffff;
-  --surface-3: #ebebeb;
-  --surface-4: #e2e2e2;
-  --border-color: #d4d4d4;
-  --accent-color: #2563eb;
-  --accent-hover-color: #1d4ed8;
+  --surface-0: 240 240 240;
+  --surface-1: 248 248 248;
+  --surface-2: 255 255 255;
+  --surface-3: 235 235 235;
+  --surface-4: 226 226 226;
+  --border-color: 212 212 212;
+  --accent-color: 37 99 235;
+  --accent-hover-color: 29 78 216;
 
   /*
    * Gray scale — semantically inverted for light backgrounds.
@@ -57,14 +58,14 @@
    * Pattern  text-gray-600 hover:text-gray-300  reads:
    *   rest → visible-but-subtle (#6b7a99)  hover → darker-active (#334155)
    */
-  --gray-100: #0f172a;
-  --gray-200: #1e293b;
-  --gray-300: #334155;
-  --gray-400: #4b5563;
-  --gray-500: #64748b;
-  --gray-600: #6b7a99;
-  --gray-700: #9aaabb;
-  --gray-900: #e2e8f0;
+  --gray-100: 15 23 42;
+  --gray-200: 30 41 59;
+  --gray-300: 51 65 85;
+  --gray-400: 75 85 99;
+  --gray-500: 100 116 139;
+  --gray-600: 107 122 153;
+  --gray-700: 154 170 187;
+  --gray-900: 226 232 240;
 
   --scrollbar-thumb: #c8c8c8;
   --scrollbar-thumb-hover: #a8a8a8;
@@ -85,8 +86,8 @@
     height: 100%;
     margin: 0;
     padding: 0;
-    background-color: var(--surface-0);
-    color: var(--gray-200);
+    background-color: rgb(var(--surface-0));
+    color: rgb(var(--gray-200));
     font-family: var(--font-family, Inter, system-ui, sans-serif);
     font-size: var(--font-size, 14px);
     -webkit-font-smoothing: antialiased;

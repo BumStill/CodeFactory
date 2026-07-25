@@ -110,6 +110,21 @@ async fn clear_chat_running_if_current(
     }
 }
 
+/// Await the actual agent future through a JoinHandle so panics and runtime
+/// cancellation cannot disappear when the outer fire-and-forget task is
+/// detached from the command response.
+async fn supervise_chat_task<F, T>(future: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, AppError>> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::spawn(future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(join_error) => Err(format!("后台执行异常:{join_error}")),
+    }
+}
+
 struct ChatRunningSetupGuard {
     chat_cancels: crate::ChatCancelMap,
     session_id: String,
@@ -118,11 +133,7 @@ struct ChatRunningSetupGuard {
 }
 
 impl ChatRunningSetupGuard {
-    fn new(
-        chat_cancels: crate::ChatCancelMap,
-        session_id: String,
-        flag: Arc<AtomicBool>,
-    ) -> Self {
+    fn new(chat_cancels: crate::ChatCancelMap, session_id: String, flag: Arc<AtomicBool>) -> Self {
         Self {
             chat_cancels,
             session_id,
@@ -396,31 +407,35 @@ pub async fn send_message(
     tokio::spawn(async move {
         let db_for_error = db.clone();
         let session_for_error = session_id_clone.clone();
-        let mut agent = AgentLoop::new_with_mode(
-            app,
-            db,
-            session_id_clone,
-            endpoint_name,
-            resolved_model,
-            endpoint.base_url,
-            api_key,
-            api_style,
-            std::path::PathBuf::from(session.cwd),
-            settings_state,
-            pending_permissions,
-            mcp_manager,
-            None,
-            mode,
-        )
-        .with_cancel(cancel_flag);
-        if let Err(e) = agent.run(history).await {
-            tracing::error!("Agent loop error: {e:#}");
+        let loop_result = supervise_chat_task(async move {
+            let mut agent = AgentLoop::new_with_mode(
+                app,
+                db,
+                session_id_clone,
+                endpoint_name,
+                resolved_model,
+                endpoint.base_url,
+                api_key,
+                api_style,
+                std::path::PathBuf::from(session.cwd),
+                settings_state,
+                pending_permissions,
+                mcp_manager,
+                None,
+                mode,
+            )
+            .with_cancel(cancel_flag);
+            agent.run(history).await
+        })
+        .await;
+        if let Err(error_text) = loop_result {
+            tracing::error!("Agent loop error: {error_text}");
             // Persist the failure so it survives reloads: the 2026-07-21
             // field report had four interruptions with zero forensic trace
             // because the error only ever existed as this transient stream
             // event. Tagged turn_error → rendered as an error notice, and
             // excluded from provider history replay.
-            let error_text = format!("回合中断:{e}");
+            let persisted_error_text = format!("回合中断:{error_text}");
             if let Err(persist_err) = sqlx::query(
                 "INSERT INTO messages (id, session_id, role, content, completion_state, created_at) \
                  VALUES (?,?,?,?,?,?)",
@@ -428,7 +443,7 @@ pub async fn send_message(
             .bind(uuid::Uuid::new_v4().to_string())
             .bind(&session_for_error)
             .bind("user")
-            .bind(&error_text)
+            .bind(&persisted_error_text)
             .bind("turn_error")
             .bind(chrono::Utc::now().timestamp_millis())
             .execute(&db_for_error)
@@ -441,24 +456,20 @@ pub async fn send_message(
                 crate::notify::send(
                     &settings,
                     crate::notify::NotifyEvent::TurnError,
-                    e.to_string().chars().take(200).collect(),
+                    error_text.chars().take(200).collect(),
                 );
             }
             app_clone
                 .emit(
                     &event_name,
                     StreamEvent::Error {
-                        message: e.to_string(),
+                        message: error_text,
                     },
                 )
                 .ok();
         }
-        clear_chat_running_if_current(
-            &chat_cancels,
-            &session_for_error,
-            &tracked_cancel_flag,
-        )
-        .await;
+        clear_chat_running_if_current(&chat_cancels, &session_for_error, &tracked_cancel_flag)
+            .await;
     });
     running_setup_guard.disarm();
 
@@ -583,41 +594,41 @@ pub async fn send_message_anonymous(
     let tracked_cancel_flag = cancel_flag.clone();
     tokio::spawn(async move {
         let completed_session_id = session_id_clone.clone();
-        // `.anonymous()` disables every DB write + cost record in the loop.
-        let mut agent = AgentLoop::new(
-            app,
-            db,
-            session_id_clone,
-            endpoint_name,
-            resolved_model,
-            endpoint.base_url,
-            api_key,
-            api_style,
-            std::path::PathBuf::from(cwd),
-            settings_state,
-            pending_permissions,
-            mcp_manager,
-            None,
-        )
-        .anonymous()
-        .with_cancel(cancel_flag);
-        if let Err(e) = agent.run(full_history).await {
-            tracing::error!("Anonymous agent loop error: {e:#}");
+        let loop_result = supervise_chat_task(async move {
+            // `.anonymous()` disables every DB write + cost record in the loop.
+            let mut agent = AgentLoop::new(
+                app,
+                db,
+                session_id_clone,
+                endpoint_name,
+                resolved_model,
+                endpoint.base_url,
+                api_key,
+                api_style,
+                std::path::PathBuf::from(cwd),
+                settings_state,
+                pending_permissions,
+                mcp_manager,
+                None,
+            )
+            .anonymous()
+            .with_cancel(cancel_flag);
+            agent.run(full_history).await
+        })
+        .await;
+        if let Err(error_text) = loop_result {
+            tracing::error!("Anonymous agent loop error: {error_text}");
             app_clone
                 .emit(
                     &event_name,
                     StreamEvent::Error {
-                        message: e.to_string(),
+                        message: error_text,
                     },
                 )
                 .ok();
         }
-        clear_chat_running_if_current(
-            &chat_cancels,
-            &completed_session_id,
-            &tracked_cancel_flag,
-        )
-        .await;
+        clear_chat_running_if_current(&chat_cancels, &completed_session_id, &tracked_cancel_flag)
+            .await;
     });
     running_setup_guard.disarm();
 
@@ -669,8 +680,7 @@ mod tests {
             .insert("failed".into(), failed_setup.clone());
 
         {
-            let _guard =
-                ChatRunningSetupGuard::new(flags.clone(), "failed".into(), failed_setup);
+            let _guard = ChatRunningSetupGuard::new(flags.clone(), "failed".into(), failed_setup);
         }
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while flags.lock().await.contains_key("failed") {
@@ -687,8 +697,7 @@ mod tests {
             .await
             .insert("replaced".into(), stale_setup.clone());
         {
-            let _guard =
-                ChatRunningSetupGuard::new(flags.clone(), "replaced".into(), stale_setup);
+            let _guard = ChatRunningSetupGuard::new(flags.clone(), "replaced".into(), stale_setup);
             flags
                 .lock()
                 .await
@@ -722,5 +731,19 @@ mod tests {
             select_chat_mode(true, Some("方案已经准备好。是否开始实施？"), "做吧"),
             crate::agent::AgentMode::Execute
         );
+    }
+
+    #[tokio::test]
+    async fn supervised_chat_task_converts_a_panic_into_a_visible_failure() {
+        let result = supervise_chat_task(async move {
+            panic!("synthetic agent panic");
+            #[allow(unreachable_code)]
+            Ok::<(), AppError>(())
+        })
+        .await;
+
+        let failure = result.expect_err("panic must not disappear with the JoinHandle");
+        assert!(failure.contains("后台执行异常"));
+        assert!(failure.contains("synthetic agent panic"));
     }
 }
