@@ -9,10 +9,11 @@
 
 use crate::config::Settings;
 
-// Settings-free estimation/compression, relocated to the shared crate.
-pub use codefactory_agent_loop::context::{
-    compress_if_needed, estimate_prompt_tokens, is_context_overflow, COMPRESSION_TRIGGER,
-};
+// `COMPRESSION_TRIGGER` backs `select_limit` below; the estimation/compression
+// fns themselves moved to `agent-loop::context` (slice 4.6b) and are called
+// there by `run_agent_loop` — the bin no longer references them (run_anthropic
+// uses `crate::openrouter`/agent-loop directly), so only the constant re-exports.
+pub use codefactory_agent_loop::context::COMPRESSION_TRIGGER;
 
 /// Conservative window when nothing is known about the model.
 /// 128K is the modern baseline (GPT-4o, Claude, Gemini, DeepSeek-v4-pro all
