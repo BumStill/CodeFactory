@@ -142,7 +142,7 @@ export function WorkspacePage({
   const blockedTasks = failedTasks.filter((task) => task.failure_attribution?.repairable === false);
   const taskBlockedCount = blockedTasks.length;
   const taskProviderBlockedCount = blockedTasks.filter((task) => task.failure_attribution?.kind === "model-provider").length;
-  const taskActivityVisible = taskRunningCount + taskPendingCount + taskFailedCount > 0;
+  const taskActivityVisible = taskRunningCount + taskFailedCount > 0;
   const [taskActivityOpen, setTaskActivityOpen] = useState(Boolean(initialTaskLogId));
   const taskActivityButtonRef = useRef<HTMLButtonElement>(null);
   const closeTaskActivity = () => {
