@@ -103,6 +103,74 @@ impl FactChecker for NoOpFactChecker {
     }
 }
 
+/// What one compaction pass did, so the loop can report it.
+#[derive(Debug, Default)]
+pub struct CompactionOutcome {
+    pub messages: Vec<crate::types::ChatMessage>,
+    /// True when anything was elided/dropped — the loop emits `ContextCompressed`.
+    pub compacted: bool,
+    pub elided_count: usize,
+    pub tokens_freed: u32,
+}
+
+/// How a surface keeps the prompt inside its context budget (keystone slice
+/// 4.8c). Called before EVERY model request, and it OWNS the history — the
+/// desktop elides oversized messages by token estimate
+/// ([`DefaultCompressor`]); the Terminal-Bench sidecar instead applies its
+/// destructive char-budget digest. Making this a seam is what lets the sidecar
+/// join the shared loop WITHOUT its eval scores moving: a token-based
+/// compressor and a char-based compactor are not interchangeable.
+pub trait ContextCompactor: Send + Sync {
+    fn compact(
+        &self,
+        messages: Vec<crate::types::ChatMessage>,
+        system_prompt: &str,
+        context_limit: u32,
+    ) -> CompactionOutcome;
+}
+
+/// The desktop compactor: today's `compress_if_needed` + the OpenAI tool-call
+/// protocol repair, byte-identical to the pre-4.8c inline block.
+pub struct DefaultCompressor;
+
+impl ContextCompactor for DefaultCompressor {
+    fn compact(
+        &self,
+        messages: Vec<crate::types::ChatMessage>,
+        system_prompt: &str,
+        context_limit: u32,
+    ) -> CompactionOutcome {
+        let compression = crate::context::compress_if_needed(messages, system_prompt, context_limit);
+        CompactionOutcome {
+            // Storage repair is not enough: compression can change the final
+            // provider payload, so enforce the tool-call protocol at the last
+            // boundary before the request.
+            messages: crate::protocol::repair_openai_tool_protocol(compression.messages),
+            compacted: compression.compressed,
+            elided_count: compression.elided_count,
+            tokens_freed: compression.tokens_freed,
+        }
+    }
+}
+
+/// A compactor that never touches the history — for surfaces whose budget is
+/// managed elsewhere (or not at all).
+pub struct NoOpCompactor;
+
+impl ContextCompactor for NoOpCompactor {
+    fn compact(
+        &self,
+        messages: Vec<crate::types::ChatMessage>,
+        _system_prompt: &str,
+        _context_limit: u32,
+    ) -> CompactionOutcome {
+        CompactionOutcome {
+            messages,
+            ..Default::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +204,59 @@ mod tests {
         assert!(h.pre_tool("bash", &serde_json::json!({"cmd": "ls"})).await);
         // post_tool is fire-and-forget: it must simply not panic.
         h.post_tool("bash", "output", 12).await;
+    }
+
+    #[test]
+    fn a_custom_compactor_displaces_the_default_entirely() {
+        // The point of the seam (slice 4.8c): a surface with a DIFFERENT budget
+        // discipline — e.g. the eval sidecar's destructive char-budget digest —
+        // must be able to replace token-based elision wholesale, so joining the
+        // shared loop cannot silently move its scores.
+        struct DropAllButLast;
+        impl ContextCompactor for DropAllButLast {
+            fn compact(
+                &self,
+                messages: Vec<crate::types::ChatMessage>,
+                _system_prompt: &str,
+                _context_limit: u32,
+            ) -> CompactionOutcome {
+                let elided = messages.len().saturating_sub(1);
+                CompactionOutcome {
+                    messages: messages.into_iter().last().into_iter().collect(),
+                    compacted: elided > 0,
+                    elided_count: elided,
+                    tokens_freed: 0,
+                }
+            }
+        }
+        fn msg(text: &str) -> crate::types::ChatMessage {
+            crate::types::ChatMessage {
+                role: "user".into(),
+                content: crate::types::MessageContent::Text(text.into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            }
+        }
+        let c: std::sync::Arc<dyn ContextCompactor> = std::sync::Arc::new(DropAllButLast);
+        let out = c.compact(vec![msg("a"), msg("b"), msg("c")], "sys", 1_000);
+        assert_eq!(out.messages.len(), 1, "custom rule fully replaced the default");
+        assert!(out.compacted);
+        assert_eq!(out.elided_count, 2);
+
+        // The desktop default leaves a small history untouched (well under the
+        // 75% trigger) — i.e. it is genuinely a different discipline.
+        let d: std::sync::Arc<dyn ContextCompactor> = std::sync::Arc::new(DefaultCompressor);
+        let out = d.compact(vec![msg("a"), msg("b"), msg("c")], "sys", 1_000_000);
+        assert_eq!(out.messages.len(), 3);
+        assert!(!out.compacted);
+
+        // NoOpCompactor never touches anything.
+        let n: std::sync::Arc<dyn ContextCompactor> = std::sync::Arc::new(NoOpCompactor);
+        let out = n.compact(vec![msg("a"), msg("b")], "sys", 1);
+        assert_eq!(out.messages.len(), 2);
+        assert!(!out.compacted);
     }
 
     #[test]

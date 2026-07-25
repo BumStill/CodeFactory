@@ -1001,6 +1001,8 @@ impl AgentLoop {
             persistence: std::sync::Arc::new(self.persistence()),
             events: self.events.clone(),
             budget: std::sync::Arc::new(codefactory_agent_loop::journal::NullBudget),
+            // Today's token-based elision, unchanged (slice 4.8c seam).
+            compactor: std::sync::Arc::new(codefactory_agent_loop::services::DefaultCompressor),
             permission: std::sync::Arc::new(self.permission_gateway()),
             hooks,
             context_policy: std::sync::Arc::new(self.context_policy(expand_context_window)),
