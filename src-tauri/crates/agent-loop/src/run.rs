@@ -253,6 +253,10 @@ pub struct LoopServices {
     pub persistence: Arc<dyn Persistence>,
     pub events: Arc<dyn EventSink>,
     pub budget: Arc<dyn crate::journal::Budget>,
+    /// How the prompt is kept inside the context budget. Desktop supplies
+    /// `DefaultCompressor` (token-based elision, today's behaviour); the eval
+    /// sidecar supplies its char-budget digest so its scores don't move.
+    pub compactor: Arc<dyn crate::services::ContextCompactor>,
     pub permission: Arc<dyn crate::services::PermissionGateway>,
     pub hooks: Arc<dyn crate::services::LifecycleHooks>,
     pub context_policy: Arc<dyn crate::services::ContextPolicy>,
@@ -300,6 +304,27 @@ pub struct RunOutcome {
     pub completion_evidence: CompletionEvidence,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Why the run ended (keystone slice 4.8c). The desktop ignores it — it has
+    /// already emitted the terminal `StreamEvent`; the eval sidecar needs it to
+    /// pick its `finished` text (e.g. a budget-exhaustion message vs the last
+    /// model reply).
+    pub stop_reason: StopReason,
+}
+
+/// Why `run_agent_loop` returned. Purely informational for the desktop; the
+/// sidecar branches its terminal `finished` payload on it (keystone 4.8c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// A tool-call-free reply passed (or was released by) the completion gate.
+    Finished,
+    /// The gate blocked the run (`BlockOnIncomplete` with unmet evidence).
+    Blocked,
+    /// The shared cancel flag tripped.
+    Cancelled,
+    /// The segment/iteration ceiling was reached without a terminal reply.
+    IterationCeiling,
+    /// `Budget::may_continue` refused another round (wall-clock reserve).
+    BudgetExhausted,
 }
 
 /// The single shared agent loop (keystone slice 4.6b). Drives one chat turn to a
@@ -348,6 +373,7 @@ pub async fn run_agent_loop(
         persistence,
         events,
         budget,
+        compactor,
         permission,
         hooks,
         context_policy,
@@ -400,6 +426,12 @@ pub async fn run_agent_loop(
     let mut require_tool_next = false;
     let mut model_round_index = 0_usize;
     let mut stalled_chat_segments = 0_u32;
+    // Run-level totals + the last model reply, carried into `RunOutcome`
+    // (keystone slice 4.8c). The desktop discards them; the sidecar builds its
+    // terminal `finished` payload from them.
+    let mut total_input_tokens = 0_u64;
+    let mut total_output_tokens = 0_u64;
+    let mut last_final_text = String::new();
     loop {
         let segment_start_evidence = completion_gate.evidence();
         for segment_iteration in 0..max_iterations {
@@ -432,19 +464,20 @@ pub async fn run_agent_loop(
             // history passes through untouched (no mem::take/repair/event) — we
             // still resolve the window above for the ContextUsage denominator.
             if context_compression {
-                let compression = crate::context::compress_if_needed(
+                // Delegated to the ContextCompactor seam (slice 4.8c) so each
+                // surface keeps its own budget discipline: desktop = token-based
+                // elision (DefaultCompressor, byte-identical to before),
+                // sidecar = its destructive char-budget digest.
+                let compaction = compactor.compact(
                     std::mem::take(&mut messages),
                     system_prompt,
                     context_limit,
                 );
-                // Storage repair is not enough: context compression can change the
-                // final provider payload. Enforce the OpenAI tool-call protocol at
-                // the last possible boundary before every model request.
-                messages = crate::protocol::repair_openai_tool_protocol(compression.messages);
-                if compression.compressed {
+                messages = compaction.messages;
+                if compaction.compacted {
                     events.emit(crate::types::StreamEvent::ContextCompressed {
-                        elided_count: compression.elided_count,
-                        tokens_freed: compression.tokens_freed,
+                        elided_count: compaction.elided_count,
+                        tokens_freed: compaction.tokens_freed,
                     });
                 }
             }
@@ -580,6 +613,13 @@ pub async fn run_agent_loop(
             // Usage before honoring a cancellation that arrived in flight.
             let usage_request_id = usage_request_id(&usage_run_id, iteration);
             if let Some(round_usage) = usage.as_ref() {
+                // Run-level totals for RunOutcome (slice 4.8c) — accumulated
+                // alongside the per-round persistence, so a cancelled or
+                // ceiling-terminated run still reports what it consumed.
+                total_input_tokens =
+                    total_input_tokens.saturating_add(round_usage.prompt_tokens as u64);
+                total_output_tokens =
+                    total_output_tokens.saturating_add(round_usage.completion_tokens as u64);
                 record_usage_event_for_round(
                     persistence.as_ref(),
                     events.as_ref(),
@@ -588,6 +628,9 @@ pub async fn run_agent_loop(
                     iteration,
                 )
                 .await;
+            }
+            if !text.is_empty() {
+                last_final_text = text.clone();
             }
 
             if is_cancelled(cancel.as_ref()) {
@@ -751,11 +794,10 @@ pub async fn run_agent_loop(
                 {
                     finish_cancelled_tool_batch(persistence.as_ref(), events.as_ref(), remaining)
                         .await?;
-                    return Ok(run_outcome_for_terminal(&completion_gate));
+                    return Ok(run_outcome_for_terminal(&completion_gate, StopReason::Cancelled, (total_input_tokens, total_output_tokens), &last_final_text));
                 }
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                let completion_args = args.clone();
 
                 // Extract bash command for finer-grained permission matching
                 let bash_cmd = if tc.function.name == "bash" {
@@ -794,7 +836,7 @@ pub async fn run_agent_loop(
                                 &tool_calls[tool_index..],
                             )
                             .await?;
-                            return Ok(run_outcome_for_terminal(&completion_gate));
+                            return Ok(run_outcome_for_terminal(&completion_gate, StopReason::Cancelled, (total_input_tokens, total_output_tokens), &last_final_text));
                         }
                     }
                 };
@@ -901,10 +943,8 @@ pub async fn run_agent_loop(
                     &mut progress_tracker,
                     &mut completion_sequence,
                     &cwd,
-                    &tc.function.name,
-                    &completion_args,
-                    &output.content,
-                    output.is_error,
+                    &tc.id,
+                    &output,
                 ) {
                     progress_prompt = Some(prompt);
                 }
@@ -1096,7 +1136,7 @@ pub async fn run_agent_loop(
                 detail: notice.clone(),
             });
             events.emit(crate::types::StreamEvent::Error { message: notice });
-            return Ok(run_outcome_for_terminal(&completion_gate));
+            return Ok(run_outcome_for_terminal(&completion_gate, StopReason::Blocked, (total_input_tokens, total_output_tokens), &last_final_text));
         }
         persistence
             .persist_message(
@@ -1189,18 +1229,35 @@ pub async fn run_agent_loop(
         }
     }
 
-    Ok(run_outcome_for_terminal(&completion_gate))
+    // The loop fell out of its segments: either a terminal reply already
+    // emitted (emitted_terminal) or the ceiling/budget stopped it.
+    let stop_reason = if emitted_terminal {
+        StopReason::Finished
+    } else {
+        StopReason::IterationCeiling
+    };
+    Ok(run_outcome_for_terminal(
+        &completion_gate,
+        stop_reason,
+        (total_input_tokens, total_output_tokens), &last_final_text,
+    ))
 }
 
 /// The `RunOutcome` for a terminal. The desktop adapter discards it (it already
 /// emitted the terminal `StreamEvent`), so only the completion evidence is
 /// filled; the sidecar slice will populate `final_text`/tokens.
-fn run_outcome_for_terminal(gate: &codefactory_agent_core::CompletionGate) -> RunOutcome {
+fn run_outcome_for_terminal(
+    gate: &codefactory_agent_core::CompletionGate,
+    stop_reason: StopReason,
+    tokens: (u64, u64),
+    final_text: &str,
+) -> RunOutcome {
     RunOutcome {
-        final_text: String::new(),
+        final_text: final_text.to_string(),
         completion_evidence: gate.evidence(),
-        input_tokens: 0,
-        output_tokens: 0,
+        input_tokens: tokens.0,
+        output_tokens: tokens.1,
+        stop_reason,
     }
 }
 
@@ -1492,6 +1549,7 @@ mod tests {
             persistence,
             events,
             budget: Arc::new(NullBudget),
+            compactor: Arc::new(crate::services::DefaultCompressor),
             permission: Arc::new(AllowAllPermissions),
             hooks: Arc::new(NoOpHooks),
             context_policy: Arc::new(FixedContext),

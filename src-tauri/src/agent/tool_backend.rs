@@ -12,7 +12,6 @@
 //! unit-test EXE links no Tauri entrypoints (#166). It is constructed only in
 //! `run_openai`/`run_anthropic`, which the test EXE dead-strips.
 
-use codefactory_agent_core::ToolKind;
 use codefactory_agent_loop::tool::{ToolBackend, ToolCtx, ToolError, ToolInvocationResult};
 
 use crate::openrouter::types::{ToolCall, ToolDefinition};
@@ -85,16 +84,18 @@ impl ToolBackend for DesktopToolBackend {
             }
         };
 
+        let (command, kind) =
+            codefactory_agent_loop::policy::completion_command_and_kind(&call.function.name, args);
         Ok(ToolInvocationResult {
             content: output.content,
             is_error: output.is_error,
-            command: call.function.name.clone(),
-            // Desktop tools return a single combined `content`, not separate
-            // shell streams; these fields carry the sidecar's shell delegation.
-            // `kind` is not consumed until the loop feeds the gate through the
-            // backend (slice 4.6); the loop still classifies via
-            // `record_completion_outcome` for now.
-            kind: ToolKind::ReadOnly,
+            // The loop now feeds the gate from these fields (slice 4.8c b2), so
+            // the backend owns classification. This is exactly the rule the loop
+            // applied inline before — `classify_command` for `bash`, the
+            // arg-derived command + ReadOnly otherwise — so desktop gate
+            // behaviour (#135/#136) is unchanged.
+            command,
+            kind,
             return_code: None,
             stdout: String::new(),
             stderr: String::new(),
