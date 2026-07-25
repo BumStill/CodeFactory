@@ -64,27 +64,26 @@ use codefactory_agent_loop::services::{LifecycleHooks, NoOpHooks};
 // matched at the call sites. `DesktopPermissionGateway` lives in
 // `permission_gateway`; the pure `decide_permission` stays a free fn below.
 use codefactory_agent_loop::services::{PermissionGateway as _, PermissionOutcome};
-// Brings `.fact_check()` into scope; `DesktopFactChecker` lives in `fact_checker`.
-use codefactory_agent_loop::services::FactChecker as _;
-// The loop drives the model round through the `ModelTransport::complete()` seam
-// (slice 4.6 sub-step 7): `RoundOptions` carries require-tool + reasoning effort,
-// `ModelResponse` is the provider-independent answer. `TransportError` crosses
-// back as `AppError` via the `From` impl in `errors` (message verbatim).
-use codefactory_agent_loop::transport::{ModelResponse, ModelTransport as _, RoundOptions};
 // Pure loop helpers relocated to agent-loop (keystone slice 4.6b); re-imported so
-// both provider loops + the bin unit tests keep the unqualified names.
-use codefactory_agent_loop::run::{cancelled_tool_suffix, is_cancelled, usage_request_id};
-use codefactory_agent_loop::protocol::{
-    is_vision_rejection, repair_openai_tool_protocol, strip_image_parts, strip_image_values,
-};
+// run_anthropic + the bin unit tests keep the unqualified names. (run_openai's
+// transport/fact-check/cancel helpers now live inside run_agent_loop, so those
+// imports moved there with the body — slice 4.6b.)
+use codefactory_agent_loop::run::cancelled_tool_suffix;
+use codefactory_agent_loop::protocol::{is_vision_rejection, strip_image_values};
+// Test-only: these fns moved to agent-loop (slice 4.6/4.6b) but their bin unit
+// tests stayed here; run_openai (which used them in production) is now the
+// adapter, so outside tests the bin no longer references them.
+#[cfg(test)]
+use codefactory_agent_loop::policy::completion_command_and_kind;
+#[cfg(test)]
+use codefactory_agent_loop::protocol::{repair_openai_tool_protocol, strip_image_parts};
 // The pure completion-gate mode policy moved to agent-loop (slice 4.6 sub-step
 // 1). Pure fns are re-used directly; the mode-taking fns keep thin AgentMode
 // wrappers below that map to `FinalizationPolicy`, so call sites + #135/#136
 // tests are unchanged.
 use codefactory_agent_loop::policy::{
-    self, active_tool_definitions, completion_command_and_kind,
-    completion_recovery_attempts_after_tool_batch, openai_tool_controls, record_completion_outcome,
-    CompletionFinalization,
+    self, active_tool_definitions, completion_recovery_attempts_after_tool_batch,
+    openai_tool_controls, record_completion_outcome, CompletionFinalization,
 };
 use codefactory_agent_loop::run::FinalizationPolicy;
 
