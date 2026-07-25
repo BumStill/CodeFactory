@@ -217,6 +217,10 @@ pub struct RunConfig {
     /// Whether to reactively back off + retry on a transient provider overload
     /// (Anthropic=true; OpenAI=false).
     pub overload_backoff: bool,
+    /// Deny further READ-ONLY calls once the read-only allowance is spent
+    /// (keystone slice 4.8c b5). The eval sidecar enables it; the desktop does
+    /// not, so its behaviour is unchanged.
+    pub inspection_budget: bool,
     // Usage-attribution identity + working dir (all constant for the run).
     pub session_id: String,
     pub endpoint_name: String,
@@ -354,6 +358,7 @@ pub async fn run_agent_loop(
         wall_budget_applies: wall_budget,
         context_compression,
         overload_backoff,
+        inspection_budget,
         session_id,
         endpoint_name,
         model_id,
@@ -816,7 +821,24 @@ pub async fn run_agent_loop(
 
                 let remaining = max_iterations.saturating_sub(segment_iteration + 1) as u32;
                 let completion_evidence = completion_gate.evidence();
-                let denial_content = if let Some(denial) = crate::policy::autonomous_budget_denial(
+                // Classify ONCE, via the backend (slice 4.8c b5): the default
+                // rule is bash-only, so a surface whose shell tool has another
+                // name must override it or every call reads as ReadOnly.
+                let (classified_command, classified_kind) = tool_backend.classify(tc, &args);
+                // Inspection budget first (b5), then the completion-policy
+                // budget — matching the sidecar's ordering. Both are off on the
+                // desktop unless the surface opts in.
+                let inspection_denial = if inspection_budget {
+                    crate::policy::inspection_budget_denial(
+                        progress_tracker.read_only_exhausted(),
+                        progress_tracker.mutation_seen(),
+                        &classified_kind,
+                    )
+                } else {
+                    None
+                };
+                let denial_content = if let Some(denial) = inspection_denial.or_else(|| {
+                    crate::policy::autonomous_budget_denial(
                     wall_budget,
                     remaining,
                     // The Budget owns the run's clock (slice 4.8c b3); desktop
@@ -824,10 +846,11 @@ pub async fn run_agent_loop(
                     // evaluator behave exactly as before.
                     budget.wall_time(),
                     &completion_evidence,
-                    &tc.function.name,
-                    &args,
+                    &classified_command,
+                    &classified_kind,
                     &cwd,
-                ) {
+                )
+                }) {
                     // Wording is the surface's (b4): desktop keeps its sentence,
                     // the sidecar its `policy denied command (rule): reason`.
                     Some(permission.format_budget_denial(&denial.rule, &denial.reason))
@@ -1531,6 +1554,7 @@ mod tests {
             wall_budget_applies: false,
             context_compression: true,
             overload_backoff: false,
+            inspection_budget: false,
             session_id: "session".into(),
             endpoint_name: "test".into(),
             model_id: "model".into(),
@@ -1790,6 +1814,7 @@ mod tests {
             wall_budget_applies,
             context_compression: true,
             overload_backoff: false,
+            inspection_budget: false,
             session_id: session_id.clone(),
             endpoint_name: endpoint_name.clone(),
             model_id: model_id.clone(),
@@ -1810,6 +1835,7 @@ mod tests {
             wall_budget_applies,
             context_compression: false,
             overload_backoff: true,
+            inspection_budget: true,
             session_id,
             endpoint_name,
             model_id,

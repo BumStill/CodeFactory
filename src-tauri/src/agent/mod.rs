@@ -976,6 +976,8 @@ impl AgentLoop {
             wall_budget_applies: wall_budget_applies(self.mode),
             context_compression,
             overload_backoff,
+            // Desktop keeps its unlimited inspection allowance (slice 4.8c b5).
+            inspection_budget: false,
             session_id: self.session_id.clone(),
             endpoint_name: self.endpoint_name.clone(),
             model_id: self.model_id.clone(),
@@ -1803,13 +1805,16 @@ fn autonomous_budget_denial(
     // `format_budget_denial` wording — applying both here keeps these tests
     // pinning the exact user-facing string the loop produces.
     use codefactory_agent_loop::services::PermissionGateway as _;
+    // The desktop backend's `classify` is the default rule, so applying it here
+    // keeps these tests pinning exactly what the loop computes (slice 4.8c b5).
+    let (command, kind) = policy::completion_command_and_kind(tool_name, args);
     policy::autonomous_budget_denial(
         wall_budget_applies(mode),
         remaining_model_rounds,
         None,
         evidence,
-        tool_name,
-        args,
+        &command,
+        &kind,
         working_directory,
     )
     .map(|denial| {
