@@ -139,7 +139,7 @@ describe("persisted chat hydration", () => {
     );
   });
 
-  it("hydrates only the original request and final answer across internal recovery rounds", () => {
+  it("hydrates every step of a recovered turn, dropping only the gate's own prompts", () => {
     const rows: Message[] = [
       {
         id: "user",
@@ -234,12 +234,23 @@ describe("persisted chat hydration", () => {
     const hydrated = dbMessagesToUI(rows);
     expect(hydrated.map(({ role, content }) => ({ role, content }))).toEqual([
       { role: "user", content: "把拆任务内置到当前 session。" },
+      { role: "assistant", content: "先运行与用户无关的内部检查。" },
+      { role: "assistant", content: "unrelated candidate answer" },
+      { role: "assistant", content: "后台服务已运行，现在执行后续探针。" },
       { role: "assistant", content: "已完成：拆任务已内置到当前会话。" },
     ]);
-    expect(hydrated.flatMap((message) => message.toolCalls ?? [])).toEqual([]);
+    // Both tool cards survive with their replayed results attached.
+    expect(
+      hydrated.flatMap((message) => message.toolCalls ?? []).map((tc) => [tc.id, tc.result]),
+    ).toEqual([
+      ["early-probe", "internal check passed"],
+      ["probe-1", "later client probe passed"],
+    ]);
+    // The gate's injected prompts are the only thing withheld.
+    expect(JSON.stringify(hydrated)).not.toMatch(/completion gate|completion evidence/i);
   });
 
-  it("hydrates an internal recovery failure without raw control-loop details", () => {
+  it("keeps the draft and the raw turn error when a recovery round dies", () => {
     const rows: Message[] = [
       {
         id: "user",
@@ -281,15 +292,16 @@ describe("persisted chat hydration", () => {
       completionState,
     }))).toEqual([
       { role: "user", content: "完成这个修改。", completionState: undefined },
+      { role: "assistant", content: "draft", completionState: "rejected_candidate" },
       {
         role: "user",
-        content: "本次处理未能完成，请重试。",
+        content: "回合中断:Completion blocked: unresolved probe fingerprint",
         completionState: "turn_error",
       },
     ]);
   });
 
-  it("hydrates an interrupted recovery as safe progress without raw prompts or tool args", () => {
+  it("shows an interrupted recovery round as ordinary work, never the gate's prompt", () => {
     const rows: Message[] = [
       {
         id: "user",
@@ -327,19 +339,17 @@ describe("persisted chat hydration", () => {
 
     const hydrated = dbMessagesToUI(rows);
     expect(hydrated).toHaveLength(2);
+    // The recovery round's tool call is work the agent actually did — it
+    // renders like any other tool card, args included.
     expect(hydrated[1]).toEqual(
       expect.objectContaining({
         role: "assistant",
         content: "",
-        reviewProgress: expect.objectContaining({
-          phase: "interrupted",
-          attempt: 1,
-          limit: 3,
-          currentStep: "执行在完成前中断",
-        }),
+        toolCalls: [expect.objectContaining({ id: "probe-1", name: "bash" })],
       }),
     );
-    expect(JSON.stringify(hydrated)).not.toMatch(/secret blocker|curl|secret\.example/);
+    // The injected gate prompt is the one thing that stays out of the transcript.
+    expect(JSON.stringify(hydrated)).not.toMatch(/secret blocker|completion gate/i);
   });
 
   it("attaches a persisted verification warning to the final answer", () => {

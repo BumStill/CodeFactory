@@ -428,7 +428,7 @@ describe("long-session history paging", () => {
     expect(runtime.persistedMessages.some((item) => item.id === local.id)).toBe(false);
   });
 
-  it("rehydrates tool replay ownership and hides completion-gate internals across pages", async () => {
+  it("rehydrates tool replay ownership and hides only the gate's prompts across pages", async () => {
     const olderRows: Message[] = [
       message("u-old", "user", 1),
       message("decl-old", "assistant", 2, {
@@ -515,11 +515,15 @@ describe("long-session history paging", () => {
     await useChatStore.getState().loadOlderMessages();
 
     const runtime = useChatStore.getState().runtime[session.id]!;
+    // Merging pages must not resurrect the gate's injected prompts, and must
+    // not drop the work a recovery round produced either.
     expect(runtime.messages.map((item) => item.id)).toEqual([
       "u-old",
       "decl-old",
       "final-old",
       "u-new",
+      "candidate-new",
+      "decl-internal",
       "final-new",
       "notice-new",
     ]);

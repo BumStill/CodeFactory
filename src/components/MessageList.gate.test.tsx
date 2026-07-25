@@ -2,12 +2,15 @@
 //
 // Completion-gate isolation tests for MessageList.
 //
-// Regression for the 2026-07-16 session: the gate rejected the model's final
-// response seven times, every rejected candidate rendered as a full normal
-// reply, and the injected recovery instruction was invisible — so the user
-// saw the assistant repeat itself for 13 minutes with no explanation. These
-// tests pin the user-facing contract: internal gate traffic is never rendered,
-// while user-actionable warnings and ordinary final answers remain visible.
+// Two field reports shape this contract. 2026-07-16: every rejected candidate
+// rendered as a full normal reply, so the assistant appeared to repeat itself
+// for 13 minutes. 2026-07-25: the fix for that erased the whole turn instead —
+// one session lost 1111 rows of visible work, up to 152 steps at once.
+//
+// The contract that satisfies both: the gate's own control traffic (injected
+// prompts) never renders, and nothing the model actually did is ever deleted.
+// Drafts and recovery rounds stay in the timeline as ordinary steps; only the
+// last prose block is the answer.
 
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
@@ -27,8 +30,8 @@ const msg = (over: Partial<UIMessage> = {}): UIMessage => ({
 });
 
 describe("MessageList completion-review isolation", () => {
-  it("hides rejected candidates instead of exposing internal review history", () => {
-    const { container } = render(
+  it("keeps a rejected draft visible as an ordinary step in the turn", () => {
+    render(
       <MessageList
         messages={[
           msg({ id: "candidate", completionState: "rejected_candidate" }),
@@ -39,13 +42,12 @@ describe("MessageList completion-review isolation", () => {
       />,
     );
 
-    expect(screen.queryByText(/candidate answer with a very long plan/)).toBeNull();
-    expect(screen.queryByText(/完成度检查|候选回复|点击展开/)).toBeNull();
+    expect(screen.getByText(/candidate answer with a very long plan/)).toBeTruthy();
     expect(screen.getByText(/brief final answer/)).toBeTruthy();
-    expect(container.textContent).toBe("brief final answer");
+    expect(screen.queryByText(/完成度检查|执行已中断|第 \d\/3 次/)).toBeNull();
   });
 
-  it("hides persisted recovery and ready instructions entirely", () => {
+  it("hides persisted gate instructions entirely", () => {
     const { container } = render(
       <MessageList
         messages={[
@@ -61,6 +63,12 @@ describe("MessageList completion-review isolation", () => {
             content: "The structured completion evidence is satisfied…",
             completionState: "gate_ready",
           }),
+          msg({
+            id: "blocked",
+            role: "user",
+            content: "Completion blocked because required verification is still missing…",
+            completionState: "gate_blocked",
+          }),
         ]}
         streaming={false}
         cwd={null}
@@ -71,37 +79,7 @@ describe("MessageList completion-review isolation", () => {
     expect(container.querySelector(".justify-end")).toBeNull();
   });
 
-  it("shows safe recovery progress without exposing internal gate details", () => {
-    const { container } = render(
-      <MessageList
-        messages={[
-          msg({
-            id: "streaming",
-            content: "",
-            internalReviewState: "recovery",
-            reviewProgress: {
-              phase: "recovering",
-              attempt: 2,
-              limit: 3,
-              reason: "最终答复还缺少验证证据",
-              currentStep: "正在运行验证或修复步骤",
-              updatedAt: Date.now(),
-            },
-          }),
-        ]}
-        streaming={true}
-        cwd={null}
-      />,
-    );
-
-    expect(screen.getByText("正在补充验证")).toBeTruthy();
-    expect(screen.getByText("第 2/3 次")).toBeTruthy();
-    expect(screen.getByText("正在运行验证或修复步骤")).toBeTruthy();
-    expect(screen.queryByText(/Thinking|background services require/)).toBeNull();
-    expect(container.textContent).not.toContain("completion");
-  });
-
-  it("renders only the self-contained answer after a real recovery event sequence", () => {
+  it("keeps the recovery round's work on screen and ends with the final answer", () => {
     let state: ChatEventState = {
       messages: [
         msg({
@@ -160,11 +138,16 @@ describe("MessageList completion-review isolation", () => {
     const { container } = render(
       <MessageList messages={state.messages} streaming={false} cwd={null} />,
     );
-    expect(container.textContent).toBe(
-      "已完成：拆任务能力已内置到当前会话，用户无需进入独立页面。",
-    );
-    expect(container.querySelector("[data-segment='step']")).toBeNull();
-    expect(screen.queryByText(/bash|后台服务|完成度检查|background services/)).toBeNull();
+    // Everything the model did survives, in order…
+    expect(screen.getByText(/先执行与用户无关的内部步骤/)).toBeTruthy();
+    expect(screen.getByText(/后台服务已运行，现在执行后续探针/)).toBeTruthy();
+    // …as dim step lines, with only the last prose block as the answer.
+    expect(container.querySelectorAll("[data-segment='step']").length).toBe(2);
+    expect(
+      screen.getByText("已完成：拆任务能力已内置到当前会话，用户无需进入独立页面。"),
+    ).toBeTruthy();
+    // The gate's own vocabulary still never reaches the screen.
+    expect(screen.queryByText(/完成度检查|执行已中断|background services/)).toBeNull();
   });
 
   it("shows a user-facing verification warning without internal gate wording", () => {

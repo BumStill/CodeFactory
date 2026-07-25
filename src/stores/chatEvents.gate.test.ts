@@ -3,6 +3,10 @@
 // Completion-gate stream-event tests (vitest). The legacy chatEvents.test.ts
 // uses a hand-rolled harness that vitest excludes; new reducer coverage goes
 // here.
+//
+// Contract: the gate is a control loop, not a chat participant. Recovery and
+// ready rounds change what the model does next and nothing about what the user
+// sees — no erasure, no progress card, no framework vocabulary on screen.
 
 import { describe, it, expect } from "vitest";
 import { reduceChatStreamEvent, type ChatEventState } from "./chatEvents";
@@ -28,14 +32,14 @@ function baseState(): ChatEventState {
 }
 
 describe("completion gate stream events", () => {
-  it("clears rejected drafts and internal work when recovery starts", () => {
+  it("keeps every step the turn already produced when recovery starts", () => {
     const state = baseState();
     state.messages[0] = {
       ...state.messages[0],
-      content: "unrelated candidate answer",
+      content: "candidate answer",
       toolCalls: [{ id: "t1", name: "bash", args: "{}", status: "done", result: "ok" }],
       segments: [
-        { kind: "text", text: "unrelated candidate answer" },
+        { kind: "text", text: "candidate answer" },
         { kind: "tool", toolCallId: "t1" },
       ],
     };
@@ -50,95 +54,74 @@ describe("completion gate stream events", () => {
       "assistant-1",
     );
 
-    expect(next.messages[0]).toEqual(
-      expect.objectContaining({
-        content: "",
-        toolCalls: [],
-        segments: [],
-        internalReviewState: "recovery",
-        internalReviewDraft: "",
-        reviewProgress: expect.objectContaining({
-          phase: "recovering",
-          attempt: 1,
-          limit: 3,
-          currentStep: "正在补充验证",
-        }),
-      }),
-    );
-    expect(next.messages[0].gateActions).toBeUndefined();
+    expect(next.messages[0]).toEqual(state.messages[0]);
     expect(next.streaming).toBe(true);
-
-    const narrated = reduceChatStreamEvent(
-      next,
-      { type: "text_delta", content: "后台服务已运行，现在做内部探针。" },
-      "assistant-1",
-    );
-    expect(narrated.messages[0].content).toBe("");
-    expect(narrated.messages[0].segments).toEqual([]);
-    expect(narrated.messages[0].internalReviewDraft).toBe(
-      "后台服务已运行，现在做内部探针。",
-    );
-
-    const toolStarted = reduceChatStreamEvent(
-      narrated,
-      { type: "tool_call_start", id: "hidden-tool", name: "bash", args: {} },
-      "assistant-1",
-    );
-    expect(toolStarted.messages[0].toolCalls).toEqual([]);
-    expect(toolStarted.messages[0].internalReviewDraft).toBe("");
-    expect(toolStarted.messages[0].reviewProgress).toEqual(expect.objectContaining({
-      phase: "recovering",
-      attempt: 1,
-      limit: 3,
-      currentStep: "正在运行验证或修复步骤",
-    }));
   });
 
-  it("clears verification chatter at ready so only the final reply follows", () => {
+  it("keeps the recovery round's work visible and starts a fresh final answer", () => {
     let state = baseState();
     state.messages[0] = {
       ...state.messages[0],
-      content: "later client probe passed",
-      toolCalls: [{ id: "t2", name: "bash", args: "{}", status: "done", result: "passed" }],
-      segments: [{ kind: "text", text: "later client probe passed" }],
+      content: "candidate answer",
+      toolCalls: [{ id: "t1", name: "bash", args: "{}", status: "done", result: "ok" }],
+      segments: [
+        { kind: "text", text: "candidate answer" },
+        { kind: "tool", toolCallId: "t1" },
+      ],
     };
     state = reduceChatStreamEvent(
       state,
       { type: "completion_gate_action", kind: "recovery", detail: "verify" },
       "assistant-1",
     );
+    // A recovery round always runs a tool before it may speak again
+    // (`require_tool_next`), so its work lands in the timeline as usual.
     state = reduceChatStreamEvent(
       state,
-      { type: "text_delta", content: "这段验证旁白不应显示。" },
+      { type: "tool_call_start", id: "t2", name: "bash", args: { command: "npm test" } },
       "assistant-1",
     );
-    expect(state.messages[0].content).toBe("");
     state = reduceChatStreamEvent(
+      state,
+      { type: "tool_result", tool_call_id: "t2", content: "313 passed", is_error: false, status: "done" },
+      "assistant-1",
+    );
+    state = reduceChatStreamEvent(
+      state,
+      { type: "text_delta", content: "已完成：测试全绿。" },
+      "assistant-1",
+    );
+
+    expect(state.messages[0].toolCalls?.map((tc) => tc.id)).toEqual(["t1", "t2"]);
+    expect(state.messages[0].toolCalls?.[1].result).toBe("313 passed");
+    // The tool segment between them means the final answer is its own segment,
+    // never concatenated onto the rejected draft.
+    expect(state.messages[0].segments).toEqual([
+      { kind: "text", text: "candidate answer" },
+      { kind: "tool", toolCallId: "t1" },
+      { kind: "tool", toolCallId: "t2" },
+      { kind: "text", text: "已完成：测试全绿。" },
+    ]);
+  });
+
+  it("treats ready as a no-op for the transcript", () => {
+    const state = baseState();
+    state.messages[0] = {
+      ...state.messages[0],
+      content: "probe passed",
+      segments: [{ kind: "text", text: "probe passed" }],
+    };
+
+    const next = reduceChatStreamEvent(
       state,
       { type: "completion_gate_action", kind: "ready", detail: "" },
       "assistant-1",
     );
-    expect(state.messages[0].internalReviewState).toBe("finalizing");
-    expect(state.messages[0].reviewProgress).toEqual(expect.objectContaining({
-      phase: "finalizing",
-      attempt: 1,
-      limit: 3,
-      currentStep: "正在整理最终答复",
-    }));
-    const finalState = reduceChatStreamEvent(
-      state,
-      { type: "text_delta", content: "已完成：拆任务已内置到当前会话。" },
-      "assistant-1",
-    );
 
-    expect(finalState.messages[0].content).toBe("已完成：拆任务已内置到当前会话。");
-    expect(finalState.messages[0].toolCalls).toEqual([]);
-    expect(finalState.messages[0].segments).toEqual([
-      { kind: "text", text: "已完成：拆任务已内置到当前会话。" },
-    ]);
+    expect(next.messages[0]).toEqual(state.messages[0]);
   });
 
-  it("keeps only the final answer plus a user-facing warning when verification is incomplete", () => {
+  it("appends the unverified warning without collapsing the turn", () => {
     const state = baseState();
     state.messages[0] = {
       ...state.messages[0],
@@ -151,20 +134,8 @@ describe("completion gate stream events", () => {
       ],
     };
 
-    let recovering = reduceChatStreamEvent(
-      state,
-      { type: "completion_gate_action", kind: "recovery", detail: "verify" },
-      "assistant-1",
-    );
-    recovering = reduceChatStreamEvent(
-      recovering,
-      { type: "text_delta", content: "最终回答：功能已经内置到会话。" },
-      "assistant-1",
-    );
-    expect(recovering.messages[0].content).toBe("");
-
     const next = reduceChatStreamEvent(
-      recovering,
+      state,
       {
         type: "completion_gate_action",
         kind: "warning",
@@ -173,46 +144,36 @@ describe("completion gate stream events", () => {
       "assistant-1",
     );
 
-    expect(next.messages[0].content).toBe("最终回答：功能已经内置到会话。");
-    expect(next.messages[0].toolCalls).toEqual([]);
-    expect(next.messages[0].segments).toEqual([
-      { kind: "text", text: "最终回答：功能已经内置到会话。" },
-    ]);
+    expect(next.messages[0].content).toBe(state.messages[0].content);
+    expect(next.messages[0].toolCalls).toEqual(state.messages[0].toolCalls);
+    expect(next.messages[0].segments).toEqual(state.messages[0].segments);
     expect(next.messages[0].gateActions).toEqual([
       { kind: "warning", detail: "⚠ 以上回复未经完整验证：仍有一项检查未通过。" },
     ]);
   });
 
-  it("replaces an internal recovery error with a concise user-facing failure", () => {
-    let state = reduceChatStreamEvent(
-      baseState(),
-      { type: "completion_gate_action", kind: "recovery", detail: "verify" },
+  it("keeps the completed steps when the turn errors out mid-recovery", () => {
+    let state = baseState();
+    state = reduceChatStreamEvent(
+      state,
+      { type: "tool_call_start", id: "t4", name: "bash", args: {} },
       "assistant-1",
     );
     state = reduceChatStreamEvent(
       state,
-      { type: "text_delta", content: "internal verification narration" },
+      { type: "completion_gate_action", kind: "recovery", detail: "verify" },
       "assistant-1",
     );
     const next = reduceChatStreamEvent(
       state,
-      { type: "error", message: "Completion blocked: unresolved probe fingerprint" },
+      { type: "error", message: "503 Service Unavailable" },
       "assistant-1",
     );
 
     expect(next.streaming).toBe(false);
-    expect(next.messages[0].content).toBe("本次处理未能完成，请重试。");
-    expect(next.messages[0].segments).toEqual([
-      { kind: "text", text: "本次处理未能完成，请重试。" },
-    ]);
-    expect(next.messages[0].reviewProgress).toEqual(
-      expect.objectContaining({
-        phase: "interrupted",
-        reason: "本次处理未能完成",
-        currentStep: "执行在完成前中断",
-      }),
-    );
-    expect(next.messages[0].content).not.toMatch(/Completion|probe|Error/);
+    expect(next.messages[0].toolCalls?.map((tc) => tc.id)).toEqual(["t4"]);
+    expect(next.messages[0].content).toContain("503 Service Unavailable");
+    expect(next.messages[0].durationMs).toBeGreaterThanOrEqual(0);
   });
 
   it("leaves other messages untouched", () => {
@@ -229,6 +190,6 @@ describe("completion gate stream events", () => {
       "assistant-2",
     );
     expect(next.messages[0].content).toBe("");
-    expect(next.messages[1].content).toBe("");
+    expect(next.messages[1].content).toBe("old");
   });
 });

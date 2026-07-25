@@ -1096,16 +1096,10 @@ function parsePersistedToolReplay(raw: string): {
 export function dbMessagesToUI(messages: Message[]): UIMessage[] {
   const hydrated: UIMessage[] = [];
   const toolOwners = new Map<string, number>();
-  let suppressingInternalRecovery = false;
-  let currentUserTurnStart = 0;
-  let recoveryAttempt = 0;
 
   for (const message of messages) {
     const completionState = message.completion_state;
-    let internalRecoveryError = false;
     if (completionState === "gate_warning") {
-      suppressingInternalRecovery = false;
-      if (hydrated[hydrated.length - 1]?.reviewProgress) hydrated.pop();
       const answer = [...hydrated].reverse().find((item) => item.role === "assistant");
       if (answer) {
         answer.gateActions = [
@@ -1115,62 +1109,16 @@ export function dbMessagesToUI(messages: Message[]): UIMessage[] {
       }
       continue;
     }
+    // Gate prompts are framework instructions the loop injects as role=user.
+    // They are neither the user's words nor an answer, so they never enter the
+    // transcript — but they also never delete anything from it. The work each
+    // recovery round produced stays visible as ordinary timeline steps.
     if (
-      completionState === "rejected_candidate" ||
-      completionState === "gate_recovery"
+      completionState === "gate_recovery" ||
+      completionState === "gate_ready" ||
+      completionState === "gate_blocked"
     ) {
-      // Match the live reducer: once internal review starts, remove every
-      // assistant/tool artifact produced for this user turn, including work
-      // that preceded the first rejected draft or ready signal.
-      hydrated.splice(currentUserTurnStart);
-      toolOwners.clear();
-      suppressingInternalRecovery = true;
-      if (completionState === "gate_recovery") {
-        recoveryAttempt = Math.min(recoveryAttempt + 1, 3);
-        hydrated.push({
-          id: `review-progress:${message.id}`,
-          role: "assistant",
-          content: "",
-          createdAt: message.created_at,
-          reviewProgress: {
-            phase: "interrupted",
-            attempt: recoveryAttempt,
-            limit: 3,
-            reason: "未收到最终答复",
-            currentStep: "执行在完成前中断",
-            updatedAt: message.created_at,
-          },
-        });
-      }
       continue;
-    }
-    if (completionState === "gate_ready") {
-      suppressingInternalRecovery = true;
-      continue;
-    }
-
-    if (suppressingInternalRecovery) {
-      // A terminal error is useful, but raw provider/review details are not.
-      if (completionState === "turn_error") {
-        suppressingInternalRecovery = false;
-        internalRecoveryError = true;
-        if (hydrated[hydrated.length - 1]?.reviewProgress) hydrated.pop();
-      // A new untagged user turn means the prior run ended before it could
-      // produce a final answer. Never let suppression consume real user input.
-      } else if (message.role === "user" && !completionState) {
-        suppressingInternalRecovery = false;
-      } else if (
-        message.role === "assistant" &&
-        parsePersistedToolCalls(message.tool_calls).length === 0
-      ) {
-        // Rejected drafts are tagged above. Therefore the first remaining
-        // tool-free assistant turn is the accepted (or warning-released)
-        // answer and resumes the user-visible transcript.
-        suppressingInternalRecovery = false;
-        if (hydrated[hydrated.length - 1]?.reviewProgress) hydrated.pop();
-      } else {
-        continue;
-      }
     }
     if (message.role === "tool") {
       const replay = parsePersistedToolReplay(message.content);
@@ -1191,15 +1139,7 @@ export function dbMessagesToUI(messages: Message[]): UIMessage[] {
       continue;
     }
 
-    const uiMessage = internalRecoveryError
-      ? { ...dbToUI(message), content: "本次处理未能完成，请重试。" }
-      : dbToUI(message);
-    if (message.role === "user" && !completionState) {
-      // Keep the real user bubble; any following assistant/tool rows belong to
-      // this turn and may be rolled back if an internal review signal follows.
-      recoveryAttempt = 0;
-      currentUserTurnStart = hydrated.length + 1;
-    }
+    const uiMessage = dbToUI(message);
     if (message.role === "assistant") {
       const toolCalls = parsePersistedToolCalls(message.tool_calls);
       if (toolCalls.length > 0) {
