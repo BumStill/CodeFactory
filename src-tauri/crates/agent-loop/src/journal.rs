@@ -141,6 +141,16 @@ pub trait Budget: Send + Sync {
     /// True while another round is permitted. The desktop uses the iteration
     /// ceiling; the sidecar also stops when the wall-clock reserve is hit.
     fn may_continue(&self, iteration: usize) -> bool;
+
+    /// `(remaining_secs, total_secs)` of the run's wall-clock budget, when the
+    /// surface has one (keystone slice 4.8c b3). The budget owns the clock, so
+    /// the loop can hand it to the completion-policy evaluator — which uses it
+    /// for the convergence / time-finalization / delivery-checkpoint windows.
+    /// Desktop has no wall clock and keeps the default `None`, which makes the
+    /// evaluator behave exactly as before.
+    fn wall_time(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 /// Always permits another round — the desktop loop bounds itself with the

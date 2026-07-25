@@ -17,7 +17,8 @@
 use crate::run::FinalizationPolicy;
 use crate::types::{StreamEvent, ToolDefinition};
 use codefactory_agent_core::{
-    build_completion_recovery_prompt, classify_command, evaluate_budget_command_in_directory,
+    build_completion_recovery_prompt, classify_command,
+    evaluate_budget_command_with_time_in_directory,
     CompletionEvidence, CompletionGate, PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
 };
 use std::path::Path;
@@ -310,14 +311,28 @@ pub fn completion_command_and_kind(
     (command, kind)
 }
 
+/// A completion-policy denial, kept STRUCTURED so each surface can word it its
+/// own way (keystone slice 4.8c b4) — the desktop's user-facing sentence and the
+/// eval sidecar's `policy denied command ({rule}): {reason}` are different
+/// contracts. Formatting happens in `PermissionGateway::format_budget_denial`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetDenial {
+    pub rule: String,
+    pub reason: String,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn autonomous_budget_denial(
     wall_budget_applies: bool,
     remaining_model_rounds: u32,
+    // `(remaining, total)` seconds — `None` on surfaces without a wall clock,
+    // which is exactly what the old call passed (slice 4.8c b3).
+    wall_time: Option<(u64, u64)>,
     evidence: &CompletionEvidence,
     tool_name: &str,
     args: &serde_json::Value,
     working_directory: &Path,
-) -> Option<String> {
+) -> Option<BudgetDenial> {
     let (command, kind) = completion_command_and_kind(tool_name, args);
     // Interactive chat (wall budget off) is not constrained by the round budget,
     // but deterministic completion invariants still apply to model tools.
@@ -326,17 +341,16 @@ pub fn autonomous_budget_denial(
     } else {
         remaining_model_rounds
     };
-    match evaluate_budget_command_in_directory(
+    match evaluate_budget_command_with_time_in_directory(
         effective_remaining,
+        wall_time,
         evidence,
         &command,
         &kind,
         working_directory.to_str(),
     ) {
         PolicyDecision::Allow => None,
-        PolicyDecision::Deny { reason, .. } => Some(format!(
-            "Tool call denied by completion policy: {reason}. Resolve the current completion blocker or finalize."
-        )),
+        PolicyDecision::Deny { rule, reason } => Some(BudgetDenial { rule, reason }),
     }
 }
 

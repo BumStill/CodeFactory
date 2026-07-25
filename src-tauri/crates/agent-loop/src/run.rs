@@ -816,15 +816,21 @@ pub async fn run_agent_loop(
 
                 let remaining = max_iterations.saturating_sub(segment_iteration + 1) as u32;
                 let completion_evidence = completion_gate.evidence();
-                let denial_content = if let Some(content) = crate::policy::autonomous_budget_denial(
+                let denial_content = if let Some(denial) = crate::policy::autonomous_budget_denial(
                     wall_budget,
                     remaining,
+                    // The Budget owns the run's clock (slice 4.8c b3); desktop
+                    // has none and keeps the default `None`, which makes the
+                    // evaluator behave exactly as before.
+                    budget.wall_time(),
                     &completion_evidence,
                     &tc.function.name,
                     &args,
                     &cwd,
                 ) {
-                    Some(content)
+                    // Wording is the surface's (b4): desktop keeps its sentence,
+                    // the sidecar its `policy denied command (rule): reason`.
+                    Some(permission.format_budget_denial(&denial.rule, &denial.reason))
                 } else {
                     match permission.authorize(tc, &args, bash_cmd.as_deref()).await {
                         PermissionOutcome::Allow => None,
