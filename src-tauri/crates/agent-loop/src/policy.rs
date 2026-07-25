@@ -33,25 +33,38 @@ pub fn record_completion_outcome(
     progress: &mut ProgressTracker,
     sequence: &mut u64,
     working_directory: &Path,
-    tool_name: &str,
-    args: &serde_json::Value,
-    content: &str,
-    is_error: bool,
+    request_id: &str,
+    result: &crate::tool::ToolInvocationResult,
 ) -> Option<String> {
     *sequence += 1;
-    let (command, kind) = completion_command_and_kind(tool_name, args);
+    // The BACKEND supplies `command`/`kind` and the real shell streams (keystone
+    // slice 4.8c b2). Previously this synthesized them from `(tool_name, args)`
+    // via `completion_command_and_kind`, which only calls `classify_command`
+    // when `tool_name == "bash"` — fine for the desktop (whose backend now
+    // applies exactly that rule), but it silently classified EVERY eval-sidecar
+    // call as `ReadOnly` (its tool is named `run_shell`), so the gate would
+    // never have seen a `Mutation`.
     let outcome = ToolOutcome {
-        request_id: format!("desktop-tool-{sequence}"),
-        command,
+        request_id: request_id.to_string(),
+        command: result.command.clone(),
         working_directory: Some(working_directory.to_string_lossy().into_owned()),
-        kind,
+        kind: result.kind.clone(),
         sequence: *sequence,
         started_at_ms: 0,
         finished_at_ms: 0,
-        return_code: Some(if is_error { 1 } else { 0 }),
-        stdout: content.to_string(),
-        stderr: String::new(),
-        error: is_error.then(|| content.to_string()),
+        return_code: result
+            .return_code
+            .or(Some(if result.is_error { 1 } else { 0 })),
+        stdout: if result.stdout.is_empty() {
+            result.content.clone()
+        } else {
+            result.stdout.clone()
+        },
+        stderr: result.stderr.clone(),
+        error: result
+            .error
+            .clone()
+            .or_else(|| result.is_error.then(|| result.content.clone())),
         semantic_failure: false,
     }
     .with_detected_semantic_failure();

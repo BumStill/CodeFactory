@@ -46,9 +46,6 @@ use crate::openrouter::types::*;
 use crate::storage::Message;
 use crate::tools::{self};
 use crate::PendingPermissionMap;
-// Brings the `Persistence` methods into scope for the inherent delegators; the
-// concrete `SqlitePersistence` lives in `persistence`.
-use codefactory_agent_loop::journal::Persistence as _;
 // `LifecycleHooks`/`NoOpHooks` are imported by name (used as a `dyn` type + built
 // directly); `DesktopLifecycleHooks` lives in `lifecycle_hooks`.
 use codefactory_agent_loop::services::{LifecycleHooks, NoOpHooks};
@@ -2278,6 +2275,30 @@ fn glob_match(pattern: &str, input: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Build the `ToolInvocationResult` the loop now feeds the gate with
+    /// (slice 4.8c b2), applying the SAME classification the loop used inline
+    /// before — so these #135/#136 gate tests pin identical behaviour.
+    fn tool_result(
+        tool_name: &str,
+        args: &serde_json::Value,
+        content: &str,
+        is_error: bool,
+    ) -> codefactory_agent_loop::tool::ToolInvocationResult {
+        let (command, kind) =
+            codefactory_agent_loop::policy::completion_command_and_kind(tool_name, args);
+        codefactory_agent_loop::tool::ToolInvocationResult {
+            content: content.to_string(),
+            is_error,
+            command,
+            kind,
+            return_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+            next_working_directory: None,
+            duration_ms: 0,
+        }
+    }
     use super::*;
     // `completion_command_and_kind` (and its `ToolKind` result) moved to
     // agent-loop in slice 4.6; this test still exercises it via the re-export.
@@ -3189,9 +3210,8 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "write_file",
-            &serde_json::json!({"path": "src/example.rs", "content": "fn main() {}"}),
-            "written", false,
+            "t",
+            &tool_result("write_file", &serde_json::json!({"path": "src/example.rs", "content": "fn main() {}"}), "written", false),
         );
         assert!(!gate.evidence().completed);
 
@@ -3200,9 +3220,8 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "bash",
-            &serde_json::json!({"command": "cargo test"}),
-            "test result: ok", false,
+            "t",
+            &tool_result("bash", &serde_json::json!({"command": "cargo test"}), "test result: ok", false),
         );
         assert!(gate.evidence().completed);
     }
@@ -3218,20 +3237,18 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "write_file",
-            &serde_json::json!({"path": "src/app.rs", "content": "fixed"}),
-            "written", false,
+            "t",
+            &tool_result("write_file", &serde_json::json!({"path": "src/app.rs", "content": "fixed"}), "written", false),
         );
         record_completion_outcome(
             &mut gate,
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "bash",
-            &serde_json::json!({
+            "t",
+            &tool_result("bash", &serde_json::json!({
                 "command": "status=0; grep -n stale src/app.rs || status=$?; test \"$status\" -le 1"
-            }),
-            "zsh:1: read-only variable: status", true,
+            }), "zsh:1: read-only variable: status", true),
         );
 
         let failed = gate.evidence();
@@ -3246,9 +3263,8 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "bash",
-            &serde_json::json!({"command": "cargo test"}),
-            "test result: ok. 1 passed; 0 failed", false,
+            "t",
+            &tool_result("bash", &serde_json::json!({"command": "cargo test"}), "test result: ok. 1 passed; 0 failed", false),
         );
 
         let recovered = gate.evidence();
@@ -3272,9 +3288,8 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "write_file",
-            &serde_json::json!({"path": "result.txt", "content": "candidate"}),
-            "written", false,
+            "t",
+            &tool_result("write_file", &serde_json::json!({"path": "result.txt", "content": "candidate"}), "written", false),
         );
         let evidence = gate.evidence();
 
@@ -3320,27 +3335,24 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "write_file",
-            &serde_json::json!({"path": "src/worker.rs", "content": "candidate"}),
-            "written", false,
+            "t",
+            &tool_result("write_file", &serde_json::json!({"path": "src/worker.rs", "content": "candidate"}), "written", false),
         );
         record_completion_outcome(
             &mut gate,
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "bash",
-            &serde_json::json!({"command": "cargo test worker::tests::behavior"}),
-            "assertion failed", true,
+            "t",
+            &tool_result("bash", &serde_json::json!({"command": "cargo test worker::tests::behavior"}), "assertion failed", true),
         );
         record_completion_outcome(
             &mut gate,
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "read_file",
-            &serde_json::json!({"path": "src/worker.rs"}),
-            "candidate", false,
+            "t",
+            &tool_result("read_file", &serde_json::json!({"path": "src/worker.rs"}), "candidate", false),
         );
         let evidence = gate.evidence();
 
@@ -3382,20 +3394,18 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "write_file",
-            &serde_json::json!({"path": "tool", "content": "implementation"}),
-            "written", false,
+            "t",
+            &tool_result("write_file", &serde_json::json!({"path": "tool", "content": "implementation"}), "written", false),
         );
         record_completion_outcome(
             &mut gate,
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "bash",
-            &serde_json::json!({
+            "t",
+            &tool_result("bash", &serde_json::json!({
                 "command": "test \"$(./tool 3)\" = 9 && test \"$(./tool 5)\" = 25"
-            }),
-            "examples passed", false,
+            }), "examples passed", false),
         );
 
         let smoke = gate.evidence();
@@ -3408,9 +3418,8 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "bash",
-            &serde_json::json!({"command": "test \"$(./tool 7)\" = 49"}),
-            "independent case passed", false,
+            "t",
+            &tool_result("bash", &serde_json::json!({"command": "test \"$(./tool 7)\" = 49"}), "independent case passed", false),
         );
         let completed = gate.evidence();
         assert_eq!(completed.last_independent_verification_sequence, Some(3));
@@ -3430,11 +3439,10 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "bash",
-            &serde_json::json!({
+            "t",
+            &tool_result("bash", &serde_json::json!({
                 "command": "set -e\nprintf '== agent injection ==\\n'; sed -n '445,500p' src-tauri/src/agent/mod.rs"
-            }),
-            "Err(e) => Ok(tools::ToolOutput::err(format!(\"MCP error: {e}\")))", false,
+            }), "Err(e) => Ok(tools::ToolOutput::err(format!(\"MCP error: {e}\")))", false),
         );
         let evidence = gate.evidence();
         assert!(
@@ -3449,11 +3457,10 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "bash",
-            &serde_json::json!({
+            "t",
+            &tool_result("bash", &serde_json::json!({
                 "command": "pnpm exec vitest run src/pages/Workspace/TaskCreator.test.tsx"
-            }),
-            "Test Files  2 passed (2)", false,
+            }), "Test Files  2 passed (2)", false),
         );
         let evidence = gate.evidence();
         assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
@@ -3790,11 +3797,10 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "bash",
-            &serde_json::json!({
+            "t",
+            &tool_result("bash", &serde_json::json!({
                 "command": "nohup ./server >server.log 2>&1 & echo $! >server.pid"
-            }),
-            "started", false,
+            }), "started", false),
         );
         assert!(!gate.evidence().completed);
 
@@ -3803,11 +3809,10 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "bash",
-            &serde_json::json!({
+            "t",
+            &tool_result("bash", &serde_json::json!({
                 "command": "timeout 10 curl --fail http://127.0.0.1:8080/health"
-            }),
-            "healthy", false,
+            }), "healthy", false),
         );
         assert!(gate.evidence().completed);
     }
@@ -4051,13 +4056,12 @@ mod tests {
             &mut progress,
             &mut sequence,
             Path::new("/workspace"),
-            "edit_file",
-            &serde_json::json!({
+            "t",
+            &tool_result("edit_file", &serde_json::json!({
                 "path": "/workspace/compatdemo/service.py",
                 "old_string": "rt.old_value(value)",
                 "new_string": "rt.new_value(value)"
-            }),
-            "Edited /workspace/compatdemo/service.py", false,
+            }), "Edited /workspace/compatdemo/service.py", false),
         );
 
         let evidence = gate.evidence();

@@ -798,7 +798,6 @@ pub async fn run_agent_loop(
                 }
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                let completion_args = args.clone();
 
                 // Extract bash command for finer-grained permission matching
                 let bash_cmd = if tc.function.name == "bash" {
@@ -944,10 +943,8 @@ pub async fn run_agent_loop(
                     &mut progress_tracker,
                     &mut completion_sequence,
                     &cwd,
-                    &tc.function.name,
-                    &completion_args,
-                    &output.content,
-                    output.is_error,
+                    &tc.id,
+                    &output,
                 ) {
                     progress_prompt = Some(prompt);
                 }
