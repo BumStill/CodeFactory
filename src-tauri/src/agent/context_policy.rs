@@ -19,6 +19,11 @@ pub(super) struct DesktopContextPolicy {
     pub(super) endpoint_name: String,
     pub(super) model_id: String,
     pub(super) api_style: ApiStyle,
+    /// OpenAI/ChatGPT expand the window to `max_limit` when a prompt would
+    /// otherwise trigger compression (`select_limit`); Anthropic keeps the flat
+    /// `default_limit` for its context-bar denominator — it never elides
+    /// (keystone slice 4.7). `false` → `default_limit`.
+    pub(super) expand_context_window: bool,
 }
 
 #[async_trait::async_trait]
@@ -31,7 +36,12 @@ impl ContextPolicy for DesktopContextPolicy {
             &self.model_id,
             None,
         );
-        (window.select_limit(estimated_tokens), window.max_limit)
+        let limit = if self.expand_context_window {
+            window.select_limit(estimated_tokens)
+        } else {
+            window.default_limit
+        };
+        (limit, window.max_limit)
     }
 
     async fn supports_vision(&self) -> bool {

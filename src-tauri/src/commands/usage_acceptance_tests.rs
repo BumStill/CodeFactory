@@ -123,108 +123,65 @@ async fn fresh_and_historical_databases_receive_request_level_usage_schema() {
 
 #[test]
 fn openai_and_anthropic_persist_usage_before_terminal_tool_branch() {
-    // The openai loop body physically moved to `agent-loop::run_agent_loop`
-    // (keystone slice 4.6b); anthropic still lives in the bin's mod.rs — so the
-    // acceptance source is selected per provider.
-    let mod_src = include_str!("../agent/mod.rs");
+    // BOTH providers now drive the SAME `agent-loop::run_agent_loop` (slice 4.7
+    // put Anthropic on it too, via a ChatMessage↔wire edge in the transport), so
+    // one check over run.rs covers OpenAI, ChatGPT, and Anthropic.
     let run_src = include_str!("../../crates/agent-loop/src/run.rs");
-    for (provider, source, start, end) in [
-        (
-            "openai",
-            run_src,
-            "pub async fn run_agent_loop(",
-            // End marker: the first item after run_agent_loop (the private
-            // RunOutcome helper).
-            "\nfn run_outcome_for_terminal(",
-        ),
-        (
-            "anthropic",
-            mod_src,
-            "    async fn run_anthropic(",
-            // End marker: the first free fn after run_anthropic. (openai_tool_controls
-            // moved to agent-loop in slice 4.6; validate_openai_sse_completion is now
-            // the tight bound of the run_anthropic section.)
-            "\n}\n\nfn validate_openai_sse_completion(",
-        ),
-    ] {
-        let section = source
-            .split_once(start)
-            .unwrap_or_else(|| panic!("missing {provider} loop start"))
-            .1
-            .split_once(end)
-            .unwrap_or_else(|| panic!("missing {provider} loop end"))
-            .0;
-        let loop_pos = section
-            .find("for iteration in 0..max_iterations")
-            .unwrap_or_else(|| panic!("missing {provider} provider-round loop"));
-        let record_pos = section
-            .find("record_usage_event")
-            .unwrap_or_else(|| panic!("{provider} does not persist request-level usage"));
-        let terminal_pos = section
-            .find("if tool_calls.is_empty()")
-            .unwrap_or_else(|| panic!("missing {provider} terminal/tool branch"));
+    let section = run_src
+        .split_once("pub async fn run_agent_loop(")
+        .expect("missing run_agent_loop start")
+        .1
+        .split_once("\nfn run_outcome_for_terminal(")
+        .expect("missing run_agent_loop end")
+        .0;
+    let loop_pos = section
+        .find("for iteration in 0..max_iterations")
+        .expect("missing provider-round loop");
+    let record_pos = section
+        .find("record_usage_event")
+        .expect("does not persist request-level usage");
+    let terminal_pos = section
+        .find("if tool_calls.is_empty()")
+        .expect("missing terminal/tool branch");
 
-        assert!(
-            loop_pos < record_pos && record_pos < terminal_pos,
-            "{provider} must persist usage inside every provider round and before the tool-call branch; otherwise intermediate tool rounds are omitted"
-        );
-    }
+    assert!(
+        loop_pos < record_pos && record_pos < terminal_pos,
+        "usage must be persisted inside every provider round and before the tool-call branch; otherwise intermediate tool rounds are omitted"
+    );
 }
 
 #[test]
 fn completed_usage_is_persisted_before_post_response_cancellation() {
-    // openai body moved to agent-loop::run_agent_loop (slice 4.6b); anthropic
-    // stays in mod.rs — source selected per provider.
-    let mod_src = include_str!("../agent/mod.rs");
+    // BOTH providers share `agent-loop::run_agent_loop` (slice 4.7), so one check
+    // over run.rs covers OpenAI, ChatGPT, and Anthropic.
     let run_src = include_str!("../../crates/agent-loop/src/run.rs");
-    for (provider, source, start, end, response_marker) in [
-        (
-            "openai",
-            run_src,
-            "pub async fn run_agent_loop(",
-            "\nfn run_outcome_for_terminal(",
-            // The round's model answer (a `ModelResponse` destructure since slice
-            // 4.6 sub-step 7 switched the loop onto `ModelTransport::complete`).
-            "} = match call_result",
-        ),
-        (
-            "anthropic",
-            mod_src,
-            "    async fn run_anthropic(",
-            // End marker: the first free fn after run_anthropic. (openai_tool_controls
-            // moved to agent-loop in slice 4.6; validate_openai_sse_completion is now
-            // the tight bound of the run_anthropic section.)
-            "\n}\n\nfn validate_openai_sse_completion(",
-            "let resp = match first_attempt",
-        ),
-    ] {
-        let section = source
-            .split_once(start)
-            .unwrap_or_else(|| panic!("missing {provider} loop start"))
+    {
+        let section = run_src
+            .split_once("pub async fn run_agent_loop(")
+            .expect("missing run_agent_loop start")
             .1
-            .split_once(end)
-            .unwrap_or_else(|| panic!("missing {provider} loop end"))
+            .split_once("\nfn run_outcome_for_terminal(")
+            .expect("missing run_agent_loop end")
             .0;
+        // Post-response anchor: the round's `usage_request_id` binding, which sits
+        // right AFTER the transport call + all reactive retry arms
+        // (overflow/overload/vision) resolve — and right BEFORE the usage record +
+        // the post-response cancel check. Past the arms so the overload-backoff
+        // arm's own cancel check and the loop-top cancel aren't mistaken for it.
         let after_response = section
-            .split_once(response_marker)
-            .unwrap_or_else(|| panic!("missing {provider} completed response marker"))
+            .split_once("let usage_request_id = usage_request_id(&usage_run_id")
+            .expect("missing completed response marker")
             .1;
         let record_pos = after_response
             .find("record_usage_event")
-            .unwrap_or_else(|| panic!("{provider} does not persist response usage"));
-        let cancel_pos = if provider == "anthropic" {
-            after_response
-                .find("if resp.cancelled || self.is_cancelled()")
-                .expect("missing anthropic post-response cancellation")
-        } else {
-            after_response
-                .find("if is_cancelled(cancel.as_ref())")
-                .expect("missing openai post-response cancellation")
-        };
+            .expect("does not persist response usage");
+        let cancel_pos = after_response
+            .find("if is_cancelled(cancel.as_ref())")
+            .expect("missing post-response cancellation");
 
         assert!(
             record_pos < cancel_pos,
-            "{provider} must persist already-received Usage before honoring post-response cancellation"
+            "must persist already-received Usage before honoring post-response cancellation"
         );
     }
 }

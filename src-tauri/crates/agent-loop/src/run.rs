@@ -208,6 +208,12 @@ pub struct RunConfig {
     /// Whether the autonomous round budget constrains tools this run
     /// (Interactive = false).
     pub wall_budget_applies: bool,
+    /// Whether to compress history + emergency-recompress on overflow before
+    /// each send (OpenAI/ChatGPT=true; Anthropic=false — it never elides).
+    pub context_compression: bool,
+    /// Whether to reactively back off + retry on a transient provider overload
+    /// (Anthropic=true; OpenAI=false).
+    pub overload_backoff: bool,
     // Usage-attribution identity + working dir (all constant for the run).
     pub session_id: String,
     pub endpoint_name: String,
@@ -318,6 +324,8 @@ pub async fn run_agent_loop(
         recovery_limit,
         max_iterations,
         wall_budget_applies: wall_budget,
+        context_compression,
+        overload_backoff,
         session_id,
         endpoint_name,
         model_id,
@@ -405,20 +413,26 @@ pub async fn run_agent_loop(
             let estimated = crate::context::estimate_prompt_tokens(&messages, system_prompt);
             let (context_limit, max_context_limit) =
                 context_policy.context_window(estimated).await;
-            let compression = crate::context::compress_if_needed(
-                std::mem::take(&mut messages),
-                system_prompt,
-                context_limit,
-            );
-            // Storage repair is not enough: context compression can change the
-            // final provider payload. Enforce the OpenAI tool-call protocol at
-            // the last possible boundary before every model request.
-            messages = crate::protocol::repair_openai_tool_protocol(compression.messages);
-            if compression.compressed {
-                events.emit(crate::types::StreamEvent::ContextCompressed {
-                            elided_count: compression.elided_count,
-                            tokens_freed: compression.tokens_freed,
-                        });
+            // Compression is OpenAI/ChatGPT-only (slice 4.7): the Anthropic path
+            // never elides history, so with `context_compression=false` the
+            // history passes through untouched (no mem::take/repair/event) — we
+            // still resolve the window above for the ContextUsage denominator.
+            if context_compression {
+                let compression = crate::context::compress_if_needed(
+                    std::mem::take(&mut messages),
+                    system_prompt,
+                    context_limit,
+                );
+                // Storage repair is not enough: context compression can change the
+                // final provider payload. Enforce the OpenAI tool-call protocol at
+                // the last possible boundary before every model request.
+                messages = crate::protocol::repair_openai_tool_protocol(compression.messages);
+                if compression.compressed {
+                    events.emit(crate::types::StreamEvent::ContextCompressed {
+                        elided_count: compression.elided_count,
+                        tokens_freed: compression.tokens_freed,
+                    });
+                }
             }
 
             let active_tool_defs = crate::policy::active_tool_definitions(tool_defs, finalization_pending);
@@ -452,7 +466,7 @@ pub async fn run_agent_loop(
                 // compress against a reduced budget and retry ONCE — a killed
                 // turn on a replayable history dies identically on every
                 //「继续」(2026-07-21: three context-window deaths in one day).
-                Err(e) if crate::context::is_context_overflow(&e.to_string()) => {
+                Err(e) if context_compression && crate::context::is_context_overflow(&e.to_string()) => {
                     let emergency_limit = (context_limit / 5).max(1) * 4;
                     let compression = crate::context::compress_if_needed(
                         std::mem::take(&mut messages),
@@ -475,6 +489,44 @@ pub async fn run_agent_loop(
                     transport
                         .complete(&messages, active_tool_defs, &round_options)
                         .await?
+                }
+                // Transient provider saturation (Anthropic 529/overloaded, 503,
+                // rate limit): back off + retry, up to twice, cancel-aware. No
+                // StreamEvent — a persisted turn_notice is the only trace. Only
+                // installed for surfaces that set `overload_backoff` (Anthropic);
+                // OpenAI leaves it off, so this arm never matches there (slice 4.7).
+                Err(e) if overload_backoff && crate::context::is_provider_overloaded(&e.to_string()) => {
+                    let notice = "模型服务过载,正在自动退避重试(最多 2 次)。".to_string();
+                    persistence
+                        .persist_gate_message_once("自动退避重试", &notice, "turn_notice")
+                        .await?;
+                    let mut last_err = e;
+                    let mut recovered = None;
+                    for delay in [20u64, 40] {
+                        if is_cancelled(cancel.as_ref()) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        match transport
+                            .complete(&messages, active_tool_defs, &round_options)
+                            .await
+                        {
+                            Ok(ok) => {
+                                recovered = Some(ok);
+                                break;
+                            }
+                            Err(next)
+                                if crate::context::is_provider_overloaded(&next.to_string()) =>
+                            {
+                                last_err = next;
+                            }
+                            Err(next) => return Err(next.into()),
+                        }
+                    }
+                    match recovered {
+                        Some(resp) => resp,
+                        None => return Err(last_err.into()),
+                    }
                 }
                 Err(e) if crate::protocol::is_vision_rejection(&e.to_string()) => {
                     let stripped = crate::protocol::strip_image_parts(&mut messages);
@@ -993,6 +1045,8 @@ mod tests {
             recovery_limit: 3,
             max_iterations: 30,
             wall_budget_applies,
+            context_compression: true,
+            overload_backoff: false,
             session_id: session_id.clone(),
             endpoint_name: endpoint_name.clone(),
             model_id: model_id.clone(),
@@ -1011,6 +1065,8 @@ mod tests {
             recovery_limit: 1,
             max_iterations: 80,
             wall_budget_applies,
+            context_compression: false,
+            overload_backoff: true,
             session_id,
             endpoint_name,
             model_id,

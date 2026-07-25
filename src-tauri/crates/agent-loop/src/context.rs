@@ -114,6 +114,16 @@ pub fn is_context_overflow(error: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// Does this provider error mean "transiently overloaded, retry with backoff"?
+/// (Anthropic 529 "Overloaded", rate limits, 503.) Drives the loop's overload
+/// backoff arm (keystone slice 4.7).
+pub fn is_provider_overloaded(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    ["overloaded", "try again later", "rate limit", "429", "503", "529"]
+        .iter()
+        .any(|w| lower.contains(w))
+}
+
 /// Elide oversized messages (tool results AND assistant prose) from the
 /// older half of the conversation when the prompt estimate exceeds
 /// `limit * COMPRESSION_TRIGGER`. After pass 1, if the estimate still
