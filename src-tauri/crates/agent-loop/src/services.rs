@@ -68,6 +68,16 @@ pub trait PermissionGateway: Send + Sync {
         args: &serde_json::Value,
         bash_command: Option<&str>,
     ) -> PermissionOutcome;
+
+    /// Word a completion-policy budget denial for this surface (keystone slice
+    /// 4.8c b4). The default is the desktop's user-facing sentence; the eval
+    /// sidecar overrides it with its own `policy denied command ({rule}):
+    /// {reason}` contract, which its tests pin.
+    fn format_budget_denial(&self, _rule: &str, reason: &str) -> String {
+        format!(
+            "Tool call denied by completion policy: {reason}. Resolve the current completion blocker or finalize."
+        )
+    }
 }
 
 /// Headless permission gateway: every tool is allowed. Owns no `AppHandle`.

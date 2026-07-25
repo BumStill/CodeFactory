@@ -1799,14 +1799,23 @@ fn autonomous_budget_denial(
     args: &serde_json::Value,
     working_directory: &Path,
 ) -> Option<String> {
+    // Desktop has no wall clock (`None`, slice 4.8c b3) and uses the DEFAULT
+    // `format_budget_denial` wording — applying both here keeps these tests
+    // pinning the exact user-facing string the loop produces.
+    use codefactory_agent_loop::services::PermissionGateway as _;
     policy::autonomous_budget_denial(
         wall_budget_applies(mode),
         remaining_model_rounds,
+        None,
         evidence,
         tool_name,
         args,
         working_directory,
     )
+    .map(|denial| {
+        codefactory_agent_loop::services::AllowAllPermissions
+            .format_budget_denial(&denial.rule, &denial.reason)
+    })
 }
 
 // `record_completion_outcome` moved to `agent-loop::policy` (keystone slice
