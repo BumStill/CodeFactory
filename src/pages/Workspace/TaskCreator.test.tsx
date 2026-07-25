@@ -211,8 +211,19 @@ describe("session-native task delegation", () => {
     expect(within(header).queryByRole("group", { name: "主题" })).not.toBeInTheDocument();
   });
 
-  it("keeps delegated execution out of the conversation and opens it from a compact task activity control", async () => {
+  it("keeps pending-only delegated work out of the header because it is not user-actionable", async () => {
     fakeTasksState.tasks = { s1: [task()] };
+    renderWorkspace();
+
+    const conversation = screen.getByRole("main", { name: "会话窗口" });
+    expect(within(conversation).queryByText("会话执行详情")).not.toBeInTheDocument();
+    expect(within(conversation).queryByText("实现登录页")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "打开任务活动" })).not.toBeInTheDocument();
+  });
+
+  it("opens task activity for running delegated execution and keeps it out of the conversation", async () => {
+    fakeTasksState.tasks = { s1: [task({ status: "running" })] };
+    fakeTasksState.running = { s1: true };
     renderWorkspace();
 
     const conversation = screen.getByRole("main", { name: "会话窗口" });
@@ -220,7 +231,7 @@ describe("session-native task delegation", () => {
     expect(within(conversation).queryByText("实现登录页")).not.toBeInTheDocument();
 
     const activity = screen.getByRole("button", { name: "打开任务活动" });
-    expect(activity).toHaveTextContent("待执行 1");
+    expect(activity).toHaveTextContent("正在执行 1");
     await userEvent.click(activity);
     const drawer = screen.getByRole("dialog", { name: "任务活动" });
     expect(within(drawer).getByText("实现登录页")).toBeInTheDocument();
@@ -229,8 +240,9 @@ describe("session-native task delegation", () => {
 
   it("keeps legacy spec provenance visible without reopening a spec product surface", async () => {
     fakeTasksState.tasks = {
-      s1: [task({ spec_req_id: "CF-010", spec_title: "Token 成本仪表盘" })],
+      s1: [task({ status: "running", spec_req_id: "CF-010", spec_title: "Token 成本仪表盘" })],
     };
+    fakeTasksState.running = { s1: true };
     renderWorkspace();
 
     await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
@@ -238,13 +250,13 @@ describe("session-native task delegation", () => {
     expect(screen.queryByTitle(/规范工作台/)).not.toBeInTheDocument();
   });
 
-  it("shows explanation text instead of a manual start button when tasks are pending without failures", async () => {
+  it("does not surface pending-only tasks as a manual action", async () => {
     fakeTasksState.tasks = { s1: [task()] };
     renderWorkspace();
 
-    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
-    expect(screen.getByText("执行已暂停，还有 1 项等待执行。" )).toBeInTheDocument();
-    expect(screen.getByText("任务已委派，由后台调度器自动执行；若长时间未开始请检查模型配置或重试委派。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "打开任务活动" })).not.toBeInTheDocument();
+    expect(screen.queryByText("执行已暂停，还有 1 项等待执行。" )).not.toBeInTheDocument();
+    expect(screen.queryByText("任务已委派，由后台调度器自动执行；若长时间未开始请检查模型配置或重试委派。")).not.toBeInTheDocument();
   });
 
   it("does not offer a generic continue action while a failure blocks pending work", async () => {
