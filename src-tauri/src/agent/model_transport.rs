@@ -591,6 +591,89 @@ impl DesktopModelTransport {
 /// (message preserved verbatim). `RoundOptions` supplies the per-round
 /// `require_tool` + pre-resolved `reasoning_effort`; the sink and cancel handle
 /// are the transport's own fields, so `complete` needs neither as a param.
+impl DesktopModelTransport {
+    /// One Anthropic round (keystone slice 4.7): convert canonical `ChatMessage`
+    /// history to the Anthropic wire at the edge, run `stream_anthropic`, and
+    /// apply the required→auto tool-choice fallback (moved here from
+    /// `AgentLoop::call_anthropic_transport` so the shared loop, which only calls
+    /// `complete`, keeps it). `reasoning_effort` is ignored for Anthropic.
+    async fn call_anthropic_model(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        require_tool: bool,
+    ) -> Result<super::anthropic_client::AnthropicResponse> {
+        let (system, wire_messages) = chat_messages_to_anthropic(messages);
+        let first = super::anthropic_client::stream_anthropic(
+            &self.http,
+            &self.base_url,
+            &self.api_key,
+            &self.model_id,
+            &system,
+            wire_messages.clone(),
+            tools,
+            require_tool,
+            self.cancel.as_ref(),
+            self.events.as_ref(),
+        )
+        .await;
+        let required_choice_unsupported = first.as_ref().err().is_some_and(|error| {
+            require_tool && provider_rejects_required_tool_choice(&error.to_string())
+        });
+        if !required_choice_unsupported {
+            return first;
+        }
+        super::anthropic_client::stream_anthropic(
+            &self.http,
+            &self.base_url,
+            &self.api_key,
+            &self.model_id,
+            &system,
+            wire_messages,
+            tools,
+            false,
+            self.cancel.as_ref(),
+            self.events.as_ref(),
+        )
+        .await
+    }
+}
+
+/// Map the Anthropic streamed answer onto the provider-independent
+/// `ModelResponse` (keystone slice 4.7). Usage is gated on `(input>0||output>0)`
+/// — the same guard `record_usage_event_for_round` uses; `reasoning` is `None`
+/// (Anthropic thinking is neither requested nor parsed); `tool_calls` are
+/// cleared on cancel for parity with the OpenAI path (unobservable — the loop
+/// breaks first); the per-response `cancelled` bool is dropped (cancellation
+/// flows through the shared `Arc`).
+fn anthropic_response_to_model_response(
+    resp: super::anthropic_client::AnthropicResponse,
+) -> ModelResponse {
+    let usage = (resp.input_tokens > 0 || resp.output_tokens > 0).then(|| {
+        let input = resp.input_tokens.max(0) as u32;
+        let output = resp.output_tokens.max(0) as u32;
+        codefactory_agent_loop::types::Usage {
+            prompt_tokens: input,
+            completion_tokens: output,
+            total_tokens: input + output,
+            cost: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        }
+    });
+    let tool_calls = if resp.cancelled {
+        Vec::new()
+    } else {
+        resp.tool_calls
+    };
+    ModelResponse {
+        text: resp.text,
+        tool_calls,
+        usage,
+        reasoning: None,
+    }
+}
+
 #[async_trait::async_trait]
 impl ModelTransport for DesktopModelTransport {
     async fn complete(
@@ -599,16 +682,29 @@ impl ModelTransport for DesktopModelTransport {
         tools: &[ToolDefinition],
         opts: &RoundOptions,
     ) -> std::result::Result<ModelResponse, TransportError> {
-        let (text, tool_calls, usage, reasoning) = self
-            .call_openai_transport(messages, tools, opts.require_tool, &opts.reasoning_effort)
-            .await
-            .map_err(|e| TransportError::Fatal(e.to_string()))?;
-        Ok(ModelResponse {
-            text,
-            tool_calls,
-            usage,
-            reasoning,
-        })
+        // Dispatch on the provider dialect. The OpenAI path's `_ =>` would
+        // silently mis-route Anthropic to call_openai_model — MUST branch here.
+        match self.api_style {
+            ApiStyle::Anthropic => {
+                let resp = self
+                    .call_anthropic_model(messages, tools, opts.require_tool)
+                    .await
+                    .map_err(|e| TransportError::Fatal(e.to_string()))?;
+                Ok(anthropic_response_to_model_response(resp))
+            }
+            _ => {
+                let (text, tool_calls, usage, reasoning) = self
+                    .call_openai_transport(messages, tools, opts.require_tool, &opts.reasoning_effort)
+                    .await
+                    .map_err(|e| TransportError::Fatal(e.to_string()))?;
+                Ok(ModelResponse {
+                    text,
+                    tool_calls,
+                    usage,
+                    reasoning,
+                })
+            }
+        }
     }
 }
 
@@ -626,7 +722,6 @@ impl ModelTransport for DesktopModelTransport {
 ///   (`input = from_str(args).unwrap_or({})`); empty-both → `[{text:""}]`;
 /// - user `Text` → a bare JSON string; user `Parts` → `[text | image]` blocks,
 ///   `image_url` data-URLs split back to `{type:image, source:{base64,…}}`.
-#[allow(dead_code)]
 fn chat_messages_to_anthropic(
     messages: &[codefactory_agent_loop::types::ChatMessage],
 ) -> (String, Vec<serde_json::Value>) {
@@ -726,7 +821,6 @@ fn chat_messages_to_anthropic(
 }
 
 /// Split a `data:<media_type>;base64,<data>` URL into `(media_type, data)`.
-#[allow(dead_code)]
 fn parse_data_url(url: &str) -> Option<(String, String)> {
     let rest = url.strip_prefix("data:")?;
     let (media_type, data) = rest.split_once(";base64,")?;
@@ -900,6 +994,42 @@ mod tests {
     fn edge_user_text_is_a_bare_json_string() {
         let (_, msgs) = chat_messages_to_anthropic(&[cm("user", "just text")]);
         assert_eq!(msgs[0]["content"], serde_json::Value::String("just text".into()));
+    }
+
+    #[test]
+    fn anthropic_response_maps_usage_reasoning_and_cancel() {
+        use crate::agent::anthropic_client::AnthropicResponse;
+        // input/output>0 → Some usage; reasoning always None; tool_calls kept.
+        let mr = anthropic_response_to_model_response(AnthropicResponse {
+            text: "hi".into(),
+            tool_calls: vec![call("t1", "bash", "{}")],
+            input_tokens: 5,
+            output_tokens: 7,
+            cancelled: false,
+        });
+        assert_eq!(mr.text, "hi");
+        assert_eq!(mr.tool_calls.len(), 1);
+        assert!(mr.reasoning.is_none());
+        let u = mr.usage.expect("usage present when tokens > 0");
+        assert_eq!((u.prompt_tokens, u.completion_tokens, u.total_tokens), (5, 7, 12));
+        // (0,0) tokens → None (matches the record_usage guard).
+        let none = anthropic_response_to_model_response(AnthropicResponse {
+            text: String::new(),
+            tool_calls: vec![],
+            input_tokens: 0,
+            output_tokens: 0,
+            cancelled: false,
+        });
+        assert!(none.usage.is_none());
+        // cancelled → tool_calls cleared (OpenAI parity, unobservable).
+        let cancelled = anthropic_response_to_model_response(AnthropicResponse {
+            text: String::new(),
+            tool_calls: vec![call("t1", "bash", "{}")],
+            input_tokens: 1,
+            output_tokens: 1,
+            cancelled: true,
+        });
+        assert!(cancelled.tool_calls.is_empty());
     }
     use std::sync::Arc;
 
