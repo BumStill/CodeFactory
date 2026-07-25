@@ -183,9 +183,13 @@ fn completed_usage_is_persisted_before_post_response_cancellation() {
             run_src,
             "pub async fn run_agent_loop(",
             "\nfn run_outcome_for_terminal(",
-            // The round's model answer (a `ModelResponse` destructure since slice
-            // 4.6 sub-step 7 switched the loop onto `ModelTransport::complete`).
-            "} = match call_result",
+            // Post-response anchor: the round's `usage_request_id` binding, which
+            // sits right AFTER the transport call + all reactive retry arms
+            // (overflow/overload/vision) resolve — and right BEFORE the usage
+            // record + the post-response cancel check. Past the arms so the
+            // overload-backoff arm's own cancel check (slice 4.7) and the loop-top
+            // cancel aren't mistaken for the post-response one.
+            "let usage_request_id = usage_request_id(&usage_run_id",
         ),
         (
             "anthropic",

@@ -70,6 +70,7 @@ use codefactory_agent_loop::services::{PermissionGateway as _, PermissionOutcome
 // imports moved there with the body — slice 4.6b.)
 use codefactory_agent_loop::run::cancelled_tool_suffix;
 use codefactory_agent_loop::protocol::{is_vision_rejection, strip_image_values};
+use codefactory_agent_loop::context::is_provider_overloaded;
 // Test-only: these fns moved to agent-loop (slice 4.6/4.6b) but their bin unit
 // tests stayed here; run_openai (which used them in production) is now the
 // adapter, so outside tests the bin no longer references them.
@@ -1037,6 +1038,8 @@ impl AgentLoop {
             recovery_limit: recovery_limit_for(self.mode),
             max_iterations: self.mode.max_iterations(),
             wall_budget_applies: wall_budget_applies(self.mode),
+            context_compression: true,
+            overload_backoff: false,
             session_id: self.session_id.clone(),
             endpoint_name: self.endpoint_name.clone(),
             model_id: self.model_id.clone(),
@@ -1061,7 +1064,7 @@ impl AgentLoop {
             budget: std::sync::Arc::new(codefactory_agent_loop::journal::NullBudget),
             permission: std::sync::Arc::new(self.permission_gateway()),
             hooks,
-            context_policy: std::sync::Arc::new(self.context_policy()),
+            context_policy: std::sync::Arc::new(self.context_policy(true)),
             fact_checker: std::sync::Arc::new(fact_checker::DesktopFactChecker { mode: self.mode }),
         };
         // The desktop discards the returned RunOutcome (Done already emitted via
@@ -1166,7 +1169,7 @@ impl AgentLoop {
     /// Absorbs the old `resolve_round_reasoning_effort` (per-round freshness: a
     /// mid-run `sessions.reasoning_effort` change takes effect next round) plus
     /// the `supports_vision`/`context_window` reads.
-    fn context_policy(&self) -> context_policy::DesktopContextPolicy {
+    fn context_policy(&self, expand_context_window: bool) -> context_policy::DesktopContextPolicy {
         context_policy::DesktopContextPolicy {
             settings: self.settings.clone(),
             db: self.db.clone(),
@@ -1174,6 +1177,7 @@ impl AgentLoop {
             endpoint_name: self.endpoint_name.clone(),
             model_id: self.model_id.clone(),
             api_style: self.api_style.clone(),
+            expand_context_window,
         }
     }
 
@@ -1495,7 +1499,7 @@ impl AgentLoop {
         let fact_check_instruction = effective_fact_check_instruction(&history);
         let mut messages = self.build_anthropic_messages(history);
         // Proactive capability match — see the OpenAI loop for rationale.
-        if !self.context_policy().supports_vision().await {
+        if !self.context_policy(false).supports_vision().await {
             let stripped = strip_image_values(&mut messages);
             if stripped > 0 {
                 let notice = format!(
@@ -2204,12 +2208,8 @@ fn effective_fact_check_instruction(history: &[Message]) -> String {
 
 /// Transient provider saturation worth a backoff retry instead of a dead
 /// turn. Distinct from capacity (context) and capability (vision) errors.
-fn is_provider_overloaded(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    ["overloaded", "try again later", "rate limit", "429", "503", "529"]
-        .iter()
-        .any(|w| lower.contains(w))
-}
+// `is_provider_overloaded` moved to `agent-loop::context` (keystone slice 4.7);
+// re-exported via `context::` (bin) so run_anthropic + the matcher test resolve it.
 
 /// The self-recovery behavioral contract, appended to EVERY mode's system
 /// prompt. Systemic answer to the field pattern where the agent reported
