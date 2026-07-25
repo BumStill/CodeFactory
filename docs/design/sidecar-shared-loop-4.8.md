@@ -63,6 +63,37 @@ previews, then drops oldest user-turns. These are not variants of one another.
 catastrophic. `true` ⇒ different history ⇒ guaranteed score change. Only a
 `ContextCompactor` seam preserves the semantics — and even then (c) remains.
 
+## 4.8c progress (shipped)
+- **b7** — already landed by #204 (`Budget::may_continue` is wired at the
+  segment-continue boundary). Not duplicated.
+- **b10 ✅ v1.64.18** — `RunOutcome` carries accumulated tokens, the last model
+  reply, and a `StopReason`.
+- **b1 ✅ v1.64.18** — `ContextCompactor` seam; desktop supplies
+  `DefaultCompressor` (byte-identical), sidecar can plug its char-budget digest.
+- **b2 ✅ v1.64.18** — the loop feeds the gate from the backend's real
+  `ToolInvocationResult`; `DesktopToolBackend` classifies with the same rule as
+  before. Closes the `run_shell`→always-`ReadOnly` silent gate failure
+  *post*-execution.
+- **b3/b4 ✅ merged** — `Budget::wall_time()` owns the clock and feeds
+  `evaluate_budget_command_with_time_in_directory` (identical for desktop, which
+  passes `None`); `BudgetDenial{rule,reason}` is structured and worded by
+  `PermissionGateway::format_budget_denial` (defaulted to today's sentence).
+
+### ⚠️ b5 blocked on a PRE-execution twin of the b2 trap
+The inspection-budget rule needs the tool's `ToolKind` *before* the call runs, to
+decide `read_only_exhausted() && kind == ReadOnly`. The only pre-execution
+classifier today is `policy::completion_command_and_kind`, which still has the
+`tool_name == "bash"` gate — so for the sidecar's `run_shell` **every** call
+would classify `ReadOnly` and the rule would fire on everything (b2 fixed only
+the *post*-execution path, which reads the backend's result).
+
+**Fix first: add a defaulted `ToolBackend::classify(&self, call, args) ->
+(String, ToolKind)`** (default = today's `completion_command_and_kind`), have the
+loop use `tools.classify(...)` for the budget denial, and only then add the
+inspection rule behind a `RunConfig` flag. The backend already owns
+post-execution classification after b2; this makes it own pre-execution too,
+which is the coherent end state.
+
 ## Recommended decomposition (each independently green)
 1. **4.8a ✅ SHIPPED** (PR #205) — sidecar internal module split
    (protocol/transport/compaction/policy), zero behaviour change, the 28-test
