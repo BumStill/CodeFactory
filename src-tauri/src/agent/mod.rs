@@ -820,49 +820,6 @@ impl AgentLoop {
         Ok(receipt)
     }
 
-    /// Per-run identity for the shared usage recorder. Pre-derives the surface
-    /// (`&str`) and `is_chatgpt` bool so `ApiStyle`/`UsageSurface` never cross
-    /// into agent-loop (keystone slice 4.6b).
-    fn usage_identity(&self) -> codefactory_agent_loop::run::UsageIdentity {
-        codefactory_agent_loop::run::UsageIdentity {
-            session_id: self.session_id.clone(),
-            endpoint_name: self.endpoint_name.clone(),
-            model_id: self.model_id.clone(),
-            base_url: self.base_url.clone(),
-            usage_run_id: self.usage_run_id.clone(),
-            surface: self
-                .execution_context
-                .as_ref()
-                .map_or(UsageSurface::Interactive, |context| context.usage_surface)
-                .as_str()
-                .to_string(),
-            task_id: self
-                .execution_context
-                .as_ref()
-                .and_then(|context| context.task_id.clone()),
-            anonymous: self.anonymous,
-            is_chatgpt: self.api_style == ApiStyle::Chatgpt,
-        }
-    }
-
-    async fn record_usage_event_for_round(&self, usage: &Usage, iteration: usize) {
-        // Delegates to the shared recorder (keystone slice 4.6b); run_anthropic
-        // still calls this method, and the openai loop keeps the call-site symbol
-        // (`record_usage_event…`) that the usage-ordering source-text tests grep.
-        codefactory_agent_loop::run::record_usage_event_for_round(
-            &self.persistence(),
-            self.events.as_ref(),
-            &self.usage_identity(),
-            usage,
-            iteration,
-        )
-        .await;
-    }
-
-    fn usage_request_id(&self, iteration: usize) -> String {
-        codefactory_agent_loop::run::usage_request_id(&self.usage_run_id, iteration)
-    }
-
     /// Mark this loop as an anonymous/ephemeral run: disables ALL DB
     /// persistence (messages, cost entries). Chainable —
     /// `AgentLoop::new(..).anonymous()`. Used by `send_message_anonymous`.
@@ -878,20 +835,6 @@ impl AgentLoop {
     pub fn with_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
         self.cancel = Some(flag);
         self
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.cancel
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::SeqCst))
-    }
-
-    fn emit_cancelled_done(&self) {
-        tracing::info!("chat turn cancelled by user (session {})", self.session_id);
-        self.events.emit(StreamEvent::Done {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                });
     }
 
     pub async fn run(&mut self, history: Vec<Message>) -> Result<()> {
@@ -1094,36 +1037,6 @@ impl AgentLoop {
             .await
     }
 
-    async fn finish_cancelled_tool_batch(
-        &self,
-        remaining: &[ToolCall],
-    ) -> Result<()> {
-        let contents =
-            persist_cancelled_tool_batch(&self.db, &self.session_id, self.anonymous, remaining)
-                .await?;
-        for (index, (tc, content)) in remaining.iter().zip(contents).enumerate() {
-            if index > 0 {
-                let args = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                self.events.emit(StreamEvent::ToolCallStart {
-                            id: tc.id.clone(),
-                            name: tc.function.name.clone(),
-                            args,
-                        });
-            }
-            self.events.emit(StreamEvent::ToolResult {
-                        tool_call_id: tc.id.clone(),
-                        content: content.clone(),
-                        is_error: true,
-                        status: "cancelled".into(),
-                    });
-        }
-        self.events.emit(StreamEvent::Done {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                });
-        Ok(())
-    }
-
     /// Flatten a message body to plain text for protocol fields that cannot
     /// carry multimodal content (system instructions and tool output).
     fn content_to_text(content: &MessageContent) -> String {
@@ -1243,84 +1156,6 @@ impl AgentLoop {
             session_id: self.session_id.clone(),
             anonymous: self.anonymous,
         }
-    }
-
-    async fn persist_message(
-        &self,
-        role: &str,
-        content: &str,
-        usage: Option<&Usage>,
-        tool_calls: Option<&[ToolCall]>,
-        reasoning_content: Option<&str>,
-        usage_request_id: Option<&str>,
-    ) -> Result<Option<String>> {
-        // Decompose Usage to the primitive token counts the trait carries, then
-        // delegate. Anonymous handling + the load-bearing `None` return live in
-        // the backend.
-        let input_tok = usage.map(|u| u.prompt_tokens as i64);
-        let output_tok = usage.map(|u| u.completion_tokens as i64);
-        self.persistence()
-            .persist_message(
-                role,
-                content,
-                input_tok,
-                output_tok,
-                tool_calls,
-                reasoning_content,
-                usage_request_id,
-            )
-            .await
-            .map_err(persistence::to_app_error)
-    }
-
-    /// Persist completion-gate controls with explicit provenance. Recovery and
-    /// ready prompts remain provider-shaped user rows; `turn_notice` rows are
-    /// stored as system messages because they are runtime observations, not a
-    /// new user objective. Every row stays tagged via `completion_state`.
-    async fn persist_gate_message(&self, content: &str, state: &str) -> Result<()> {
-        self.persistence()
-            .persist_gate_message(content, state)
-            .await
-            .map_err(persistence::to_app_error)
-    }
-
-    /// Persist a gate/system notice at most once per session (matched by a
-    /// stable `marker` substring) — proactive capability notices would
-    /// otherwise repeat on every turn because history is rebuilt each run.
-    async fn persist_gate_message_once(
-        &self,
-        marker: &str,
-        content: &str,
-        state: &str,
-    ) -> Result<()> {
-        self.persistence()
-            .persist_gate_message_once(marker, content, state)
-            .await
-            .map_err(persistence::to_app_error)
-    }
-
-    /// Tag a persisted assistant reply that the completion gate rejected so
-    /// the UI collapses it instead of rendering yet another full
-    /// near-duplicate answer (2026-07-16 session: seven of them).
-    async fn mark_rejected_candidate(&self, message_id: Option<&str>) -> Result<()> {
-        self.persistence()
-            .mark_rejected_candidate(message_id)
-            .await
-            .map_err(persistence::to_app_error)
-    }
-
-    async fn record_tool_call_outcome(
-        &self,
-        tool_call: &ToolCall,
-        status: &str,
-        result: Option<&str>,
-        error: Option<&str>,
-        duration_ms: u64,
-    ) -> Result<()> {
-        self.persistence()
-            .record_tool_call_outcome(tool_call, status, result, error, duration_ms)
-            .await
-            .map_err(persistence::to_app_error)
     }
 
     fn build_openai_messages(
