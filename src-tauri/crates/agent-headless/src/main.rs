@@ -1,153 +1,45 @@
 use codefactory_agent_core::{
     build_budget_convergence_prompt, build_completion_ready_prompt,
     build_completion_recovery_prompt, build_product_system_prompt, build_system_prompt,
-    build_time_convergence_prompt, classify_command, completion_evidence_made_progress,
-    effective_command_timeout_sec, evaluate_budget_command_with_time_in_directory,
-    execution_contract_sha256, provider_rejects_required_tool_choice, sanitize_completion_summary,
-    should_prompt_budget_convergence, should_prompt_time_convergence, BenchmarkPolicy,
-    CompletionEvidence, CompletionGate, PolicyDecision, ProductPolicy, ProgressTracker,
+    build_time_convergence_prompt, classify_command, completion_evidence_made_progress, evaluate_budget_command_with_time_in_directory,
+    execution_contract_sha256, sanitize_completion_summary,
+    should_prompt_budget_convergence, should_prompt_time_convergence, CompletionGate, PolicyDecision, ProgressTracker,
     ToolOutcome,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::io::{
-    self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
-};
+use tokio::io::{self, AsyncBufRead, AsyncWrite, BufReader, BufWriter};
+// Test-only: the tokio-test harness drives the reader/writer directly and builds
+// CompletionEvidence fixtures; production paths reach them via the modules.
+#[cfg(test)]
+use codefactory_agent_core::CompletionEvidence;
+#[cfg(test)]
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-const MAX_CONTEXT_CHARS: usize = 40_000;
-const MAX_TOOL_STREAM_CHARS: usize = 3_000;
-const MODEL_REQUEST_INITIAL_ATTEMPTS: usize = 3;
-const MODEL_REQUEST_PROGRESS_ATTEMPTS: usize = 5;
-const MODEL_ERROR_BODY_CHARS: usize = 1_000;
+mod compaction;
+mod policy;
+mod protocol;
+mod transport;
 
-#[derive(Debug, Clone)]
-struct ToolHistoryEntry {
-    command: String,
-    return_code: Option<i32>,
-    stdout: String,
-    stderr: String,
-    error: Option<String>,
-}
+// Re-exported so `run()` and the test module (`use super::*`) keep every
+// unqualified name they had before the 4.8a split.
+use compaction::*;
+use policy::*;
+use protocol::*;
+use transport::*;
 
-impl ToolHistoryEntry {
-    fn new(
-        command: impl Into<String>,
-        return_code: Option<i32>,
-        stdout: impl Into<String>,
-        stderr: impl Into<String>,
-        error: Option<String>,
-    ) -> Self {
-        Self {
-            command: command.into(),
-            return_code,
-            stdout: stdout.into(),
-            stderr: stderr.into(),
-            error,
-        }
-    }
-}
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum InputMessage {
-    #[serde(rename = "start")]
-    Start {
-        instruction: String,
-        model: String,
-        api_key: String,
-        base_url: String,
-        max_steps: u32,
-        model_timeout_sec: u64,
-        shell_timeout_sec: u64,
-        #[serde(default)]
-        wall_time_budget_sec: Option<u64>,
-        #[serde(default)]
-        working_directory: Option<String>,
-        allow_network: bool,
-        #[serde(default)]
-        policy_profile: RuntimePolicyProfile,
-        execution_contract_sha256: String,
-    },
-    #[serde(rename = "tool_result")]
-    ToolResult {
-        id: String,
-        return_code: Option<i32>,
-        stdout: String,
-        stderr: String,
-        error: Option<String>,
-        #[serde(default)]
-        next_working_directory: Option<String>,
-    },
-}
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
-enum OutputMessage {
-    #[serde(rename = "tool_request")]
-    ToolRequest {
-        id: String,
-        command: String,
-        timeout_sec: u64,
-        usage: Usage,
-    },
-    #[serde(rename = "event")]
-    UsageSnapshot { name: String, usage: Usage },
-    #[serde(rename = "finished")]
-    Finished {
-        final_text: String,
-        execution_contract_sha256: String,
-        completion_evidence: CompletionEvidence,
-        usage: Usage,
-    },
-}
 
-#[derive(Debug, Clone)]
-struct StartConfig {
-    instruction: String,
-    model: String,
-    api_key: String,
-    base_url: String,
-    max_steps: u32,
-    model_timeout_sec: u64,
-    shell_timeout_sec: u64,
-    wall_time_budget_sec: Option<u64>,
-    working_directory: Option<String>,
-    allow_network: bool,
-    policy_profile: RuntimePolicyProfile,
-}
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum RuntimePolicyProfile {
-    Product,
-    #[default]
-    Benchmark,
-}
 
-enum RuntimePolicy {
-    Product(ProductPolicy),
-    Benchmark(BenchmarkPolicy),
-}
 
-impl RuntimePolicy {
-    fn new(profile: RuntimePolicyProfile, allow_network: bool) -> Self {
-        match profile {
-            RuntimePolicyProfile::Product => Self::Product(ProductPolicy::new(allow_network)),
-            RuntimePolicyProfile::Benchmark => Self::Benchmark(BenchmarkPolicy::new(allow_network)),
-        }
-    }
 
-    fn evaluate_command(&self, command: &str) -> PolicyDecision {
-        match self {
-            Self::Product(policy) => policy.evaluate_command(command),
-            Self::Benchmark(policy) => policy.evaluate_command(command),
-        }
-    }
-}
+
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct Usage {
@@ -197,12 +89,6 @@ enum HeadlessError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(Debug)]
-struct ToolCall {
-    id: String,
-    command: String,
-    timeout_sec: u64,
-}
 
 #[tokio::main]
 async fn main() {
@@ -572,495 +458,27 @@ where
     Ok(())
 }
 
-async fn read_start<R>(input: &mut R) -> Result<StartConfig, HeadlessError>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let line = read_protocol_line(input)
-        .await?
-        .ok_or(HeadlessError::MissingStart)?;
-    match serde_json::from_str::<InputMessage>(&line)? {
-        InputMessage::Start {
-            instruction,
-            model,
-            api_key,
-            base_url,
-            max_steps,
-            model_timeout_sec,
-            shell_timeout_sec,
-            wall_time_budget_sec,
-            working_directory,
-            allow_network,
-            policy_profile,
-            execution_contract_sha256: bridge_hash,
-        } => {
-            let sidecar_hash = execution_contract_sha256();
-            if bridge_hash != sidecar_hash {
-                return Err(HeadlessError::ContractMismatch {
-                    bridge: bridge_hash,
-                    sidecar: sidecar_hash,
-                });
-            }
-            Ok(StartConfig {
-                instruction,
-                model,
-                api_key,
-                base_url,
-                max_steps,
-                model_timeout_sec,
-                shell_timeout_sec,
-                wall_time_budget_sec,
-                working_directory,
-                allow_network,
-                policy_profile,
-            })
-        }
-        InputMessage::ToolResult { .. } => Err(HeadlessError::ExpectedStart),
-    }
-}
 
-async fn read_tool_result<R>(
-    input: &mut R,
-    expected_id: &str,
-) -> Result<(Option<i32>, String, String, Option<String>, Option<String>), HeadlessError>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let line = read_protocol_line(input)
-        .await?
-        .ok_or_else(|| HeadlessError::MissingToolResult(expected_id.to_owned()))?;
-    match serde_json::from_str::<InputMessage>(&line)? {
-        InputMessage::ToolResult {
-            id,
-            return_code,
-            stdout,
-            stderr,
-            error,
-            next_working_directory,
-        } if id == expected_id => Ok((return_code, stdout, stderr, error, next_working_directory)),
-        InputMessage::ToolResult { id, .. } => Err(HeadlessError::UnexpectedToolResult {
-            expected: expected_id.to_owned(),
-            actual: id,
-        }),
-        InputMessage::Start { .. } => Err(HeadlessError::UnexpectedToolResult {
-            expected: expected_id.to_owned(),
-            actual: "start".to_owned(),
-        }),
-    }
-}
 
-async fn read_protocol_line<R>(input: &mut R) -> Result<Option<String>, HeadlessError>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let mut line = String::new();
-    let bytes = input.read_line(&mut line).await?;
-    if bytes == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(line.trim_end().to_owned()))
-    }
-}
 
-async fn write_output<W>(output: &mut W, message: &OutputMessage) -> Result<(), HeadlessError>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut serialized = serde_json::to_vec(message)?;
-    serialized.push(b'\n');
-    output.write_all(&serialized).await?;
-    output.flush().await?;
-    Ok(())
-}
 
-async fn request_model(
-    client: &Client,
-    endpoint: &str,
-    config: &StartConfig,
-    messages: &[Value],
-    allow_tools: bool,
-    require_tool: bool,
-    attempt_timeout_sec: u64,
-    max_attempts: usize,
-    wall_deadline: Option<Instant>,
-) -> Result<Value, HeadlessError> {
-    let first = request_model_with_tool_choice(
-        client,
-        endpoint,
-        config,
-        messages,
-        allow_tools,
-        require_tool,
-        attempt_timeout_sec,
-        max_attempts,
-        wall_deadline,
-    )
-    .await;
-    let required_choice_unsupported = matches!(
-        &first,
-        Err(HeadlessError::ModelHttpStatus { status, body })
-            if require_tool
-                && matches!(*status, 400 | 422)
-                && provider_rejects_required_tool_choice(body)
-    );
-    if required_choice_unsupported {
-        return request_model_with_tool_choice(
-            client,
-            endpoint,
-            config,
-            messages,
-            allow_tools,
-            false,
-            attempt_timeout_sec,
-            max_attempts,
-            wall_deadline,
-        )
-        .await;
-    }
-    first
-}
 
-async fn request_model_with_tool_choice(
-    client: &Client,
-    endpoint: &str,
-    config: &StartConfig,
-    messages: &[Value],
-    allow_tools: bool,
-    require_tool: bool,
-    attempt_timeout_sec: u64,
-    max_attempts: usize,
-    wall_deadline: Option<Instant>,
-) -> Result<Value, HeadlessError> {
-    let mut payload = json!({
-        "model": config.model,
-        "messages": messages,
-        "tool_choice": if !allow_tools {
-            "none"
-        } else if require_tool {
-            "required"
-        } else {
-            "auto"
-        }
-    });
-    if allow_tools {
-        payload["tools"] = json!([{
-            "type": "function",
-            "function": {
-                "name": "run_shell",
-                "description": "Run one bounded shell script in the task environment. Batch related reads, compatible edits, and focused checks into this call when their order and failure handling are clear, so end-to-end build, install, runtime, and test stages finish within the execution budget.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                        "timeout_sec": {"type": "integer", "minimum": 1}
-                    },
-                    "required": ["command"]
-                }
-            }
-        }]);
-    }
-    let attempt_timeout = Duration::from_secs(attempt_timeout_sec.max(1));
-    let max_attempts = max_attempts.max(1);
-    for attempt in 1..=max_attempts {
-        if wall_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(HeadlessError::ModelResponse {
-                attempts: attempt - 1,
-                detail: "wall-clock deadline exhausted before the next model request".to_owned(),
-            });
-        }
-        let effective_timeout = wall_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-            .map(|remaining| remaining.min(attempt_timeout))
-            .unwrap_or(attempt_timeout)
-            .max(Duration::from_millis(1));
-        let mut request = client
-            .post(endpoint)
-            .timeout(effective_timeout)
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
-            .json(&payload);
-        if !config.api_key.is_empty() {
-            request = request.bearer_auth(&config.api_key);
-        }
 
-        let response = match request.send().await {
-            Ok(response) => response,
-            Err(error) if attempt < max_attempts && is_retryable_model_error(&error) => {
-                wait_before_model_retry(attempt, wall_deadline).await;
-                continue;
-            }
-            Err(error) => return Err(HeadlessError::ModelRequest(error)),
-        };
-        let status = response.status();
-        let body = match response.bytes().await {
-            Ok(body) => body,
-            Err(error) if attempt < max_attempts && is_retryable_model_error(&error) => {
-                wait_before_model_retry(attempt, wall_deadline).await;
-                continue;
-            }
-            Err(error) => {
-                return Err(HeadlessError::ModelResponse {
-                    attempts: attempt,
-                    detail: error.to_string(),
-                });
-            }
-        };
 
-        if !status.is_success() {
-            let body = response_body_preview(&body);
-            if attempt < max_attempts && (status.as_u16() == 429 || status.is_server_error()) {
-                wait_before_model_retry(attempt, wall_deadline).await;
-                continue;
-            }
-            return Err(HeadlessError::ModelHttpStatus {
-                status: status.as_u16(),
-                body,
-            });
-        }
 
-        match serde_json::from_slice(&body) {
-            Ok(value) => return Ok(value),
-            Err(_error) if attempt < max_attempts => {
-                wait_before_model_retry(attempt, wall_deadline).await;
-                continue;
-            }
-            Err(error) => {
-                return Err(HeadlessError::ModelResponse {
-                    attempts: attempt,
-                    detail: format!(
-                        "invalid JSON: {error}; body={}",
-                        response_body_preview(&body)
-                    ),
-                });
-            }
-        }
-    }
 
-    unreachable!("model request loop always returns")
-}
 
-fn is_retryable_model_error(error: &reqwest::Error) -> bool {
-    error.is_timeout()
-        || error.is_connect()
-        || error.is_request()
-        || error.is_body()
-        || error.is_decode()
-}
 
-async fn wait_before_model_retry(attempt: usize, wall_deadline: Option<Instant>) {
-    let delay = Duration::from_millis(250 * attempt as u64);
-    let bounded_delay = wall_deadline
-        .map(|deadline| {
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(delay)
-        })
-        .unwrap_or(delay);
-    if !bounded_delay.is_zero() {
-        tokio::time::sleep(bounded_delay).await;
-    }
-}
 
-fn model_request_attempts(tool_outcome_count: usize) -> usize {
-    if tool_outcome_count == 0 {
-        MODEL_REQUEST_INITIAL_ATTEMPTS
-    } else {
-        MODEL_REQUEST_PROGRESS_ATTEMPTS
-    }
-}
 
-fn response_body_preview(body: &[u8]) -> String {
-    truncate_for_model(&String::from_utf8_lossy(body), MODEL_ERROR_BODY_CHARS)
-}
 
-fn parse_tool_calls(
-    message: &Value,
-    shell_timeout_sec: u64,
-) -> Result<Vec<ToolCall>, HeadlessError> {
-    let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
-    calls
-        .iter()
-        .map(|call| {
-            let id = call["id"].as_str().unwrap_or("tool-call").to_owned();
-            let arguments = call["function"]["arguments"]
-                .as_str()
-                .ok_or(HeadlessError::MissingToolArguments)?;
-            let arguments: Value = serde_json::from_str(arguments)?;
-            let command = arguments["command"]
-                .as_str()
-                .filter(|command| !command.trim().is_empty())
-                .ok_or(HeadlessError::MissingCommand)?
-                .to_owned();
-            let requested_timeout = arguments["timeout_sec"]
-                .as_u64()
-                .unwrap_or(shell_timeout_sec);
-            Ok(ToolCall {
-                id,
-                timeout_sec: effective_command_timeout_sec(
-                    &command,
-                    requested_timeout,
-                    shell_timeout_sec,
-                ),
-                command,
-            })
-        })
-        .collect()
-}
 
-fn message_content(message: &Value) -> String {
-    match message.get("content") {
-        Some(Value::String(content)) => content.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
 
-fn tool_result_content(
-    return_code: Option<i32>,
-    stdout: &str,
-    stderr: &str,
-    error: Option<&str>,
-) -> String {
-    json!({
-        "return_code": return_code,
-        "stdout": truncate_for_model(stdout, MAX_TOOL_STREAM_CHARS),
-        "stderr": truncate_for_model(stderr, MAX_TOOL_STREAM_CHARS),
-        "error": error,
-    })
-    .to_string()
-}
 
-fn compact_messages(messages: &mut Vec<Value>, history: &[ToolHistoryEntry], max_chars: usize) {
-    if messages.len() <= 3
-        || serde_json::to_string(messages)
-            .map(|value| value.len() <= max_chars)
-            .unwrap_or(true)
-    {
-        return;
-    }
 
-    let recent_start = messages
-        .iter()
-        .enumerate()
-        .skip(2)
-        .rev()
-        .find(|(_, message)| {
-            message.get("role").and_then(Value::as_str) == Some("assistant")
-                && message
-                    .get("tool_calls")
-                    .and_then(Value::as_array)
-                    .is_some()
-        })
-        .map(|(index, _)| index)
-        .unwrap_or_else(|| messages.len().saturating_sub(2));
 
-    let mut summary = String::from("Compacted execution history (oldest details omitted):\n");
-    for (index, entry) in history
-        .iter()
-        .rev()
-        .take(30)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .enumerate()
-    {
-        let command = entry.command.lines().next().unwrap_or("");
-        let output = if let Some(error) = &entry.error {
-            error.as_str()
-        } else if !entry.stderr.trim().is_empty() {
-            entry.stderr.trim()
-        } else {
-            entry.stdout.trim()
-        };
-        summary.push_str(&format!(
-            "{}. rc={:?} command={} output={}\n",
-            index + 1,
-            entry.return_code,
-            truncate_for_model(command, 200),
-            truncate_for_model(output, 400),
-        ));
-    }
-    summary = truncate_for_model(&summary, max_chars.saturating_div(2).max(800));
 
-    let system = messages[0].clone();
-    let task = messages[1].clone();
-    let recent = messages[recent_start..].to_vec();
-    *messages = vec![system, task, json!({"role": "user", "content": summary})];
-    messages.extend(recent);
-}
 
-fn truncate_for_model(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_owned();
-    }
-    let head_limit = limit / 4;
-    let tail_limit = limit.saturating_sub(head_limit);
-    let head = value.chars().take(head_limit).collect::<String>();
-    let tail = value
-        .chars()
-        .rev()
-        .take(tail_limit)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    format!(
-        "{head}\n[truncated middle; kept first {head_limit} and last {tail_limit} characters]\n{tail}"
-    )
-}
-
-fn chat_completions_endpoint(base_url: &str) -> String {
-    let trimmed = base_url.trim_end_matches('/');
-    if trimmed.ends_with("/chat/completions") {
-        trimmed.to_owned()
-    } else {
-        format!("{trimmed}/chat/completions")
-    }
-}
-
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn remaining_wall_time(started: Instant, wall_time_budget_sec: Option<u64>) -> Option<(u64, u64)> {
-    let total = wall_time_budget_sec?.max(1);
-    let remaining = total.saturating_sub(started.elapsed().as_secs());
-    Some((remaining, total))
-}
-
-fn clamp_timeout_to_wall_reserve(requested: u64, remaining: u64, reserve: u64) -> u64 {
-    requested.min(remaining.saturating_sub(reserve).max(1))
-}
-
-fn budget_exhaustion_message(stopped_for_wall_budget: bool) -> &'static str {
-    if stopped_for_wall_budget {
-        "Stopped because the wall-clock budget entered its final reserve before completion."
-    } else {
-        "Stopped because the model step budget was exhausted before completion."
-    }
-}
-
-fn should_finish_after_model_error(wall_time: Option<(u64, u64)>, outcome_count: usize) -> bool {
-    let Some((remaining, total)) = wall_time else {
-        return false;
-    };
-    outcome_count > 0 && remaining <= (total / 15).max(60)
-}
-
-fn completion_recovery_attempts_after_tool_batch(
-    attempts: u32,
-    _material_evidence_progress: bool,
-) -> u32 {
-    attempts
-}
 
 #[cfg(test)]
 mod tests {
