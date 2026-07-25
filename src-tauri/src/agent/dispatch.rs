@@ -59,6 +59,20 @@ const STRONG_CJK: &[&str] = &[
     "做吧",
     "搞吧",
     "去吧",
+    "开始改",
+    "开始修",
+    "赶紧开始",
+    "赶紧修",
+    "修复上线",
+    "搞定",
+    "落地执行",
+    "直到上线",
+    "完成上面",
+    "继续执行",
+    "继续修复",
+    "继续交付",
+    "继续开发",
+    "继续完成",
     "就这样",
     "就这么",
     "可以执行",
@@ -301,5 +315,22 @@ mod tests {
             decide_chat_mode(Some("我已经重构了解析器。"), "好"),
             AgentMode::Interactive
         );
+    }
+
+    #[test]
+    fn direct_delivery_instructions_use_the_execute_contract() {
+        for instruction in [
+            "开始改吧",
+            "输出完整方案，然后赶紧开始修复上线",
+            "搞定上面所有方案里的内容，直到上线发布",
+            "ok，把卡死的问题和新的视觉设计一起落地执行",
+            "继续修复并完成发布",
+        ] {
+            assert_eq!(
+                decide_chat_mode(Some("问题和方案已经分析清楚。"), instruction),
+                AgentMode::Execute,
+                "{instruction:?} must not fall back to the 30-round interactive contract"
+            );
+        }
     }
 }

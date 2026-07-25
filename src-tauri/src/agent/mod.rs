@@ -93,10 +93,10 @@ fn recovery_limit_for(mode: AgentMode) -> u32 {
     }
 }
 
-/// Whether the autonomous round budget constrains model tools this run.
-/// Interactive is uncapped; Execute + Autonomous apply the wall budget.
+/// Chat modes auto-continue across segment checkpoints; only unattended
+/// Autonomous runs apply the converging wall-budget tool policy.
 fn wall_budget_applies(mode: AgentMode) -> bool {
-    !matches!(mode, AgentMode::Interactive)
+    matches!(mode, AgentMode::Autonomous)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,9 +151,9 @@ async fn await_permission_response(
 // `cancelled_tool_suffix` moved to `agent-loop::run` (keystone slice 4.6b) and is
 // re-imported below so both provider loops keep the unqualified name.
 
-/// Tool-call iteration ceiling for INTERACTIVE chat. Conservative
-/// because every iteration is a user-visible turn — letting it run too
-/// long makes the chat feel stuck.
+/// Internal checkpoint cadence for INTERACTIVE chat. Reaching this count
+/// produces a progress summary and begins another segment when the task is
+/// still advancing; it is not a task-level execution limit.
 const MAX_ITERATIONS_INTERACTIVE: usize = 30;
 
 /// Iteration ceiling for AUTONOMOUS execution (subagents, approved
@@ -162,10 +162,10 @@ const MAX_ITERATIONS_INTERACTIVE: usize = 30;
 /// are tool round-trips, not LLM turns — they're cheap.
 const MAX_ITERATIONS_AUTONOMOUS: usize = 200;
 
-/// Iteration ceiling for EXECUTE turns — the chat surface right after the
-/// user approved a plan. Higher than interactive (the work was greenlit, so
-/// don't bounce back early) but well under autonomous (the user is still in
-/// the room and may interject between turns).
+/// Internal checkpoint cadence for EXECUTE turns — the chat surface right
+/// after the user approved a plan. It is less frequent than interactive chat
+/// while still giving the user natural progress summaries and an opportunity
+/// to interject between continuing segments.
 const MAX_ITERATIONS_EXECUTE: usize = 80;
 
 /// How many distinct retry attempts the autonomous agent makes against
@@ -461,7 +461,7 @@ pub struct AgentLoop {
     pending_permissions: PendingPermissionMap,
     mcp_manager: Arc<McpManager>,
     execution_context: Option<AgentExecutionContext>,
-    /// Selects iteration ceiling and system prompt. Interactive for
+    /// Selects segment checkpoint cadence and system prompt. Interactive for
     /// chat panel use, Autonomous for subagent / approved-task runs.
     mode: AgentMode,
     /// Stable for one AgentLoop execution; combined with the provider-round
@@ -3309,7 +3309,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_final_stage_requires_repair_after_one_failure_diagnostic() {
+    fn unattended_final_stage_requires_repair_after_one_failure_diagnostic() {
         let mut gate = CompletionGate::new(true);
         let mut progress = ProgressTracker::new(8);
         let mut sequence = 0;
@@ -3342,28 +3342,29 @@ mod tests {
         );
         let evidence = gate.evidence();
 
-        for mode in [AgentMode::Autonomous, AgentMode::Execute] {
-            let denied = autonomous_budget_denial(
+        let denied = autonomous_budget_denial(
+            AgentMode::Autonomous,
+            8,
+            &evidence,
+            "read_file",
+            &serde_json::json!({"path": "src/another_module.rs"}),
+            Path::new("/workspace"),
+        );
+        assert!(denied
+            .as_deref()
+            .is_some_and(|message| message.contains("final-stage diagnostic read")));
+
+        for mode in [AgentMode::Interactive, AgentMode::Execute] {
+            assert!(autonomous_budget_denial(
                 mode,
                 8,
                 &evidence,
                 "read_file",
                 &serde_json::json!({"path": "src/another_module.rs"}),
                 Path::new("/workspace"),
-            );
-            assert!(denied
-                .as_deref()
-                .is_some_and(|message| message.contains("final-stage diagnostic read")));
+            )
+            .is_none());
         }
-        assert!(autonomous_budget_denial(
-            AgentMode::Interactive,
-            8,
-            &evidence,
-            "read_file",
-            &serde_json::json!({"path": "src/another_module.rs"}),
-            Path::new("/workspace"),
-        )
-        .is_none());
     }
 
     #[test]

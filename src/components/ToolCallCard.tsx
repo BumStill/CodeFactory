@@ -344,32 +344,32 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
   const needsAttention = tc.status !== "done" || Boolean(tc.isError);
   const shellClass = needsAttention
     ? tc.status === "error" || tc.status === "denied" || tc.isError
-      ? "rounded-md border border-red-500/25 bg-red-500/5"
+      ? "rounded-r-sm border-l border-red-500/50 bg-transparent"
       : tc.status === "waiting_permission"
-        ? "rounded-md border border-amber-500/25 bg-amber-500/5"
-        : "rounded-md border border-accent/20 bg-accent/5"
-    : "rounded-md border border-border/25 bg-surface-1/30 shadow-none";
+        ? "rounded-r-md border-l-2 border-amber-500/40 bg-amber-500/[0.025]"
+        : "rounded-r-md border-l-2 border-accent/35 bg-accent/[0.025]"
+    : "rounded-md";
 
   return (
-    <div className={`my-0.5 text-xs ${shellClass}`} data-tool-status={tc.status}>
+    <div className={`my-0.5 w-fit max-w-full text-[13px] leading-5 ${shellClass}`} data-tool-status={tc.status}>
       <button
         data-density={needsAttention ? "attention" : "compact"}
         aria-label={`${toolLabel(tc.name)}${summary ? ` · ${summary}` : ""}`}
-        className={`flex min-h-7 w-full items-center gap-1.5 px-2 text-left transition-colors hover:bg-surface-3 ${
-          needsAttention ? "py-1" : "py-0.5"
+        className={`inline-flex min-h-7 max-w-full items-center gap-1.5 rounded-md px-1.5 text-left transition-colors hover:bg-surface-3/55 ${
+          needsAttention ? "py-0.5" : "py-0"
         }`}
         onClick={() => setOpen((o) => !o)}
       >
-        {open ? <ChevronDown size={11} className="text-gray-600 shrink-0" /> : <ChevronRight size={11} className="text-gray-600 shrink-0" />}
-        <Icon size={11} className={`${needsAttention ? iconClass : "text-gray-600"} shrink-0`} />
+        {open ? <ChevronDown size={12} className="text-gray-600 shrink-0" /> : <ChevronRight size={12} className="text-gray-600 shrink-0" />}
+        <Icon size={12} className={`${needsAttention ? iconClass : "text-gray-600"} shrink-0`} />
         <span className={`shrink-0 ${needsAttention ? "text-gray-300" : "text-gray-500"}`}>{toolLabel(tc.name)}</span>
         {isTestMod && (
-          <span className="shrink-0 rounded bg-surface-3 px-1 py-0.5 text-[9px] font-medium text-gray-500">
+          <span className="shrink-0 rounded bg-surface-3 px-1 py-0.5 text-[11px] font-medium text-gray-500">
             test
           </span>
         )}
         {summary && (
-          <span className="min-w-0 truncate font-mono text-[11px] text-gray-600">· {summary}</span>
+          <span className="min-w-0 truncate font-mono text-[13px] text-gray-600">· {summary}</span>
         )}
         <span className="ml-auto shrink-0">{statusIcon}</span>
       </button>
@@ -378,7 +378,7 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
           first line of the error on the collapsed card. Full output stays
           behind the expand toggle. */}
       {!open && (tc.isError || tc.status === "error") && tc.result && (
-        <div className="border-t border-red-500/20 px-3 py-1 pl-9 text-[11px] font-mono text-red-700 dark:text-red-300 truncate">
+        <div className="ml-7 max-w-[56ch] truncate px-1.5 pb-1 text-[13px] font-mono leading-5 text-red-700 dark:text-red-300">
           {firstNonEmptyLine(tc.result)}
         </div>
       )}
@@ -391,16 +391,16 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
             }).catch(() => {})
           }
           title={`打开 ${filePath}`}
-          className="ml-7 flex max-w-[calc(100%-1.75rem)] items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-[10px] text-accent transition-colors hover:bg-surface-3"
+          className="ml-7 flex max-w-[calc(100%-1.75rem)] items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-[12px] text-accent transition-colors hover:bg-surface-3"
         >
           <ExternalLink size={11} className="shrink-0" />
           <span className="truncate font-mono">{basename(filePath)}</span>
-          <span className="ml-auto shrink-0 text-[10px] text-gray-500">打开文件</span>
+          <span className="ml-auto shrink-0 text-[11px] text-gray-500">打开文件</span>
         </button>
       )}
 
       {open && (
-        <div className="border-t border-border px-2.5 py-1.5 space-y-1.5 font-mono">
+        <div className="ml-2 border-l border-border/45 px-2.5 py-1.5 space-y-1.5 font-mono">
           {tc.args && (
             <div>
               <div className="text-gray-500 mb-1">input</div>

@@ -135,8 +135,8 @@ fn openai_and_anthropic_persist_usage_before_terminal_tool_branch() {
         .expect("missing run_agent_loop end")
         .0;
     let loop_pos = section
-        .find("for iteration in 0..max_iterations")
-        .expect("missing provider-round loop");
+        .find("for segment_iteration in 0..max_iterations")
+        .expect("missing provider-round segment loop");
     let record_pos = section
         .find("record_usage_event")
         .expect("does not persist request-level usage");
