@@ -25,7 +25,6 @@ vi.mock("./pages/Profile/ProfilePage", () => ({ ProfilePage: () => null }));
 vi.mock("./components/Toast", () => ({ ToastContainer: () => null }));
 vi.mock("./components/EvidenceViewer", () => ({ EvidenceViewer: () => null }));
 vi.mock("./components/UpdaterBanner", () => ({ UpdaterBanner: () => null }));
-vi.mock("./components/OnboardingOverlay", () => ({ OnboardingOverlay: () => null }));
 vi.mock("./stores/settings", () => ({
   useSettingsStore: (selector: (state: { load: () => void; settings: { onboarded: boolean } }) => unknown) =>
     selector({ load: vi.fn(), settings: { onboarded: true } }),
