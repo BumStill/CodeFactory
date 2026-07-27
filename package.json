@@ -7,6 +7,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "postinstall": "node scripts/worktree-janitor.mjs --warn-only",
     "cargo:shared": "node scripts/cargo-shared.mjs",
     "worktrees": "node scripts/worktree-janitor.mjs",
     "worktrees:clean": "node scripts/worktree-janitor.mjs --apply --stale-days 7",

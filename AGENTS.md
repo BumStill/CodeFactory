@@ -53,6 +53,40 @@
 - 未运行验证命令时，不得声称完成，只能说明已修改并待验证。
 - 本仓库治理基线验证命令：`python tools/governance/validate_repo_governance_baseline.py`。
 
+### Rust 命令一律走共享缓存（硬规则）
+
+**跑 Rust 就用 `pnpm cargo:shared -- <cargo 参数>`，不要敲裸 `cargo build` / `cargo test` / `cargo clippy`。**
+
+裸 `cargo` 会在**当前 worktree** 另起一份独立的 `target/`。并行 agent 各开各的
+worktree，每份 target 2–20 GB，没人清理——2026-07-27 实测：22 个 worktree、
+约 300 GB，其中约 95% 是重复的构建产物，而同一台机器上早就躺着一份 37 GB 的
+共享缓存没人用。
+
+只有 `pnpm cargo:shared` 会把输出导向 `<repo>/.codefactory-cache/cargo-target`，
+让所有 worktree 复用同一份依赖编译结果——省的不只是磁盘，冷启动构建也快得多。
+
+> 为什么不做成默认（已实测否掉，别再重复尝试）：
+> - `.cargo/config.toml` 里的相对 `target-dir` 不成立——worktree 深度不同
+>   （`~/Projects/CodeFactory-x` vs `CodeFactory/.claude/worktrees/y`），没有一个
+>   相对路径能同时命中。
+> - 绝对路径是机器相关的，不能提交；而 `.cargo/config.toml` **是已跟踪文件**
+>   （承载 Windows MSVC 必需的 `RUST_MIN_STACK`），脚本生成会把它覆盖掉。
+> - `include = [...]` 可用，但**被 include 的文件缺失时是硬报错**，提交后会让
+>   新 clone 和 CI 在跑 `pnpm install` 之前完全无法使用 cargo。
+
+### 收尾必须清理 worktree（硬规则）
+
+PR 合并/关闭后，立刻删掉自己那个 worktree 和分支：
+
+    git worktree remove --force <路径> && git branch -D <分支>
+
+兜底是每日的 `pnpm worktrees:clean`，但**兜底不是许可**——目录留着一天，就多一天
+在过期副本上改代码的风险。
+
+判断分支合没合**不要用 `git merge-base --is-ancestor`**：本仓库一律 squash 合并，
+squash commit 与分支 tip 是不同对象，merge-base 会把已合并分支判成未合并。用
+`pnpm worktrees` 看报告，它按「是否存在已合并 PR」判定。
+
 ### 会话静默禁止规则（硬规则）
 
 **适用范围：** 任何耗时 >30 秒且不产生实时输出的 bash 调用（CI 轮询、cargo build、

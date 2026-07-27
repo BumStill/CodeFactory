@@ -36,6 +36,32 @@ const args = process.argv.slice(2);
 const APPLY = args.includes("--apply");
 const PREFIX = valueOf("--prefix") ?? "";
 const STALE_DAYS = Number(valueOf("--stale-days") ?? 0);
+// Cheap nag for `postinstall`: counts worktrees and exits. No `du`, no network,
+// no `gh` — it must not slow down or fail an install. Worktrees are what carry
+// the multi-GB target dirs, so the count alone is a good enough proxy.
+const WARN_ONLY = args.includes("--warn-only");
+const WARN_ABOVE = 8;
+
+if (WARN_ONLY) {
+  try {
+    const count = execFileSync("git", ["worktree", "list"], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+    })
+      .split("\n")
+      .filter(Boolean).length;
+    if (count > WARN_ABOVE) {
+      console.warn(
+        `\n! ${count} git worktrees exist for this repo. Each carries its own ` +
+          `multi-GB Cargo target.\n  Run \`pnpm worktrees\` to see what is finished, ` +
+          `\`pnpm worktrees:clean\` to reclaim it.\n`,
+      );
+    }
+  } catch {
+    // Never let a nag break an install.
+  }
+  process.exit(0);
+}
 
 function valueOf(flag) {
   const i = args.indexOf(flag);
