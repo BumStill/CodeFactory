@@ -3,10 +3,14 @@ use chrono::Utc;
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::agent::failover::{RouteCandidate, RouteCandidatePlan};
 use crate::agent::AgentLoop;
+use crate::config::settings::Settings;
 use crate::errors::AppError;
 use crate::mcp::McpManager;
 use crate::openrouter::types::StreamEvent;
@@ -16,23 +20,191 @@ fn endpoint_requires_api_key(api_style: &crate::config::settings::ApiStyle) -> b
     !matches!(api_style, crate::config::settings::ApiStyle::Chatgpt)
 }
 
-fn load_endpoint_api_key(
-    endpoint_name: &str,
-    endpoint: &crate::config::settings::Endpoint,
-) -> Result<(Option<String>, String), AppError> {
-    // ChatGPT subscription requests resolve their OAuth access token inside
-    // AgentLoop::call_chatgpt_model. Touching a synthetic endpoint key here can
-    // fail on an unavailable keychain before OAuth gets a chance to run.
-    if !endpoint_requires_api_key(&endpoint.api_style) {
-        return Ok((None, String::new()));
+#[derive(Debug)]
+struct RouteCandidateResolution {
+    candidates: Vec<RouteCandidate>,
+    excluded: Vec<String>,
+}
+
+/// Resolve a stable per-turn route snapshot without probing or mutating the
+/// user's preferred endpoint. The preferred endpoint is always considered
+/// first; configured alternatives follow in deterministic name order.
+///
+/// Credential values are carried only into the in-memory route plan. Exclusion
+/// diagnostics intentionally mention the endpoint and remediation class, never
+/// the secret value or keychain error text.
+fn resolve_route_candidates_with<F>(
+    settings: &Settings,
+    requested_model: &str,
+    mut load_secret: F,
+    chatgpt_authenticated: bool,
+) -> RouteCandidateResolution
+where
+    F: FnMut(&str) -> std::result::Result<Option<String>, String>,
+{
+    let mut endpoint_names: Vec<String> = settings.endpoints.keys().cloned().collect();
+    endpoint_names.sort();
+    if let Some(primary_index) = endpoint_names
+        .iter()
+        .position(|name| name == &settings.default_endpoint)
+    {
+        let primary = endpoint_names.remove(primary_index);
+        endpoint_names.insert(0, primary);
     }
 
-    let key_ref = endpoint
-        .key_ref
-        .clone()
-        .unwrap_or_else(|| format!("codefactory.endpoint.{endpoint_name}"));
-    let api_key = crate::secrets::get_key(&key_ref)?.unwrap_or_default();
-    Ok((Some(key_ref), api_key))
+    let mut candidates = Vec::new();
+    let mut excluded = Vec::new();
+    for endpoint_name in endpoint_names {
+        let Some(endpoint) = settings.endpoints.get(&endpoint_name) else {
+            continue;
+        };
+        let Some(model_id) = settings.resolve_model_for_endpoint(&endpoint_name, requested_model)
+        else {
+            excluded.push(format!("{endpoint_name}：没有可用模型"));
+            continue;
+        };
+
+        let api_key = if !endpoint_requires_api_key(&endpoint.api_style) {
+            if !chatgpt_authenticated {
+                excluded.push(format!("{endpoint_name}：缺少 ChatGPT 登录凭据"));
+                continue;
+            }
+            String::new()
+        } else {
+            let key_ref = endpoint
+                .key_ref
+                .clone()
+                .unwrap_or_else(|| format!("codefactory.endpoint.{endpoint_name}"));
+            match load_secret(&key_ref) {
+                Ok(Some(secret)) if !secret.trim().is_empty() => secret,
+                Ok(_) => {
+                    excluded.push(format!("{endpoint_name}：缺少凭据"));
+                    continue;
+                }
+                Err(_) => {
+                    excluded.push(format!("{endpoint_name}：凭据读取失败"));
+                    continue;
+                }
+            }
+        };
+
+        candidates.push(RouteCandidate {
+            endpoint_name,
+            model_id,
+            base_url: endpoint.base_url.clone(),
+            api_key,
+            api_style: endpoint.api_style.clone(),
+        });
+    }
+
+    RouteCandidateResolution {
+        candidates,
+        excluded,
+    }
+}
+
+const CREDENTIAL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn bounded_blocking_lookup<T, F>(lookup: F) -> std::result::Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::result::Result<T, String> + Send + 'static,
+{
+    bounded_blocking_lookup_with_timeout(CREDENTIAL_LOOKUP_TIMEOUT, lookup).await
+}
+
+async fn bounded_blocking_lookup_with_timeout<T, F>(
+    timeout: Duration,
+    lookup: F,
+) -> std::result::Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::result::Result<T, String> + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(lookup)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("凭据读取任务异常".into()),
+        Err(_) => Err("凭据读取超时".into()),
+    }
+}
+
+pub(crate) async fn resolve_route_plan(
+    settings: &Settings,
+    requested_model: &str,
+) -> Result<(RouteCandidatePlan, Vec<String>), AppError> {
+    // macOS Security.framework can block indefinitely when a missing or locked
+    // keychain item is queried. Resolve every configured credential off the
+    // async runtime and cap each lookup, otherwise one unusable fallback (for
+    // example OpenRouter without a key) freezes the whole chat before the agent
+    // loop can emit any progress.
+    let chatgpt_lookup = bounded_blocking_lookup(|| {
+        crate::codex_auth::load_tokens()
+            .map(|tokens| tokens.is_some())
+            .map_err(|_| "ChatGPT 登录凭据读取失败".to_string())
+    });
+
+    let mut secret_refs: Vec<String> = settings
+        .endpoints
+        .iter()
+        .filter(|(_, endpoint)| endpoint_requires_api_key(&endpoint.api_style))
+        .map(|(endpoint_name, endpoint)| {
+            endpoint
+                .key_ref
+                .clone()
+                .unwrap_or_else(|| format!("codefactory.endpoint.{endpoint_name}"))
+        })
+        .collect();
+    secret_refs.sort();
+    secret_refs.dedup();
+
+    let secret_lookups = async move {
+        let mut lookups = tokio::task::JoinSet::new();
+        for key_ref in secret_refs {
+            lookups.spawn(async move {
+                let lookup_ref = key_ref.clone();
+                let result = bounded_blocking_lookup(move || {
+                    crate::secrets::get_key(&lookup_ref).map_err(|_| "端点凭据读取失败".to_string())
+                })
+                .await;
+                (key_ref, result)
+            });
+        }
+        let mut snapshot = HashMap::new();
+        while let Some(joined) = lookups.join_next().await {
+            if let Ok((key_ref, result)) = joined {
+                snapshot.insert(key_ref, result);
+            }
+        }
+        snapshot
+    };
+
+    let (chatgpt_authenticated, mut secret_snapshot) = tokio::join!(chatgpt_lookup, secret_lookups);
+    let resolution = resolve_route_candidates_with(
+        settings,
+        requested_model,
+        |key_ref| {
+            secret_snapshot
+                .remove(key_ref)
+                .unwrap_or_else(|| Err("凭据未解析".into()))
+        },
+        chatgpt_authenticated.unwrap_or(false),
+    );
+    let mut routes = resolution.candidates.into_iter();
+    let Some(primary) = routes.next() else {
+        let detail = if resolution.excluded.is_empty() {
+            "没有配置任何模型端点".to_string()
+        } else {
+            resolution.excluded.join("；")
+        };
+        return Err(AppError::Other(format!(
+            "所有可用模型端点均不可用：{detail}。请在模型设置中登录或配置凭据后重试。"
+        )));
+    };
+    let mut plan = RouteCandidatePlan::new(primary);
+    for fallback in routes {
+        plan.push_fallback(fallback);
+    }
+    Ok((plan, resolution.excluded))
 }
 
 #[tauri::command]
@@ -297,28 +469,22 @@ pub async fn send_message(
         }
     }
 
-    // Resolve endpoint + key
-    let endpoint_name = settings.default_endpoint.clone();
-    let endpoint = settings
-        .endpoints
-        .get(&endpoint_name)
-        .ok_or_else(|| AppError::Other("No default endpoint configured".into()))?
+    // Freeze all locally usable routes for this turn. This is a runtime
+    // availability plan only: it never overwrites the user's preferred
+    // endpoint/model in Settings.
+    let (route_plan, excluded_routes) = resolve_route_plan(&settings, &session.model_id).await?;
+    let primary_route = route_plan
+        .candidates()
+        .first()
+        .expect("route plan always has a primary")
         .clone();
+    let endpoint_name = primary_route.endpoint_name.clone();
+    let resolved_model = primary_route.model_id.clone();
+    let base_url = primary_route.base_url.clone();
+    let api_key = primary_route.api_key.clone();
+    let api_style = primary_route.api_style.clone();
 
-    let api_style = endpoint.api_style.clone();
-
-    let (key_ref, api_key) = load_endpoint_api_key(&endpoint_name, &endpoint)?;
-
-    let resolved_model = settings
-        .resolve_model_for_endpoint(&endpoint_name, &session.model_id)
-        .ok_or_else(|| {
-            AppError::Other(format!(
-                "No model configured for endpoint '{}'. Please choose a model in the picker.",
-                settings.default_endpoint
-            ))
-        })?;
-
-    if resolved_model != session.model_id {
+    if endpoint_name == settings.default_endpoint && resolved_model != session.model_id {
         tracing::warn!(
             "send_message: repaired session model '{}' to endpoint '{}' active model '{}'",
             session.model_id,
@@ -345,19 +511,12 @@ pub async fn send_message(
     }
 
     tracing::info!(
-        "send_message: endpoint={} model={} key_ref={} key_len={}",
-        endpoint.base_url,
+        "send_message: endpoint={} model={} candidate_count={} excluded_count={}",
+        endpoint_name,
         resolved_model,
-        key_ref.as_deref().unwrap_or("chatgpt-oauth"),
-        api_key.len(),
+        route_plan.candidates().len(),
+        excluded_routes.len(),
     );
-
-    if api_key.is_empty() && endpoint_requires_api_key(&api_style) {
-        return Err(AppError::Other(format!(
-            "API key not found for key_ref '{}'. Please configure it in Settings.",
-            key_ref.as_deref().unwrap_or("unknown")
-        )));
-    }
 
     // Fetch history
     let history = {
@@ -414,7 +573,7 @@ pub async fn send_message(
                 session_id_clone,
                 endpoint_name,
                 resolved_model,
-                endpoint.base_url,
+                base_url,
                 api_key,
                 api_style,
                 std::path::PathBuf::from(session.cwd),
@@ -424,6 +583,7 @@ pub async fn send_message(
                 None,
                 mode,
             )
+            .with_failover_plan(route_plan)
             .with_cancel(cancel_flag);
             agent.run(history).await
         })
@@ -538,30 +698,19 @@ pub async fn send_message_anonymous(
 
     let settings = state.settings.read().await.clone();
 
-    // Resolve endpoint + key (identical to send_message).
-    let endpoint_name = settings.default_endpoint.clone();
-    let endpoint = settings
-        .endpoints
-        .get(&endpoint_name)
-        .ok_or_else(|| AppError::Other("No default endpoint configured".into()))?
+    // Resolve the same stable failover plan as persisted chats. Anonymous mode
+    // changes persistence only; it must not be less resilient.
+    let (route_plan, _excluded_routes) = resolve_route_plan(&settings, &model_id).await?;
+    let primary_route = route_plan
+        .candidates()
+        .first()
+        .expect("route plan always has a primary")
         .clone();
-    let api_style = endpoint.api_style.clone();
-    let resolved_model = settings
-        .resolve_model_for_endpoint(&endpoint_name, &model_id)
-        .ok_or_else(|| {
-            AppError::Other(format!(
-                "No model configured for endpoint '{}'. Please choose a model in the picker.",
-                settings.default_endpoint
-            ))
-        })?;
-
-    let (key_ref, api_key) = load_endpoint_api_key(&endpoint_name, &endpoint)?;
-    if api_key.is_empty() && endpoint_requires_api_key(&api_style) {
-        return Err(AppError::Other(format!(
-            "API key not found for key_ref '{}'. Please configure it in Settings.",
-            key_ref.as_deref().unwrap_or("unknown")
-        )));
-    }
+    let endpoint_name = primary_route.endpoint_name.clone();
+    let resolved_model = primary_route.model_id.clone();
+    let base_url = primary_route.base_url.clone();
+    let api_key = primary_route.api_key.clone();
+    let api_style = primary_route.api_style.clone();
 
     // Anonymous sessions have no project dir; resolve an empty cwd to the shared
     // scratch dir so tools + the system prompt get a valid working directory.
@@ -602,7 +751,7 @@ pub async fn send_message_anonymous(
                 session_id_clone,
                 endpoint_name,
                 resolved_model,
-                endpoint.base_url,
+                base_url,
                 api_key,
                 api_style,
                 std::path::PathBuf::from(cwd),
@@ -612,6 +761,7 @@ pub async fn send_message_anonymous(
                 None,
             )
             .anonymous()
+            .with_failover_plan(route_plan)
             .with_cancel(cancel_flag);
             agent.run(full_history).await
         })
@@ -646,7 +796,7 @@ fn select_chat_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::settings::ApiStyle;
+    use crate::config::settings::{ApiStyle, Endpoint};
 
     #[tokio::test]
     async fn completed_chat_only_clears_its_own_running_flag() {
@@ -715,6 +865,86 @@ mod tests {
         assert!(!endpoint_requires_api_key(&ApiStyle::Chatgpt));
         assert!(endpoint_requires_api_key(&ApiStyle::Openai));
         assert!(endpoint_requires_api_key(&ApiStyle::Anthropic));
+    }
+
+    #[test]
+    fn route_candidates_keep_primary_then_only_locally_usable_fallbacks() {
+        let mut settings = crate::config::settings::Settings::default();
+        settings.default_endpoint = "chatgpt".into();
+        settings.default_model = "gpt-5.5".into();
+        settings.endpoints.clear();
+        settings.endpoints.insert(
+            "chatgpt".into(),
+            Endpoint {
+                base_url: crate::codex_auth::CHATGPT_BASE_URL.into(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                custom_models: vec![],
+                active_model: Some("gpt-5.5".into()),
+            },
+        );
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://api.deepseek.example/v1".into(),
+                key_ref: Some("deepseek-secret".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+        settings.endpoints.insert(
+            "openrouter".into(),
+            Endpoint {
+                base_url: "https://openrouter.example/v1".into(),
+                key_ref: Some("openrouter-secret".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("anthropic/claude-opus-4-7".into()),
+            },
+        );
+
+        let resolution = resolve_route_candidates_with(
+            &settings,
+            "gpt-5.5",
+            |key_ref| {
+                Ok(if key_ref == "deepseek-secret" {
+                    Some("configured-deepseek-key".into())
+                } else {
+                    None
+                })
+            },
+            true,
+        );
+
+        assert_eq!(
+            resolution
+                .candidates
+                .iter()
+                .map(|route| (route.endpoint_name.as_str(), route.model_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("chatgpt", "gpt-5.5"), ("deepseek", "deepseek-v4-pro")]
+        );
+        assert!(resolution
+            .excluded
+            .iter()
+            .any(|reason| reason.contains("openrouter") && reason.contains("缺少凭据")));
+    }
+
+    #[tokio::test]
+    async fn credential_lookup_timeout_cannot_freeze_chat_setup() {
+        let started = std::time::Instant::now();
+        let result = bounded_blocking_lookup_with_timeout(
+            Duration::from_millis(10),
+            || -> std::result::Result<(), String> {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), "凭据读取超时");
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

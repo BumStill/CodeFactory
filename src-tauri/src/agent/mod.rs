@@ -11,6 +11,7 @@ pub mod hooks;
 pub mod journal;
 mod context_policy;
 mod fact_checker;
+pub mod failover;
 mod lifecycle_hooks;
 pub mod model_transport;
 mod permission_gateway;
@@ -450,8 +451,8 @@ pub struct AgentLoop {
     endpoint_name: String,
     model_id: String,
     base_url: String,
-    api_key: String,
     api_style: ApiStyle,
+    route_state: failover::ActiveRouteState,
     cwd: PathBuf,
     http: Client,
     settings: Arc<RwLock<Settings>>,
@@ -643,6 +644,16 @@ impl AgentLoop {
     ) -> Self {
         let events: std::sync::Arc<dyn events::EventSink> =
             std::sync::Arc::new(events::TauriEventSink::new(app.clone(), &session_id));
+        let route_state =
+            failover::ActiveRouteState::from_plan(failover::RouteCandidatePlan::new(
+                failover::RouteCandidate {
+                    endpoint_name: endpoint_name.clone(),
+                    model_id: model_id.clone(),
+                    base_url: base_url.clone(),
+                    api_key: api_key.clone(),
+                    api_style: api_style.clone(),
+                },
+            ));
         Self {
             app: Some(app),
             events,
@@ -651,8 +662,8 @@ impl AgentLoop {
             endpoint_name,
             model_id,
             base_url,
-            api_key,
             api_style,
+            route_state,
             cwd,
             http: Client::new(),
             settings,
@@ -709,6 +720,16 @@ impl AgentLoop {
         execution_context: Option<AgentExecutionContext>,
         mode: AgentMode,
     ) -> Self {
+        let route_state =
+            failover::ActiveRouteState::from_plan(failover::RouteCandidatePlan::new(
+                failover::RouteCandidate {
+                    endpoint_name: endpoint_name.clone(),
+                    model_id: model_id.clone(),
+                    base_url: base_url.clone(),
+                    api_key: api_key.clone(),
+                    api_style: api_style.clone(),
+                },
+            ));
         Self {
             app: None,
             events,
@@ -717,8 +738,8 @@ impl AgentLoop {
             endpoint_name,
             model_id,
             base_url,
-            api_key,
             api_style,
+            route_state,
             cwd,
             http: Client::new(),
             settings,
@@ -730,6 +751,14 @@ impl AgentLoop {
             anonymous: false,
             cancel: None,
         }
+    }
+
+    /// Add per-turn fallback candidates without changing the user's configured
+    /// default endpoint. The selected route is shared by transport, context
+    /// policy, and usage attribution for the lifetime of this run.
+    pub fn with_failover_plan(mut self, plan: failover::RouteCandidatePlan) -> Self {
+        self.route_state = failover::ActiveRouteState::from_plan(plan);
+        self
     }
 
     /// Headless construction smoke (keystone slice 3). Release CI invokes this
@@ -1112,9 +1141,7 @@ impl AgentLoop {
             settings: self.settings.clone(),
             db: self.db.clone(),
             session_id: self.session_id.clone(),
-            endpoint_name: self.endpoint_name.clone(),
-            model_id: self.model_id.clone(),
-            api_style: self.api_style.clone(),
+            route_state: self.route_state.clone(),
             expand_context_window,
         }
     }
@@ -1137,15 +1164,12 @@ impl AgentLoop {
     /// cancel `Arc` (shared `AtomicBool`), and NO `AppHandle` (#166). The three
     /// run-loop call sites dispatch through this; the transport methods now live
     /// on [`model_transport::DesktopModelTransport`].
-    fn model_transport(&self) -> model_transport::DesktopModelTransport {
-        model_transport::DesktopModelTransport {
+    fn model_transport(&self) -> model_transport::RoutedDesktopModelTransport {
+        model_transport::RoutedDesktopModelTransport {
             http: self.http.clone(),
             events: self.events.clone(),
-            model_id: self.model_id.clone(),
             session_id: self.session_id.clone(),
-            base_url: self.base_url.clone(),
-            api_key: self.api_key.clone(),
-            api_style: self.api_style.clone(),
+            route_state: self.route_state.clone(),
             cancel: self.cancel.clone(),
         }
     }

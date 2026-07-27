@@ -108,7 +108,22 @@ pub async fn run_subagent(
     app_handle: &AppHandle,
     pending_perms: &PendingPermissionMap,
 ) -> std::result::Result<SubagentResult, AppError> {
-    let model = resolved_subagent_model(settings)?;
+    let requested_model = resolved_subagent_model(settings)?;
+    // Resolve before creating the child session so its stored model reflects
+    // the route that will actually execute, including a cooled-down-primary
+    // fallback selected at turn start.
+    let (route_plan, _excluded_routes) =
+        crate::commands::chat::resolve_route_plan(settings, &requested_model).await?;
+    let primary_route = route_plan
+        .candidates()
+        .first()
+        .expect("route plan always has a primary")
+        .clone();
+    let model = primary_route.model_id.clone();
+    let api_key = primary_route.api_key.clone();
+    let base_url = primary_route.base_url.clone();
+    let api_style = primary_route.api_style.clone();
+    let endpoint_name = primary_route.endpoint_name.clone();
 
     // 1. Create the sub-session.
     let sub_session_id = Uuid::new_v4().to_string();
@@ -144,25 +159,7 @@ pub async fn run_subagent(
     .execute(pool)
     .await?;
 
-    // 3. Resolve endpoint + key the same way commands::chat does.
-    let endpoint = settings
-        .endpoints
-        .get(&settings.default_endpoint)
-        .ok_or_else(|| AppError::Other("No default endpoint configured".into()))?
-        .clone();
-    let key_ref = endpoint
-        .key_ref
-        .clone()
-        .unwrap_or_else(|| format!("codefactory.endpoint.{}", settings.default_endpoint));
-    let api_key = crate::secrets::get_key(&key_ref)?.unwrap_or_default();
-    if api_key.is_empty() {
-        return Err(AppError::Other(format!(
-            "API key not found for key_ref '{}'",
-            key_ref
-        )));
-    }
-
-    // 4. Build the AgentLoop with the sub-session id and a one-message history.
+    // 3. Build the AgentLoop with the sub-session id and a one-message history.
     let history = vec![Message {
         id: msg_id.clone(),
         session_id: sub_session_id.clone(),
@@ -195,11 +192,11 @@ pub async fn run_subagent(
         app_handle.clone(),
         pool.clone(),
         sub_session_id.clone(),
-        settings.default_endpoint.clone(),
+        endpoint_name,
         model.clone(),
-        endpoint.base_url.clone(),
+        base_url.clone(),
         api_key.clone(),
-        endpoint.api_style.clone(),
+        api_style.clone(),
         PathBuf::from(&brief.cwd),
         settings_lock,
         pending_perms.clone(),
@@ -215,32 +212,13 @@ pub async fn run_subagent(
             usage_surface: crate::agent::UsageSurface::Subagent,
         }),
         crate::agent::AgentMode::Autonomous,
-    );
-
-    // Hard wall-clock cap per subagent. Without this an unbounded
-    // tool-call loop (model keeps asking to read more files) can burn
-    // tokens and clock indefinitely. 10 minutes is generous for a real
-    // task but bounded enough to catch runaway behaviour.
-    const PER_TASK_TIMEOUT_SECS: u64 = 600;
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(PER_TASK_TIMEOUT_SECS),
-        agent.run(history),
     )
-    .await
-    {
-        Ok(r) => r?,
-        Err(_) => {
-            tracing::warn!(
-                "subagent task '{}' hit {}s wall-clock cap; aborting",
-                brief.title,
-                PER_TASK_TIMEOUT_SECS
-            );
-            return Err(AppError::Other(format!(
-                "Task exceeded {}s execution cap and was aborted to prevent drift",
-                PER_TASK_TIMEOUT_SECS
-            )));
-        }
-    }
+    .with_failover_plan(route_plan);
+
+    // A subtask stops on its terminal result or explicit cancellation, not an
+    // arbitrary wall-clock deadline. Long builds and CI waits are legitimate
+    // work; time alone must not turn them into unexplained interruptions.
+    agent.run(history).await?;
 
     // 5. Walk messages to produce a result summary.
     let result = summarize_run(pool, &sub_session_id).await?;
@@ -253,10 +231,10 @@ pub async fn run_subagent(
             run_acceptance_check(
                 criteria,
                 &result.summary,
-                &endpoint.base_url,
+                &base_url,
                 &api_key,
                 &model,
-                &endpoint.api_style,
+                &api_style,
             )
             .await,
         )

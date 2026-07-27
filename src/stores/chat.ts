@@ -15,6 +15,7 @@ import {
   markPermissionResponse,
   reduceChatStreamEvent,
   formatToolArgs,
+  presentChatInvocationError,
   type ChatEventState,
   type PendingPermission,
   type ToolCallState,
@@ -577,6 +578,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         });
       }
     } catch (e) {
+      const errorPresentation = presentChatInvocationError(e);
       set((s) => {
         const prev = s.runtime[id];
         if (!prev) return {};
@@ -586,7 +588,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             [id]: {
               ...prev,
               messages: prev.messages.map((m) =>
-                m.id === assistantMsgId ? { ...m, content: `Error: ${String(e)}` } : m,
+                m.id === assistantMsgId ? { ...m, ...errorPresentation } : m,
               ),
               streaming: false,
               revision: prev.revision + 1,

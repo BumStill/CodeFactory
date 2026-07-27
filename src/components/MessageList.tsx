@@ -13,7 +13,11 @@ import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import { RememberButton } from "./RememberButton";
 import { formatDuration, useNowTick } from "../lib/duration";
 import type { UIMessage } from "../stores/chat";
-import type { TurnSegment } from "../stores/chatEvents";
+import {
+  isModelRouteExhaustedError,
+  MODEL_ROUTE_EXHAUSTED_GUIDANCE,
+  type TurnSegment,
+} from "../stores/chatEvents";
 
 interface Props {
   messages: UIMessage[];
@@ -386,6 +390,10 @@ function isQuietSuccess(tool: NonNullable<UIMessage["toolCalls"]>[number] | unde
   return Boolean(tool && tool.status === "done" && !tool.isError);
 }
 
+function isModelRouteSwitchNotice(detail: string): boolean {
+  return detail.includes("已自动切换到") && detail.includes("任务继续执行");
+}
+
 const MessageRow = memo(function MessageRow({
   msg,
   isStreamingTail,
@@ -408,10 +416,28 @@ const MessageRow = memo(function MessageRow({
   // notice with the raw error so it survives reloads — the 2026-07-21
   // interruptions left zero trace because errors were transient events.
   if (msg.completionState === "turn_error") {
+    const persistedError = msg.content.replace(/^回合中断[::]\s*/, "");
+    if (isModelRouteExhaustedError(persistedError)) {
+      return (
+        <div className="space-y-1.5 text-[13px] leading-5">
+          <p className="max-w-[72ch] text-gray-300">
+            {MODEL_ROUTE_EXHAUSTED_GUIDANCE}
+          </p>
+          <details className="w-fit max-w-full text-[13px] leading-5 text-gray-500">
+            <summary className="cursor-pointer select-none hover:text-gray-400">
+              查看失败详情
+            </summary>
+            <div className="ml-4 mt-1 max-w-[72ch] whitespace-pre-wrap break-words text-gray-600">
+              {persistedError}
+            </div>
+          </details>
+        </div>
+      );
+    }
     return (
       <div className="flex justify-center">
         <div className="max-w-[85%] rounded border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-[11px] leading-snug text-red-800 dark:text-red-200 break-words">
-          回合中断:{msg.content.replace(/^回合中断[::]\s*/, "")}
+          回合中断:{persistedError}
         </div>
       </div>
     );
@@ -430,6 +456,17 @@ const MessageRow = memo(function MessageRow({
 
   // Neutral runtime notices (e.g. images stripped for a no-vision model).
   if (msg.completionState === "turn_notice") {
+    if (isModelRouteSwitchNotice(msg.content)) {
+      return (
+        <div
+          role="status"
+          aria-live="polite"
+          className="text-[13px] leading-5 text-gray-500 break-words"
+        >
+          {msg.content}
+        </div>
+      );
+    }
     return (
       <div className="flex justify-center">
         <div className="max-w-[85%] rounded border border-sky-500/30 bg-sky-500/10 px-2.5 py-1 text-[11px] leading-snug text-sky-800 dark:text-sky-200 break-words">
@@ -465,7 +502,8 @@ const MessageRow = memo(function MessageRow({
     isStreamingTail &&
     !msg.content &&
     (!msg.toolCalls || msg.toolCalls.length === 0) &&
-    (!msg.transportRetries || msg.transportRetries.length === 0);
+    (!msg.transportRetries || msg.transportRetries.length === 0) &&
+    (!msg.gateActions || msg.gateActions.length === 0);
   // Turn timeline: when segments exist (live-streamed turns), render
   // narration and tool cards in ARRIVAL order — mid-turn narration as light
   // step lines, only the final segment as full prose. Without segments
@@ -602,22 +640,34 @@ const MessageRow = memo(function MessageRow({
           })()}
         </>
       )}
-      {msg.transportRetries?.map((retry, index) => (
-        <div
-          key={`${retry.attempt}-${index}`}
-          className="w-fit max-w-full rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] leading-snug text-amber-800 dark:text-amber-200 break-words"
-        >
-          模型连接重试 {retry.attempt}/{retry.maxAttempts} · {retry.reason}
-        </div>
-      ))}
+      {msg.transportRetries && msg.transportRetries.length > 0 && (() => {
+        return (
+          <details className="w-fit max-w-full text-[13px] leading-5 text-gray-500">
+            <summary className="cursor-pointer select-none hover:text-gray-400">
+              {isStreamingTail ? "模型连接不稳定，正在重新连接…" : "模型连接曾短暂不稳定，已完成重连"}
+            </summary>
+            <div className="ml-4 mt-1 space-y-0.5 text-[13px] leading-5 text-gray-600">
+              {msg.transportRetries.map((retry, index) => (
+                <div key={`${retry.attempt}-${index}`} className="break-words">
+                  第 {retry.attempt} 次 · {retry.reason}
+                </div>
+              ))}
+            </div>
+          </details>
+        );
+      })()}
       {msg.gateActions
         ?.filter((action) => action.kind === "warning" || action.kind === "turn_notice")
         .map((action, index) => (
           <div
             key={`notice-${index}`}
+            role={isModelRouteSwitchNotice(action.detail) ? "status" : undefined}
+            aria-live={isModelRouteSwitchNotice(action.detail) ? "polite" : undefined}
             className={
               action.kind === "warning"
                 ? "w-fit max-w-full rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] leading-snug text-amber-800 dark:text-amber-200 break-words"
+                : isModelRouteSwitchNotice(action.detail)
+                  ? "text-[13px] leading-5 text-gray-500 break-words"
                 : "w-fit max-w-full rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1 text-[11px] leading-snug text-sky-800 dark:text-sky-200 break-words"
             }
           >
@@ -629,6 +679,16 @@ const MessageRow = memo(function MessageRow({
           <ReactMarkdown components={markdownComponents} remarkPlugins={[remarkGfm]} urlTransform={allowedLocalImageUrl}>{msg.content}</ReactMarkdown>
           {isStreamingTail && <TypingDots />}
         </div>
+      )}
+      {msg.failureEvidence && (
+        <details className="w-fit max-w-full text-[13px] leading-5 text-gray-500">
+          <summary className="cursor-pointer select-none hover:text-gray-400">
+            查看失败详情
+          </summary>
+          <div className="ml-4 mt-1 max-w-[72ch] whitespace-pre-wrap break-words text-gray-600">
+            {msg.failureEvidence}
+          </div>
+        </details>
       )}
       {showThinkingHint && (
         <div className="text-xs text-gray-500 inline-flex items-center">

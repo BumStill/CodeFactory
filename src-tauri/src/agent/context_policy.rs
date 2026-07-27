@@ -10,15 +10,14 @@
 use codefactory_agent_loop::services::ContextPolicy;
 use std::sync::Arc;
 
+use super::failover::ActiveRouteState;
 use crate::config::settings::{ApiStyle, Settings};
 
 pub(super) struct DesktopContextPolicy {
     pub(super) settings: Arc<tokio::sync::RwLock<Settings>>,
     pub(super) db: sqlx::SqlitePool,
     pub(super) session_id: String,
-    pub(super) endpoint_name: String,
-    pub(super) model_id: String,
-    pub(super) api_style: ApiStyle,
+    pub(super) route_state: ActiveRouteState,
     /// OpenAI/ChatGPT expand the window to `max_limit` when a prompt would
     /// otherwise trigger compression (`select_limit`); Anthropic keeps the flat
     /// `default_limit` for its context-bar denominator — it never elides
@@ -29,11 +28,12 @@ pub(super) struct DesktopContextPolicy {
 #[async_trait::async_trait]
 impl ContextPolicy for DesktopContextPolicy {
     async fn context_window(&self, estimated_tokens: u32) -> (u32, u32) {
+        let route = self.route_state.current();
         let settings = self.settings.read().await;
         let window = super::context::resolve_context_window(
             &settings,
-            &self.endpoint_name,
-            &self.model_id,
+            &route.endpoint_name,
+            &route.model_id,
             None,
         );
         let limit = if self.expand_context_window {
@@ -45,12 +45,14 @@ impl ContextPolicy for DesktopContextPolicy {
     }
 
     async fn supports_vision(&self) -> bool {
+        let route = self.route_state.current();
         let settings = self.settings.read().await;
-        super::context::model_supports_vision(&settings, &self.endpoint_name, &self.model_id)
+        super::context::model_supports_vision(&settings, &route.endpoint_name, &route.model_id)
     }
 
     async fn round_reasoning_effort(&self) -> String {
-        if !matches!(self.api_style, ApiStyle::Chatgpt) {
+        let route = self.route_state.current();
+        if !matches!(route.api_style, ApiStyle::Chatgpt) {
             return String::new();
         }
         // Re-read per round (freshness): a mid-run sessions.reasoning_effort
@@ -61,8 +63,8 @@ impl ContextPolicy for DesktopContextPolicy {
         let settings = self.settings.read().await;
         super::resolve_chatgpt_reasoning_effort(
             &settings,
-            &self.endpoint_name,
-            &self.model_id,
+            &route.endpoint_name,
+            &route.model_id,
             session_effort.as_deref(),
         )
         .as_str()
