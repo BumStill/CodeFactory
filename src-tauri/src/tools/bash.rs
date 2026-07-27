@@ -458,6 +458,23 @@ mod tests {
         }
     }
 
+    /// Reports whether a background service is still up, by requiring it to
+    /// stay up rather than sampling once.
+    ///
+    /// The same teardown window `wait_for_process_exit` exists for also breaks
+    /// the opposite question, and there it FALSE-PASSES: a service that the
+    /// tool has just SIGKILLed still answers `kill(pid, 0)` with 0 until it
+    /// leaves the process table, so a single sample reads it as alive.
+    /// Mutating `output_with_timeout` to group-kill on its success path —
+    /// capturing the pgid before the wait, since `Child::id()` is None once
+    /// the child is reaped — left the survival assertions GREEN. Every service
+    /// in these tests is a `sleep 30`, so one that really survived is still
+    /// there after the settle and one that was killed is long gone.
+    #[cfg(unix)]
+    async fn service_stayed_up(pid: i32) -> bool {
+        !wait_for_process_exit(pid, Duration::from_millis(500)).await
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timeout_terminates_descendants_in_the_shell_process_group() {
@@ -476,7 +493,19 @@ mod tests {
         //
         // Both are now waited out instead of assumed, so the timeout path
         // under test is unchanged and the assertions below mean what they say.
-        const RUN_TIMEOUT: Duration = Duration::from_secs(3);
+        //
+        // #216 then set this to 3s, which still loses race 1 under heavier
+        // fork/exec load — 3 runs in 5, every one of them "descendant never
+        // recorded its pid". The budget is only the window the descendant has
+        // to reach `echo $$`, and it pays TWO shell startups to get there
+        // (`zsh -lc` then `sh -c`), the login one costing 250ms+ under load.
+        // 5s matches the SHELL_START_BUDGET its sibling tests settled on and
+        // stays as far from `sleep 30` as 3s did; the tool still times out
+        // here, since `& wait` blocks until the kill, so the path under test
+        // is unchanged. This test's runtime equals this budget, so it buys
+        // headroom at 1s per second — enough for the load that broke 3s, not
+        // a guarantee at any load.
+        const RUN_TIMEOUT: Duration = Duration::from_secs(5);
 
         let cwd = std::env::temp_dir().join(format!("codefactory-bash-timeout-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&cwd).expect("create cwd");
@@ -529,13 +558,13 @@ mod tests {
         let pid = wait_for_recorded_pid(&cwd.join("service.pid"), Duration::from_secs(2))
             .await
             .expect("service pid written");
-        let process_exists = unsafe { libc::kill(pid, 0) } == 0;
+        let survived = service_stayed_up(pid).await;
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
         let _ = std::fs::remove_dir_all(cwd);
 
-        assert!(process_exists, "background service {pid} did not survive");
+        assert!(survived, "background service {pid} did not survive");
     }
 
     #[cfg(unix)]
@@ -598,7 +627,7 @@ mod tests {
         let pid = wait_for_recorded_pid(&cwd.join("service.pid"), Duration::from_secs(2))
             .await
             .expect("service pid written");
-        let process_exists = unsafe { libc::kill(pid, 0) } == 0;
+        let survived = service_stayed_up(pid).await;
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
@@ -608,6 +637,6 @@ mod tests {
             "stdout was discarded: {}",
             output.content
         );
-        assert!(process_exists, "background service {pid} did not survive");
+        assert!(survived, "background service {pid} did not survive");
     }
 }
