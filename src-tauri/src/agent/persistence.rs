@@ -31,12 +31,51 @@ fn perr<E: std::fmt::Display>(e: E) -> PersistError {
 }
 
 
+/// Gate control states that are pure forensics: the loop injects them as
+/// prompts, `replayable_history` excludes them from the model's context, and
+/// the UI excludes them from the transcript. They belong in `gate_events`, not
+/// in the conversation store — a control loop decides what the agent does next,
+/// it does not get to write rows into the user's conversation.
+///
+/// `gate_warning` / `turn_notice` / `turn_error` are deliberately NOT here:
+/// those are user-facing notices that the transcript is supposed to show.
+///
+/// `rejected_candidate` is also not here. It marks a real assistant row, and
+/// three separate consumers key off that marker (replay filtering, the plan/act
+/// dispatch in `commands::chat`, and the latest-assistant lookup). Moving it
+/// changes what the model sees on later turns, so it gets its own change with
+/// its own tests rather than riding along on a storage move.
+fn is_gate_control_state(state: &str) -> bool {
+    matches!(state, "gate_recovery" | "gate_ready" | "gate_blocked")
+}
+
 /// In-process persistence for the desktop app. Owns the pool + session + the
 /// `anonymous` no-trace flag. No `AppHandle` (#166).
 pub(super) struct SqlitePersistence {
     pub(super) db: SqlitePool,
     pub(super) session_id: String,
     pub(super) anonymous: bool,
+}
+
+impl SqlitePersistence {
+    /// Append one gate control event to the side table. Content is stored raw:
+    /// these rows exist to answer "why did the loop keep going", so redacting
+    /// them would defeat the only reason to keep them.
+    async fn record_gate_event(&self, kind: &str, content: &str) -> PersistResult<()> {
+        sqlx::query(
+            "INSERT INTO gate_events (id, session_id, kind, content, created_at) \
+             VALUES (?,?,?,?,?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&self.session_id)
+        .bind(kind)
+        .bind(content)
+        .bind(Utc::now().timestamp_millis())
+        .execute(&self.db)
+        .await
+        .map_err(perr)?;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -91,10 +130,12 @@ impl Persistence for SqlitePersistence {
         if self.anonymous {
             return Ok(());
         }
-        // Runtime notices are internal provenance, not new user intent. Gate
-        // recovery/ready prompts remain user-shaped because they reconstruct
-        // the control messages the provider saw; turn notices are explicitly
-        // excluded from replay and must not masquerade as user-authored rows.
+        if is_gate_control_state(state) {
+            return self.record_gate_event(state, content).await;
+        }
+        // What's left is user-facing: a warning, a runtime notice, or a turn
+        // error. Notices are internal provenance rather than new user intent,
+        // so they stay role=system and out of replay.
         let role = if state == "turn_notice" {
             "system"
         } else {
@@ -125,16 +166,20 @@ impl Persistence for SqlitePersistence {
         if self.anonymous {
             return Ok(());
         }
-        let existing: (i64,) = sqlx::query_as(
+        let sql = if is_gate_control_state(state) {
+            "SELECT COUNT(*) FROM gate_events WHERE session_id = ? AND kind = ? \
+             AND content LIKE ?"
+        } else {
             "SELECT COUNT(*) FROM messages WHERE session_id = ? AND completion_state = ? \
-             AND content LIKE ?",
-        )
-        .bind(&self.session_id)
-        .bind(state)
-        .bind(format!("%{marker}%"))
-        .fetch_one(&self.db)
-        .await
-        .map_err(perr)?;
+             AND content LIKE ?"
+        };
+        let existing: (i64,) = sqlx::query_as(sql)
+            .bind(&self.session_id)
+            .bind(state)
+            .bind(format!("%{marker}%"))
+            .fetch_one(&self.db)
+            .await
+            .map_err(perr)?;
         if existing.0 > 0 {
             return Ok(());
         }
@@ -262,28 +307,101 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
+        sqlx::query(
+            "CREATE TABLE gate_events (id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, \
+             content TEXT, created_at INTEGER)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
         db
     }
 
     #[tokio::test]
-    async fn persist_gate_message_writes_a_raw_tagged_row() {
+    async fn gate_control_prompts_go_to_the_side_table_not_the_conversation() {
         let db = pool().await;
         let p = SqlitePersistence {
             db: db.clone(),
             session_id: "s1".into(),
             anonymous: false,
         };
-        p.persist_gate_message("recover: verify then finish", "gate_recovery")
+        for state in ["gate_recovery", "gate_ready", "gate_blocked"] {
+            p.persist_gate_message("recover: verify then finish", state)
+                .await
+                .unwrap();
+        }
+
+        // The conversation store stays untouched — this is the whole point.
+        let messages: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages")
+            .fetch_one(&db)
             .await
             .unwrap();
-        let (content, state): (String, String) = sqlx::query_as(
-            "SELECT content, completion_state FROM messages WHERE session_id='s1'",
-        )
-        .fetch_one(&db)
-        .await
-        .unwrap();
-        assert_eq!(content, "recover: verify then finish"); // RAW, not redacted
-        assert_eq!(state, "gate_recovery");
+        assert_eq!(messages.0, 0);
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT kind, content FROM gate_events WHERE session_id='s1' ORDER BY kind")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            ["gate_blocked", "gate_ready", "gate_recovery"],
+        );
+        // RAW, not redacted — forensics is the only reason these rows exist.
+        assert!(rows.iter().all(|(_, c)| c == "recover: verify then finish"));
+    }
+
+    #[tokio::test]
+    async fn user_facing_gate_notices_stay_in_the_conversation() {
+        let db = pool().await;
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: false,
+        };
+        p.persist_gate_message("⚠ 以上回复未经完整验证", "gate_warning")
+            .await
+            .unwrap();
+        let (role, state): (String, String) =
+            sqlx::query_as("SELECT role, completion_state FROM messages WHERE session_id='s1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(role, "user");
+        assert_eq!(state, "gate_warning");
+        let side: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM gate_events")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(side.0, 0);
+    }
+
+    #[tokio::test]
+    async fn persist_gate_message_once_dedups_against_the_table_it_writes() {
+        let db = pool().await;
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: false,
+        };
+        for _ in 0..2 {
+            p.persist_gate_message_once("已在发送前", "已在发送前移除图片", "turn_notice")
+                .await
+                .unwrap();
+            p.persist_gate_message_once("verify", "verify then finish", "gate_recovery")
+                .await
+                .unwrap();
+        }
+        let notices: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let control: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM gate_events")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(notices.0, 1, "turn notices dedup within messages");
+        assert_eq!(control.0, 1, "gate prompts dedup within gate_events");
     }
 
     #[tokio::test]

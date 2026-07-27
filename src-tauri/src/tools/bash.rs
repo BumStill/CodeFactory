@@ -419,10 +419,20 @@ mod tests {
         let pid_path = cwd.join("descendant.pid");
         let command = format!("sh -c 'echo $$ > {}; sleep 30' & wait", pid_path.display());
 
+        // Pre-existing flake (~25% under a loaded parallel run, on main too):
+        // the descendant raced the timeout. If the kill fired before `sh` was
+        // spawned into the process group, the descendant survived it and then
+        // wrote its pid afterwards — surfacing as either a missing pid file or
+        // a "survived" assertion, depending on when the read landed.
+        //
+        // Neither outcome says anything about group termination, which is what
+        // this test is for. A 2s budget is still far below `sleep 30`, so the
+        // timeout path under test is unchanged — the descendant is simply
+        // reliably running by the time the group is killed.
         let output = execute_with_timeout(
             json!({"command": command}),
             &ExecCtx::new(cwd.clone(), None),
-            Duration::from_millis(150),
+            Duration::from_secs(2),
         )
         .await
         .expect("tool returns timeout output");
