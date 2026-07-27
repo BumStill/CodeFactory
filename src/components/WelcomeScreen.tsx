@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-import { FolderOpen, Folder, Clock, ArrowRight, MessageSquare, RotateCcw } from "lucide-react";
+import { FolderOpen, Folder, Clock, ArrowRight, RotateCcw } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../stores/chat";
 import { WelcomeUsageCard } from "./WelcomeUsageCard";
-import { folderName, recentProjects } from "../lib/projects";
+import { folderName } from "../lib/projects";
 
 /**
  * In-line render of the app's "Crystallization" gem mark — same geometry
@@ -78,7 +78,6 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
   const { sessions, activeSession, draftSession, activeModel } = useChatStore();
 
   const scopeCwd = draftSession ? draftSession.cwd : activeSession?.cwd ?? null;
-  const projects = recentProjects(sessions ?? [], 6);
   // While drafting, the project tiles re-scope this blank conversation. The
   // "resume" list is kept visually and verbally separate below, because
   // conflating the two is what used to drop users into old history.
@@ -121,60 +120,35 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
           onOpenUsage={onOpenUsage}
         />
 
-        {/* Where should this new conversation work? Draft-only, and every
-            action here keeps you on THIS blank conversation. */}
+        {/* One quiet line, not a question you must answer first. A blank
+            conversation is always valid; attaching a folder is an option the
+            user reaches for when they happen to need one. */}
         {draftSession && onPickProject && (
-          <section className="space-y-2" aria-labelledby="welcome-scope-title">
-            <h2 id="welcome-scope-title" className="px-1 text-[11px] font-semibold tracking-wide text-gray-400">
-              这次在哪里干活
-            </h2>
-            <div className="grid grid-cols-1 gap-2 min-[520px]:grid-cols-2">
+          <div className="flex flex-wrap items-center gap-2 px-1 text-[11px] text-gray-500">
+            <span>{scopeCwd ? "这次在" : "没有指定目录，不会碰任何代码。"}</span>
+            {scopeCwd && (
+              <span className="inline-flex items-center gap-1 text-gray-300">
+                <Folder size={11} className="text-accent" />
+                <span className="max-w-[220px] truncate" title={scopeCwd}>{folderName(scopeCwd)}</span>
+                <span className="text-gray-500">里干活</span>
+              </span>
+            )}
+            <button
+              onClick={() => void browseForProject()}
+              className="inline-flex items-center gap-1 rounded text-accent transition-colors hover:underline"
+            >
+              <FolderOpen size={11} />
+              {scopeCwd ? "换一个目录" : "要在某个目录里干活？"}
+            </button>
+            {scopeCwd && (
               <button
                 onClick={() => onPickProject(null)}
-                aria-pressed={scopeCwd === null}
-                className={`flex items-center gap-2 rounded-lg border px-3 py-2.5 text-left transition-colors ${
-                  scopeCwd === null
-                    ? "border-accent/50 bg-accent/10"
-                    : "border-border bg-surface-1 hover:border-accent/40 hover:bg-surface-2"
-                }`}
+                className="rounded text-gray-500 transition-colors hover:text-gray-300 hover:underline"
               >
-                <MessageSquare size={13} className="shrink-0 text-gray-400" />
-                <span className="min-w-0 flex-1">
-                  <span className="block text-xs font-medium text-gray-100">独立任务</span>
-                  <span className="block text-[11px] text-gray-500">不使用项目，不碰任何代码</span>
-                </span>
+                取消
               </button>
-              {projects.map((project) => (
-                <button
-                  key={project.cwd}
-                  onClick={() => onPickProject(project.cwd)}
-                  aria-pressed={scopeCwd === project.cwd}
-                  title={project.cwd}
-                  className={`flex items-center gap-2 rounded-lg border px-3 py-2.5 text-left transition-colors ${
-                    scopeCwd === project.cwd
-                      ? "border-accent/50 bg-accent/10"
-                      : "border-border bg-surface-1 hover:border-accent/40 hover:bg-surface-2"
-                  }`}
-                >
-                  <Folder size={13} className="shrink-0 text-gray-400" />
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-xs font-medium text-gray-100">{project.name}</span>
-                    <span className="block text-[11px] text-gray-500">在这个项目里开新会话</span>
-                  </span>
-                </button>
-              ))}
-              <button
-                onClick={() => void browseForProject()}
-                className="flex items-center gap-2 rounded-lg border border-dashed border-border bg-surface-1 px-3 py-2.5 text-left transition-colors hover:border-accent/40 hover:bg-surface-2"
-              >
-                <FolderOpen size={13} className="shrink-0 text-gray-400" />
-                <span className="min-w-0 flex-1">
-                  <span className="block text-xs font-medium text-gray-100">选择其他目录…</span>
-                  <span className="block text-[11px] text-gray-500">打开一个还没用过的项目</span>
-                </span>
-              </button>
-            </div>
-          </section>
+            )}
+          </div>
         )}
 
         {/* Example prompts */}

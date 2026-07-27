@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Interaction tests for the Workspace SessionSidebar. The rail groups sessions
-// into projects ("where I work") and standalone tasks, and enforces the two
-// rules the old sidebar broke:
-//   - "+ 新建" always starts a BLANK conversation, never resumes one
-//   - clicking a PROJECT expands it; only a conversation row opens history
+// Interaction tests for the Workspace SessionSidebar: one recency-ordered
+// list where a folder only becomes a group after it holds a second
+// conversation, plus the two rules the old sidebar broke:
+//   - "+" always starts a BLANK conversation, never resumes one
+//   - clicking a FOLDER expands it; only a conversation row opens history
 // jsdom — no real Tauri backend, so the chat store is mocked.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -22,7 +22,7 @@ const mk = (over: Record<string, unknown>) => ({
 });
 
 // Two conversations in one project, one in another, plus a standalone task.
-const fakeChatState = {
+const fakeChatState: { sessions: ReturnType<typeof mk>[] } & Record<string, unknown> = {
   sessions: [
     mk({ id: "p1a", title: "CodeFactory 主线", cwd: "/code/CodeFactory", updated_at: 400 }),
     mk({ id: "q1", title: "改图脚本", cwd: "/home/.codefactory/quick/q1", updated_at: 300, kind: "quick" }),
@@ -57,40 +57,75 @@ describe("SessionSidebar", () => {
     mocks.loadSessions.mockResolvedValue(undefined);
   });
 
-  it("groups conversations under their project, newest project first", () => {
+  it("keeps one recency-ordered list with no imposed sections", () => {
     render(
       <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
     );
 
-    expect(screen.getByText("项目")).toBeInTheDocument();
+    // A folder used twice became a group; everything else stays a plain row.
     expect(screen.getByText("CodeFactory")).toBeInTheDocument();
-    expect(screen.getByText("ledger")).toBeInTheDocument();
-    expect(screen.getByText("独立任务")).toBeInTheDocument();
     expect(screen.getByText("改图脚本")).toBeInTheDocument();
+    expect(screen.getByText("记账 app")).toBeInTheDocument();
+    // No "项目 / 独立任务" headers telling the user to classify anything.
+    expect(screen.queryByText("项目")).not.toBeInTheDocument();
+    expect(screen.queryByText("独立任务")).not.toBeInTheDocument();
   });
 
-  it("expands the project holding the open conversation and collapses others", () => {
-    render(
-      <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
-    );
-
-    // The active project's conversations are visible…
-    expect(screen.getByText("CodeFactory 主线")).toBeInTheDocument();
-    expect(screen.getByText("CodeFactory 旧会话")).toBeInTheDocument();
-    // …and an unrelated project stays collapsed until asked.
-    expect(screen.queryByText("记账 app")).not.toBeInTheDocument();
-  });
-
-  it("clicking a project expands it instead of opening a conversation", () => {
+  it("leaves a folder used once as an ordinary row, not a group", () => {
     const onOpen = vi.fn();
     render(
       <SessionSidebar currentSessionId="p1a" onOpenSession={onOpen} onNewConversation={noop} />,
     );
 
-    fireEvent.click(screen.getByText("ledger"));
+    // /code/ledger holds a single conversation → the conversation itself is the
+    // row (the folder is only a subtitle), with nothing to expand and no
+    // per-folder action yet. Clicking it opens that conversation directly.
+    expect(screen.queryByLabelText("在 ledger 里新建会话")).not.toBeInTheDocument();
+    const row = screen.getByText("记账 app").closest('[role="button"]');
+    expect(row).not.toHaveAttribute("aria-expanded");
+
+    fireEvent.click(screen.getByText("记账 app"));
+    expect(onOpen).toHaveBeenCalledWith("p2");
+  });
+
+  it("grows a group as soon as a folder holds a second conversation", () => {
+    fakeChatState.sessions = [
+      ...fakeChatState.sessions,
+      mk({ id: "p2b", title: "记账 app 续", cwd: "/code/ledger", updated_at: 90 }),
+    ];
+    try {
+      render(
+        <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+      );
+
+      expect(screen.getByText("ledger")).toBeInTheDocument();
+      expect(screen.getByLabelText("在 ledger 里新建会话")).toBeInTheDocument();
+    } finally {
+      fakeChatState.sessions = fakeChatState.sessions.filter((s) => s.id !== "p2b");
+    }
+  });
+
+  it("expands the folder holding the open conversation", () => {
+    render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+    );
+
+    expect(screen.getByText("CodeFactory 主线")).toBeInTheDocument();
+    expect(screen.getByText("CodeFactory 旧会话")).toBeInTheDocument();
+  });
+
+  it("clicking a folder expands it instead of opening a conversation", () => {
+    const onOpen = vi.fn();
+    render(
+      <SessionSidebar currentSessionId="q1" onOpenSession={onOpen} onNewConversation={noop} />,
+    );
+
+    // CodeFactory holds two conversations, so it is a collapsed group here.
+    expect(screen.queryByText("CodeFactory 主线")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("CodeFactory"));
 
     expect(onOpen).not.toHaveBeenCalled();
-    expect(screen.getByText("记账 app")).toBeInTheDocument();
+    expect(screen.getByText("CodeFactory 主线")).toBeInTheDocument();
   });
 
   it("opens history only when a conversation row is clicked", () => {
@@ -126,17 +161,17 @@ describe("SessionSidebar", () => {
     expect(onNew).toHaveBeenCalledWith(null);
   });
 
-  it("starts a blank conversation scoped to a project from its row action", () => {
+  it("starts a blank conversation scoped to a folder from its group action", () => {
     const onNew = vi.fn();
     const onOpen = vi.fn();
     render(
       <SessionSidebar currentSessionId="p1a" onOpenSession={onOpen} onNewConversation={onNew} />,
     );
 
-    fireEvent.click(screen.getByLabelText("在 ledger 里新建会话"));
+    fireEvent.click(screen.getByLabelText("在 CodeFactory 里新建会话"));
 
-    // New conversation in that project — emphatically NOT its latest session.
-    expect(onNew).toHaveBeenCalledWith("/code/ledger");
+    // New conversation in that folder — emphatically NOT its latest session.
+    expect(onNew).toHaveBeenCalledWith("/code/CodeFactory");
     expect(onOpen).not.toHaveBeenCalled();
   });
 

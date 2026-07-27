@@ -99,12 +99,17 @@ function Shell() {
 }
 
 describe("picking a project never opens its history", () => {
+  /** What `list_sessions` returns — the sidebar refetches on mount, so tests
+   *  that need a second conversation in the folder must seed it here. */
+  let listed: (typeof projectSession)[] = [];
+
   beforeEach(() => {
+    listed = [projectSession];
     Object.values(mocks).forEach((m) => m.mockReset());
     mocks.onStream.mockResolvedValue(() => {});
     mocks.onSessionUpdated.mockResolvedValue(() => {});
     mocks.invoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === "list_sessions") return Promise.resolve([projectSession]);
+      if (cmd === "list_sessions") return Promise.resolve(listed);
       if (cmd === "get_session") {
         return args?.sessionId === projectSession.id
           ? Promise.resolve(projectSession)
@@ -138,20 +143,15 @@ describe("picking a project never opens its history", () => {
     useChatStore.getState().beginDraft();
   });
 
-  it("keeps the blank draft when a project is picked from the welcome screen", async () => {
-    const draftId = useChatStore.getState().draftSession?.id;
+  it("never asks the user to classify the work before starting it", async () => {
     render(<Shell />);
-    const scopeSection = await screen.findByRole("region", { name: "这次在哪里干活" });
+    await screen.findByRole("main", { name: "会话窗口" });
 
-    fireEvent.click(within(scopeSection).getByText("ledger"));
-
-    await waitFor(() => {
-      expect(useChatStore.getState().draftSession?.cwd).toBe("/code/ledger");
-    });
-    const state = useChatStore.getState();
-    // Same blank conversation, re-scoped — not the project's old session.
-    expect(state.draftSession?.id).toBe(draftId);
-    expect(state.activeSession).toBeNull();
+    // A blank conversation is immediately usable: no project/quick choice, no
+    // required directory, just one quiet line offering a folder if wanted.
+    expect(screen.queryByText("快速任务")).not.toBeInTheDocument();
+    expect(screen.getByText("没有指定目录，不会碰任何代码。")).toBeInTheDocument();
+    expect(screen.getByText("要在某个目录里干活？")).toBeInTheDocument();
     expect(screen.queryByText(HISTORY_LINE)).not.toBeInTheDocument();
     expect(mocks.invoke).not.toHaveBeenCalledWith("get_message_page", expect.anything());
   });
@@ -170,7 +170,10 @@ describe("picking a project never opens its history", () => {
     expect(screen.queryByText(HISTORY_LINE)).not.toBeInTheDocument();
   });
 
-  it("starts a NEW conversation from a project's sidebar + action", async () => {
+  it("starts a NEW conversation from a folder's sidebar + action", async () => {
+    // A second conversation in the folder is what grows it into a group.
+    listed = [projectSession, { ...projectSession, id: "s-older", updated_at: 0 }];
+    useChatStore.setState({ sessions: listed });
     render(<Shell />);
 
     fireEvent.click(await screen.findByLabelText("在 ledger 里新建会话"));
@@ -185,9 +188,8 @@ describe("picking a project never opens its history", () => {
   it("resumes history only from an explicit conversation row, and the shell follows", async () => {
     render(<Shell />);
 
-    // Expand the project, then click the conversation itself.
+    // A folder used once is the conversation row itself — click it to resume.
     const rail = await screen.findByRole("complementary", { name: "会话列表" });
-    fireEvent.click(within(rail).getByText("ledger"));
     fireEvent.click(within(rail).getByText("上一次的对话"));
 
     await screen.findByText(HISTORY_LINE);

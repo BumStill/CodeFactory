@@ -81,3 +81,44 @@ export function groupSessionsByProject(sessions: Session[]): SessionGrouping {
 export function recentProjects(sessions: Session[], limit = 8): ProjectGroup[] {
   return groupSessionsByProject(sessions).projects.slice(0, limit);
 }
+
+/** One row of the session rail: either a folder that grew a group of
+ *  conversations, or a single conversation. */
+export type RailEntry =
+  | { kind: "project"; project: ProjectGroup; sortKey: number }
+  | { kind: "session"; session: Session; projectName: string | null; sortKey: number };
+
+/**
+ * The session rail as ONE recency-ordered list, where a directory only becomes
+ * a collapsible group once it holds more than one conversation.
+ *
+ * The user never creates a project and is never asked to classify work up
+ * front: a project is what a directory *becomes* after they've worked in it
+ * twice. Anything used once stays a plain row. This keeps "project" a
+ * description of what happened rather than a concept imposed before starting —
+ * and if the useful boundary later turns out not to be a directory at all,
+ * only this function changes.
+ */
+export function buildSessionRail(sessions: Session[]): RailEntry[] {
+  const { projects, standalone } = groupSessionsByProject(sessions);
+  const entries: RailEntry[] = [];
+
+  for (const project of projects) {
+    if (project.sessions.length > 1) {
+      entries.push({ kind: "project", project, sortKey: project.updatedAt });
+    } else {
+      const session = project.sessions[0];
+      entries.push({
+        kind: "session",
+        session,
+        projectName: project.name,
+        sortKey: session.updated_at,
+      });
+    }
+  }
+  for (const session of standalone) {
+    entries.push({ kind: "session", session, projectName: null, sortKey: session.updated_at });
+  }
+
+  return entries.sort((a, b) => b.sortKey - a.sortKey);
+}

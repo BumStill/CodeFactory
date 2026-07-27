@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// SessionSidebar — the Workspace's left rail, organised the way users think:
+// SessionSidebar — the Workspace's left rail: ONE recency-ordered list of
+// conversations, where a directory quietly becomes a collapsible group once
+// it holds more than one of them.
 //
-//   项目/<name>            a place you work; expand to see its conversations
-//     └ conversation       one conversation inside that project
-//   独立任务                conversations with no project attached
+// Nobody creates a project here. There is no "new project" action and no
+// classification step: a project is simply what a folder *becomes* after you
+// have worked in it twice, and a folder used once stays an ordinary row. That
+// keeps the concept a description of what happened rather than a decision
+// forced before any work starts — and if the useful boundary later turns out
+// not to be a directory, only `lib/projects` changes.
 //
-// Two rules this rail exists to enforce:
+// Two rules this rail enforces:
 //
-//   1. "+ 新建" always opens a BLANK conversation. Picking a project (here or
-//      in the composer) only chooses where the new conversation works — it
-//      never re-opens an old one.
-//   2. Entering an existing conversation happens ONE way: clicking its row in
-//      this list. Clicking a project row expands it, nothing more.
-//
-// The app previously offered "新建快速任务 / 新建项目" as two species of task,
-// which forced the user to classify work before starting it and left project
-// history reachable from surfaces that looked like "start something new".
+//   1. "+" always opens a BLANK conversation. Picking a project (here or in
+//      the composer) only chooses where the new conversation works — it never
+//      re-opens an old one.
+//   2. Entering an existing conversation happens ONE way: clicking its row.
+//      Clicking a folder expands it, nothing more.
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Plus,
@@ -30,7 +31,7 @@ import {
 } from "lucide-react";
 import { useChatStore } from "../stores/chat";
 import { formatRelativeTime } from "../lib/time";
-import { groupSessionsByProject } from "../lib/projects";
+import { buildSessionRail } from "../lib/projects";
 import type { Session } from "../lib/tauri";
 
 interface SessionSidebarProps {
@@ -58,10 +59,7 @@ export function SessionSidebar({
     void loadSessions();
   }, []);
 
-  const { projects, standalone } = useMemo(
-    () => groupSessionsByProject(sessions),
-    [sessions],
-  );
+  const rail = useMemo(() => buildSessionRail(sessions), [sessions]);
   const draftActive = draftSession?.id === currentSessionId;
   const draftProject = draftActive ? draftSession?.cwd ?? null : null;
 
@@ -122,76 +120,53 @@ export function SessionSidebar({
           </div>
         )}
 
-        {projects.length === 0 && standalone.length === 0 ? (
+        {rail.length === 0 ? (
           <p className="px-2 py-8 text-center text-[11px] leading-relaxed text-gray-600">
             还没有会话
             <br />
             <span className="text-gray-700">点右上角「＋」开始</span>
           </p>
         ) : (
-          <div className="space-y-3">
-            {projects.length > 0 && (
-              <section aria-labelledby="session-group-projects">
-                <h2
-                  id="session-group-projects"
-                  className="px-2 pb-0.5 text-[9px] font-medium tracking-wide text-gray-600"
+          <ul className="space-y-0.5">
+            {rail.map((entry) =>
+              entry.kind === "project" ? (
+                <ProjectRow
+                  key={entry.project.cwd}
+                  name={entry.project.name}
+                  cwd={entry.project.cwd}
+                  count={entry.project.sessions.length}
+                  expanded={isExpanded(entry.project.cwd)}
+                  onToggle={() => toggleProject(entry.project.cwd)}
+                  onNewConversation={() => {
+                    setOverrides((prev) => ({ ...prev, [entry.project.cwd]: true }));
+                    onNewConversation(entry.project.cwd);
+                  }}
                 >
-                  项目
-                </h2>
-                <ul className="space-y-0.5">
-                  {projects.map((project) => (
-                    <ProjectRow
-                      key={project.cwd}
-                      name={project.name}
-                      cwd={project.cwd}
-                      count={project.sessions.length}
-                      expanded={isExpanded(project.cwd)}
-                      onToggle={() => toggleProject(project.cwd)}
-                      onNewConversation={() => {
-                        setOverrides((prev) => ({ ...prev, [project.cwd]: true }));
-                        onNewConversation(project.cwd);
-                      }}
-                    >
-                      {project.sessions.map((session) => (
-                        <SessionRow
-                          key={session.id}
-                          session={session}
-                          active={session.id === currentSessionId}
-                          nested
-                          onClick={() => onOpenSession(session.id)}
-                          onDelete={() => deleteSession(session.id)}
-                          onRename={(title) => renameSession(session.id, title)}
-                        />
-                      ))}
-                    </ProjectRow>
-                  ))}
-                </ul>
-              </section>
-            )}
-
-            {standalone.length > 0 && (
-              <section aria-labelledby="session-group-standalone">
-                <h2
-                  id="session-group-standalone"
-                  className="px-2 pb-0.5 text-[9px] font-medium tracking-wide text-gray-600"
-                >
-                  独立任务
-                </h2>
-                <ul className="space-y-0.5">
-                  {standalone.map((session) => (
+                  {entry.project.sessions.map((session) => (
                     <SessionRow
                       key={session.id}
                       session={session}
                       active={session.id === currentSessionId}
+                      nested
                       onClick={() => onOpenSession(session.id)}
                       onDelete={() => deleteSession(session.id)}
                       onRename={(title) => renameSession(session.id, title)}
                     />
                   ))}
-                </ul>
-              </section>
+                </ProjectRow>
+              ) : (
+                <SessionRow
+                  key={entry.session.id}
+                  session={entry.session}
+                  active={entry.session.id === currentSessionId}
+                  projectName={entry.projectName}
+                  onClick={() => onOpenSession(entry.session.id)}
+                  onDelete={() => deleteSession(entry.session.id)}
+                  onRename={(title) => renameSession(entry.session.id, title)}
+                />
+              ),
             )}
-          </div>
+          </ul>
         )}
       </div>
     </div>
@@ -262,6 +237,7 @@ function SessionRow({
   session,
   active,
   nested = false,
+  projectName = null,
   onClick,
   onDelete,
   onRename,
@@ -269,6 +245,8 @@ function SessionRow({
   session: Session;
   active: boolean;
   nested?: boolean;
+  /** Folder this conversation ran in, when it isn't already under one. */
+  projectName?: string | null;
   onClick: () => void;
   onDelete: () => void;
   onRename: (title: string) => void;
@@ -429,9 +407,9 @@ function SessionRow({
           )}
         </div>
         <div className="mt-0.5 flex min-w-0 items-center gap-1 pl-[18px] text-[9px] text-gray-600">
-          {!nested && session.kind !== "quick" && (
+          {!nested && projectName && (
             <>
-              <span className="truncate">{session.cwd?.split(/[/\\]/).pop() || "项目"}</span>
+              <span className="truncate">{projectName}</span>
               <span aria-hidden="true">·</span>
             </>
           )}

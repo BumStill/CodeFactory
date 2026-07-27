@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from "vitest";
-import { folderName, groupSessionsByProject, recentProjects } from "./projects";
+import { buildSessionRail, folderName, groupSessionsByProject, recentProjects } from "./projects";
 import type { Session } from "./tauri";
 
 const mk = (over: Partial<Session> & { id: string }): Session => ({
@@ -80,5 +80,48 @@ describe("recentProjects", () => {
     const picked = recentProjects(sessions, 3);
 
     expect(picked.map((p) => p.name)).toEqual(["p9", "p8", "p7"]);
+  });
+});
+
+describe("buildSessionRail", () => {
+  it("keeps one recency-ordered list mixing folders and conversations", () => {
+    const rail = buildSessionRail([
+      mk({ id: "a1", cwd: "/code/a", updated_at: 400 }),
+      mk({ id: "q1", cwd: "/scratch/q1", kind: "quick", updated_at: 300 }),
+      mk({ id: "a2", cwd: "/code/a", updated_at: 200 }),
+      mk({ id: "b1", cwd: "/code/b", updated_at: 100 }),
+    ]);
+
+    // /code/a has two conversations → a group, ordered by its newest child.
+    expect(rail.map((e) => (e.kind === "project" ? e.project.name : e.session.id))).toEqual([
+      "a",
+      "q1",
+      "b1",
+    ]);
+  });
+
+  it("leaves a folder used once as a plain conversation row", () => {
+    const rail = buildSessionRail([mk({ id: "b1", cwd: "/code/b" })]);
+
+    expect(rail).toHaveLength(1);
+    expect(rail[0].kind).toBe("session");
+    expect(rail[0].kind === "session" && rail[0].projectName).toBe("b");
+  });
+
+  it("grows that folder into a group as soon as it holds a second one", () => {
+    const rail = buildSessionRail([
+      mk({ id: "b1", cwd: "/code/b", updated_at: 2 }),
+      mk({ id: "b2", cwd: "/code/b", updated_at: 1 }),
+    ]);
+
+    expect(rail).toHaveLength(1);
+    expect(rail[0].kind).toBe("project");
+    expect(rail[0].kind === "project" && rail[0].project.sessions).toHaveLength(2);
+  });
+
+  it("marks a standalone conversation with no folder at all", () => {
+    const rail = buildSessionRail([mk({ id: "q1", cwd: "/scratch/q1", kind: "quick" })]);
+
+    expect(rail[0].kind === "session" && rail[0].projectName).toBeNull();
   });
 });
