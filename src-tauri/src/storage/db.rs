@@ -583,11 +583,57 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         .execute(pool)
         .await?;
 
+    // Completion-gate control events. The gate injects prompts to make the
+    // loop keep working; those are framework instructions, never conversation.
+    // Keeping them in `messages` made them role=user rows that had to be
+    // filtered out of replay, out of the transcript, out of user-turn paging
+    // and out of intent extraction — and one missed filter once turned an
+    // internal notice into the next turn's completion instruction. They live
+    // here instead, where nothing has to defend against them.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS gate_events (
+            id          TEXT PRIMARY KEY,
+            session_id  TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            content     TEXT NOT NULL DEFAULT '',
+            created_at  INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_gate_events_session ON gate_events(session_id, kind)",
+    )
+    .execute(pool)
+    .await?;
+
     // ── Per-column adds for messages — covers the v0.3.7 regression and
     //    any prior divergence between code and old DBs.
     ensure_column(pool, "messages", "tool_calls", "TEXT").await?;
     ensure_column(pool, "messages", "reasoning_content", "TEXT").await?;
     ensure_column(pool, "messages", "completion_state", "TEXT").await?;
+
+    // The turn-notice dedup check filters by (session_id, completion_state)
+    // before its LIKE, so this turns a full conversation scan per turn into an
+    // index seek over the handful of notice rows.
+    //
+    // Two ordering constraints: it must follow the ensure_column above
+    // (`completion_state` is not in 0001_init.sql), and it must tolerate a
+    // `messages` table that predates `session_id` — ensure_schema's whole job
+    // is surviving whatever historical schema the user actually has, so it
+    // checks rather than assumes.
+    let message_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('messages')")
+            .fetch_all(pool)
+            .await?;
+    if message_columns.iter().any(|c| c == "session_id") {
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session_completion_state \
+             ON messages(session_id, completion_state)",
+        )
+        .execute(pool)
+        .await?;
+    }
 
     // ── task_runs has a verification_results JSON column referenced by
     //    the verification engine. Some older DBs and all fresh installs
@@ -1150,6 +1196,18 @@ mod tests {
             cols.contains(&"completion_state".to_string()),
             "ensure_schema must add completion_state column. Got: {cols:?}"
         );
+
+        // Gate control events get their own table, and the index over
+        // messages(session_id, completion_state) must survive the fact that
+        // completion_state is added by ALTER, not by 0001_init.sql.
+        let objects: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE name IN \
+             ('gate_events','idx_gate_events_session','idx_messages_session_completion_state')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(objects.len(), 3, "gate_events + both indexes. Got: {objects:?}");
 
         // The seeded row's data must survive the ALTER TABLE.
         let role: String = sqlx::query_scalar("SELECT role FROM messages WHERE id='m1'")
