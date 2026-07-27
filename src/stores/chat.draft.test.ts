@@ -127,6 +127,33 @@ describe("lazy draft session", () => {
     );
   });
 
+  it("lands on a blank draft in the same project after deleting the open conversation", async () => {
+    // The workspace renders whatever the store says is open, so deleting the
+    // conversation you are IN must leave something behind — otherwise the shell
+    // has nothing to show at all.
+    const open = { ...materialized, id: "open", cwd: "/Users/x/project", kind: "project" as const };
+    useChatStore.setState({ sessions: [open], activeSession: open, draftSession: null });
+
+    await useChatStore.getState().deleteSession("open");
+
+    const state = useChatStore.getState();
+    expect(state.sessions).toEqual([]);
+    expect(state.activeSession).toBeNull();
+    expect(state.draftSession?.cwd).toBe("/Users/x/project");
+  });
+
+  it("leaves the open conversation alone when a different one is deleted", async () => {
+    const open = { ...materialized, id: "open" };
+    const other = { ...materialized, id: "other" };
+    useChatStore.setState({ sessions: [open, other], activeSession: open, draftSession: null });
+
+    await useChatStore.getState().deleteSession("other");
+
+    const state = useChatStore.getState();
+    expect(state.activeSession?.id).toBe("open");
+    expect(state.draftSession).toBeNull();
+  });
+
   it("falls back to a blank draft when a session id can no longer be opened", async () => {
     // A stale id used to leave the workspace pointing at a session that isn't
     // there: the rejection went unhandled and the PREVIOUS conversation stayed

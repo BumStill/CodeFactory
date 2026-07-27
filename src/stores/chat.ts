@@ -487,6 +487,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   deleteSession: async (id) => {
+    const deleted = findSession(get(), id);
+    const wasActive = get().activeSession?.id === id;
     await invoke("delete_session", { sessionId: id });
     get()._unlisten[id]?.();
     get()._unlistenSessionUpdated[id]?.();
@@ -508,6 +510,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         ...(s.activeSession?.id === id ? { activeSession: null } : {}),
       };
     });
+    // The workspace shows whatever the store says is open, so deleting the
+    // conversation you are *in* has to leave something behind — otherwise the
+    // shell has nothing to render. Land on a blank one, scoped to the same
+    // project so the user stays where they were working.
+    if (wasActive) {
+      get().beginDraft({ cwd: deleted?.kind === "quick" ? null : deleted?.cwd ?? null });
+    }
   },
 
   renameSession: async (id, title) => {
