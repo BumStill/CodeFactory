@@ -164,9 +164,6 @@ pub trait Budget: Send + Sync {
     }
 }
 
-/// Always permits another round — the desktop loop bounds itself with the
-/// iteration ceiling (`for iteration in 0..max_iterations`), so it carries this
-/// for the shared `LoopServices` contract without consuming it (slice 4.6b).
 /// Swallows every write. The eval sidecar has no database and the desktop's
 /// anonymous runs have nothing to write either, so both carry this rather than
 /// branching inside the shared loop (slice 4.8).
@@ -234,6 +231,9 @@ impl Persistence for NullPersistence {
     }
 }
 
+/// Always permits another round — the desktop loop bounds itself with the
+/// iteration ceiling (`for iteration in 0..max_iterations`), so it carries this
+/// for the shared `LoopServices` contract without consuming it (slice 4.6b).
 pub struct NullBudget;
 
 impl Budget for NullBudget {
