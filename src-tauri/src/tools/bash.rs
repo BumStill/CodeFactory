@@ -411,46 +411,99 @@ mod tests {
         assert!(output.content.contains("exit_code=0"));
     }
 
+    /// Polls until the backgrounded descendant has recorded its pid, or
+    /// `deadline` passes. Commands run through a LOGIN shell (`zsh -lc`), so
+    /// profile startup plus two forks sit between the spawn and that write —
+    /// ~30ms on an idle machine but ~250ms under load.
+    #[cfg(unix)]
+    async fn wait_for_recorded_pid(pid_path: &std::path::Path, deadline: Duration) -> Option<i32> {
+        let start = std::time::Instant::now();
+        loop {
+            // A torn read of a half-written file parses as a different, live
+            // pid, so only accept a line `echo` has already terminated.
+            if let Some(pid) = std::fs::read_to_string(pid_path)
+                .ok()
+                .filter(|raw| raw.ends_with('\n'))
+                .and_then(|raw| raw.trim().parse::<i32>().ok())
+            {
+                return Some(pid);
+            }
+            if start.elapsed() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Waits for `pid` to leave the process table, reporting whether it did so
+    /// inside `deadline`. `kill(pid, 0)` still answers 0 for a process that has
+    /// been SIGKILLed but not yet torn down — on macOS it shows as `E`/exiting,
+    /// already reparented to pid 1 — and that teardown window is microseconds
+    /// wide, so a single sample lands inside it under load. A descendant that
+    /// genuinely survived stays alive for its whole `sleep 30`, so waiting for
+    /// the exit proves the same thing without racing teardown.
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: i32, deadline: Duration) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            if start.elapsed() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timeout_terminates_descendants_in_the_shell_process_group() {
+        // Two separate races used to make this flake under a loaded parallel
+        // run, neither of which says anything about group termination:
+        //
+        //   1. The descendant raced the timeout. If the kill fired before `sh`
+        //      was spawned into the process group, it survived and wrote its
+        //      pid afterwards. #213 widened the budget to 2s for this; the
+        //      window here stays comfortably clear of `sleep 30`, and the pid
+        //      is now waited for rather than assumed.
+        //   2. The liveness probe raced teardown — see wait_for_process_exit.
+        //      This one outlived #213: at 2s the test still failed 7/8 under
+        //      load, every time with "survived", because a killed descendant
+        //      still answers kill(pid, 0) for a few microseconds.
+        //
+        // Both are now waited out instead of assumed, so the timeout path
+        // under test is unchanged and the assertions below mean what they say.
+        const RUN_TIMEOUT: Duration = Duration::from_secs(3);
+
         let cwd = std::env::temp_dir().join(format!("codefactory-bash-timeout-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&cwd).expect("create cwd");
         let pid_path = cwd.join("descendant.pid");
         let command = format!("sh -c 'echo $$ > {}; sleep 30' & wait", pid_path.display());
 
-        // Pre-existing flake (~25% under a loaded parallel run, on main too):
-        // the descendant raced the timeout. If the kill fired before `sh` was
-        // spawned into the process group, the descendant survived it and then
-        // wrote its pid afterwards — surfacing as either a missing pid file or
-        // a "survived" assertion, depending on when the read landed.
-        //
-        // Neither outcome says anything about group termination, which is what
-        // this test is for. A 2s budget is still far below `sleep 30`, so the
-        // timeout path under test is unchanged — the descendant is simply
-        // reliably running by the time the group is killed.
+        let recorded_pid = tokio::spawn({
+            let pid_path = pid_path.clone();
+            async move { wait_for_recorded_pid(&pid_path, RUN_TIMEOUT).await }
+        });
+
         let output = execute_with_timeout(
             json!({"command": command}),
             &ExecCtx::new(cwd.clone(), None),
-            Duration::from_secs(2),
+            RUN_TIMEOUT,
         )
         .await
         .expect("tool returns timeout output");
 
-        let pid = std::fs::read_to_string(&pid_path)
-            .expect("descendant pid written")
-            .trim()
-            .parse::<i32>()
-            .expect("numeric descendant pid");
-        let process_exists = unsafe { libc::kill(pid, 0) } == 0;
+        let pid = recorded_pid
+            .await
+            .expect("pid watcher task")
+            .expect("descendant never recorded its pid inside the run window");
+        let exited = wait_for_process_exit(pid, Duration::from_secs(2)).await;
         let _ = std::fs::remove_dir_all(cwd);
 
         assert!(output.is_error);
         assert!(output.content.contains("Command timed out"));
-        assert!(
-            !process_exists,
-            "timed-out descendant process {pid} survived"
-        );
+        assert!(exited, "timed-out descendant process {pid} survived");
     }
 
     #[cfg(unix)]
