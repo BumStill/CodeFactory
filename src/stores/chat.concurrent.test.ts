@@ -58,7 +58,6 @@ beforeEach(() => {
   for (const k of Object.keys(streamHandlers)) delete streamHandlers[k];
   useChatStore.setState({
     sessions: [A, B] as never,
-    quickSessions: [],
     activeSession: A as never,
     runtime: { A: freshRuntime(), B: freshRuntime() },
     _unlisten: {},

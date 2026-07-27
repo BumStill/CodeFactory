@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-import { FolderOpen, Clock, ArrowRight } from "lucide-react";
+import { FolderOpen, Folder, Clock, ArrowRight, RotateCcw } from "lucide-react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../stores/chat";
 import { WelcomeUsageCard } from "./WelcomeUsageCard";
+import { folderName } from "../lib/projects";
 
 /**
  * In-line render of the app's "Crystallization" gem mark — same geometry
@@ -38,6 +40,12 @@ interface Props {
   onUsePrompt?: (text: string) => void;
   /** Opens Settings directly on the first-class usage dashboard. */
   onOpenUsage?: () => void;
+  /** Resume an existing conversation. Always an explicit, labelled act — this
+   *  screen must never move the user into old history as a side effect. */
+  onOpenSession?: (id: string) => void;
+  /** Re-scope the current draft to a project directory (null = standalone).
+   *  Only meaningful while the conversation is still a draft. */
+  onPickProject?: (cwd: string | null) => void;
 }
 
 // Curated short prompts that hint at what the agent can do, mostly bias
@@ -66,13 +74,24 @@ const EXAMPLES: { title: string; prompt: string }[] = [
   },
 ];
 
-export function WelcomeScreen({ onUsePrompt, onOpenUsage }: Props) {
-  const { sessions, activeSession, activeModel, selectSession } = useChatStore();
+export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickProject }: Props) {
+  const { sessions, activeSession, draftSession, activeModel } = useChatStore();
 
-  // Show up to 4 most recent sessions other than the currently-active one.
-  const recentSessions = sessions
+  const scopeCwd = draftSession ? draftSession.cwd : activeSession?.cwd ?? null;
+  // While drafting, the project tiles re-scope this blank conversation. The
+  // "resume" list is kept visually and verbally separate below, because
+  // conflating the two is what used to drop users into old history.
+  const scopedSessions = scopeCwd
+    ? (sessions ?? []).filter((s) => s.cwd === scopeCwd && s.id !== activeSession?.id)
+    : [];
+  const recentSessions = (sessions ?? [])
     .filter((s) => s.id !== activeSession?.id)
     .slice(0, 4);
+
+  const browseForProject = async () => {
+    const dir = await openDialog({ directory: true, title: "选择项目目录" });
+    if (dir) onPickProject?.(dir as string);
+  };
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -101,6 +120,37 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage }: Props) {
           onOpenUsage={onOpenUsage}
         />
 
+        {/* One quiet line, not a question you must answer first. A blank
+            conversation is always valid; attaching a folder is an option the
+            user reaches for when they happen to need one. */}
+        {draftSession && onPickProject && (
+          <div className="flex flex-wrap items-center gap-2 px-1 text-[11px] text-gray-500">
+            <span>{scopeCwd ? "这次在" : "没有指定目录，不会碰任何代码。"}</span>
+            {scopeCwd && (
+              <span className="inline-flex items-center gap-1 text-gray-300">
+                <Folder size={11} className="text-accent" />
+                <span className="max-w-[220px] truncate" title={scopeCwd}>{folderName(scopeCwd)}</span>
+                <span className="text-gray-500">里干活</span>
+              </span>
+            )}
+            <button
+              onClick={() => void browseForProject()}
+              className="inline-flex items-center gap-1 rounded text-accent transition-colors hover:underline"
+            >
+              <FolderOpen size={11} />
+              {scopeCwd ? "换一个目录" : "要在某个目录里干活？"}
+            </button>
+            {scopeCwd && (
+              <button
+                onClick={() => onPickProject(null)}
+                className="rounded text-gray-500 transition-colors hover:text-gray-300 hover:underline"
+              >
+                取消
+              </button>
+            )}
+          </div>
+        )}
+
         {/* Example prompts */}
         <section className="space-y-2" aria-labelledby="welcome-suggestions-title">
           <h2 id="welcome-suggestions-title" className="px-1 text-[11px] font-semibold tracking-wide text-gray-400">可以试试</h2>
@@ -126,24 +176,41 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage }: Props) {
           </div>
         </section>
 
-        {/* Recent sessions */}
-        {recentSessions.length > 0 && (
+        {/* Resume — deliberately the only path back into old history, and it
+            says so. Everything above starts something new. */}
+        {onOpenSession && (scopedSessions.length > 0 || recentSessions.length > 0) && (
           <div className="space-y-2">
             <div className="text-[11px] uppercase tracking-wider text-gray-600 font-semibold px-1 flex items-center gap-1.5">
               <Clock size={11} />
-              最近会话
+              继续之前的会话
             </div>
+            {scopedSessions.length > 0 && (
+              <button
+                onClick={() => onOpenSession(scopedSessions[0].id)}
+                className="w-full rounded border border-border bg-surface-1 px-3 py-2 text-left transition-colors hover:bg-surface-2"
+              >
+                <div className="flex items-center gap-2">
+                  <RotateCcw size={11} className="shrink-0 text-accent" />
+                  <span className="min-w-0 flex-1 truncate text-xs text-gray-200">
+                    接着上次说：{scopedSessions[0].title || "未命名会话"}
+                  </span>
+                  <span className="shrink-0 text-[10px] text-gray-600">
+                    {folderName(scopedSessions[0].cwd)}
+                  </span>
+                </div>
+              </button>
+            )}
             <div className="space-y-1">
               {recentSessions.map((s) => (
                 <button
                   key={s.id}
-                  onClick={() => selectSession(s.id)}
+                  onClick={() => onOpenSession(s.id)}
                   className="w-full text-left rounded border border-border bg-surface-1 hover:bg-surface-2 px-3 py-1.5 transition-colors"
                 >
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-gray-300 truncate flex-1">{s.title || "未命名"}</span>
                     <span className="text-[10px] text-gray-600 font-mono truncate max-w-[140px]" title={s.cwd}>
-                      {s.cwd.split(/[\\/]/).pop()}
+                      {s.kind === "quick" ? "独立任务" : folderName(s.cwd)}
                     </span>
                   </div>
                 </button>

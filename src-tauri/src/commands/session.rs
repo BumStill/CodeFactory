@@ -105,18 +105,21 @@ async fn materialize_session_and_first_message(
     Ok(session)
 }
 
+/// Turn a frontend draft into a real session on its first message.
+///
+/// A draft has exactly ONE dimension the user controls: does it have a project
+/// directory or not. `cwd = Some(dir)` → a project session that works inside
+/// that directory; `cwd = None` → a standalone task with its own scratch dir.
+/// There is no separate "quick task" species the user has to choose up front —
+/// `kind` is *derived* here, never asked for.
 #[tauri::command]
 pub async fn materialize_draft_session(
     draft_id: String,
-    mode: String,
     cwd: Option<String>,
     model_id: String,
     first_message: String,
     state: State<'_, AppState>,
 ) -> Result<Session, AppError> {
-    if mode != "quick" && mode != "project" {
-        return Err(AppError::Other(format!("Unsupported draft mode '{mode}'")));
-    }
     if first_message.trim().is_empty() {
         return Err(AppError::Other("First message cannot be empty".into()));
     }
@@ -129,31 +132,33 @@ pub async fn materialize_draft_session(
         ))
     })?;
 
-    let resolved_cwd = if mode == "project" {
-        let path = cwd
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| AppError::Other("Project draft requires a working directory".into()))?;
-        let path_buf = std::path::PathBuf::from(&path);
-        if !path_buf.is_dir() {
-            return Err(AppError::Other(format!(
-                "Project directory does not exist: {path}"
-            )));
+    let project_cwd = cwd.filter(|value| !value.trim().is_empty());
+    let (kind, resolved_cwd) = match project_cwd {
+        Some(path) => {
+            let path_buf = std::path::PathBuf::from(&path);
+            if !path_buf.is_dir() {
+                return Err(AppError::Other(format!(
+                    "Project directory does not exist: {path}"
+                )));
+            }
+            ("project", path)
         }
-        path
-    } else {
-        let home =
-            dirs::home_dir().ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
-        let quick_dir = home.join(".codefactory").join("quick").join(&draft_id);
-        std::fs::create_dir_all(&quick_dir)
-            .map_err(|error| AppError::Other(format!("create quick-task dir failed: {error}")))?;
-        quick_dir.to_string_lossy().to_string()
+        None => {
+            let home = dirs::home_dir()
+                .ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
+            let scratch_dir = home.join(".codefactory").join("quick").join(&draft_id);
+            std::fs::create_dir_all(&scratch_dir).map_err(|error| {
+                AppError::Other(format!("create standalone-task dir failed: {error}"))
+            })?;
+            ("quick", scratch_dir.to_string_lossy().to_string())
+        }
     };
 
     let pool = state.db.read().await;
     materialize_session_and_first_message(
         &pool,
         &draft_id,
-        &mode,
+        kind,
         &resolved_cwd,
         &settings.default_endpoint,
         &resolved_model,
@@ -164,135 +169,21 @@ pub async fn materialize_draft_session(
     .await
 }
 
+/// Every session the user owns, newest first — project-scoped and standalone
+/// alike. The two used to be fetched separately (`list_sessions` +
+/// `list_quick_sessions`) and re-merged in the frontend, which is what made
+/// "quick task" look like a different species of thing. It isn't: the sidebar
+/// groups by project directory, so one ordered list is all it needs.
+///
+/// Subagent-spawned children stay excluded — those are machinery, not sessions
+/// the user opened.
 #[tauri::command]
 pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Session>, AppError> {
     let pool = state.db.read().await;
-    // Filter out subagent-spawned child sessions AND ephemeral quick-task
-    // sessions; the home page Recent Projects list should only show
-    // "real" project sessions the user explicitly created.
     let sessions = sqlx::query_as::<_, Session>(
         "SELECT * FROM sessions \
-         WHERE parent_session_id IS NULL AND kind != 'quick' \
-         ORDER BY updated_at DESC LIMIT 100",
-    )
-    .fetch_all(&*pool)
-    .await?;
-    Ok(sessions)
-}
-
-/// Return the single persistent Quick Task session, creating it on first
-/// use. The cwd lives under the user's home so the AI has a safe scratch
-/// area (created on demand). Reused across visits — the user gets a
-/// continuous "scratch chat" history that doesn't pollute Recent Projects.
-#[tauri::command]
-pub async fn get_or_create_quick_session(
-    model_id: String,
-    state: State<'_, AppState>,
-) -> Result<Session, AppError> {
-    // Try to find an existing quick session first.
-    {
-        let pool = state.db.read().await;
-        if let Ok(existing) = sqlx::query_as::<_, Session>(
-            "SELECT * FROM sessions WHERE kind = 'quick' ORDER BY updated_at DESC LIMIT 1",
-        )
-        .fetch_one(&*pool)
-        .await
-        {
-            return Ok(existing);
-        }
-    }
-
-    // Create one. cwd = ~/.codefactory/quick — auto-mkdir so the agent's
-    // working directory is valid and write tools have a safe home.
-    let home = dirs::home_dir().ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
-    let quick_dir = home.join(".codefactory").join("quick");
-    std::fs::create_dir_all(&quick_dir)
-        .map_err(|e| AppError::Other(format!("create quick-task dir failed: {e}")))?;
-
-    let settings = state.settings.read().await.clone();
-    let model_id = resolve_new_session_model(&settings, &model_id).ok_or_else(|| {
-        AppError::Other(format!(
-            "No model configured for endpoint '{}'. Please choose a model in the picker.",
-            settings.default_endpoint
-        ))
-    })?;
-
-    let id = Uuid::new_v4().to_string();
-    let now = Utc::now().timestamp_millis();
-    let pool = state.db.read().await;
-    sqlx::query(
-        "INSERT INTO sessions
-         (id, title, cwd, endpoint_id, model_id, model_policy, created_at, updated_at, kind) \
-         VALUES (?,?,?,?,?,?,?,?,'quick')",
-    )
-    .bind(&id)
-    .bind("快速任务")
-    .bind(quick_dir.to_string_lossy().to_string())
-    .bind(&settings.default_endpoint)
-    .bind(&model_id)
-    .bind(new_session_model_policy(&settings))
-    .bind(now)
-    .bind(now)
-    .execute(&*pool)
-    .await?;
-
-    let session = sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = ?")
-        .bind(&id)
-        .fetch_one(&*pool)
-        .await?;
-    Ok(session)
-}
-
-/// Create a *fresh* Quick Task session. Multi-session: each gets its own
-/// scratch dir `~/.codefactory/quick/<id>`. Unlike get_or_create_quick_session
-/// this never reuses an existing one — it's the "new quick task" action.
-#[tauri::command]
-pub async fn create_quick_session(
-    model_id: String,
-    state: State<'_, AppState>,
-) -> Result<Session, AppError> {
-    let settings = state.settings.read().await.clone();
-    let resolved_model = resolve_new_session_model(&settings, &model_id).ok_or_else(|| {
-        AppError::Other(format!(
-            "No model configured for endpoint '{}'. Please choose a model in the picker.",
-            settings.default_endpoint
-        ))
-    })?;
-    let id = Uuid::new_v4().to_string();
-    let home = dirs::home_dir().ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
-    let quick_dir = home.join(".codefactory").join("quick").join(&id);
-    std::fs::create_dir_all(&quick_dir)
-        .map_err(|e| AppError::Other(format!("create quick-task dir failed: {e}")))?;
-    let now = Utc::now().timestamp_millis();
-    let pool = state.db.read().await;
-    sqlx::query(
-        "INSERT INTO sessions
-         (id, title, cwd, endpoint_id, model_id, model_policy, created_at, updated_at, kind) \
-         VALUES (?,?,?,?,?,?,?,?,'quick')",
-    )
-    .bind(&id)
-    .bind("快速任务")
-    .bind(quick_dir.to_string_lossy().to_string())
-    .bind(&settings.default_endpoint)
-    .bind(&resolved_model)
-    .bind(new_session_model_policy(&settings))
-    .bind(now)
-    .bind(now)
-    .execute(&*pool)
-    .await?;
-    let session = sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = ?")
-        .bind(&id)
-        .fetch_one(&*pool)
-        .await?;
-    Ok(session)
-}
-
-/// List Quick Task sessions (most-recent first) for the quick-session switcher.
-#[tauri::command]
-pub async fn list_quick_sessions(state: State<'_, AppState>) -> Result<Vec<Session>, AppError> {
-    let pool = state.db.read().await;
-    let sessions = sqlx::query_as::<_, Session>(
-        "SELECT * FROM sessions WHERE kind = 'quick' ORDER BY updated_at DESC LIMIT 50",
+         WHERE parent_session_id IS NULL \
+         ORDER BY updated_at DESC LIMIT 200",
     )
     .fetch_all(&*pool)
     .await?;

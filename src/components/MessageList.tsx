@@ -29,6 +29,10 @@ interface Props {
   /** Called when the user picks an example prompt from the welcome screen. */
   onUsePrompt?: (text: string) => void;
   onOpenUsage?: () => void;
+  /** Resume an existing conversation from the empty-state welcome screen. */
+  onOpenSession?: (id: string) => void;
+  /** Re-scope the current draft to a project directory (null = standalone). */
+  onPickProject?: (cwd: string | null) => void;
   conversationKey?: string | null;
   hasOlderHistory?: boolean;
   loadingOlderHistory?: boolean;
@@ -227,6 +231,8 @@ export function MessageList({
   cwd,
   onUsePrompt,
   onOpenUsage,
+  onOpenSession,
+  onPickProject,
   conversationKey,
   hasOlderHistory = false,
   loadingOlderHistory = false,
@@ -263,7 +269,14 @@ export function MessageList({
   }, [onLoadOlder, prepareForPrepend, scrollerRef]);
 
   if (messages.length === 0) {
-    return <WelcomeScreen onUsePrompt={onUsePrompt} onOpenUsage={onOpenUsage} />;
+    return (
+      <WelcomeScreen
+        onUsePrompt={onUsePrompt}
+        onOpenUsage={onOpenUsage}
+        onOpenSession={onOpenSession}
+        onPickProject={onPickProject}
+      />
+    );
   }
 
   const visible = messages.filter(

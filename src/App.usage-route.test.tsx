@@ -4,8 +4,6 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 
-const draft = { id: "draft-start", mode: "quick", cwd: null, modelId: "test-model", text: "" };
-
 vi.mock("./pages/Workspace/WorkspacePage", () => ({
   WorkspacePage: ({
     sessionId,
@@ -49,9 +47,10 @@ vi.mock("./stores/settings", () => ({
   useSettingsStore: (selector: (state: { load: () => void; settings: { onboarded: boolean } }) => unknown) =>
     selector({ load: vi.fn(), settings: { onboarded: true } }),
 }));
-vi.mock("./stores/chat", () => ({
-  useChatStore: () => ({ draftSession: null, beginQuickDraft: vi.fn(() => draft) }),
-}));
+vi.mock("./stores/chat", async () => {
+  const { createFakeChatModule } = await import("./test-utils/fakeChatStore");
+  return createFakeChatModule();
+});
 vi.mock("./stores/chatgptCatalog", () => ({ syncChatGptCatalog: vi.fn() }));
 
 describe("App usage drill-down routing", () => {

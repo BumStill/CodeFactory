@@ -25,7 +25,6 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
 const fakeChatState = {
   sessions: [] as unknown[],
-  quickSessions: [] as unknown[],
   activeSession: { id: "s1", kind: "project", cwd: "/Users/x/proj", title: "proj" },
   activeDraft: null,
   messages: [] as unknown[],
@@ -42,7 +41,6 @@ const fakeChatState = {
   updateActiveSessionModel: vi.fn(),
   createSession: vi.fn(),
   loadSessions: vi.fn(),
-  loadQuickSessions: vi.fn(),
   inputTokenTotal: 0,
   outputTokenTotal: 0,
 };
@@ -134,7 +132,7 @@ const renderWorkspace = (onOpenSettings = vi.fn()) =>
     ...render(
       <WorkspacePage
         sessionId="s1"
-        onBackHome={() => {}}
+        onNewConversation={() => {}}
         onOpenSettings={onOpenSettings}
         onOpenSession={() => {}}
       />,

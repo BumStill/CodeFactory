@@ -36,11 +36,20 @@ export interface QueuedMessage {
 }
 
 /** A conversation shell that exists only in frontend memory until the first
- * real message is submitted. It must never be passed to backend session APIs. */
+ * real message is submitted. It must never be passed to backend session APIs.
+ *
+ * A draft has exactly two switches, both changeable right up to the moment the
+ * first message is sent:
+ *   • `cwd`       — which project directory to work in (null = standalone task)
+ *   • `anonymous` — leave no trace (never persisted, never listed)
+ *
+ * There is deliberately no "kind" here. Picking a project is choosing *where*
+ * this conversation works, never *which* conversation to open — that
+ * distinction is the whole point of the draft. */
 export interface DraftSession {
   id: string;
-  mode: "quick" | "project";
   cwd: string | null;
+  anonymous: boolean;
   modelId: string;
   text: string;
 }
@@ -122,12 +131,18 @@ export function freshRuntime(
 }
 
 interface ChatStore {
+  /** Every session the user owns, newest first — project and standalone alike.
+   *  Grouping into projects is a view concern (see `lib/projects`). */
   sessions: Session[];
-  quickSessions: Session[];
   activeSession: Session | null;
   draftSession: DraftSession | null;
-  beginQuickDraft: () => DraftSession;
-  beginProjectDraft: (cwd: string) => DraftSession;
+  /** Open a brand-new empty conversation. Optionally scoped to a project
+   *  directory and/or anonymous. Never touches the backend. */
+  beginDraft: (opts?: { cwd?: string | null; anonymous?: boolean }) => DraftSession;
+  /** Re-scope the current draft to a project (or back to standalone). This is
+   *  the ONLY thing picking a project does — it never opens a session. */
+  setDraftProject: (cwd: string | null) => void;
+  setDraftAnonymous: (anonymous: boolean) => void;
   updateDraftText: (text: string) => void;
   discardDraft: () => void;
   /** Per-session ephemeral chat state, keyed by session id. Source of truth for
@@ -138,7 +153,6 @@ interface ChatStore {
   activeModel: string;
 
   loadSessions: () => Promise<void>;
-  loadQuickSessions: () => Promise<void>;
   createSession: (cwd: string, model: string) => Promise<Session>;
   selectSession: (id: string) => Promise<void>;
   loadOlderMessages: () => Promise<void>;
@@ -170,7 +184,6 @@ interface ChatStore {
     policy: "fixed" | "prefer" | "auto";
   }) => Promise<void>;
   updateActiveSessionReasoningEffort: (effort: ReasoningEffort | null) => Promise<void>;
-  startAnonymousSession: () => Session;
   exitAnonymous: () => void;
 
   /** Per-session stream listeners — kept alive across session switches so a
@@ -189,15 +202,25 @@ export function activeRuntime(s: ChatStore): SessionRuntime {
   return (id ? s.runtime[id] : undefined) ?? EMPTY_RUNTIME;
 }
 
-/** Resolve a session object by id across the active / project / quick lists. */
+/** Resolve a session object by id across the active session and the list. */
 function findSession(s: ChatStore, id: string): Session | undefined {
   if (s.activeSession?.id === id) return s.activeSession;
-  return s.sessions.find((x) => x.id === id) ?? s.quickSessions.find((x) => x.id === id);
+  return s.sessions.find((x) => x.id === id);
+}
+
+/** Selector: the id of whatever conversation is currently open — a draft or a
+ *  real session, never both (every transition sets one and clears the other).
+ *
+ *  This is the single source of truth for "what is the workspace showing". The
+ *  app shell used to keep its own copy in React state, which could drift from
+ *  the store: the chat pane rendered one session while every session-scoped
+ *  feature (tasks, git, interjections) addressed another. Derive, don't copy. */
+export function openSessionId(s: ChatStore): string | null {
+  return s.draftSession?.id ?? s.activeSession?.id ?? null;
 }
 
 export const useChatStore = create<ChatStore>((set, get) => ({
   sessions: [],
-  quickSessions: [],
   activeSession: null,
   draftSession: null,
   runtime: {},
@@ -209,14 +232,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   _draftMaterialization: null,
   _selectionRequestId: 0,
 
-  beginQuickDraft: () => {
+  beginDraft: ({ cwd = null, anonymous = false } = {}) => {
     const draft: DraftSession = {
       id: crypto.randomUUID(),
-      mode: "quick",
-      cwd: null,
+      cwd,
+      anonymous,
       modelId: get().activeModel,
       text: "",
     };
+    // Bumping the selection id cancels any in-flight session hydration, so a
+    // slow round-trip can never land history on top of this new blank page.
     set((state) => ({
       activeSession: null,
       draftSession: draft,
@@ -225,21 +250,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     return draft;
   },
 
-  beginProjectDraft: (cwd) => {
-    const draft: DraftSession = {
-      id: crypto.randomUUID(),
-      mode: "project",
-      cwd,
-      modelId: get().activeModel,
-      text: "",
-    };
-    set((state) => ({
-      activeSession: null,
-      draftSession: draft,
-      _selectionRequestId: state._selectionRequestId + 1,
-    }));
-    return draft;
-  },
+  setDraftProject: (cwd) => set((state) => ({
+    draftSession: state.draftSession ? { ...state.draftSession, cwd } : null,
+  })),
+
+  setDraftAnonymous: (anonymous) => set((state) => ({
+    draftSession: state.draftSession ? { ...state.draftSession, anonymous } : null,
+  })),
 
   updateDraftText: (text) => set((state) => ({
     draftSession: state.draftSession ? { ...state.draftSession, text } : null,
@@ -250,11 +267,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   loadSessions: async () => {
     const sessions = await invoke<Session[]>("list_sessions");
     set({ sessions });
-  },
-
-  loadQuickSessions: async () => {
-    const quickSessions = await invoke<Session[]>("list_quick_sessions");
-    set({ quickSessions });
   },
 
   createSession: async (cwd, model) => {
@@ -278,7 +290,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     const requestId = get()._selectionRequestId + 1;
     set({ _selectionRequestId: requestId });
-    const session = await invoke<Session>("get_session", { sessionId: id });
+    let session: Session;
+    try {
+      session = await invoke<Session>("get_session", { sessionId: id });
+    } catch (error) {
+      // The row is gone (deleted elsewhere, or an id that never existed).
+      // Land on a blank draft rather than leaving the workspace pointed at a
+      // session that isn't there — the previous behaviour was an unhandled
+      // rejection that silently kept the *old* conversation on screen.
+      if (get()._selectionRequestId !== requestId) return;
+      console.error(`selectSession: ${id} could not be opened`, error);
+      get().beginDraft();
+      return;
+    }
     if (get()._selectionRequestId !== requestId) return;
 
     // A frontend bucket can remain stuck at streaming=true after the backend
@@ -463,6 +487,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   deleteSession: async (id) => {
+    const deleted = findSession(get(), id);
+    const wasActive = get().activeSession?.id === id;
     await invoke("delete_session", { sessionId: id });
     get()._unlisten[id]?.();
     get()._unlistenSessionUpdated[id]?.();
@@ -477,7 +503,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       delete _streamingMsgId[id];
       return {
         sessions: s.sessions.filter((x) => x.id !== id),
-        quickSessions: s.quickSessions.filter((x) => x.id !== id),
         runtime,
         _unlisten,
         _unlistenSessionUpdated,
@@ -485,13 +510,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         ...(s.activeSession?.id === id ? { activeSession: null } : {}),
       };
     });
+    // The workspace shows whatever the store says is open, so deleting the
+    // conversation you are *in* has to leave something behind — otherwise the
+    // shell has nothing to render. Land on a blank one, scoped to the same
+    // project so the user stays where they were working.
+    if (wasActive) {
+      get().beginDraft({ cwd: deleted?.kind === "quick" ? null : deleted?.cwd ?? null });
+    }
   },
 
   renameSession: async (id, title) => {
     await invoke("update_session_title", { sessionId: id, title });
     set((s) => ({
       sessions: s.sessions.map((x) => (x.id === id ? { ...x, title } : x)),
-      quickSessions: s.quickSessions.map((x) => (x.id === id ? { ...x, title } : x)),
       ...(s.activeSession?.id === id
         ? { activeSession: { ...s.activeSession, title } }
         : {}),
@@ -517,9 +548,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           activeSession: s.activeSession?.id === session.id ? session : s.activeSession,
           activeModel: s.activeSession?.id === session.id ? session.model_id : s.activeModel,
           sessions: s.sessions.map((existing) => (existing.id === session.id ? session : existing)),
-          quickSessions: s.quickSessions.map((existing) =>
-            existing.id === session.id ? session : existing,
-          ),
         }));
       });
       set((s) => ({
@@ -619,11 +647,18 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const draft = get().draftSession;
     if (!active && draft) {
       get().updateDraftText(text);
+      // Anonymous drafts never reach the database: they become an in-memory
+      // session instead, keeping the same "nothing exists until you send" rule
+      // as every other draft.
+      if (draft.anonymous) {
+        const anon = materializeAnonymousDraft(draft, set, get);
+        await get().sendMessage(text, anon.id);
+        return "sent";
+      }
       let materialization = get()._draftMaterialization;
       if (!materialization) {
         materialization = invoke<Session>("materialize_draft_session", {
           draftId: draft.id,
-          mode: draft.mode,
           cwd: draft.cwd,
           modelId: draft.modelId,
           firstMessage: text,
@@ -644,12 +679,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             ...state.runtime,
             [session.id]: state.runtime[session.id] ?? freshRuntime(),
           },
-          sessions: session.kind === "project"
-            ? [session, ...state.sessions.filter((item) => item.id !== session.id)]
-            : state.sessions,
-          quickSessions: session.kind === "quick"
-            ? [session, ...state.quickSessions.filter((item) => item.id !== session.id)]
-            : state.quickSessions,
+          sessions: [session, ...state.sessions.filter((item) => item.id !== session.id)],
         }));
         if (!alreadyMaterialized) {
           await get().sendMessage(text, session.id, true);
@@ -774,9 +804,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       sessions: state.sessions.map((existing) =>
         existing.id === session.id ? session : existing
       ),
-      quickSessions: state.quickSessions.map((existing) =>
-        existing.id === session.id ? session : existing
-      ),
     }));
   },
 
@@ -795,31 +822,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       activeSession: session,
       sessions: s.sessions.map((existing) => (existing.id === session.id ? session : existing)),
     }));
-  },
-
-  startAnonymousSession: () => {
-    // A purely in-memory session: a client-generated id, kind "anonymous", and
-    // an empty cwd (the backend resolves a scratch dir). Never written to the
-    // DB. Gets its own fresh runtime bucket like any other session.
-    const anon: Session = {
-      id: crypto.randomUUID(),
-      title: "匿名会话",
-      cwd: "",
-      model_id: get().activeModel,
-      endpoint_id: useSettingsStore.getState().settings?.default_endpoint ?? "openrouter",
-      model_policy:
-        useSettingsStore.getState().settings?.default_model_policy ?? "prefer",
-      created_at: Date.now(),
-      updated_at: Date.now(),
-      total_input_tokens: 0,
-      total_output_tokens: 0,
-      kind: "anonymous",
-    };
-    set((s) => ({
-      activeSession: anon,
-      runtime: { ...s.runtime, [anon.id]: freshRuntime() },
-    }));
-    return anon;
   },
 
   exitAnonymous: () => {
@@ -968,6 +970,37 @@ const POSTMORTEM_THROTTLE_MS = 5 * 60 * 1000;
  *  messages — anything shorter has nothing useful to learn from. */
 const POSTMORTEM_MIN_MESSAGES = 3;
 const _lastPostmortemAt: Record<string, number> = {};
+
+/** Turn an anonymous draft into the purely in-memory session it sends through:
+ *  a client-generated id, kind "anonymous", and the draft's project directory
+ *  (empty → the backend resolves a scratch dir). Never written to the DB, never
+ *  listed. Anonymity is a property of the draft, not a separate kind of task —
+ *  an anonymous conversation can still be scoped to a project. */
+function materializeAnonymousDraft(
+  draft: DraftSession,
+  set: (partial: Partial<ChatStore>) => void,
+  get: () => ChatStore,
+): Session {
+  const anon: Session = {
+    id: draft.id,
+    title: "匿名会话",
+    cwd: draft.cwd ?? "",
+    model_id: draft.modelId,
+    endpoint_id: useSettingsStore.getState().settings?.default_endpoint ?? "openrouter",
+    model_policy: useSettingsStore.getState().settings?.default_model_policy ?? "prefer",
+    created_at: Date.now(),
+    updated_at: Date.now(),
+    total_input_tokens: 0,
+    total_output_tokens: 0,
+    kind: "anonymous",
+  };
+  set({
+    activeSession: anon,
+    draftSession: null,
+    runtime: { ...get().runtime, [anon.id]: freshRuntime() },
+  });
+  return anon;
+}
 
 function drainNextQueuedMessage(
   sessionId: string,

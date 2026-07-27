@@ -384,25 +384,6 @@ export function importBenchmarkResults(jobPath: string): Promise<ImportedBenchma
   });
 }
 
-// ── Quick Task sessions (multi-session) ─────────────────────────────────────
-
-/** Resume the most-recent Quick Task session, creating the first one on
- *  demand. Backs Home's "快速任务" card (continue-latest semantics). */
-export function getOrCreateQuickSession(modelId: string): Promise<Session> {
-  return invoke<Session>("get_or_create_quick_session", { modelId });
-}
-
-/** Always create a *fresh* Quick Task session with its own scratch dir.
- *  Backs the "+ 新建快速任务" action in the switcher. */
-export function createQuickSession(modelId: string): Promise<Session> {
-  return invoke<Session>("create_quick_session", { modelId });
-}
-
-/** List Quick Task sessions, most-recent first (for the Home switcher). */
-export function listQuickSessions(): Promise<Session[]> {
-  return invoke<Session[]>("list_quick_sessions");
-}
-
 /** One prior turn of an anonymous conversation (role + text). */
 export interface AnonTurn {
   role: "user" | "assistant";

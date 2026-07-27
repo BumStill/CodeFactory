@@ -270,7 +270,7 @@ const session: Session = {
 };
 
 const { useChatStore } = await import("../stores/chat");
-useChatStore.setState({ sessions: [session], quickSessions: [] });
+useChatStore.setState({ sessions: [session] });
 const { EvolutionWorkbenchPage } = await import("../pages/Evolution/EvolutionWorkbenchPage");
 
 createRoot(document.getElementById("root")!).render(
