@@ -14,11 +14,10 @@
 //!   `classify_command` — the shared default is bash-only and would mark every
 //!   call `ReadOnly`, so the completion gate would never see a mutation.
 //!
-//! NOT YET CONSUMED: `run()` still drives the sidecar's own loop body. Flipping
-//! it over additionally needs the two `usage_snapshot` emission points the
-//! bridge contract requires but the shared loop has no hook for (b13/b14) — see
-//! `docs/design/sidecar-shared-loop-4.8.md`.
-#![allow(dead_code)]
+//! The bridge's "every model round emits usage" invariant is upheld without a
+//! second loop: [`SidecarTransport`] emits on its own error paths (b13), and
+//! [`JsonlEventSink::round_ended`] fills in any round that wrote no
+//! `tool_request` (b14). See `docs/design/sidecar-shared-loop-4.8.md`.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -38,6 +37,11 @@ use crate::compaction::{tool_result_content, ToolHistoryEntry};
 use crate::policy::RuntimePolicy;
 use crate::protocol::{read_tool_result, write_output, OutputMessage};
 use crate::Usage;
+
+/// Seconds of wall clock held back from the model and from shell calls so the
+/// run can still write a final answer. Every clamp in this file uses it; the
+/// sidecar's own loop hard-coded the same `30`.
+pub(crate) const WALL_RESERVE_SEC: u64 = 30;
 
 /// Shared stdin/stdout, so the tool backend's `tool_request`, the event sink's
 /// `usage_snapshot`, and `main()`'s `finished` interleave in the pinned order.
@@ -62,6 +66,9 @@ pub(crate) struct DelegatingToolBackend<R, W> {
     /// Untruncated streams for the compaction digest — the message copy is
     /// already truncated, so only the backend sees the full text.
     pub(crate) history: Arc<Mutex<Vec<ToolHistoryEntry>>>,
+    /// Shared with the event sink so `round_ended` knows whether this round
+    /// already put usage on the wire (b14).
+    pub(crate) emitted_usage_this_round: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<R, W> DelegatingToolBackend<R, W> {
@@ -102,9 +109,24 @@ where
         ctx: &ToolCtx,
     ) -> Result<ToolInvocationResult, ToolError> {
         let command = Self::command_of(args);
-        let requested = ctx.timeout_sec.unwrap_or(self.shell_timeout_sec);
+        let requested = ctx
+            .timeout_sec
+            .or_else(|| args.get("timeout_sec").and_then(|v| v.as_u64()))
+            .unwrap_or(self.shell_timeout_sec);
         let timeout_sec =
             effective_command_timeout_sec(&command, requested, self.shell_timeout_sec);
+        // A long shell call must not run past the final reserve either — the
+        // reserve is what pays for the closing answer.
+        let timeout_sec =
+            crate::policy::remaining_wall_time(self.started, self.wall_time_budget_sec)
+                .map(|(remaining, _)| {
+                    crate::policy::clamp_timeout_to_wall_reserve(
+                        timeout_sec,
+                        remaining,
+                        WALL_RESERVE_SEC,
+                    )
+                })
+                .unwrap_or(timeout_sec);
         let started = Instant::now();
 
         {
@@ -124,6 +146,9 @@ where
             .map_err(|e| ToolError {
                 message: e.to_string(),
             })?;
+            // The bridge now has usage for this round (b14).
+            self.emitted_usage_this_round
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         let (return_code, stdout, stderr, error, next_working_directory) = {
@@ -161,13 +186,44 @@ where
     }
 }
 
-/// Emits nothing: the sidecar's wire vocabulary is `tool_request` /
-/// `usage_snapshot` / `finished`, not the desktop's `StreamEvent`s. Holding the
-/// shared stdout keeps ordering correct once usage snapshots are wired in.
-pub(crate) struct JsonlEventSink;
+/// Swallows the desktop's `StreamEvent`s — the sidecar's wire vocabulary is
+/// `tool_request` / `usage_snapshot` / `finished`. Its real job is `round_ended`:
+/// upholding the bridge invariant that EVERY model round emits at least one
+/// line carrying usage (b14). A round whose tool calls were all denied writes
+/// no `tool_request`, so this fills the gap — which is why `round_ended` is
+/// async: it genuinely writes to the shared stdout at the round boundary.
+pub(crate) struct JsonlEventSink<R, W> {
+    pub(crate) io: Arc<Jsonl<R, W>>,
+    /// Set by the tool backend on each `tool_request`; cleared here per round.
+    pub(crate) emitted_usage_this_round: Arc<std::sync::atomic::AtomicBool>,
+}
 
-impl EventSink for JsonlEventSink {
+#[async_trait::async_trait]
+impl<R, W> EventSink for JsonlEventSink<R, W>
+where
+    R: Send + Sync,
+    W: AsyncWrite + Unpin + Send + Sync,
+{
     fn emit(&self, _event: StreamEvent) {}
+
+    async fn round_ended(&self) {
+        use std::sync::atomic::Ordering;
+        // If the backend already wrote a tool_request this round, the bridge
+        // has its usage; otherwise emit the snapshot now.
+        if self.emitted_usage_this_round.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let usage = { self.io.usage.lock().await.clone() };
+        let mut out = self.io.output.lock().await;
+        let _ = write_output(
+            &mut *out,
+            &OutputMessage::UsageSnapshot {
+                name: "usage_snapshot".to_string(),
+                usage,
+            },
+        )
+        .await;
+    }
 }
 
 /// Stops the run when the wall-clock reserve is reached, and hands the loop the
@@ -181,9 +237,7 @@ pub(crate) struct WallClockBudget {
 impl WallClockBudget {
     /// `(remaining, total)` seconds — `None` when the run is untimed.
     pub(crate) fn remaining(&self) -> Option<(u64, u64)> {
-        let total = self.wall_time_budget_sec?;
-        let elapsed = self.started.elapsed().as_secs();
-        Some((total.saturating_sub(elapsed), total))
+        crate::policy::remaining_wall_time(self.started, self.wall_time_budget_sec)
     }
 }
 
@@ -192,14 +246,21 @@ impl Budget for WallClockBudget {
         if iteration >= self.max_steps {
             return false;
         }
-        // Same 30s reserve the sidecar's own loop used.
         !self
             .remaining()
-            .is_some_and(|(remaining, _)| remaining <= 30)
+            .is_some_and(|(remaining, _)| remaining <= WALL_RESERVE_SEC)
     }
 
     fn wall_time(&self) -> Option<(u64, u64)> {
         self.remaining()
+    }
+
+    /// The sidecar's own loop checked the reserve before EVERY call in a batch
+    /// and abandoned the run when it was gone.
+    fn may_start_tool(&self) -> bool {
+        !self
+            .remaining()
+            .is_some_and(|(remaining, _)| remaining <= WALL_RESERVE_SEC)
     }
 }
 
@@ -303,5 +364,198 @@ impl ContextCompactor for CharBudgetCompactor {
             elided_count,
             tokens_freed: 0,
         }
+    }
+}
+
+/// One model round for the sidecar: canonical `ChatMessage` history serializes
+/// straight to the OpenAI chat-completions array it already sent, then
+/// `request_model` applies the retry/backoff/fallback policy unchanged.
+///
+/// Owns the shared stdout, so it satisfies the bridge invariant itself on the
+/// error path (b13): a round that fails still emits a `usage_snapshot` before
+/// the error propagates, with no loop hook needed.
+pub(crate) struct SidecarTransport<R, W> {
+    pub(crate) io: Arc<Jsonl<R, W>>,
+    pub(crate) client: reqwest::Client,
+    pub(crate) endpoint: String,
+    pub(crate) config: crate::protocol::StartConfig,
+    pub(crate) started: Instant,
+    /// Set by the tool backend when it writes a `tool_request`; the event sink
+    /// clears it each round. Lets `round_ended` know whether the bridge already
+    /// saw usage for this round (b14).
+    pub(crate) emitted_usage_this_round: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<R, W> SidecarTransport<R, W>
+where
+    W: AsyncWrite + Unpin + Send + Sync,
+{
+    async fn emit_usage_snapshot(&self) {
+        let usage = { self.io.usage.lock().await.clone() };
+        let mut out = self.io.output.lock().await;
+        let _ = write_output(&mut *out, &OutputMessage::UsageSnapshot {
+            name: "usage_snapshot".to_string(),
+            usage,
+        }).await;
+        self.emitted_usage_this_round
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The model must stop `WALL_RESERVE_SEC` BEFORE the budget ends, so the
+    /// run keeps enough time to write a final answer. Dropping the reserve here
+    /// would let a last request eat the tail of the budget and turn a partial
+    /// answer into no answer — a silent eval-score regression.
+    fn wall_deadline(&self) -> Option<Instant> {
+        self.config.wall_time_budget_sec.map(|total| {
+            self.started
+                + std::time::Duration::from_secs(
+                    total.max(1).saturating_sub(WALL_RESERVE_SEC).max(1),
+                )
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl<R, W> codefactory_agent_loop::transport::ModelTransport for SidecarTransport<R, W>
+where
+    R: Send + Sync,
+    W: AsyncWrite + Unpin + Send + Sync,
+{
+    async fn complete(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[codefactory_agent_loop::types::ToolDefinition],
+        opts: &codefactory_agent_loop::transport::RoundOptions,
+    ) -> Result<
+        codefactory_agent_loop::transport::ModelResponse,
+        codefactory_agent_loop::transport::TransportError,
+    > {
+        // ChatMessage IS the OpenAI chat-completions shape, so this is a direct
+        // serialization rather than a translation.
+        let wire: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+            .collect();
+
+        // b15: the sidecar allows more attempts once work has been done —
+        // abandoning a run that already produced tool outcomes costs more.
+        let max_attempts = crate::transport::model_request_attempts(opts.tool_outcomes_so_far);
+        // Same clamp the sidecar's own loop applied: never let one attempt run
+        // into the final reserve.
+        let attempt_timeout_sec =
+            crate::policy::remaining_wall_time(self.started, self.config.wall_time_budget_sec)
+                .map(|(remaining, _)| {
+                    crate::policy::clamp_timeout_to_wall_reserve(
+                        self.config.model_timeout_sec,
+                        remaining,
+                        WALL_RESERVE_SEC,
+                    )
+                })
+                .unwrap_or(self.config.model_timeout_sec);
+
+        let response = crate::transport::request_model(
+            &self.client,
+            &self.endpoint,
+            &self.config,
+            &wire,
+            !tools.is_empty(),
+            opts.require_tool,
+            attempt_timeout_sec,
+            max_attempts,
+            self.wall_deadline(),
+        )
+        .await;
+
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                // b13: the bridge needs usage for EVERY round, including one
+                // that died. We own stdout, so emit before propagating.
+                self.emit_usage_snapshot().await;
+                return Err(codefactory_agent_loop::transport::TransportError::Fatal(
+                    error.to_string(),
+                ));
+            }
+        };
+
+        {
+            let mut usage = self.io.usage.lock().await;
+            usage.add_response(&response);
+        }
+
+        let message = match response.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")) {
+            Some(message) => message.clone(),
+            None => {
+                self.emit_usage_snapshot().await;
+                return Err(codefactory_agent_loop::transport::TransportError::Fatal(
+                    crate::HeadlessError::MissingChoice.to_string(),
+                ));
+            }
+        };
+
+        let text = crate::compaction::message_content(&message);
+        let parsed =
+            match crate::transport::parse_tool_calls(&message, self.config.shell_timeout_sec) {
+                Ok(calls) => calls,
+                Err(error) => {
+                    self.emit_usage_snapshot().await;
+                    return Err(codefactory_agent_loop::transport::TransportError::Fatal(
+                        error.to_string(),
+                    ));
+                }
+            };
+        // parse_tool_calls already validated + computed the per-call timeout;
+        // carry both through the canonical shape so nothing is re-derived.
+        let tool_calls: Vec<ToolCall> = parsed
+            .into_iter()
+            .map(|c| ToolCall {
+                id: c.id,
+                r#type: "function".into(),
+                function: codefactory_agent_loop::types::FunctionCall {
+                    name: "run_shell".into(),
+                    arguments: serde_json::json!({
+                        "command": c.command,
+                        "timeout_sec": c.timeout_sec,
+                    })
+                    .to_string(),
+                },
+            })
+            .collect();
+
+        Ok(codefactory_agent_loop::transport::ModelResponse {
+            text,
+            tool_calls,
+            // The sidecar accounts usage in its own cumulative `Usage` (which
+            // carries `model_requests`); the loop's per-round row is a desktop
+            // concern and would double-count here.
+            usage: None,
+            reasoning: None,
+            // Desktop failover concepts; the sidecar has a single fixed route.
+            effective_route: None,
+            route_change: None,
+        })
+    }
+}
+
+/// The eval sidecar has no model registry and no DB, so the context window is a
+/// fixed pair rather than a per-model lookup. It is deliberately large: the
+/// sidecar's real limit is `CharBudgetCompactor`'s char budget, and a token
+/// window that bit first would silently change what the model sees.
+pub(crate) struct FixedContext;
+
+#[async_trait::async_trait]
+impl codefactory_agent_loop::services::ContextPolicy for FixedContext {
+    async fn context_window(&self, _estimated_tokens: u32) -> (u32, u32) {
+        (u32::MAX, u32::MAX)
+    }
+
+    /// The bridge protocol carries text only.
+    async fn supports_vision(&self) -> bool {
+        false
+    }
+
+    /// OpenAI-style chat completions; no ChatGPT reasoning-effort field.
+    async fn round_reasoning_effort(&self) -> String {
+        String::new()
     }
 }

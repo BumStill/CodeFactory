@@ -94,28 +94,57 @@ inspection rule behind a `RunConfig` flag. The backend already owns
 post-execution classification after b2; this makes it own pre-execution too,
 which is the coherent end state.
 
-### The flip's real remaining blocker (corrected)
-The sidecar's six seam impls now exist and compile (`agent-headless/src/loop_services.rs`),
-so `run()` is the only thing still on the old body. Working the two
-`usage_snapshot` gaps through properly:
+### The flip ✅ SHIPPED
 
-- **b13 (transport error) needs NO loop hook.** `SidecarTransport` holds the same
-  shared `Arc<Jsonl>` stdout as the tool backend, so it can emit the snapshot
-  itself immediately before returning a `TransportError`. Entirely internal to
-  the sidecar's transport impl.
-- **b14 (a round that emitted no `tool_request`) needs ONE defaulted method:**
-  `EventSink::round_ended(&self)`, called once per model round after the tool
-  batch. The sidecar's sink emits a snapshot only when no `tool_request` went out
-  that round (a flag it shares with the backend). Desktop sinks keep the no-op —
-  the same shape as the existing `usage_recorded`.
+`run()` is now a ~180-line adapter over `run_agent_loop`: it reads the `start`
+handshake, builds `LoopInputs`/`RunConfig`/`LoopServices` from
+`loop_services.rs`, and writes `finished` from the returned `RunOutcome`. The
+sidecar's 354-line copy of the agent loop is gone. **There is one loop.**
 
-The bridge invariant this protects: **every model round emits at least one line
-carrying usage** (`tool_request` OR `usage_snapshot`); `codefactory_bench/agent.py`
-depends on it via `_latest_usage_snapshot`.
+The bridge invariant it had to preserve: **every model round emits at least one
+line carrying usage** (`tool_request` OR `usage_snapshot`);
+`codefactory_bench/agent.py` depends on it via `_latest_usage_snapshot`. It is
+now upheld by two seams and pinned by
+`every_model_round_puts_usage_on_the_wire`, which fails if either is removed:
 
-So the remaining flip is: add `EventSink::round_ended` → rewrite `run()` as an
-adapter → adjust the 28 tokio tests for the new emission timing → 4.8d
-differential harness → 4.8e re-baseline (needs a real TB-21 run).
+- **b13 (transport error)** — no loop hook. `SidecarTransport` holds the same
+  shared `Arc<Jsonl>` stdout as the tool backend and emits the snapshot itself
+  before returning a `TransportError`.
+- **b14 (a round that wrote no `tool_request`)** — `EventSink::round_ended()`,
+  defaulted and **async** (it genuinely writes at the round boundary; a sync
+  flag would only drain after `run_agent_loop` returned). Called at the end of
+  the tool batch **and** in the gate-rejection path — a text-only round the gate
+  rejects writes nothing at all, and was the easy one to lose.
+
+#### Eval-surface drifts caught during the flip
+Four behaviours were silently dropped by the first cut of the adapter and
+restored before merge. All four are eval-score-affecting and none was caught by
+a pre-existing test — the reserve ones only surfaced as `never used` warnings on
+the functions that used to implement them:
+
+| Drift | Consequence if shipped | Restored by |
+| --- | --- | --- |
+| Model requests lost the 30s wall reserve | A last request eats the tail of the budget; partial answer becomes no answer | `SidecarTransport::wall_deadline` + `clamp_timeout_to_wall_reserve` |
+| Shell calls lost the same reserve | Same, via a long tool call | `DelegatingToolBackend::execute` |
+| No mid-batch reserve check (b8) | A multi-call response runs the whole batch past the reserve | `Budget::may_start_tool()` (defaulted true; desktop unaffected) |
+| Transport error in the final reserve became fatal (b9) | Exit 1 and a zero score instead of partial credit | `should_finish_after_model_error` in the adapter's `Err` arm |
+
+`WALL_RESERVE_SEC` now names the constant that all of these share.
+
+#### Also folded in
+- **b6/b11/b12/b15** landed with the seams (mutable cwd, time-convergence
+  prompt, rejected-draft replay, `model_request_attempts`).
+- `run_shell`'s schema has ONE definition, read by both the outbound payload and
+  the loop's `tool_defs`, so they cannot drift.
+- Dead after the flip and removed: the sidecar's `compact_messages`,
+  `unix_time_ms`, and its duplicate `completion_recovery_attempts_after_tool_batch`.
+  The compaction test was **retargeted onto `CharBudgetCompactor`** rather than
+  deleted with the function it covered.
+- `HeadlessError::Loop(String)` carries loop failures out. The typed variant
+  collapses, but `Display` is verbatim at every layer, so the stderr line and
+  exit code are unchanged.
+
+Remaining: 4.8d differential harness, 4.8e re-baseline (needs a real TB-21 run).
 
 ## Recommended decomposition (each independently green)
 1. **4.8a ✅ SHIPPED** (PR #205) — sidecar internal module split
@@ -153,7 +182,8 @@ differential harness → 4.8e re-baseline (needs a real TB-21 run).
    before and after, same trial count. Any pass-rate regression is a blocker.
 
 ## If schedule pressure forces one PR
-Do **4.8a + 4.8b only** and leave the sidecar on its own loop body. That retires
-the transport/tool/output duplication (the bulk of what the refactor targets)
-while leaving the eval-scoring surface — compaction, gate feeding, denial policy,
-wall-clock control — untouched.
+~~Do **4.8a + 4.8b only**~~ — moot: the flip shipped. Kept for the reasoning,
+which held up. The eval-scoring surface (compaction, gate feeding, denial
+policy, wall-clock control) was preserved by CHOOSING the sidecar's impls at the
+seams, not by inheriting the desktop's — see the drift table above for what
+happens when that choice is made by omission instead of deliberately.

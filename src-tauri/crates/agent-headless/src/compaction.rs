@@ -66,40 +66,6 @@ pub(crate) fn tool_result_content(
     .to_string()
 }
 
-pub(crate) fn compact_messages(messages: &mut Vec<Value>, history: &[ToolHistoryEntry], max_chars: usize) {
-    if messages.len() <= 3
-        || serde_json::to_string(messages)
-            .map(|value| value.len() <= max_chars)
-            .unwrap_or(true)
-    {
-        return;
-    }
-
-    let recent_start = messages
-        .iter()
-        .enumerate()
-        .skip(2)
-        .rev()
-        .find(|(_, message)| {
-            message.get("role").and_then(Value::as_str) == Some("assistant")
-                && message
-                    .get("tool_calls")
-                    .and_then(Value::as_array)
-                    .is_some()
-        })
-        .map(|(index, _)| index)
-        .unwrap_or_else(|| messages.len().saturating_sub(2));
-
-    let summary = history_digest(history);
-    let summary = truncate_for_model(&summary, max_chars.saturating_div(2).max(800));
-
-    let system = messages[0].clone();
-    let task = messages[1].clone();
-    let recent = messages[recent_start..].to_vec();
-    *messages = vec![system, task, json!({"role": "user", "content": summary})];
-    messages.extend(recent);
-}
-
 pub(crate) fn truncate_for_model(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
         return value.to_owned();

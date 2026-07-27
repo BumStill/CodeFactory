@@ -151,11 +151,85 @@ pub trait Budget: Send + Sync {
     fn wall_time(&self) -> Option<(u64, u64)> {
         None
     }
+
+    /// True while another TOOL CALL may start, checked before each call inside
+    /// a batch. A model response can carry several calls, and a wall-clock
+    /// surface must be able to stop part-way through one rather than run the
+    /// whole batch past its reserve. Desktop bounds itself by iterations only,
+    /// so the default never interrupts a batch.
+    fn may_start_tool(&self) -> bool {
+        true
+    }
 }
 
 /// Always permits another round — the desktop loop bounds itself with the
 /// iteration ceiling (`for iteration in 0..max_iterations`), so it carries this
 /// for the shared `LoopServices` contract without consuming it (slice 4.6b).
+/// Swallows every write. The eval sidecar has no database and the desktop's
+/// anonymous runs have nothing to write either, so both carry this rather than
+/// branching inside the shared loop (slice 4.8).
+pub struct NullPersistence;
+
+#[async_trait::async_trait]
+impl Persistence for NullPersistence {
+    async fn persist_message(
+        &self,
+        _role: &str,
+        _content: &str,
+        _input_tokens: Option<i64>,
+        _output_tokens: Option<i64>,
+        _tool_calls: Option<&[ToolCall]>,
+        _reasoning_content: Option<&str>,
+        _usage_request_id: Option<&str>,
+    ) -> PersistResult<Option<String>> {
+        Ok(None)
+    }
+    async fn persist_gate_message(&self, _content: &str, _state: &str) -> PersistResult<()> {
+        Ok(())
+    }
+    async fn persist_gate_message_once(
+        &self,
+        _marker: &str,
+        _content: &str,
+        _state: &str,
+    ) -> PersistResult<()> {
+        Ok(())
+    }
+    async fn mark_rejected_candidate(&self, _id: Option<&str>) -> PersistResult<()> {
+        Ok(())
+    }
+    async fn record_tool_call_started(
+        &self,
+        _message_id: &str,
+        _tool_call: &ToolCall,
+    ) -> PersistResult<()> {
+        Ok(())
+    }
+    async fn record_tool_call_outcome(
+        &self,
+        _tc: &ToolCall,
+        _status: &str,
+        _result: Option<&str>,
+        _error: Option<&str>,
+        _duration_ms: u64,
+    ) -> PersistResult<()> {
+        Ok(())
+    }
+    async fn persist_cancelled_tool_batch(
+        &self,
+        remaining: &[ToolCall],
+    ) -> PersistResult<Vec<String>> {
+        // Content is returned even by the null impl — the UI path needs it.
+        Ok(remaining
+            .iter()
+            .map(|tc| format!("Cancelled: {}", tc.function.name))
+            .collect())
+    }
+    async fn record_usage(&self, _row: UsageRow<'_>) -> PersistResult<bool> {
+        Ok(false)
+    }
+}
+
 pub struct NullBudget;
 
 impl Budget for NullBudget {
@@ -167,68 +241,6 @@ impl Budget for NullBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct NullPersistence;
-
-    #[async_trait::async_trait]
-    impl Persistence for NullPersistence {
-        async fn persist_message(
-            &self,
-            _role: &str,
-            _content: &str,
-            _input_tokens: Option<i64>,
-            _output_tokens: Option<i64>,
-            _tool_calls: Option<&[ToolCall]>,
-            _reasoning_content: Option<&str>,
-            _usage_request_id: Option<&str>,
-        ) -> PersistResult<Option<String>> {
-            Ok(None)
-        }
-        async fn persist_gate_message(&self, _content: &str, _state: &str) -> PersistResult<()> {
-            Ok(())
-        }
-        async fn persist_gate_message_once(
-            &self,
-            _marker: &str,
-            _content: &str,
-            _state: &str,
-        ) -> PersistResult<()> {
-            Ok(())
-        }
-        async fn mark_rejected_candidate(&self, _id: Option<&str>) -> PersistResult<()> {
-            Ok(())
-        }
-        async fn record_tool_call_started(
-            &self,
-            _message_id: &str,
-            _tool_call: &ToolCall,
-        ) -> PersistResult<()> {
-            Ok(())
-        }
-        async fn record_tool_call_outcome(
-            &self,
-            _tc: &ToolCall,
-            _status: &str,
-            _result: Option<&str>,
-            _error: Option<&str>,
-            _duration_ms: u64,
-        ) -> PersistResult<()> {
-            Ok(())
-        }
-        async fn persist_cancelled_tool_batch(
-            &self,
-            remaining: &[ToolCall],
-        ) -> PersistResult<Vec<String>> {
-            // Content is returned even by the null impl — the UI path needs it.
-            Ok(remaining
-                .iter()
-                .map(|tc| format!("Cancelled: {}", tc.function.name))
-                .collect())
-        }
-        async fn record_usage(&self, _row: UsageRow<'_>) -> PersistResult<bool> {
-            Ok(false)
-        }
-    }
 
     struct CeilingBudget(usize);
     impl Budget for CeilingBudget {

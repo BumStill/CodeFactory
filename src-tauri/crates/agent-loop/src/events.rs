@@ -13,6 +13,7 @@ use crate::types::StreamEvent;
 
 /// Where the agent loop sends its stream events. `Send + Sync` so it can live
 /// behind an `Arc` shared across the loop's async tasks.
+#[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
     fn emit(&self, event: StreamEvent);
 
@@ -22,6 +23,14 @@ pub trait EventSink: Send + Sync {
     /// headless, collecting — keeps the defaulted no-op. Keystone slice 4.6:
     /// the loop calls this instead of touching a raw `AppHandle`.
     fn usage_recorded(&self, _session_id: &str) {}
+
+    /// One model round finished (after its tool batch, if any). Defaulted
+    /// no-op; the eval sidecar overrides it to satisfy its bridge invariant —
+    /// EVERY model round must emit at least one line carrying usage, either a
+    /// `tool_request` or a `usage_snapshot`. A round whose tool calls were all
+    /// denied emits no `tool_request`, so the sink fills the gap here
+    /// (keystone slice 4.8 b14).
+    async fn round_ended(&self) {}
 }
 
 /// Test / headless sink: records every event in order for assertion. Tauri-free,
@@ -42,6 +51,7 @@ impl CollectingEventSink {
     }
 }
 
+#[async_trait::async_trait]
 impl EventSink for CollectingEventSink {
     fn emit(&self, event: StreamEvent) {
         self.events.lock().expect("event sink mutex").push(event);

@@ -768,6 +768,11 @@ pub async fn run_agent_loop(
                     recovery_limit,
                 ) {
                     crate::policy::CompletionFinalization::Recover(prompt) => {
+                        // This round ends here and the loop goes around again.
+                        // No tool_request went out, so a surface that must put
+                        // usage on the wire every round emits it now (b14) —
+                        // the tool-batch path calls this at its own end.
+                        events.round_ended().await;
                         completion_recovery_attempts += 1;
                         require_tool_next = true;
                         // Make the rejection visible instead of silently looping:
@@ -858,6 +863,18 @@ pub async fn run_agent_loop(
                     finish_cancelled_tool_batch(persistence.as_ref(), events.as_ref(), remaining)
                         .await?;
                     return Ok(run_outcome_for_terminal(&completion_gate, StopReason::Cancelled, (total_input_tokens, total_output_tokens), &last_final_text));
+                }
+                // A wall-clock surface stops BETWEEN calls of one batch: the
+                // reserve pays for the closing answer, so the rest of the batch
+                // is abandoned rather than run past it. Desktop's default never
+                // trips this.
+                if !budget.may_start_tool() {
+                    return Ok(run_outcome_for_terminal(
+                        &completion_gate,
+                        StopReason::BudgetExhausted,
+                        (total_input_tokens, total_output_tokens),
+                        &last_final_text,
+                    ));
                 }
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.function.arguments).unwrap_or_default();
@@ -1072,6 +1089,10 @@ pub async fn run_agent_loop(
                 });
             }
 
+            // The round (and its tool batch) is done — let the surface close it
+            // out; the sidecar emits a usage_snapshot when no tool_request went
+            // out this round (b14).
+            events.round_ended().await;
             completion_recovery_attempts =
                 crate::policy::completion_recovery_attempts_after_tool_batch(
                     completion_recovery_attempts,
