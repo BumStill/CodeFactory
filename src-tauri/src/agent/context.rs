@@ -368,6 +368,7 @@ mod tests {
         assert!(!model_supports_vision(&settings, "any", "deepseek-v4-pro"));
         assert!(!model_supports_vision(&settings, "any", "deepseek-reasoner"));
         assert!(model_supports_vision(&settings, "any", "deepseek-vl2"));
+        assert!(model_supports_vision(&settings, "chatgpt", "gpt-5.5"));
         assert!(model_supports_vision(&settings, "any", "gpt-5.6-sol"));
         assert!(model_supports_vision(&settings, "any", "claude-opus-4-8"));
         assert!(model_supports_vision(&settings, "any", "totally-unknown-model"));

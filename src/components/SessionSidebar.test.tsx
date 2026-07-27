@@ -146,4 +146,12 @@ describe("SessionSidebar", () => {
     fireEvent.doubleClick(screen.getByText("CodeFactory"));
     expect(screen.getByDisplayValue("CodeFactory")).toBeInTheDocument();
   });
+
+  it("applies scrollbar-auto-hide class to the session list for hover-only scrollbar visibility", () => {
+    const { container } = render(<SessionSidebar currentSessionId="p1" onOpenSession={() => {}} />);
+    // The session list is the overflow-y-auto div inside the sidebar
+    const list = container.querySelector(".scrollbar-auto-hide");
+    expect(list).not.toBeNull();
+    expect(list!).toHaveClass("overflow-y-auto");
+  });
 });
