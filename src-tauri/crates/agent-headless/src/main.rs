@@ -21,6 +21,7 @@ use codefactory_agent_core::CompletionEvidence;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 mod compaction;
+mod loop_services;
 mod policy;
 mod protocol;
 mod transport;
@@ -42,7 +43,7 @@ use transport::*;
 
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-struct Usage {
+pub(crate) struct Usage {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
