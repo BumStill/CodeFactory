@@ -14,11 +14,10 @@
 //!   `classify_command` — the shared default is bash-only and would mark every
 //!   call `ReadOnly`, so the completion gate would never see a mutation.
 //!
-//! NOT YET CONSUMED: `run()` still drives the sidecar's own loop body. Flipping
-//! it over additionally needs the two `usage_snapshot` emission points the
-//! bridge contract requires but the shared loop has no hook for (b13/b14) — see
-//! `docs/design/sidecar-shared-loop-4.8.md`.
-#![allow(dead_code)]
+//! The bridge's "every model round emits usage" invariant is upheld without a
+//! second loop: [`SidecarTransport`] emits on its own error paths (b13), and
+//! [`JsonlEventSink::round_ended`] fills in any round that wrote no
+//! `tool_request` (b14). See `docs/design/sidecar-shared-loop-4.8.md`.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -38,6 +37,11 @@ use crate::compaction::{tool_result_content, ToolHistoryEntry};
 use crate::policy::RuntimePolicy;
 use crate::protocol::{read_tool_result, write_output, OutputMessage};
 use crate::Usage;
+
+/// Seconds of wall clock held back from the model and from shell calls so the
+/// run can still write a final answer. Every clamp in this file uses it; the
+/// sidecar's own loop hard-coded the same `30`.
+pub(crate) const WALL_RESERVE_SEC: u64 = 30;
 
 /// Shared stdin/stdout, so the tool backend's `tool_request`, the event sink's
 /// `usage_snapshot`, and `main()`'s `finished` interleave in the pinned order.
@@ -111,6 +115,18 @@ where
             .unwrap_or(self.shell_timeout_sec);
         let timeout_sec =
             effective_command_timeout_sec(&command, requested, self.shell_timeout_sec);
+        // A long shell call must not run past the final reserve either — the
+        // reserve is what pays for the closing answer.
+        let timeout_sec =
+            crate::policy::remaining_wall_time(self.started, self.wall_time_budget_sec)
+                .map(|(remaining, _)| {
+                    crate::policy::clamp_timeout_to_wall_reserve(
+                        timeout_sec,
+                        remaining,
+                        WALL_RESERVE_SEC,
+                    )
+                })
+                .unwrap_or(timeout_sec);
         let started = Instant::now();
 
         {
@@ -221,9 +237,7 @@ pub(crate) struct WallClockBudget {
 impl WallClockBudget {
     /// `(remaining, total)` seconds — `None` when the run is untimed.
     pub(crate) fn remaining(&self) -> Option<(u64, u64)> {
-        let total = self.wall_time_budget_sec?;
-        let elapsed = self.started.elapsed().as_secs();
-        Some((total.saturating_sub(elapsed), total))
+        crate::policy::remaining_wall_time(self.started, self.wall_time_budget_sec)
     }
 }
 
@@ -232,14 +246,21 @@ impl Budget for WallClockBudget {
         if iteration >= self.max_steps {
             return false;
         }
-        // Same 30s reserve the sidecar's own loop used.
         !self
             .remaining()
-            .is_some_and(|(remaining, _)| remaining <= 30)
+            .is_some_and(|(remaining, _)| remaining <= WALL_RESERVE_SEC)
     }
 
     fn wall_time(&self) -> Option<(u64, u64)> {
         self.remaining()
+    }
+
+    /// The sidecar's own loop checked the reserve before EVERY call in a batch
+    /// and abandoned the run when it was gone.
+    fn may_start_tool(&self) -> bool {
+        !self
+            .remaining()
+            .is_some_and(|(remaining, _)| remaining <= WALL_RESERVE_SEC)
     }
 }
 
@@ -380,10 +401,17 @@ where
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// The model must stop `WALL_RESERVE_SEC` BEFORE the budget ends, so the
+    /// run keeps enough time to write a final answer. Dropping the reserve here
+    /// would let a last request eat the tail of the budget and turn a partial
+    /// answer into no answer — a silent eval-score regression.
     fn wall_deadline(&self) -> Option<Instant> {
-        self.config
-            .wall_time_budget_sec
-            .map(|total| self.started + std::time::Duration::from_secs(total))
+        self.config.wall_time_budget_sec.map(|total| {
+            self.started
+                + std::time::Duration::from_secs(
+                    total.max(1).saturating_sub(WALL_RESERVE_SEC).max(1),
+                )
+        })
     }
 }
 
@@ -412,11 +440,18 @@ where
         // b15: the sidecar allows more attempts once work has been done —
         // abandoning a run that already produced tool outcomes costs more.
         let max_attempts = crate::transport::model_request_attempts(opts.tool_outcomes_so_far);
-        let remaining = self
-            .wall_deadline()
-            .map(|d| d.saturating_duration_since(Instant::now()).as_secs())
-            .unwrap_or(self.config.model_timeout_sec);
-        let attempt_timeout_sec = self.config.model_timeout_sec.min(remaining.max(1));
+        // Same clamp the sidecar's own loop applied: never let one attempt run
+        // into the final reserve.
+        let attempt_timeout_sec =
+            crate::policy::remaining_wall_time(self.started, self.config.wall_time_budget_sec)
+                .map(|(remaining, _)| {
+                    crate::policy::clamp_timeout_to_wall_reserve(
+                        self.config.model_timeout_sec,
+                        remaining,
+                        WALL_RESERVE_SEC,
+                    )
+                })
+                .unwrap_or(self.config.model_timeout_sec);
 
         let response = crate::transport::request_model(
             &self.client,
@@ -453,7 +488,7 @@ where
             None => {
                 self.emit_usage_snapshot().await;
                 return Err(codefactory_agent_loop::transport::TransportError::Fatal(
-                    "model response did not contain choices[0].message".to_string(),
+                    crate::HeadlessError::MissingChoice.to_string(),
                 ));
             }
         };
@@ -499,5 +534,28 @@ where
             effective_route: None,
             route_change: None,
         })
+    }
+}
+
+/// The eval sidecar has no model registry and no DB, so the context window is a
+/// fixed pair rather than a per-model lookup. It is deliberately large: the
+/// sidecar's real limit is `CharBudgetCompactor`'s char budget, and a token
+/// window that bit first would silently change what the model sees.
+pub(crate) struct FixedContext;
+
+#[async_trait::async_trait]
+impl codefactory_agent_loop::services::ContextPolicy for FixedContext {
+    async fn context_window(&self, _estimated_tokens: u32) -> (u32, u32) {
+        (u32::MAX, u32::MAX)
+    }
+
+    /// The bridge protocol carries text only.
+    async fn supports_vision(&self) -> bool {
+        false
+    }
+
+    /// OpenAI-style chat completions; no ChatGPT reasoning-effort field.
+    async fn round_reasoning_effort(&self) -> String {
+        String::new()
     }
 }

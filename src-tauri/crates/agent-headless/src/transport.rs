@@ -74,6 +74,29 @@ pub(crate) async fn request_model(
     first
 }
 
+/// The one and only `run_shell` tool schema.
+///
+/// Both the outbound wire payload and the shared loop's `tool_defs` read this,
+/// so the definition the model sees and the definition the loop advertises
+/// cannot drift apart.
+pub(crate) fn run_shell_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "description": "Run one bounded shell script in the task environment. Batch related reads, compatible edits, and focused checks into this call when their order and failure handling are clear, so end-to-end build, install, runtime, and test stages finish within the execution budget.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout_sec": {"type": "integer", "minimum": 1}
+                },
+                "required": ["command"]
+            }
+        }
+    })
+}
+
 pub(crate) async fn request_model_with_tool_choice(
     client: &Client,
     endpoint: &str,
@@ -97,21 +120,7 @@ pub(crate) async fn request_model_with_tool_choice(
         }
     });
     if allow_tools {
-        payload["tools"] = json!([{
-            "type": "function",
-            "function": {
-                "name": "run_shell",
-                "description": "Run one bounded shell script in the task environment. Batch related reads, compatible edits, and focused checks into this call when their order and failure handling are clear, so end-to-end build, install, runtime, and test stages finish within the execution budget.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                        "timeout_sec": {"type": "integer", "minimum": 1}
-                    },
-                    "required": ["command"]
-                }
-            }
-        }]);
+        payload["tools"] = json!([run_shell_schema()]);
     }
     let attempt_timeout = Duration::from_secs(attempt_timeout_sec.max(1));
     let max_attempts = max_attempts.max(1);

@@ -1,15 +1,13 @@
 use codefactory_agent_core::{
-    build_budget_convergence_prompt, build_completion_ready_prompt,
-    build_completion_recovery_prompt, build_product_system_prompt, build_system_prompt,
-    build_time_convergence_prompt, classify_command, completion_evidence_made_progress, evaluate_budget_command_with_time_in_directory,
-    execution_contract_sha256, sanitize_completion_summary,
-    should_prompt_budget_convergence, should_prompt_time_convergence, CompletionGate, PolicyDecision, ProgressTracker,
-    ToolOutcome,
+    build_product_system_prompt, build_system_prompt, execution_contract_sha256,
 };
+#[cfg(test)]
+use codefactory_agent_core::classify_command;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::path::Path;
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{self, AsyncBufRead, AsyncWrite, BufReader, BufWriter};
@@ -88,6 +86,12 @@ enum HeadlessError {
     MissingCommand,
     #[error("protocol I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    /// A failure surfaced by the shared loop. Every `LoopError` arm's `Display`
+    /// is its underlying error verbatim, and the sidecar's transport/tool seams
+    /// fill those with `HeadlessError` strings — so the stderr line is
+    /// unchanged from when the loop lived here.
+    #[error("{0}")]
+    Loop(String),
 }
 
 
@@ -95,21 +99,37 @@ enum HeadlessError {
 async fn main() {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut input = BufReader::new(stdin);
-    let mut output = BufWriter::new(stdout);
+    let input = BufReader::new(stdin);
+    let output = BufWriter::new(stdout);
 
-    if let Err(error) = run(&mut input, &mut output).await {
+    if let Err(error) = run(input, output).await {
         eprintln!("codefactory-agent-headless: {error}");
         std::process::exit(1);
     }
 }
 
-async fn run<R, W>(input: &mut R, output: &mut W) -> Result<(), HeadlessError>
+/// Thin adapter onto the SHARED loop (keystone slice 4.8). Everything that used
+/// to be a second copy of the agent loop now lives in
+/// `agent_loop::run::run_agent_loop`; this reads the `start` handshake, wires
+/// the sidecar's own capability impls (see `loop_services`), and writes the
+/// terminal `finished` line from the returned `RunOutcome`.
+///
+/// The eval-scoring surface is preserved by CHOOSING the sidecar's impls, not
+/// by inheriting the desktop's: char-budget compaction, RuntimePolicy denials,
+/// `run_shell` classification, and the wall clock all come from `loop_services`.
+async fn run<R, W>(input: R, output: W) -> Result<(), HeadlessError>
 where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin + Send + Sync + 'static,
+    W: AsyncWrite + Unpin + Send + Sync + 'static,
 {
-    let mut config = read_start(input).await?;
+    use std::sync::atomic::AtomicBool;
+    use loop_services::{
+        CharBudgetCompactor, DelegatingToolBackend, Jsonl, JsonlEventSink, SidecarTransport,
+        SidecarPermissions, WallClockBudget,
+    };
+
+    let mut input = input;
+    let config = read_start(&mut input).await?;
     let client = Client::builder()
         .timeout(Duration::from_secs(config.model_timeout_sec.max(1)))
         .build()?;
@@ -119,344 +139,178 @@ where
         RuntimePolicyProfile::Product => build_product_system_prompt(config.allow_network),
         RuntimePolicyProfile::Benchmark => build_system_prompt(config.allow_network),
     };
-    let mut messages = vec![
-        json!({"role": "system", "content": system_prompt}),
-        json!({"role": "user", "content": config.instruction}),
-    ];
-    let mut gate = CompletionGate::new_for_instruction(true, &config.instruction);
-    let mut usage = Usage::default();
-    let mut sequence = 0_u64;
-    let mut last_final_text = String::new();
-    let mut tool_history = Vec::new();
-    let mut last_completion_nudge_sequence = None;
-    let mut progress_tracker = ProgressTracker::new(4);
-    let mut finalization_pending = false;
-    let mut require_tool_next = false;
-    let mut completion_recovery_attempts = 0_u32;
-    let execution_started = Instant::now();
-    let mut stopped_for_wall_budget = false;
+    let started = Instant::now();
 
-    let max_steps = config.max_steps.max(1);
-    'execution: for step_index in 0..max_steps {
-        let wall_time = remaining_wall_time(execution_started, config.wall_time_budget_sec);
-        if wall_time.is_some_and(|(remaining, _)| remaining <= 30) {
-            stopped_for_wall_budget = true;
-            break;
-        }
-        compact_messages(&mut messages, &tool_history, MAX_CONTEXT_CHARS);
-        let request_timeout_sec = wall_time
-            .map(|(remaining, _)| {
-                clamp_timeout_to_wall_reserve(config.model_timeout_sec, remaining, 30)
-            })
-            .unwrap_or(config.model_timeout_sec);
-        let model_wall_deadline = config.wall_time_budget_sec.map(|total| {
-            execution_started + Duration::from_secs(total.max(1).saturating_sub(30).max(1))
-        });
-        let finalization_response = finalization_pending;
-        let required_tool_response = require_tool_next && !finalization_response;
-        let model_request_attempts = model_request_attempts(tool_history.len());
-        let response = match request_model(
-            &client,
-            &endpoint,
-            &config,
-            &messages,
-            !finalization_response,
-            required_tool_response,
-            request_timeout_sec,
-            model_request_attempts,
-            model_wall_deadline,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(error)
-                if should_finish_after_model_error(
-                    remaining_wall_time(execution_started, config.wall_time_budget_sec),
-                    tool_history.len(),
-                ) =>
-            {
-                last_final_text = format!(
-                    "Stopped after a model transport failure in the final wall-clock reserve: {error}"
-                );
-                stopped_for_wall_budget = true;
-                break;
-            }
-            Err(error) => return Err(error),
-        };
-        usage.add_response(&response);
-        let message = match response["choices"]
-            .get(0)
-            .and_then(|choice| choice.get("message"))
-            .cloned()
-        {
-            Some(message) => message,
-            None => {
-                write_output(
-                    output,
-                    &OutputMessage::UsageSnapshot {
-                        name: "usage_snapshot".to_owned(),
-                        usage: usage.clone(),
-                    },
-                )
-                .await?;
-                return Err(HeadlessError::MissingChoice);
-            }
-        };
-        let final_text = message_content(&message);
-        let mut tool_calls = match parse_tool_calls(&message, config.shell_timeout_sec) {
-            Ok(tool_calls) => tool_calls,
-            Err(error) => {
-                write_output(
-                    output,
-                    &OutputMessage::UsageSnapshot {
-                        name: "usage_snapshot".to_owned(),
-                        usage: usage.clone(),
-                    },
-                )
-                .await?;
-                return Err(error);
-            }
-        };
-        if finalization_response {
-            finalization_pending = false;
-            tool_calls.clear();
-        }
+    // One shared stdin/stdout so `tool_request`, `usage_snapshot` and
+    // `finished` keep their pinned interleaving across the backend, the sink
+    // and this adapter.
+    let io = std::sync::Arc::new(Jsonl {
+        input: tokio::sync::Mutex::new(input),
+        output: tokio::sync::Mutex::new(output),
+        usage: tokio::sync::Mutex::new(Usage::default()),
+    });
+    let history = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let emitted_usage_this_round = std::sync::Arc::new(AtomicBool::new(false));
 
-        if tool_calls.is_empty() {
-            last_final_text = if finalization_response {
-                sanitize_completion_summary(&final_text)
-            } else {
-                final_text
-            };
-            let evidence = gate.evidence();
-            if evidence.completed {
-                write_output(
-                    output,
-                    &OutputMessage::Finished {
-                        final_text: last_final_text,
-                        execution_contract_sha256: execution_contract_sha256(),
-                        completion_evidence: evidence,
-                        usage,
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
-            if required_tool_response || completion_recovery_attempts >= 1 {
-                write_output(
-                    output,
-                    &OutputMessage::Finished {
-                        final_text: last_final_text,
-                        execution_contract_sha256: execution_contract_sha256(),
-                        completion_evidence: evidence,
-                        usage,
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
-            write_output(
-                output,
-                &OutputMessage::UsageSnapshot {
-                    name: "usage_snapshot".to_owned(),
-                    usage: usage.clone(),
-                },
-            )
-            .await?;
-            messages.push(message);
-            messages.push(json!({
-                "role": "user",
-                "content": build_completion_recovery_prompt(&evidence),
-            }));
-            completion_recovery_attempts += 1;
-            require_tool_next = true;
-            continue;
-        }
+    let tool_schema: codefactory_agent_loop::types::ToolDefinition =
+        serde_json::from_value(transport::run_shell_schema())
+            .map_err(HeadlessError::InvalidJson)?;
 
-        finalization_pending = false;
-        require_tool_next = false;
-        messages.push(message);
-        let mut progress_prompt = None;
-        let mut emitted_tool_request = false;
-        let completion_evidence_before_tool_batch = gate.evidence();
-        let remaining = max_steps.saturating_sub(step_index + 1);
-        for tool_call in tool_calls {
-            if remaining_wall_time(execution_started, config.wall_time_budget_sec)
-                .is_some_and(|(remaining, _)| remaining <= 30)
-            {
-                stopped_for_wall_budget = true;
-                break 'execution;
-            }
-            let started_at_ms = unix_time_ms();
-            let wall_time = remaining_wall_time(execution_started, config.wall_time_budget_sec);
-            let effective_tool_timeout_sec = wall_time
-                .map(|(remaining, _)| {
-                    clamp_timeout_to_wall_reserve(tool_call.timeout_sec, remaining, 30)
-                })
-                .unwrap_or(tool_call.timeout_sec);
-            let kind = classify_command(&tool_call.command, effective_tool_timeout_sec * 1_000);
-            let policy_decision = match policy.evaluate_command(&tool_call.command) {
-                PolicyDecision::Allow
-                    if progress_tracker.read_only_exhausted()
-                        && matches!(kind, codefactory_agent_core::ToolKind::ReadOnly) =>
-                {
-                    PolicyDecision::Deny {
-                        rule: "inspection_budget".to_owned(),
-                        reason: if progress_tracker.mutation_seen() {
-                            "post-change inspection is exhausted; make the smallest corrective edit, run a bounded functional verification, or batch a specifically justified read with that action"
-                                .to_owned()
-                        } else {
-                            "initial inspection is exhausted; batch any remaining reads with the first implementation or begin the smallest candidate implementation now"
-                                .to_owned()
-                        },
-                    }
-                }
-                PolicyDecision::Allow => evaluate_budget_command_with_time_in_directory(
-                    remaining,
-                    wall_time,
-                    &gate.evidence(),
-                    &tool_call.command,
-                    &kind,
-                    config.working_directory.as_deref(),
-                ),
-                denied => denied,
-            };
-            let (return_code, stdout, stderr, error, next_working_directory) = match policy_decision
-            {
-                PolicyDecision::Allow => {
-                    sequence += 1;
-                    write_output(
-                        output,
-                        &OutputMessage::ToolRequest {
-                            id: tool_call.id.clone(),
-                            command: tool_call.command.clone(),
-                            timeout_sec: effective_tool_timeout_sec,
-                            usage: usage.clone(),
-                        },
-                    )
-                    .await?;
-                    emitted_tool_request = true;
-                    read_tool_result(input, &tool_call.id).await?
-                }
-                PolicyDecision::Deny { rule, reason } => (
-                    None,
-                    String::new(),
-                    String::new(),
-                    Some(format!("policy denied command ({rule}): {reason}")),
-                    None,
-                ),
-            };
+    let budget = WallClockBudget {
+        started,
+        wall_time_budget_sec: config.wall_time_budget_sec,
+        max_steps: config.max_steps.max(1) as usize,
+    };
 
-            let outcome = ToolOutcome {
-                request_id: tool_call.id.clone(),
-                command: tool_call.command.clone(),
-                working_directory: config.working_directory.clone(),
-                kind,
-                sequence,
-                started_at_ms,
-                finished_at_ms: unix_time_ms(),
-                return_code,
-                stdout: stdout.clone(),
-                stderr: stderr.clone(),
-                error: error.clone(),
-                semantic_failure: false,
-            }
-            .with_detected_semantic_failure();
-            if let Some(next_working_directory) = next_working_directory
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty() && Path::new(path).is_absolute())
-            {
-                config.working_directory = Some(next_working_directory.to_owned());
-            }
-            let policy_denied = error
-                .as_deref()
-                .is_some_and(|message| message.starts_with("policy denied command"));
-            if !policy_denied {
-                gate.record(&outcome);
-                if let Some(prompt) = progress_tracker.record(&outcome) {
-                    progress_prompt = Some(prompt);
-                }
-            }
-            tool_history.push(ToolHistoryEntry::new(
-                &tool_call.command,
-                return_code,
-                &stdout,
-                &stderr,
-                error.clone(),
-            ));
-
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": tool_result_content(return_code, &stdout, &stderr, error.as_deref()),
-            }));
-        }
-        if !emitted_tool_request {
-            write_output(
-                output,
-                &OutputMessage::UsageSnapshot {
-                    name: "usage_snapshot".to_owned(),
-                    usage: usage.clone(),
-                },
-            )
-            .await?;
-        } else {
-            completion_recovery_attempts = completion_recovery_attempts_after_tool_batch(
-                completion_recovery_attempts,
-                completion_evidence_made_progress(
-                    &completion_evidence_before_tool_batch,
-                    &gate.evidence(),
-                ),
-            );
-        }
-        if let Some(prompt) = progress_prompt {
-            messages.push(json!({"role": "user", "content": prompt}));
-        }
-        let evidence = gate.evidence();
-        if evidence.completed
-            && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
-        {
-            last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
-            finalization_pending = true;
-            messages.push(json!({
-                "role": "user",
-                "content": build_completion_ready_prompt(),
-            }));
-        } else {
-            let wall_time = remaining_wall_time(execution_started, config.wall_time_budget_sec);
-            if wall_time
-                .is_some_and(|(seconds, total)| should_prompt_time_convergence(seconds, total))
-            {
-                let seconds = wall_time.map(|(seconds, _)| seconds).unwrap_or_default();
-                messages.push(json!({
-                    "role": "user",
-                    "content": build_time_convergence_prompt(seconds, &evidence),
-                }));
-            } else if should_prompt_budget_convergence(remaining) {
-                messages.push(json!({
-                    "role": "user",
-                    "content": build_budget_convergence_prompt(remaining, &evidence),
-                }));
-            }
-        }
-    }
-
-    write_output(
-        output,
-        &OutputMessage::Finished {
-            final_text: if last_final_text.is_empty() {
-                budget_exhaustion_message(stopped_for_wall_budget).to_owned()
-            } else {
-                last_final_text
+    let inputs = codefactory_agent_loop::run::LoopInputs {
+        messages: vec![
+            codefactory_agent_loop::types::ChatMessage {
+                role: "system".into(),
+                content: codefactory_agent_loop::types::MessageContent::Text(system_prompt),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
             },
-            execution_contract_sha256: execution_contract_sha256(),
-            completion_evidence: gate.evidence(),
-            usage,
-        },
-    )
-    .await?;
-    Ok(())
+            codefactory_agent_loop::types::ChatMessage {
+                role: "user".into(),
+                content: codefactory_agent_loop::types::MessageContent::Text(
+                    config.instruction.clone(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+        ],
+        system_prompt: String::new(),
+        tool_defs: vec![tool_schema.clone()],
+        completion_instruction: config.instruction.clone(),
+        fact_check_instruction: config.instruction.clone(),
+        audit_session_id: String::new(),
+        knowledge_library_ids: None,
+        cancel: None,
+    };
+
+    let run_config = codefactory_agent_loop::run::RunConfig {
+        finalization: codefactory_agent_loop::run::FinalizationPolicy::Benchmark,
+        gate_benchmark: true,
+        progress_window: 4,
+        recovery_limit: 1,
+        max_iterations: config.max_steps.max(1) as usize,
+        wall_budget_applies: true,
+        // The compactor runs; it is the sidecar's CHAR-budget digest, not the
+        // desktop's token-based elision — that is what keeps scores comparable.
+        context_compression: true,
+        overload_backoff: false,
+        inspection_budget: true,
+        replay_rejected_draft: true,
+        session_id: String::new(),
+        endpoint_name: String::new(),
+        model_id: config.model.clone(),
+        base_url: config.base_url.clone(),
+        usage_run_id: String::new(),
+        surface: "benchmark".into(),
+        task_id: None,
+        // No DB: NullPersistence swallows every write anyway.
+        anonymous: true,
+        is_chatgpt: false,
+        cwd: config
+            .working_directory
+            .clone()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(".")),
+    };
+
+    let services = codefactory_agent_loop::run::LoopServices {
+        transport: std::sync::Arc::new(SidecarTransport {
+            io: io.clone(),
+            client,
+            endpoint,
+            config: config.clone(),
+            started,
+            emitted_usage_this_round: emitted_usage_this_round.clone(),
+        }),
+        tools: std::sync::Arc::new(DelegatingToolBackend {
+            io: io.clone(),
+            schema: tool_schema,
+            shell_timeout_sec: config.shell_timeout_sec,
+            started,
+            wall_time_budget_sec: config.wall_time_budget_sec,
+            history: history.clone(),
+            emitted_usage_this_round: emitted_usage_this_round.clone(),
+        }),
+        persistence: std::sync::Arc::new(codefactory_agent_loop::journal::NullPersistence),
+        events: std::sync::Arc::new(JsonlEventSink {
+            io: io.clone(),
+            emitted_usage_this_round,
+        }),
+        budget: std::sync::Arc::new(budget),
+        permission: std::sync::Arc::new(SidecarPermissions { policy }),
+        hooks: std::sync::Arc::new(codefactory_agent_loop::services::NoOpHooks),
+        context_policy: std::sync::Arc::new(loop_services::FixedContext),
+        fact_checker: std::sync::Arc::new(codefactory_agent_loop::services::NoOpFactChecker),
+        compactor: std::sync::Arc::new(CharBudgetCompactor {
+            max_chars: MAX_CONTEXT_CHARS,
+            history: history.clone(),
+        }),
+    };
+
+    let outcome = codefactory_agent_loop::run::run_agent_loop(inputs, run_config, services).await;
+
+    // A transport failure inside the final wall-clock reserve, on a run that
+    // already produced tool outcomes, is finished gracefully rather than
+    // propagated: the task keeps whatever partial credit it earned instead of
+    // the process exiting 1 and scoring zero. Tool/persist failures stay fatal,
+    // as they were protocol violations before the flip too.
+    let outcome = match outcome {
+        Err(codefactory_agent_loop::run::LoopError::Transport(error))
+            if should_finish_after_model_error(
+                remaining_wall_time(started, config.wall_time_budget_sec),
+                history.lock().await.len(),
+            ) =>
+        {
+            Ok(codefactory_agent_loop::run::RunOutcome {
+                final_text: format!(
+                    "Stopped after a model transport failure in the final wall-clock reserve: {error}"
+                ),
+                completion_evidence: Default::default(),
+                input_tokens: 0,
+                output_tokens: 0,
+                stop_reason: codefactory_agent_loop::run::StopReason::BudgetExhausted,
+            })
+        }
+        other => other,
+    };
+
+    let usage = { io.usage.lock().await.clone() };
+    let mut out = io.output.lock().await;
+    match outcome {
+        Ok(outcome) => {
+            let stopped_for_wall_budget = matches!(
+                outcome.stop_reason,
+                codefactory_agent_loop::run::StopReason::BudgetExhausted
+            );
+            write_output(
+                &mut *out,
+                &OutputMessage::Finished {
+                    final_text: if outcome.final_text.trim().is_empty() {
+                        budget_exhaustion_message(stopped_for_wall_budget).to_owned()
+                    } else {
+                        outcome.final_text
+                    },
+                    execution_contract_sha256: execution_contract_sha256(),
+                    completion_evidence: outcome.completion_evidence,
+                    usage,
+                },
+            )
+            .await?;
+            Ok(())
+        }
+        // The loop's error text is the underlying provider/tool message
+        // verbatim, so the exit path reads exactly as it did before.
+        Err(error) => Err(HeadlessError::Loop(error.to_string())),
+    }
 }
 
 
@@ -492,8 +346,11 @@ mod tests {
 
     #[test]
     fn successful_tool_batch_does_not_reopen_text_recovery() {
-        assert_eq!(completion_recovery_attempts_after_tool_batch(1, true), 1);
-        assert_eq!(completion_recovery_attempts_after_tool_batch(1, false), 1);
+        // The shared loop owns this now; the sidecar's identical copy is gone.
+        // Still pinned here: material progress must NOT refund recovery rounds.
+        use codefactory_agent_loop::policy::completion_recovery_attempts_after_tool_batch as recovery_attempts;
+        assert_eq!(recovery_attempts(1, true), 1);
+        assert_eq!(recovery_attempts(1, false), 1);
     }
 
     #[test]
@@ -705,33 +562,87 @@ mod tests {
         );
     }
 
+    /// Pins the eval-scoring compaction contract on the LIVE path: since the
+    /// flip this is `CharBudgetCompactor`, not the sidecar's old
+    /// `compact_messages`. Keep [contract, task], replace the middle with a
+    /// digest, keep the most recent tool round, land under budget.
     #[test]
     fn context_compaction_preserves_contract_task_and_recent_tool_round() {
-        let mut messages = vec![
-            json!({"role":"system","content":"shared contract"}),
-            json!({"role":"user","content":"original task"}),
-            json!({"role":"assistant","content":null,"tool_calls":[{"id":"old","function":{"name":"run_shell","arguments":"{\"command\":\"cat huge\"}"}}]}),
-            json!({"role":"tool","tool_call_id":"old","content":"x".repeat(2000)}),
-            json!({"role":"assistant","content":null,"tool_calls":[{"id":"recent","function":{"name":"run_shell","arguments":"{\"command\":\"cargo test\"}"}}]}),
-            json!({"role":"tool","tool_call_id":"recent","content":"all tests passed"}),
+        use codefactory_agent_loop::services::ContextCompactor;
+        use codefactory_agent_loop::types::{ChatMessage, FunctionCall, MessageContent, ToolCall};
+
+        fn body_of(m: &ChatMessage) -> &str {
+            match &m.content {
+                MessageContent::Text(t) => t.as_str(),
+                MessageContent::Parts(_) => "",
+            }
+        }
+        fn text(role: &str, body: &str) -> ChatMessage {
+            ChatMessage {
+                role: role.into(),
+                content: MessageContent::Text(body.into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            }
+        }
+        fn calls(id: &str, command: &str) -> ChatMessage {
+            ChatMessage {
+                role: "assistant".into(),
+                content: MessageContent::Text(String::new()),
+                tool_calls: Some(vec![ToolCall {
+                    id: id.into(),
+                    r#type: "function".into(),
+                    function: FunctionCall {
+                        name: "run_shell".into(),
+                        arguments: format!("{{\"command\":\"{command}\"}}"),
+                    },
+                }]),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            }
+        }
+        fn result(id: &str, body: &str) -> ChatMessage {
+            ChatMessage {
+                role: "tool".into(),
+                content: MessageContent::Text(body.into()),
+                tool_calls: None,
+                tool_call_id: Some(id.into()),
+                name: None,
+                reasoning_content: None,
+            }
+        }
+
+        let messages = vec![
+            text("system", "shared contract"),
+            text("user", "original task"),
+            calls("old", "cat huge"),
+            result("old", &"x".repeat(2000)),
+            calls("recent", "cargo test"),
+            result("recent", "all tests passed"),
         ];
-        let history = vec![
+        let history = std::sync::Arc::new(tokio::sync::Mutex::new(vec![
             ToolHistoryEntry::new("cat huge", Some(0), "x".repeat(2000), "", None),
             ToolHistoryEntry::new("cargo test", Some(0), "all tests passed", "", None),
-        ];
+        ]));
 
-        compact_messages(&mut messages, &history, 500);
+        let compactor = loop_services::CharBudgetCompactor {
+            max_chars: 500,
+            history,
+        };
+        let out = compactor.compact(messages, "", 0);
 
-        assert_eq!(messages[0]["content"], "shared contract");
-        assert_eq!(messages[1]["content"], "original task");
-        assert!(messages[2]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Compacted execution history"));
-        assert!(messages
+        assert!(out.compacted);
+        assert_eq!(body_of(&out.messages[0]), "shared contract");
+        assert_eq!(body_of(&out.messages[1]), "original task");
+        assert!(body_of(&out.messages[2]).contains("Compacted execution history"));
+        assert!(out
+            .messages
             .iter()
-            .any(|message| message["tool_call_id"] == "recent"));
-        assert!(serde_json::to_string(&messages).unwrap().len() < 1600);
+            .any(|m| m.tool_call_id.as_deref() == Some("recent")));
+        assert!(serde_json::to_string(&out.messages).unwrap().len() < 1600);
     }
 
     #[test]
@@ -802,9 +713,9 @@ mod tests {
         let (test_input, run_input) = tokio::io::duplex(16 * 1024);
         let (run_output, test_output) = tokio::io::duplex(16 * 1024);
         let runner = tokio::spawn(async move {
-            let mut input = BufReader::new(run_input);
-            let mut output = run_output;
-            run(&mut input, &mut output).await
+            let input = BufReader::new(run_input);
+            let output = run_output;
+            run(input, output).await
         });
         let mut input = test_input;
         let mut output = BufReader::new(test_output);
@@ -908,9 +819,9 @@ mod tests {
         let (test_input, run_input) = tokio::io::duplex(16 * 1024);
         let (run_output, test_output) = tokio::io::duplex(16 * 1024);
         let runner = tokio::spawn(async move {
-            let mut input = BufReader::new(run_input);
-            let mut output = run_output;
-            run(&mut input, &mut output).await
+            let input = BufReader::new(run_input);
+            let output = run_output;
+            run(input, output).await
         });
         let mut input = test_input;
         let mut output = BufReader::new(test_output);
@@ -1025,9 +936,9 @@ mod tests {
         let (test_input, run_input) = tokio::io::duplex(16 * 1024);
         let (run_output, test_output) = tokio::io::duplex(16 * 1024);
         let runner = tokio::spawn(async move {
-            let mut input = BufReader::new(run_input);
-            let mut output = run_output;
-            run(&mut input, &mut output).await
+            let input = BufReader::new(run_input);
+            let output = run_output;
+            run(input, output).await
         });
         let mut input = test_input;
         let mut output = BufReader::new(test_output);
@@ -1132,9 +1043,9 @@ mod tests {
         let (test_input, run_input) = tokio::io::duplex(16 * 1024);
         let (run_output, test_output) = tokio::io::duplex(16 * 1024);
         let runner = tokio::spawn(async move {
-            let mut input = BufReader::new(run_input);
-            let mut output = run_output;
-            run(&mut input, &mut output).await
+            let input = BufReader::new(run_input);
+            let output = run_output;
+            run(input, output).await
         });
         let mut input = test_input;
         let mut output = BufReader::new(test_output);
@@ -1188,9 +1099,9 @@ mod tests {
         let (test_input, run_input) = tokio::io::duplex(16 * 1024);
         let (run_output, test_output) = tokio::io::duplex(16 * 1024);
         let runner = tokio::spawn(async move {
-            let mut input = BufReader::new(run_input);
-            let mut output = run_output;
-            run(&mut input, &mut output).await
+            let input = BufReader::new(run_input);
+            let output = run_output;
+            run(input, output).await
         });
         let mut input = test_input;
         let mut output = BufReader::new(test_output);
@@ -1275,9 +1186,9 @@ mod tests {
         let (test_input, run_input) = tokio::io::duplex(16 * 1024);
         let (run_output, test_output) = tokio::io::duplex(16 * 1024);
         let runner = tokio::spawn(async move {
-            let mut input = BufReader::new(run_input);
-            let mut output = run_output;
-            run(&mut input, &mut output).await
+            let input = BufReader::new(run_input);
+            let output = run_output;
+            run(input, output).await
         });
         let mut input = test_input;
         let mut output = BufReader::new(test_output);
@@ -1348,9 +1259,9 @@ mod tests {
         let (test_input, run_input) = tokio::io::duplex(32 * 1024);
         let (run_output, test_output) = tokio::io::duplex(32 * 1024);
         let runner = tokio::spawn(async move {
-            let mut input = BufReader::new(run_input);
-            let mut output = run_output;
-            run(&mut input, &mut output).await
+            let input = BufReader::new(run_input);
+            let output = run_output;
+            run(input, output).await
         });
         let mut input = test_input;
         let mut output = BufReader::new(test_output);
@@ -1446,9 +1357,9 @@ mod tests {
         let (test_input, run_input) = tokio::io::duplex(32 * 1024);
         let (run_output, test_output) = tokio::io::duplex(32 * 1024);
         let runner = tokio::spawn(async move {
-            let mut input = BufReader::new(run_input);
-            let mut output = run_output;
-            run(&mut input, &mut output).await
+            let input = BufReader::new(run_input);
+            let output = run_output;
+            run(input, output).await
         });
         let mut input = test_input;
         let mut output = BufReader::new(test_output);
@@ -1543,9 +1454,9 @@ mod tests {
         let (test_input, run_input) = tokio::io::duplex(32 * 1024);
         let (run_output, test_output) = tokio::io::duplex(32 * 1024);
         let runner = tokio::spawn(async move {
-            let mut input = BufReader::new(run_input);
-            let mut output = run_output;
-            run(&mut input, &mut output).await
+            let input = BufReader::new(run_input);
+            let output = run_output;
+            run(input, output).await
         });
         let mut input = test_input;
         let mut output = BufReader::new(test_output);
@@ -1656,9 +1567,9 @@ mod tests {
         let (test_input, run_input) = tokio::io::duplex(8 * 1024);
         let (run_output, test_output) = tokio::io::duplex(8 * 1024);
         let runner = tokio::spawn(async move {
-            let mut input = BufReader::new(run_input);
-            let mut output = run_output;
-            run(&mut input, &mut output).await
+            let input = BufReader::new(run_input);
+            let output = run_output;
+            run(input, output).await
         });
         let mut input = test_input;
         let mut output = BufReader::new(test_output);
@@ -1687,8 +1598,12 @@ mod tests {
         assert_eq!(snapshot["usage"]["model_requests"], 1);
         assert_eq!(snapshot["usage"]["total_tokens"], 10);
 
+        // Transport failures now reach `main` through `LoopError`, so the typed
+        // variant collapses into `Loop`. What the contract actually pins is the
+        // operator-visible stderr line and the non-zero exit — assert the text
+        // itself rather than the discriminant.
         let error = runner.await.unwrap().unwrap_err();
-        assert!(matches!(error, HeadlessError::MissingCommand));
+        assert_eq!(error.to_string(), HeadlessError::MissingCommand.to_string());
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
@@ -1716,9 +1631,9 @@ mod tests {
         let (test_input, run_input) = tokio::io::duplex(32 * 1024);
         let (run_output, test_output) = tokio::io::duplex(32 * 1024);
         let runner = tokio::spawn(async move {
-            let mut input = BufReader::new(run_input);
-            let mut output = run_output;
-            run(&mut input, &mut output).await
+            let input = BufReader::new(run_input);
+            let output = run_output;
+            run(input, output).await
         });
         let mut input = test_input;
         let mut output = BufReader::new(test_output);
@@ -1852,6 +1767,127 @@ mod tests {
             .unwrap();
         writer.write_all(b"\n").await.unwrap();
         writer.flush().await.unwrap();
+    }
+
+    /// The bridge contract the Python harness depends on: EVERY model round must
+    /// put at least one usage-carrying line on the wire (`tool_request` carries
+    /// usage inline, otherwise a `usage_snapshot` stands in), because
+    /// `codefactory_bench/agent.py` reads per-round cost from that stream. Two
+    /// separate seams uphold it now that the sidecar shares the desktop's loop —
+    /// the tool backend on the tool path, `round_ended` on every other path — so
+    /// this states the rule directly instead of leaving it implied by the
+    /// line-by-line expectations in the scenario tests.
+    #[tokio::test]
+    async fn every_model_round_puts_usage_on_the_wire() {
+        fn tool_round(id: &str, command: &str, total: u64) -> Value {
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": "run_shell", "arguments": format!("{{\"command\":\"{command}\",\"timeout_sec\":5}}")}
+                }]}}],
+                "usage": {"prompt_tokens": total, "completion_tokens": 1, "total_tokens": total + 1}
+            })
+        }
+
+        // Round 1 mutates, round 2 is a text-only reply the gate REJECTS (the
+        // round that emits no tool_request — historically the easy one to lose),
+        // round 3 verifies, round 4 closes the run out.
+        let (base_url, server) = fake_openai_server(vec![
+            tool_round("mutate-1", "printf fixed > result.txt", 10),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "All done."}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 1, "total_tokens": 21}
+            }),
+            tool_round("verify-1", "cargo test", 30),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Verified and complete."}}],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 1, "total_tokens": 41}
+            }),
+        ]);
+
+        let (test_input, run_input) = tokio::io::duplex(16 * 1024);
+        let (run_output, test_output) = tokio::io::duplex(16 * 1024);
+        let runner = tokio::spawn(async move {
+            let input = BufReader::new(run_input);
+            let output = run_output;
+            run(input, output).await
+        });
+        let mut input = test_input;
+        let mut output = BufReader::new(test_output);
+
+        write_test_line(
+            &mut input,
+            &json!({
+                "type": "start",
+                "instruction": "Fix the project and verify it.",
+                "model": "fake-model",
+                "api_key": "test-key",
+                "base_url": base_url,
+                "max_steps": 6,
+                "model_timeout_sec": 5,
+                "shell_timeout_sec": 60,
+                "allow_network": false,
+                "execution_contract_sha256": execution_contract_sha256()
+            }),
+        )
+        .await;
+
+        // Drain to `finished`, answering tool requests and recording which
+        // lines carried usage.
+        let mut lines = Vec::new();
+        loop {
+            let line = read_test_output(&mut output).await;
+            let kind = line["type"].as_str().unwrap_or_default().to_string();
+            lines.push(line.clone());
+            match kind.as_str() {
+                "tool_request" => {
+                    write_test_line(
+                        &mut input,
+                        &json!({
+                            "type": "tool_result",
+                            "id": line["id"],
+                            "return_code": 0,
+                            "stdout": "",
+                            "stderr": "",
+                            "error": null
+                        }),
+                    )
+                    .await;
+                }
+                "finished" => break,
+                _ => {}
+            }
+        }
+        runner.await.unwrap().unwrap();
+
+        // Every line the sidecar writes carries usage, and the model_requests
+        // counter never goes backwards.
+        let mut seen_requests = 0_u64;
+        for line in &lines {
+            let usage = line
+                .get("usage")
+                .unwrap_or_else(|| panic!("line without usage: {line}"));
+            let requests = usage["model_requests"].as_u64().unwrap();
+            assert!(
+                requests >= seen_requests,
+                "model_requests went backwards: {seen_requests} -> {requests}"
+            );
+            seen_requests = requests;
+        }
+
+        // Four model rounds happened, and the wire accounts for all four.
+        assert_eq!(server.join().unwrap().len(), 4);
+        assert_eq!(seen_requests, 4);
+        // The rejected text-only round contributed a standalone snapshot: it
+        // wrote no tool_request, so without `round_ended` its cost would be
+        // invisible to the bridge until the next line.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l["type"] == "event" && l["name"] == "usage_snapshot"),
+            "the gate-rejected round emitted no usage_snapshot"
+        );
     }
 
     async fn read_test_output<R>(reader: &mut R) -> Value

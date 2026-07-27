@@ -8,7 +8,7 @@
 
 use codefactory_agent_core::*;
 use serde::Deserialize;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -39,13 +39,6 @@ impl RuntimePolicy {
     }
 }
 
-pub(crate) fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 pub(crate) fn remaining_wall_time(started: Instant, wall_time_budget_sec: Option<u64>) -> Option<(u64, u64)> {
     let total = wall_time_budget_sec?.max(1);
     let remaining = total.saturating_sub(started.elapsed().as_secs());
@@ -71,9 +64,3 @@ pub(crate) fn should_finish_after_model_error(wall_time: Option<(u64, u64)>, out
     outcome_count > 0 && remaining <= (total / 15).max(60)
 }
 
-pub(crate) fn completion_recovery_attempts_after_tool_batch(
-    attempts: u32,
-    _material_evidence_progress: bool,
-) -> u32 {
-    attempts
-}
