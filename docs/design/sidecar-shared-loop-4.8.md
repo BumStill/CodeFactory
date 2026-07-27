@@ -94,6 +94,29 @@ inspection rule behind a `RunConfig` flag. The backend already owns
 post-execution classification after b2; this makes it own pre-execution too,
 which is the coherent end state.
 
+### The flip's real remaining blocker (corrected)
+The sidecar's six seam impls now exist and compile (`agent-headless/src/loop_services.rs`),
+so `run()` is the only thing still on the old body. Working the two
+`usage_snapshot` gaps through properly:
+
+- **b13 (transport error) needs NO loop hook.** `SidecarTransport` holds the same
+  shared `Arc<Jsonl>` stdout as the tool backend, so it can emit the snapshot
+  itself immediately before returning a `TransportError`. Entirely internal to
+  the sidecar's transport impl.
+- **b14 (a round that emitted no `tool_request`) needs ONE defaulted method:**
+  `EventSink::round_ended(&self)`, called once per model round after the tool
+  batch. The sidecar's sink emits a snapshot only when no `tool_request` went out
+  that round (a flag it shares with the backend). Desktop sinks keep the no-op —
+  the same shape as the existing `usage_recorded`.
+
+The bridge invariant this protects: **every model round emits at least one line
+carrying usage** (`tool_request` OR `usage_snapshot`); `codefactory_bench/agent.py`
+depends on it via `_latest_usage_snapshot`.
+
+So the remaining flip is: add `EventSink::round_ended` → rewrite `run()` as an
+adapter → adjust the 28 tokio tests for the new emission timing → 4.8d
+differential harness → 4.8e re-baseline (needs a real TB-21 run).
+
 ## Recommended decomposition (each independently green)
 1. **4.8a ✅ SHIPPED** (PR #205) — sidecar internal module split
    (protocol/transport/compaction/policy), zero behaviour change, the 28-test
