@@ -6,7 +6,15 @@ import { useSettingsStore } from "../stores/settings";
 import { invoke } from "../lib/tauri";
 
 export function ModelPicker() {
-  const { models, activeModel, updateActiveSessionModel, loadModels, setModel } = useChatStore();
+  const {
+    models,
+    activeModel,
+    activeSession,
+    updateActiveSessionModel,
+    updateActiveSessionModelConfig,
+    loadModels,
+    setModel,
+  } = useChatStore();
   const { settings, load: reloadSettings, save: saveSettings } = useSettingsStore();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -20,21 +28,27 @@ export function ModelPicker() {
   //      previous OpenRouter session into a direct-DeepSeek run, which
   //      was the root cause of the v0.3.5 400 reports.
   useEffect(() => {
-    const ep = settings?.default_endpoint ?? "openrouter";
+    const ep = activeSession?.endpoint_id ?? settings?.default_endpoint ?? "openrouter";
     let cancelled = false;
     setLoadingEndpoint(ep);
     loadModels(ep).finally(() => {
       if (!cancelled) setLoadingEndpoint(null);
     });
-    invoke<string>("get_endpoint_active_model", { endpointName: ep })
-      .then((m) => {
-        if (!cancelled && m && m !== activeModel) setModel(m);
-      })
-      .catch(() => { /* first run / endpoint without a saved model */ });
+    // An existing session owns its model independently. The endpoint's
+    // remembered default is only a seed for a not-yet-materialized draft;
+    // applying it here would make opening a session silently display and use
+    // a different model from the one persisted on that session.
+    if (!activeSession) {
+      invoke<string>("get_endpoint_active_model", { endpointName: ep })
+        .then((m) => {
+          if (!cancelled && m && m !== activeModel) setModel(m);
+        })
+        .catch(() => { /* first run / endpoint without a saved model */ });
+    }
     return () => {
       cancelled = true;
     };
-  }, [settings?.default_endpoint]);
+  }, [activeSession?.endpoint_id, settings?.default_endpoint]);
 
   useEffect(() => {
     const close = (e: MouseEvent) => {
@@ -45,7 +59,10 @@ export function ModelPicker() {
   }, []);
 
   const displayed = activeModel.split("/").pop() ?? activeModel;
-  const activeEndpoint = settings?.default_endpoint ?? "openrouter";
+  const activeEndpoint =
+    activeSession?.endpoint_id ?? settings?.default_endpoint ?? "openrouter";
+  const activePolicy =
+    activeSession?.model_policy ?? settings?.default_model_policy ?? "prefer";
   const endpointKeys = settings ? Object.keys(settings.endpoints).sort() : [];
   const modelListLoading = loadingEndpoint !== null;
   const filtered = models
@@ -66,17 +83,45 @@ export function ModelPicker() {
       <button
         onClick={() => setOpen((o) => !o)}
         className="flex items-center gap-1 rounded px-2 py-1 text-xs text-gray-400 hover:text-gray-200 hover:bg-surface-3 transition-colors"
-        title={`${activeEndpoint} / ${activeModel}`}
+        title={`${activeEndpoint} / ${activeModel} · ${activePolicy}`}
       >
-        <span className="max-w-[160px] truncate">{activeEndpoint} / {displayed}</span>
+        <span className="max-w-[190px] truncate">
+          {activeEndpoint} / {displayed} · {
+            activePolicy === "fixed" ? "固定" : activePolicy === "auto" ? "自动" : "首选"
+          }
+        </span>
         <ChevronDown size={12} />
       </button>
 
       {open && (
         <div className="absolute right-0 top-full mt-1 z-50 w-72 rounded-lg border border-border bg-surface-2 shadow-xl">
           <div className="space-y-2 p-2 border-b border-border">
+            {activeSession && (
+              <>
+                <select
+                  aria-label="模型策略"
+                  value={activePolicy}
+                  onChange={(event) => {
+                    void updateActiveSessionModelConfig({
+                      endpointId: activeEndpoint,
+                      modelId: activeModel,
+                      policy: event.target.value as "fixed" | "prefer" | "auto",
+                    });
+                  }}
+                  className="w-full rounded bg-surface-3 px-2 py-1 text-xs text-gray-200 outline-none"
+                >
+                  <option value="fixed">固定 · 只使用当前模型</option>
+                  <option value="prefer">首选 · 安全时允许兼容接管</option>
+                  <option value="auto">自动 · 按能力与状态选择</option>
+                </select>
+                <p className="px-0.5 text-xs leading-5 text-gray-500">
+                  会话策略更改只从下一轮开始生效；当前运行中的回合不会改路。
+                </p>
+              </>
+            )}
             {endpointKeys.length > 1 && (
               <select
+                aria-label="模型端点"
                 value={activeEndpoint}
                 onChange={async (e) => {
                   if (!settings) return;
@@ -84,14 +129,27 @@ export function ModelPicker() {
                   setLoadingEndpoint(endpointName);
                   setQuery("");
                   try {
-                    await saveSettings({ ...settings, default_endpoint: endpointName });
-                    await loadModels(endpointName);
+                    const modelsLoading = loadModels(endpointName);
                     const model = await invoke<string>("get_endpoint_active_model", {
                       endpointName,
                     }).catch(() => "");
                     if (model) {
-                      await updateActiveSessionModel(model);
+                      if (activeSession) {
+                        await updateActiveSessionModelConfig({
+                          endpointId: endpointName,
+                          modelId: model,
+                          policy: activePolicy,
+                        });
+                      } else {
+                        await saveSettings({
+                          ...settings,
+                          default_endpoint: endpointName,
+                          default_model: model,
+                        });
+                        setModel(model);
+                      }
                     }
+                    await modelsLoading;
                     await reloadSettings();
                   } finally {
                     setLoadingEndpoint(null);
@@ -123,15 +181,22 @@ export function ModelPicker() {
                     m.id === activeModel ? "text-accent" : "text-gray-300"
                   }`}
                   onClick={async () => {
-                    const ep = settings?.default_endpoint ?? "openrouter";
-                    // Persist as the endpoint's active model so the choice
-                    // survives endpoint switches and app restarts.
-                    await invoke("set_endpoint_active_model", {
-                      endpointName: ep,
-                      modelId: m.id,
-                    }).catch(() => { /* best-effort */ });
-                    updateActiveSessionModel(m.id);
-                    await reloadSettings(); // pull fresh endpoint state
+                    if (activeSession) {
+                      await updateActiveSessionModelConfig({
+                        endpointId: activeEndpoint,
+                        modelId: m.id,
+                        policy: activePolicy,
+                      });
+                    } else {
+                      // Outside an existing session this remains the
+                      // new-session default for the endpoint.
+                      await invoke("set_endpoint_active_model", {
+                        endpointName: activeEndpoint,
+                        modelId: m.id,
+                      }).catch(() => { /* best-effort */ });
+                      await updateActiveSessionModel(m.id);
+                      await reloadSettings();
+                    }
                     setOpen(false);
                   }}
                   title={m.id}

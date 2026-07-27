@@ -2,13 +2,14 @@
 
 ## 范围
 
-本规格定义首个可上线切片：当当前模型端点在**尚未产生可见输出或工具调用**时发生
+本规格定义首个可上线切片：当当前模型端点在**当前 root turn 尚未产生可见输出、工具调用
+或工具副作用**时发生
 可重放的服务故障，CodeFactory 使用本机已经配置、能解析模型且能读取凭据的其它端点
 继续同一回合。
 
-能力元数据筛选、跨进程恢复 route episode、结构化“重试原端点/打开设置”按钮和完整
-attempt journal 是后续增强，不作为本切片的完成声明。现有 vision/context/tool-choice
-确定性兼容逻辑保持不变；本切片不得让这些行为倒退。
+能力元数据筛选、会话级模型策略、结构化认证恢复和惰性凭据读取由后续
+`model-runtime-control-plane.md` 接管；发生冲突时以该新规格为准。跨进程恢复 route
+episode 和完整 attempt journal 仍是后续增强。
 
 ## Requirements Traceability
 
@@ -16,10 +17,10 @@ attempt journal 是后续增强，不作为本切片的完成声明。现有 vis
 | --- | --- | --- |
 | CF-ECF-R1 | 每个回合从当前 endpoint/model 开始，并对本机 Settings 生成稳定候选快照；不得使用未配置端点 | resolver unit |
 | CF-ECF-R2 | 缺模型、缺凭据或凭据读取失败的端点不进入请求候选；ChatGPT OAuth 不读取 synthetic API key | resolver/credential tests |
-| CF-ECF-R3 | macOS Keychain 读取必须离开 async runtime，并对每项并发设置 2 秒防冻结上限；单个坏候选不得卡住整个会话 | timeout regression + real App |
-| CF-ECF-R4 | `503/5xx/circuit_open`、429、连接超时/拒绝及 401/403 可触发下一端点；400、context、vision、policy/fatal 不得错误切换 | classifier table tests |
+| CF-ECF-R3 | macOS Keychain 读取必须离开 async runtime；只在候选真正将被使用时惰性读取，并以 singleflight/缓存避免重复系统授权；单个坏候选不得卡住整个会话 | broker regression + real App |
+| CF-ECF-R4 | `503/5xx/circuit_open`、429、连接超时/拒绝可按会话策略触发下一端点；401/403 必须先区分账号过期、缺凭据、权限拒绝和 quota，认证过期不得静默跨供应商；400、context、vision、policy/fatal 不得错误切换 | classifier table tests |
 | CF-ECF-R5 | 同端点已有短重试耗尽后，按候选顺序 A→B→C；同一候选每回合最多一次，禁止 A→B→A | routed transport tests |
-| CF-ECF-R6 | 一旦产生可见 SSE、tool call 或 tool result，不再跨端点重放，避免混合回答和副作用重复 | partial-output regression |
+| CF-ECF-R6 | 当前 root turn 一旦产生可见 SSE、tool call、tool result 或其它副作用，后续模型 round 也不再跨端点重放，避免混合回答和副作用重复 | root-turn replay regression |
 | CF-ECF-R7 | 切换保持同一 session、root turn、规范化 history、工具结果、权限和 cancel flag | shared-loop integration |
 | CF-ECF-R8 | 切换后的 route 驱动 context/reasoning 计算，并按真实 endpoint/model 记录 usage | context + usage attribution tests |
 | CF-ECF-R9 | 自动切换只影响当前运行，不修改 `default_endpoint/default_model` | settings immutability assertion |
@@ -44,9 +45,9 @@ ChatGPT 请求经同端点短重试后仍返回
 
 ### 坏凭据候选不冻结
 
-Settings 中存在没有 Key 的 OpenRouter。系统读取该候选时即使 macOS Keychain 阻塞，
-也必须在单项 2 秒后排除它；ChatGPT 或 DeepSeek 的正常路径继续。若全部候选都不可用，
-对话显示解决办法，而不是一直“运行中”。
+Settings 中存在没有 Key 的 OpenRouter。系统使用 ChatGPT 时不得预读 OpenRouter
+Keychain；只有真正前进到该候选时才读取。读取阻塞或被拒绝时排除它，并显示结构化解决
+办法，而不是一直“运行中”或在后续回合重复弹系统授权。
 
 ### 可见输出后失败
 
@@ -97,7 +98,7 @@ Settings 中存在没有 Key 的 OpenRouter。系统读取该候选时即使 mac
 
 ## 兼容与安全边界
 
-- 不自动创建、复制、导出或打印 secret；凭据仍由现有 secure store/fallback 管理。
+- 不导出或打印 secret；凭据由 CredentialBroker 按候选惰性读取并管理缓存/fallback。
 - 不修改用户的默认端点；失败端点仅在当前进程进入 120 秒健康冷却，后续回合仍显示
   自动切换说明。
 - 不用 failover 绕过权限、取消、内容政策或工具确认。

@@ -5,12 +5,31 @@ import {
   RefreshCw, Download, Package, LogIn, LogOut, Sparkles, Github, ExternalLink,
   ArrowRight, UserRound, GitPullRequestArrow, Gauge, Puzzle, ShieldCheck,
 } from "lucide-react";
-import { invoke, codexLogin, codexLogout, codexAccount } from "../../lib/tauri";
+import {
+  invoke,
+  codexLogout,
+  codexAccount,
+  codexLoginStart,
+  codexLoginOpen,
+  codexLoginStatus,
+  codexLoginCancel,
+} from "../../lib/tauri";
 import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
 import { useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
-import type { Settings, Endpoint, ApiStyle, CustomModel, AddGitRemoteRequest, GitRemoteConfig, GitProvider, CodexAccount, GithubCliCredentialStatus } from "../../lib/tauri";
+import type {
+  Settings,
+  Endpoint,
+  ApiStyle,
+  CustomModel,
+  AddGitRemoteRequest,
+  GitRemoteConfig,
+  GitProvider,
+  CodexAccount,
+  CodexLoginFlow,
+  GithubCliCredentialStatus,
+} from "../../lib/tauri";
 import { CHATGPT_DEFAULT_MODEL, CHATGPT_ENDPOINT_KEY } from "../../lib/chatgptModels";
 import { syncChatGptCatalog } from "../../stores/chatgptCatalog";
 import { UsageDashboardSection } from "../../components/UsageDashboardSection";
@@ -310,8 +329,8 @@ function EndpointCard({
         </div>
         <p className="text-[11px] leading-4 text-gray-600">
           {hasSavedKeyRef
-            ? "已配置系统凭据引用；默认不读取明文，输入新密钥后保存会替换。"
-            : "保存时会写入系统凭据库，不会保存在设置备份中。"}
+            ? "已保存。macOS 同时保留权限为 0600 的本机可用性副本，避免每次使用都弹出密钥授权；输入新密钥可替换。"
+            : "保存时写入系统凭据库；macOS 另存权限为 0600 的本机可用性副本。两者都不进入设置备份。"}
         </p>
       </div>
 
@@ -577,6 +596,9 @@ export function SettingsPage({
 
   const handleDeleteEndpoint = async (key: string) => {
     if (settings.default_endpoint === key) return; // can't delete default
+    const keyRef =
+      settings.endpoints[key]?.key_ref ?? `codefactory.endpoint.${key}`;
+    await invoke("delete_api_key", { keyRef });
     const newEndpoints = { ...settings.endpoints };
     delete newEndpoints[key];
     await save({ ...settings, endpoints: newEndpoints });
@@ -729,6 +751,35 @@ export function SettingsPage({
         {tab === "endpoints" && (
           <div className="max-w-xl space-y-3">
             <ChatGptLoginCard />
+
+            <div className="rounded-lg border border-border bg-surface-1 p-3">
+              <label className="flex items-center justify-between gap-4">
+                <span>
+                  <span className="block text-sm text-gray-200">新会话默认策略</span>
+                  <span className="mt-1 block text-xs leading-5 text-gray-500">
+                    只影响之后创建的会话；已有会话继续使用自己的策略。
+                  </span>
+                </span>
+                <select
+                  aria-label="新会话默认策略"
+                  value={settings.default_model_policy ?? "prefer"}
+                  onChange={(event) => {
+                    void save({
+                      ...settings,
+                      default_model_policy: event.target.value as
+                        | "fixed"
+                        | "prefer"
+                        | "auto",
+                    });
+                  }}
+                  className="shrink-0 rounded border border-border bg-surface-3 px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-accent/50"
+                >
+                  <option value="fixed">固定</option>
+                  <option value="prefer">首选</option>
+                  <option value="auto">自动</option>
+                </select>
+              </label>
+            </div>
 
             <div className="flex items-center justify-between mb-1">
               <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
@@ -1586,6 +1637,8 @@ function ChatGptLoginCard() {
   const [account, setAccount] = useState<CodexAccount | null | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [flow, setFlow] = useState<CodexLoginFlow | null>(null);
+  const [copied, setCopied] = useState(false);
   // Is ChatGPT the endpoint requests currently route to? Shown explicitly so
   // it's clear whether the subscription or one of the API endpoints is active.
   const isDefault =
@@ -1602,13 +1655,73 @@ function ChatGptLoginCard() {
       .catch(() => setAccount(null));
   }, []);
 
+  useEffect(() => {
+    if (!flow || (flow.status !== "waiting" && flow.status !== "exchanging")) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const next = await codexLoginStatus(flow.flow_id);
+        if (cancelled) return;
+        setFlow(next);
+        if (next.status === "succeeded" && next.account) {
+          setAccount(next.account);
+          await syncChatGptCatalog(true);
+        } else if (next.status === "failed") {
+          setError(next.error_message ?? "ChatGPT 验证失败，请重试");
+        }
+      } catch (pollError) {
+        if (!cancelled) {
+          setError(pollError instanceof Error ? pollError.message : String(pollError));
+        }
+      }
+    };
+    const timer = window.setInterval(() => void poll(), 800);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [flow?.flow_id, flow?.status]);
+
   const handleLogin = async () => {
     setBusy(true);
     setError(null);
     try {
-      const acct = await codexLogin();
-      setAccount(acct);
-      await syncChatGptCatalog(true);
+      setFlow(await codexLoginStart());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleOpenLogin = async () => {
+    if (!flow) return;
+    setError(null);
+    try {
+      const next = await codexLoginOpen(flow.flow_id);
+      setFlow(next);
+      if (next.browser_open_error) setError(next.browser_open_error);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleCopyLogin = async () => {
+    if (!flow) return;
+    try {
+      await navigator.clipboard.writeText(flow.authorization_url);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "复制验证链接失败");
+    }
+  };
+
+  const handleCancelLogin = async () => {
+    if (!flow) return;
+    setBusy(true);
+    try {
+      setFlow(await codexLoginCancel(flow.flow_id));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1642,6 +1755,7 @@ function ChatGptLoginCard() {
   };
 
   const loggedIn = account != null;
+  const flowActive = flow?.status === "waiting" || flow?.status === "exchanging";
 
   return (
     <div className="space-y-2.5 rounded-lg border border-border bg-surface-1 p-3">
@@ -1653,14 +1767,14 @@ function ChatGptLoginCard() {
           <div className="min-w-0">
             <p className="text-sm text-gray-200">使用 ChatGPT 登录</p>
             {account === undefined ? (
-              <p className="text-[11px] text-gray-600">检查登录状态…</p>
+              <p className="text-xs text-gray-600">检查登录状态…</p>
             ) : loggedIn ? (
-              <p className="truncate text-[11px] text-gray-500">
+              <p className="truncate text-xs text-gray-500">
                 已登录{account.email ? `：${account.email}` : ""}
                 {account.plan ? ` · ${account.plan}` : ""}
               </p>
             ) : (
-              <p className="text-[11px] text-gray-600">
+              <p className="text-xs text-gray-600">
                 用 ChatGPT Plus/Pro 订阅，免去手动填 API Key
               </p>
             )}
@@ -1694,25 +1808,62 @@ function ChatGptLoginCard() {
               <LogOut size={12} /> 退出登录
             </button>
           </div>
-        ) : (
+        ) : flowActive ? null : (
           <button
             onClick={handleLogin}
             disabled={busy}
             className="flex shrink-0 items-center gap-1.5 rounded bg-accent px-2.5 py-1 text-xs text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
           >
             {busy ? <RefreshCw size={12} className="animate-spin" /> : <LogIn size={12} />}
-            {busy ? "等待浏览器授权…" : "登录"}
+            {busy ? "正在准备验证…" : flow?.status === "expired" ? "生成新的验证链接" : "登录"}
           </button>
         )}
       </div>
 
-      {busy && !loggedIn && (
-        <p className="text-[11px] text-gray-500">
-          已在浏览器中打开 OpenAI 登录页，请完成授权后返回（5 分钟内有效）。
-        </p>
+      {flowActive && !loggedIn && (
+        <div role="status" aria-live="polite" className="space-y-2 rounded-md border border-border/70 bg-surface-2 p-2.5">
+          <div>
+            <p className="text-xs font-medium text-gray-200">
+              {flow.status === "exchanging" ? "正在完成 ChatGPT 验证" : "在浏览器中完成 ChatGPT 验证"}
+            </p>
+            <p className="mt-1 text-xs leading-5 text-gray-500">
+              若浏览器没有自动打开，可手动打开或复制同一条验证链接。
+            </p>
+            {flow.browser_open_error && (
+              <p className="mt-1 text-xs leading-5 text-amber-700 dark:text-amber-300">
+                自动打开失败：{flow.browser_open_error}
+              </p>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => void handleOpenLogin()}
+              disabled={flow.status === "exchanging"}
+              className="rounded bg-accent px-2.5 py-1.5 text-xs text-white disabled:opacity-50"
+            >
+              打开验证页面
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleCopyLogin()}
+              className="rounded border border-border px-2.5 py-1.5 text-xs text-gray-300 hover:bg-surface-3"
+            >
+              {copied ? "已复制" : "复制链接"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleCancelLogin()}
+              disabled={busy || flow.status === "exchanging"}
+              className="rounded px-2.5 py-1.5 text-xs text-gray-500 hover:bg-surface-3 hover:text-gray-300 disabled:opacity-50"
+            >
+              取消
+            </button>
+          </div>
+        </div>
       )}
       {error && (
-        <p className="flex items-start gap-1.5 text-[11px] text-rose-500">
+        <p className="flex items-start gap-1.5 text-xs leading-5 text-rose-500">
           <AlertCircle size={12} className="mt-0.5 shrink-0" /> {error}
         </p>
       )}
@@ -1983,7 +2134,8 @@ function DataSection() {
         </div>
         <p className="text-[11px] text-gray-600 leading-relaxed">
           所有会话、消息和设置都保存在这里。卸载并重装后依然保留。
-          API Key 单独存储在系统凭据库中，不包含在备份内。
+          API Key 不包含在设置备份内。macOS 会同时保存系统凭据与权限为 0600 的本机可用性副本；
+          删除端点时两份都会清理。
         </p>
       </div>
 

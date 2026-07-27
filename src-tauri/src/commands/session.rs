@@ -8,6 +8,23 @@ use crate::errors::AppError;
 use crate::storage::{Message, Session};
 use crate::AppState;
 
+fn validate_model_policy(policy: &str) -> Result<(), AppError> {
+    if matches!(policy, "fixed" | "prefer" | "auto") {
+        Ok(())
+    } else {
+        Err(AppError::Other(format!(
+            "Unsupported model policy '{policy}'"
+        )))
+    }
+}
+
+fn new_session_model_policy(settings: &crate::config::Settings) -> &str {
+    match settings.default_model_policy.as_str() {
+        "fixed" | "prefer" | "auto" => settings.default_model_policy.as_str(),
+        _ => "prefer",
+    }
+}
+
 fn resolve_new_session_model(
     settings: &crate::config::Settings,
     requested_model: &str,
@@ -38,7 +55,9 @@ async fn materialize_session_and_first_message(
     draft_id: &str,
     mode: &str,
     cwd: &str,
+    endpoint_id: &str,
     model_id: &str,
+    model_policy: &str,
     first_message: &str,
     now: i64,
 ) -> Result<Session, AppError> {
@@ -53,13 +72,15 @@ async fn materialize_session_and_first_message(
     let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO sessions
-         (id, title, cwd, model_id, created_at, updated_at, kind)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         (id, title, cwd, endpoint_id, model_id, model_policy, created_at, updated_at, kind)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(draft_id)
     .bind(draft_title(first_message))
     .bind(cwd)
+    .bind(endpoint_id)
     .bind(model_id)
+    .bind(model_policy)
     .bind(now)
     .bind(now)
     .bind(mode)
@@ -109,21 +130,20 @@ pub async fn materialize_draft_session(
     })?;
 
     let resolved_cwd = if mode == "project" {
-        let path = cwd.filter(|value| !value.trim().is_empty()).ok_or_else(|| {
-            AppError::Other("Project draft requires a working directory".into())
-        })?;
+        let path = cwd
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| AppError::Other("Project draft requires a working directory".into()))?;
         let path_buf = std::path::PathBuf::from(&path);
         if !path_buf.is_dir() {
-            return Err(AppError::Other(format!("Project directory does not exist: {path}")));
+            return Err(AppError::Other(format!(
+                "Project directory does not exist: {path}"
+            )));
         }
         path
     } else {
-        let home = dirs::home_dir()
-            .ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
-        let quick_dir = home
-            .join(".codefactory")
-            .join("quick")
-            .join(&draft_id);
+        let home =
+            dirs::home_dir().ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
+        let quick_dir = home.join(".codefactory").join("quick").join(&draft_id);
         std::fs::create_dir_all(&quick_dir)
             .map_err(|error| AppError::Other(format!("create quick-task dir failed: {error}")))?;
         quick_dir.to_string_lossy().to_string()
@@ -135,7 +155,9 @@ pub async fn materialize_draft_session(
         &draft_id,
         &mode,
         &resolved_cwd,
+        &settings.default_endpoint,
         &resolved_model,
+        new_session_model_policy(&settings),
         &first_message,
         Utc::now().timestamp_millis(),
     )
@@ -182,12 +204,10 @@ pub async fn get_or_create_quick_session(
 
     // Create one. cwd = ~/.codefactory/quick — auto-mkdir so the agent's
     // working directory is valid and write tools have a safe home.
-    let home = dirs::home_dir()
-        .ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
+    let home = dirs::home_dir().ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
     let quick_dir = home.join(".codefactory").join("quick");
-    std::fs::create_dir_all(&quick_dir).map_err(|e| {
-        AppError::Other(format!("create quick-task dir failed: {e}"))
-    })?;
+    std::fs::create_dir_all(&quick_dir)
+        .map_err(|e| AppError::Other(format!("create quick-task dir failed: {e}")))?;
 
     let settings = state.settings.read().await.clone();
     let model_id = resolve_new_session_model(&settings, &model_id).ok_or_else(|| {
@@ -201,13 +221,16 @@ pub async fn get_or_create_quick_session(
     let now = Utc::now().timestamp_millis();
     let pool = state.db.read().await;
     sqlx::query(
-        "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at, kind) \
-         VALUES (?,?,?,?,?,?,'quick')",
+        "INSERT INTO sessions
+         (id, title, cwd, endpoint_id, model_id, model_policy, created_at, updated_at, kind) \
+         VALUES (?,?,?,?,?,?,?,?,'quick')",
     )
     .bind(&id)
     .bind("快速任务")
     .bind(quick_dir.to_string_lossy().to_string())
+    .bind(&settings.default_endpoint)
     .bind(&model_id)
+    .bind(new_session_model_policy(&settings))
     .bind(now)
     .bind(now)
     .execute(&*pool)
@@ -236,21 +259,23 @@ pub async fn create_quick_session(
         ))
     })?;
     let id = Uuid::new_v4().to_string();
-    let home = dirs::home_dir()
-        .ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
+    let home = dirs::home_dir().ok_or_else(|| AppError::Other("home dir not resolvable".into()))?;
     let quick_dir = home.join(".codefactory").join("quick").join(&id);
     std::fs::create_dir_all(&quick_dir)
         .map_err(|e| AppError::Other(format!("create quick-task dir failed: {e}")))?;
     let now = Utc::now().timestamp_millis();
     let pool = state.db.read().await;
     sqlx::query(
-        "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at, kind) \
-         VALUES (?,?,?,?,?,?,'quick')",
+        "INSERT INTO sessions
+         (id, title, cwd, endpoint_id, model_id, model_policy, created_at, updated_at, kind) \
+         VALUES (?,?,?,?,?,?,?,?,'quick')",
     )
     .bind(&id)
     .bind("快速任务")
     .bind(quick_dir.to_string_lossy().to_string())
+    .bind(&settings.default_endpoint)
     .bind(&resolved_model)
+    .bind(new_session_model_policy(&settings))
     .bind(now)
     .bind(now)
     .execute(&*pool)
@@ -264,9 +289,7 @@ pub async fn create_quick_session(
 
 /// List Quick Task sessions (most-recent first) for the quick-session switcher.
 #[tauri::command]
-pub async fn list_quick_sessions(
-    state: State<'_, AppState>,
-) -> Result<Vec<Session>, AppError> {
+pub async fn list_quick_sessions(state: State<'_, AppState>) -> Result<Vec<Session>, AppError> {
     let pool = state.db.read().await;
     let sessions = sqlx::query_as::<_, Session>(
         "SELECT * FROM sessions WHERE kind = 'quick' ORDER BY updated_at DESC LIMIT 50",
@@ -328,12 +351,16 @@ pub async fn create_session(
     let now = Utc::now().timestamp_millis();
 
     sqlx::query(
-        "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO sessions
+         (id, title, cwd, endpoint_id, model_id, model_policy, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(&title)
     .bind(&cwd)
+    .bind(&settings.default_endpoint)
     .bind(&resolved_model)
+    .bind(new_session_model_policy(&settings))
     .bind(now)
     .bind(now)
     .execute(&*pool)
@@ -392,21 +419,54 @@ pub async fn update_session_model(
         .fetch_one(&*pool)
         .await?;
 
-    // Mirror the choice to the endpoint's active_model so it persists across
-    // app restarts AND survives the user switching to a different endpoint
-    // and back — the bug we're fixing in this release.
-    {
-        let mut settings = state.settings.write().await;
-        let endpoint_name = settings.default_endpoint.clone();
-        if settings.set_active_model(&endpoint_name, &model_id) {
-            // Best-effort persist — failure here doesn't undo the DB write.
-            if let Err(e) = crate::config::settings::save(&settings) {
-                tracing::warn!("Failed to persist active_model: {e}");
-            }
-        }
-    }
-
     Ok(session)
+}
+
+#[tauri::command]
+pub async fn update_session_model_config(
+    session_id: String,
+    endpoint_id: String,
+    model_id: String,
+    policy: String,
+    state: State<'_, AppState>,
+) -> Result<Session, AppError> {
+    validate_model_policy(&policy)?;
+    let settings = state.settings.read().await;
+    let endpoint = settings
+        .endpoints
+        .get(&endpoint_id)
+        .ok_or_else(|| AppError::Other(format!("Unknown endpoint: {endpoint_id}")))?;
+    let model_valid = endpoint.active_model.as_deref() == Some(model_id.as_str())
+        || endpoint
+            .custom_models
+            .iter()
+            .any(|model| model.id == model_id);
+    if !model_valid {
+        return Err(AppError::Other(format!(
+            "Model '{model_id}' is not configured for endpoint '{endpoint_id}'"
+        )));
+    }
+    drop(settings);
+
+    let pool = state.db.read().await;
+    sqlx::query(
+        "UPDATE sessions
+         SET endpoint_id = ?, model_id = ?, model_policy = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&endpoint_id)
+    .bind(&model_id)
+    .bind(&policy)
+    .bind(Utc::now().timestamp_millis())
+    .bind(&session_id)
+    .execute(&*pool)
+    .await?;
+    Ok(
+        sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = ?")
+            .bind(&session_id)
+            .fetch_one(&*pool)
+            .await?,
+    )
 }
 
 /// Explicit endpoint-scoped model setter. Used by the ModelPicker when the
@@ -495,6 +555,7 @@ struct MessagePageRow {
     session_id: String,
     role: String,
     content: String,
+    endpoint_id: Option<String>,
     model_id: Option<String>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
@@ -513,6 +574,7 @@ impl MessagePageRow {
                 session_id: self.session_id,
                 role: self.role,
                 content: self.content,
+                endpoint_id: self.endpoint_id,
                 model_id: self.model_id,
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
@@ -546,13 +608,7 @@ async fn load_message_page(
         .and_then(|rowid| rowid.checked_add(1))
         .unwrap_or(i64::MAX),
     };
-    load_message_page_below(
-        pool,
-        session_id,
-        upper_rowid,
-        user_turn_limit,
-    )
-    .await
+    load_message_page_below(pool, session_id, upper_rowid, user_turn_limit).await
 }
 
 async fn load_message_page_below(
@@ -629,7 +685,7 @@ async fn load_message_page_below(
     // process writes the shared database between awaits.
     let rows = sqlx::query_as::<_, MessagePageRow>(
         "SELECT rowid AS page_rowid,
-                id, session_id, role, content, model_id, input_tokens,
+                id, session_id, role, content, endpoint_id, model_id, input_tokens,
                 output_tokens, tool_calls, reasoning_content,
                 completion_state, created_at
          FROM messages
@@ -825,7 +881,9 @@ mod tests {
             "draft-1",
             "quick",
             "/tmp/quick/draft-1",
+            "deepseek",
             "deepseek-v4",
+            "prefer",
             "第一条真实消息",
             123,
         )
@@ -869,20 +927,24 @@ mod tests {
             "draft-rollback",
             "quick",
             "/tmp/quick/draft-rollback",
+            "deepseek",
             "model",
+            "prefer",
             "reject",
             123,
         )
         .await;
 
         assert!(result.is_err());
-        let session_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sessions WHERE id = 'draft-rollback'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(session_count, 0, "failed first-message write must roll back the session row");
+        let session_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id = 'draft-rollback'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            session_count, 0,
+            "failed first-message write must roll back the session row"
+        );
     }
 
     #[tokio::test]
@@ -900,7 +962,9 @@ mod tests {
                 "draft-1",
                 "project",
                 "/tmp/project",
+                "deepseek",
                 "model",
+                "prefer",
                 "只保存一次",
                 123,
             )
@@ -908,12 +972,11 @@ mod tests {
             .expect("idempotent materialize");
         }
 
-        let message_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM messages WHERE session_id = 'draft-1'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let message_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id = 'draft-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(message_count, 1);
     }
 
@@ -923,7 +986,9 @@ mod tests {
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 cwd TEXT NOT NULL,
+                endpoint_id TEXT,
                 model_id TEXT NOT NULL,
+                model_policy TEXT NOT NULL DEFAULT 'fixed',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 total_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -942,6 +1007,7 @@ mod tests {
                 session_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                endpoint_id TEXT,
                 model_id TEXT,
                 input_tokens INTEGER,
                 output_tokens INTEGER,
@@ -1009,14 +1075,9 @@ mod tests {
         assert_eq!(newest.messages.last().unwrap().id, "11-gate");
         assert_eq!(newest.messages.len(), 15);
 
-        let older = load_message_page(
-            &pool,
-            "long",
-            newest.next_before_rowid,
-            3,
-        )
-        .await
-        .expect("older page");
+        let older = load_message_page(&pool, "long", newest.next_before_rowid, 3)
+            .await
+            .expect("older page");
         assert_eq!(older.messages.first().unwrap().id, "6-user");
         assert_eq!(older.messages.last().unwrap().id, "8-gate");
         assert_eq!(older.messages.len(), 15);
@@ -1096,10 +1157,7 @@ mod tests {
                 .expect("bounded giant-turn page");
             page_count += 1;
             assert!(page.messages.len() <= MAX_MESSAGE_PAGE_ROWS as usize);
-            assert!(
-                serde_json::to_vec(&page).unwrap().len()
-                    <= MAX_MESSAGE_PAGE_SERIALIZED_BYTES
-            );
+            assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_MESSAGE_PAGE_SERIALIZED_BYTES);
             for message in &page.messages {
                 assert!(
                     all_ids.insert(message.id.clone()),
@@ -1270,10 +1328,7 @@ mod tests {
             serde_json::from_str(&page.messages[2].content).expect("valid replay JSON");
         assert_eq!(replay["tool_call_id"], "call-huge");
         assert_eq!(replay["content"], PAYLOAD_OMITTED);
-        assert!(
-            serde_json::to_vec(&page).unwrap().len()
-                <= MAX_MESSAGE_PAGE_SERIALIZED_BYTES
-        );
+        assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_MESSAGE_PAGE_SERIALIZED_BYTES);
         let multilingual = "你".repeat(MAX_MESSAGE_FIELD_BYTES);
         let preview = truncate_utf8(&multilingual, MAX_MESSAGE_FIELD_BYTES);
         assert!(preview.len() <= MAX_MESSAGE_FIELD_BYTES);
@@ -1305,10 +1360,7 @@ mod tests {
             },
         );
 
-        let resolved = resolve_new_session_model(
-            &settings,
-            "anthropic/claude-opus-4-7",
-        );
+        let resolved = resolve_new_session_model(&settings, "anthropic/claude-opus-4-7");
 
         assert_eq!(resolved.as_deref(), Some("deepseek-v4-pro"));
     }

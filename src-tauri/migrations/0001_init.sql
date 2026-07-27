@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id  TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     role        TEXT    NOT NULL,   -- user | assistant | tool | system
     content     TEXT    NOT NULL,   -- plain text or JSON for tool messages
+    endpoint_id TEXT,
     model_id    TEXT,
     input_tokens  INTEGER,
     output_tokens INTEGER,

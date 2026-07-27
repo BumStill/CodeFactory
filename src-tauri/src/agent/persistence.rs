@@ -30,6 +30,46 @@ fn perr<E: std::fmt::Display>(e: E) -> PersistError {
     }
 }
 
+pub async fn persist_model_route_attempts(
+    db: &SqlitePool,
+    session_id: &str,
+    root_turn_id: &str,
+    policy: &str,
+    attempts: &[super::failover::RouteAttemptSnapshot],
+    output_started: bool,
+    side_effect_started: bool,
+) -> PersistResult<()> {
+    if attempts.is_empty() {
+        return Ok(());
+    }
+    let now = Utc::now().to_rfc3339();
+    let mut tx = db.begin().await.map_err(perr)?;
+    for attempt in attempts {
+        sqlx::query(
+            "INSERT INTO model_route_attempts
+             (id, root_turn_id, session_id, endpoint, model, policy, status,
+              failure_code, output_started, side_effect_started, created_at, completed_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(root_turn_id)
+        .bind(session_id)
+        .bind(&attempt.endpoint)
+        .bind(&attempt.model)
+        .bind(policy)
+        .bind(&attempt.status)
+        .bind(&attempt.failure_code)
+        .bind(i64::from(output_started))
+        .bind(i64::from(side_effect_started))
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(perr)?;
+    }
+    tx.commit().await.map_err(perr)?;
+    Ok(())
+}
 
 /// Gate control states that are pure forensics: the loop injects them as
 /// prompts, `replayable_history` excludes them from the model's context, and
@@ -93,6 +133,8 @@ impl Persistence for SqlitePersistence {
         output_tokens: Option<i64>,
         tool_calls: Option<&[ToolCall]>,
         reasoning_content: Option<&str>,
+        endpoint_id: Option<&str>,
+        model_id: Option<&str>,
         usage_request_id: Option<&str>,
     ) -> PersistResult<Option<String>> {
         // Anonymous runs never touch the DB — the assistant turn lives only in
@@ -112,13 +154,15 @@ impl Persistence for SqlitePersistence {
             .map(|tcs| crate::trajectory::redact_tool_calls_for_storage(tcs).unwrap_or_default());
 
         sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, input_tokens, output_tokens, tool_calls, reasoning_content, usage_request_id, created_at) \
-             VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages (id, session_id, role, content, endpoint_id, model_id, input_tokens, output_tokens, tool_calls, reasoning_content, usage_request_id, created_at) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(&msg_id)
         .bind(&self.session_id)
         .bind(role)
         .bind(persisted_content)
+        .bind(endpoint_id)
+        .bind(model_id)
         .bind(input_tokens)
         .bind(output_tokens)
         .bind(tool_calls_json)
@@ -307,7 +351,8 @@ mod tests {
             .unwrap();
         sqlx::query(
             "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, \
-             content TEXT, input_tokens INTEGER, output_tokens INTEGER, tool_calls TEXT, \
+             content TEXT, endpoint_id TEXT, model_id TEXT, input_tokens INTEGER,
+             output_tokens INTEGER, tool_calls TEXT, \
              reasoning_content TEXT, usage_request_id TEXT, completion_state TEXT, created_at INTEGER)",
         )
         .execute(&db)
@@ -316,6 +361,17 @@ mod tests {
         sqlx::query(
             "CREATE TABLE gate_events (id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, \
              content TEXT, message_id TEXT, created_at INTEGER)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE model_route_attempts (
+                id TEXT PRIMARY KEY, root_turn_id TEXT, session_id TEXT,
+                endpoint TEXT, model TEXT, policy TEXT, status TEXT,
+                failure_code TEXT, output_started INTEGER,
+                side_effect_started INTEGER, created_at TEXT, completed_at TEXT
+            )",
         )
         .execute(&db)
         .await
@@ -396,11 +452,12 @@ mod tests {
             .unwrap();
         assert_eq!(messages.0, 0);
 
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT kind, content FROM gate_events WHERE session_id='s1' ORDER BY kind")
-                .fetch_all(&db)
-                .await
-                .unwrap();
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT kind, content FROM gate_events WHERE session_id='s1' ORDER BY kind",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
         assert_eq!(
             rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
             ["gate_blocked", "gate_ready", "gate_recovery"],
@@ -473,12 +530,11 @@ mod tests {
         p.persist_gate_message("runtime correction", "turn_notice")
             .await
             .unwrap();
-        let (role, state): (String, String) = sqlx::query_as(
-            "SELECT role, completion_state FROM messages WHERE session_id='s1'",
-        )
-        .fetch_one(&db)
-        .await
-        .unwrap();
+        let (role, state): (String, String) =
+            sqlx::query_as("SELECT role, completion_state FROM messages WHERE session_id='s1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
         assert_eq!(role, "system");
         assert_eq!(state, "turn_notice");
     }
@@ -492,9 +548,19 @@ mod tests {
             anonymous: true,
         };
         assert_eq!(
-            p.persist_message("assistant", "secret", Some(1), Some(2), None, None, Some("r"))
-                .await
-                .unwrap(),
+            p.persist_message(
+                "assistant",
+                "secret",
+                Some(1),
+                Some(2),
+                None,
+                None,
+                Some("chatgpt"),
+                Some("gpt-5.5"),
+                Some("r"),
+            )
+            .await
+            .unwrap(),
             None
         );
         p.persist_gate_message("x", "gate_ready").await.unwrap();
@@ -504,5 +570,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 0, "anonymous run left DB rows");
+    }
+
+    #[tokio::test]
+    async fn assistant_message_persists_the_effective_endpoint_and_model() {
+        let db = pool().await;
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: false,
+        };
+        p.persist_message(
+            "assistant",
+            "ok",
+            Some(11),
+            Some(7),
+            None,
+            None,
+            Some("deepseek"),
+            Some("deepseek-v4-pro"),
+            Some("request-1"),
+        )
+        .await
+        .unwrap();
+
+        let actual: (String, String) =
+            sqlx::query_as("SELECT endpoint_id, model_id FROM messages LIMIT 1")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(actual, ("deepseek".into(), "deepseek-v4-pro".into()));
+    }
+
+    #[tokio::test]
+    async fn route_attempt_journal_contains_provenance_but_no_credentials() {
+        let db = pool().await;
+        let attempts = vec![
+            super::super::failover::RouteAttemptSnapshot {
+                endpoint: "chatgpt".into(),
+                model: "gpt-5.5".into(),
+                status: "failed".into(),
+                failure_code: Some("AUTH_EXPIRED".into()),
+            },
+            super::super::failover::RouteAttemptSnapshot {
+                endpoint: "deepseek".into(),
+                model: "deepseek-v4-pro".into(),
+                status: "succeeded".into(),
+                failure_code: None,
+            },
+        ];
+        persist_model_route_attempts(&db, "s1", "user-1", "prefer", &attempts, true, false)
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, String, String, Option<String>, i64, i64)> = sqlx::query_as(
+            "SELECT endpoint, model, status, failure_code,
+                    output_started, side_effect_started
+             FROM model_route_attempts ORDER BY rowid",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].3.as_deref(), Some("AUTH_EXPIRED"));
+        assert_eq!(rows[1].0, "deepseek");
+        assert_eq!(rows[1].4, 1);
+        assert_eq!(rows[1].5, 0);
+        let serialized = serde_json::to_string(&rows).unwrap();
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("api_key"));
     }
 }

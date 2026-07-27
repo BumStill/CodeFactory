@@ -118,6 +118,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       font_family: s.font_family ?? "inter",
       font_size: s.font_size ?? 14,
       remote_postmortem_enabled: s.remote_postmortem_enabled ?? false,
+      default_model_policy: s.default_model_policy ?? "prefer",
     };
     applyTheme(merged);
     set({ settings: merged });

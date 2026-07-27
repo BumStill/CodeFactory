@@ -6,6 +6,7 @@ mod benchmark_consistency;
 mod codex_auth;
 mod commands;
 mod config;
+mod credential_broker;
 mod errors;
 mod git_remote;
 mod http_util;
@@ -256,6 +257,10 @@ pub fn run() {
             commands::settings::save_api_key,
             commands::settings::delete_api_key,
             codex_auth::codex_login,
+            codex_auth::codex_login_start,
+            codex_auth::codex_login_status,
+            codex_auth::codex_login_open,
+            codex_auth::codex_login_cancel,
             codex_auth::codex_logout,
             codex_auth::codex_account,
             codex_auth::codex_models,
@@ -318,6 +323,7 @@ pub fn run() {
             commands::session::get_session,
             commands::session::delete_session,
             commands::session::update_session_model,
+            commands::session::update_session_model_config,
             commands::session::set_endpoint_active_model,
             commands::session::get_endpoint_active_model,
             commands::session::update_session_title,

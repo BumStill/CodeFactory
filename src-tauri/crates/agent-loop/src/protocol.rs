@@ -25,6 +25,20 @@ pub fn is_vision_rejection(error: &str) -> bool {
         && !lower.contains("rate limit")
 }
 
+/// Count image parts without mutating history. Capability gating must preserve
+/// the user's original prompt so switching to a vision model can retry it.
+pub fn image_part_count(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            MessageContent::Parts(parts) => Some(parts),
+            MessageContent::Text(_) => None,
+        })
+        .flatten()
+        .filter(|part| part.r#type == "image_url" && part.image_url.is_some())
+        .count()
+}
+
 /// Replace image parts in OpenAI-shaped messages with a text placeholder.
 /// Returns how many were stripped (0 = nothing to do → do not retry again).
 pub fn strip_image_parts(messages: &mut [ChatMessage]) -> usize {
@@ -43,7 +57,6 @@ pub fn strip_image_parts(messages: &mut [ChatMessage]) -> usize {
     }
     stripped
 }
-
 
 /// Repair a compressed/replayed OpenAI history so it satisfies the strict
 /// tool-call protocol: every `assistant` tool_call must be followed by a matching

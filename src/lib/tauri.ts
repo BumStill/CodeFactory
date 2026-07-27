@@ -50,6 +50,13 @@ export type StreamEvent =
       reason: string;
     }
   | { type: "completion_gate_action"; kind: string; detail: string }
+  | {
+      type: "runtime_error";
+      code: string;
+      message: string;
+      endpoint_id?: string | null;
+      recoverable: boolean;
+    }
   | { type: "error"; message: string };
 
 export interface Session {
@@ -57,6 +64,10 @@ export interface Session {
   title: string;
   cwd: string;
   model_id: string;
+  /** Endpoint owned by this session. Null on unresolved legacy rows only. */
+  endpoint_id?: string | null;
+  /** Per-session routing strategy. */
+  model_policy?: "fixed" | "prefer" | "auto";
   created_at: number;
   updated_at: number;
   total_input_tokens: number;
@@ -75,6 +86,7 @@ export interface Message {
   session_id: string;
   role: "user" | "assistant" | "tool" | "system";
   content: string;
+  endpoint_id?: string;
   model_id?: string;
   input_tokens?: number;
   output_tokens?: number;
@@ -138,12 +150,42 @@ export interface CodexAccount {
   account_id?: string | null;
 }
 
+export interface CodexLoginFlow {
+  flow_id: string;
+  authorization_url: string;
+  status: "waiting" | "exchanging" | "succeeded" | "failed" | "cancelled" | "expired";
+  expires_at: number;
+  browser_open_error?: string | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  account?: CodexAccount | null;
+}
+
 /** Run the interactive ChatGPT OAuth login: opens the system browser, captures
  *  the localhost:1455 callback, exchanges the code, and stores tokens in the OS
  *  keychain. Resolves with the signed-in account, or rejects on error/timeout.
  *  The `app` handle is injected by Tauri, so no JS arguments are passed. */
 export function codexLogin(): Promise<CodexAccount> {
   return invoke<CodexAccount>("codex_login");
+}
+
+/** Start or reuse the shared non-blocking ChatGPT authorization flow. */
+export function codexLoginStart(): Promise<CodexLoginFlow> {
+  return invoke<CodexLoginFlow>("codex_login_start");
+}
+
+/** Ask the OS to open the existing flow URL again. The same URL remains
+ * copyable even if the system opener reports an error. */
+export function codexLoginOpen(flowId: string): Promise<CodexLoginFlow> {
+  return invoke<CodexLoginFlow>("codex_login_open", { flowId });
+}
+
+export function codexLoginStatus(flowId: string): Promise<CodexLoginFlow> {
+  return invoke<CodexLoginFlow>("codex_login_status", { flowId });
+}
+
+export function codexLoginCancel(flowId: string): Promise<CodexLoginFlow> {
+  return invoke<CodexLoginFlow>("codex_login_cancel", { flowId });
 }
 
 /** Sign out: remove the stored ChatGPT tokens from the OS keychain. */
@@ -378,6 +420,8 @@ export function sendMessageAnonymous(
   history: AnonTurn[],
   cwd: string,
   modelId: string,
+  endpointId?: string | null,
+  modelPolicy?: "fixed" | "prefer" | "auto",
 ): Promise<void> {
   return invoke<void>("send_message_anonymous", {
     sessionId,
@@ -385,6 +429,8 @@ export function sendMessageAnonymous(
     history,
     cwd,
     modelId,
+    endpointId,
+    modelPolicy,
   });
 }
 
@@ -420,6 +466,8 @@ export interface Settings {
   endpoints: Record<string, Endpoint>;
   default_endpoint: string;
   default_model: string;
+  /** Routing strategy copied into new sessions; existing sessions are unchanged. */
+  default_model_policy?: "fixed" | "prefer" | "auto";
   permissions: {
     allow: string[];
     ask: string[];

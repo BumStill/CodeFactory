@@ -113,14 +113,17 @@ pub async fn run_subagent(
     // the route that will actually execute, including a cooled-down-primary
     // fallback selected at turn start.
     let (route_plan, _excluded_routes) =
-        crate::commands::chat::resolve_route_plan(settings, &requested_model).await?;
+        crate::commands::chat::resolve_route_plan(settings, &requested_model, "auto", false)
+            .await?;
     let primary_route = route_plan
         .candidates()
         .first()
         .expect("route plan always has a primary")
         .clone();
     let model = primary_route.model_id.clone();
-    let api_key = primary_route.api_key.clone();
+    // The failover plan carries only opaque credential references. The
+    // process-wide broker resolves the active route lazily.
+    let api_key = String::new();
     let base_url = primary_route.base_url.clone();
     let api_style = primary_route.api_style.clone();
     let endpoint_name = primary_route.endpoint_name.clone();
@@ -131,14 +134,16 @@ pub async fn run_subagent(
     let now = Utc::now().timestamp_millis();
 
     sqlx::query(
-        "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at, \
-         total_input_tokens, total_output_tokens, parent_session_id) \
-         VALUES (?,?,?,?,?,?,0,0,?)",
+        "INSERT INTO sessions (id, title, cwd, endpoint_id, model_id, model_policy,
+         created_at, updated_at, total_input_tokens, total_output_tokens, parent_session_id) \
+         VALUES (?,?,?,?,?,?,?, ?,0,0,?)",
     )
     .bind(&sub_session_id)
     .bind(&sub_title)
     .bind(&brief.cwd)
+    .bind(&endpoint_name)
     .bind(&model)
+    .bind("auto")
     .bind(now)
     .bind(now)
     .bind(parent_session_id)
@@ -165,6 +170,7 @@ pub async fn run_subagent(
         session_id: sub_session_id.clone(),
         role: "user".into(),
         content: brief_text.clone(),
+        endpoint_id: None,
         model_id: None,
         input_tokens: None,
         output_tokens: None,
