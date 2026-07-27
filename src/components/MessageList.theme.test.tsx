@@ -214,6 +214,26 @@ describe("MessageList theme readability", () => {
     expect(image?.className).toMatch(/max-h-80/);
   });
 
+  it("renders image attachments inside user message bubbles instead of raw markdown links", () => {
+    const { container } = render(
+      <MessageList
+        messages={[
+          baseMsg({
+            role: "user",
+            content: "请看这张图：\n\n![image.png](file:///proj/.codefactory/attachments/user-image.png)",
+          }),
+        ]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+
+    const image = container.querySelector("img[alt='image.png']");
+    expect(image, "expected the user attachment to render as an inline preview").toBeTruthy();
+    expect(convertFileSrcMock).toHaveBeenCalledWith("/proj/.codefactory/attachments/user-image.png");
+    expect(screen.queryByText(/!\[image\.png\]/)).not.toBeInTheDocument();
+  });
+
   it("shows a visible fallback if an attached image preview fails to load", () => {
     render(
       <MessageList
