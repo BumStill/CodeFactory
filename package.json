@@ -15,7 +15,8 @@
     "test:resume:headless": "node scripts/verify-resume-journal-headless.mjs",
     "test:usage:headless": "node scripts/verify-token-usage-headless.mjs",
     "test:attachments:asset-scope": "node scripts/verify-attachment-asset-scope.mjs",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:scrollbar:headless": "node scripts/verify-scrollbar-auto-hide-headless.mjs"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.19",
