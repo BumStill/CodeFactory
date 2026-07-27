@@ -8,6 +8,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "cargo:shared": "node scripts/cargo-shared.mjs",
+    "worktrees": "node scripts/worktree-janitor.mjs",
+    "worktrees:clean": "node scripts/worktree-janitor.mjs --apply --stale-days 7",
     "test": "vitest run",
     "test:rust:fast": "node scripts/cargo-shared.mjs test --manifest-path src-tauri/Cargo.toml",
     "test:evolution:headless": "node scripts/verify-evolution-workbench-headless.mjs",

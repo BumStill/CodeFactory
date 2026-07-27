@@ -174,10 +174,12 @@ Remaining: 4.8d differential harness, 4.8e re-baseline (needs a real TB-21 run).
    own focused change, not as a tail-end step.
 3. **4.8c** — add each `run_agent_loop` seam separately, verified against the
    DESKTOP suite. **b2 and b5 deserve their own PRs.**
-4. **4.8d** — differential harness before the flip: run both loops against the
-   same canned `fake_openai_server` scripts and diff the emitted JSONL **and** the
-   captured outbound payloads. Merge only when the JSONL diff is empty and the
-   payload diff is exactly the accepted (c) set.
+4. ~~**4.8d** — differential harness before the flip~~ **VOID.** It was a
+   *pre-flip* safety net: diff the two loops against the same canned scripts.
+   The flip shipped without it and the sidecar's loop is deleted, so the half it
+   would compare against no longer exists — it can prove nothing now. Do not
+   resurrect it from git history to run a diff against a refactor that already
+   merged, released, and passed CI.
 5. **4.8e** — re-baseline: an `official_comparable: yes` Terminal-Bench 21 run
    before and after, same trial count. Any pass-rate regression is a blocker.
 

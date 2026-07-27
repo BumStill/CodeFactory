@@ -41,6 +41,9 @@
 
 ## 快速命令
 - 跨 worktree 共享 Cargo 缓存：`pnpm cargo:shared -- <cargo arguments>`
+  - **裸 `cargo build` / `cargo test` 不走共享缓存**，会在当前 worktree 另起一份数 GB 的 `target/`。长会话优先用上面这条。
+- 清理已完结的 worktree：`pnpm worktrees`（只报告）/ `pnpm worktrees:clean`（删已合并且干净的，并清 7 天未动的构建产物）
+  - 本仓库一律 squash 合并，`git merge-base --is-ancestor` 会把已合并分支判成未合并；脚本靠「是否存在已合并 PR」来判定，不要用裸 merge-base 自己写清理。
 - Rust 快速回归：`pnpm test:rust:fast -- <test filter>`
 - 治理基线：`python tools/governance/validate_repo_governance_baseline.py`
 - PowerShell 包装：`powershell -ExecutionPolicy Bypass -File tools/governance/check_repo_governance.ps1`
