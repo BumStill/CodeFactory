@@ -10,6 +10,16 @@ pub struct Session {
     pub title: String,
     pub cwd: String,
     pub model_id: String,
+    /// Per-session endpoint binding. Legacy rows can remain unresolved until
+    /// the user chooses an endpoint; new sessions always persist one.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub endpoint_id: Option<String>,
+    /// fixed | prefer | auto. Legacy sessions migrate to fixed so an upgrade
+    /// never starts sending their history to a different provider.
+    #[serde(default = "default_model_policy")]
+    #[sqlx(default)]
+    pub model_policy: String,
     pub created_at: i64,
     pub updated_at: i64,
     pub total_input_tokens: i64,
@@ -29,7 +39,12 @@ pub struct Session {
     pub reasoning_effort: Option<String>,
 }
 
-fn default_session_kind() -> String { "project".into() }
+fn default_session_kind() -> String {
+    "project".into()
+}
+fn default_model_policy() -> String {
+    "fixed".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Message {
@@ -37,6 +52,7 @@ pub struct Message {
     pub session_id: String,
     pub role: String,
     pub content: String,
+    pub endpoint_id: Option<String>,
     pub model_id: Option<String>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -118,7 +134,7 @@ mod tests {
             .unwrap();
         sqlx::query(
             "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, \
-             content TEXT, model_id TEXT, input_tokens INTEGER, output_tokens INTEGER, \
+             content TEXT, endpoint_id TEXT, model_id TEXT, input_tokens INTEGER, output_tokens INTEGER, \
              tool_calls TEXT, reasoning_content TEXT, completion_state TEXT, created_at INTEGER)",
         )
         .execute(&db)
@@ -207,6 +223,9 @@ mod tests {
         // The anti-join is by message id, which is globally unique — a stray
         // row naming this id still refers to this message, so it applies.
         let history = load_agent_history(&db, "s1").await.unwrap();
-        assert_eq!(history.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["u1"]);
+        assert_eq!(
+            history.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["u1"]
+        );
     }
 }

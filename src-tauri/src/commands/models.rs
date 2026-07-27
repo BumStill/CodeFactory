@@ -46,7 +46,11 @@ pub async fn list_models(
         .key_ref
         .clone()
         .unwrap_or_else(|| format!("codefactory.endpoint.{endpoint_name}"));
-    let api_key = crate::secrets::get_key(&key_ref)?.unwrap_or_default();
+    let api_key = crate::credential_broker::CredentialBroker::global()
+        .get(&key_ref)
+        .await
+        .map_err(|error| AppError::Other(error.message))?
+        .unwrap_or_default();
 
     let client = crate::openrouter::OpenRouterClient::new(&endpoint.base_url, api_key);
     match client.list_models().await {

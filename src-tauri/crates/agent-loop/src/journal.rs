@@ -80,6 +80,8 @@ pub trait Persistence: Send + Sync {
         output_tokens: Option<i64>,
         tool_calls: Option<&[ToolCall]>,
         reasoning_content: Option<&str>,
+        endpoint_id: Option<&str>,
+        model_id: Option<&str>,
         usage_request_id: Option<&str>,
     ) -> PersistResult<Option<String>>;
 
@@ -180,6 +182,8 @@ impl Persistence for NullPersistence {
         _output_tokens: Option<i64>,
         _tool_calls: Option<&[ToolCall]>,
         _reasoning_content: Option<&str>,
+        _endpoint_id: Option<&str>,
+        _model_id: Option<&str>,
         _usage_request_id: Option<&str>,
     ) -> PersistResult<Option<String>> {
         Ok(None)
@@ -265,9 +269,19 @@ mod tests {
         let p: std::sync::Arc<dyn Persistence> = std::sync::Arc::new(NullPersistence);
         // persist_message returns None (the load-bearing anonymous sentinel).
         assert_eq!(
-            p.persist_message("assistant", "hi", Some(1), Some(2), None, None, Some("r"))
-                .await
-                .unwrap(),
+            p.persist_message(
+                "assistant",
+                "hi",
+                Some(1),
+                Some(2),
+                None,
+                None,
+                Some("chatgpt"),
+                Some("gpt-5.5"),
+                Some("r"),
+            )
+            .await
+            .unwrap(),
             None
         );
         p.persist_gate_message("recover now", "gate_recovery")

@@ -436,20 +436,16 @@ pub async fn run_agent_loop(
     };
     let system_prompt = system_prompt.as_str();
     let tool_defs = tool_defs.as_slice();
-    // Proactive capability match: strip images BEFORE the first request
-    // when the model is KNOWN text-only, instead of burning a 400 round
-    // trip every turn. The reactive strip-and-retry stays as the net for
-    // unknown models and wrong guesses.
+    // Images are user input, not optional context. Never silently replace them
+    // with placeholders: keep the original history intact so the user can
+    // switch to a vision-capable model and retry.
     if !context_policy.supports_vision().await {
-        let stripped = crate::protocol::strip_image_parts(&mut messages);
-        if stripped > 0 {
-            let notice = format!(
-                "当前模型不支持图片输入,已在发送前将历史中的 {stripped} 张图片替换为\
-占位文本;切换到支持图片的模型可恢复图片理解。"
-            );
-            persistence
-                .persist_gate_message_once("已在发送前", &notice, "turn_notice")
-                .await?;
+        let image_count = crate::protocol::image_part_count(&messages);
+        if image_count > 0 {
+            return Err(TransportError::Fatal(format!(
+                "IMAGE_INPUT_UNSUPPORTED: 当前模型不支持图片输入，本次请求未发送，{image_count} 张图片均已保留。请切换到支持图片的模型后重试"
+            ))
+            .into());
         }
     }
 
@@ -512,11 +508,8 @@ pub async fn run_agent_loop(
                 // surface keeps its own budget discipline: desktop = token-based
                 // elision (DefaultCompressor, byte-identical to before),
                 // sidecar = its destructive char-budget digest.
-                let compaction = compactor.compact(
-                    std::mem::take(&mut messages),
-                    system_prompt,
-                    context_limit,
-                );
+                let compaction =
+                    compactor.compact(std::mem::take(&mut messages), system_prompt, context_limit);
                 messages = compaction.messages;
                 if compaction.compacted {
                     events.emit(crate::types::StreamEvent::ContextCompressed {
@@ -551,11 +544,6 @@ pub async fn run_agent_loop(
                 route_change,
             } = match call_result {
                 Ok(ok) => ok,
-                // The active model rejects image input (e.g. the user switched
-                // the session to a no-vision model with image attachments in
-                // history). Strip images to placeholders and retry ONCE —
-                // otherwise every「继续」replays the same history and dies the
-                // same death (2026-07-21 field report).
                 // Provider says the prompt is over the window: the resolved
                 // window metadata or the token estimate was wrong. Emergency-
                 // compress against a reduced budget and retry ONCE — a killed
@@ -632,24 +620,10 @@ pub async fn run_agent_loop(
                     }
                 }
                 Err(e) if crate::protocol::is_vision_rejection(&e.to_string()) => {
-                    let stripped = crate::protocol::strip_image_parts(&mut messages);
-                    if stripped == 0 {
-                        return Err(e.into());
-                    }
-                    let notice = format!(
-                        "已自动移除历史中的 {stripped} 张图片后重试:当前模型不支持图片输入。\
-如需图片理解,请切换回支持图片的模型。"
-                    );
-                    persistence
-                        .persist_gate_message(&notice, "turn_notice")
-                        .await?;
-                    events.emit(crate::types::StreamEvent::CompletionGateAction {
-                        kind: "turn_notice".into(),
-                        detail: notice.clone(),
-                    });
-                    transport
-                        .complete(&messages, active_tool_defs, &round_options)
-                        .await?
+                    return Err(TransportError::Fatal(format!(
+                        "IMAGE_INPUT_UNSUPPORTED: 当前模型拒绝了图片输入，本次请求已停止且不会移除图片。请切换到支持图片的模型后重试。原始错误：{e}"
+                    ))
+                    .into());
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -720,6 +694,12 @@ pub async fn run_agent_loop(
                                 Some(&tool_calls)
                             },
                             reasoning.as_deref(),
+                            effective_route
+                                .as_ref()
+                                .map(|route| route.endpoint_name.as_str()),
+                            effective_route
+                                .as_ref()
+                                .map(|route| route.model_id.as_str()),
                             Some(&usage_request_id),
                         )
                         .await?
@@ -862,7 +842,12 @@ pub async fn run_agent_loop(
                 {
                     finish_cancelled_tool_batch(persistence.as_ref(), events.as_ref(), remaining)
                         .await?;
-                    return Ok(run_outcome_for_terminal(&completion_gate, StopReason::Cancelled, (total_input_tokens, total_output_tokens), &last_final_text));
+                    return Ok(run_outcome_for_terminal(
+                        &completion_gate,
+                        StopReason::Cancelled,
+                        (total_input_tokens, total_output_tokens),
+                        &last_final_text,
+                    ));
                 }
                 // A wall-clock surface stops BETWEEN calls of one batch: the
                 // reserve pays for the closing answer, so the rest of the batch
@@ -914,17 +899,17 @@ pub async fn run_agent_loop(
                 };
                 let denial_content = if let Some(denial) = inspection_denial.or_else(|| {
                     crate::policy::autonomous_budget_denial(
-                    wall_budget,
-                    remaining,
-                    // The Budget owns the run's clock (slice 4.8c b3); desktop
-                    // has none and keeps the default `None`, which makes the
-                    // evaluator behave exactly as before.
-                    budget.wall_time(),
-                    &completion_evidence,
-                    &classified_command,
-                    &classified_kind,
-                    &cwd,
-                )
+                        wall_budget,
+                        remaining,
+                        // The Budget owns the run's clock (slice 4.8c b3); desktop
+                        // has none and keeps the default `None`, which makes the
+                        // evaluator behave exactly as before.
+                        budget.wall_time(),
+                        &completion_evidence,
+                        &classified_command,
+                        &classified_kind,
+                        &cwd,
+                    )
                 }) {
                     // Wording is the surface's (b4): desktop keeps its sentence,
                     // the sidecar its `policy denied command (rule): reason`.
@@ -940,7 +925,12 @@ pub async fn run_agent_loop(
                                 &tool_calls[tool_index..],
                             )
                             .await?;
-                            return Ok(run_outcome_for_terminal(&completion_gate, StopReason::Cancelled, (total_input_tokens, total_output_tokens), &last_final_text));
+                            return Ok(run_outcome_for_terminal(
+                                &completion_gate,
+                                StopReason::Cancelled,
+                                (total_input_tokens, total_output_tokens),
+                                &last_final_text,
+                            ));
                         }
                     }
                 };
@@ -1286,7 +1276,12 @@ pub async fn run_agent_loop(
                 detail: notice.clone(),
             });
             events.emit(crate::types::StreamEvent::Error { message: notice });
-            return Ok(run_outcome_for_terminal(&completion_gate, StopReason::Blocked, (total_input_tokens, total_output_tokens), &last_final_text));
+            return Ok(run_outcome_for_terminal(
+                &completion_gate,
+                StopReason::Blocked,
+                (total_input_tokens, total_output_tokens),
+                &last_final_text,
+            ));
         }
         persistence
             .persist_message(
@@ -1300,6 +1295,12 @@ pub async fn run_agent_loop(
                     .map(|usage| usage.completion_tokens as i64),
                 None,
                 checkpoint_reasoning.as_deref(),
+                checkpoint_effective_route
+                    .as_ref()
+                    .map(|route| route.endpoint_name.as_str()),
+                checkpoint_effective_route
+                    .as_ref()
+                    .map(|route| route.model_id.as_str()),
                 Some(&checkpoint_usage_id),
             )
             .await?;
@@ -1389,7 +1390,8 @@ pub async fn run_agent_loop(
     Ok(run_outcome_for_terminal(
         &completion_gate,
         stop_reason,
-        (total_input_tokens, total_output_tokens), &last_final_text,
+        (total_input_tokens, total_output_tokens),
+        &last_final_text,
     ))
 }
 
@@ -1423,7 +1425,8 @@ mod tests {
     use crate::tool::{ToolBackend, ToolCtx, ToolInvocationResult};
     use crate::transport::{ModelResponse, ModelTransport, RoundOptions};
     use crate::types::{
-        ChatMessage, FunctionCall, FunctionDefinition, MessageContent, StreamEvent, ToolDefinition,
+        ChatMessage, ContentPart, FunctionCall, FunctionDefinition, ImageUrl, MessageContent,
+        StreamEvent, ToolDefinition,
     };
     use codefactory_agent_core::ToolKind;
 
@@ -1479,6 +1482,8 @@ mod tests {
             _output_tokens: Option<i64>,
             _tool_calls: Option<&[ToolCall]>,
             _reasoning_content: Option<&str>,
+            _endpoint_id: Option<&str>,
+            _model_id: Option<&str>,
             usage_request_id: Option<&str>,
         ) -> PersistResult<Option<String>> {
             let id = format!("m{}", self.messages.lock().expect("messages").len());
@@ -1605,6 +1610,23 @@ mod tests {
         }
     }
 
+    struct TextOnlyContext;
+
+    #[async_trait::async_trait]
+    impl crate::services::ContextPolicy for TextOnlyContext {
+        async fn context_window(&self, _estimated_tokens: u32) -> (u32, u32) {
+            (100_000, 100_000)
+        }
+
+        async fn supports_vision(&self) -> bool {
+            false
+        }
+
+        async fn round_reasoning_effort(&self) -> String {
+            String::new()
+        }
+    }
+
     fn usage(prompt_tokens: u32, completion_tokens: u32) -> Usage {
         serde_json::from_value(serde_json::json!({
             "prompt_tokens": prompt_tokens,
@@ -1709,6 +1731,42 @@ mod tests {
             context_policy: Arc::new(FixedContext),
             fact_checker: Arc::new(NoOpFactChecker),
         }
+    }
+
+    #[tokio::test]
+    async fn text_only_model_blocks_image_turn_before_transport_instead_of_stripping() {
+        let transport = Arc::new(ScriptedTransport::new(vec![response(
+            "should never be called",
+            vec![],
+            0,
+        )]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut image_inputs = inputs();
+        image_inputs.messages[0].content = MessageContent::Parts(vec![
+            ContentPart {
+                r#type: "text".into(),
+                text: Some("这张图是什么？".into()),
+                image_url: None,
+            },
+            ContentPart {
+                r#type: "image_url".into(),
+                text: None,
+                image_url: Some(ImageUrl {
+                    url: "data:image/png;base64,AA==".into(),
+                }),
+            },
+        ]);
+        let mut loop_services = services(transport.clone(), persistence.clone(), events.clone());
+        loop_services.context_policy = Arc::new(TextOnlyContext);
+
+        let error = run_agent_loop(image_inputs, config(), loop_services)
+            .await
+            .expect_err("image must be blocked before any provider request");
+
+        assert!(error.to_string().contains("IMAGE_INPUT_UNSUPPORTED"));
+        assert!(transport.advertised_tool_counts().is_empty());
+        assert!(persistence.notices.lock().expect("notices").is_empty());
     }
 
     #[tokio::test]

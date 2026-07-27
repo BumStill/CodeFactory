@@ -25,6 +25,11 @@ export interface UIMessage {
   /** Technical route failures retained behind an expandable disclosure when
    * every configured candidate has been exhausted. */
   failureEvidence?: string;
+  runtimeError?: {
+    code: string;
+    endpointId?: string | null;
+    recoverable: boolean;
+  };
   inputTokens?: number;
   outputTokens?: number;
   createdAt: number;
@@ -237,6 +242,26 @@ export function reduceChatStreamEvent(
             durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
           };
         }),
+      };
+    }
+
+    case "runtime_error": {
+      const endedAt = Date.now();
+      return {
+        ...state,
+        streaming: false,
+        pendingPermission: null,
+        messages: updateMessageById(state.messages, msgId, (message) => ({
+          ...message,
+          content: event.message,
+          runtimeError: {
+            code: event.code,
+            endpointId: event.endpoint_id,
+            recoverable: event.recoverable,
+          },
+          durationMs:
+            message.durationMs ?? Math.max(0, endedAt - message.createdAt),
+        })),
       };
     }
 

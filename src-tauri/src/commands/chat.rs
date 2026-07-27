@@ -3,10 +3,8 @@ use chrono::Utc;
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
-use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::agent::failover::{RouteCandidate, RouteCandidatePlan};
 use crate::agent::AgentLoop;
@@ -15,6 +13,16 @@ use crate::errors::AppError;
 use crate::mcp::McpManager;
 use crate::openrouter::types::StreamEvent;
 use crate::AppState;
+
+fn is_chatgpt_auth_expired(endpoint_name: &str, message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("auth_expired")
+        || (endpoint_name == crate::codex_auth::CHATGPT_ENDPOINT_KEY
+            && (lower.contains("http 401")
+                || lower.contains("401 unauthorized")
+                || lower.contains("invalid_grant")
+                || lower.contains("refresh_token")))
+}
 
 fn endpoint_requires_api_key(api_style: &crate::config::settings::ApiStyle) -> bool {
     !matches!(api_style, crate::config::settings::ApiStyle::Chatgpt)
@@ -26,6 +34,49 @@ struct RouteCandidateResolution {
     excluded: Vec<String>,
 }
 
+fn settings_for_session_route(
+    settings: &Settings,
+    endpoint_id: Option<&str>,
+    model_id: &str,
+    policy: &str,
+) -> Result<Settings, AppError> {
+    let mut turn = settings.clone();
+    let endpoint = if let Some(endpoint) =
+        endpoint_id.filter(|endpoint| settings.endpoints.contains_key(*endpoint))
+    {
+        endpoint
+    } else {
+        let matching = settings
+            .endpoints
+            .iter()
+            .filter(|(_, endpoint)| {
+                endpoint.active_model.as_deref() == Some(model_id)
+                    || endpoint
+                        .custom_models
+                        .iter()
+                        .any(|model| model.id == model_id)
+            })
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [only] => *only,
+            many if many.contains(&settings.default_endpoint.as_str()) => {
+                settings.default_endpoint.as_str()
+            }
+            _ => {
+                return Err(AppError::Other(format!(
+                    "MODEL_ROUTE_UNRESOLVED: 无法确定模型 '{model_id}' 属于哪个端点，请在本会话模型菜单中重新选择"
+                )))
+            }
+        }
+    };
+    turn.default_endpoint = endpoint.to_string();
+    if policy == "fixed" || policy.is_empty() {
+        turn.endpoints.retain(|candidate, _| candidate == endpoint);
+    }
+    Ok(turn)
+}
+
 /// Resolve a stable per-turn route snapshot without probing or mutating the
 /// user's preferred endpoint. The preferred endpoint is always considered
 /// first; configured alternatives follow in deterministic name order.
@@ -33,15 +84,10 @@ struct RouteCandidateResolution {
 /// Credential values are carried only into the in-memory route plan. Exclusion
 /// diagnostics intentionally mention the endpoint and remediation class, never
 /// the secret value or keychain error text.
-fn resolve_route_candidates_with<F>(
+fn resolve_route_candidates(
     settings: &Settings,
     requested_model: &str,
-    mut load_secret: F,
-    chatgpt_authenticated: bool,
-) -> RouteCandidateResolution
-where
-    F: FnMut(&str) -> std::result::Result<Option<String>, String>,
-{
+) -> RouteCandidateResolution {
     let mut endpoint_names: Vec<String> = settings.endpoints.keys().cloned().collect();
     endpoint_names.sort();
     if let Some(primary_index) = endpoint_names
@@ -64,35 +110,28 @@ where
             continue;
         };
 
-        let api_key = if !endpoint_requires_api_key(&endpoint.api_style) {
-            if !chatgpt_authenticated {
-                excluded.push(format!("{endpoint_name}：缺少 ChatGPT 登录凭据"));
-                continue;
-            }
-            String::new()
+        let credential_ref = if endpoint_requires_api_key(&endpoint.api_style) {
+            Some(
+                endpoint
+                    .key_ref
+                    .clone()
+                    .unwrap_or_else(|| format!("codefactory.endpoint.{endpoint_name}")),
+            )
         } else {
-            let key_ref = endpoint
-                .key_ref
-                .clone()
-                .unwrap_or_else(|| format!("codefactory.endpoint.{endpoint_name}"));
-            match load_secret(&key_ref) {
-                Ok(Some(secret)) if !secret.trim().is_empty() => secret,
-                Ok(_) => {
-                    excluded.push(format!("{endpoint_name}：缺少凭据"));
-                    continue;
-                }
-                Err(_) => {
-                    excluded.push(format!("{endpoint_name}：凭据读取失败"));
-                    continue;
-                }
-            }
+            None
         };
 
         candidates.push(RouteCandidate {
+            supports_vision: crate::agent::context::model_supports_vision(
+                settings,
+                &endpoint_name,
+                &model_id,
+            ),
             endpoint_name,
             model_id,
             base_url: endpoint.base_url.clone(),
-            api_key,
+            credential_ref,
+            legacy_inline_api_key: None,
             api_style: endpoint.api_style.clone(),
         });
     }
@@ -103,92 +142,28 @@ where
     }
 }
 
-const CREDENTIAL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
-
-async fn bounded_blocking_lookup<T, F>(lookup: F) -> std::result::Result<T, String>
-where
-    T: Send + 'static,
-    F: FnOnce() -> std::result::Result<T, String> + Send + 'static,
-{
-    bounded_blocking_lookup_with_timeout(CREDENTIAL_LOOKUP_TIMEOUT, lookup).await
-}
-
-async fn bounded_blocking_lookup_with_timeout<T, F>(
-    timeout: Duration,
-    lookup: F,
-) -> std::result::Result<T, String>
-where
-    T: Send + 'static,
-    F: FnOnce() -> std::result::Result<T, String> + Send + 'static,
-{
-    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(lookup)).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("凭据读取任务异常".into()),
-        Err(_) => Err("凭据读取超时".into()),
-    }
-}
-
 pub(crate) async fn resolve_route_plan(
     settings: &Settings,
     requested_model: &str,
+    policy: &str,
+    requires_vision: bool,
 ) -> Result<(RouteCandidatePlan, Vec<String>), AppError> {
-    // macOS Security.framework can block indefinitely when a missing or locked
-    // keychain item is queried. Resolve every configured credential off the
-    // async runtime and cap each lookup, otherwise one unusable fallback (for
-    // example OpenRouter without a key) freezes the whole chat before the agent
-    // loop can emit any progress.
-    let chatgpt_lookup = bounded_blocking_lookup(|| {
-        crate::codex_auth::load_tokens()
-            .map(|tokens| tokens.is_some())
-            .map_err(|_| "ChatGPT 登录凭据读取失败".to_string())
-    });
-
-    let mut secret_refs: Vec<String> = settings
-        .endpoints
-        .iter()
-        .filter(|(_, endpoint)| endpoint_requires_api_key(&endpoint.api_style))
-        .map(|(endpoint_name, endpoint)| {
-            endpoint
-                .key_ref
-                .clone()
-                .unwrap_or_else(|| format!("codefactory.endpoint.{endpoint_name}"))
-        })
-        .collect();
-    secret_refs.sort();
-    secret_refs.dedup();
-
-    let secret_lookups = async move {
-        let mut lookups = tokio::task::JoinSet::new();
-        for key_ref in secret_refs {
-            lookups.spawn(async move {
-                let lookup_ref = key_ref.clone();
-                let result = bounded_blocking_lookup(move || {
-                    crate::secrets::get_key(&lookup_ref).map_err(|_| "端点凭据读取失败".to_string())
-                })
-                .await;
-                (key_ref, result)
-            });
+    // Planning is deliberately credential-blind. Touching every configured
+    // Keychain item here caused unrelated DeepSeek authorization prompts even
+    // when a ChatGPT route was selected. The transport resolves only the route
+    // it is about to invoke.
+    let mut resolution = resolve_route_candidates(settings, requested_model);
+    if requires_vision && policy != "fixed" {
+        resolution
+            .candidates
+            .retain(|candidate| candidate.supports_vision);
+        if resolution.candidates.is_empty() {
+            return Err(AppError::Other(
+                "IMAGE_INPUT_UNSUPPORTED: 当前没有可用的图片模型；图片已保留，请选择支持图片的模型后重试"
+                    .into(),
+            ));
         }
-        let mut snapshot = HashMap::new();
-        while let Some(joined) = lookups.join_next().await {
-            if let Ok((key_ref, result)) = joined {
-                snapshot.insert(key_ref, result);
-            }
-        }
-        snapshot
-    };
-
-    let (chatgpt_authenticated, mut secret_snapshot) = tokio::join!(chatgpt_lookup, secret_lookups);
-    let resolution = resolve_route_candidates_with(
-        settings,
-        requested_model,
-        |key_ref| {
-            secret_snapshot
-                .remove(key_ref)
-                .unwrap_or_else(|| Err("凭据未解析".into()))
-        },
-        chatgpt_authenticated.unwrap_or(false),
-    );
+    }
     let mut routes = resolution.candidates.into_iter();
     let Some(primary) = routes.next() else {
         let detail = if resolution.excluded.is_empty() {
@@ -200,7 +175,11 @@ pub(crate) async fn resolve_route_plan(
             "所有可用模型端点均不可用：{detail}。请在模型设置中登录或配置凭据后重试。"
         )));
     };
-    let mut plan = RouteCandidatePlan::new(primary);
+    let mut plan = if policy == "auto" {
+        RouteCandidatePlan::new_automatic(primary)
+    } else {
+        RouteCandidatePlan::new(primary)
+    };
     for fallback in routes {
         plan.push_fallback(fallback);
     }
@@ -472,23 +451,45 @@ pub async fn send_message(
     // Freeze all locally usable routes for this turn. This is a runtime
     // availability plan only: it never overwrites the user's preferred
     // endpoint/model in Settings.
-    let (route_plan, excluded_routes) = resolve_route_plan(&settings, &session.model_id).await?;
+    let turn_settings = settings_for_session_route(
+        &settings,
+        session.endpoint_id.as_deref(),
+        &session.model_id,
+        &session.model_policy,
+    )?;
+    // Fetch history as the agent should see it — excludes gate-rejected drafts.
+    // It is also the capability source for the frozen turn plan.
+    let history = {
+        let pool = state.db.read().await;
+        crate::storage::load_agent_history(&pool, &session_id).await?
+    };
+    let requires_vision = history.iter().any(|message| {
+        !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
+    });
+    let (route_plan, excluded_routes) = resolve_route_plan(
+        &turn_settings,
+        &session.model_id,
+        &session.model_policy,
+        requires_vision,
+    )
+    .await?;
     let primary_route = route_plan
         .candidates()
         .first()
         .expect("route plan always has a primary")
         .clone();
     let endpoint_name = primary_route.endpoint_name.clone();
+    let endpoint_for_error = endpoint_name.clone();
     let resolved_model = primary_route.model_id.clone();
     let base_url = primary_route.base_url.clone();
-    let api_key = primary_route.api_key.clone();
+    let api_key = String::new();
     let api_style = primary_route.api_style.clone();
 
-    if endpoint_name == settings.default_endpoint && resolved_model != session.model_id {
+    if endpoint_name == turn_settings.default_endpoint && resolved_model != session.model_id {
         tracing::warn!(
             "send_message: repaired session model '{}' to endpoint '{}' active model '{}'",
             session.model_id,
-            settings.default_endpoint,
+            turn_settings.default_endpoint,
             resolved_model
         );
         let pool = state.db.read().await;
@@ -517,14 +518,6 @@ pub async fn send_message(
         route_plan.candidates().len(),
         excluded_routes.len(),
     );
-
-    // Fetch history as the agent should see it — excludes gate-rejected drafts.
-    // This is also what the plan/act dispatch below reads, so a withdrawn "I'm
-    // done" draft can never be mistaken for the pending proposal.
-    let history = {
-        let pool = state.db.read().await;
-        crate::storage::load_agent_history(&pool, &session_id).await?
-    };
 
     // Framework-side plan/act dispatch (no user-facing mode toggle): if the
     // previous assistant turn ended on a pending proposal and this message
@@ -592,7 +585,12 @@ pub async fn send_message(
             // because the error only ever existed as this transient stream
             // event. Tagged turn_error → rendered as an error notice, and
             // excluded from provider history replay.
-            let persisted_error_text = format!("回合中断:{error_text}");
+            let auth_expired = is_chatgpt_auth_expired(&endpoint_for_error, &error_text);
+            let persisted_error_text = if auth_expired {
+                error_text.clone()
+            } else {
+                format!("回合中断:{error_text}")
+            };
             if let Err(persist_err) = sqlx::query(
                 "INSERT INTO messages (id, session_id, role, content, completion_state, created_at) \
                  VALUES (?,?,?,?,?,?)",
@@ -601,7 +599,11 @@ pub async fn send_message(
             .bind(&session_for_error)
             .bind("user")
             .bind(&persisted_error_text)
-            .bind("turn_error")
+            .bind(if auth_expired {
+                "auth_expired"
+            } else {
+                "turn_error"
+            })
             .bind(chrono::Utc::now().timestamp_millis())
             .execute(&db_for_error)
             .await
@@ -616,14 +618,28 @@ pub async fn send_message(
                     error_text.chars().take(200).collect(),
                 );
             }
-            app_clone
-                .emit(
-                    &event_name,
-                    StreamEvent::Error {
-                        message: error_text,
-                    },
-                )
-                .ok();
+            if auth_expired {
+                app_clone
+                    .emit(
+                        &event_name,
+                        StreamEvent::RuntimeError {
+                            code: "AUTH_EXPIRED".into(),
+                            message: "ChatGPT 授权已过期。重新验证后可以回到这个会话继续；当前失败回合不会自动重放。".into(),
+                            endpoint_id: Some(crate::codex_auth::CHATGPT_ENDPOINT_KEY.into()),
+                            recoverable: true,
+                        },
+                    )
+                    .ok();
+            } else {
+                app_clone
+                    .emit(
+                        &event_name,
+                        StreamEvent::Error {
+                            message: error_text,
+                        },
+                    )
+                    .ok();
+            }
         }
         clear_chat_running_if_current(&chat_cancels, &session_for_error, &tracked_cancel_flag)
             .await;
@@ -649,6 +665,7 @@ fn anon_message(session_id: &str, role: String, content: String) -> crate::stora
         session_id: session_id.to_string(),
         role,
         content,
+        endpoint_id: None,
         model_id: None,
         input_tokens: None,
         output_tokens: None,
@@ -677,6 +694,8 @@ pub async fn send_message_anonymous(
     history: Vec<AnonTurn>,
     cwd: String,
     model_id: String,
+    endpoint_id: Option<String>,
+    model_policy: Option<String>,
     state: State<'_, AppState>,
     mcp: State<'_, Arc<McpManager>>,
 ) -> Result<(), AppError> {
@@ -694,20 +713,6 @@ pub async fn send_message_anonymous(
     );
 
     let settings = state.settings.read().await.clone();
-
-    // Resolve the same stable failover plan as persisted chats. Anonymous mode
-    // changes persistence only; it must not be less resilient.
-    let (route_plan, _excluded_routes) = resolve_route_plan(&settings, &model_id).await?;
-    let primary_route = route_plan
-        .candidates()
-        .first()
-        .expect("route plan always has a primary")
-        .clone();
-    let endpoint_name = primary_route.endpoint_name.clone();
-    let resolved_model = primary_route.model_id.clone();
-    let base_url = primary_route.base_url.clone();
-    let api_key = primary_route.api_key.clone();
-    let api_style = primary_route.api_style.clone();
 
     // Anonymous sessions have no project dir; resolve an empty cwd to the shared
     // scratch dir so tools + the system prompt get a valid working directory.
@@ -727,6 +732,24 @@ pub async fn send_message_anonymous(
         .map(|t| anon_message(&session_id, t.role, t.content))
         .collect();
     full_history.push(anon_message(&session_id, "user".into(), content));
+    let active_policy = model_policy.as_deref().unwrap_or("prefer");
+    let turn_settings =
+        settings_for_session_route(&settings, endpoint_id.as_deref(), &model_id, active_policy)?;
+    let requires_vision = full_history.iter().any(|message| {
+        !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
+    });
+    let (route_plan, _excluded_routes) =
+        resolve_route_plan(&turn_settings, &model_id, active_policy, requires_vision).await?;
+    let primary_route = route_plan
+        .candidates()
+        .first()
+        .expect("route plan always has a primary")
+        .clone();
+    let endpoint_name = primary_route.endpoint_name.clone();
+    let resolved_model = primary_route.model_id.clone();
+    let base_url = primary_route.base_url.clone();
+    let api_key = String::new();
+    let api_style = primary_route.api_style.clone();
 
     let db = state.db.read().await.clone();
     let settings_state = state.settings.clone();
@@ -793,7 +816,9 @@ fn select_chat_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::failover::{ActiveRouteState, EndpointHealthRegistry};
     use crate::config::settings::{ApiStyle, Endpoint};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn completed_chat_only_clears_its_own_running_flag() {
@@ -865,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn route_candidates_keep_primary_then_only_locally_usable_fallbacks() {
+    fn route_candidates_keep_primary_and_defer_credentials_to_transport() {
         let mut settings = crate::config::settings::Settings::default();
         settings.default_endpoint = "chatgpt".into();
         settings.default_model = "gpt-5.5".into();
@@ -901,18 +926,7 @@ mod tests {
             },
         );
 
-        let resolution = resolve_route_candidates_with(
-            &settings,
-            "gpt-5.5",
-            |key_ref| {
-                Ok(if key_ref == "deepseek-secret" {
-                    Some("configured-deepseek-key".into())
-                } else {
-                    None
-                })
-            },
-            true,
-        );
+        let resolution = resolve_route_candidates(&settings, "gpt-5.5");
 
         assert_eq!(
             resolution
@@ -920,28 +934,131 @@ mod tests {
                 .iter()
                 .map(|route| (route.endpoint_name.as_str(), route.model_id.as_str()))
                 .collect::<Vec<_>>(),
-            vec![("chatgpt", "gpt-5.5"), ("deepseek", "deepseek-v4-pro")]
+            vec![
+                ("chatgpt", "gpt-5.5"),
+                ("deepseek", "deepseek-v4-pro"),
+                ("openrouter", "anthropic/claude-opus-4-7")
+            ]
         );
-        assert!(resolution
-            .excluded
-            .iter()
-            .any(|reason| reason.contains("openrouter") && reason.contains("缺少凭据")));
+        assert_eq!(
+            resolution.candidates[1].credential_ref.as_deref(),
+            Some("deepseek-secret")
+        );
+        assert_eq!(
+            resolution.candidates[2].credential_ref.as_deref(),
+            Some("openrouter-secret")
+        );
+        assert!(resolution.excluded.is_empty());
+    }
+
+    #[test]
+    fn route_planning_does_not_read_any_endpoint_credential() {
+        let mut settings = crate::config::settings::Settings::default();
+        settings.default_endpoint = "chatgpt".into();
+        settings.default_model = "gpt-5.5".into();
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://api.deepseek.example/v1".into(),
+                key_ref: Some("must-not-read".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+
+        let resolution = resolve_route_candidates(&settings, "gpt-5.5");
+
+        assert!(!resolution.candidates.is_empty());
     }
 
     #[tokio::test]
-    async fn credential_lookup_timeout_cannot_freeze_chat_setup() {
-        let started = std::time::Instant::now();
-        let result = bounded_blocking_lookup_with_timeout(
-            Duration::from_millis(10),
-            || -> std::result::Result<(), String> {
-                std::thread::sleep(Duration::from_millis(200));
-                Ok(())
+    async fn automatic_image_route_excludes_text_only_candidates_before_transport() {
+        let mut settings = crate::config::settings::Settings::default();
+        settings.default_endpoint = "deepseek".into();
+        settings.default_model = "deepseek-v4-pro".into();
+        settings.endpoints.clear();
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://api.deepseek.example/v1".into(),
+                key_ref: Some("deepseek-secret".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
             },
-        )
-        .await;
+        );
+        settings.endpoints.insert(
+            "chatgpt".into(),
+            Endpoint {
+                base_url: crate::codex_auth::CHATGPT_BASE_URL.into(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                custom_models: vec![],
+                active_model: Some("gpt-5.5".into()),
+            },
+        );
 
-        assert_eq!(result.unwrap_err(), "凭据读取超时");
-        assert!(started.elapsed() < Duration::from_millis(500));
+        let (plan, _) = resolve_route_plan(&settings, "deepseek-v4-pro", "auto", true)
+            .await
+            .expect("vision route exists");
+
+        assert_eq!(plan.candidates().len(), 1);
+        assert_eq!(plan.candidates()[0].endpoint_name, "chatgpt");
+        assert_eq!(plan.candidates()[0].model_id, "gpt-5.5");
+    }
+
+    #[tokio::test]
+    async fn prefer_retries_the_selected_primary_while_auto_respects_recent_health() {
+        let mut settings = crate::config::settings::Settings::default();
+        settings.default_endpoint = "chatgpt".into();
+        settings.default_model = "gpt-5.5".into();
+        settings.endpoints.clear();
+        settings.endpoints.insert(
+            "chatgpt".into(),
+            Endpoint {
+                base_url: crate::codex_auth::CHATGPT_BASE_URL.into(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                custom_models: vec![],
+                active_model: Some("gpt-5.5".into()),
+            },
+        );
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://api.deepseek.example/v1".into(),
+                key_ref: Some("deepseek-secret".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+
+        let (prefer_plan, _) = resolve_route_plan(&settings, "gpt-5.5", "prefer", false)
+            .await
+            .expect("prefer route");
+        let prefer_health = EndpointHealthRegistry::new(Duration::from_secs(120));
+        prefer_health.mark_unavailable("chatgpt");
+        let prefer_state = ActiveRouteState::from_plan_with_health(prefer_plan, prefer_health);
+        assert_eq!(prefer_state.current().endpoint_name, "chatgpt");
+
+        let (auto_plan, _) = resolve_route_plan(&settings, "gpt-5.5", "auto", false)
+            .await
+            .expect("auto route");
+        let auto_health = EndpointHealthRegistry::new(Duration::from_secs(120));
+        auto_health.mark_unavailable("chatgpt");
+        let auto_state = ActiveRouteState::from_plan_with_health(auto_plan, auto_health);
+        assert_eq!(auto_state.current().endpoint_name, "deepseek");
+        assert!(auto_state.take_initial_route_change().is_some());
+    }
+
+    #[test]
+    fn structured_auth_expired_is_detected_even_when_chatgpt_was_a_fallback() {
+        assert!(is_chatgpt_auth_expired(
+            "deepseek",
+            "AUTH_EXPIRED: ChatGPT 授权已过期"
+        ));
     }
 
     #[test]

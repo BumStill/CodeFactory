@@ -11,6 +11,7 @@ import { ToolCallCard } from "./ToolCallCard";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import { RememberButton } from "./RememberButton";
+import { ChatGptAuthRecovery } from "./ChatGptAuthRecovery";
 import { formatDuration, useNowTick } from "../lib/duration";
 import type { UIMessage } from "../stores/chat";
 import {
@@ -443,6 +444,18 @@ const MessageRow = memo(function MessageRow({
     );
   }
 
+  if (msg.completionState === "auth_expired") {
+    return (
+      <div className="max-w-[72ch] space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+        <p className="text-sm font-medium text-gray-200">ChatGPT 授权已过期</p>
+        <p className="text-xs leading-5 text-gray-500">
+          重新验证后可以回到这个会话继续；当前失败回合不会自动重放。
+        </p>
+        <ChatGptAuthRecovery />
+      </div>
+    );
+  }
+
   // Verification-incomplete warning: the reply stands, amber notice below.
   if (msg.completionState === "gate_warning") {
     return (
@@ -568,6 +581,15 @@ const MessageRow = memo(function MessageRow({
 
   return (
     <div className="group text-sm text-gray-200 space-y-1.5">
+      {msg.runtimeError?.code === "AUTH_EXPIRED" && (
+        <div className="max-w-[72ch] space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+          <p className="text-sm font-medium text-gray-200">ChatGPT 授权已过期</p>
+          <p className="text-xs leading-5 text-gray-500">
+            重新验证后可以回到这个会话继续；当前失败回合不会自动重放。
+          </p>
+          <ChatGptAuthRecovery />
+        </div>
+      )}
       {timeline ? (
         <>
           {collapsible && (

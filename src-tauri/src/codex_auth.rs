@@ -18,7 +18,9 @@
 use base64::Engine;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tauri::State;
 
 use crate::config::settings::{
@@ -53,6 +55,8 @@ static AUTH_MUTATION_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sy
 static AUTH_REVISION: AtomicU64 = AtomicU64::new(1);
 static LAST_CATALOG_FETCH: Lazy<tokio::sync::Mutex<Option<CatalogFetch>>> =
     Lazy::new(|| tokio::sync::Mutex::new(None));
+static LOGIN_FLOW: Lazy<tokio::sync::Mutex<Option<LoginFlowRuntime>>> =
+    Lazy::new(|| tokio::sync::Mutex::new(None));
 
 #[derive(Clone)]
 struct CatalogFetch {
@@ -82,11 +86,46 @@ pub struct CodexTokens {
 }
 
 /// Account info surfaced to the frontend — never includes raw tokens.
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CodexAccount {
     pub email: Option<String>,
     pub plan: Option<String>,
     pub account_id: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct CodexLoginFlow {
+    pub flow_id: String,
+    pub authorization_url: String,
+    pub status: String,
+    pub expires_at: i64,
+    pub browser_open_error: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub account: Option<CodexAccount>,
+}
+
+#[derive(Clone)]
+struct LoginFlowRuntime {
+    view: CodexLoginFlow,
+    cancel: Arc<AtomicBool>,
+}
+
+fn login_flow_is_active(status: &str) -> bool {
+    matches!(status, "waiting" | "exchanging")
+}
+
+async fn update_login_flow(
+    flow_id: &str,
+    update: impl FnOnce(&mut CodexLoginFlow),
+) -> Option<CodexLoginFlow> {
+    let mut guard = LOGIN_FLOW.lock().await;
+    let runtime = guard.as_mut()?;
+    if runtime.view.flow_id != flow_id {
+        return None;
+    }
+    update(&mut runtime.view);
+    Some(runtime.view.clone())
 }
 
 impl From<&CodexTokens> for CodexAccount {
@@ -320,6 +359,38 @@ async fn refresh(mut tokens: CodexTokens) -> Result<CodexTokens> {
     Ok(tokens)
 }
 
+fn is_terminal_refresh_error(error: &AppError) -> bool {
+    let lower = error.to_string().to_ascii_lowercase();
+    lower.contains("invalid_grant")
+        || lower.contains("refresh_token")
+        || lower.contains("refresh token")
+        || lower.contains("401 unauthorized")
+        || lower.contains("oauth 令牌请求失败（401")
+        || lower.contains("oauth 令牌请求失败（400")
+}
+
+fn expire_stored_auth() {
+    if let Err(error) = crate::secrets::delete_key(SECRET_REF) {
+        tracing::warn!("failed to clear expired ChatGPT auth: {error}");
+    }
+    AUTH_REVISION.fetch_add(1, Ordering::SeqCst);
+}
+
+fn auth_expired_error() -> AppError {
+    AppError::Other("AUTH_EXPIRED: ChatGPT 授权已过期，请重新验证后在原会话继续".into())
+}
+
+async fn refresh_or_classify(tokens: CodexTokens) -> Result<CodexTokens> {
+    match refresh(tokens).await {
+        Ok(tokens) => Ok(tokens),
+        Err(error) if is_terminal_refresh_error(&error) => {
+            expire_stored_auth();
+            Err(auth_expired_error())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -358,7 +429,7 @@ async fn valid_tokens_locked() -> Result<CodexTokens> {
         None => now_secs() - tokens.last_refresh >= 25 * 60,
     };
     let tokens = if needs_refresh {
-        refresh(tokens).await?
+        refresh_or_classify(tokens).await?
     } else {
         tokens
     };
@@ -369,6 +440,20 @@ pub async fn valid_access_token() -> Result<(String, Option<String>)> {
     let _auth_guard = AUTH_MUTATION_LOCK.lock().await;
     let tokens = valid_tokens_locked().await?;
     Ok((tokens.access_token, tokens.account_id))
+}
+
+/// A backend 401 may be caused by an access token revoked before its JWT
+/// expiry. Force one refresh under the same mutation lock, then let the caller
+/// resend exactly once.
+pub async fn force_refresh_access_token() -> Result<(String, Option<String>)> {
+    let _auth_guard = AUTH_MUTATION_LOCK.lock().await;
+    let tokens = load_tokens()?.ok_or_else(auth_expired_error)?;
+    let tokens = refresh_or_classify(tokens).await?;
+    Ok((tokens.access_token, tokens.account_id))
+}
+
+pub fn mark_auth_expired() {
+    expire_stored_auth();
 }
 
 async fn valid_access_token_snapshot() -> Result<(String, Option<String>, u64)> {
@@ -619,12 +704,28 @@ pub(crate) fn reconcile_chatgpt_settings(current: &Settings, incoming: &mut Sett
 /// Blocking single-shot loopback server: accept connections until one carries
 /// a `/auth/callback` with a matching `state`, then return its `code`. Responds
 /// to the browser with a small success page.
-fn wait_for_callback(listener: std::net::TcpListener, expected_state: &str) -> Result<String> {
+fn wait_for_callback(
+    listener: std::net::TcpListener,
+    expected_state: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<String> {
     use std::io::{Read, Write};
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| AppError::Other(format!("无法配置本地回调监听：{error}")))?;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(AppError::Other("LOGIN_CANCELLED".into()));
+        }
+        let mut stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(error) => {
+                return Err(AppError::Other(format!("本地回调监听失败：{error}")));
+            }
         };
         let mut buf = [0u8; 4096];
         let n = stream.read(&mut buf).unwrap_or(0);
@@ -665,7 +766,6 @@ fn wait_for_callback(listener: std::net::TcpListener, expected_state: &str) -> R
             }
         }
     }
-    Err(AppError::Other("本地回调服务器意外关闭".into()))
 }
 
 fn simple_http(status: u16, body_text: &str) -> String {
@@ -735,9 +835,16 @@ fn open_browser(app: &tauri::AppHandle, url: &str) -> Result<()> {
         .map_err(|e| AppError::Other(format!("无法打开浏览器：{e}")))
 }
 
-/// Run the full interactive login: open the browser, capture the loopback
-/// callback, exchange the code, and persist the tokens. Returns account info.
-pub async fn login(app: tauri::AppHandle) -> Result<CodexAccount> {
+async fn start_login_flow(app: tauri::AppHandle) -> Result<CodexLoginFlow> {
+    {
+        let guard = LOGIN_FLOW.lock().await;
+        if let Some(runtime) = guard.as_ref() {
+            if login_flow_is_active(&runtime.view.status) {
+                return Ok(runtime.view.clone());
+            }
+        }
+    }
+
     let pkce = generate_pkce()?;
     let state = random_state()?;
     let redirect_uri = format!("http://localhost:{REDIRECT_PORT}/auth/callback");
@@ -750,30 +857,227 @@ pub async fn login(app: tauri::AppHandle) -> Result<CodexAccount> {
         ))
     })?;
 
-    let url = authorize_url(&pkce.challenge, &state, &redirect_uri);
-    open_browser(&app, &url)?;
+    let authorization_url = authorize_url(&pkce.challenge, &state, &redirect_uri);
+    let flow_id = uuid::Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let view = CodexLoginFlow {
+        flow_id: flow_id.clone(),
+        authorization_url: authorization_url.clone(),
+        status: "waiting".into(),
+        expires_at: chrono::Utc::now().timestamp_millis() + 300_000,
+        browser_open_error: None,
+        error_code: None,
+        error_message: None,
+        account: None,
+    };
+    {
+        let mut guard = LOGIN_FLOW.lock().await;
+        if let Some(runtime) = guard.as_ref() {
+            if login_flow_is_active(&runtime.view.status) {
+                return Ok(runtime.view.clone());
+            }
+        }
+        *guard = Some(LoginFlowRuntime {
+            view: view.clone(),
+            cancel: cancel.clone(),
+        });
+    }
 
-    let expected = state.clone();
-    let code = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        tokio::task::spawn_blocking(move || wait_for_callback(listener, &expected)),
-    )
-    .await
-    .map_err(|_| AppError::Other("登录超时：5 分钟内未完成授权".into()))?
-    .map_err(|e| AppError::Other(format!("回调任务失败：{e}")))??;
+    let task_flow_id = flow_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let expected = state;
+        let callback_result = tokio::time::timeout(
+            Duration::from_secs(300),
+            tokio::task::spawn_blocking(move || wait_for_callback(listener, &expected, cancel)),
+        )
+        .await;
+        let code = match callback_result {
+            Err(_) => {
+                update_login_flow(&task_flow_id, |flow| {
+                    flow.status = "expired".into();
+                    flow.error_code = Some("LOGIN_EXPIRED".into());
+                    flow.error_message = Some("验证链接已过期，请重新开始登录".into());
+                })
+                .await;
+                return;
+            }
+            Ok(Err(error)) => {
+                update_login_flow(&task_flow_id, |flow| {
+                    flow.status = "failed".into();
+                    flow.error_code = Some("CALLBACK_TASK_FAILED".into());
+                    flow.error_message = Some(format!("回调任务失败：{error}"));
+                })
+                .await;
+                return;
+            }
+            Ok(Ok(Err(error))) => {
+                let message = error.to_string();
+                if message.contains("LOGIN_CANCELLED") {
+                    update_login_flow(&task_flow_id, |flow| {
+                        flow.status = "cancelled".into();
+                        flow.error_code = None;
+                        flow.error_message = None;
+                    })
+                    .await;
+                } else {
+                    update_login_flow(&task_flow_id, |flow| {
+                        flow.status = "failed".into();
+                        flow.error_code = Some(if message.contains("state") {
+                            "STATE_MISMATCH".into()
+                        } else if message.contains("授权被拒绝") {
+                            "AUTH_DENIED".into()
+                        } else {
+                            "CALLBACK_FAILED".into()
+                        });
+                        flow.error_message = Some(message);
+                    })
+                    .await;
+                }
+                return;
+            }
+            Ok(Ok(Ok(code))) => code,
+        };
 
-    let tokens = exchange_code(&code, &pkce.verifier, &redirect_uri).await?;
-    let _auth_guard = AUTH_MUTATION_LOCK.lock().await;
-    store_tokens(&tokens)?;
-    AUTH_REVISION.fetch_add(1, Ordering::SeqCst);
-    *LAST_CATALOG_FETCH.lock().await = None;
-    Ok(CodexAccount::from(&tokens))
+        update_login_flow(&task_flow_id, |flow| {
+            flow.status = "exchanging".into();
+        })
+        .await;
+        match exchange_code(&code, &pkce.verifier, &redirect_uri).await {
+            Ok(tokens) => {
+                let account = CodexAccount::from(&tokens);
+                let store_result = async {
+                    let _auth_guard = AUTH_MUTATION_LOCK.lock().await;
+                    store_tokens(&tokens)?;
+                    AUTH_REVISION.fetch_add(1, Ordering::SeqCst);
+                    *LAST_CATALOG_FETCH.lock().await = None;
+                    Result::<()>::Ok(())
+                }
+                .await;
+                match store_result {
+                    Ok(()) => {
+                        update_login_flow(&task_flow_id, |flow| {
+                            flow.status = "succeeded".into();
+                            flow.account = Some(account);
+                            flow.error_code = None;
+                            flow.error_message = None;
+                        })
+                        .await;
+                    }
+                    Err(error) => {
+                        update_login_flow(&task_flow_id, |flow| {
+                            flow.status = "failed".into();
+                            flow.error_code = Some("TOKEN_STORE_FAILED".into());
+                            flow.error_message = Some(error.to_string());
+                        })
+                        .await;
+                    }
+                }
+            }
+            Err(error) => {
+                update_login_flow(&task_flow_id, |flow| {
+                    flow.status = "failed".into();
+                    flow.error_code = Some("TOKEN_EXCHANGE_FAILED".into());
+                    flow.error_message = Some(error.to_string());
+                })
+                .await;
+            }
+        }
+    });
+
+    if let Err(error) = open_browser(&app, &authorization_url) {
+        update_login_flow(&flow_id, |flow| {
+            flow.browser_open_error = Some(error.to_string());
+        })
+        .await;
+    }
+    codex_login_status(flow_id).await
+}
+
+/// Compatibility wrapper for callers that still expect one blocking login
+/// command. New UI should use start/status/open/cancel so browser failures are
+/// recoverable and the same flow can be observed from multiple surfaces.
+pub async fn login(app: tauri::AppHandle) -> Result<CodexAccount> {
+    let flow = start_login_flow(app).await?;
+    loop {
+        let current = codex_login_status(flow.flow_id.clone()).await?;
+        match current.status.as_str() {
+            "succeeded" => {
+                return current
+                    .account
+                    .ok_or_else(|| AppError::Other("登录完成但缺少账号信息".into()))
+            }
+            "failed" | "expired" | "cancelled" => {
+                return Err(AppError::Other(
+                    current.error_message.unwrap_or_else(|| "登录未完成".into()),
+                ))
+            }
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
 }
 
 // ── Tauri commands ───────────────────────────────────────────────────────────
 #[tauri::command]
 pub async fn codex_login(app: tauri::AppHandle) -> Result<CodexAccount> {
     login(app).await
+}
+
+#[tauri::command]
+pub async fn codex_login_start(app: tauri::AppHandle) -> Result<CodexLoginFlow> {
+    start_login_flow(app).await
+}
+
+#[tauri::command]
+pub async fn codex_login_status(flow_id: String) -> Result<CodexLoginFlow> {
+    let guard = LOGIN_FLOW.lock().await;
+    let runtime = guard
+        .as_ref()
+        .ok_or_else(|| AppError::Other("没有正在进行的 ChatGPT 验证".into()))?;
+    if runtime.view.flow_id != flow_id {
+        return Err(AppError::Other("ChatGPT 验证流程已失效".into()));
+    }
+    Ok(runtime.view.clone())
+}
+
+#[tauri::command]
+pub async fn codex_login_open(app: tauri::AppHandle, flow_id: String) -> Result<CodexLoginFlow> {
+    let authorization_url = {
+        let guard = LOGIN_FLOW.lock().await;
+        let runtime = guard
+            .as_ref()
+            .ok_or_else(|| AppError::Other("没有正在进行的 ChatGPT 验证".into()))?;
+        if runtime.view.flow_id != flow_id || !login_flow_is_active(&runtime.view.status) {
+            return Err(AppError::Other("ChatGPT 验证流程已失效".into()));
+        }
+        runtime.view.authorization_url.clone()
+    };
+    let open_error = open_browser(&app, &authorization_url)
+        .err()
+        .map(|error| error.to_string());
+    update_login_flow(&flow_id, |flow| {
+        flow.browser_open_error = open_error;
+    })
+    .await
+    .ok_or_else(|| AppError::Other("ChatGPT 验证流程已失效".into()))
+}
+
+#[tauri::command]
+pub async fn codex_login_cancel(flow_id: String) -> Result<CodexLoginFlow> {
+    let mut guard = LOGIN_FLOW.lock().await;
+    let runtime = guard
+        .as_mut()
+        .ok_or_else(|| AppError::Other("没有正在进行的 ChatGPT 验证".into()))?;
+    if runtime.view.flow_id != flow_id {
+        return Err(AppError::Other("ChatGPT 验证流程已失效".into()));
+    }
+    if runtime.view.status == "exchanging" {
+        return Err(AppError::Other("授权码正在交换令牌，暂时无法取消".into()));
+    }
+    runtime.cancel.store(true, Ordering::SeqCst);
+    runtime.view.status = "cancelled".into();
+    runtime.view.error_code = None;
+    runtime.view.error_message = None;
+    Ok(runtime.view.clone())
 }
 
 #[tauri::command]
@@ -860,7 +1164,7 @@ mod tests {
                 ReasoningEffort::Medium,
                 ReasoningEffort::High,
             ]),
-        supports_vision: None,
+            supports_vision: None,
         }
     }
 
@@ -1130,5 +1434,64 @@ mod tests {
             vec!["server-first", "server-second"]
         );
         assert_eq!(models[0].supported_reasoning_efforts, None);
+    }
+
+    #[tokio::test]
+    async fn recoverable_login_flow_keeps_one_url_and_can_be_cancelled_from_any_surface() {
+        let flow_id = "shared-flow".to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = LOGIN_FLOW.lock().await;
+            *guard = Some(LoginFlowRuntime {
+                view: CodexLoginFlow {
+                    flow_id: flow_id.clone(),
+                    authorization_url: "https://auth.openai.test/authorize?state=stable".into(),
+                    status: "waiting".into(),
+                    expires_at: 123,
+                    browser_open_error: Some("系统未能打开浏览器".into()),
+                    error_code: None,
+                    error_message: None,
+                    account: None,
+                },
+                cancel: cancel.clone(),
+            });
+        }
+
+        let observed = codex_login_status(flow_id.clone())
+            .await
+            .expect("settings and conversation should observe the shared flow");
+        assert_eq!(
+            observed.authorization_url,
+            "https://auth.openai.test/authorize?state=stable"
+        );
+        assert_eq!(
+            observed.browser_open_error.as_deref(),
+            Some("系统未能打开浏览器")
+        );
+        assert!(codex_login_status("stale-flow".into()).await.is_err());
+
+        let cancelled = codex_login_cancel(flow_id)
+            .await
+            .expect("either surface can cancel the shared flow");
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+
+        *LOGIN_FLOW.lock().await = None;
+    }
+
+    #[test]
+    fn refresh_classification_expires_only_terminal_oauth_failures() {
+        assert!(is_terminal_refresh_error(&AppError::Other(
+            "invalid_grant: refresh token expired".into()
+        )));
+        assert!(is_terminal_refresh_error(&AppError::Other(
+            "HTTP 401 Unauthorized".into()
+        )));
+        assert!(!is_terminal_refresh_error(&AppError::Other(
+            "HTTP 503 Service Unavailable".into()
+        )));
+        assert!(!is_terminal_refresh_error(&AppError::Other(
+            "request timed out".into()
+        )));
     }
 }

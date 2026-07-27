@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod anthropic_client;
-pub mod events;
 pub mod attachments;
 pub mod checkpoint;
 pub mod context;
 pub mod context_budget;
+mod context_policy;
 pub mod delivery;
 pub mod dispatch;
-pub mod hooks;
-pub mod journal;
-mod context_policy;
+pub mod events;
 mod fact_checker;
 pub mod failover;
+pub mod hooks;
+pub mod journal;
 mod lifecycle_hooks;
 pub mod model_transport;
 mod permission_gateway;
@@ -55,13 +55,13 @@ use codefactory_agent_loop::services::{LifecycleHooks, NoOpHooks};
 // are referenced only inside agent-loop now. The mode-policy AgentMode wrappers
 // below still delegate to `policy::`, and several fns are exercised by bin unit
 // tests that stayed here — those imports are `#[cfg(test)]`-gated.
+#[cfg(test)]
+use codefactory_agent_core::{CompletionGate, ProgressTracker};
+#[cfg(test)]
+use codefactory_agent_loop::context::is_provider_overloaded;
 use codefactory_agent_loop::policy::openai_tool_controls;
 #[cfg(test)]
 use codefactory_agent_loop::policy::{self, CompletionFinalization};
-#[cfg(test)]
-use codefactory_agent_loop::context::is_provider_overloaded;
-#[cfg(test)]
-use codefactory_agent_loop::run::cancelled_tool_suffix;
 #[cfg(test)]
 use codefactory_agent_loop::policy::{
     active_tool_definitions, completion_command_and_kind,
@@ -72,7 +72,7 @@ use codefactory_agent_loop::protocol::{
     is_vision_rejection, repair_openai_tool_protocol, strip_image_parts,
 };
 #[cfg(test)]
-use codefactory_agent_core::{CompletionGate, ProgressTracker};
+use codefactory_agent_loop::run::cancelled_tool_suffix;
 use codefactory_agent_loop::run::FinalizationPolicy;
 
 /// Desktop `AgentMode` → the loop crate's `FinalizationPolicy`.
@@ -477,6 +477,13 @@ pub struct AgentLoop {
     /// polls it between rounds and stops cleanly — it never interrupts an
     /// in-flight tool call, and never touches the task scheduler.
     cancel: Option<Arc<AtomicBool>>,
+    /// Root-turn safety latch shared by every provider round in this run.
+    /// Once visible text or any tool activity starts, replaying the turn on a
+    /// different endpoint is no longer safe.
+    turn_output_started: Arc<AtomicBool>,
+    /// Separate audit bit for tool activity; all tool activity also trips the
+    /// broader replay-safety latch above.
+    turn_side_effect_started: Arc<AtomicBool>,
 }
 
 fn resolve_chatgpt_reasoning_effort(
@@ -644,16 +651,17 @@ impl AgentLoop {
     ) -> Self {
         let events: std::sync::Arc<dyn events::EventSink> =
             std::sync::Arc::new(events::TauriEventSink::new(app.clone(), &session_id));
-        let route_state =
-            failover::ActiveRouteState::from_plan(failover::RouteCandidatePlan::new(
-                failover::RouteCandidate {
-                    endpoint_name: endpoint_name.clone(),
-                    model_id: model_id.clone(),
-                    base_url: base_url.clone(),
-                    api_key: api_key.clone(),
-                    api_style: api_style.clone(),
-                },
-            ));
+        let route_state = failover::ActiveRouteState::from_plan(failover::RouteCandidatePlan::new(
+            failover::RouteCandidate {
+                endpoint_name: endpoint_name.clone(),
+                model_id: model_id.clone(),
+                base_url: base_url.clone(),
+                credential_ref: None,
+                legacy_inline_api_key: Some(api_key.clone()),
+                supports_vision: true,
+                api_style: api_style.clone(),
+            },
+        ));
         Self {
             app: Some(app),
             events,
@@ -674,6 +682,8 @@ impl AgentLoop {
             usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,
             cancel: None,
+            turn_output_started: Arc::new(AtomicBool::new(false)),
+            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -720,16 +730,17 @@ impl AgentLoop {
         execution_context: Option<AgentExecutionContext>,
         mode: AgentMode,
     ) -> Self {
-        let route_state =
-            failover::ActiveRouteState::from_plan(failover::RouteCandidatePlan::new(
-                failover::RouteCandidate {
-                    endpoint_name: endpoint_name.clone(),
-                    model_id: model_id.clone(),
-                    base_url: base_url.clone(),
-                    api_key: api_key.clone(),
-                    api_style: api_style.clone(),
-                },
-            ));
+        let route_state = failover::ActiveRouteState::from_plan(failover::RouteCandidatePlan::new(
+            failover::RouteCandidate {
+                endpoint_name: endpoint_name.clone(),
+                model_id: model_id.clone(),
+                base_url: base_url.clone(),
+                credential_ref: None,
+                legacy_inline_api_key: Some(api_key.clone()),
+                supports_vision: true,
+                api_style: api_style.clone(),
+            },
+        ));
         Self {
             app: None,
             events,
@@ -750,6 +761,8 @@ impl AgentLoop {
             usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,
             cancel: None,
+            turn_output_started: Arc::new(AtomicBool::new(false)),
+            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -864,6 +877,11 @@ impl AgentLoop {
     }
 
     pub async fn run(&mut self, history: Vec<Message>) -> Result<()> {
+        let root_turn_id = history
+            .iter()
+            .rev()
+            .find(|message| message.role == "user" && message.completion_state.is_none())
+            .map(|message| message.id.clone());
         let mut tool_defs = tools::all_definitions();
         // Append MCP tools as additional tool definitions
         let mcp_tools = self.mcp_manager.list_all_tools().await;
@@ -923,19 +941,51 @@ impl AgentLoop {
         }
         let api_style = self.api_style.clone();
 
-        match api_style {
+        let result = match api_style {
             // ChatGPT shares the OpenAI orchestration loop (same ChatMessage
             // shape, tool loop, persistence, events). Only the per-round model
             // call differs — run_openai picks call_chatgpt_model when needed.
             ApiStyle::Openai | ApiStyle::Chatgpt => {
-                self.run_openai(history, &tool_defs, &system_prompt)
-                    .await
+                self.run_openai(history, &tool_defs, &system_prompt).await
             }
             ApiStyle::Anthropic => {
                 self.run_anthropic(history, &tool_defs, &system_prompt)
                     .await
             }
+        };
+
+        if !self.anonymous {
+            if let Some(root_turn_id) = root_turn_id.as_deref() {
+                let policy = sqlx::query_scalar::<_, String>(
+                    "SELECT model_policy FROM sessions WHERE id = ?",
+                )
+                .bind(&self.session_id)
+                .fetch_optional(&self.db)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "fixed".into());
+                let attempts = self.route_state.attempt_snapshots(result.is_ok());
+                if let Err(error) = persistence::persist_model_route_attempts(
+                    &self.db,
+                    &self.session_id,
+                    root_turn_id,
+                    &policy,
+                    &attempts,
+                    self.turn_output_started.load(Ordering::SeqCst),
+                    self.turn_side_effect_started.load(Ordering::SeqCst),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "failed to persist model route attempts for session {}: {}",
+                        self.session_id,
+                        error
+                    );
+                }
+            }
         }
+        result
     }
 
     fn audit_session_id(&self) -> String {
@@ -1021,7 +1071,10 @@ impl AgentLoop {
                 .map_or(UsageSurface::Interactive, |c| c.usage_surface)
                 .as_str()
                 .to_string(),
-            task_id: self.execution_context.as_ref().and_then(|c| c.task_id.clone()),
+            task_id: self
+                .execution_context
+                .as_ref()
+                .and_then(|c| c.task_id.clone()),
             anonymous: self.anonymous,
             is_chatgpt: self.api_style == ApiStyle::Chatgpt,
             cwd: self.cwd.clone(),
@@ -1174,6 +1227,8 @@ impl AgentLoop {
             session_id: self.session_id.clone(),
             route_state: self.route_state.clone(),
             cancel: self.cancel.clone(),
+            turn_output_started: self.turn_output_started.clone(),
+            turn_side_effect_started: self.turn_side_effect_started.clone(),
         }
     }
 
@@ -1260,7 +1315,6 @@ impl AgentLoop {
     }
 
     // ── Anthropic-specific helpers ────────────────────────────────────────────
-
 }
 
 fn validate_openai_sse_completion(
@@ -1563,7 +1617,13 @@ fn claims_delivery_blocked(text: &str) -> bool {
         "pr created",
     ];
     let inability = ["无法", "不能", "cannot", "can't", "unable"];
-    let channel = ["创建 pr", "开 pr", "create the pr", "create a pr", "自动创建 pr"];
+    let channel = [
+        "创建 pr",
+        "开 pr",
+        "create the pr",
+        "create a pr",
+        "自动创建 pr",
+    ];
     fact_claim_units(text).into_iter().any(|unit| {
         if is_example_or_hypothesis(&unit) {
             return false;
@@ -1580,9 +1640,7 @@ fn claims_delivery_blocked(text: &str) -> bool {
         let setup_demand = (lower.contains("gh auth login")
             || (lower.contains("token")
                 && (lower.contains("配置") || lower.contains("configure"))))
-            && (lower.contains("请")
-                || lower.contains("please")
-                || lower.contains("完成认证"));
+            && (lower.contains("请") || lower.contains("please") || lower.contains("完成认证"));
         inability_hit || setup_demand
     })
 }
@@ -1605,7 +1663,9 @@ fn claims_command_missing(text: &str) -> Option<String> {
     if !missing_markers.iter().any(|m| lower.contains(m)) {
         return None;
     }
-    for cmd in ["docker", "gh", "git", "node", "pnpm", "npm", "cargo", "python3"] {
+    for cmd in [
+        "docker", "gh", "git", "node", "pnpm", "npm", "cargo", "python3",
+    ] {
         if lower.contains(cmd) {
             // The marker must plausibly refer to the command, not random prose.
             return Some(cmd.to_string());
@@ -1642,25 +1702,15 @@ fn claims_wait_for_user_on_checkable(text: &str) -> bool {
         "reply \"continue\" once",
         "let me know once",
     ];
-    wait_markers.iter().any(|m| lower.contains(&m.to_lowercase()))
+    wait_markers
+        .iter()
+        .any(|m| lower.contains(&m.to_lowercase()))
 }
 
 fn instruction_requests_delivery(instruction: &str) -> bool {
     let request_markers = [
-        "请",
-        "立即",
-        "现在",
-        "继续",
-        "直接",
-        "帮我",
-        "开始",
-        "完成",
-        "然后",
-        "并",
-        "please",
-        "go ahead",
-        "continue",
-        "then",
+        "请", "立即", "现在", "继续", "直接", "帮我", "开始", "完成", "然后", "并", "please",
+        "go ahead", "continue", "then",
     ];
     let delivery_actions = [
         "deliver_changes",
@@ -1721,9 +1771,7 @@ fn instruction_requests_delivery(instruction: &str) -> bool {
             return false;
         }
         let lower = unit.to_lowercase();
-        let asks_analysis = analysis_markers
-            .iter()
-            .any(|marker| lower.contains(marker));
+        let asks_analysis = analysis_markers.iter().any(|marker| lower.contains(marker));
         if asks_analysis
             && !execution_bridges
                 .iter()
@@ -1731,12 +1779,8 @@ fn instruction_requests_delivery(instruction: &str) -> bool {
         {
             return false;
         }
-        delivery_actions
-            .iter()
-            .any(|action| lower.contains(action))
-            && request_markers
-                .iter()
-                .any(|marker| lower.contains(marker))
+        delivery_actions.iter().any(|action| lower.contains(action))
+            && request_markers.iter().any(|marker| lower.contains(marker))
     })
 }
 
@@ -1769,11 +1813,7 @@ fn delivery_fact_check_correction(
 /// never as a hidden correction loop. Probes run ONLY on a text match, so
 /// ordinary execution turns pay nothing. Delivery corrections additionally
 /// require a user instruction that explicitly asks for delivery.
-fn fact_check_reply(
-    text: &str,
-    completion_instruction: &str,
-    mode: AgentMode,
-) -> Option<String> {
+fn fact_check_reply(text: &str, completion_instruction: &str, mode: AgentMode) -> Option<String> {
     if matches!(mode, AgentMode::Interactive) {
         return None;
     }
@@ -1930,6 +1970,7 @@ fn repair_incomplete_tool_history(history: Vec<Message>) -> Vec<Message> {
                 "content": "Tool result unavailable in persisted history; continue from current workspace state.",
             })
             .to_string(),
+            endpoint_id: None,
             model_id: None,
             input_tokens: None,
             output_tokens: None,
@@ -2683,7 +2724,7 @@ mod tests {
                     ReasoningEffort::Medium,
                     ReasoningEffort::Max,
                 ]),
-            supports_vision: None,
+                supports_vision: None,
             },
             ReasoningEffort::High,
         );
@@ -2736,7 +2777,7 @@ mod tests {
                     ReasoningEffort::High,
                     ReasoningEffort::XHigh,
                 ]),
-            supports_vision: None,
+                supports_vision: None,
             },
             ReasoningEffort::Ultra,
         );
@@ -2764,7 +2805,7 @@ mod tests {
                     ReasoningEffort::Medium,
                     ReasoningEffort::High,
                 ]),
-            supports_vision: None,
+                supports_vision: None,
             },
             ReasoningEffort::Max,
         );
@@ -2816,7 +2857,7 @@ mod tests {
                     ReasoningEffort::Medium,
                     ReasoningEffort::High,
                 ]),
-            supports_vision: None,
+                supports_vision: None,
             },
             ReasoningEffort::Ultra,
         );
@@ -2981,6 +3022,7 @@ mod tests {
             session_id: "session-1".into(),
             role: role.into(),
             content: content.into(),
+            endpoint_id: None,
             model_id: None,
             input_tokens: None,
             output_tokens: None,
@@ -3051,8 +3093,10 @@ mod tests {
             assert!(prompt.contains("AGENTS.md"));
             assert!(prompt.contains("docs/specs"));
             assert!(prompt.contains("docs/design"));
-            assert!(prompt.contains("plans and delegated task state belong to the current conversation"));
-            assert!(prompt.contains("do not direct the user to a separate specification or planning screen"));
+            assert!(prompt
+                .contains("plans and delegated task state belong to the current conversation"));
+            assert!(prompt
+                .contains("do not direct the user to a separate specification or planning screen"));
         }
     }
 
@@ -3232,7 +3276,9 @@ mod tests {
         assert!(blocks[0].content.contains("Use pnpm."));
         assert_eq!(blocks[1].priority, 1);
         assert!(blocks[1].content.contains("# Repository Intent Index"));
-        assert!(blocks[1].content.contains("docs/specs/feature-specs/login.md"));
+        assert!(blocks[1]
+            .content
+            .contains("docs/specs/feature-specs/login.md"));
         assert!(blocks[1].content.contains("docs/design/auth.md"));
         assert!(!blocks[1].content.contains(".codefactory/specs"));
         assert_eq!(blocks[2].priority, 2);
@@ -3259,7 +3305,12 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("write_file", &serde_json::json!({"path": "src/example.rs", "content": "fn main() {}"}), "written", false),
+            &tool_result(
+                "write_file",
+                &serde_json::json!({"path": "src/example.rs", "content": "fn main() {}"}),
+                "written",
+                false,
+            ),
         );
         assert!(!gate.evidence().completed);
 
@@ -3269,7 +3320,12 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("bash", &serde_json::json!({"command": "cargo test"}), "test result: ok", false),
+            &tool_result(
+                "bash",
+                &serde_json::json!({"command": "cargo test"}),
+                "test result: ok",
+                false,
+            ),
         );
         assert!(gate.evidence().completed);
     }
@@ -3286,7 +3342,12 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("write_file", &serde_json::json!({"path": "src/app.rs", "content": "fixed"}), "written", false),
+            &tool_result(
+                "write_file",
+                &serde_json::json!({"path": "src/app.rs", "content": "fixed"}),
+                "written",
+                false,
+            ),
         );
         record_completion_outcome(
             &mut gate,
@@ -3294,9 +3355,14 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("bash", &serde_json::json!({
-                "command": "status=0; grep -n stale src/app.rs || status=$?; test \"$status\" -le 1"
-            }), "zsh:1: read-only variable: status", true),
+            &tool_result(
+                "bash",
+                &serde_json::json!({
+                    "command": "status=0; grep -n stale src/app.rs || status=$?; test \"$status\" -le 1"
+                }),
+                "zsh:1: read-only variable: status",
+                true,
+            ),
         );
 
         let failed = gate.evidence();
@@ -3312,7 +3378,12 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("bash", &serde_json::json!({"command": "cargo test"}), "test result: ok. 1 passed; 0 failed", false),
+            &tool_result(
+                "bash",
+                &serde_json::json!({"command": "cargo test"}),
+                "test result: ok. 1 passed; 0 failed",
+                false,
+            ),
         );
 
         let recovered = gate.evidence();
@@ -3337,7 +3408,12 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("write_file", &serde_json::json!({"path": "result.txt", "content": "candidate"}), "written", false),
+            &tool_result(
+                "write_file",
+                &serde_json::json!({"path": "result.txt", "content": "candidate"}),
+                "written",
+                false,
+            ),
         );
         let evidence = gate.evidence();
 
@@ -3384,7 +3460,12 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("write_file", &serde_json::json!({"path": "src/worker.rs", "content": "candidate"}), "written", false),
+            &tool_result(
+                "write_file",
+                &serde_json::json!({"path": "src/worker.rs", "content": "candidate"}),
+                "written",
+                false,
+            ),
         );
         record_completion_outcome(
             &mut gate,
@@ -3392,7 +3473,12 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("bash", &serde_json::json!({"command": "cargo test worker::tests::behavior"}), "assertion failed", true),
+            &tool_result(
+                "bash",
+                &serde_json::json!({"command": "cargo test worker::tests::behavior"}),
+                "assertion failed",
+                true,
+            ),
         );
         record_completion_outcome(
             &mut gate,
@@ -3400,7 +3486,12 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("read_file", &serde_json::json!({"path": "src/worker.rs"}), "candidate", false),
+            &tool_result(
+                "read_file",
+                &serde_json::json!({"path": "src/worker.rs"}),
+                "candidate",
+                false,
+            ),
         );
         let evidence = gate.evidence();
 
@@ -3443,7 +3534,12 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("write_file", &serde_json::json!({"path": "tool", "content": "implementation"}), "written", false),
+            &tool_result(
+                "write_file",
+                &serde_json::json!({"path": "tool", "content": "implementation"}),
+                "written",
+                false,
+            ),
         );
         record_completion_outcome(
             &mut gate,
@@ -3451,9 +3547,14 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("bash", &serde_json::json!({
-                "command": "test \"$(./tool 3)\" = 9 && test \"$(./tool 5)\" = 25"
-            }), "examples passed", false),
+            &tool_result(
+                "bash",
+                &serde_json::json!({
+                    "command": "test \"$(./tool 3)\" = 9 && test \"$(./tool 5)\" = 25"
+                }),
+                "examples passed",
+                false,
+            ),
         );
 
         let smoke = gate.evidence();
@@ -3467,7 +3568,12 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("bash", &serde_json::json!({"command": "test \"$(./tool 7)\" = 49"}), "independent case passed", false),
+            &tool_result(
+                "bash",
+                &serde_json::json!({"command": "test \"$(./tool 7)\" = 49"}),
+                "independent case passed",
+                false,
+            ),
         );
         let completed = gate.evidence();
         assert_eq!(completed.last_independent_verification_sequence, Some(3));
@@ -3488,9 +3594,14 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("bash", &serde_json::json!({
-                "command": "set -e\nprintf '== agent injection ==\\n'; sed -n '445,500p' src-tauri/src/agent/mod.rs"
-            }), "Err(e) => Ok(tools::ToolOutput::err(format!(\"MCP error: {e}\")))", false),
+            &tool_result(
+                "bash",
+                &serde_json::json!({
+                    "command": "set -e\nprintf '== agent injection ==\\n'; sed -n '445,500p' src-tauri/src/agent/mod.rs"
+                }),
+                "Err(e) => Ok(tools::ToolOutput::err(format!(\"MCP error: {e}\")))",
+                false,
+            ),
         );
         let evidence = gate.evidence();
         assert!(
@@ -3506,9 +3617,14 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("bash", &serde_json::json!({
-                "command": "pnpm exec vitest run src/pages/Workspace/TaskCreator.test.tsx"
-            }), "Test Files  2 passed (2)", false),
+            &tool_result(
+                "bash",
+                &serde_json::json!({
+                    "command": "pnpm exec vitest run src/pages/Workspace/TaskCreator.test.tsx"
+                }),
+                "Test Files  2 passed (2)",
+                false,
+            ),
         );
         let evidence = gate.evidence();
         assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
@@ -3542,7 +3658,11 @@ mod tests {
         // behavioral contract must bind ALL modes — verify-before-asserting
         // environment state, try at least two approaches before asking, and
         // never park on "回复继续" for conditions a tool can poll.
-        for mode in [AgentMode::Interactive, AgentMode::Execute, AgentMode::Autonomous] {
+        for mode in [
+            AgentMode::Interactive,
+            AgentMode::Execute,
+            AgentMode::Autonomous,
+        ] {
             let prompt = base_system_prompt(mode, Path::new("/workspace"));
             assert!(
                 prompt.contains("VERIFY BEFORE ASSERTING"),
@@ -3623,32 +3743,25 @@ mod tests {
             );
             assert!(correction.is_some_and(|c| c.contains("docker")));
         }
-        assert!(
-            fact_check_reply(
-                "一切正常,任务完成。",
-                "请完成当前修改。",
-                AgentMode::Execute,
-            )
-            .is_none()
-        );
+        assert!(fact_check_reply(
+            "一切正常,任务完成。",
+            "请完成当前修改。",
+            AgentMode::Execute,
+        )
+        .is_none());
     }
 
     #[test]
     fn fact_check_cannot_redirect_an_interactive_analysis_turn() {
-        let blocked_claim =
-            "无法创建 PR：请在设置中配置 GitHub token，然后我才能继续。";
+        let blocked_claim = "无法创建 PR：请在设置中配置 GitHub token，然后我才能继续。";
         for analysis_instruction in [
             "仔细分析一下待执行入口，我觉得应该做成后台任务结果或子 agent 展示。",
             "请分析提交并推送流程是否合理，不要实际执行。",
             "如何设计创建 PR 和发布版本的状态展示？",
         ] {
             assert!(
-                fact_check_reply(
-                    blocked_claim,
-                    analysis_instruction,
-                    AgentMode::Interactive,
-                )
-                .is_none(),
+                fact_check_reply(blocked_claim, analysis_instruction, AgentMode::Interactive,)
+                    .is_none(),
                 "{analysis_instruction}"
             );
         }
@@ -3673,12 +3786,8 @@ mod tests {
                 "请分析失败原因，然后提交改动并创建 PR。",
             ] {
                 assert!(
-                    fact_check_reply(
-                        blocked_claim,
-                        delivery_instruction,
-                        AgentMode::Execute,
-                    )
-                    .is_some_and(|correction| correction.contains("deliver_changes")),
+                    fact_check_reply(blocked_claim, delivery_instruction, AgentMode::Execute,)
+                        .is_some_and(|correction| correction.contains("deliver_changes")),
                     "{delivery_instruction}"
                 );
             }
@@ -3846,9 +3955,14 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("bash", &serde_json::json!({
-                "command": "nohup ./server >server.log 2>&1 & echo $! >server.pid"
-            }), "started", false),
+            &tool_result(
+                "bash",
+                &serde_json::json!({
+                    "command": "nohup ./server >server.log 2>&1 & echo $! >server.pid"
+                }),
+                "started",
+                false,
+            ),
         );
         assert!(!gate.evidence().completed);
 
@@ -3858,9 +3972,14 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("bash", &serde_json::json!({
-                "command": "timeout 10 curl --fail http://127.0.0.1:8080/health"
-            }), "healthy", false),
+            &tool_result(
+                "bash",
+                &serde_json::json!({
+                    "command": "timeout 10 curl --fail http://127.0.0.1:8080/health"
+                }),
+                "healthy",
+                false,
+            ),
         );
         assert!(gate.evidence().completed);
     }
@@ -4105,11 +4224,16 @@ mod tests {
             &mut sequence,
             Path::new("/workspace"),
             "t",
-            &tool_result("edit_file", &serde_json::json!({
-                "path": "/workspace/compatdemo/service.py",
-                "old_string": "rt.old_value(value)",
-                "new_string": "rt.new_value(value)"
-            }), "Edited /workspace/compatdemo/service.py", false),
+            &tool_result(
+                "edit_file",
+                &serde_json::json!({
+                    "path": "/workspace/compatdemo/service.py",
+                    "old_string": "rt.old_value(value)",
+                    "new_string": "rt.new_value(value)"
+                }),
+                "Edited /workspace/compatdemo/service.py",
+                false,
+            ),
         );
 
         let evidence = gate.evidence();

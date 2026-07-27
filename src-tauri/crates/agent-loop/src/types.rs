@@ -279,4 +279,12 @@ pub enum StreamEvent {
     Error {
         message: String,
     },
+    /// A recoverable product/runtime failure with a stable machine code.
+    /// The legacy Error variant remains for compatibility.
+    RuntimeError {
+        code: String,
+        message: String,
+        endpoint_id: Option<String>,
+        recoverable: bool,
+    },
 }

@@ -25,15 +25,25 @@ pub async fn save_settings(
 
 #[tauri::command]
 pub async fn get_api_key(key_ref: String) -> Result<Option<String>, AppError> {
-    crate::secrets::get_key(&key_ref)
+    crate::credential_broker::CredentialBroker::global()
+        .get(&key_ref)
+        .await
+        .map_err(|error| AppError::Other(error.message))
 }
 
 #[tauri::command]
 pub async fn save_api_key(key_ref: String, value: String) -> Result<(), AppError> {
-    crate::secrets::set_key(&key_ref, &value)
+    crate::credential_broker::CredentialBroker::global()
+        .put(&key_ref, &value)
+        .await
+        .map(|_| ())
+        .map_err(|error| AppError::Other(error.message))
 }
 
 #[tauri::command]
 pub async fn delete_api_key(key_ref: String) -> Result<(), AppError> {
-    crate::secrets::delete_key(&key_ref)
+    crate::credential_broker::CredentialBroker::global()
+        .delete(&key_ref)
+        .await
+        .map_err(|error| AppError::Other(error.message))
 }

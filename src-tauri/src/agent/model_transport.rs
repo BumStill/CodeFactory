@@ -60,11 +60,15 @@ pub(super) struct RoutedDesktopModelTransport {
     pub(super) session_id: String,
     pub(super) route_state: ActiveRouteState,
     pub(super) cancel: Option<Arc<AtomicBool>>,
+    pub(super) turn_output_started: Arc<AtomicBool>,
+    pub(super) turn_side_effect_started: Arc<AtomicBool>,
 }
 
 struct TrackingEventSink {
     delegate: Arc<dyn EventSink>,
     output_started: Arc<AtomicBool>,
+    turn_output_started: Arc<AtomicBool>,
+    turn_side_effect_started: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -77,6 +81,13 @@ impl EventSink for TrackingEventSink {
                 | StreamEvent::ToolResult { .. }
         ) {
             self.output_started.store(true, Ordering::SeqCst);
+            self.turn_output_started.store(true, Ordering::SeqCst);
+            if matches!(
+                event,
+                StreamEvent::ToolCallStart { .. } | StreamEvent::ToolResult { .. }
+            ) {
+                self.turn_side_effect_started.store(true, Ordering::SeqCst);
+            }
         }
         self.delegate.emit(event);
     }
@@ -104,24 +115,64 @@ fn classify_transport_error(message: String) -> TransportError {
 }
 
 impl RoutedDesktopModelTransport {
-    fn transport_for(
+    async fn transport_for(
         &self,
         route: &RouteCandidate,
         output_started: Arc<AtomicBool>,
-    ) -> DesktopModelTransport {
-        DesktopModelTransport {
+    ) -> std::result::Result<DesktopModelTransport, TransportError> {
+        let api_key = if matches!(route.api_style, ApiStyle::Chatgpt) {
+            String::new()
+        } else if let Some(api_key) = route.legacy_inline_api_key.as_ref() {
+            api_key.clone()
+        } else if let Some(key_ref) = route.credential_ref.as_deref() {
+            match crate::credential_broker::CredentialBroker::global()
+                .get(key_ref)
+                .await
+            {
+                Ok(Some(secret)) if !secret.trim().is_empty() => secret,
+                Ok(_) => {
+                    return Err(TransportError::Retryable(format!(
+                        "AUTH_MISSING: {} 尚未配置凭据，请在模型设置中保存后重试",
+                        route.endpoint_name
+                    )))
+                }
+                Err(error) => {
+                    let action = match error.kind {
+                        crate::credential_broker::CredentialErrorKind::Unavailable => {
+                            "系统仍在等待密钥访问授权"
+                        }
+                        crate::credential_broker::CredentialErrorKind::Store => {
+                            "系统未能读取已保存的密钥"
+                        }
+                    };
+                    return Err(TransportError::Retryable(format!(
+                        "CREDENTIAL_ACCESS_REQUIRED: {}。请允许一次系统密钥访问，或在模型设置中重新保存该端点凭据",
+                        action
+                    )));
+                }
+            }
+        } else {
+            return Err(TransportError::Retryable(format!(
+                "AUTH_MISSING: {} 尚未配置凭据，请在模型设置中保存后重试",
+                route.endpoint_name
+            )));
+        };
+
+        Ok(DesktopModelTransport {
             http: self.http.clone(),
             events: Arc::new(TrackingEventSink {
                 delegate: self.events.clone(),
                 output_started,
+                turn_output_started: self.turn_output_started.clone(),
+                turn_side_effect_started: self.turn_side_effect_started.clone(),
             }),
             model_id: route.model_id.clone(),
             session_id: self.session_id.clone(),
             base_url: route.base_url.clone(),
-            api_key: route.api_key.clone(),
+            api_key,
             api_style: route.api_style.clone(),
             cancel: self.cancel.clone(),
-        }
+        })
     }
 }
 
@@ -162,10 +213,7 @@ impl DesktopModelTransport {
                 self.call_chatgpt_model(messages, tool_defs, false, reasoning_effort)
                     .await
             }
-            _ => {
-                self.call_openai_model(messages, tool_defs, false)
-                    .await
-            }
+            _ => self.call_openai_model(messages, tool_defs, false).await,
         }
     }
 
@@ -180,7 +228,7 @@ impl DesktopModelTransport {
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         let finalization_response = tool_defs.is_empty();
 
-        let (access_token, account_id) = crate::codex_auth::valid_access_token().await?;
+        let (mut access_token, mut account_id) = crate::codex_auth::valid_access_token().await?;
         // The ChatGPT backend URL is fixed — use the canonical constant rather
         // than the endpoint's base_url so the request always lands correctly.
         let url = format!("{}/responses", crate::codex_auth::CHATGPT_BASE_URL);
@@ -257,7 +305,7 @@ impl DesktopModelTransport {
             body["tools"] = serde_json::Value::Array(tools);
         }
 
-        let response = crate::http_util::send_with_retry_and_notify(
+        let mut response = crate::http_util::send_with_retry_and_notify(
             "ChatGPT Responses stream request",
             || {
                 let mut request = self
@@ -277,6 +325,35 @@ impl DesktopModelTransport {
             |notice| super::AgentLoop::emit_transport_retry(self.events.as_ref(), notice),
         )
         .await?;
+        if response.status().as_u16() == 401 {
+            (access_token, account_id) = crate::codex_auth::force_refresh_access_token().await?;
+            response = crate::http_util::send_with_retry_and_notify(
+                "ChatGPT Responses stream request after forced token refresh",
+                || {
+                    let mut request = self
+                        .http
+                        .post(&url)
+                        .bearer_auth(&access_token)
+                        .header("OpenAI-Beta", "responses=experimental")
+                        .header("originator", "codex_cli_rs")
+                        .header("session_id", &self.session_id)
+                        .header("Accept", "text/event-stream")
+                        .json(&body);
+                    if let Some(acct) = &account_id {
+                        request = request.header("chatgpt-account-id", acct.as_str());
+                    }
+                    request
+                },
+                |notice| super::AgentLoop::emit_transport_retry(self.events.as_ref(), notice),
+            )
+            .await?;
+            if response.status().as_u16() == 401 {
+                crate::codex_auth::mark_auth_expired();
+                return Err(crate::errors::AppError::Other(
+                    "AUTH_EXPIRED: ChatGPT 授权已过期，请重新验证后在原会话继续".into(),
+                ));
+            }
+        }
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -419,8 +496,12 @@ impl DesktopModelTransport {
             return Ok((text_buf, Vec::new(), usage, reasoning));
         }
 
-        validate_openai_sse_completion(saw_terminal_marker, byte_buffer.len(), malformed_data_lines)
-            .map_err(crate::errors::AppError::Other)?;
+        validate_openai_sse_completion(
+            saw_terminal_marker,
+            byte_buffer.len(),
+            malformed_data_lines,
+        )
+        .map_err(crate::errors::AppError::Other)?;
 
         if finalization_response {
             text_buf = sanitize_completion_summary(&text_buf);
@@ -586,7 +667,8 @@ impl DesktopModelTransport {
                     let delta = choice.delta;
                     if let Some(t) = delta.content.filter(|s| !s.is_empty()) {
                         if !finalization_response {
-                            self.events.emit(StreamEvent::TextDelta { content: t.clone() });
+                            self.events
+                                .emit(StreamEvent::TextDelta { content: t.clone() });
                         }
                         text_buf.push_str(&t);
                     }
@@ -623,8 +705,12 @@ impl DesktopModelTransport {
             return Ok((text_buf, Vec::new(), usage, reasoning));
         }
 
-        validate_openai_sse_completion(saw_terminal_marker, byte_buffer.len(), malformed_data_lines)
-            .map_err(crate::errors::AppError::Other)?;
+        validate_openai_sse_completion(
+            saw_terminal_marker,
+            byte_buffer.len(),
+            malformed_data_lines,
+        )
+        .map_err(crate::errors::AppError::Other)?;
 
         let mut tool_calls: Vec<ToolCall> = tc_map
             .into_iter()
@@ -769,7 +855,12 @@ impl ModelTransport for DesktopModelTransport {
             }
             _ => {
                 let (text, tool_calls, usage, reasoning) = self
-                    .call_openai_transport(messages, tools, opts.require_tool, &opts.reasoning_effort)
+                    .call_openai_transport(
+                        messages,
+                        tools,
+                        opts.require_tool,
+                        &opts.reasoning_effort,
+                    )
                     .await
                     .map_err(|e| classify_transport_error(e.to_string()))?;
                 Ok(ModelResponse {
@@ -801,7 +892,26 @@ impl ModelTransport for RoutedDesktopModelTransport {
         loop {
             let route = self.route_state.current();
             let output_started = Arc::new(AtomicBool::new(false));
-            let transport = self.transport_for(&route, output_started.clone());
+            let transport = match self.transport_for(&route, output_started.clone()).await {
+                Ok(transport) => transport,
+                Err(TransportError::Fatal(reason)) => {
+                    self.route_state.record_current_failure(&reason);
+                    return Err(TransportError::Fatal(reason));
+                }
+                Err(TransportError::Retryable(reason)) => {
+                    if self.turn_output_started.load(Ordering::SeqCst) {
+                        self.route_state.record_current_failure(&reason);
+                        return Err(TransportError::Retryable(reason));
+                    }
+                    let Some(change) = self.route_state.advance_after_failure(&reason) else {
+                        return Err(TransportError::Retryable(
+                            self.route_state.exhausted_error(&reason),
+                        ));
+                    };
+                    transitions.push(change);
+                    continue;
+                }
+            };
             match transport.complete(messages, tools, opts).await {
                 Ok(mut response) => {
                     self.route_state.mark_current_success();
@@ -830,12 +940,17 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     }
                     return Ok(response);
                 }
-                Err(error @ TransportError::Fatal(_)) => return Err(error),
+                Err(error @ TransportError::Fatal(_)) => {
+                    self.route_state.record_current_failure(&error.to_string());
+                    return Err(error);
+                }
                 Err(TransportError::Retryable(reason)) => {
                     // A provider can fail after yielding visible SSE. Replaying
                     // on another model would mix answers and can duplicate tool
                     // intent, so fail visibly without switching.
-                    if output_started.load(Ordering::SeqCst) {
+                    if output_started.load(Ordering::SeqCst)
+                        || self.turn_output_started.load(Ordering::SeqCst)
+                    {
                         self.route_state.record_current_failure(&reason);
                         return Err(TransportError::Retryable(reason));
                     }
@@ -1022,7 +1137,8 @@ mod tests {
 
     #[test]
     fn edge_extracts_leading_system_and_emits_no_system_message() {
-        let (system, msgs) = chat_messages_to_anthropic(&[cm("system", "you are helpful"), cm("user", "hi")]);
+        let (system, msgs) =
+            chat_messages_to_anthropic(&[cm("system", "you are helpful"), cm("user", "hi")]);
         assert_eq!(system, "you are helpful");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "user");
@@ -1139,7 +1255,10 @@ mod tests {
     #[test]
     fn edge_user_text_is_a_bare_json_string() {
         let (_, msgs) = chat_messages_to_anthropic(&[cm("user", "just text")]);
-        assert_eq!(msgs[0]["content"], serde_json::Value::String("just text".into()));
+        assert_eq!(
+            msgs[0]["content"],
+            serde_json::Value::String("just text".into())
+        );
     }
 
     #[test]
@@ -1157,7 +1276,10 @@ mod tests {
         assert_eq!(mr.tool_calls.len(), 1);
         assert!(mr.reasoning.is_none());
         let u = mr.usage.expect("usage present when tokens > 0");
-        assert_eq!((u.prompt_tokens, u.completion_tokens, u.total_tokens), (5, 7, 12));
+        assert_eq!(
+            (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            (5, 7, 12)
+        );
         // (0,0) tokens → None (matches the record_usage guard).
         let none = anthropic_response_to_model_response(AnthropicResponse {
             text: String::new(),
@@ -1229,7 +1351,9 @@ mod tests {
             endpoint_name: name.into(),
             model_id: model.into(),
             base_url,
-            api_key: "test-key".into(),
+            credential_ref: None,
+            legacy_inline_api_key: Some("test-key".into()),
+            supports_vision: true,
             api_style: ApiStyle::Openai,
         }
     }
@@ -1283,8 +1407,9 @@ mod tests {
         let (a_url, a_hits) = serve_responses(vec![DOWN, DOWN, DOWN]);
         let (b_url, b_hits) = serve_responses(vec![DOWN, DOWN, DOWN]);
         let (c_url, c_hits) = serve_responses(vec![OK, OK]);
-        let mut plan =
-            super::super::failover::RouteCandidatePlan::new(openai_candidate("route-a", "a", a_url));
+        let mut plan = super::super::failover::RouteCandidatePlan::new(openai_candidate(
+            "route-a", "a", a_url,
+        ));
         plan.push_fallback(openai_candidate("route-b", "b", b_url));
         plan.push_fallback(openai_candidate("route-c", "c", c_url));
         let transport = RoutedDesktopModelTransport {
@@ -1298,6 +1423,8 @@ mod tests {
                 ),
             ),
             cancel: None,
+            turn_output_started: Arc::new(AtomicBool::new(false)),
+            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
         };
 
         let response = transport
@@ -1307,7 +1434,10 @@ mod tests {
 
         assert_eq!(response.text, "ok");
         assert_eq!(
-            response.effective_route.as_ref().map(|route| route.endpoint_name.as_str()),
+            response
+                .effective_route
+                .as_ref()
+                .map(|route| route.endpoint_name.as_str()),
             Some("route-c")
         );
         let change = response.route_change.expect("route change metadata");
@@ -1345,11 +1475,7 @@ mod tests {
             "a",
             primary_url,
         ));
-        plan.push_fallback(openai_candidate(
-            "must-not-run",
-            "b",
-            fallback_url,
-        ));
+        plan.push_fallback(openai_candidate("must-not-run", "b", fallback_url));
         let transport = RoutedDesktopModelTransport {
             http: test_client(),
             events: Arc::new(super::super::events::CollectingEventSink::new()),
@@ -1361,6 +1487,8 @@ mod tests {
                 ),
             ),
             cancel: None,
+            turn_output_started: Arc::new(AtomicBool::new(false)),
+            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
         };
         let tools = vec![ToolDefinition {
             r#type: "function".into(),
@@ -1379,6 +1507,70 @@ mod tests {
         assert!(matches!(error, TransportError::Retryable(_)));
         assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
-        assert_eq!(transport.route_state.current().endpoint_name, "partial-primary");
+        assert_eq!(
+            transport.route_state.current().endpoint_name,
+            "partial-primary"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_transport_does_not_switch_in_a_later_round_after_turn_output_started() {
+        const DOWN: (&str, &str, &str) = (
+            "503 Service Unavailable",
+            "application/json",
+            r#"{"error":{"message":"Service Unavailable","code":"circuit_open"}}"#,
+        );
+        const OK: (&str, &str, &str) = (
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"round-one\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let (primary_url, primary_hits) = serve_responses(vec![OK, DOWN, DOWN, DOWN]);
+        let (fallback_url, fallback_hits) = serve_responses(vec![(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"unsafe-replay\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )]);
+        let mut plan = super::super::failover::RouteCandidatePlan::new(openai_candidate(
+            "turn-primary",
+            "a",
+            primary_url,
+        ));
+        plan.push_fallback(openai_candidate(
+            "must-not-run-after-output",
+            "b",
+            fallback_url,
+        ));
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: "turn-latch-test".into(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                plan,
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_output_started: Arc::new(AtomicBool::new(false)),
+            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+        };
+
+        transport
+            .complete(&[], &[], &RoundOptions::default())
+            .await
+            .expect("first round emits visible output");
+        let error = transport
+            .complete(&[], &[], &RoundOptions::default())
+            .await
+            .expect_err("later round must not replay the root turn elsewhere");
+
+        assert!(matches!(error, TransportError::Retryable(_)));
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 4);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            transport.route_state.current().endpoint_name,
+            "turn-primary"
+        );
     }
 }

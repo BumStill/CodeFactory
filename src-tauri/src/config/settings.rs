@@ -76,11 +76,19 @@ fn default_sandbox_image() -> String {
     "ubuntu:24.04".to_string()
 }
 
+fn default_model_policy() -> String {
+    "prefer".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub endpoints: HashMap<String, Endpoint>,
     pub default_endpoint: String,
     pub default_model: String,
+    /// Routing strategy copied into each newly created session. Existing
+    /// sessions remain independent after creation.
+    #[serde(default = "default_model_policy")]
+    pub default_model_policy: String,
     pub permissions: PermissionPolicy,
     pub shell: ShellConfig,
     #[serde(default)]
@@ -543,6 +551,7 @@ impl Default for Settings {
             endpoints,
             default_endpoint: "openrouter".into(),
             default_model: "anthropic/claude-opus-4-7".into(),
+            default_model_policy: default_model_policy(),
             // Action-biased default: non-destructive reads + writes (incl.
             // document generation) auto-approve, so the agent produces
             // deliverables without a confirmation prompt on every file write.
@@ -620,6 +629,7 @@ mod subagent_isolation_tests {
         let s: Settings = serde_json::from_value(legacy).expect("legacy settings must parse");
         assert_eq!(s.subagent_isolation, SubagentIsolation::Shared);
         assert_eq!(s.max_parallel_tasks, 3);
+        assert_eq!(s.default_model_policy, "prefer");
     }
 
     #[test]
@@ -806,7 +816,7 @@ mod reasoning_effort_tests {
                     effective_context_window_percent: Some(95),
                     default_reasoning_effort: None,
                     supported_reasoning_efforts: None,
-                supports_vision: None,
+                    supports_vision: None,
                 }],
                 active_model: Some("gpt-5.5".into()),
             },

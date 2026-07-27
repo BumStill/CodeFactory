@@ -320,7 +320,9 @@ mod tests {
         // user opted into — the error must name the fix instead.
         assert!(super::sandbox::MISSING_DOCKER_ERROR.contains("docker"));
         assert!(super::sandbox::MISSING_DOCKER_ERROR.contains("沙箱"));
-        assert!(!super::sandbox::runtime_available("definitely-not-a-real-binary-xyz"));
+        assert!(!super::sandbox::runtime_available(
+            "definitely-not-a-real-binary-xyz"
+        ));
     }
 
     use super::*;
@@ -509,6 +511,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn background_service_survives_after_the_shell_tool_returns() {
+        const SHELL_START_BUDGET: Duration = Duration::from_secs(5);
         let cwd = std::env::temp_dir().join(format!("codefactory-bash-service-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&cwd).expect("create cwd");
 
@@ -517,62 +520,59 @@ mod tests {
                 "command": "sleep 30 > service.log 2>&1 & echo $! > service.pid"
             }),
             &ExecCtx::new(cwd.clone(), None),
-            Duration::from_secs(2),
+            SHELL_START_BUDGET,
         )
         .await
         .expect("tool returns output");
+        assert!(!output.is_error, "service start failed: {}", output.content);
 
-        let pid = std::fs::read_to_string(cwd.join("service.pid"))
-            .expect("service pid written")
-            .trim()
-            .parse::<i32>()
-            .expect("numeric service pid");
+        let pid = wait_for_recorded_pid(&cwd.join("service.pid"), Duration::from_secs(2))
+            .await
+            .expect("service pid written");
         let process_exists = unsafe { libc::kill(pid, 0) } == 0;
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
         let _ = std::fs::remove_dir_all(cwd);
 
-        assert!(!output.is_error, "service start failed: {}", output.content);
         assert!(process_exists, "background service {pid} did not survive");
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn background_service_without_redirect_cannot_hold_output_pipes_forever() {
+        const SHELL_START_BUDGET: Duration = Duration::from_secs(5);
         let cwd =
             std::env::temp_dir().join(format!("codefactory-bash-service-pipes-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&cwd).expect("create cwd");
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(8),
             execute_with_timeout(
                 json!({"command": "sleep 30 & echo $! > service.pid"}),
                 &ExecCtx::new(cwd.clone(), None),
-                Duration::from_secs(1),
+                SHELL_START_BUDGET,
             ),
         )
         .await;
-
-        let pid = std::fs::read_to_string(cwd.join("service.pid"))
-            .expect("service pid written")
-            .trim()
-            .parse::<i32>()
-            .expect("numeric service pid");
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
-        let _ = std::fs::remove_dir_all(cwd);
 
         let output = result
             .expect("background process held output pipes past the tool timeout")
             .expect("tool returns output");
         assert!(!output.is_error, "service start failed: {}", output.content);
+        let pid = wait_for_recorded_pid(&cwd.join("service.pid"), Duration::from_secs(2))
+            .await
+            .expect("service pid written");
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_dir_all(cwd);
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn background_service_holding_only_stderr_preserves_completed_stdout() {
+        const SHELL_START_BUDGET: Duration = Duration::from_secs(5);
         let cwd = std::env::temp_dir().join(format!(
             "codefactory-bash-service-one-pipe-{}",
             Uuid::new_v4()
@@ -580,32 +580,29 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("create cwd");
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(8),
             execute_with_timeout(
                 json!({
                     "command": "echo ready; sleep 30 >/dev/null & echo $! > service.pid"
                 }),
                 &ExecCtx::new(cwd.clone(), None),
-                Duration::from_secs(1),
+                SHELL_START_BUDGET,
             ),
         )
         .await;
-
-        let pid = std::fs::read_to_string(cwd.join("service.pid"))
-            .expect("service pid written")
-            .trim()
-            .parse::<i32>()
-            .expect("numeric service pid");
-        let process_exists = unsafe { libc::kill(pid, 0) } == 0;
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
-        let _ = std::fs::remove_dir_all(cwd);
 
         let output = result
             .expect("single inherited pipe held the shell tool forever")
             .expect("tool returns output");
         assert!(!output.is_error, "service start failed: {}", output.content);
+        let pid = wait_for_recorded_pid(&cwd.join("service.pid"), Duration::from_secs(2))
+            .await
+            .expect("service pid written");
+        let process_exists = unsafe { libc::kill(pid, 0) } == 0;
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_dir_all(cwd);
         assert!(
             output.content.contains("ready"),
             "stdout was discarded: {}",

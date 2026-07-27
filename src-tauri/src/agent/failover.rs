@@ -16,7 +16,12 @@ pub struct RouteCandidate {
     pub endpoint_name: String,
     pub model_id: String,
     pub base_url: String,
-    pub api_key: String,
+    /// Opaque reference resolved lazily by the process-wide credential broker.
+    pub credential_ref: Option<String>,
+    /// Compatibility seam for headless/tests whose caller already owns a
+    /// secret. Desktop route plans never put persisted credentials here.
+    pub legacy_inline_api_key: Option<String>,
+    pub supports_vision: bool,
     pub api_style: ApiStyle,
 }
 
@@ -26,7 +31,12 @@ impl std::fmt::Debug for RouteCandidate {
             .field("endpoint_name", &self.endpoint_name)
             .field("model_id", &self.model_id)
             .field("base_url", &self.base_url)
-            .field("api_key", &"<redacted>")
+            .field("credential_ref", &self.credential_ref)
+            .field(
+                "legacy_inline_api_key",
+                &self.legacy_inline_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("supports_vision", &self.supports_vision)
             .field("api_style", &self.api_style)
             .finish()
     }
@@ -35,12 +45,31 @@ impl std::fmt::Debug for RouteCandidate {
 #[derive(Clone, Debug)]
 pub struct RouteCandidatePlan {
     candidates: Vec<RouteCandidate>,
+    initial_selection: InitialRouteSelection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitialRouteSelection {
+    Preferred,
+    HealthAware,
 }
 
 impl RouteCandidatePlan {
+    /// Prefer the user's selected primary at the start of every new turn.
+    /// Fallbacks are still available after a replay-safe failure.
     pub fn new(primary: RouteCandidate) -> Self {
         Self {
             candidates: vec![primary],
+            initial_selection: InitialRouteSelection::Preferred,
+        }
+    }
+
+    /// Let automatic routing skip a primary that is still in the short
+    /// endpoint-unavailable cooldown window.
+    pub fn new_automatic(primary: RouteCandidate) -> Self {
+        Self {
+            candidates: vec![primary],
+            initial_selection: InitialRouteSelection::HealthAware,
         }
     }
 
@@ -63,7 +92,9 @@ impl RouteCandidatePlan {
 pub enum ProviderFailureClass {
     EndpointUnavailable,
     RateLimited,
-    AuthOrQuota,
+    AuthExpired,
+    CredentialUnavailable,
+    QuotaExceeded,
     ContextOverflow,
     VisionUnsupported,
     FieldUnsupported,
@@ -74,7 +105,10 @@ impl ProviderFailureClass {
     pub fn permits_endpoint_failover(self) -> bool {
         matches!(
             self,
-            Self::EndpointUnavailable | Self::RateLimited | Self::AuthOrQuota
+            Self::EndpointUnavailable
+                | Self::RateLimited
+                | Self::CredentialUnavailable
+                | Self::QuotaExceeded
         )
     }
 }
@@ -97,15 +131,25 @@ pub fn classify_provider_failure(message: &str) -> ProviderFailureClass {
     {
         return ProviderFailureClass::FieldUnsupported;
     }
-    if lower.contains("http 401")
+    if lower.contains("auth_expired")
+        || lower.contains("invalid_grant")
+        || lower.contains("refresh_token")
+        || lower.contains("http 401")
         || lower.contains("401 unauthorized")
+    {
+        return ProviderFailureClass::AuthExpired;
+    }
+    if lower.contains("credential_access_required")
+        || lower.contains("auth_missing")
         || lower.contains("http 403")
         || lower.contains("403 forbidden")
         || lower.contains("invalid api key")
         || lower.contains("invalid_api_key")
-        || lower.contains("insufficient_quota")
     {
-        return ProviderFailureClass::AuthOrQuota;
+        return ProviderFailureClass::CredentialUnavailable;
+    }
+    if lower.contains("insufficient_quota") || lower.contains("quota exceeded") {
+        return ProviderFailureClass::QuotaExceeded;
     }
     if lower.contains("http 429")
         || lower.contains("429 too many requests")
@@ -204,6 +248,14 @@ pub struct RouteChange {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteAttemptSnapshot {
+    pub endpoint: String,
+    pub model: String,
+    pub status: String,
+    pub failure_code: Option<String>,
+}
+
 impl RouteChange {
     pub fn notice(&self) -> String {
         format!(
@@ -250,11 +302,14 @@ impl ActiveRouteState {
             !plan.candidates.is_empty(),
             "route candidate plan must contain a primary"
         );
-        let current_index = plan
-            .candidates
-            .iter()
-            .position(|candidate| health.is_available(&candidate.endpoint_name))
-            .unwrap_or(0);
+        let current_index = match plan.initial_selection {
+            InitialRouteSelection::Preferred => 0,
+            InitialRouteSelection::HealthAware => plan
+                .candidates
+                .iter()
+                .position(|candidate| health.is_available(&candidate.endpoint_name))
+                .unwrap_or(0),
+        };
         let initial_route_change = (current_index > 0).then(|| RouteChange {
             from_endpoint: plan.candidates[0].endpoint_name.clone(),
             from_model: plan.candidates[0].model_id.clone(),
@@ -297,7 +352,9 @@ impl ActiveRouteState {
             from.model_id.clone(),
             reason.to_string(),
         ));
-        self.health.mark_unavailable(&from.endpoint_name);
+        if classify_provider_failure(reason) == ProviderFailureClass::EndpointUnavailable {
+            self.health.mark_unavailable(&from.endpoint_name);
+        }
 
         let next_index = ((from_index + 1)..inner.candidates.len()).find(|index| {
             !inner.failed_indices.contains(index)
@@ -332,12 +389,38 @@ impl ActiveRouteState {
                 reason.to_string(),
             ));
         }
-        self.health.mark_unavailable(&current.endpoint_name);
+        if classify_provider_failure(reason) == ProviderFailureClass::EndpointUnavailable {
+            self.health.mark_unavailable(&current.endpoint_name);
+        }
     }
 
     pub fn mark_current_success(&self) {
         let current = self.current();
         self.health.mark_success(&current.endpoint_name);
+    }
+
+    pub fn attempt_snapshots(&self, succeeded: bool) -> Vec<RouteAttemptSnapshot> {
+        let inner = self.inner.lock().expect("active route mutex poisoned");
+        let mut attempts = inner
+            .failures
+            .iter()
+            .map(|(endpoint, model, reason)| RouteAttemptSnapshot {
+                endpoint: endpoint.clone(),
+                model: model.clone(),
+                status: "failed".into(),
+                failure_code: Some(failure_code(reason).into()),
+            })
+            .collect::<Vec<_>>();
+        if succeeded {
+            let current = &inner.candidates[inner.current_index];
+            attempts.push(RouteAttemptSnapshot {
+                endpoint: current.endpoint_name.clone(),
+                model: current.model_id.clone(),
+                status: "succeeded".into(),
+                failure_code: None,
+            });
+        }
+        attempts
     }
 
     pub fn exhausted_error(&self, final_reason: &str) -> String {
@@ -383,6 +466,20 @@ fn concise_reason(reason: &str) -> String {
         .collect()
 }
 
+fn failure_code(reason: &str) -> &'static str {
+    match classify_provider_failure(reason) {
+        ProviderFailureClass::EndpointUnavailable => "ENDPOINT_UNAVAILABLE",
+        ProviderFailureClass::RateLimited => "RATE_LIMITED",
+        ProviderFailureClass::AuthExpired => "AUTH_EXPIRED",
+        ProviderFailureClass::CredentialUnavailable => "CREDENTIAL_UNAVAILABLE",
+        ProviderFailureClass::QuotaExceeded => "QUOTA_EXCEEDED",
+        ProviderFailureClass::ContextOverflow => "CONTEXT_OVERFLOW",
+        ProviderFailureClass::VisionUnsupported => "IMAGE_INPUT_UNSUPPORTED",
+        ProviderFailureClass::FieldUnsupported => "FIELD_UNSUPPORTED",
+        ProviderFailureClass::Fatal => "PROVIDER_FATAL",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,7 +491,9 @@ mod tests {
             endpoint_name: name.into(),
             model_id: model.into(),
             base_url: format!("https://{name}.example"),
-            api_key: format!("{name}-key"),
+            credential_ref: Some(format!("{name}-key-ref")),
+            legacy_inline_api_key: Some(format!("super-secret-inline-{name}")),
+            supports_vision: true,
             api_style: ApiStyle::Openai,
         }
     }
@@ -413,11 +512,11 @@ mod tests {
         );
         assert_eq!(
             classify_provider_failure("HTTP 401 Unauthorized"),
-            ProviderFailureClass::AuthOrQuota
+            ProviderFailureClass::AuthExpired
         );
         assert_eq!(
             classify_provider_failure("HTTP 403 Forbidden"),
-            ProviderFailureClass::AuthOrQuota
+            ProviderFailureClass::CredentialUnavailable
         );
         assert_eq!(
             classify_provider_failure("HTTP 400 Bad Request: max_tokens is unsupported"),
@@ -429,7 +528,7 @@ mod tests {
     fn route_candidate_debug_redacts_credentials() {
         let candidate = route("deepseek", "deepseek-v4-pro");
         let rendered = format!("{candidate:?}");
-        assert!(!rendered.contains("deepseek-key"));
+        assert!(!rendered.contains("super-secret-inline"));
         assert!(rendered.contains("<redacted>"));
     }
 
@@ -437,13 +536,26 @@ mod tests {
     fn active_route_skips_a_cooled_down_primary_and_stays_on_fallback() {
         let health = EndpointHealthRegistry::new(Duration::from_secs(120));
         health.mark_unavailable("chatgpt");
-        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-5.5"));
+        let mut plan = RouteCandidatePlan::new_automatic(route("chatgpt", "gpt-5.5"));
         plan.push_fallback(route("deepseek", "deepseek-v4-pro"));
 
         let state = ActiveRouteState::from_plan_with_health(plan, health);
 
         assert_eq!(state.current().endpoint_name, "deepseek");
         assert_eq!(state.current().endpoint_name, "deepseek");
+    }
+
+    #[test]
+    fn preferred_route_still_starts_with_the_users_selected_primary() {
+        let health = EndpointHealthRegistry::new(Duration::from_secs(120));
+        health.mark_unavailable("chatgpt");
+        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-5.5"));
+        plan.push_fallback(route("deepseek", "deepseek-v4-pro"));
+
+        let state = ActiveRouteState::from_plan_with_health(plan, health);
+
+        assert_eq!(state.current().endpoint_name, "chatgpt");
+        assert!(state.take_initial_route_change().is_none());
     }
 
     #[test]
@@ -496,10 +608,36 @@ mod tests {
     }
 
     #[test]
+    fn route_attempt_snapshot_records_failed_and_effective_routes_without_secrets() {
+        let health = EndpointHealthRegistry::new(Duration::from_secs(120));
+        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-5.5"));
+        plan.push_fallback(route("deepseek", "deepseek-v4-pro"));
+        let state = ActiveRouteState::from_plan_with_health(plan, health);
+
+        state
+            .advance_after_failure("HTTP 503 Service Unavailable")
+            .expect("fallback exists");
+        let attempts = state.attempt_snapshots(true);
+
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].endpoint, "chatgpt");
+        assert_eq!(attempts[0].status, "failed");
+        assert_eq!(
+            attempts[0].failure_code.as_deref(),
+            Some("ENDPOINT_UNAVAILABLE")
+        );
+        assert_eq!(attempts[1].endpoint, "deepseek");
+        assert_eq!(attempts[1].status, "succeeded");
+        assert!(attempts
+            .iter()
+            .all(|attempt| !format!("{attempt:?}").contains("deepseek-key")));
+    }
+
+    #[test]
     fn cooled_primary_records_an_initial_route_change_notice() {
         let health = EndpointHealthRegistry::new(Duration::from_secs(120));
         health.mark_unavailable("chatgpt");
-        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-5.5"));
+        let mut plan = RouteCandidatePlan::new_automatic(route("chatgpt", "gpt-5.5"));
         plan.push_fallback(route("deepseek", "deepseek-v4-pro"));
         let state = ActiveRouteState::from_plan_with_health(plan, health);
 

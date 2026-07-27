@@ -622,6 +622,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ensure_column(pool, "messages", "tool_calls", "TEXT").await?;
     ensure_column(pool, "messages", "reasoning_content", "TEXT").await?;
     ensure_column(pool, "messages", "completion_state", "TEXT").await?;
+    ensure_column(pool, "messages", "endpoint_id", "TEXT").await?;
 
     // The turn-notice dedup check filters by (session_id, completion_state)
     // before its LIKE, so this turns a full conversation scan per turn into an
@@ -1013,6 +1014,50 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ensure_column(pool, "sessions", "kind", "TEXT NOT NULL DEFAULT 'project'").await?;
     // Per-session reasoning effort override (NULL → use the global default).
     ensure_column(pool, "sessions", "reasoning_effort", "TEXT").await?;
+    // Model runtime ownership moved from global Settings to the session.
+    // Existing rows stay fixed and unresolved rather than silently crossing
+    // providers after upgrade.
+    ensure_column(pool, "sessions", "endpoint_id", "TEXT").await?;
+    ensure_column(
+        pool,
+        "sessions",
+        "model_policy",
+        "TEXT NOT NULL DEFAULT 'fixed'",
+    )
+    .await?;
+    if table_exists(pool, "sessions").await? {
+        sqlx::query(
+            "UPDATE sessions SET model_policy = 'fixed'
+             WHERE model_policy IS NULL OR model_policy NOT IN ('fixed','prefer','auto')",
+        )
+        .execute(pool)
+        .await?;
+    }
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS model_route_attempts (
+            id                  TEXT PRIMARY KEY,
+            root_turn_id        TEXT NOT NULL,
+            session_id          TEXT NOT NULL,
+            endpoint            TEXT NOT NULL,
+            model               TEXT NOT NULL,
+            policy              TEXT NOT NULL,
+            status              TEXT NOT NULL,
+            failure_code        TEXT,
+            output_started      INTEGER NOT NULL DEFAULT 0,
+            side_effect_started INTEGER NOT NULL DEFAULT 0,
+            created_at          TEXT NOT NULL,
+            completed_at        TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_model_route_attempts_turn
+         ON model_route_attempts(session_id, root_turn_id, created_at)",
+    )
+    .execute(pool)
+    .await?;
 
     // task_runs.acceptance_criteria_json: JSON Vec<String> set by the
     // decompose commands at task creation time. The autonomous subagent
@@ -1206,6 +1251,10 @@ mod tests {
             cols.contains(&"completion_state".to_string()),
             "ensure_schema must add completion_state column. Got: {cols:?}"
         );
+        assert!(
+            cols.contains(&"endpoint_id".to_string()),
+            "ensure_schema must add endpoint_id column for actual route provenance. Got: {cols:?}"
+        );
 
         // Gate control events get their own table, and the index over
         // messages(session_id, completion_state) must survive the fact that
@@ -1217,7 +1266,11 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(objects.len(), 3, "gate_events + both indexes. Got: {objects:?}");
+        assert_eq!(
+            objects.len(),
+            3,
+            "gate_events + both indexes. Got: {objects:?}"
+        );
 
         // The seeded row's data must survive the ALTER TABLE.
         let role: String = sqlx::query_scalar("SELECT role FROM messages WHERE id='m1'")
@@ -1251,6 +1304,64 @@ mod tests {
                 .unwrap();
         // No duplicate columns (sqlite would have errored if we double-added).
         assert_eq!(cols.iter().filter(|c| *c == "reasoning_content").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_sessions_gain_fixed_model_runtime_config_and_route_journal() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                total_input_tokens INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions
+             (id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('legacy', 'legacy', '/tmp', 'gpt-5.5', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+
+        let cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('sessions')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(cols.contains(&"endpoint_id".to_string()), "{cols:?}");
+        assert!(cols.contains(&"model_policy".to_string()), "{cols:?}");
+        let policy: String =
+            sqlx::query_scalar("SELECT model_policy FROM sessions WHERE id='legacy'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(policy, "fixed");
+
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='model_route_attempts'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 1);
     }
 
     /// Fresh-install path: ensure_schema must also create the satellite

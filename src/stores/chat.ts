@@ -164,6 +164,11 @@ interface ChatStore {
   addLocalAssistantMessage: (content: string) => void;
   clearVisibleConversation: () => void;
   updateActiveSessionModel: (modelId: string) => Promise<void>;
+  updateActiveSessionModelConfig: (config: {
+    endpointId: string;
+    modelId: string;
+    policy: "fixed" | "prefer" | "auto";
+  }) => Promise<void>;
   updateActiveSessionReasoningEffort: (effort: ReasoningEffort | null) => Promise<void>;
   startAnonymousSession: () => Session;
   exitAnonymous: () => void;
@@ -569,7 +574,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     try {
       if (isAnon) {
-        await sendMessageAnonymous(id, content, anonHistory, target.cwd, target.model_id);
+        await sendMessageAnonymous(
+          id,
+          content,
+          anonHistory,
+          target.cwd,
+          target.model_id,
+          target.endpoint_id,
+          target.model_policy,
+        );
       } else {
         await invoke("send_message", {
           sessionId: id,
@@ -730,6 +743,43 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }));
   },
 
+  updateActiveSessionModelConfig: async ({ endpointId, modelId, policy }) => {
+    const activeSession = get().activeSession;
+    set({
+      activeModel: modelId,
+      draftSession: get().draftSession
+        ? { ...get().draftSession!, modelId }
+        : get().draftSession,
+    });
+    if (!activeSession) return;
+    if (activeSession.kind === "anonymous") {
+      set({
+        activeSession: {
+          ...activeSession,
+          endpoint_id: endpointId,
+          model_id: modelId,
+          model_policy: policy,
+        },
+      });
+      return;
+    }
+    const session = await invoke<Session>("update_session_model_config", {
+      sessionId: activeSession.id,
+      endpointId,
+      modelId,
+      policy,
+    });
+    set((state) => ({
+      activeSession: session,
+      sessions: state.sessions.map((existing) =>
+        existing.id === session.id ? session : existing
+      ),
+      quickSessions: state.quickSessions.map((existing) =>
+        existing.id === session.id ? session : existing
+      ),
+    }));
+  },
+
   updateActiveSessionReasoningEffort: async (effort) => {
     const activeSession = get().activeSession;
     if (!activeSession) return;
@@ -756,6 +806,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       title: "匿名会话",
       cwd: "",
       model_id: get().activeModel,
+      endpoint_id: useSettingsStore.getState().settings?.default_endpoint ?? "openrouter",
+      model_policy:
+        useSettingsStore.getState().settings?.default_model_policy ?? "prefer",
       created_at: Date.now(),
       updated_at: Date.now(),
       total_input_tokens: 0,

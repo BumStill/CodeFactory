@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   loadModels: vi.fn(),
   setModel: vi.fn(),
   updateActiveSessionModel: vi.fn(),
+  updateActiveSessionModelConfig: vi.fn(),
   reloadSettings: vi.fn(),
   saveSettings: vi.fn(),
 }));
@@ -21,6 +22,13 @@ const chatState = vi.hoisted(() => ({
   loadModels: mocks.loadModels,
   setModel: mocks.setModel,
   updateActiveSessionModel: mocks.updateActiveSessionModel,
+  updateActiveSessionModelConfig: mocks.updateActiveSessionModelConfig,
+  activeSession: {
+    id: "session-a",
+    endpoint_id: "chatgpt",
+    model_id: "gpt-5.5",
+    model_policy: "prefer",
+  },
 }));
 
 const settingsState = vi.hoisted(() => ({
@@ -63,11 +71,13 @@ describe("ModelPicker", () => {
     mocks.loadModels.mockReset();
     mocks.setModel.mockReset();
     mocks.updateActiveSessionModel.mockReset();
+    mocks.updateActiveSessionModelConfig.mockReset();
     mocks.reloadSettings.mockReset();
     mocks.saveSettings.mockReset();
     mocks.saveSettings.mockResolvedValue(undefined);
     mocks.reloadSettings.mockResolvedValue(undefined);
     mocks.updateActiveSessionModel.mockResolvedValue(undefined);
+    mocks.updateActiveSessionModelConfig.mockResolvedValue(undefined);
     mocks.invoke.mockImplementation((cmd: string, args: { endpointName?: string }) => {
       if (cmd === "get_endpoint_active_model") {
         return Promise.resolve(args.endpointName === "deepseek" ? "deepseek-v4-pro" : "gpt-5.5");
@@ -90,10 +100,54 @@ describe("ModelPicker", () => {
     await user.click(screen.getByRole("button", { name: /chatgpt/ }));
     expect(screen.getByText("gpt-5.5")).toBeInTheDocument();
 
-    await user.selectOptions(screen.getByRole("combobox"), "deepseek");
+    await user.selectOptions(screen.getByLabelText("模型端点"), "deepseek");
 
-    await waitFor(() => expect(mocks.saveSettings).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(mocks.updateActiveSessionModelConfig).toHaveBeenCalledWith({
+        endpointId: "deepseek",
+        modelId: "deepseek-v4-pro",
+        policy: "prefer",
+      }),
+    );
+    expect(mocks.saveSettings).not.toHaveBeenCalled();
     expect(screen.queryByText("gpt-5.5")).not.toBeInTheDocument();
     expect(screen.getByText("正在加载模型…")).toBeInTheDocument();
+  });
+
+  it("changes only the active session policy and explains next-turn semantics", async () => {
+    const user = userEvent.setup();
+    mocks.loadModels.mockResolvedValue(undefined);
+
+    render(<ModelPicker />);
+    await user.click(screen.getByRole("button", { name: /chatgpt/ }));
+    await user.selectOptions(screen.getByLabelText("模型策略"), "fixed");
+
+    expect(mocks.updateActiveSessionModelConfig).toHaveBeenCalledWith({
+      endpointId: "chatgpt",
+      modelId: "gpt-5.5",
+      policy: "fixed",
+    });
+    expect(mocks.saveSettings).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/会话策略更改只从下一轮开始生效/),
+    ).toBeInTheDocument();
+  });
+
+  it("does not replace an existing session model with the endpoint default", async () => {
+    mocks.loadModels.mockResolvedValue(undefined);
+    mocks.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_endpoint_active_model") {
+        return Promise.resolve("anthropic/claude-opus-4-7");
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<ModelPicker />);
+
+    await waitFor(() => expect(mocks.loadModels).toHaveBeenCalledWith("chatgpt"));
+    expect(mocks.setModel).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: /chatgpt.*gpt-5\.5.*首选/ }),
+    ).toBeInTheDocument();
   });
 });
