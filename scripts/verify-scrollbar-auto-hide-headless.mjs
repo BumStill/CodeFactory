@@ -29,7 +29,7 @@ async function main() {
   await waitForHttp(VITE_URL);
   console.log('Vite ready.');
 
-  const browser = await chromium.launch({ headless: true, executablePath: SHELL });
+  const browser = await chromium.launch({ headless: true, channel: 'chrome' });
   const page = await browser.newPage();
 
   try {
