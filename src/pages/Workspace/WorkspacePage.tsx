@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   BookOpen,
@@ -19,6 +19,7 @@ import {
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
 import { SessionSidebar } from "../../components/SessionSidebar";
+import { DraftScopeBar } from "../../components/DraftScopeBar";
 import { ModelPicker } from "../../components/ModelPicker";
 import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
@@ -29,6 +30,7 @@ import { GitChangesPanel } from "../../components/GitChangesPanel";
 import { GitHistoryPanel } from "../../components/GitHistoryPanel";
 import { RemoteGitPanel } from "../../components/RemoteGitPanel";
 import { useGitStore } from "../../stores/git";
+import { recentProjects } from "../../lib/projects";
 import { invoke } from "../../lib/tauri";
 import { useChatStore, activeRuntime } from "../../stores/chat";
 import { QueueBadge } from "../../components/QueueBadge";
@@ -39,9 +41,8 @@ import { parseVerification, verificationSummary } from "../../lib/verification";
 
 interface WorkspacePageProps {
   sessionId: string;
-  /** Start another empty quick draft; kept under the legacy prop name so
-   * existing embedders remain source-compatible while Home no longer exists. */
-  onBackHome: () => void;
+  /** Start a blank conversation, optionally scoped to a project directory. */
+  onNewConversation: (cwd?: string | null) => void;
   onOpenSettings: (tab?: "capabilities" | "endpoints" | "permissions") => void;
   onOpenUsage?: () => void;
   /** Switch the workspace to another session in-place (from the sidebar). */
@@ -62,15 +63,15 @@ interface WorkspacePageProps {
  */
 export function WorkspacePage({
   sessionId,
-  onBackHome,
+  onNewConversation,
   onOpenSettings,
   onOpenUsage,
   onOpenSession,
   initialTaskLogId,
 }: WorkspacePageProps) {
   const {
-    activeSession, draftSession,
-    selectSession, sendOrQueue, cancelStream, removeFromQueue,
+    activeSession, draftSession, sessions,
+    sendOrQueue, cancelStream, removeFromQueue, setDraftProject, setDraftAnonymous,
     respondPermission, exitAnonymous, renameSession, loadOlderMessages,
   } = useChatStore();
   const activeDraft = draftSession?.id === sessionId ? draftSession : null;
@@ -132,6 +133,7 @@ export function WorkspacePage({
   const [gitPanel, setGitPanel] = useState<"changes" | "history" | "remote" | null>(null);
   const gitBranch = useGitStore((s) => s.status?.branch ?? "");
   const activeCwd = activeSession?.cwd ?? activeDraft?.cwd ?? null;
+  const draftProjects = useMemo(() => recentProjects(sessions ?? []), [sessions]);
   const projectTasks = useTasksStore((state) => state.tasks[sessionId]);
   const sessionTasks = projectTasks ?? [];
   const projectTaskCount = sessionTasks.length;
@@ -175,14 +177,6 @@ export function WorkspacePage({
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [taskActivityOpen]);
 
-  useEffect(() => {
-    // Draft IDs are reused by materialization. Once the first message creates
-    // the real session, activeSession already contains that same ID; calling
-    // selectSession here would reload persisted history and race the live stream.
-    if (activeDraft || activeSession?.id === sessionId) return;
-    void selectSession(sessionId);
-  }, [activeDraft, activeSession?.id, selectSession, sessionId]);
-
   return (
     <div className="h-full flex flex-col bg-surface-0">
 
@@ -223,17 +217,24 @@ export function WorkspacePage({
                   }
                 }}
               >
-                {activeSession?.title || (activeDraft?.mode === "project" ? "新项目" : "新对话")}
+                {activeSession?.title || "新会话"}
               </span>
             )}
-            {(activeSession?.kind === "quick" || activeDraft?.mode === "quick") && (
+            {activeDraft ? (
               <span
                 className="text-[9px] px-1.5 py-0.5 rounded bg-accent/15 text-accent font-normal"
-                title={activeDraft ? "尚未创建记录；发送首条消息后生成" : "一次性助手会话，不会出现在「最近项目」"}
+                title="尚未创建记录；发送首条消息后生成"
               >
-                {activeDraft ? "草稿" : "Quick"}
+                草稿
               </span>
-            )}
+            ) : activeSession?.kind === "quick" ? (
+              <span
+                className="text-[9px] px-1.5 py-0.5 rounded bg-surface-3 text-gray-400 font-normal"
+                title="没有绑定项目的独立任务"
+              >
+                独立任务
+              </span>
+            ) : null}
             {isAnonymous && (
               <span
                 className="inline-flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400 font-normal"
@@ -248,7 +249,7 @@ export function WorkspacePage({
             {isAnonymous
               ? "无痕会话 · 不落库 · 不计费 · 不学习"
               : activeDraft
-                ? (activeDraft.mode === "project" ? activeDraft.cwd : "发送首条消息后创建会话")
+                ? (activeDraft.cwd ?? "发送首条消息后创建会话")
                 : activeSession?.cwd}
           </div>
         </div>
@@ -256,7 +257,7 @@ export function WorkspacePage({
           <button
             onClick={() => {
               exitAnonymous();
-              onBackHome();
+              onNewConversation(null);
             }}
             className="flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-600 transition-colors hover:bg-amber-500/20 dark:text-amber-400"
             title="退出匿名会话并丢弃其历史"
@@ -329,7 +330,11 @@ export function WorkspacePage({
         {/* ─── Left: collapsible session rail; the header control always restores it. ─── */}
         {!sidebarCollapsed && (
           <aside id="workspace-session-sidebar" aria-label="会话列表" className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col min-h-0">
-            <SessionSidebar currentSessionId={sessionId} onOpenSession={onOpenSession} />
+            <SessionSidebar
+              currentSessionId={sessionId}
+              onOpenSession={onOpenSession}
+              onNewConversation={onNewConversation}
+            />
           </aside>
         )}
 
@@ -346,10 +351,24 @@ export function WorkspacePage({
             onLoadOlder={loadOlderMessages}
             onUsePrompt={(text) => setPendingInsert(text)}
             onOpenUsage={onOpenUsage}
+            onOpenSession={onOpenSession}
+            onPickProject={activeDraft ? setDraftProject : undefined}
           />
           <ContextUsageBar sessionId={activeSession?.id} />
           {queue.length > 0 && (
             <QueueBadge queue={queue} onRemove={removeFromQueue} />
+          )}
+          {/* A draft's two remaining choices — where it works, and whether it
+              leaves a trace — live right above the composer, because they stop
+              being editable the moment the first message is sent. */}
+          {activeDraft && (
+            <DraftScopeBar
+              cwd={activeDraft.cwd}
+              anonymous={activeDraft.anonymous}
+              projects={draftProjects}
+              onPickProject={setDraftProject}
+              onToggleAnonymous={setDraftAnonymous}
+            />
           )}
           <MessageInput
             key={activeSession?.id ?? activeDraft?.id ?? sessionId}

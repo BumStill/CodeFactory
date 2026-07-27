@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Quick-task session storage tests. The actual `get_or_create_quick_session`
-// command needs an AppState (Tauri runtime), so here we verify the underlying
-// SQL contract that command depends on:
-//   - sessions table accepts kind='quick' rows
-//   - list_sessions WHERE clause excludes quick rows
-//   - subsequent inserts don't create duplicates if the caller is well-behaved
+// Session-list storage tests. The commands themselves need an AppState (Tauri
+// runtime), so here we verify the underlying SQL contract they depend on:
+//   - one unified list carries project AND standalone rows, newest first
+//   - subagent-spawned children never leak into it
+//   - `kind` is a *derived* storage marker, not a user-facing species
 
 #[cfg(test)]
 mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::SqlitePool;
+
+    /// Mirrors `list_sessions`, so a change to one fails the other.
+    const LIST_SESSIONS_SQL: &str = "SELECT id FROM sessions \
+         WHERE parent_session_id IS NULL \
+         ORDER BY updated_at DESC LIMIT 200";
 
     async fn fresh_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -44,6 +48,7 @@ mod tests {
         id: &str,
         kind: &str,
         parent: Option<&str>,
+        updated_at: i64,
     ) {
         sqlx::query(
             "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at, parent_session_id, kind) \
@@ -54,7 +59,7 @@ mod tests {
         .bind("/tmp/proj")
         .bind("m")
         .bind(0_i64)
-        .bind(0_i64)
+        .bind(updated_at)
         .bind(parent)
         .bind(kind)
         .execute(pool)
@@ -62,98 +67,45 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
-    async fn list_sessions_excludes_quick_kind() {
-        let pool = fresh_pool().await;
-        insert_session(&pool, "p1", "project", None).await;
-        insert_session(&pool, "p2", "project", None).await;
-        insert_session(&pool, "q1", "quick",   None).await;
-
-        let ids: Vec<(String,)> = sqlx::query_as(
-            "SELECT id FROM sessions \
-             WHERE parent_session_id IS NULL AND kind != 'quick' \
-             ORDER BY id",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        let ids: Vec<String> = ids.into_iter().map(|(s,)| s).collect();
-        assert_eq!(ids, vec!["p1", "p2"]);
+    async fn listed_ids(pool: &SqlitePool) -> Vec<String> {
+        let rows: Vec<(String,)> = sqlx::query_as(LIST_SESSIONS_SQL)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        rows.into_iter().map(|(id,)| id).collect()
     }
 
     #[tokio::test]
-    async fn list_sessions_excludes_subagent_children_independently_of_kind() {
-        // Defence-in-depth: quick + subagent are independent filters.
-        // A subagent-spawned child of a quick session shouldn't leak into
-        // the list either (rare in practice but cheap to verify).
+    async fn list_sessions_returns_project_and_standalone_in_one_recency_order() {
+        // The split lists were what made "quick task" feel like a different
+        // species. One list, ordered purely by recency; the sidebar decides
+        // how to group it.
         let pool = fresh_pool().await;
-        insert_session(&pool, "p1", "project", None).await;
-        insert_session(&pool, "c1", "project", Some("p1")).await; // child
-        insert_session(&pool, "q1", "quick",   None).await;
-        insert_session(&pool, "qc", "project", Some("q1")).await; // child of quick
+        insert_session(&pool, "p1", "project", None, 300).await;
+        insert_session(&pool, "q1", "quick", None, 200).await;
+        insert_session(&pool, "p2", "project", None, 100).await;
 
-        let ids: Vec<(String,)> = sqlx::query_as(
-            "SELECT id FROM sessions \
-             WHERE parent_session_id IS NULL AND kind != 'quick' \
-             ORDER BY id",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            ids.into_iter().map(|(s,)| s).collect::<Vec<_>>(),
-            vec!["p1"]
-        );
+        assert_eq!(listed_ids(&pool).await, vec!["p1", "q1", "p2"]);
     }
 
     #[tokio::test]
-    async fn quick_session_lookup_returns_most_recent() {
-        // The command picks ORDER BY updated_at DESC LIMIT 1 — if the user
-        // somehow has two quick sessions (e.g. from a bug or a restore),
-        // we should return the newer one, not error.
+    async fn list_sessions_excludes_subagent_children_of_every_kind() {
+        // Subagent children are machinery, not sessions the user opened —
+        // and that holds whether the parent is project- or standalone-scoped.
         let pool = fresh_pool().await;
-        sqlx::query(
-            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at, parent_session_id, kind) \
-             VALUES ('old','q','/tmp','m',1,1,NULL,'quick'), \
-                    ('new','q','/tmp','m',2,2,NULL,'quick')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let id: (String,) = sqlx::query_as(
-            "SELECT id FROM sessions WHERE kind = 'quick' ORDER BY updated_at DESC LIMIT 1",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(id.0, "new");
+        insert_session(&pool, "p1", "project", None, 400).await;
+        insert_session(&pool, "c1", "project", Some("p1"), 300).await;
+        insert_session(&pool, "q1", "quick", None, 200).await;
+        insert_session(&pool, "qc", "project", Some("q1"), 100).await;
+
+        assert_eq!(listed_ids(&pool).await, vec!["p1", "q1"]);
     }
 
     #[tokio::test]
-    async fn list_quick_sessions_returns_all_quick_most_recent_first() {
-        // Multi-session: the switcher lists every quick session, newest first,
-        // and never surfaces project rows.
+    async fn anonymous_sessions_never_reach_storage() {
+        // Anonymous is a per-draft switch ("leave no trace"), not a stored
+        // kind: nothing is ever written, so the list stays empty.
         let pool = fresh_pool().await;
-        insert_session(&pool, "p1", "project", None).await;
-        sqlx::query(
-            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at, parent_session_id, kind) \
-             VALUES ('qa','q','/tmp','m',1,1,NULL,'quick'), \
-                    ('qb','q','/tmp','m',2,2,NULL,'quick'), \
-                    ('qc','q','/tmp','m',3,3,NULL,'quick')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let ids: Vec<(String,)> = sqlx::query_as(
-            "SELECT id FROM sessions WHERE kind = 'quick' ORDER BY updated_at DESC LIMIT 50",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            ids.into_iter().map(|(s,)| s).collect::<Vec<_>>(),
-            vec!["qc", "qb", "qa"]
-        );
+        assert!(listed_ids(&pool).await.is_empty());
     }
 }

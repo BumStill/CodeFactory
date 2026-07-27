@@ -6,13 +6,11 @@ const mocks = vi.hoisted(() => ({
   selectSession: vi.fn(),
   sendOrQueue: vi.fn(),
   loadSessions: vi.fn(),
-  loadQuickSessions: vi.fn(),
 }));
 
-const draft = { id: "draft-1", mode: "quick" as const, cwd: null, modelId: "model", text: "" };
+const draft = { id: "draft-1", cwd: null, anonymous: false, modelId: "model", text: "" };
 const chatState = {
   sessions: [],
-  quickSessions: [],
   activeSession: null,
   draftSession: draft,
   activeModel: "model",
@@ -23,12 +21,11 @@ const chatState = {
   respondPermission: vi.fn(),
   exitAnonymous: vi.fn(),
   renameSession: vi.fn(),
-  beginQuickDraft: vi.fn(),
-  beginProjectDraft: vi.fn(),
-  startAnonymousSession: vi.fn(),
+  beginDraft: vi.fn(),
+  setDraftProject: vi.fn(),
+  setDraftAnonymous: vi.fn(),
   deleteSession: vi.fn(),
   loadSessions: mocks.loadSessions,
-  loadQuickSessions: mocks.loadQuickSessions,
 };
 const runtime = {
   messages: [], streaming: false, queue: [], pendingPermission: null,
@@ -88,10 +85,10 @@ describe("Workspace virtual draft", () => {
   });
 
   it("removes the duplicate header new action and lets the user collapse and restore the session rail", async () => {
-    render(<WorkspacePage sessionId="draft-1" onBackHome={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />);
+    render(<WorkspacePage sessionId="draft-1" onNewConversation={() => {}} onOpenSettings={() => {}} onOpenSession={() => {}} />);
 
     expect(screen.queryByRole("button", { name: "新建空白会话" })).not.toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "新建" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "新建会话" })).toHaveLength(1);
     expect(screen.getByRole("complementary", { name: "会话列表" })).toBeInTheDocument();
     expect(screen.getByRole("main", { name: "会话窗口" })).toBeInTheDocument();
 

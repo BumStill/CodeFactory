@@ -18,6 +18,28 @@ vi.mock("../lib/tauri", () => ({
   sendMessageAnonymous: sendAnonMock,
 }));
 
+/** Anonymity is a draft switch now: begin an anonymous draft and let the first
+ *  send turn it into the in-memory session these tests exercise. */
+function startAnonymous() {
+  const draft = useChatStore.getState().beginDraft({ anonymous: true });
+  useChatStore.setState({
+    draftSession: null,
+    activeSession: {
+      id: draft.id,
+      title: "匿名会话",
+      cwd: "",
+      model_id: draft.modelId,
+      created_at: 0,
+      updated_at: 0,
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      kind: "anonymous",
+    },
+    runtime: { ...useChatStore.getState().runtime, [draft.id]: freshRuntime() },
+  });
+  return useChatStore.getState().activeSession!;
+}
+
 /** Merge a patch into a specific session's runtime bucket. */
 function seedRuntime(id: string, patch: Partial<SessionRuntime>) {
   useChatStore.setState((s) => ({
@@ -32,8 +54,8 @@ beforeEach(() => {
   sendAnonMock.mockResolvedValue(undefined);
   useChatStore.setState({
     sessions: [],
-    quickSessions: [],
     activeSession: null,
+    draftSession: null,
     runtime: {},
     activeModel: "anthropic/claude-opus-4-7",
     _unlisten: {},
@@ -64,17 +86,34 @@ describe("anonymous chat store flow", () => {
     expect(useChatStore.getState().activeModel).toBe("deepseek-v4-pro");
   });
 
-  it("startAnonymousSession creates a blank in-memory anonymous session", () => {
-    const s = useChatStore.getState().startAnonymousSession();
-    expect(s.kind).toBe("anonymous");
+  it("an anonymous draft becomes an in-memory session on first send, never a row", async () => {
+    const draft = useChatStore.getState().beginDraft({ anonymous: true });
+
+    await useChatStore.getState().sendOrQueue("secret question");
+
     const st = useChatStore.getState();
-    expect(st.activeSession?.id).toBe(s.id);
+    expect(st.activeSession?.id).toBe(draft.id);
     expect(st.activeSession?.kind).toBe("anonymous");
-    expect(activeRuntime(st).messages).toEqual([]);
+    expect(st.draftSession).toBeNull();
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "materialize_draft_session",
+      expect.anything(),
+    );
+    expect(sendAnonMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("an anonymous draft can still be scoped to a project directory", async () => {
+    useChatStore.getState().beginDraft({ cwd: "/proj", anonymous: true });
+
+    await useChatStore.getState().sendOrQueue("look at this repo");
+
+    const [, , , cwd] = sendAnonMock.mock.calls[0];
+    expect(cwd).toBe("/proj");
+    expect(useChatStore.getState().sessions).toEqual([]);
   });
 
   it("routes anonymous turns to send_message_anonymous with replayed history", async () => {
-    const s = useChatStore.getState().startAnonymousSession();
+    const s = startAnonymous();
     seedRuntime(s.id, {
       messages: [
         { id: "u1", role: "user", content: "hi", createdAt: 0 },
@@ -117,7 +156,7 @@ describe("anonymous chat store flow", () => {
   });
 
   it("exitAnonymous discards the in-memory session and its history", () => {
-    const s = useChatStore.getState().startAnonymousSession();
+    const s = startAnonymous();
     seedRuntime(s.id, {
       messages: [{ id: "x", role: "user", content: "secret", createdAt: 0 }],
     });
@@ -131,7 +170,7 @@ describe("anonymous chat store flow", () => {
   });
 
   it("selectSession never hits the DB for the active anonymous session", async () => {
-    const s = useChatStore.getState().startAnonymousSession();
+    const s = startAnonymous();
     await useChatStore.getState().selectSession(s.id);
     expect(invokeMock).not.toHaveBeenCalledWith("get_session", expect.anything());
     expect(invokeMock).not.toHaveBeenCalledWith("get_messages", expect.anything());

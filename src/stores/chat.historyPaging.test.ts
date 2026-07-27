@@ -61,7 +61,6 @@ beforeEach(() => {
   invokeMock.mockReset();
   useChatStore.setState({
     sessions: [session],
-    quickSessions: [],
     activeSession: null,
     draftSession: null,
     runtime: {},

@@ -204,7 +204,6 @@ applyTheme(settings);
 useSettingsStore.setState({ settings });
 useChatStore.setState({
   sessions: sidebarSessions,
-  quickSessions: [],
   activeSession: session,
   draftSession: null,
   activeModel: session.model_id,
@@ -248,7 +247,7 @@ function AcceptanceApp() {
       ) : (
         <WorkspacePage
           sessionId={sessionId}
-          onBackHome={() => {}}
+          onNewConversation={() => {}}
           onOpenSettings={(tab) => {
             const target = tab === "permissions" ? "permissions" : "endpoints";
             (window as typeof window & { __settingsTab?: string }).__settingsTab = target;

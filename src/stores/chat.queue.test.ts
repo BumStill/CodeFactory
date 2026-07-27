@@ -31,7 +31,6 @@ const SID = "s1";
 function resetStore() {
   useChatStore.setState({
     sessions: [],
-    quickSessions: [],
     activeSession: {
       id: SID,
       title: "t",

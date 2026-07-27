@@ -13,30 +13,36 @@ import { UpdaterBanner } from "./components/UpdaterBanner";
 import { OnboardingWizard } from "./components/OnboardingWizard";
 import { useSettingsStore } from "./stores/settings";
 import { syncChatGptCatalog } from "./stores/chatgptCatalog";
-import { useChatStore } from "./stores/chat";
+import { useChatStore, openSessionId } from "./stores/chat";
 
 export type AppView = "workspace" | "resources" | "settings" | "profile" | "control-plane" | "benchmarks" | "evolution";
 
 export default function App() {
   const [view, setView] = useState<AppView>("workspace");
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab | undefined>();
-  const [activeProject, setActiveProject] = useState<string | null>(null);
   const [workspaceTaskLogId, setWorkspaceTaskLogId] = useState<string | null>(null);
   const [evolutionCwd, setEvolutionCwd] = useState<string | null>(null);
   const [evidenceViewerPath, setEvidenceViewerPath] = useState<string | null>(null);
   const loadSettings = useSettingsStore((s) => s.load);
   const settings = useSettingsStore((s) => s.settings);
-  const { draftSession, beginQuickDraft } = useChatStore();
+  const { beginDraft, selectSession } = useChatStore();
+  // Which conversation is open is DERIVED from the store, never copied into
+  // React state. The shell used to hold its own id, which could drift from the
+  // store — the chat pane showed one conversation while tasks, git and
+  // interjections addressed another (and a stale id produced an unhandled
+  // rejection that silently kept the old conversation on screen).
+  const openSession = useChatStore(openSessionId);
   const startupDraftStarted = useRef(false);
 
-  // Workspace is the application shell. Start it with one virtual quick draft:
+  // Workspace is the application shell. Start it with one virtual draft:
   // no DB row, scratch directory or history entry exists until first send.
   useEffect(() => {
     if (startupDraftStarted.current) return;
     startupDraftStarted.current = true;
-    const draft = draftSession ?? beginQuickDraft();
-    setActiveProject(draft.id);
-  }, [beginQuickDraft, draftSession]);
+    if (!useChatStore.getState().draftSession && !useChatStore.getState().activeSession) {
+      beginDraft();
+    }
+  }, [beginDraft]);
 
   useEffect(() => { loadSettings(); }, [loadSettings]);
 
@@ -45,26 +51,31 @@ export default function App() {
     if (settingsLoaded) void syncChatGptCatalog();
   }, [settingsLoaded]);
 
-  const openProject = (sessionId: string) => {
+  // Opening an existing conversation is one act with one entry point: it
+  // resolves the session in the store, and the workspace follows because its
+  // id is derived from that store.
+  const openExistingSession = (sessionId: string) => {
     setWorkspaceTaskLogId(null);
-    setActiveProject(sessionId);
+    void selectSession(sessionId);
     setView("workspace");
   };
 
   const openJobLog = (sessionId: string, taskId: string) => {
     setWorkspaceTaskLogId(taskId);
-    setActiveProject(sessionId);
+    void selectSession(sessionId);
     setView("workspace");
   };
 
-  const openFreshQuickDraft = () => {
-    const draft = beginQuickDraft();
-    openProject(draft.id);
+  /** Start a blank conversation, optionally scoped to a project directory. */
+  const startNewConversation = (cwd?: string | null) => {
+    setWorkspaceTaskLogId(null);
+    beginDraft({ cwd: cwd ?? null });
+    setView("workspace");
   };
 
   const backToWorkspace = () => {
-    if (!activeProject) {
-      openFreshQuickDraft();
+    if (!openSession) {
+      startNewConversation(null);
       return;
     }
     setView("workspace");
@@ -91,13 +102,13 @@ export default function App() {
     <>
       <UpdaterBanner />
 
-      {view === "workspace" && activeProject && (
+      {view === "workspace" && openSession && (
         <WorkspacePage
-          sessionId={activeProject}
-          onBackHome={openFreshQuickDraft}
+          sessionId={openSession}
+          onNewConversation={startNewConversation}
           onOpenSettings={openSettings}
           onOpenUsage={openUsage}
-          onOpenSession={openProject}
+          onOpenSession={openExistingSession}
           initialTaskLogId={workspaceTaskLogId}
         />
       )}
@@ -111,7 +122,7 @@ export default function App() {
         <SettingsPage
           onBack={backToWorkspace}
           initialTab={settingsInitialTab}
-          onOpenSession={openProject}
+          onOpenSession={openExistingSession}
           onOpenJobLog={openJobLog}
           onOpenResources={() => setView("resources")}
           onOpenControlPlane={() => setView("control-plane")}

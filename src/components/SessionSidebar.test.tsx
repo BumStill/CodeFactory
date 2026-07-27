@@ -1,41 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Interaction tests for the Workspace SessionSidebar (Codex-style rail):
-// unified quick+project list with time groups, newest-first order, active highlight,
-// in-place switching, and the "+ 新建" menu (quick / project). jsdom — no real
-// Tauri backend, so the chat store + tauri helpers + dialog are mocked.
+// Interaction tests for the Workspace SessionSidebar. The rail groups sessions
+// into projects ("where I work") and standalone tasks, and enforces the two
+// rules the old sidebar broke:
+//   - "+ 新建" always starts a BLANK conversation, never resumes one
+//   - clicking a PROJECT expands it; only a conversation row opens history
+// jsdom — no real Tauri backend, so the chat store is mocked.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 
 const mocks = vi.hoisted(() => ({
-  beginQuickDraft: vi.fn(),
-  beginProjectDraft: vi.fn(),
-  startAnonymousSession: vi.fn(),
-  openDialog: vi.fn(),
   loadSessions: vi.fn(),
-  loadQuickSessions: vi.fn(),
+  deleteSession: vi.fn(),
+  renameSession: vi.fn(),
 }));
 
 const mk = (over: Record<string, unknown>) => ({
   id: "x", title: "", cwd: "/x", model_id: "m", created_at: 1, updated_at: 1,
-  total_input_tokens: 0, total_output_tokens: 0, ...over,
+  total_input_tokens: 0, total_output_tokens: 0, kind: "project", ...over,
 });
 
-// Two projects + one quick, interleaved update times to prove the merge sort.
+// Two conversations in one project, one in another, plus a standalone task.
 const fakeChatState = {
   sessions: [
-    mk({ id: "p1", title: "CodeFactory", updated_at: 300, kind: "project" }),
-    mk({ id: "p2", title: "记账 app", updated_at: 100, kind: "project" }),
+    mk({ id: "p1a", title: "CodeFactory 主线", cwd: "/code/CodeFactory", updated_at: 400 }),
+    mk({ id: "q1", title: "改图脚本", cwd: "/home/.codefactory/quick/q1", updated_at: 300, kind: "quick" }),
+    mk({ id: "p1b", title: "CodeFactory 旧会话", cwd: "/code/CodeFactory", updated_at: 200 }),
+    mk({ id: "p2", title: "记账 app", cwd: "/code/ledger", updated_at: 100 }),
   ],
-  quickSessions: [mk({ id: "q1", title: "改图脚本", updated_at: 200, kind: "quick" })],
+  runtime: {},
   activeModel: "anthropic/claude-opus-4-7",
   draftSession: null,
-  beginQuickDraft: mocks.beginQuickDraft,
-  beginProjectDraft: mocks.beginProjectDraft,
-  startAnonymousSession: mocks.startAnonymousSession,
   loadSessions: mocks.loadSessions,
-  loadQuickSessions: mocks.loadQuickSessions,
+  deleteSession: mocks.deleteSession,
+  renameSession: mocks.renameSession,
 };
 
 vi.mock("../stores/chat", () => ({
@@ -45,111 +44,128 @@ vi.mock("../stores/chat", () => ({
     { setState: vi.fn(), getState: () => fakeChatState },
   ),
 }));
-vi.mock("../lib/tauri", async (orig) => {
-  const real = (await orig()) as Record<string, unknown>;
-  return { ...real };
-});
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mocks.openDialog }));
+vi.mock("../lib/tauri", async (orig) => ({ ...((await orig()) as Record<string, unknown>) }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
 import { SessionSidebar } from "./SessionSidebar";
+
+const noop = () => {};
 
 describe("SessionSidebar", () => {
   beforeEach(() => {
     Object.values(mocks).forEach((m) => m.mockReset());
     mocks.loadSessions.mockResolvedValue(undefined);
-    mocks.loadQuickSessions.mockResolvedValue(undefined);
   });
 
-  it("renders a flat, grouped, newest-first list without redundant type badges", () => {
-    render(<SessionSidebar currentSessionId="p1" onOpenSession={() => {}} />);
+  it("groups conversations under their project, newest project first", () => {
+    render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+    );
+
+    expect(screen.getByText("项目")).toBeInTheDocument();
     expect(screen.getByText("CodeFactory")).toBeInTheDocument();
+    expect(screen.getByText("ledger")).toBeInTheDocument();
+    expect(screen.getByText("独立任务")).toBeInTheDocument();
     expect(screen.getByText("改图脚本")).toBeInTheDocument();
+  });
+
+  it("expands the project holding the open conversation and collapses others", () => {
+    render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+    );
+
+    // The active project's conversations are visible…
+    expect(screen.getByText("CodeFactory 主线")).toBeInTheDocument();
+    expect(screen.getByText("CodeFactory 旧会话")).toBeInTheDocument();
+    // …and an unrelated project stays collapsed until asked.
+    expect(screen.queryByText("记账 app")).not.toBeInTheDocument();
+  });
+
+  it("clicking a project expands it instead of opening a conversation", () => {
+    const onOpen = vi.fn();
+    render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={onOpen} onNewConversation={noop} />,
+    );
+
+    fireEvent.click(screen.getByText("ledger"));
+
+    expect(onOpen).not.toHaveBeenCalled();
     expect(screen.getByText("记账 app")).toBeInTheDocument();
-    expect(screen.getByText("会话")).toBeInTheDocument();
-    expect(screen.getByText("更早")).toBeInTheDocument();
-    expect(screen.queryByText("快速")).not.toBeInTheDocument();
-    expect(screen.queryByText("项目")).not.toBeInTheDocument();
-    // order by updated_at desc: p1(300) > q1(200) > p2(100)
-    const order = screen
-      .getAllByRole("button")
-      .map((b) => b.textContent || "")
-      .filter((t) => /CodeFactory|改图脚本|记账/.test(t));
-    expect(order[0]).toContain("CodeFactory");
-    expect(order[1]).toContain("改图脚本");
-    expect(order[2]).toContain("记账");
   });
 
-  it("marks the current session active via aria-current", () => {
-    render(<SessionSidebar currentSessionId="q1" onOpenSession={() => {}} />);
-    expect(screen.getByText("改图脚本").closest('[role="button"]')).toHaveAttribute("aria-current", "page");
-    expect(screen.getByText("CodeFactory").closest('[role="button"]')).not.toHaveAttribute("aria-current");
-  });
-
-  it("switches session in place when a row is clicked", () => {
+  it("opens history only when a conversation row is clicked", () => {
     const onOpen = vi.fn();
-    render(<SessionSidebar currentSessionId="p1" onOpenSession={onOpen} />);
-    fireEvent.click(screen.getByText("记账 app"));
-    expect(onOpen).toHaveBeenCalledWith("p2");
+    render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={onOpen} onNewConversation={noop} />,
+    );
+
+    fireEvent.click(screen.getByText("CodeFactory 旧会话"));
+
+    expect(onOpen).toHaveBeenCalledWith("p1b");
   });
 
-  it("opens a fresh in-memory quick draft from + 新建 without persistence", async () => {
-    const onOpen = vi.fn();
-    mocks.beginQuickDraft.mockReturnValue({ id: "draft-q", mode: "quick", cwd: null, modelId: "m", text: "" });
-    render(<SessionSidebar currentSessionId="p1" onOpenSession={onOpen} />);
+  it("marks the current conversation active via aria-current", () => {
+    render(
+      <SessionSidebar currentSessionId="q1" onOpenSession={noop} onNewConversation={noop} />,
+    );
 
-    fireEvent.click(screen.getByRole("button", { name: /新建/ }));
-    fireEvent.click(await screen.findByText("新建快速任务"));
-
-    await waitFor(() => expect(mocks.beginQuickDraft).toHaveBeenCalledTimes(1));
-    expect(onOpen).toHaveBeenCalledWith("draft-q");
-    expect(mocks.loadQuickSessions).not.toHaveBeenCalledTimes(2);
+    expect(screen.getByText("改图脚本").closest('[role="button"]')).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
   });
 
-  it("opens a project draft after directory selection without persistence", async () => {
-    const onOpen = vi.fn();
-    mocks.openDialog.mockResolvedValue("/Users/x/newproj");
-    mocks.beginProjectDraft.mockReturnValue({ id: "draft-p", mode: "project", cwd: "/Users/x/newproj", modelId: "m", text: "" });
-    render(<SessionSidebar currentSessionId="p1" onOpenSession={onOpen} />);
+  it("starts a blank conversation from + 新建 with no project attached", () => {
+    const onNew = vi.fn();
+    render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={onNew} />,
+    );
 
-    fireEvent.click(screen.getByRole("button", { name: /新建/ }));
-    fireEvent.click(await screen.findByText("新建项目"));
+    fireEvent.click(screen.getByRole("button", { name: "新建会话" }));
 
-    await waitFor(() => expect(mocks.openDialog).toHaveBeenCalled());
-    expect(mocks.beginProjectDraft).toHaveBeenCalledWith("/Users/x/newproj");
-    expect(onOpen).toHaveBeenCalledWith("draft-p");
+    expect(onNew).toHaveBeenCalledWith(null);
   });
 
-  it("aborts project creation when the picker is cancelled", async () => {
+  it("starts a blank conversation scoped to a project from its row action", () => {
+    const onNew = vi.fn();
     const onOpen = vi.fn();
-    mocks.openDialog.mockResolvedValue(null);
-    render(<SessionSidebar currentSessionId="p1" onOpenSession={onOpen} />);
+    render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={onOpen} onNewConversation={onNew} />,
+    );
 
-    fireEvent.click(screen.getByRole("button", { name: /新建/ }));
-    fireEvent.click(await screen.findByText("新建项目"));
+    fireEvent.click(screen.getByLabelText("在 ledger 里新建会话"));
 
-    await waitFor(() => expect(mocks.openDialog).toHaveBeenCalled());
-    expect(mocks.beginProjectDraft).not.toHaveBeenCalled();
+    // New conversation in that project — emphatically NOT its latest session.
+    expect(onNew).toHaveBeenCalledWith("/code/ledger");
     expect(onOpen).not.toHaveBeenCalled();
   });
 
   it("reveals rename/delete from a low-emphasis row action", () => {
-    render(<SessionSidebar currentSessionId="p1" onOpenSession={() => {}} />);
-    // The menu is closed until the kebab is clicked.
+    render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+    );
+
     expect(screen.queryByText("重命名")).not.toBeInTheDocument();
     fireEvent.click(screen.getAllByLabelText("更多操作")[0]);
     expect(screen.getByText("重命名")).toBeInTheDocument();
     expect(screen.getByText("删除")).toBeInTheDocument();
   });
 
-  it("double-clicking a session title opens an inline rename input", () => {
-    render(<SessionSidebar currentSessionId="p1" onOpenSession={() => {}} />);
-    fireEvent.doubleClick(screen.getByText("CodeFactory"));
-    expect(screen.getByDisplayValue("CodeFactory")).toBeInTheDocument();
+  it("double-clicking a conversation title opens an inline rename input", () => {
+    render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+    );
+
+    fireEvent.doubleClick(screen.getByText("CodeFactory 主线"));
+
+    expect(screen.getByDisplayValue("CodeFactory 主线")).toBeInTheDocument();
   });
 
-  it("applies scrollbar-auto-hide class to the session list for hover-only scrollbar visibility", () => {
-    const { container } = render(<SessionSidebar currentSessionId="p1" onOpenSession={() => {}} />);
-    // The session list is the overflow-y-auto div inside the sidebar
+  it("applies scrollbar-auto-hide to the list for hover-only scrollbar visibility", () => {
+    const { container } = render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+    );
+
     const list = container.querySelector(".scrollbar-auto-hide");
     expect(list).not.toBeNull();
     expect(list!).toHaveClass("overflow-y-auto");

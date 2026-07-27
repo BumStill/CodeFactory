@@ -4,7 +4,6 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 
-const draft = { id: "draft-start", mode: "quick", cwd: null, modelId: "test-model", text: "" };
 
 vi.mock("./pages/Resources/ResourcesPage", () => ({
   ResourcesPage: () => <main aria-label="资源中心页面">资源中心已打开</main>,
@@ -31,13 +30,10 @@ vi.mock("./stores/settings", () => ({
   useSettingsStore: (selector: (state: { load: () => void; settings: { onboarded: boolean } }) => unknown) =>
     selector({ load: vi.fn(), settings: { onboarded: true } }),
 }));
-vi.mock("./stores/chat", () => ({
-  useChatStore: () => ({
-    draftSession: null,
-    beginQuickDraft: vi.fn(() => draft),
-    beginProjectDraft: vi.fn(),
-  }),
-}));
+vi.mock("./stores/chat", async () => {
+  const { createFakeChatModule } = await import("./test-utils/fakeChatStore");
+  return createFakeChatModule();
+});
 vi.mock("./stores/chatgptCatalog", () => ({ syncChatGptCatalog: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 

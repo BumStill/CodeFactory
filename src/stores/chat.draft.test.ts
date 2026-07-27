@@ -34,7 +34,6 @@ describe("lazy draft session", () => {
     mocks.onSessionUpdated.mockResolvedValue(() => {});
     useChatStore.setState({
       sessions: [],
-      quickSessions: [],
       activeSession: null,
       draftSession: null,
       runtime: {},
@@ -45,13 +44,13 @@ describe("lazy draft session", () => {
     });
   });
 
-  it("creates an in-memory quick draft without calling the backend", () => {
-    const draft = useChatStore.getState().beginQuickDraft();
+  it("creates an in-memory draft without calling the backend", () => {
+    const draft = useChatStore.getState().beginDraft();
 
     expect(draft).toEqual(expect.objectContaining({
       id: expect.any(String),
-      mode: "quick",
       cwd: null,
+      anonymous: false,
       modelId: "deepseek-v4",
     }));
     expect(useChatStore.getState().activeSession).toBeNull();
@@ -59,11 +58,39 @@ describe("lazy draft session", () => {
     expect(mocks.invoke).not.toHaveBeenCalled();
   });
 
+  it("scoping a draft to a project keeps the SAME blank conversation", () => {
+    // The bug this guards: picking a project used to be able to move the user
+    // into that project's previous conversation. Scope is a property of the
+    // draft — choosing one must never load history or swap the session.
+    const draft = useChatStore.getState().beginDraft();
+
+    useChatStore.getState().setDraftProject("/Users/x/project");
+
+    const state = useChatStore.getState();
+    expect(state.draftSession?.id).toBe(draft.id);
+    expect(state.draftSession?.cwd).toBe("/Users/x/project");
+    expect(state.activeSession).toBeNull();
+    expect(mocks.invoke).not.toHaveBeenCalled();
+  });
+
+  it("opens a blank draft for a project that already has sessions", () => {
+    const existing = { ...materialized, id: "old", cwd: "/Users/x/project", kind: "project" as const };
+    useChatStore.setState({ sessions: [existing] });
+
+    const draft = useChatStore.getState().beginDraft({ cwd: "/Users/x/project" });
+
+    const state = useChatStore.getState();
+    expect(draft.id).not.toBe(existing.id);
+    expect(state.draftSession?.cwd).toBe("/Users/x/project");
+    expect(state.activeSession).toBeNull();
+    expect(mocks.invoke).not.toHaveBeenCalledWith("get_message_page", expect.anything());
+  });
+
   it("materializes exactly once on first send, then streams through the real session", async () => {
     useChatStore.setState({ draftSession: {
       id: "draft-1",
-      mode: "quick",
       cwd: null,
+      anonymous: false,
       modelId: "deepseek-v4",
       text: "",
     } });
@@ -71,7 +98,6 @@ describe("lazy draft session", () => {
       if (cmd === "materialize_draft_session") {
         expect(args).toEqual({
           draftId: "draft-1",
-          mode: "quick",
           cwd: null,
           modelId: "deepseek-v4",
           firstMessage: "第一条真实消息",
@@ -95,17 +121,33 @@ describe("lazy draft session", () => {
     });
     expect(useChatStore.getState().draftSession).toBeNull();
     expect(useChatStore.getState().activeSession?.id).toBe("draft-1");
-    expect(useChatStore.getState().quickSessions[0]?.id).toBe("draft-1");
+    expect(useChatStore.getState().sessions[0]?.id).toBe("draft-1");
     expect(useChatStore.getState().runtime["draft-1"] ?? freshRuntime()).toEqual(
       expect.objectContaining({ streaming: true }),
     );
   });
 
+  it("falls back to a blank draft when a session id can no longer be opened", async () => {
+    // A stale id used to leave the workspace pointing at a session that isn't
+    // there: the rejection went unhandled and the PREVIOUS conversation stayed
+    // on screen while every session-scoped feature addressed the dead id.
+    const stale = { ...materialized, id: "gone" };
+    useChatStore.setState({ sessions: [stale], activeSession: stale, draftSession: null });
+    mocks.invoke.mockRejectedValueOnce(new Error("no such session: gone"));
+
+    await expect(useChatStore.getState().selectSession("gone")).resolves.toBeUndefined();
+
+    const state = useChatStore.getState();
+    expect(state.activeSession).toBeNull();
+    expect(state.draftSession).not.toBeNull();
+    expect(state.draftSession?.cwd).toBeNull();
+  });
+
   it("updates the in-memory draft model without calling session persistence", async () => {
     useChatStore.setState({ draftSession: {
       id: "draft-1",
-      mode: "quick",
       cwd: null,
+      anonymous: false,
       modelId: "old-model",
       text: "",
     } });
@@ -120,8 +162,8 @@ describe("lazy draft session", () => {
   it("keeps the draft and its text when materialization fails", async () => {
     useChatStore.setState({ draftSession: {
       id: "draft-1",
-      mode: "project",
       cwd: "/Users/x/project",
+      anonymous: false,
       modelId: "deepseek-v4",
       text: "不能丢失的需求",
     } });
