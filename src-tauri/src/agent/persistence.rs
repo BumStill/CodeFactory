@@ -40,11 +40,10 @@ fn perr<E: std::fmt::Display>(e: E) -> PersistError {
 /// `gate_warning` / `turn_notice` / `turn_error` are deliberately NOT here:
 /// those are user-facing notices that the transcript is supposed to show.
 ///
-/// `rejected_candidate` is also not here. It marks a real assistant row, and
-/// three separate consumers key off that marker (replay filtering, the plan/act
-/// dispatch in `commands::chat`, and the latest-assistant lookup). Moving it
-/// changes what the model sees on later turns, so it gets its own change with
-/// its own tests rather than riding along on a storage move.
+/// `rejected_candidate` is not a state passed through here either — it marks
+/// an existing assistant row rather than injecting a new one, so it arrives
+/// via [`Persistence::mark_rejected_candidate`] and is recorded as a
+/// `gate_events` row that points at the message id.
 fn is_gate_control_state(state: &str) -> bool {
     matches!(state, "gate_recovery" | "gate_ready" | "gate_blocked")
 }
@@ -61,15 +60,21 @@ impl SqlitePersistence {
     /// Append one gate control event to the side table. Content is stored raw:
     /// these rows exist to answer "why did the loop keep going", so redacting
     /// them would defeat the only reason to keep them.
-    async fn record_gate_event(&self, kind: &str, content: &str) -> PersistResult<()> {
+    async fn record_gate_event(
+        &self,
+        kind: &str,
+        content: &str,
+        message_id: Option<&str>,
+    ) -> PersistResult<()> {
         sqlx::query(
-            "INSERT INTO gate_events (id, session_id, kind, content, created_at) \
-             VALUES (?,?,?,?,?)",
+            "INSERT INTO gate_events (id, session_id, kind, content, message_id, created_at) \
+             VALUES (?,?,?,?,?,?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(&self.session_id)
         .bind(kind)
         .bind(content)
+        .bind(message_id)
         .bind(Utc::now().timestamp_millis())
         .execute(&self.db)
         .await
@@ -131,7 +136,7 @@ impl Persistence for SqlitePersistence {
             return Ok(());
         }
         if is_gate_control_state(state) {
-            return self.record_gate_event(state, content).await;
+            return self.record_gate_event(state, content, None).await;
         }
         // What's left is user-facing: a warning, a runtime notice, or a turn
         // error. Notices are internal provenance rather than new user intent,
@@ -186,6 +191,11 @@ impl Persistence for SqlitePersistence {
         self.persist_gate_message(content, state).await
     }
 
+    /// Record that the gate rejected this assistant turn as a premature final
+    /// answer. The assistant row itself is left exactly as written — a control
+    /// loop does not get to rewrite what already happened. The rejection is an
+    /// annotation beside the conversation, and `load_agent_history` reads it to
+    /// keep rejected drafts out of the model's replayed context.
     async fn mark_rejected_candidate(&self, message_id: Option<&str>) -> PersistResult<()> {
         let Some(message_id) = message_id else {
             return Ok(());
@@ -193,12 +203,8 @@ impl Persistence for SqlitePersistence {
         if self.anonymous {
             return Ok(());
         }
-        sqlx::query("UPDATE messages SET completion_state='rejected_candidate' WHERE id=?")
-            .bind(message_id)
-            .execute(&self.db)
+        self.record_gate_event("rejected_candidate", "", Some(message_id))
             .await
-            .map_err(perr)?;
-        Ok(())
     }
 
     async fn record_tool_call_started(
@@ -309,12 +315,64 @@ mod tests {
         .unwrap();
         sqlx::query(
             "CREATE TABLE gate_events (id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, \
-             content TEXT, created_at INTEGER)",
+             content TEXT, message_id TEXT, created_at INTEGER)",
         )
         .execute(&db)
         .await
         .unwrap();
         db
+    }
+
+    #[tokio::test]
+    async fn rejecting_a_draft_annotates_it_without_rewriting_the_assistant_row() {
+        let db = pool().await;
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, created_at) \
+             VALUES ('a1','s1','assistant','premature done claim',1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: false,
+        };
+
+        p.mark_rejected_candidate(Some("a1")).await.unwrap();
+
+        // The conversation row is untouched — content AND completion_state.
+        let (content, state): (String, Option<String>) =
+            sqlx::query_as("SELECT content, completion_state FROM messages WHERE id='a1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(content, "premature done claim");
+        assert_eq!(state, None, "the gate must not rewrite history in place");
+
+        let (kind, message_id): (String, String) =
+            sqlx::query_as("SELECT kind, message_id FROM gate_events WHERE session_id='s1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(kind, "rejected_candidate");
+        assert_eq!(message_id, "a1");
+    }
+
+    #[tokio::test]
+    async fn anonymous_rejection_writes_nothing() {
+        let db = pool().await;
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: true,
+        };
+        p.mark_rejected_candidate(Some("a1")).await.unwrap();
+        let rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM gate_events")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(rows.0, 0);
     }
 
     #[tokio::test]
