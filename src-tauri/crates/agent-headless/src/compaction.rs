@@ -90,33 +90,8 @@ pub(crate) fn compact_messages(messages: &mut Vec<Value>, history: &[ToolHistory
         .map(|(index, _)| index)
         .unwrap_or_else(|| messages.len().saturating_sub(2));
 
-    let mut summary = String::from("Compacted execution history (oldest details omitted):\n");
-    for (index, entry) in history
-        .iter()
-        .rev()
-        .take(30)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .enumerate()
-    {
-        let command = entry.command.lines().next().unwrap_or("");
-        let output = if let Some(error) = &entry.error {
-            error.as_str()
-        } else if !entry.stderr.trim().is_empty() {
-            entry.stderr.trim()
-        } else {
-            entry.stdout.trim()
-        };
-        summary.push_str(&format!(
-            "{}. rc={:?} command={} output={}\n",
-            index + 1,
-            entry.return_code,
-            truncate_for_model(command, 200),
-            truncate_for_model(output, 400),
-        ));
-    }
-    summary = truncate_for_model(&summary, max_chars.saturating_div(2).max(800));
+    let summary = history_digest(history);
+    let summary = truncate_for_model(&summary, max_chars.saturating_div(2).max(800));
 
     let system = messages[0].clone();
     let task = messages[1].clone();
@@ -143,4 +118,38 @@ pub(crate) fn truncate_for_model(value: &str, limit: usize) -> String {
     format!(
         "{head}\n[truncated middle; kept first {head_limit} and last {tail_limit} characters]\n{tail}"
     )
+}
+
+/// The compaction digest: the last 30 tool outcomes, oldest-first, one line
+/// each. Extracted from `compact_messages` (keystone slice 4.8) so the shared
+/// loop's `ContextCompactor` produces the byte-identical summary the sidecar's
+/// own loop did.
+pub(crate) fn history_digest(history: &[ToolHistoryEntry]) -> String {
+    let mut summary = String::from("Compacted execution history (oldest details omitted):\n");
+    for (index, entry) in history
+        .iter()
+        .rev()
+        .take(30)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .enumerate()
+    {
+        let command = entry.command.lines().next().unwrap_or("");
+        let output = if let Some(error) = &entry.error {
+            error.as_str()
+        } else if !entry.stderr.trim().is_empty() {
+            entry.stderr.trim()
+        } else {
+            entry.stdout.trim()
+        };
+        summary.push_str(&format!(
+            "{}. rc={:?} command={} output={}\n",
+            index + 1,
+            entry.return_code,
+            truncate_for_model(command, 200),
+            truncate_for_model(output, 400),
+        ));
+    }
+    summary
 }

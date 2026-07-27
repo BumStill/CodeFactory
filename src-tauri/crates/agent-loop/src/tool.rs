@@ -94,6 +94,20 @@ pub trait ToolBackend: Send + Sync {
         args: &serde_json::Value,
         ctx: &ToolCtx,
     ) -> Result<ToolInvocationResult, ToolError>;
+
+    /// Classify a call BEFORE it runs, for the pre-execution policy checks
+    /// (budget denial, inspection budget) — keystone slice 4.8c b5.
+    ///
+    /// The backend owns this because the default rule only calls
+    /// `classify_command` when the tool is literally named `bash`: correct for
+    /// the desktop, but it would classify EVERY eval-sidecar call (`run_shell`)
+    /// as `ReadOnly`, so the inspection-budget rule would fire on everything and
+    /// the budget evaluator would never see a mutation. b2 fixed the same trap
+    /// on the post-execution side; this closes it pre-execution, so the backend
+    /// owns classification on both sides.
+    fn classify(&self, call: &ToolCall, args: &serde_json::Value) -> (String, ToolKind) {
+        crate::policy::completion_command_and_kind(&call.function.name, args)
+    }
 }
 
 #[cfg(test)]

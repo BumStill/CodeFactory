@@ -30,6 +30,12 @@ pub struct RoundOptions {
     /// Pre-resolved reasoning effort (empty for api styles that ignore it, e.g.
     /// non-ChatGPT). Never read from a DB inside the transport.
     pub reasoning_effort: String,
+    /// How many tool calls have completed in this run so far (keystone slice
+    /// 4.8c b15). A transport may scale its retry budget with it — the eval
+    /// sidecar allows 3 attempts before any tool has run and 5 after, on the
+    /// grounds that abandoning a run that has already done work costs more.
+    /// Desktop transports ignore it.
+    pub tool_outcomes_so_far: usize,
 }
 
 /// The canonical model answer, provider-independent. (Not `Clone`: `Usage` is
@@ -117,6 +123,7 @@ mod tests {
                 &RoundOptions {
                     require_tool: true,
                     reasoning_effort: String::new(),
+                    tool_outcomes_so_far: 0,
                 },
             )
             .await

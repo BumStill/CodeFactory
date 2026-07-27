@@ -329,11 +329,13 @@ pub fn autonomous_budget_denial(
     // which is exactly what the old call passed (slice 4.8c b3).
     wall_time: Option<(u64, u64)>,
     evidence: &CompletionEvidence,
-    tool_name: &str,
-    args: &serde_json::Value,
+    // Pre-classified by the ToolBackend (slice 4.8c b5) — see
+    // `ToolBackend::classify`. Deriving it here would re-introduce the
+    // `tool_name == "bash"` trap for surfaces whose shell tool has another name.
+    command: &str,
+    kind: &ToolKind,
     working_directory: &Path,
 ) -> Option<BudgetDenial> {
-    let (command, kind) = completion_command_and_kind(tool_name, args);
     // Interactive chat (wall budget off) is not constrained by the round budget,
     // but deterministic completion invariants still apply to model tools.
     let effective_remaining = if !wall_budget_applies {
@@ -345,8 +347,8 @@ pub fn autonomous_budget_denial(
         effective_remaining,
         wall_time,
         evidence,
-        &command,
-        &kind,
+        command,
+        kind,
         working_directory.to_str(),
     ) {
         PolicyDecision::Allow => None,
@@ -356,6 +358,39 @@ pub fn autonomous_budget_denial(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn inspection_budget_denies_only_exhausted_read_only_calls() {
+        // Fires only when the allowance is spent AND the call is ReadOnly.
+        assert!(inspection_budget_denial(false, false, &ToolKind::ReadOnly).is_none());
+        assert!(inspection_budget_denial(true, false, &ToolKind::Mutation).is_none());
+        let d = inspection_budget_denial(true, false, &ToolKind::ReadOnly)
+            .expect("exhausted + read-only denies");
+        assert_eq!(d.rule, "inspection_budget");
+        assert!(d.reason.contains("initial inspection is exhausted"));
+        // The reason switches once a mutation has been seen.
+        let d = inspection_budget_denial(true, true, &ToolKind::ReadOnly).unwrap();
+        assert!(d.reason.contains("post-change inspection is exhausted"));
+    }
+
+    #[test]
+    fn the_default_classifier_is_bash_only_which_is_why_backends_override_it() {
+        // Pins the trap this seam exists for: the DEFAULT rule classifies a
+        // shell tool named anything other than `bash` as ReadOnly. A surface
+        // whose tool is `run_shell` MUST override `ToolBackend::classify`, or
+        // every call reads ReadOnly and inspection_budget_denial fires on all
+        // of them.
+        let args = serde_json::json!({"command": "rm -rf build"});
+        let (_, bash_kind) = completion_command_and_kind("bash", &args);
+        let (_, other_kind) = completion_command_and_kind("run_shell", &args);
+        assert!(!matches!(bash_kind, ToolKind::ReadOnly), "bash is classified");
+        assert!(
+            matches!(other_kind, ToolKind::ReadOnly),
+            "non-bash falls back to ReadOnly — the reason ToolBackend::classify is overridable"
+        );
+    }
+
     use super::*;
 
     fn evidence(completed: bool, blockers: &[&str]) -> CompletionEvidence {
@@ -470,4 +505,32 @@ mod tests {
             FinalizationPolicy::BlockOnIncomplete
         ));
     }
+}
+
+/// The inspection-budget rule (keystone slice 4.8c b5): once a surface's
+/// read-only allowance is spent, further READ-ONLY calls are denied so the model
+/// stops inspecting and starts acting. Pure — the loop supplies the tracker
+/// state, since `ProgressTracker` lives inside `run_agent_loop`.
+///
+/// `kind` MUST come from `ToolBackend::classify` — with the default
+/// bash-only rule a `run_shell`-style tool classifies `ReadOnly` every time and
+/// this would deny every call.
+pub fn inspection_budget_denial(
+    read_only_exhausted: bool,
+    mutation_seen: bool,
+    kind: &ToolKind,
+) -> Option<BudgetDenial> {
+    if !read_only_exhausted || !matches!(kind, ToolKind::ReadOnly) {
+        return None;
+    }
+    Some(BudgetDenial {
+        rule: "inspection_budget".to_owned(),
+        reason: if mutation_seen {
+            "post-change inspection is exhausted; make the smallest corrective edit, run a bounded functional verification, or batch a specifically justified read with that action"
+                .to_owned()
+        } else {
+            "initial inspection is exhausted; batch any remaining reads with the first implementation or begin the smallest candidate implementation now"
+                .to_owned()
+        },
+    })
 }
