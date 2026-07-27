@@ -15,12 +15,12 @@
 
 ## Current State
 
-- Current phase: 实现、全量自动化与隔离桌面 App 验收完成，进入 PR+CI 与正式发布。
+- Current phase: 已完成。
 - Current checkpoint: 会话策略、OAuth 恢复、惰性凭据、图片能力门禁和 route journal 已实现；
   真实 App 额外发现并修复“端点默认覆盖会话模型”和“首选/自动执行语义相同”两个问题。
-- Next owner: 当前实现线完成 PR+CI、merge、release 和公开产物验收。
+- Next owner: 无；后续按真实用户反馈进入新的任务。
 - Updated at: 2026-07-27
-- Live status: `not live`
+- Live status: `live in v1.66.1`
 
 ## Completed Items
 
@@ -42,10 +42,14 @@
   恢复卡。
 - [x] 实地发现并以失败测试修复：打开已有 `gpt-5.5` 会话时端点默认模型覆盖会话模型。
 - [x] 失败测试后区分策略：`prefer` 每回合先尝试用户首选；`auto` 可按短期健康状态预选。
+- [x] PR #221 全部 CI 通过并 squash merge。
+- [x] `v1.66.1` macOS、Windows 构建与平台闭环验收通过。
+- [x] 公开 Release 下载后的 macOS DMG 二次安装、窗口和 Evolution 闭环验收通过。
+- [x] 公开 `latest.json` 确认版本为 `1.66.1`，同时包含 Windows 与 macOS 签名更新地址。
 
 ## Remaining Items
 
-- [ ] PR+CI、merge、release、公开产物验收。
+- 无。
 
 ## AI Collaboration
 
@@ -56,7 +60,7 @@
 - review point: 独立规划、架构和 QA 角色只读复核；主实现线拥有唯一编辑权。
 - validation result: 全量前后端自动化和隔离真实 App 主路径通过；实际 OAuth 授权点击未执行，
   以避免在验收环境创建新的持久账号授权，start/open/copy/cancel 由后端状态测试和组件测试覆盖；
-  发布链待完成。
+  PR #221、CI、merge、`v1.66.1` 双平台构建、公开安装包和更新清单验收均完成。
 
 ## Baseline Observation
 
