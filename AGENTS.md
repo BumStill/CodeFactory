@@ -47,6 +47,11 @@
 - 首次使用或 checkout 后运行：`git config core.hooksPath .githooks`。如果 hook 拦截，按提示 merge 最新默认分支，不要用重复 PR 或旧基线继续开发。
 - 只有用户明确批准紧急热修时才允许 `CODEFACTORY_SKIP_SYNC_GATE=1 git commit ...`，最终说明必须标记 `hotfix bypass` 并补回 PR+CI。
 
+## Worktree 生命周期与 Cargo 缓存
+- 创建或 checkout 新 worktree 后，版本化 `post-checkout` hook 会把缺失的 `src-tauri/target` 链接到共同缓存；已有本地 target 一律不自动替换。
+- PR 通过 GitHub squash 合并后，执行者必须从其他 checkout 运行 `pnpm worktrees:closeout -- --path <自己的绝对路径> --apply`，由 GitHub 已合并 PR 判定后删除目录和本地分支；不得用 `merge-base` 否定 squash 合并。
+- 长会话优先使用 `pnpm cargo:shared -- <cargo arguments>`；裸 Cargo 在新 worktree 中也必须落到共同 target，不得形成新的独占 `src-tauri/target`。
+
 ## 验证与测试
 - 行为或代码修改前必须先写独立测试或可执行验收，并先看到失败。
 - 修改后运行相关测试；若存在 lint、typecheck、build，应优先补齐并执行。

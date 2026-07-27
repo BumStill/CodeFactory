@@ -1,0 +1,10 @@
+#!/usr/bin/env sh
+# Keep new worktrees from creating their own multi-GB Cargo target directories.
+# Never fail a checkout or replace an existing local target automatically.
+set -u
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -n "$repo_root" ] && [ -f "$repo_root/scripts/worktree-cargo-target.mjs" ]; then
+  node "$repo_root/scripts/worktree-cargo-target.mjs" || \
+    echo "cargo target: shared-target setup failed; checkout remains usable" >&2
+fi
