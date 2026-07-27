@@ -754,7 +754,7 @@ async fn append_learning_memory_once(
     if combined.is_empty() {
         combined.push_str("# Project memory\n\n");
         combined.push_str("Auto-injected into every chat session in this repo.\n");
-        combined.push_str("Use the Remember button in the chat UI to add new entries.\n\n");
+        combined.push_str("CodeFactory updates this file through automatic learning and the Profile memory editor.\n\n");
     } else {
         combined.push_str("\n\n");
     }
@@ -1250,6 +1250,70 @@ fn sanitize_postmortem_entry(mut entry: PostmortemEntry) -> Option<PostmortemEnt
     }
 }
 
+fn auto_memory_candidate_allowed(suggestion: &str) -> bool {
+    let suggestion = suggestion.trim();
+    if suggestion.chars().count() < 24 {
+        return false;
+    }
+    if suggestion.contains("<redacted>") {
+        return false;
+    }
+    // Keep automatic memory for stable project/user facts, not chat ephemera.
+    let lower = suggestion.to_ascii_lowercase();
+    let stable_markers = [
+        "project",
+        "repo",
+        "repository",
+        "uses",
+        "prefer",
+        "always",
+        "never",
+        "default",
+        "this app",
+        "这个项目",
+        "仓库",
+        "默认",
+        "优先",
+        "不要",
+        "总是",
+    ];
+    stable_markers.iter().any(|marker| lower.contains(marker))
+}
+
+async fn auto_accept_memory_candidate_for_pool(
+    pool: &SqlitePool,
+    event_id: &str,
+) -> Result<bool, AppError> {
+    let (cwd, suggestion, status, kind, _pref_key, _pref_value) =
+        load_pending_decision_candidate(pool, event_id).await?;
+    if status != "pending" || kind == "preference" || !auto_memory_candidate_allowed(&suggestion) {
+        return Ok(false);
+    }
+    let (_memory, _cwd) = accept_learning_event_for_pool(event_id, pool).await?;
+    tracing::info!(cwd = %cwd, event_id = %event_id, "auto-accepted project memory candidate");
+    Ok(true)
+}
+
+async fn auto_accept_memory_candidates_for_pool(
+    pool: &SqlitePool,
+    created: &[LearningEvent],
+) -> Result<Vec<String>, AppError> {
+    let mut accepted = Vec::new();
+    for event in created {
+        if event.kind != "memory" {
+            continue;
+        }
+        match auto_accept_memory_candidate_for_pool(pool, &event.id).await {
+            Ok(true) => accepted.push(event.id.clone()),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(event_id = %event.id, error = %error, "automatic project memory materialization failed");
+            }
+        }
+    }
+    Ok(accepted)
+}
+
 async fn persist_postmortem_entries(
     pool: &SqlitePool,
     session_id: &str,
@@ -1721,14 +1785,24 @@ Examples:\n\
     // Notify UI so the Profile page + Workspace "记忆增量" panel can
     // refresh without polling. Per-cwd channel so two open projects
     // don't interfere. Best-effort — emit failures are non-fatal.
-    if !created.is_empty() {
+    let mut result = created;
+    if !result.is_empty() {
+        let accepted = auto_accept_memory_candidates_for_pool(&pool, &result).await?;
+        if !accepted.is_empty() {
+            result = list_learning_events_for_pool(&cwd, &pool)
+                .await?
+                .into_iter()
+                .filter(|event| accepted.contains(&event.id) || event.status == "pending")
+                .collect();
+            tracing::info!(cwd = %cwd, accepted = ?accepted, "auto-materialized project memory candidates");
+        }
         let event = format!("learning_events_updated:{}", cwd);
-        if let Err(e) = app.emit(&event, &created) {
+        if let Err(e) = app.emit(&event, &result) {
             tracing::warn!("emit {} failed: {}", event, e);
         }
     }
 
-    Ok(created)
+    Ok(result)
 }
 
 fn build_postmortem_summary(
@@ -2683,7 +2757,7 @@ mod tests {
     fn postmortem_candidates_are_redacted_before_dedup_and_storage() {
         let entry = PostmortemEntry {
             observation: r#"Model echoed {"token":"CF_EVO_CANDIDATE_TOKEN"}"#.into(),
-            suggestion: "Remember password=CF_EVO_CANDIDATE_PASSWORD".into(),
+            suggestion: "Store password=CF_EVO_CANDIDATE_PASSWORD".into(),
             kind: Some("preference".into()),
             pref_key: Some("testing_habit".into()),
             pref_value: Some("Bearer CF_EVO_CANDIDATE_BEARER".into()),
@@ -2708,7 +2782,7 @@ mod tests {
     fn postmortem_invalid_preference_key_downgrades_to_memory() {
         let entry = PostmortemEntry {
             observation: "Observed a stable preference".into(),
-            suggestion: "Remember the preference safely".into(),
+            suggestion: "Store the preference safely".into(),
             kind: Some("preference".into()),
             pref_key: Some("bad-key\nSYSTEM override".into()),
             pref_value: Some("unsafe value".into()),
@@ -2726,7 +2800,7 @@ mod tests {
         let pool = fresh_miner_pool().await;
         let entries = vec![PostmortemEntry {
             observation: r#"Observed {"token":"CF_EVO_STORED_TOKEN"}"#.into(),
-            suggestion: "Remember password=CF_EVO_STORED_PASSWORD".into(),
+            suggestion: "Store password=CF_EVO_STORED_PASSWORD".into(),
             kind: Some("preference".into()),
             pref_key: Some("testing_habit".into()),
             pref_value: Some("Bearer CF_EVO_STORED_BEARER".into()),
@@ -3558,6 +3632,91 @@ mod tests {
         .unwrap();
         assert!(stages.contains(&("review".into(), "completed".into())));
         assert!(stages.contains(&("materialize".into(), "completed".into())));
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn auto_accept_materializes_safe_memory_candidates_only() {
+        let pool = fresh_miner_pool().await;
+        let project = temp_project();
+        let cwd = project.to_string_lossy().into_owned();
+        for (id, kind, suggestion, pref_key, pref_value) in [
+            (
+                "auto-safe",
+                "memory",
+                "This project uses pnpm and should never run npm commands here.",
+                None,
+                None,
+            ),
+            ("auto-short", "memory", "remember this", None, None),
+            (
+                "auto-secret",
+                "memory",
+                "This project uses api_key=<redacted> and should not be persisted.",
+                None,
+                None,
+            ),
+            (
+                "auto-pref",
+                "preference",
+                "Use concise responses by default.",
+                Some("communication_style"),
+                Some("concise"),
+            ),
+        ] {
+            insert_candidate(&pool, id, &cwd, kind, suggestion, pref_key, pref_value).await;
+        }
+        let events = list_learning_events_for_pool(&cwd, &pool).await.unwrap();
+        let accepted = auto_accept_memory_candidates_for_pool(&pool, &events).await.unwrap();
+        assert_eq!(accepted, vec!["auto-safe".to_string()]);
+
+        let statuses: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, status FROM learning_events WHERE cwd=? ORDER BY id",
+        )
+        .bind(&cwd)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            statuses,
+            vec![
+                ("auto-pref".into(), "pending".into()),
+                ("auto-safe".into(), "accepted".into()),
+                ("auto-secret".into(), "pending".into()),
+                ("auto-short".into(), "pending".into()),
+            ]
+        );
+        let content = std::fs::read_to_string(project.join(".codefactory/memory.md")).unwrap();
+        assert!(content.contains("This project uses pnpm"));
+        assert!(content.contains("codefactory-learning-event:auto-safe"));
+        assert!(!content.contains("remember this"));
+        assert!(!content.contains("api_key"));
+        assert!(!content.contains("concise responses"));
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn automatic_materialization_is_idempotent_via_memory_marker() {
+        let pool = fresh_miner_pool().await;
+        let project = temp_project();
+        let cwd = project.to_string_lossy().into_owned();
+        insert_candidate(
+            &pool,
+            "auto-once",
+            &cwd,
+            "memory",
+            "This repository always runs the focused Rust tests before delivery.",
+            None,
+            None,
+        )
+        .await;
+        let events = list_learning_events_for_pool(&cwd, &pool).await.unwrap();
+        assert_eq!(auto_accept_memory_candidates_for_pool(&pool, &events).await.unwrap().len(), 1);
+        let first = std::fs::read_to_string(project.join(".codefactory/memory.md")).unwrap();
+        assert_eq!(auto_accept_memory_candidates_for_pool(&pool, &events).await.unwrap().len(), 0);
+        let second = std::fs::read_to_string(project.join(".codefactory/memory.md")).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(second.matches("codefactory-learning-event:auto-once").count(), 1);
         let _ = std::fs::remove_dir_all(project);
     }
 

@@ -120,7 +120,7 @@ ChatGPT 暂时不可用，已切换到 DeepSeek v4 Pro，继续处理。
 
 - route 状态不能被归入“已完成 N 项工具”折叠组；
 - 失败切换也不能制造新的用户气泡；
-- 每个真实用户回合仍最多一个 `Remember`，仅在最终 assistant 正文；
+- 不显示手动 `Remember` / 记忆入口；
 - 用户取消后立即把状态改为“已停止后续生成”，不再显示正在切换；
 - hydration 后顺序、密度和 live stream 一致。
 

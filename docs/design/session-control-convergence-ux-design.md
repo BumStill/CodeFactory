@@ -57,4 +57,4 @@
 - 长达 44 分钟且跨多个 segment 的模拟回合：计时连续增长，目标不因内部 guard 结束，也不只显示 `Thinking`。
 - 深浅主题下正文、边框、状态和警告均可读。
 
-完整工具证据密度、历史回合重组和 Remember 规则见 `chat-continuity-conversational-evidence-ux-design.md`。
+完整工具证据密度、历史回合重组和自动记忆规则见 `chat-continuity-conversational-evidence-ux-design.md`。

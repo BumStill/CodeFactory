@@ -82,7 +82,7 @@ Release.
 | Path | What |
 |---|---|
 | `src/` | React + TypeScript frontend. |
-| `src/components/` | Reusable UI. Notable: `useStickyAutoScroll.ts` + `.test.tsx` (chat scroll state machine), `CheckpointsPanel.tsx` (git rollback), `RememberButton.tsx` (`.codefactory/memory.md` writer). |
+| `src/components/` | Reusable UI. Notable: `useStickyAutoScroll.ts` + `.test.tsx` (chat scroll state machine), `CheckpointsPanel.tsx` (git rollback), chat rendering and evidence components. |
 | `src/pages/Chat/ChatPage.tsx` | Main chat shell. |
 | `src/stores/` | Zustand stores for chat, settings, updater, tasks. |
 | `src-tauri/src/` | Rust backend. |
@@ -110,10 +110,10 @@ crate, NOT on disk. Don't commit anything that looks like a key.
 ## Project memory (for the AI)
 
 If a repo has a `.codefactory/memory.md`, the AI auto-injects its
-contents into the system prompt every session. Use the **Remember**
-button on any assistant message to append a fact. Legacy
-`CODEFACTORY.md` at the project root is still read for backward
-compatibility.
+contents into the system prompt every session. CodeFactory updates this file
+through automatic post-session learning when a safe, stable project fact is
+found; users can inspect and edit it from Profile. Legacy `CODEFACTORY.md` at
+the project root is still read for backward compatibility.
 
 ## Working with the conversational AI
 

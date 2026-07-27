@@ -172,7 +172,7 @@ describe("MessageList theme readability", () => {
       "data-message-flow",
       "turn-continuation",
     );
-    expect(screen.getAllByText("Remember")).toHaveLength(1);
+    expect(screen.queryByText("Remember")).not.toBeInTheDocument();
     expect(screen.getAllByText(/用时/)).toHaveLength(1);
   });
 

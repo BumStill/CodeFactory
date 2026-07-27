@@ -118,16 +118,18 @@ border: "rgb(var(--border-color) / <alpha-value>)"
 
 对应 CSS 变量使用 `R G B` channel，而不是 hex。`border-border/25`、`bg-surface-1/30`、`bg-accent/5` 等类必须在生产 CSS 中真实生成；不存在的透明度类不得依赖浏览器回退。增加编译产物断言，防止组件测试因 jsdom 不计算真实 CSS 而漏掉黑框回归。
 
-## 8. Remember 与最终回复判定
+## 8. 自动项目记忆与最终回复判定
 
-`Remember` 的显示条件不是“当前 assistant 行已停止 streaming”，而是：
+聊天气泡不再提供手动 `Remember` 入口。长期记忆由会话后学习链路从真实对话和工具证据中提取候选，并只自动物化安全、稳定、可复用的 project-scope memory；Profile 仍是查看、编辑和纠错入口。
+
+最终回复判定仍用于耗时等辅助元信息：
 
 - 所属真实用户回合已有终态；
 - 该行是回合最终可见 assistant 正文；
 - completion state 不是 step、notice、checkpoint、interrupted 或 rejected candidate；
 - 不是匿名内部恢复文本。
 
-live timeline 与 hydrated rows 必须经过同一个 `isFinalAssistantForTurn` 判定。
+live timeline 与 hydrated rows 必须经过同一个 `isFinalAssistantForTurn` 判定；任何 step、notice、checkpoint、interrupted 或 rejected candidate 都不得出现手动记忆控件。
 
 ## 9. 兼容与回滚
 

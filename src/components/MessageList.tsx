@@ -10,7 +10,6 @@ import { Check, Copy, ChevronDown, ChevronUp } from "lucide-react";
 import { ToolCallCard } from "./ToolCallCard";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
-import { RememberButton } from "./RememberButton";
 import { ChatGptAuthRecovery } from "./ChatGptAuthRecovery";
 import { formatDuration, useNowTick } from "../lib/duration";
 import type { UIMessage } from "../stores/chat";
@@ -23,8 +22,7 @@ import {
 interface Props {
   messages: UIMessage[];
   streaming: boolean;
-  /** Working directory of the active session — used to scope the
-   *  "Remember" button's writes to the right project-memory file. */
+  /** Working directory of the active session. */
   cwd?: string | null;
   /** Called when the user picks an example prompt from the welcome screen. */
   onUsePrompt?: (text: string) => void;
@@ -228,7 +226,6 @@ function TypingDots() {
 export function MessageList({
   messages,
   streaming,
-  cwd,
   onUsePrompt,
   onOpenUsage,
   onOpenSession,
@@ -352,7 +349,6 @@ export function MessageList({
               msg={msg}
               isStreamingTail={streaming && msg.id === lastAssistantId}
               isLastAssistantInUserTurn={lastAssistantIdsByUserTurn.has(msg.id)}
-              cwd={cwd ?? null}
             />
           </div>
           );
@@ -412,12 +408,10 @@ const MessageRow = memo(function MessageRow({
   msg,
   isStreamingTail,
   isLastAssistantInUserTurn,
-  cwd,
 }: {
   msg: UIMessage;
   isStreamingTail: boolean;
   isLastAssistantInUserTurn: boolean;
-  cwd: string | null;
 }) {
   const isUser = msg.role === "user";
   // Must run unconditionally (before the early return) to satisfy the rules
@@ -550,7 +544,7 @@ const MessageRow = memo(function MessageRow({
     : -1;
   // Hydrated tool rounds are intermediate assistant narration, not separate
   // answers. Only a tool-free hydrated answer (or a live timeline ending in
-  // prose) owns settled metadata such as Remember and elapsed time.
+  // prose) owns settled metadata such as elapsed time.
   const isSettledAnswer =
     !isStreamingTail &&
     isLastAssistantInUserTurn &&
@@ -558,7 +552,6 @@ const MessageRow = memo(function MessageRow({
     (timeline
       ? lastTextIndex === timeline.length - 1
       : !msg.toolCalls || msg.toolCalls.length === 0);
-  const showRemember = !!cwd && isSettledAnswer;
   const durationLabel = isStreamingTail
     ? formatDuration(Math.max(0, nowMs - msg.createdAt))
     : isSettledAnswer && msg.durationMs != null
@@ -741,11 +734,6 @@ const MessageRow = memo(function MessageRow({
       {durationLabel && (
         <div className="text-[11px] text-gray-600 tabular-nums select-none">
           {isStreamingTail ? `运行中 · ${durationLabel}` : `用时 ${durationLabel}`}
-        </div>
-      )}
-      {showRemember && (
-        <div className="flex justify-end pt-0.5">
-          <RememberButton cwd={cwd} suggestedText={msg.content} />
         </div>
       )}
     </div>
