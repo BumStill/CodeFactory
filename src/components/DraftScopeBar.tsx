@@ -53,6 +53,13 @@ export function DraftScopeBar({
   };
 
   const label = cwd ? folderName(cwd) : "独立任务";
+  // A directory picked via 浏览目录… has no sessions yet, so it isn't in the
+  // recent list. Show it anyway — the menu must always reflect the current
+  // choice, otherwise nothing appears selected.
+  const options =
+    cwd && !projects.some((project) => project.cwd === cwd)
+      ? [{ cwd, name: folderName(cwd) || cwd, sessions: [], updatedAt: 0 }, ...projects]
+      : projects;
 
   return (
     <div className="relative flex items-center gap-2 px-1 pb-1.5" ref={menuRef}>
@@ -115,12 +122,12 @@ export function DraftScopeBar({
             <span className="flex-1 truncate">独立任务（不使用项目）</span>
             {cwd === null && <Check size={11} className="shrink-0 text-accent" />}
           </button>
-          {projects.length > 0 && (
+          {options.length > 0 && (
             <>
               <p className="mt-1 border-t border-border px-3 pb-0.5 pt-1.5 text-[9px] font-medium tracking-wide text-gray-600">
                 最近项目
               </p>
-              {projects.map((project) => (
+              {options.map((project) => (
                 <button
                   key={project.cwd}
                   type="button"

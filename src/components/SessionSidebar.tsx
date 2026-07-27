@@ -78,6 +78,20 @@ export function SessionSidebar({
   const toggleProject = (cwd: string) =>
     setOverrides((prev) => ({ ...prev, [cwd]: !isExpanded(cwd) }));
 
+  // Moving into a project re-expands it, dropping any earlier collapse. Without
+  // this, opening a conversation inside a project the user had collapsed would
+  // leave no row highlighted anywhere — "which conversation am I in?" with no
+  // answer on screen, which is the confusion this rail exists to remove.
+  useEffect(() => {
+    if (!activeProjectCwd) return;
+    setOverrides((prev) => {
+      if (!(activeProjectCwd in prev)) return prev;
+      const next = { ...prev };
+      delete next[activeProjectCwd];
+      return next;
+    });
+  }, [activeProjectCwd, currentSessionId]);
+
   return (
     <div className="flex flex-col min-h-0 flex-1">
       {/* ── Toolbar: one unambiguous "new blank conversation" action. ──── */}
