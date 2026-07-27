@@ -1110,6 +1110,9 @@ impl AgentLoop {
                             response_parts.push(serde_json::json!({
                                 "type": "input_image",
                                 "image_url": image_url,
+                                // Match the official Codex Responses payload
+                                // by sending an explicit local-image detail.
+                                "detail": "high",
                             }));
                         }
                     } else if let Some(text) = &part.text {
@@ -2601,7 +2604,11 @@ mod tests {
             AgentLoop::content_to_chatgpt_user_parts(&content),
             vec![
                 serde_json::json!({"type": "input_text", "text": "先看截图"}),
-                serde_json::json!({"type": "input_image", "image_url": image_data_url}),
+                serde_json::json!({
+                    "type": "input_image",
+                    "image_url": image_data_url,
+                    "detail": "high"
+                }),
                 serde_json::json!({"type": "input_text", "text": "再回答问题"}),
             ]
         );
