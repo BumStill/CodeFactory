@@ -19,6 +19,11 @@ pub const COMPRESSION_TRIGGER: f32 = 0.75;
 /// short results saves nothing and hurts the model's ability to use them.
 pub const MIN_ELIDE_TOKENS: u32 = 200;
 
+/// A single tool result or assistant response must never monopolize the model
+/// window. The character cap is deliberately conservative for CJK/code and is
+/// further reduced for models with smaller context windows.
+const MAX_SINGLE_MESSAGE_CHARS: usize = 64 * 1024;
+
 /// Quick char→token estimate. Real BPE tokenization varies 1.0-1.5×
 /// for English and up to 2.5× for code/CJK, so we use 3.0 chars/token
 /// for ASCII-heavy text and 2.0 for CJK-heavy — err on the safe side.
@@ -27,11 +32,7 @@ pub fn estimate_tokens(text: &str) -> u32 {
     if chars == 0 {
         return 0;
     }
-    let cjk_fraction = text
-        .chars()
-        .filter(|ch| is_cjk(*ch))
-        .count() as f32
-        / chars as f32;
+    let cjk_fraction = text.chars().filter(|ch| is_cjk(*ch)).count() as f32 / chars as f32;
     // Blend divisor: 3.0 for pure ASCII, 2.0 for pure CJK.
     let divisor = 3.0 - cjk_fraction; // 2.0 .. 3.0
     (chars as f32 / divisor).ceil() as u32
@@ -90,7 +91,7 @@ pub struct CompressionResult {
     pub messages: Vec<ChatMessage>,
     /// True if anything was elided.
     pub compressed: bool,
-    /// Number of tool-result messages that got elided.
+    /// Number of messages that got elided or removed.
     pub elided_count: usize,
     /// Approximate tokens reclaimed.
     pub tokens_freed: u32,
@@ -119,20 +120,34 @@ pub fn is_context_overflow(error: &str) -> bool {
 /// backoff arm (keystone slice 4.7).
 pub fn is_provider_overloaded(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
-    ["overloaded", "try again later", "rate limit", "429", "503", "529"]
-        .iter()
-        .any(|w| lower.contains(w))
+    [
+        "overloaded",
+        "try again later",
+        "rate limit",
+        "429",
+        "503",
+        "529",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
 }
 
-/// Elide oversized messages (tool results AND assistant prose) from the
-/// older half of the conversation when the prompt estimate exceeds
-/// `limit * COMPRESSION_TRIGGER`. After pass 1, if the estimate still
-/// exceeds the limit, drop the oldest messages (user + assistant pairs
-/// with their tool results) until we're within budget.
+/// Bound oversized messages (tool results AND assistant prose) anywhere in
+/// the conversation, then elide moderately large messages from the older
+/// half when the prompt estimate exceeds `limit * COMPRESSION_TRIGGER`.
+/// If the estimate still exceeds the limit, drop the oldest messages (user +
+/// assistant pairs with their tool results) until we're within budget.
 ///
 /// Why assistant messages too: in long conversations the model's own
 /// markdown output can consume more tokens than tool results — leaving
 /// those untouched is how we shipped "context window exceeded" errors.
+///
+/// Why recent messages too: one minified asset produced a 2.30 MB grep result
+/// in production. With only two user turns left, the old "preserve the recent
+/// half" rule could not reclaim any more space, so the overflow retry failed
+/// again. Head/tail compaction retains the newest evidence and tool protocol
+/// envelope while keeping the provider payload bounded. Raw SQLite history is
+/// not changed.
 pub fn compress_if_needed(
     messages: Vec<ChatMessage>,
     system_prompt: &str,
@@ -153,22 +168,44 @@ pub fn compress_if_needed(
     let half = messages.len() / 2;
     let mut elided_count = 0;
     let mut tokens_freed: u32 = 0;
+    let dynamic_message_cap = ((limit as usize / 4) * 2).clamp(400, MAX_SINGLE_MESSAGE_CHARS);
 
-    // Pass 1: elide large messages in the older half — tool results AND
-    // assistant prose both get compressed.
+    // Pass 1: hard-bound individually oversized messages anywhere, then
+    // elide moderately large messages in the older half. Tool results and
+    // assistant prose are both eligible; user input remains verbatim.
     let messages: Vec<ChatMessage> = messages
         .into_iter()
         .enumerate()
         .map(|(i, mut m)| {
-            let elidible = i < half && (m.role == "tool" || m.role == "assistant");
-            if elidible {
+            let model_generated = m.role == "tool" || m.role == "assistant";
+            if model_generated {
                 let original = content_text(&m.content);
                 let est = estimate_tokens(&original);
-                if est >= MIN_ELIDE_TOKENS {
+                let original_chars = original.chars().count();
+                if original_chars > dynamic_message_cap {
+                    let replacement = compact_head_tail(
+                        &original,
+                        dynamic_message_cap,
+                        if m.role == "tool" {
+                            "tool result"
+                        } else {
+                            "assistant response"
+                        },
+                        est,
+                    );
+                    let new_est = estimate_tokens(&replacement);
+                    tokens_freed =
+                        tokens_freed.saturating_add(est.saturating_sub(new_est));
+                    elided_count += 1;
+                    m.content = MessageContent::Text(replacement);
+                } else if i < half && est >= MIN_ELIDE_TOKENS {
                     let bytes = original.len();
                     let preview: String = original.chars().take(120).collect();
-                    let role_label = if m.role == "tool" { "tool result" }
-                                     else { "assistant response" };
+                    let role_label = if m.role == "tool" {
+                        "tool result"
+                    } else {
+                        "assistant response"
+                    };
                     let replacement = format!(
                         "[elided {role_label} to fit context window — {bytes} bytes / ~{est} tokens]\n\nPreview:\n{}{}",
                         preview,
@@ -210,8 +247,8 @@ pub fn compress_if_needed(
             .map(|p| first_user + 1 + p)
             .unwrap_or(trimmed.len());
         for msg in trimmed.drain(first_user..next_user) {
-            tokens_freed = tokens_freed.saturating_add(
-                estimate_tokens(&content_text(&msg.content)));
+            tokens_freed =
+                tokens_freed.saturating_add(estimate_tokens(&content_text(&msg.content)));
             elided_count += 1;
         }
     }
@@ -222,6 +259,26 @@ pub fn compress_if_needed(
         elided_count,
         tokens_freed,
     }
+}
+
+fn compact_head_tail(
+    original: &str,
+    retained_chars: usize,
+    role_label: &str,
+    estimated_tokens: u32,
+) -> String {
+    let total_chars = original.chars().count();
+    let head_chars = retained_chars / 2;
+    let tail_chars = retained_chars.saturating_sub(head_chars);
+    let head: String = original.chars().take(head_chars).collect();
+    let mut tail: Vec<char> = original.chars().rev().take(tail_chars).collect();
+    tail.reverse();
+    let tail: String = tail.into_iter().collect();
+    let omitted_chars = total_chars.saturating_sub(retained_chars);
+
+    format!(
+        "[elided middle of {role_label} to fit context window — kept {retained_chars} of {total_chars} chars, omitted {omitted_chars}, original ~{estimated_tokens} tokens]\n\nHead:\n{head}\n\n[… elided middle …]\n\nTail:\n{tail}"
+    )
 }
 
 #[cfg(test)]
@@ -252,31 +309,102 @@ mod tests {
     fn compresses_oversized_assistant_content_in_the_older_half() {
         let messages = vec![
             msg("user", "hi"),
-            large_assistant(),       // index 1, older half, ~13.3K tokens
+            large_assistant(), // index 1, older half, ~13.3K tokens
             msg("user", "continue"),
-            msg("assistant", "ok"),  // index 3, recent half — untouched
+            msg("assistant", "ok"), // index 3, recent half — untouched
         ];
         // Use a small 10K window so 13.3K triggers compression at 75% = 7.5K.
         let result = compress_if_needed(messages, "", 10_000);
-        assert!(result.compressed, "large assistant content should be elided");
+        assert!(
+            result.compressed,
+            "large assistant content should be elided"
+        );
         let body = content_of(&result.messages[1]);
-        assert!(body.starts_with("[elided assistant response"), "assistant body should be replaced with elision marker, got: {body:.100}");
-        assert_eq!(content_of(&result.messages[3]), "ok", "recent half assistant must stay verbatim");
+        assert!(
+            body.contains("assistant response") && body.contains("elided"),
+            "assistant body should be replaced with elision marker, got: {body:.100}"
+        );
+        assert_eq!(
+            content_of(&result.messages[3]),
+            "ok",
+            "recent half assistant must stay verbatim"
+        );
     }
 
     #[test]
-    fn compresses_tool_results_from_older_half_only() {
+    fn compresses_old_tool_results_and_hard_bounds_oversized_recent_results() {
         let messages = vec![
             msg("user", "read the file"),
             msg("tool", &"T".repeat(80_000)), // index 1, old half, ~26.6K tokens
             msg("user", "now edit it"),
-            msg("tool", &"E".repeat(80_000)), // index 3, new half — untouched
+            msg("tool", &"E".repeat(80_000)), // index 3, new half — hard bounded
         ];
-        // Small window so the old tool triggers compression.
+        // A small window reduces the per-message cap to preserve total budget.
         let result = compress_if_needed(messages, "", 10_000);
         assert!(result.compressed);
         assert!(content_of(&result.messages[1]).contains("elided"));
-        assert_eq!(content_of(&result.messages[3]), "E".repeat(80_000));
+        let recent = content_of(&result.messages[3]);
+        assert!(recent.contains("Head:\nEEE"));
+        assert!(recent.contains("Tail:\nEEE"));
+        assert!(recent.len() < 10_000);
+    }
+
+    #[test]
+    fn production_shape_recent_tool_result_is_bounded_without_dropping_two_user_turns() {
+        let huge_tool_result = format!(
+            "PRODUCTION_HEAD\n{}\nPRODUCTION_TAIL",
+            "minified-dist-asset;".repeat(121_000),
+        );
+        assert!(
+            huge_tool_result.len() >= 2_298_000,
+            "fixture must remain comparable to the 2.30 MB production result",
+        );
+
+        let mut recent_tool_result = msg("tool", &huge_tool_result);
+        recent_tool_result.tool_call_id = Some("call_production_grep".into());
+        let messages = vec![
+            msg("user", "inspect the repository"),
+            msg("assistant", "I will search for the implementation."),
+            msg("user", "continue"),
+            recent_tool_result, // recent half: the production failure mode
+        ];
+        let limit = 272_000_u32;
+        let result = compress_if_needed(messages, "", limit);
+
+        assert!(
+            result.compressed,
+            "recent oversized tool output must be compacted"
+        );
+        assert_eq!(
+            result.messages.iter().filter(|m| m.role == "user").count(),
+            2,
+            "the two recent user turns are the conversation skeleton",
+        );
+        let body = content_of(result.messages.last().expect("recent tool result"));
+        assert!(
+            body.contains("PRODUCTION_HEAD"),
+            "head context must be retained"
+        );
+        assert!(
+            body.contains("PRODUCTION_TAIL"),
+            "tail context must be retained"
+        );
+        assert!(
+            body.contains("elided") || body.contains("truncated"),
+            "compaction must be explicit to the model",
+        );
+        assert!(
+            estimate_prompt_tokens(&result.messages, "") <= limit,
+            "the replay sent to the provider must fit the configured model window",
+        );
+        assert_eq!(
+            result
+                .messages
+                .last()
+                .and_then(|m| m.tool_call_id.as_deref()),
+            Some("call_production_grep"),
+            "content compaction must preserve the provider tool protocol envelope",
+        );
     }
 
     #[test]
@@ -296,7 +424,10 @@ mod tests {
         let limit = 128_000_u32;
         let result = compress_if_needed(messages, "", limit);
 
-        assert!(result.compressed, "should have elided at least some tool results");
+        assert!(
+            result.compressed,
+            "should have elided at least some tool results"
+        );
         let post_estimate = estimate_prompt_tokens(&result.messages, "");
         assert!(
             post_estimate <= limit,
@@ -310,10 +441,17 @@ mod tests {
     fn cjk_text_yields_higher_token_estimate_than_english_for_same_char_count() {
         let english = "hello world this is a test message".repeat(100);
         let chinese = "这是中文".repeat(850); // 4 chars × 850 = 3400 = same as English
-        assert_eq!(english.chars().count(), chinese.chars().count(), "char counts equal");
+        assert_eq!(
+            english.chars().count(),
+            chinese.chars().count(),
+            "char counts equal"
+        );
         let eng_est = estimate_tokens(&english);
         let cn_est = estimate_tokens(&chinese);
-        assert!(cn_est >= eng_est, "CJK estimate {cn_est} ≥ English {eng_est} for same char count");
+        assert!(
+            cn_est >= eng_est,
+            "CJK estimate {cn_est} ≥ English {eng_est} for same char count"
+        );
     }
 
     #[test]
