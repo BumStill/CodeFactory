@@ -518,15 +518,12 @@ pub async fn send_message(
         excluded_routes.len(),
     );
 
-    // Fetch history
+    // Fetch history as the agent should see it — excludes gate-rejected drafts.
+    // This is also what the plan/act dispatch below reads, so a withdrawn "I'm
+    // done" draft can never be mistaken for the pending proposal.
     let history = {
         let pool = state.db.read().await;
-        sqlx::query_as::<_, crate::storage::Message>(
-            "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
-        )
-        .bind(&session_id)
-        .fetch_all(&*pool)
-        .await?
+        crate::storage::load_agent_history(&pool, &session_id).await?
     };
 
     // Framework-side plan/act dispatch (no user-facing mode toggle): if the

@@ -596,13 +596,23 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
             session_id  TEXT NOT NULL,
             kind        TEXT NOT NULL,
             content     TEXT NOT NULL DEFAULT '',
+            message_id  TEXT,
             created_at  INTEGER NOT NULL
         )",
     )
     .execute(pool)
     .await?;
+    // `message_id` post-dates the table by one release slot — DBs created by
+    // the first gate_events build need it added rather than recreated.
+    ensure_column(pool, "gate_events", "message_id", "TEXT").await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_gate_events_session ON gate_events(session_id, kind)",
+    )
+    .execute(pool)
+    .await?;
+    // `load_agent_history` anti-joins on this for every agent turn.
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_gate_events_message ON gate_events(message_id, kind)",
     )
     .execute(pool)
     .await?;

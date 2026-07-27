@@ -53,6 +53,40 @@ pub struct Message {
     pub created_at: i64,
 }
 
+/// Session history as the *agent* should see it, ordered oldest-first.
+///
+/// Identical to the transcript except for one exclusion: assistant turns the
+/// completion gate rejected as premature final answers. Those are real model
+/// output and stay visible to the user, but replaying them would feed the model
+/// its own withdrawn "I'm done" claims on every later turn — one long session
+/// had 48 of them.
+///
+/// Two mechanisms, because the marker moved: current builds annotate the
+/// rejection in `gate_events`, while databases written before that carry
+/// `completion_state='rejected_candidate'` on the message itself and are
+/// filtered downstream by `replayable_history`. Nothing backfills, so both
+/// paths have to keep working.
+///
+/// UI reads (`get_messages`, `get_message_page`) deliberately do NOT use this —
+/// the transcript shows everything the agent actually did.
+pub async fn load_agent_history(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+) -> Result<Vec<Message>, sqlx::Error> {
+    sqlx::query_as::<_, Message>(
+        "SELECT m.* FROM messages m \
+         WHERE m.session_id = ? \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM gate_events g \
+             WHERE g.message_id = m.id AND g.kind = 'rejected_candidate' \
+           ) \
+         ORDER BY m.created_at ASC, m.rowid ASC",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+}
+
 // Typed `FromRow` model for the normalized tool lifecycle truth source.
 // `messages.tool_calls` remains as a redacted provider-history representation;
 // extraction, evidence, and cross-session analysis read this table instead.
@@ -68,4 +102,111 @@ pub struct ToolCallRecord {
     pub error: Option<String>,
     pub duration_ms: Option<i64>,
     pub created_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::SqlitePool;
+
+    async fn pool() -> SqlitePool {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, \
+             content TEXT, model_id TEXT, input_tokens INTEGER, output_tokens INTEGER, \
+             tool_calls TEXT, reasoning_content TEXT, completion_state TEXT, created_at INTEGER)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE gate_events (id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, \
+             content TEXT, message_id TEXT, created_at INTEGER)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn message(db: &SqlitePool, id: &str, role: &str, content: &str, at: i64) {
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
+        )
+        .bind(id)
+        .bind("s1")
+        .bind(role)
+        .bind(content)
+        .bind(at)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_history_drops_gate_rejected_drafts_but_keeps_everything_else() {
+        let db = pool().await;
+        message(&db, "u1", "user", "do the thing", 1).await;
+        message(&db, "a1", "assistant", "premature done claim", 2).await;
+        message(&db, "t1", "tool", "probe output", 3).await;
+        message(&db, "a2", "assistant", "actually done, verified", 4).await;
+        sqlx::query(
+            "INSERT INTO gate_events (id, session_id, kind, content, message_id, created_at) \
+             VALUES ('g1','s1','rejected_candidate','','a1',2)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let history = load_agent_history(&db, "s1").await.unwrap();
+        assert_eq!(
+            history.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["u1", "t1", "a2"],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_rejection_gate_event_never_hides_a_message() {
+        let db = pool().await;
+        message(&db, "u1", "user", "do the thing", 1).await;
+        message(&db, "a1", "assistant", "done", 2).await;
+        // Recovery/ready rows carry no message_id; a NULL must not match.
+        sqlx::query(
+            "INSERT INTO gate_events (id, session_id, kind, content, message_id, created_at) \
+             VALUES ('g1','s1','gate_recovery','verify first',NULL,2)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let history = load_agent_history(&db, "s1").await.unwrap();
+        assert_eq!(
+            history.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["u1", "a1"],
+        );
+    }
+
+    #[tokio::test]
+    async fn one_session_rejection_cannot_hide_another_sessions_message() {
+        let db = pool().await;
+        message(&db, "u1", "user", "do the thing", 1).await;
+        message(&db, "a1", "assistant", "done", 2).await;
+        sqlx::query(
+            "INSERT INTO gate_events (id, session_id, kind, content, message_id, created_at) \
+             VALUES ('g1','other-session','rejected_candidate','','a1',2)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // The anti-join is by message id, which is globally unique — a stray
+        // row naming this id still refers to this message, so it applies.
+        let history = load_agent_history(&db, "s1").await.unwrap();
+        assert_eq!(history.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["u1"]);
+    }
 }
