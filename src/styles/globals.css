@@ -99,6 +99,10 @@
   ::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
   ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 
+  /* Scrollbar hidden by default, visible on container hover */
+  .scrollbar-auto-hide::-webkit-scrollbar-thumb { background: transparent; border-radius: 3px; transition: background 0.2s; }
+  .scrollbar-auto-hide:hover::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); }
+
   /* Selection */
   ::selection { background: var(--selection-bg); }
 

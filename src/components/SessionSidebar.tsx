@@ -155,7 +155,7 @@ export function SessionSidebar({ currentSessionId, onOpenSession }: SessionSideb
       </div>
 
       {/* ── Unified recent-session list grouped for fast scanning. ────── */}
-      <div className="flex-1 overflow-y-auto px-1.5 py-2">
+      <div className="flex-1 overflow-y-auto scrollbar-auto-hide px-1.5 py-2">
         {draftActive && draftSession && (
           <button
             type="button"
