@@ -64,7 +64,7 @@ describe("MessageList theme readability", () => {
     expect(cls).not.toMatch(/(^|\s)text-amber-200(\s|$)/);
   });
 
-  it("shows model transport retry status on the assistant message", () => {
+  it("shows model transport retries as a quiet expandable assistant status", () => {
     render(
       <MessageList
         messages={[
@@ -86,7 +86,9 @@ describe("MessageList theme readability", () => {
       />,
     );
 
-    expect(screen.getByText(/模型连接重试 1\/3/)).toBeTruthy();
+    const summary = screen.getByText("模型连接不稳定，正在重新连接…");
+    expect(summary.closest("details")).toBeTruthy();
+    expect(summary.closest("details")?.className).not.toMatch(/\bborder\b|\bbg-/);
     expect(screen.getByText(/HTTP 503 Service Unavailable/)).toBeTruthy();
     expect(screen.queryByText(/Thinking/)).toBeNull();
   });

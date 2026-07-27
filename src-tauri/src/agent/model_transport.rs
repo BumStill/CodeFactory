@@ -26,10 +26,12 @@ use codefactory_agent_core::{provider_rejects_required_tool_choice, sanitize_com
 use reqwest::Client;
 
 use codefactory_agent_loop::transport::{
-    ModelResponse, ModelTransport, RoundOptions, TransportError,
+    EffectiveRoute, ModelResponse, ModelTransport, RoundOptions, RouteChange as LoopRouteChange,
+    TransportError,
 };
 
 use super::events::EventSink;
+use super::failover::{classify_provider_failure, ActiveRouteState, RouteCandidate};
 use super::{next_stream_item, openai_tool_controls, validate_openai_sse_completion, StreamPoll};
 use crate::config::settings::ApiStyle;
 use crate::errors::Result;
@@ -50,6 +52,76 @@ pub(super) struct DesktopModelTransport {
     pub(super) api_key: String,
     pub(super) api_style: ApiStyle,
     pub(super) cancel: Option<Arc<AtomicBool>>,
+}
+
+pub(super) struct RoutedDesktopModelTransport {
+    pub(super) http: Client,
+    pub(super) events: Arc<dyn EventSink>,
+    pub(super) session_id: String,
+    pub(super) route_state: ActiveRouteState,
+    pub(super) cancel: Option<Arc<AtomicBool>>,
+}
+
+struct TrackingEventSink {
+    delegate: Arc<dyn EventSink>,
+    output_started: Arc<AtomicBool>,
+}
+
+impl EventSink for TrackingEventSink {
+    fn emit(&self, event: StreamEvent) {
+        if matches!(
+            event,
+            StreamEvent::TextDelta { .. }
+                | StreamEvent::ToolCallStart { .. }
+                | StreamEvent::ToolResult { .. }
+        ) {
+            self.output_started.store(true, Ordering::SeqCst);
+        }
+        self.delegate.emit(event);
+    }
+
+    fn usage_recorded(&self, session_id: &str) {
+        self.delegate.usage_recorded(session_id);
+    }
+}
+
+fn effective_route(route: &RouteCandidate) -> EffectiveRoute {
+    EffectiveRoute {
+        endpoint_name: route.endpoint_name.clone(),
+        model_id: route.model_id.clone(),
+        base_url: route.base_url.clone(),
+        is_chatgpt: matches!(route.api_style, ApiStyle::Chatgpt),
+    }
+}
+
+fn classify_transport_error(message: String) -> TransportError {
+    if classify_provider_failure(&message).permits_endpoint_failover() {
+        TransportError::Retryable(message)
+    } else {
+        TransportError::Fatal(message)
+    }
+}
+
+impl RoutedDesktopModelTransport {
+    fn transport_for(
+        &self,
+        route: &RouteCandidate,
+        output_started: Arc<AtomicBool>,
+    ) -> DesktopModelTransport {
+        DesktopModelTransport {
+            http: self.http.clone(),
+            events: Arc::new(TrackingEventSink {
+                delegate: self.events.clone(),
+                output_started,
+            }),
+            model_id: route.model_id.clone(),
+            session_id: self.session_id.clone(),
+            base_url: route.base_url.clone(),
+            api_key: route.api_key.clone(),
+            api_style: route.api_style.clone(),
+            cancel: self.cancel.clone(),
+        }
+    }
 }
 
 impl DesktopModelTransport {
@@ -671,6 +743,8 @@ fn anthropic_response_to_model_response(
         tool_calls,
         usage,
         reasoning: None,
+        effective_route: None,
+        route_change: None,
     }
 }
 
@@ -689,20 +763,88 @@ impl ModelTransport for DesktopModelTransport {
                 let resp = self
                     .call_anthropic_model(messages, tools, opts.require_tool)
                     .await
-                    .map_err(|e| TransportError::Fatal(e.to_string()))?;
+                    .map_err(|e| classify_transport_error(e.to_string()))?;
                 Ok(anthropic_response_to_model_response(resp))
             }
             _ => {
                 let (text, tool_calls, usage, reasoning) = self
                     .call_openai_transport(messages, tools, opts.require_tool, &opts.reasoning_effort)
                     .await
-                    .map_err(|e| TransportError::Fatal(e.to_string()))?;
+                    .map_err(|e| classify_transport_error(e.to_string()))?;
                 Ok(ModelResponse {
                     text,
                     tool_calls,
                     usage,
                     reasoning,
+                    effective_route: None,
+                    route_change: None,
                 })
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for RoutedDesktopModelTransport {
+    async fn complete(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        opts: &RoundOptions,
+    ) -> std::result::Result<ModelResponse, TransportError> {
+        let mut transitions = self
+            .route_state
+            .take_initial_route_change()
+            .into_iter()
+            .collect::<Vec<_>>();
+        loop {
+            let route = self.route_state.current();
+            let output_started = Arc::new(AtomicBool::new(false));
+            let transport = self.transport_for(&route, output_started.clone());
+            match transport.complete(messages, tools, opts).await {
+                Ok(mut response) => {
+                    self.route_state.mark_current_success();
+                    response.effective_route = Some(effective_route(&route));
+                    if let Some(first) = transitions.first() {
+                        let reason = transitions
+                            .iter()
+                            .map(|change| change.reason.as_str())
+                            .collect::<Vec<_>>()
+                            .join("；");
+                        let combined = super::failover::RouteChange {
+                            from_endpoint: first.from_endpoint.clone(),
+                            from_model: first.from_model.clone(),
+                            to_endpoint: route.endpoint_name.clone(),
+                            to_model: route.model_id.clone(),
+                            reason,
+                        };
+                        response.route_change = Some(LoopRouteChange {
+                            from_endpoint: combined.from_endpoint.clone(),
+                            from_model: combined.from_model.clone(),
+                            to_endpoint: combined.to_endpoint.clone(),
+                            to_model: combined.to_model.clone(),
+                            reason: combined.reason.clone(),
+                            notice: combined.notice(),
+                        });
+                    }
+                    return Ok(response);
+                }
+                Err(error @ TransportError::Fatal(_)) => return Err(error),
+                Err(TransportError::Retryable(reason)) => {
+                    // A provider can fail after yielding visible SSE. Replaying
+                    // on another model would mix answers and can duplicate tool
+                    // intent, so fail visibly without switching.
+                    if output_started.load(Ordering::SeqCst) {
+                        self.route_state.record_current_failure(&reason);
+                        return Err(TransportError::Retryable(reason));
+                    }
+                    let Some(change) = self.route_state.advance_after_failure(&reason) else {
+                        return Err(TransportError::Retryable(
+                            self.route_state.exhausted_error(&reason),
+                        ));
+                    };
+                    transitions.push(change);
+                }
             }
         }
     }
@@ -838,6 +980,9 @@ mod tests {
         ChatMessage, ContentPart, FunctionCall, ImageUrl, MessageContent, ToolCall,
     };
     use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
 
     // ── chat_messages_to_anthropic golden pins (keystone slice 4.7 step 4) ──
     // The Anthropic representation switch is fully pinned HERE, before it is
@@ -1035,7 +1180,7 @@ mod tests {
 
     fn transport() -> DesktopModelTransport {
         DesktopModelTransport {
-            http: Client::new(),
+            http: test_client(),
             events: Arc::new(super::super::events::CollectingEventSink::new()),
             model_id: "m".into(),
             session_id: "s".into(),
@@ -1051,5 +1196,188 @@ mod tests {
         // The shared loop (4.6) holds Arc<dyn ModelTransport>; prove the desktop
         // impl coerces and constructs with no AppHandle.
         let _t: Arc<dyn ModelTransport> = Arc::new(transport());
+    }
+
+    fn serve_responses(
+        responses: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let base_url = format!("http://{}", listener.local_addr().expect("fixture addr"));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let fixture_hits = hits.clone();
+        std::thread::spawn(move || {
+            for (status, content_type, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept fixture request");
+                fixture_hits.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 16 * 1024];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write fixture response");
+            }
+        });
+        (base_url, hits)
+    }
+
+    fn openai_candidate(name: &str, model: &str, base_url: String) -> RouteCandidate {
+        RouteCandidate {
+            endpoint_name: name.into(),
+            model_id: model.into(),
+            base_url,
+            api_key: "test-key".into(),
+            api_style: ApiStyle::Openai,
+        }
+    }
+
+    fn test_client() -> Client {
+        // Local fixtures must never leak through a developer or CI machine's
+        // ambient HTTP proxy. A proxy-generated 502 would otherwise look like
+        // a provider failure while the fixture server receives zero requests.
+        Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build fixture HTTP client")
+    }
+
+    fn serve_truncated_chunked_sse() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncated fixture");
+        let base_url = format!("http://{}", listener.local_addr().expect("fixture addr"));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let fixture_hits = hits.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept truncated request");
+            fixture_hits.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 16 * 1024];
+            let _ = stream.read(&mut request);
+            let body =
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write truncated response");
+            // Deliberately omit the terminal zero-length chunk.
+        });
+        (base_url, hits)
+    }
+
+    #[tokio::test]
+    async fn routed_transport_visits_each_candidate_until_the_third_succeeds() {
+        const DOWN: (&str, &str, &str) = (
+            "503 Service Unavailable",
+            "application/json",
+            r#"{"error":{"message":"Service Unavailable","code":"circuit_open"}}"#,
+        );
+        const OK: (&str, &str, &str) = (
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let (a_url, a_hits) = serve_responses(vec![DOWN, DOWN, DOWN]);
+        let (b_url, b_hits) = serve_responses(vec![DOWN, DOWN, DOWN]);
+        let (c_url, c_hits) = serve_responses(vec![OK, OK]);
+        let mut plan =
+            super::super::failover::RouteCandidatePlan::new(openai_candidate("route-a", "a", a_url));
+        plan.push_fallback(openai_candidate("route-b", "b", b_url));
+        plan.push_fallback(openai_candidate("route-c", "c", c_url));
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: "route-test".into(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                plan,
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+        };
+
+        let response = transport
+            .complete(&[], &[], &RoundOptions::default())
+            .await
+            .expect("third route succeeds");
+
+        assert_eq!(response.text, "ok");
+        assert_eq!(
+            response.effective_route.as_ref().map(|route| route.endpoint_name.as_str()),
+            Some("route-c")
+        );
+        let change = response.route_change.expect("route change metadata");
+        assert_eq!(change.from_endpoint, "route-a");
+        assert_eq!(change.to_endpoint, "route-c");
+        assert!(change.notice.contains("已自动切换到"));
+        assert!(change.notice.contains("任务继续执行"));
+        let sticky_response = transport
+            .complete(&[], &[], &RoundOptions::default())
+            .await
+            .expect("subsequent round stays on the successful fallback");
+        assert_eq!(
+            sticky_response
+                .effective_route
+                .as_ref()
+                .map(|route| route.endpoint_name.as_str()),
+            Some("route-c")
+        );
+        assert!(sticky_response.route_change.is_none());
+        assert_eq!(a_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(b_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(c_hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn routed_transport_does_not_switch_after_visible_partial_sse() {
+        let (primary_url, primary_hits) = serve_truncated_chunked_sse();
+        let (fallback_url, fallback_hits) = serve_responses(vec![(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"wrong-replay\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )]);
+        let mut plan = super::super::failover::RouteCandidatePlan::new(openai_candidate(
+            "partial-primary",
+            "a",
+            primary_url,
+        ));
+        plan.push_fallback(openai_candidate(
+            "must-not-run",
+            "b",
+            fallback_url,
+        ));
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: "partial-test".into(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                plan,
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+        };
+        let tools = vec![ToolDefinition {
+            r#type: "function".into(),
+            function: codefactory_agent_loop::types::FunctionDefinition {
+                name: "noop".into(),
+                description: "test".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        }];
+
+        let error = transport
+            .complete(&[], &tools, &RoundOptions::default())
+            .await
+            .expect_err("truncated stream is visible failure");
+
+        assert!(matches!(error, TransportError::Retryable(_)));
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.route_state.current().endpoint_name, "partial-primary");
     }
 }

@@ -67,6 +67,40 @@ pub struct UsageIdentity {
     pub is_chatgpt: bool,
 }
 
+fn usage_identity_for_route(
+    base: &UsageIdentity,
+    route: Option<&crate::transport::EffectiveRoute>,
+) -> UsageIdentity {
+    let Some(route) = route else {
+        return base.clone();
+    };
+    UsageIdentity {
+        endpoint_name: route.endpoint_name.clone(),
+        model_id: route.model_id.clone(),
+        base_url: route.base_url.clone(),
+        is_chatgpt: route.is_chatgpt,
+        ..base.clone()
+    }
+}
+
+async fn persist_route_change(
+    persistence: &dyn Persistence,
+    events: &dyn EventSink,
+    route_change: Option<&crate::transport::RouteChange>,
+) -> Result<(), LoopError> {
+    let Some(change) = route_change else {
+        return Ok(());
+    };
+    persistence
+        .persist_gate_message(&change.notice, "turn_notice")
+        .await?;
+    events.emit(crate::types::StreamEvent::CompletionGateAction {
+        kind: "turn_notice".into(),
+        detail: change.notice.clone(),
+    });
+    Ok(())
+}
+
 /// Assemble + persist one round's usage row, and fire the cost-UI ping ONLY on a
 /// newly-written row. Anonymous runs and (0,0)-token rounds are skipped BEFORE
 /// assembly. Cost/provider derivation: ChatGPT → subscription, local endpoint →
@@ -502,6 +536,8 @@ pub async fn run_agent_loop(
                 tool_calls,
                 usage,
                 reasoning,
+                effective_route,
+                route_change,
             } = match call_result {
                 Ok(ok) => ok,
                 // The active model rejects image input (e.g. the user switched
@@ -608,6 +644,8 @@ pub async fn run_agent_loop(
             };
             finalization_pending = false;
             require_tool_next = false;
+            persist_route_change(persistence.as_ref(), events.as_ref(), route_change.as_ref())
+                .await?;
 
             // The provider request has completed. Persist already-consumed
             // Usage before honoring a cancellation that arrived in flight.
@@ -623,7 +661,7 @@ pub async fn run_agent_loop(
                 record_usage_event_for_round(
                     persistence.as_ref(),
                     events.as_ref(),
-                    &usage_identity,
+                    &usage_identity_for_route(&usage_identity, effective_route.as_ref()),
                     round_usage,
                     iteration,
                 )
@@ -1114,15 +1152,23 @@ pub async fn run_agent_loop(
             tool_calls: checkpoint_tool_calls,
             usage: checkpoint_usage,
             reasoning: checkpoint_reasoning,
+            effective_route: checkpoint_effective_route,
+            route_change: checkpoint_route_change,
         } = transport
             .complete(&messages, &[], &checkpoint_options)
             .await?;
+        persist_route_change(
+            persistence.as_ref(),
+            events.as_ref(),
+            checkpoint_route_change.as_ref(),
+        )
+        .await?;
         let checkpoint_usage_id = usage_request_id(&usage_run_id, checkpoint_round);
         if let Some(round_usage) = checkpoint_usage.as_ref() {
             record_usage_event_for_round(
                 persistence.as_ref(),
                 events.as_ref(),
-                &usage_identity,
+                &usage_identity_for_route(&usage_identity, checkpoint_effective_route.as_ref()),
                 round_usage,
                 checkpoint_round,
             )
@@ -1487,6 +1533,8 @@ mod tests {
             tool_calls,
             usage: Some(usage(round + 1, round + 2)),
             reasoning: None,
+            effective_route: None,
+            route_change: None,
         }
     }
 
@@ -1824,5 +1872,35 @@ mod tests {
         // The whole point: these live as data, not as two forked code paths.
         assert!(!desktop.gate_benchmark && desktop.progress_window == 8);
         assert!(sidecar.gate_benchmark && sidecar.progress_window == 4);
+    }
+
+    #[test]
+    fn effective_route_overrides_usage_attribution_without_changing_run_identity() {
+        let base = UsageIdentity {
+            session_id: "session".into(),
+            endpoint_name: "chatgpt".into(),
+            model_id: "gpt-5.5".into(),
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            usage_run_id: "run".into(),
+            surface: "interactive".into(),
+            task_id: None,
+            anonymous: false,
+            is_chatgpt: true,
+        };
+        let actual = crate::transport::EffectiveRoute {
+            endpoint_name: "deepseek".into(),
+            model_id: "deepseek-v4-pro".into(),
+            base_url: "https://api.deepseek.com".into(),
+            is_chatgpt: false,
+        };
+
+        let resolved = usage_identity_for_route(&base, Some(&actual));
+
+        assert_eq!(resolved.endpoint_name, "deepseek");
+        assert_eq!(resolved.model_id, "deepseek-v4-pro");
+        assert_eq!(resolved.base_url, "https://api.deepseek.com");
+        assert!(!resolved.is_chatgpt);
+        assert_eq!(resolved.session_id, "session");
+        assert_eq!(resolved.usage_run_id, "run");
     }
 }

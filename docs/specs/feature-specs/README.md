@@ -18,6 +18,7 @@
 - `task-failure-attribution-repair-loop.md`: Workspace 任务失败归因、修复建议和主产品闭环规格。
 - `repository-owned-specifications.md`: 仓库归属的长期规范、会话内计划与旧 Specs 产品模块退场合同。
 - `chat-continuity-conversational-evidence.md`: 用户目标跨内部执行分段连续完成、异常可恢复终态、自然对话式工具证据与历史密度规格。
+- `endpoint-capability-failover.md`: 首选模型服务不可用时，基于本机已配置端点、凭据与本轮能力做有界自动接管，保持上下文和工具连续性并提供可行动失败说明。
 - `settings-hooks-remotes-tabs.md`: Settings 中 Hooks 与 Git remotes 管理能力的历史规格。
 - `token-cost-dashboard.md`: token 用量与成本可见性的历史规格。
 

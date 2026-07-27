@@ -41,6 +41,30 @@ pub struct ModelResponse {
     pub usage: Option<Usage>,
     /// Reasoning trace (thinking-mode models) to persist/replay verbatim.
     pub reasoning: Option<String>,
+    /// Actual endpoint/model that produced this round. Desktop failover can
+    /// differ from the user-selected primary; sidecars may leave it `None`.
+    pub effective_route: Option<EffectiveRoute>,
+    /// Present only on the first successful response after an automatic route
+    /// change. The loop persists this as a natural conversational notice.
+    pub route_change: Option<RouteChange>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectiveRoute {
+    pub endpoint_name: String,
+    pub model_id: String,
+    pub base_url: String,
+    pub is_chatgpt: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteChange {
+    pub from_endpoint: String,
+    pub from_model: String,
+    pub to_endpoint: String,
+    pub to_model: String,
+    pub reason: String,
+    pub notice: String,
 }
 
 /// Transport failure taxonomy. Reactive strip-and-retry is already handled

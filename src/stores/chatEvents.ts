@@ -22,6 +22,9 @@ export interface UIMessage {
   content: string;
   toolCalls?: ToolCallState[];
   transportRetries?: TransportRetryState[];
+  /** Technical route failures retained behind an expandable disclosure when
+   * every configured candidate has been exhausted. */
+  failureEvidence?: string;
   inputTokens?: number;
   outputTokens?: number;
   createdAt: number;
@@ -58,6 +61,28 @@ export interface TransportRetryState {
   maxAttempts: number;
   delayMs: number;
   reason: string;
+}
+
+const MODEL_ROUTE_EXHAUSTED_PREFIX = "所有可用模型端点均不可用：";
+export const MODEL_ROUTE_EXHAUSTED_GUIDANCE =
+  "所有已配置且有凭据的模型端点都暂时不可用。请检查模型设置中的凭据、余额或端点状态，选择其他可用模型后重试；如果服务正在限流，也可以稍后重试。";
+
+export function isModelRouteExhaustedError(message: string): boolean {
+  return message.startsWith(MODEL_ROUTE_EXHAUSTED_PREFIX);
+}
+
+export function presentChatInvocationError(error: unknown): Pick<
+  UIMessage,
+  "content" | "failureEvidence"
+> {
+  const message = String(error).replace(/^Error:\s*/i, "");
+  if (isModelRouteExhaustedError(message)) {
+    return {
+      content: MODEL_ROUTE_EXHAUSTED_GUIDANCE,
+      failureEvidence: message,
+    };
+  }
+  return { content: `Error: ${message}` };
 }
 
 export interface ContextUsage {
@@ -192,15 +217,26 @@ export function reduceChatStreamEvent(
 
     case "error": {
       const endedAt = Date.now();
+      const modelRoutesExhausted = isModelRouteExhaustedError(event.message);
       return {
         ...state,
         streaming: false,
         pendingPermission: null,
-        messages: updateMessageById(state.messages, msgId, (m) => ({
-          ...m,
-          content: m.content + `\n\nError: ${event.message}`,
-          durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
-        })),
+        messages: updateMessageById(state.messages, msgId, (m) => {
+          if (modelRoutesExhausted) {
+            return {
+              ...m,
+              content: MODEL_ROUTE_EXHAUSTED_GUIDANCE,
+              failureEvidence: event.message,
+              durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
+            };
+          }
+          return {
+            ...m,
+            content: m.content + `\n\nError: ${event.message}`,
+            durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
+          };
+        }),
       };
     }
 

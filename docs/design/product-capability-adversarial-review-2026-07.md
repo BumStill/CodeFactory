@@ -13,13 +13,29 @@ attacks. This is the durable plan — edit it here as reality changes.
 > delivery, onboarding wizard, self-recovery contract + fact-check registry).
 > That is independent validation, not contradiction: a from-scratch adversarial
 > analysis reached the same "reactive failure handler is the highest-ROI fix"
-> conclusion. What remains genuinely unbuilt is the **keystone** and its cheap
-> forerunner **P5-lite**.
+> conclusion. The **keystone** and its cheap forerunner **P5-lite** remain
+> unbuilt for quality measurement; the 2026-07-25 amendment below records the
+> separately proven availability-failover gap.
+
+> **2026-07-25 修订：P4 中“CUT cross-endpoint failover”的结论已废止。**
+> 真实主路径已经出现 ChatGPT `503 Service Unavailable` /
+> `biscuit_baker_service_me_circuit_open`，同时本机存在具备凭据和兼容能力的
+> DeepSeek 端点，但产品只在故障 route 内重试并终止回合。这证明“只有质量/成本信号
+> 后才需要跨端点路由”的前提不成立：**可用性 failover** 不依赖质量排序。修订后的
+> 本次上线范围是有界、只使用本机已配置且凭据/模型可解析端点的故障接管；能力元数据
+> 预筛选是后续增强。通用 RoutingPolicy DSL、健康 route 间的质量优化和静默修改默认
+> 端点仍然 CUT。权威设计与验收见
+> `endpoint-capability-failover-business-design.md`、
+> `endpoint-capability-failover-architecture-design.md`、
+> `endpoint-capability-failover-ux-design.md` 和
+> `../specs/feature-specs/endpoint-capability-failover.md`。
 
 ## The single root cause (the uncomfortable truth)
 
-Four of the five problems (P1, P4, P5, and P2's "screenshot-as-completion-proof"
-tendency) are symptoms of **one** missing thing:
+Four of the five problems (P1, P4's **quality/cost optimization** branch, P5,
+and P2's "screenshot-as-completion-proof" tendency) are symptoms of **one**
+missing thing. The 2026-07-25 availability-failover amendment above is
+independent of this root cause:
 
 > **CodeFactory has no model-independent "behavioral quality" signal, and no
 > substrate (a headless product-agent runner decoupled from `AppHandle`) that
@@ -29,14 +45,17 @@ tendency) are symptoms of **one** missing thing:
   mutation was verified" (its own comment, `agent/mod.rs`), **not** a quality
   oracle.
 - Therefore: **P1 cannot optimize** (no objective to optimize), **P4 cannot
-  route** (no per-model quality signal to rank on), **P5 cannot evaluate the
-  real tool surface** (the only headless runner is shell-only), and P2 is
-  tempted to treat a self-scored green-check screenshot as proof.
+  rank healthy routes by quality/cost** (no per-model quality signal),
+  **P5 cannot evaluate the real tool surface** (the only headless runner is
+  shell-only), and P2 is tempted to treat a self-scored green-check screenshot
+  as proof. None of these prevents deterministic recovery from an unavailable
+  route to a locally configured candidate; explicit capability metadata remains
+  a separate follow-up requirement.
 
 The one big project worth chartering is: **a headless product-agent runner
 (decouple `agent/mod.rs` from `AppHandle`) + an objective quality signal.** It
 simultaneously unlocks P5's real suite, P1's efficacy measurement, and P4's
-per-model quality data.
+per-model quality data. It is not a prerequisite for availability failover.
 
 ## Per-problem verdicts (build / cut)
 
@@ -88,10 +107,11 @@ must obtain and paste a third-party secret before the first message.
   scavenging (empty on GUI launch; reverses the "never assumes gh" contract).
 
 ### P4 — auto model routing + cross-model consistency
-Over-engineered. None of the three field failures is a routing failure; the
-single-endpoint default user never triggers `decide_route`; active
-`reasoning_effort`/`thinking` injection is exactly the v1.19.2 regression already
-reverted.
+The original review correctly rejected a speculative quality-routing platform,
+but incorrectly generalized that result to availability failover. A real
+ChatGPT circuit-open failure with a separately configured, usable DeepSeek route
+shows that a selected endpoint can be a single point of failure even when no
+quality signal exists.
 
 - **BUILD (reactive core only):** generalize the existing HTTP-400 self-heal
   (`force_max_completion_tokens`) into `classify(status, body) -> Transient |
@@ -101,10 +121,18 @@ reverted.
   visible `turn_error`. Plus a name-based `supports_vision` pre-strip. One site,
   one small function, three unit tests — fixes all three failures for every user
   including single-endpoint. *(Largely SHIPPED v1.55–v1.70 as separate fixes.)*
-- **CUT:** RoutingPolicy DSL, `decide_route`, cross-endpoint failover, the
-  `ModelProfile` mega-struct, coupling settings edits to evolution-eval, and any
-  "absorb/beautify" refactor of working code. Defer routing until there exist
-  ≥2 interchangeable same-api endpoints AND a quality/cost signal (from P5).
+- **BUILD (availability failover):** after bounded same-route repair/retry,
+  select from a stable snapshot of locally configured endpoints whose
+  credential is readable and model is resolvable; continue the same
+  root turn without replaying successful tools; persist a redacted route audit;
+  stop after each eligible route has been visited once; surface a natural switch
+  notice or an actionable exhausted state. Static capability metadata
+  prefiltering remains a follow-up.
+- **CUT remains:** RoutingPolicy DSL, `decide_route` for quality/cost
+  optimization, a `ModelProfile` mega-struct, coupling settings edits to
+  evolution-eval, silent default-endpoint mutation, and any "absorb/beautify"
+  refactor of working code. Quality routing still waits for P5 evidence;
+  bounded availability failover does not.
 
 ### P5 — evaluation mechanism
 Direction right (extend `benchmark.rs`, don't touch evolution safety gates, don't
@@ -135,6 +163,7 @@ in-process `AgentLoop`.
 P5-lite (failure distribution + cross-model report over existing rows, DAYS)  ← decides whether P1/P2/P4 each merit their reinvestment
         │
         ├─► P4 reactive failure handler (one call site)  — same site as P2 vision degradation; also stops turns dying   [mostly SHIPPED]
+        ├─► P4 availability failover — bounded local configured routes now; capability metadata follows
         ├─► P1 OPTIMIZE (needs a failable oracle + P5 efficacy measurement)
         └─► P4 routing (needs P5's per-model quality/cost signal)
 
@@ -154,8 +183,9 @@ on guesses.
 2. Local-model, on-by-default consolidation pass (no local model exists).
 3. Full desktop-input automation stack (cost all on the non-core input side;
    violates "No GUI interference").
-4. RoutingPolicy DSL + `decide_route` + active field injection (reverts v1.19.2;
-   never triggers for single-endpoint default users).
+4. RoutingPolicy DSL + quality/cost `decide_route` + active field injection
+   (reverts v1.19.2). This prohibition no longer includes bounded
+   bounded availability failover; capability metadata remains follow-up.
 5. Rust `ProviderPreset` registry + command, `GITHUB_TOKEN`/`gh` scavenging.
 6. Any "absorb/beautify" refactor of working code (regression risk, zero
    user-visible gain).
