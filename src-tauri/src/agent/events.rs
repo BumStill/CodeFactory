@@ -28,6 +28,7 @@ impl TauriEventSink {
     }
 }
 
+#[async_trait::async_trait]
 impl EventSink for TauriEventSink {
     fn emit(&self, event: StreamEvent) {
         use tauri::Emitter;

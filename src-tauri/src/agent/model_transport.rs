@@ -67,6 +67,7 @@ struct TrackingEventSink {
     output_started: Arc<AtomicBool>,
 }
 
+#[async_trait::async_trait]
 impl EventSink for TrackingEventSink {
     fn emit(&self, event: StreamEvent) {
         if matches!(
