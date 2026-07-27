@@ -24,7 +24,6 @@ vi.mock("./pages/Profile/ProfilePage", () => ({ ProfilePage: () => null }));
 vi.mock("./components/Toast", () => ({ ToastContainer: () => null }));
 vi.mock("./components/EvidenceViewer", () => ({ EvidenceViewer: () => null }));
 vi.mock("./components/UpdaterBanner", () => ({ UpdaterBanner: () => null }));
-vi.mock("./components/OnboardingOverlay", () => ({ OnboardingOverlay: () => <div>首次引导遮罩</div> }));
 vi.mock("./stores/settings", () => ({
   useSettingsStore: (selector: (state: { load: () => void; settings: { onboarded: boolean } }) => unknown) =>
     selector({ load: vi.fn(), settings: { onboarded: false } }),
@@ -49,7 +48,6 @@ describe("App default workspace entry", () => {
     const workspace = await screen.findByRole("main", { name: "会话工作区" });
     expect(workspace).toHaveAttribute("data-session-id", "draft-start");
     expect(screen.queryByText("旧首页不应出现")).not.toBeInTheDocument();
-    expect(screen.queryByText("首次引导遮罩")).not.toBeInTheDocument();
     expect(mocks.beginQuickDraft).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(mocks.createSession).not.toHaveBeenCalled());
     expect(mocks.invoke).not.toHaveBeenCalledWith(
