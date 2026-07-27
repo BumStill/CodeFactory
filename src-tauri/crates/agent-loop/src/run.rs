@@ -221,6 +221,10 @@ pub struct RunConfig {
     /// (keystone slice 4.8c b5). The eval sidecar enables it; the desktop does
     /// not, so its behaviour is unchanged.
     pub inspection_budget: bool,
+    /// Push the model's REJECTED draft into history before the recovery prompt
+    /// (keystone slice 4.8c b12). The sidecar does; the desktop does not — its
+    /// UI already collapses the rejected candidate.
+    pub replay_rejected_draft: bool,
     // Usage-attribution identity + working dir (all constant for the run).
     pub session_id: String,
     pub endpoint_name: String,
@@ -359,6 +363,7 @@ pub async fn run_agent_loop(
         context_compression,
         overload_backoff,
         inspection_budget,
+        replay_rejected_draft,
         session_id,
         endpoint_name,
         model_id,
@@ -368,7 +373,7 @@ pub async fn run_agent_loop(
         task_id,
         anonymous,
         is_chatgpt,
-        cwd,
+        mut cwd,
         gate_benchmark,
         progress_window,
     } = config;
@@ -497,6 +502,7 @@ pub async fn run_agent_loop(
             // value.
             let round_options = crate::transport::RoundOptions {
                 require_tool: required_tool_response,
+                tool_outcomes_so_far: completion_sequence as usize,
                 reasoning_effort: context_policy.round_reasoning_effort().await,
             };
             let call_result = transport
@@ -739,6 +745,20 @@ pub async fn run_agent_loop(
                             kind: "recovery".into(),
                             detail: evidence.blockers.join("; "),
                         });
+                        // b12: some surfaces let the model see its own rejected
+                        // draft before the correction, so the next round has the
+                        // context it is being asked to fix. Desktop keeps the
+                        // draft out of history (the UI already collapsed it).
+                        if replay_rejected_draft && !text.is_empty() {
+                            messages.push(crate::types::ChatMessage {
+                                role: "assistant".into(),
+                                content: crate::types::MessageContent::Text(text.clone()),
+                                tool_calls: None,
+                                tool_call_id: None,
+                                name: None,
+                                reasoning_content: None,
+                            });
+                        }
                         messages.push(crate::types::ChatMessage {
                             role: "user".into(),
                             content: crate::types::MessageContent::Text(prompt),
@@ -967,6 +987,16 @@ pub async fn run_agent_loop(
                     )
                     .await?;
 
+                // b6: the backend may report where the shell ended up (the
+                // sidecar's Harbor container tracks `cd`). Absolute paths only —
+                // a relative one would silently re-root the run.
+                if let Some(next) = output
+                    .next_working_directory
+                    .as_deref()
+                    .filter(|p| std::path::Path::new(p).is_absolute())
+                {
+                    cwd = std::path::PathBuf::from(next);
+                }
                 if let Some(prompt) = crate::policy::record_completion_outcome(
                     &mut completion_gate,
                     &mut progress_tracker,
@@ -1076,6 +1106,29 @@ pub async fn run_agent_loop(
                         reasoning_content: None,
                     });
                 }
+                // b11: surfaces with a wall clock also converge on TIME, not just
+                // on remaining rounds. Desktop has no clock (`wall_time()` is
+                // None) so this never fires there.
+                if let Some((remaining_secs, total_secs)) = budget.wall_time() {
+                    if codefactory_agent_core::should_prompt_time_convergence(
+                        remaining_secs,
+                        total_secs,
+                    ) {
+                        messages.push(crate::types::ChatMessage {
+                            role: "user".into(),
+                            content: crate::types::MessageContent::Text(
+                                codefactory_agent_core::build_time_convergence_prompt(
+                                    remaining_secs,
+                                    &evidence,
+                                ),
+                            ),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
+                            reasoning_content: None,
+                        });
+                    }
+                }
             }
         }
 
@@ -1128,6 +1181,7 @@ pub async fn run_agent_loop(
         });
         let checkpoint_options = crate::transport::RoundOptions {
             require_tool: false,
+            tool_outcomes_so_far: completion_sequence as usize,
             reasoning_effort: context_policy.round_reasoning_effort().await,
         };
         let checkpoint_round = model_round_index;
@@ -1555,6 +1609,7 @@ mod tests {
             context_compression: true,
             overload_backoff: false,
             inspection_budget: false,
+            replay_rejected_draft: false,
             session_id: "session".into(),
             endpoint_name: "test".into(),
             model_id: "model".into(),
@@ -1815,6 +1870,7 @@ mod tests {
             context_compression: true,
             overload_backoff: false,
             inspection_budget: false,
+            replay_rejected_draft: false,
             session_id: session_id.clone(),
             endpoint_name: endpoint_name.clone(),
             model_id: model_id.clone(),
@@ -1836,6 +1892,7 @@ mod tests {
             context_compression: false,
             overload_backoff: true,
             inspection_budget: true,
+            replay_rejected_draft: true,
             session_id,
             endpoint_name,
             model_id,

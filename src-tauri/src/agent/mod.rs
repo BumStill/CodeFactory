@@ -976,8 +976,11 @@ impl AgentLoop {
             wall_budget_applies: wall_budget_applies(self.mode),
             context_compression,
             overload_backoff,
-            // Desktop keeps its unlimited inspection allowance (slice 4.8c b5).
+            // Desktop keeps its unlimited inspection allowance (slice 4.8c b5)
+            // and does not replay rejected drafts — the UI already collapses
+            // them (b12).
             inspection_budget: false,
+            replay_rejected_draft: false,
             session_id: self.session_id.clone(),
             endpoint_name: self.endpoint_name.clone(),
             model_id: self.model_id.clone(),
