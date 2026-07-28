@@ -11,6 +11,7 @@
 //!
 //! Provisional: nothing consumes these yet (the loop body lands in slice 4.6).
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -482,8 +483,10 @@ pub async fn run_agent_loop(
     );
     let mut completion_sequence = 0_u64;
     let mut last_completion_nudge_sequence = None;
+    let mut successful_local_verifications = BTreeSet::new();
     let mut progress_tracker = codefactory_agent_core::ProgressTracker::new(progress_window as u32);
     let mut finalization_pending = false;
+    let mut completion_summary_retry_used = false;
     let mut completion_recovery_attempts = 0_u32;
     let mut fact_check_used = false;
     let mut require_tool_next = false;
@@ -578,6 +581,8 @@ pub async fn run_agent_loop(
                 }
             }
 
+            let summary_only_round = finalization_pending
+                && matches!(finalization, FinalizationPolicy::BlockOnIncomplete);
             let active_tool_defs =
                 crate::policy::active_tool_definitions(tool_defs, finalization_pending);
             let required_tool_response = require_tool_next && !finalization_pending;
@@ -771,12 +776,73 @@ pub async fn run_agent_loop(
                 }
             }
 
+            if summary_only_round && !tool_calls.is_empty() {
+                let content = "最终总结阶段不会执行新的工具调用；请直接使用已有验证结果完成总结。";
+                let mut cancelled_results = Vec::with_capacity(tool_calls.len());
+                for tc in &tool_calls {
+                    persistence
+                        .record_tool_call_outcome(tc, "denied", None, Some(content), 0)
+                        .await?;
+                    events.emit(crate::types::StreamEvent::ToolResult {
+                        tool_call_id: tc.id.clone(),
+                        content: content.into(),
+                        is_error: true,
+                        status: "denied".into(),
+                    });
+                    cancelled_results.push(crate::types::ChatMessage {
+                        role: "tool".into(),
+                        content: crate::types::MessageContent::Text(content.into()),
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                        name: Some(tc.function.name.clone()),
+                        reasoning_content: None,
+                    });
+                }
+                if completion_summary_retry_used {
+                    let notice = "最终总结连续返回了未执行的工具请求，已停止以避免重复验证；现有验证结果保持有效。".to_string();
+                    persistence
+                        .persist_gate_message(&notice, "turn_notice")
+                        .await?;
+                    events.emit(crate::types::StreamEvent::Error {
+                        message: notice.clone(),
+                    });
+                    return Ok(run_outcome_for_terminal(
+                        &completion_gate,
+                        StopReason::Blocked,
+                        (total_input_tokens, total_output_tokens),
+                        &last_final_text,
+                    ));
+                }
+                completion_summary_retry_used = true;
+                messages.push(crate::types::ChatMessage {
+                    role: "assistant".into(),
+                    content: crate::types::MessageContent::Text(text),
+                    tool_calls: Some(tool_calls),
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: reasoning,
+                });
+                messages.extend(cancelled_results);
+                messages.push(crate::types::ChatMessage {
+                    role: "user".into(),
+                    content: crate::types::MessageContent::Text(
+                        codefactory_agent_core::build_completion_summary_prompt().into(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                });
+                finalization_pending = true;
+                continue;
+            }
+
             if tool_calls.is_empty() {
                 // Systemic fact-check: a tool-call-free reply asserting a
                 // machine-verifiable obstacle (delivery blocked / command
                 // missing / waiting on a checkable condition) gets ONE live
                 // probe-backed correction — facts over stale memory.
-                if !fact_check_used {
+                if !summary_only_round && !fact_check_used {
                     if let Some(correction) =
                         fact_checker.fact_check(&text, &fact_check_instruction)
                     {
@@ -944,6 +1010,38 @@ pub async fn run_agent_loop(
                 // rule is bash-only, so a surface whose shell tool has another
                 // name must override it or every call reads as ReadOnly.
                 let (classified_command, classified_kind) = tool_backend.classify(tc, &args);
+                let reusable_verification_key = crate::policy::reusable_local_verification_key(
+                    &classified_command,
+                    &classified_kind,
+                    &cwd,
+                );
+                if reusable_verification_key
+                    .as_ref()
+                    .is_some_and(|key| successful_local_verifications.contains(key))
+                {
+                    let content = format!(
+                        "已复用当前 workspace 中相同命令的成功验证结果，未重复执行：{}",
+                        classified_command
+                    );
+                    persistence
+                        .record_tool_call_outcome(tc, "done", Some(&content), None, 0)
+                        .await?;
+                    events.emit(crate::types::StreamEvent::ToolResult {
+                        tool_call_id: tc.id.clone(),
+                        content: content.clone(),
+                        is_error: false,
+                        status: "done".into(),
+                    });
+                    result_messages.push(crate::types::ChatMessage {
+                        role: "tool".into(),
+                        content: crate::types::MessageContent::Text(content),
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                        name: Some(tc.function.name.clone()),
+                        reasoning_content: None,
+                    });
+                    continue;
+                }
                 // Inspection budget first (b5), then the completion-policy
                 // budget — matching the sidecar's ordering. Both are off on the
                 // desktop unless the surface opts in.
@@ -1038,6 +1136,9 @@ pub async fn run_agent_loop(
                     });
                     continue;
                 }
+                if matches!(classified_kind, codefactory_agent_core::ToolKind::Mutation) {
+                    successful_local_verifications.clear();
+                }
 
                 // Tool execution flows through the shared ToolBackend seam
                 // (keystone slice 4.3): the desktop backend builds the ExecCtx
@@ -1102,15 +1203,26 @@ pub async fn run_agent_loop(
                 {
                     cwd = std::path::PathBuf::from(next);
                 }
-                if let Some(prompt) = crate::policy::record_completion_outcome(
+                let completion_record = crate::policy::record_completion_outcome(
                     &mut completion_gate,
                     &mut progress_tracker,
                     &mut completion_sequence,
                     &cwd,
                     &tc.id,
                     &output,
-                ) {
+                );
+                if matches!(output.kind, codefactory_agent_core::ToolKind::Mutation) {
+                    successful_local_verifications.clear();
+                }
+                if let Some(prompt) = completion_record.progress_prompt {
                     progress_prompt = Some(prompt);
+                }
+                if completion_record.succeeded
+                    && matches!(output.kind, codefactory_agent_core::ToolKind::Verification)
+                {
+                    if let Some(key) = reusable_verification_key {
+                        successful_local_verifications.insert(key);
+                    }
                 }
                 // Post-tool hook (skipped headless — no hooks).
                 let post_result: String = output.content.chars().take(500).collect();
@@ -1178,11 +1290,14 @@ pub async fn run_agent_loop(
             {
                 last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
                 finalization_pending = true;
+                let ready_prompt = if matches!(finalization, FinalizationPolicy::BlockOnIncomplete)
+                {
+                    codefactory_agent_core::build_completion_summary_prompt()
+                } else {
+                    codefactory_agent_core::build_completion_ready_prompt()
+                };
                 persistence
-                    .persist_gate_message(
-                        codefactory_agent_core::build_completion_ready_prompt(),
-                        "gate_ready",
-                    )
+                    .persist_gate_message(ready_prompt, "gate_ready")
                     .await?;
                 events.emit(crate::types::StreamEvent::CompletionGateAction {
                     kind: "ready".into(),
@@ -1190,9 +1305,7 @@ pub async fn run_agent_loop(
                 });
                 messages.push(crate::types::ChatMessage {
                     role: "user".into(),
-                    content: crate::types::MessageContent::Text(
-                        codefactory_agent_core::build_completion_ready_prompt().to_string(),
-                    ),
+                    content: crate::types::MessageContent::Text(ready_prompt.to_string()),
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -1665,6 +1778,87 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CountingTools {
+        executed: Mutex<Vec<String>>,
+        fail_next_verification: AtomicBool,
+    }
+
+    impl CountingTools {
+        fn executed(&self) -> Vec<String> {
+            self.executed.lock().expect("executed").clone()
+        }
+
+        fn failing_first_verification() -> Self {
+            Self {
+                executed: Mutex::new(Vec::new()),
+                fail_next_verification: AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolBackend for CountingTools {
+        async fn list_schemas(&self) -> Vec<ToolDefinition> {
+            vec![tool_definition()]
+        }
+
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            args: &serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolInvocationResult, ToolError> {
+            let (command, kind) = self.classify(call, args);
+            self.executed
+                .lock()
+                .expect("executed")
+                .push(command.clone());
+            let verification = matches!(kind, ToolKind::Verification);
+            let failed = verification && self.fail_next_verification.swap(false, Ordering::SeqCst);
+            Ok(ToolInvocationResult {
+                content: if failed {
+                    "test result: FAILED. 1 failed".into()
+                } else if verification {
+                    "test result: ok. 1 passed; 0 failed".into()
+                } else {
+                    "updated src/lib.rs".into()
+                },
+                is_error: failed,
+                command,
+                kind,
+                return_code: Some(if failed { 1 } else { 0 }),
+                stdout: if failed {
+                    String::new()
+                } else if verification {
+                    "test result: ok".into()
+                } else {
+                    String::new()
+                },
+                stderr: if failed {
+                    "test result: FAILED".into()
+                } else {
+                    String::new()
+                },
+                error: failed.then(|| "test result: FAILED".into()),
+                next_working_directory: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingFactChecker {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::services::FactChecker for CountingFactChecker {
+        fn fact_check(&self, _reply: &str, _instruction: &str) -> Option<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Some("run another probe".into())
+        }
+    }
+
     struct FixedContext;
 
     #[async_trait::async_trait]
@@ -1902,6 +2096,260 @@ mod tests {
             .expect("messages")
             .iter()
             .any(|(role, _, _)| role == "user"));
+    }
+
+    #[tokio::test]
+    async fn repeated_successful_local_verification_is_reused_until_workspace_mutates() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "",
+                vec![call(
+                    "write-1",
+                    "write_file",
+                    serde_json::json!({"path": "src/lib.rs", "content": "one"}),
+                )],
+                0,
+            ),
+            response(
+                "",
+                vec![call(
+                    "verify-1",
+                    "bash",
+                    serde_json::json!({"command": "cargo test -p codefactory-agent-loop"}),
+                )],
+                1,
+            ),
+            response(
+                "",
+                vec![call(
+                    "verify-duplicate",
+                    "bash",
+                    serde_json::json!({"command": "cargo test -p codefactory-agent-loop"}),
+                )],
+                2,
+            ),
+            response(
+                "",
+                vec![call(
+                    "write-2",
+                    "write_file",
+                    serde_json::json!({"path": "src/lib.rs", "content": "two"}),
+                )],
+                3,
+            ),
+            response(
+                "",
+                vec![call(
+                    "verify-after-write",
+                    "bash",
+                    serde_json::json!({"command": "cargo test -p codefactory-agent-loop"}),
+                )],
+                4,
+            ),
+            response("修复完成，相关测试已通过。", vec![], 5),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let tools = Arc::new(CountingTools::default());
+        let mut cfg = config();
+        cfg.max_iterations = 8;
+        let mut svc = services(transport, persistence, events);
+        svc.tools = tools.clone();
+
+        let outcome = run_agent_loop(inputs(), cfg, svc)
+            .await
+            .expect("scripted run");
+
+        assert_eq!(
+            tools.executed(),
+            vec![
+                "write_file src/lib.rs",
+                "cargo test -p codefactory-agent-loop",
+                "write_file src/lib.rs",
+                "cargo test -p codefactory-agent-loop",
+            ],
+            "the unchanged duplicate must reuse the green result, while a later mutation invalidates it",
+        );
+        assert_eq!(
+            outcome
+                .completion_evidence
+                .last_successful_verification_sequence,
+            Some(4),
+            "the skipped duplicate must not advance completion progress",
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_local_verification_is_never_reused() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "",
+                vec![call(
+                    "write-1",
+                    "write_file",
+                    serde_json::json!({"path": "src/lib.rs", "content": "one"}),
+                )],
+                0,
+            ),
+            response(
+                "",
+                vec![call(
+                    "verify-failed",
+                    "bash",
+                    serde_json::json!({"command": "cargo test -p codefactory-agent-loop"}),
+                )],
+                1,
+            ),
+            response(
+                "",
+                vec![call(
+                    "verify-retry",
+                    "bash",
+                    serde_json::json!({"command": "cargo test -p codefactory-agent-loop"}),
+                )],
+                2,
+            ),
+            response("测试已重新执行并通过。", vec![], 3),
+        ]));
+        let tools = Arc::new(CountingTools::failing_first_verification());
+        let mut cfg = config();
+        cfg.max_iterations = 8;
+        let mut svc = services(
+            transport,
+            Arc::new(RecordingPersistence::default()),
+            Arc::new(CollectingEventSink::new()),
+        );
+        svc.tools = tools.clone();
+
+        run_agent_loop(inputs(), cfg, svc)
+            .await
+            .expect("scripted run");
+
+        assert_eq!(
+            tools.executed(),
+            vec![
+                "write_file src/lib.rs",
+                "cargo test -p codefactory-agent-loop",
+                "cargo test -p codefactory-agent-loop",
+            ],
+            "a failed check must execute again",
+        );
+    }
+
+    #[tokio::test]
+    async fn autonomous_final_summary_never_executes_returned_tool_calls() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "",
+                vec![call(
+                    "write-1",
+                    "write_file",
+                    serde_json::json!({"path": "src/lib.rs", "content": "one"}),
+                )],
+                0,
+            ),
+            response(
+                "",
+                vec![call(
+                    "verify-1",
+                    "bash",
+                    serde_json::json!({"command": "cargo test -p codefactory-agent-loop"}),
+                )],
+                1,
+            ),
+            response(
+                "",
+                vec![call(
+                    "verify-from-summary",
+                    "bash",
+                    serde_json::json!({"command": "cargo test -p codefactory-agent-loop"}),
+                )],
+                2,
+            ),
+            response("修复完成，相关测试已通过。", vec![], 3),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let tools = Arc::new(CountingTools::default());
+        let mut cfg = config();
+        cfg.finalization = FinalizationPolicy::BlockOnIncomplete;
+        cfg.max_iterations = 8;
+        let mut svc = services(transport.clone(), persistence.clone(), events);
+        svc.tools = tools.clone();
+
+        run_agent_loop(inputs(), cfg, svc)
+            .await
+            .expect("scripted run");
+
+        assert_eq!(
+            tools.executed(),
+            vec![
+                "write_file src/lib.rs",
+                "cargo test -p codefactory-agent-loop",
+            ],
+            "a tools-disabled final summary must not reopen verification",
+        );
+        assert_eq!(
+            persistence
+                .notices
+                .lock()
+                .expect("notices")
+                .iter()
+                .filter(|(state, _)| state == "gate_ready")
+                .count(),
+            1,
+            "the final-summary instruction must be emitted only once",
+        );
+        assert_eq!(
+            transport.advertised_tool_counts(),
+            vec![1, 1, 0, 0],
+            "a protocol-violating summary gets at most one tools-disabled summary retry",
+        );
+    }
+
+    #[tokio::test]
+    async fn autonomous_final_summary_skips_fact_check_reentry() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "",
+                vec![call(
+                    "write-1",
+                    "write_file",
+                    serde_json::json!({"path": "src/lib.rs", "content": "one"}),
+                )],
+                0,
+            ),
+            response(
+                "",
+                vec![call(
+                    "verify-1",
+                    "bash",
+                    serde_json::json!({"command": "cargo test -p codefactory-agent-loop"}),
+                )],
+                1,
+            ),
+            response("修复完成，相关测试已通过。", vec![], 2),
+        ]));
+        let fact_checker = Arc::new(CountingFactChecker::default());
+        let mut cfg = config();
+        cfg.finalization = FinalizationPolicy::BlockOnIncomplete;
+        cfg.max_iterations = 8;
+        let mut svc = services(
+            transport,
+            Arc::new(RecordingPersistence::default()),
+            Arc::new(CollectingEventSink::new()),
+        );
+        svc.fact_checker = fact_checker.clone();
+
+        run_agent_loop(inputs(), cfg, svc)
+            .await
+            .expect("scripted run");
+
+        assert_eq!(
+            fact_checker.calls.load(Ordering::SeqCst),
+            0,
+            "completed evidence must not trigger another fact-check/probe from the final summary",
+        );
     }
 
     #[tokio::test]
