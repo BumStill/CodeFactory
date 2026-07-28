@@ -8,9 +8,9 @@
 // one session lost 1111 rows of visible work, up to 152 steps at once.
 //
 // The contract that satisfies both: the gate's own control traffic (injected
-// prompts) never renders, and nothing the model actually did is ever deleted.
-// Drafts and recovery rounds stay in the timeline as ordinary steps; only the
-// last prose block is the answer.
+// prompts) never renders, and withdrawn final-answer drafts do not remain as
+// normal assistant replies. Recovery-round work still stays in the live turn
+// timeline as ordinary steps; only the last accepted prose block is the answer.
 
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
@@ -30,7 +30,7 @@ const msg = (over: Partial<UIMessage> = {}): UIMessage => ({
 });
 
 describe("MessageList completion-review isolation", () => {
-  it("keeps a rejected draft visible as an ordinary step in the turn", () => {
+  it("hides gate-rejected final-answer drafts while keeping the accepted final reply", () => {
     render(
       <MessageList
         messages={[
@@ -42,9 +42,30 @@ describe("MessageList completion-review isolation", () => {
       />,
     );
 
-    expect(screen.getByText(/candidate answer with a very long plan/)).toBeTruthy();
+    expect(screen.queryByText(/candidate answer with a very long plan/)).toBeNull();
     expect(screen.getByText(/brief final answer/)).toBeTruthy();
     expect(screen.queryByText(/完成度检查|执行已中断|第 \d\/3 次/)).toBeNull();
+  });
+
+  it("does not render gate-rejected assistant delivery-summary drafts", () => {
+    render(
+      <MessageList
+        messages={[
+          msg({ id: "user", role: "user", content: "修复并上线" }),
+          msg({
+            id: "draft-final",
+            content: "已修复并发布：**v1.69.1**。",
+            completionState: "rejected_candidate",
+          }),
+          msg({ id: "real-final", content: "补充验证已通过。" }),
+        ]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+
+    expect(screen.queryByText(/已修复并发布/)).toBeNull();
+    expect(screen.getByText(/补充验证已通过/)).toBeTruthy();
   });
 
   it("hides persisted gate instructions entirely", () => {

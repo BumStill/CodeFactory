@@ -588,13 +588,20 @@ async fn load_message_page_below(
     // SELECTs can observe different snapshots when another CodeFactory
     // process writes the shared database between awaits.
     let rows = sqlx::query_as::<_, MessagePageRow>(
-        "SELECT rowid AS page_rowid,
-                id, session_id, role, content, endpoint_id, model_id, input_tokens,
-                output_tokens, tool_calls, reasoning_content,
-                completion_state, created_at
-         FROM messages
-         WHERE session_id = ? AND rowid >= ? AND rowid < ?
-         ORDER BY rowid ASC",
+        "SELECT m.rowid AS page_rowid,
+                m.id, m.session_id, m.role, m.content, m.endpoint_id, m.model_id, m.input_tokens,
+                m.output_tokens, m.tool_calls, m.reasoning_content,
+                CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM gate_events g
+                        WHERE g.message_id = m.id AND g.kind = 'rejected_candidate'
+                    ) THEN 'rejected_candidate'
+                    ELSE m.completion_state
+                END AS completion_state,
+                m.created_at
+         FROM messages m
+         WHERE m.session_id = ? AND m.rowid >= ? AND m.rowid < ?
+         ORDER BY m.rowid ASC",
     )
     .bind(session_id)
     .bind(bounded_start)
@@ -1077,6 +1084,19 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
+            "CREATE TABLE gate_events (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                content TEXT NOT NULL,
+                message_id TEXT,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "CREATE TABLE chat_plan_events (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -1093,6 +1113,61 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn message_page_marks_gate_rejected_assistant_drafts_for_ui_filtering() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open db");
+        create_materialization_schema(&pool).await;
+        sqlx::query(
+            "INSERT INTO sessions (
+                id, title, cwd, model_id, created_at, updated_at,
+                total_input_tokens, total_output_tokens, kind
+             ) VALUES ('dup', 'dup', '/tmp', 'model', 1, 1, 0, 0, 'project')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, created_at)
+             VALUES ('u1', 'dup', 'user', 'fix it', 1),
+                    ('draft-final', 'dup', 'assistant', '已修复并发布：**v1.69.1**。', 2),
+                    ('real-final', 'dup', 'assistant', '补充验证已通过。', 3)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO gate_events (id, session_id, kind, content, message_id, created_at)
+             VALUES ('g1', 'dup', 'rejected_candidate', '', 'draft-final', 4)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let page = load_message_page(&pool, "dup", None, 8)
+            .await
+            .expect("load page");
+        let draft = page
+            .messages
+            .iter()
+            .find(|message| message.id == "draft-final")
+            .expect("draft-final row");
+        assert_eq!(
+            draft.completion_state.as_deref(),
+            Some("rejected_candidate"),
+            "UI can now filter withdrawn final summaries instead of rendering duplicate completed claims",
+        );
+        let real = page
+            .messages
+            .iter()
+            .find(|message| message.id == "real-final")
+            .expect("real-final row");
+        assert!(real.completion_state.is_none());
     }
 
     #[tokio::test]
