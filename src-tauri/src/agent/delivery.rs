@@ -34,7 +34,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::config::settings::{DeliveryCeiling, MergeMethod};
 use crate::util::command_env;
@@ -430,9 +431,13 @@ pub async fn deliver<R: DeliveryRemote>(
         return finish(outcome, &repo.branch, ceiling);
     }
 
-    // ── Open (or reuse) PR ──────────────────────────────────────────────────
+    // ── Open (or reuse) PR/MR ───────────────────────────────────────────────
     let Some(remote) = remote else {
-        return outcome.blocked_at(StepResult::blocked("pr", NO_TOKEN_PR_MESSAGE));
+        let origin = git(&repo.root, &["remote", "get-url", "origin"]).ok();
+        return outcome.blocked_at(StepResult::blocked(
+            "pr",
+            no_remote_channel_message(origin.as_deref()),
+        ));
     };
     let title = opts.title.clone().unwrap_or_else(|| {
         generate_commit_message(&repo.root, &repo.branch, None)
@@ -449,13 +454,16 @@ pub async fn deliver<R: DeliveryRemote>(
         .await
     {
         Ok(v) => v,
-        Err(e) => return outcome.blocked_at(StepResult::blocked("pr", format!("开 PR 失败: {e}"))),
+        Err(e) => {
+            return outcome.blocked_at(StepResult::blocked("pr", format!("开 PR/MR 失败: {e}")))
+        }
     };
     outcome.pr_number = Some(pr_number);
     outcome.pr_url = Some(pr_url.clone());
-    outcome
-        .steps
-        .push(StepResult::ok("pr", format!("PR #{pr_number}: {pr_url}")));
+    outcome.steps.push(StepResult::ok(
+        "pr",
+        format!("PR/MR #{pr_number}: {pr_url}"),
+    ));
 
     if ceiling.rank() < DeliveryCeiling::ThroughCiGreen.rank() {
         return finish(outcome, &repo.branch, ceiling);
@@ -519,6 +527,19 @@ pub const NO_TOKEN_PR_MESSAGE: &str = "已提交并推送,但没有可用的 Git
 交付链即刻可用,无需在应用里配任何令牌;2) 在设置→远程仓库为该仓库配置访问令牌。\
 把这两条路原样告诉用户;在用户完成其一之前,不要再调用 deliver_changes 重试。";
 
+fn no_remote_channel_message(origin_url: Option<&str>) -> String {
+    if let Some(origin) = origin_url {
+        if let Some(project) = parse_gitlab_project_path(origin) {
+            return format!(
+                "已提交并推送,但 GitLab 项目 {project} 没有可用的 merge request 通道。\
+请在 设置→远程仓库 配置该 GitLab/企业 GitLab 的 token,或启用仓库 delivery provider hook/plugin;\
+不要把这当成缺 GitHub 通道,在 GitLab token/provider 配好前不要再调用 deliver_changes 重试。"
+            );
+        }
+    }
+    NO_TOKEN_PR_MESSAGE.to_string()
+}
+
 fn ceiling_label(ceiling: DeliveryCeiling) -> &'static str {
     match ceiling {
         DeliveryCeiling::Off => "off",
@@ -551,37 +572,68 @@ pub fn delivery_readiness_with_gh(
     if settings.delivery_ceiling == DeliveryCeiling::Off {
         return None;
     }
-    let owner_repo = origin_url.and_then(parse_owner_repo)?;
-    if gh_available {
-        return Some(format!(
-            "\n\n# Delivery capability\n\
-             Repo {owner_repo}: a logged-in GitHub CLI is available — the delivery chain \
-             (PR/CI/merge/release, up to ceiling {}) works with ZERO app-side token setup. \
-             Never ask the user to configure a remote token while gh is available.",
-            ceiling_label(settings.delivery_ceiling)
-        ));
+    let origin = origin_url?;
+    if let Some(owner_repo) = parse_owner_repo(origin) {
+        if gh_available {
+            return Some(format!(
+                "\n\n# Delivery capability\n\
+                 Repo {owner_repo}: a logged-in GitHub CLI is available — the delivery chain \
+                 (PR/CI/merge/release, up to ceiling {}) works with ZERO app-side token setup. \
+                 Never ask the user to configure a remote token while gh is available.",
+                ceiling_label(settings.delivery_ceiling)
+            ));
+        }
+        let has_github_remote = configured_remote_for(settings, GitProvider::Github, &owner_repo)
+            .and_then(|r| crate::config::settings::resolve_git_remote_token(r).ok())
+            .is_some();
+        return Some(if has_github_remote {
+            format!(
+                "\n\n# Delivery capability\n\
+                 Repo {owner_repo} has GitHub credentials configured; delivery ceiling = {}. \
+                 Code work ends by calling deliver_changes once tests are green — it carries the \
+                 work up to that ceiling automatically.",
+                ceiling_label(settings.delivery_ceiling)
+            )
+        } else {
+            format!(
+                "\n\n# Delivery capability (BROKEN — surface early)\n\
+                 The delivery chain for {owner_repo} cannot open a PR: no logged-in GitHub CLI \
+                 and no configured token. If this task involves delivering code, say so in your \
+                 FIRST reply and offer both fixes — preferred: run `gh auth login` once in a \
+                 terminal (zero app-side config); alternative: 设置→远程仓库 token setup — and \
+                 do NOT call deliver_changes until one of them is done. Local work (tests, \
+                 edits, commits) can proceed in the meantime."
+            )
+        });
     }
-    let has_github_remote = settings
-        .git_remotes
-        .iter()
-        .any(|r| matches!(r.provider, GitProvider::Github));
-    Some(if has_github_remote {
+
+    let project = parse_gitlab_project_path(origin)?;
+    let has_gitlab_remote = configured_remote_for(settings, GitProvider::Gitlab, &project)
+        .and_then(|r| crate::config::settings::resolve_git_remote_token(r).ok())
+        .is_some();
+    let has_delivery_provider_hook = !delivery_provider_hooks_for(settings, origin).is_empty();
+    if !host_looks_like_gitlab(origin) && !has_gitlab_remote && !has_delivery_provider_hook {
+        return None;
+    }
+    Some(if has_gitlab_remote {
         format!(
             "\n\n# Delivery capability\n\
-             Repo {owner_repo} has GitHub credentials configured; delivery ceiling = {}. \
-             Code work ends by calling deliver_changes once tests are green — it carries the \
-             work up to that ceiling automatically.",
+             GitLab project {project} has credentials configured; delivery ceiling = {}. \
+             Code work ends by calling deliver_changes once tests are green — it opens or reuses \
+             a GitLab merge request and carries the work up to the configured boundary. \
+             Repository-specific CI/release automation can be supplied by a delivery provider \
+             hook/plugin when the built-in GitLab adapter is not enough.",
             ceiling_label(settings.delivery_ceiling)
         )
     } else {
         format!(
             "\n\n# Delivery capability (BROKEN — surface early)\n\
-             The delivery chain for {owner_repo} cannot open a PR: no logged-in GitHub CLI \
-             and no configured token. If this task involves delivering code, say so in your \
-             FIRST reply and offer both fixes — preferred: run `gh auth login` once in a \
-             terminal (zero app-side config); alternative: 设置→远程仓库 token setup — and \
-             do NOT call deliver_changes until one of them is done. Local work (tests, \
-             edits, commits) can proceed in the meantime."
+             The delivery chain for GitLab project {project} cannot open a merge request: no \
+             configured GitLab remote token/provider. If this task involves delivering code, \
+             say so in your FIRST reply and ask for 设置→远程仓库 token setup, or a repository \
+             delivery provider hook/plugin for this enterprise GitLab. Do NOT treat this as a \
+             missing GitHub channel and do NOT call deliver_changes until one is configured. \
+             Local work (tests, edits, commits) can proceed in the meantime."
         )
     })
 }
@@ -611,8 +663,7 @@ fn finish(mut outcome: DeliveryOutcome, branch: &str, ceiling: DeliveryCeiling) 
     // A partial ceiling must explain WHY merge/release didn't happen. Avoid
     // implying the user explicitly configured the boundary; defaults and legacy
     // settings can create one too.
-    if outcome.final_state == "delivered"
-        && ceiling.rank() < DeliveryCeiling::ThroughRelease.rank()
+    if outcome.final_state == "delivered" && ceiling.rank() < DeliveryCeiling::ThroughRelease.rank()
     {
         outcome.summary.push_str(&format!(
             "\n本次交付停止在边界({});未继续合并/发布。若本任务应以上线为完成,请继续调用 deliver_changes(through_release) 或把自动交付边界设为 through_release。",
@@ -652,6 +703,245 @@ pub enum RemoteKind {
     GhCli,
     /// The portable token+REST client from configured git_remotes.
     RestToken,
+}
+
+/// Delivery remote families known by the state machine. `Hook` is the extension
+/// seam for enterprise/self-hosted systems whose MR API is supplied by a plugin
+/// or repository hook instead of CodeFactory's built-in GitHub/GitLab adapters.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryProviderKind {
+    Github,
+    Gitlab,
+    GhCli,
+    Hook(String),
+}
+
+/// Description returned by a delivery provider resolver. Tests and future
+/// plugins use this to prove provider selection without requiring network I/O.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryRemoteDescriptor {
+    pub provider: DeliveryProviderKind,
+    pub repo: String,
+    pub default_branch: String,
+    pub missing_credentials_message: Option<String>,
+}
+
+#[cfg(test)]
+pub struct DeliveryRemoteContext<'a> {
+    pub origin_url: String,
+    pub default_branch: String,
+    pub settings: &'a crate::config::settings::Settings,
+}
+
+#[cfg(test)]
+type DeliveryRemoteResolver = Box<
+    dyn for<'a> Fn(&DeliveryRemoteContext<'a>) -> Option<DeliveryRemoteDescriptor> + Send + Sync,
+>;
+
+#[cfg(test)]
+#[derive(Default)]
+pub struct DeliveryRemoteRegistry {
+    resolvers: Vec<DeliveryRemoteResolver>,
+}
+
+#[cfg(test)]
+impl DeliveryRemoteRegistry {
+    pub fn register<F>(&mut self, resolver: F)
+    where
+        F: for<'a> Fn(&DeliveryRemoteContext<'a>) -> Option<DeliveryRemoteDescriptor>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.resolvers.push(Box::new(resolver));
+    }
+
+    pub fn resolve(&self, ctx: &DeliveryRemoteContext<'_>) -> Option<DeliveryRemoteDescriptor> {
+        self.resolvers.iter().find_map(|resolver| resolver(ctx))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryProviderHook {
+    pub id: String,
+    pub command: String,
+    pub cwd: Option<String>,
+}
+
+pub fn delivery_provider_hooks_for(
+    settings: &crate::config::settings::Settings,
+    origin_url: &str,
+) -> Vec<DeliveryProviderHook> {
+    settings
+        .hooks
+        .iter()
+        .filter(|hook| hook.enabled && hook.event == "delivery_provider")
+        .filter(|hook| {
+            hook.filter
+                .as_deref()
+                .map(|filter| origin_url.contains(filter))
+                .unwrap_or(true)
+        })
+        .filter_map(|hook| match &hook.action {
+            crate::commands::hooks::HookAction::RunCommand { command, cwd } => {
+                Some(DeliveryProviderHook {
+                    id: hook.id.clone(),
+                    command: command.clone(),
+                    cwd: cwd.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct HookPrResponse {
+    number: u64,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HookStatusResponse {
+    status: String,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HookOkResponse {
+    #[allow(dead_code)]
+    ok: Option<bool>,
+    detail: Option<String>,
+}
+
+pub struct HookRemote {
+    id: String,
+    command: String,
+    cwd: PathBuf,
+}
+
+impl HookRemote {
+    pub fn new(id: String, command: String, cwd: PathBuf) -> Self {
+        Self { id, command, cwd }
+    }
+
+    fn run_json(&self, payload: serde_json::Value) -> Result<serde_json::Value, String> {
+        let shell = command_env::shell_invocation(&self.command);
+        let mut child = Command::new(shell.program)
+            .no_window()
+            .args(shell.args)
+            .current_dir(&self.cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("delivery provider hook '{}' failed to start: {e}", self.id))?;
+        {
+            use std::io::Write;
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| format!("delivery provider hook '{}' has no stdin", self.id))?;
+            stdin
+                .write_all(payload.to_string().as_bytes())
+                .map_err(|e| format!("delivery provider hook '{}' stdin failed: {e}", self.id))?;
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("delivery provider hook '{}' wait failed: {e}", self.id))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !out.status.success() {
+            return Err(format!(
+                "delivery provider hook '{}' exited {}: {}",
+                self.id,
+                out.status.code().unwrap_or(-1),
+                stderr
+            ));
+        }
+        let value: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
+            format!(
+                "delivery provider hook '{}' returned non-JSON stdout: {e}: {}",
+                self.id, stdout
+            )
+        })?;
+        if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+            return Err(error.to_string());
+        }
+        Ok(value)
+    }
+}
+
+impl DeliveryRemote for HookRemote {
+    async fn open_or_get_pr(
+        &self,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<(u64, String), String> {
+        let value = self.run_json(json!({
+            "action": "open_or_get_pr",
+            "title": title,
+            "body": body,
+            "head": head,
+            "base": base,
+        }))?;
+        let response: HookPrResponse = serde_json::from_value(value).map_err(|e| {
+            format!(
+                "delivery provider hook '{}' PR response invalid: {e}",
+                self.id
+            )
+        })?;
+        Ok((response.number, response.url))
+    }
+
+    async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
+        let value = self.run_json(json!({ "action": "ci_status", "sha": sha }))?;
+        let response: HookStatusResponse = serde_json::from_value(value).map_err(|e| {
+            format!(
+                "delivery provider hook '{}' CI response invalid: {e}",
+                self.id
+            )
+        })?;
+        Ok(match response.status.as_str() {
+            "success" => CiStatus::Success,
+            "pending" => CiStatus::Pending,
+            "none" => CiStatus::None,
+            "failure" => CiStatus::Failure(response.detail.unwrap_or_else(|| "failure".into())),
+            other => CiStatus::Failure(format!("unknown hook ci status: {other}")),
+        })
+    }
+
+    async fn merge_pr(&self, number: u64, method: MergeMethod) -> Result<(), String> {
+        let value = self.run_json(json!({
+            "action": "merge_pr",
+            "number": number,
+            "method": method.as_str(),
+        }))?;
+        let _response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
+            format!(
+                "delivery provider hook '{}' merge response invalid: {e}",
+                self.id
+            )
+        })?;
+        Ok(())
+    }
+
+    async fn trigger_release(&self) -> Result<String, String> {
+        let value = self.run_json(json!({ "action": "trigger_release" }))?;
+        let response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
+            format!(
+                "delivery provider hook '{}' release response invalid: {e}",
+                self.id
+            )
+        })?;
+        Ok(response
+            .detail
+            .unwrap_or_else(|| format!("delivery provider hook '{}' triggered release", self.id)))
+    }
 }
 
 /// gh CLI first (the user already authenticated it once, system-wide), the
@@ -735,11 +1025,16 @@ fn gh_hosts_file_indicates_authenticated() -> bool {
 
 fn gh_pr_create_args(title: &str, body: &str, head: &str, base: &str) -> Vec<String> {
     vec![
-        "pr".into(), "create".into(),
-        "--title".into(), title.into(),
-        "--body".into(), body.into(),
-        "--head".into(), head.into(),
-        "--base".into(), base.into(),
+        "pr".into(),
+        "create".into(),
+        "--title".into(),
+        title.into(),
+        "--body".into(),
+        body.into(),
+        "--head".into(),
+        head.into(),
+        "--base".into(),
+        base.into(),
     ]
 }
 
@@ -754,8 +1049,11 @@ fn gh_pr_merge_args(number: u64, method: MergeMethod) -> Vec<String> {
 
 fn gh_workflow_run_args(workflow: &str, git_ref: &str) -> Vec<String> {
     vec![
-        "workflow".into(), "run".into(), workflow.into(),
-        "--ref".into(), git_ref.into(),
+        "workflow".into(),
+        "run".into(),
+        workflow.into(),
+        "--ref".into(),
+        git_ref.into(),
     ]
 }
 
@@ -777,7 +1075,12 @@ pub fn gh_remote_for(cwd: &Path) -> Option<GhCliRemote> {
     let repo = parse_owner_repo(&origin)?;
     let default_branch = git(
         Path::new(&root),
-        &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
     )
     .ok()
     .and_then(|s| s.rsplit('/').next().map(String::from))
@@ -815,12 +1118,18 @@ impl DeliveryRemote for GhCliRemote {
     ) -> Result<(u64, String), String> {
         // Reuse an open PR for this head first — idempotence contract.
         let existing = self.gh(&[
-            "pr".into(), "list".into(),
-            "--head".into(), head.into(),
-            "--base".into(), base.into(),
-            "--state".into(), "open".into(),
-            "--json".into(), "number,url".into(),
-            "--limit".into(), "1".into(),
+            "pr".into(),
+            "list".into(),
+            "--head".into(),
+            head.into(),
+            "--base".into(),
+            base.into(),
+            "--state".into(),
+            "open".into(),
+            "--json".into(),
+            "number,url".into(),
+            "--limit".into(),
+            "1".into(),
         ])?;
         if let Ok(list) = serde_json::from_str::<serde_json::Value>(&existing) {
             if let Some(pr) = list.as_array().and_then(|a| a.first()) {
@@ -831,8 +1140,11 @@ impl DeliveryRemote for GhCliRemote {
         }
         self.gh(&gh_pr_create_args(title, body, head, base))?;
         let created = self.gh(&[
-            "pr".into(), "view".into(), head.into(),
-            "--json".into(), "number,url".into(),
+            "pr".into(),
+            "view".into(),
+            head.into(),
+            "--json".into(),
+            "number,url".into(),
         ])?;
         let v: serde_json::Value = serde_json::from_str(&created)
             .map_err(|e| format!("gh pr view returned non-JSON: {e}"))?;
@@ -864,7 +1176,11 @@ impl DeliveryRemote for GhCliRemote {
                 return Ok(CiStatus::Failure(format!("{name}: {conclusion}")));
             }
         }
-        Ok(if pending { CiStatus::Pending } else { CiStatus::Success })
+        Ok(if pending {
+            CiStatus::Pending
+        } else {
+            CiStatus::Success
+        })
     }
 
     async fn merge_pr(&self, number: u64, method: MergeMethod) -> Result<(), String> {
@@ -872,16 +1188,21 @@ impl DeliveryRemote for GhCliRemote {
     }
 
     async fn trigger_release(&self) -> Result<String, String> {
-        self.gh(&gh_workflow_run_args(&self.release_workflow, &self.default_branch))
-            .map(|_| format!("已通过 gh 触发发布工作流 {}", self.release_workflow))
+        self.gh(&gh_workflow_run_args(
+            &self.release_workflow,
+            &self.default_branch,
+        ))
+        .map(|_| format!("已通过 gh 触发发布工作流 {}", self.release_workflow))
     }
 }
 
 /// Static-dispatch wrapper so `deliver` keeps its generic signature while the
 /// call site picks gh-vs-REST at runtime.
 pub enum EitherRemote {
+    Hook(HookRemote),
     Gh(GhCliRemote),
-    Rest(GithubRemote),
+    Github(GithubRemote),
+    Gitlab(GitlabRemote),
 }
 
 impl DeliveryRemote for EitherRemote {
@@ -893,45 +1214,72 @@ impl DeliveryRemote for EitherRemote {
         base: &str,
     ) -> Result<(u64, String), String> {
         match self {
+            EitherRemote::Hook(r) => r.open_or_get_pr(title, body, head, base).await,
             EitherRemote::Gh(r) => r.open_or_get_pr(title, body, head, base).await,
-            EitherRemote::Rest(r) => r.open_or_get_pr(title, body, head, base).await,
+            EitherRemote::Github(r) => r.open_or_get_pr(title, body, head, base).await,
+            EitherRemote::Gitlab(r) => r.open_or_get_pr(title, body, head, base).await,
         }
     }
     async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
         match self {
+            EitherRemote::Hook(r) => r.ci_status(sha).await,
             EitherRemote::Gh(r) => r.ci_status(sha).await,
-            EitherRemote::Rest(r) => r.ci_status(sha).await,
+            EitherRemote::Github(r) => r.ci_status(sha).await,
+            EitherRemote::Gitlab(r) => r.ci_status(sha).await,
         }
     }
     async fn merge_pr(&self, number: u64, method: MergeMethod) -> Result<(), String> {
         match self {
+            EitherRemote::Hook(r) => r.merge_pr(number, method).await,
             EitherRemote::Gh(r) => r.merge_pr(number, method).await,
-            EitherRemote::Rest(r) => r.merge_pr(number, method).await,
+            EitherRemote::Github(r) => r.merge_pr(number, method).await,
+            EitherRemote::Gitlab(r) => r.merge_pr(number, method).await,
         }
     }
     async fn trigger_release(&self) -> Result<String, String> {
         match self {
+            EitherRemote::Hook(r) => r.trigger_release().await,
             EitherRemote::Gh(r) => r.trigger_release().await,
-            EitherRemote::Rest(r) => r.trigger_release().await,
+            EitherRemote::Github(r) => r.trigger_release().await,
+            EitherRemote::Gitlab(r) => r.trigger_release().await,
         }
     }
 }
 
+fn hook_remote_for(cwd: &Path, settings: &crate::config::settings::Settings) -> Option<HookRemote> {
+    let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
+    let origin = git(Path::new(&root), &["remote", "get-url", "origin"]).ok()?;
+    let hook = delivery_provider_hooks_for(settings, &origin)
+        .into_iter()
+        .next()?;
+    let cwd = hook
+        .cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(root));
+    Some(HookRemote::new(hook.id, hook.command, cwd))
+}
 
-/// Resolve the best available remote for `cwd`: logged-in gh CLI first, the
-/// configured token+REST client second, `None` → delivery blocks with
-/// guidance covering BOTH setup paths.
+/// Resolve the best available remote for `cwd`: configured delivery provider
+/// hooks first, then logged-in gh CLI for GitHub, then built-in REST tokens.
+/// `None` → delivery blocks with provider-aware guidance.
 pub fn resolve_delivery_remote(
     cwd: &Path,
     settings: &crate::config::settings::Settings,
 ) -> Option<EitherRemote> {
-    let gh_ok = gh_cli_available();
-    let rest = github_remote_for(cwd, settings);
-    match resolve_remote_kind(gh_ok, rest.is_some()) {
+    if let Some(hook) = hook_remote_for(cwd, settings) {
+        return Some(EitherRemote::Hook(hook));
+    }
+    let gitlab = gitlab_remote_for(cwd, settings);
+    let github = github_remote_for(cwd, settings);
+    let gh_ok = github.is_some() && gh_cli_available();
+    match resolve_remote_kind(gh_ok, github.is_some() || gitlab.is_some()) {
         Some(RemoteKind::GhCli) => gh_remote_for(cwd)
             .map(EitherRemote::Gh)
-            .or(rest.map(EitherRemote::Rest)),
-        Some(RemoteKind::RestToken) => rest.map(EitherRemote::Rest),
+            .or(github.map(EitherRemote::Github))
+            .or(gitlab.map(EitherRemote::Gitlab)),
+        Some(RemoteKind::RestToken) => github
+            .map(EitherRemote::Github)
+            .or(gitlab.map(EitherRemote::Gitlab)),
         None => None,
     }
 }
@@ -950,18 +1298,96 @@ pub struct GithubRemote {
 /// Extract `owner/name` from a GitHub remote URL (https or ssh).
 fn parse_owner_repo(url: &str) -> Option<String> {
     let u = url.trim().trim_end_matches(".git");
-    let after_host = if let Some(idx) = u.find("github.com") {
-        &u[idx + "github.com".len()..]
+    let path = if let Some(rest) = u.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = u.strip_prefix("ssh://git@github.com/") {
+        rest
+    } else if let Some(rest) = u.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = u.strip_prefix("http://github.com/") {
+        rest
     } else {
         return None;
     };
-    let path = after_host.trim_start_matches([':', '/']);
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if parts.len() >= 2 {
         Some(format!("{}/{}", parts[0], parts[1]))
     } else {
         None
     }
+}
+
+fn remote_host(url: &str) -> Option<String> {
+    let u = url.trim();
+    if let Some(rest) = u.strip_prefix("git@") {
+        return rest.split_once(':').map(|(host, _)| host.to_ascii_lowercase());
+    }
+    if let Some(rest) = u.strip_prefix("ssh://git@") {
+        return rest.split_once('/').map(|(host, _)| host.to_ascii_lowercase());
+    }
+    if let Some(rest) = u.strip_prefix("https://") {
+        return rest.split_once('/').map(|(host, _)| host.to_ascii_lowercase());
+    }
+    if let Some(rest) = u.strip_prefix("http://") {
+        return rest.split_once('/').map(|(host, _)| host.to_ascii_lowercase());
+    }
+    None
+}
+
+fn host_looks_like_gitlab(url: &str) -> bool {
+    remote_host(url)
+        .map(|host| host == "gitlab.com" || host.starts_with("gitlab.") || host.contains(".gitlab."))
+        .unwrap_or(false)
+}
+
+/// Extract a GitLab project path from SaaS or enterprise GitLab remotes. Unlike
+/// GitHub's fixed `owner/repo`, GitLab projects can live under nested groups, so
+/// every path segment after the host belongs to the project id.
+fn parse_gitlab_project_path(url: &str) -> Option<String> {
+    let u = url.trim().trim_end_matches(".git");
+    let path = if let Some(rest) = u.strip_prefix("git@") {
+        rest.split_once(':')?.1
+    } else if let Some(rest) = u.strip_prefix("ssh://git@") {
+        let (_, path) = rest.split_once('/')?;
+        path
+    } else if let Some(rest) = u.strip_prefix("https://") {
+        let (_, path) = rest.split_once('/')?;
+        path
+    } else if let Some(rest) = u.strip_prefix("http://") {
+        let (_, path) = rest.split_once('/')?;
+        path
+    } else {
+        return None;
+    };
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() >= 2 {
+        Some(parts.join("/"))
+    } else {
+        None
+    }
+}
+
+fn configured_remote_for<'a>(
+    settings: &'a crate::config::settings::Settings,
+    provider: crate::config::settings::GitProvider,
+    repo: &str,
+) -> Option<&'a crate::config::settings::GitRemoteConfig> {
+    settings
+        .git_remotes
+        .iter()
+        .find(|r| r.provider == provider && r.default_repo.as_deref() == Some(repo))
+        .or_else(|| {
+            let mut candidates = settings
+                .git_remotes
+                .iter()
+                .filter(|r| r.provider == provider);
+            let first = candidates.next()?;
+            if candidates.next().is_none() {
+                Some(first)
+            } else {
+                None
+            }
+        })
 }
 
 /// Build a [`GithubRemote`] for `cwd` from the user's configured git remote
@@ -1016,6 +1442,74 @@ pub fn github_remote_for(
         default_branch,
         release_workflow: "auto-release.yml".to_string(),
     })
+}
+
+/// Concrete [`DeliveryRemote`] over GitLab's Merge Request REST API. GitLab CI
+/// polling and release orchestration vary widely across enterprises, so the
+/// built-in adapter guarantees MR creation/reuse and merge; CI/release are
+/// intentionally hook/provider extension points until a repo config supplies
+/// those semantics.
+pub struct GitlabRemote {
+    client: crate::git_remote::client::RemoteGitClient,
+    repo: String,
+}
+
+pub fn gitlab_remote_for(
+    cwd: &Path,
+    settings: &crate::config::settings::Settings,
+) -> Option<GitlabRemote> {
+    use crate::config::settings::GitProvider;
+    let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
+    let origin = git(Path::new(&root), &["remote", "get-url", "origin"]).ok()?;
+    let repo = parse_gitlab_project_path(&origin)?;
+    let remote = configured_remote_for(settings, GitProvider::Gitlab, &repo)?;
+    let token = crate::config::settings::resolve_git_remote_token(remote).ok()?;
+    let client = crate::git_remote::client::RemoteGitClient::new(
+        &remote.base_url,
+        &token,
+        remote.provider.clone(),
+    );
+    Some(GitlabRemote { client, repo })
+}
+
+impl DeliveryRemote for GitlabRemote {
+    async fn open_or_get_pr(
+        &self,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<(u64, String), String> {
+        if let Ok(mrs) = crate::git_remote::gitlab::list_prs(&self.client, &self.repo, "open").await
+        {
+            if let Some(mr) = mrs.into_iter().find(|mr| mr.head_branch == head) {
+                return Ok((mr.number, mr.url));
+            }
+        }
+        let mr = crate::git_remote::gitlab::create_pr(
+            &self.client,
+            &self.repo,
+            title,
+            body,
+            head,
+            base,
+            false,
+        )
+        .await?;
+        Ok((mr.number, mr.url))
+    }
+
+    async fn ci_status(&self, _sha: &str) -> Result<CiStatus, String> {
+        Ok(CiStatus::None)
+    }
+
+    async fn merge_pr(&self, number: u64, method: MergeMethod) -> Result<(), String> {
+        crate::git_remote::gitlab::merge_pr(&self.client, &self.repo, number, method.as_str()).await
+    }
+
+    async fn trigger_release(&self) -> Result<String, String> {
+        Err("GitLab release dispatch is not built in; configure a delivery provider hook/plugin for this repository's release pipeline.".into())
+    }
 }
 
 impl DeliveryRemote for GithubRemote {
@@ -1219,8 +1713,8 @@ mod tests {
                 name: "github".into(),
                 provider: crate::config::settings::GitProvider::Github,
                 base_url: "https://api.github.com".into(),
-                token_ref: None,
-                token: "t".into(),
+                token_ref: Some("cf.test.gitlab.readiness".into()),
+                token: "".into(),
                 default_repo: Some("BumStill/CodeFactory".into()),
             });
         let note = delivery_readiness_with_gh(
@@ -1234,12 +1728,11 @@ mod tests {
     }
 
     #[test]
-    fn readiness_note_stays_silent_when_off_or_not_github() {
+    fn readiness_note_stays_silent_when_off_or_unrecognized_origin() {
         let settings = crate::config::settings::Settings::default();
         assert!(delivery_readiness_with_gh(None, &settings, false).is_none());
         assert!(
-            delivery_readiness_with_gh(Some("https://gitlab.com/x/y.git"), &settings, false)
-                .is_none()
+            delivery_readiness_with_gh(Some("file:///tmp/repo.git"), &settings, false).is_none()
         );
 
         let mut off = crate::config::settings::Settings::default();
@@ -1250,6 +1743,57 @@ mod tests {
             false,
         )
         .is_none());
+    }
+
+    #[test]
+    fn readiness_note_supports_configured_enterprise_gitlab_origin() {
+        let mut settings = crate::config::settings::Settings::default();
+        settings
+            .git_remotes
+            .push(crate::config::settings::GitRemoteConfig {
+                id: "gl1".into(),
+                name: "corp-gitlab".into(),
+                provider: crate::config::settings::GitProvider::Gitlab,
+                base_url: "https://gitlab.corp.example/api/v4".into(),
+                token_ref: Some("cf.test.gitlab.readiness".into()),
+                token: "".into(),
+                default_repo: Some("platform/app".into()),
+            });
+
+        crate::secrets::set_key("cf.test.gitlab.readiness", "token").unwrap();
+        let note = delivery_readiness_with_gh(
+            Some("git@gitlab.corp.example:platform/app.git"),
+            &settings,
+            false,
+        )
+        .expect("configured GitLab origin should advertise delivery capability");
+
+        assert!(note.contains("GitLab"));
+        assert!(note.contains("merge request"));
+        assert!(note.contains("deliver_changes"));
+        assert!(
+            !note.contains("没有可用的 GitHub 通道"),
+            "GitLab remotes must not be reported as missing GitHub credentials"
+        );
+    }
+
+    #[test]
+    fn readiness_note_for_unconfigured_gitlab_origin_names_gitlab_setup_not_github_only() {
+        let settings = crate::config::settings::Settings::default();
+        let note = delivery_readiness_with_gh(
+            Some("https://gitlab.corp.example/platform/app.git"),
+            &settings,
+            false,
+        )
+        .expect("GitLab origin without token should produce an early blocker note");
+
+        assert!(note.contains("GitLab"));
+        assert!(note.contains("merge request"));
+        assert!(note.contains("远程仓库 token"));
+        assert!(
+            !note.contains("gh auth login"),
+            "enterprise GitLab setup must not tell the user that GitHub CLI auth fixes the MR path"
+        );
     }
 
     #[test]
@@ -1281,7 +1825,10 @@ mod tests {
         use super::RemoteKind;
         assert_eq!(resolve_remote_kind(true, true), Some(RemoteKind::GhCli));
         assert_eq!(resolve_remote_kind(true, false), Some(RemoteKind::GhCli));
-        assert_eq!(resolve_remote_kind(false, true), Some(RemoteKind::RestToken));
+        assert_eq!(
+            resolve_remote_kind(false, true),
+            Some(RemoteKind::RestToken)
+        );
         assert_eq!(resolve_remote_kind(false, false), None);
     }
 
@@ -1290,7 +1837,9 @@ mod tests {
         let create = gh_pr_create_args("t", "b", "feat/x", "main");
         assert_eq!(
             create,
-            vec!["pr", "create", "--title", "t", "--body", "b", "--head", "feat/x", "--base", "main"]
+            vec![
+                "pr", "create", "--title", "t", "--body", "b", "--head", "feat/x", "--base", "main"
+            ]
         );
         let merge = gh_pr_merge_args(42, MergeMethod::Squash);
         assert_eq!(merge, vec!["pr", "merge", "42", "--squash"]);
@@ -1305,6 +1854,20 @@ mod tests {
     fn no_token_message_offers_the_gh_cli_path_first() {
         assert!(NO_TOKEN_PR_MESSAGE.contains("gh auth login"));
         assert!(NO_TOKEN_PR_MESSAGE.contains("远程仓库"));
+    }
+
+    #[test]
+    fn no_remote_channel_message_is_provider_aware_for_gitlab() {
+        let message = no_remote_channel_message(Some("git@gitlab.corp.example:platform/app.git"));
+        assert!(message.contains("GitLab 项目 platform/app"));
+        assert!(message.contains("merge request"));
+        assert!(message.contains("hook/plugin"));
+        assert!(!message.contains("没有可用的 GitHub 通道"));
+        assert!(!message.contains("gh auth login"));
+
+        let github_message =
+            no_remote_channel_message(Some("git@github.com:BumStill/CodeFactory.git"));
+        assert!(github_message.contains("GitHub 通道"));
     }
 
     /// Real-runtime smoke: with a logged-in gh on this machine, ci_status on
@@ -1343,6 +1906,238 @@ mod tests {
             Some("BumStill/CodeFactory")
         );
         assert_eq!(parse_owner_repo("https://gitlab.com/x/y.git"), None);
+    }
+
+    #[test]
+    fn unrecognized_non_github_hosts_do_not_get_gitlab_readiness_by_default() {
+        let settings = crate::config::settings::Settings::default();
+        assert!(
+            delivery_readiness_with_gh(
+                Some("https://git.example.com/platform/app.git"),
+                &settings,
+                false,
+            )
+            .is_none(),
+            "generic private Git hosts should use delivery_provider hooks instead of being mislabeled as GitLab"
+        );
+    }
+
+    #[test]
+    fn parse_gitlab_project_path_handles_saas_enterprise_https_and_ssh() {
+        assert_eq!(
+            parse_gitlab_project_path("https://gitlab.com/group/sub/project.git").as_deref(),
+            Some("group/sub/project")
+        );
+        assert_eq!(
+            parse_gitlab_project_path("git@gitlab.corp.example:platform/app.git").as_deref(),
+            Some("platform/app")
+        );
+        assert_eq!(
+            parse_gitlab_project_path("ssh://git@gitlab.corp.example/platform/app.git").as_deref(),
+            Some("platform/app")
+        );
+    }
+
+    #[test]
+    fn remote_provider_hook_can_override_built_in_resolution() {
+        let mut registry = DeliveryRemoteRegistry::default();
+        registry.register(|ctx| {
+            if ctx.origin_url.contains("git.corp.example") {
+                Some(DeliveryRemoteDescriptor {
+                    provider: DeliveryProviderKind::Hook("corp-mr".into()),
+                    repo: "platform/app".into(),
+                    default_branch: "main".into(),
+                    missing_credentials_message: None,
+                })
+            } else {
+                None
+            }
+        });
+
+        let descriptor = registry
+            .resolve(&DeliveryRemoteContext {
+                origin_url: "ssh://git@git.corp.example/platform/app.git".into(),
+                default_branch: "main".into(),
+                settings: &crate::config::settings::Settings::default(),
+            })
+            .expect("hook should resolve custom enterprise remote");
+
+        assert_eq!(
+            descriptor.provider,
+            DeliveryProviderKind::Hook("corp-mr".into())
+        );
+        assert_eq!(descriptor.repo, "platform/app");
+    }
+
+    #[tokio::test]
+    async fn delivery_provider_hook_remote_executes_json_protocol() {
+        let root = make_repo("hook-remote");
+        let hook = root.join("provider.py");
+        std::fs::write(
+            &hook,
+            r#"#!/usr/bin/env python3
+import json, os, sys
+req=json.load(sys.stdin)
+action=req.get('action')
+if action == 'open_or_get_pr':
+    print(json.dumps({'number': 42, 'url': 'https://git.corp.example/platform/app/-/merge_requests/42'}))
+elif action == 'ci_status':
+    print(json.dumps({'status': 'success'}))
+elif action == 'merge_pr':
+    print(json.dumps({'ok': True}))
+elif action == 'trigger_release':
+    print(json.dumps({'detail': 'corp release dispatched'}))
+else:
+    print(json.dumps({'error': 'unknown action'}))
+    sys.exit(2)
+"#,
+        )
+        .unwrap();
+        let remote = HookRemote::new(
+            "corp-mr".into(),
+            format!("python3 {}", hook.display()),
+            root.clone(),
+        );
+
+        let (number, url) = remote
+            .open_or_get_pr("title", "body", "feat/x", "main")
+            .await
+            .expect("hook open_or_get_pr");
+        assert_eq!(number, 42);
+        assert!(url.contains("merge_requests/42"));
+        assert_eq!(remote.ci_status("abc123").await.unwrap(), CiStatus::Success);
+        remote.merge_pr(42, MergeMethod::Squash).await.unwrap();
+        assert_eq!(
+            remote.trigger_release().await.unwrap(),
+            "corp release dispatched"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn delivery_provider_hooks_are_discovered_from_settings_hooks() {
+        let mut settings = crate::config::settings::Settings::default();
+        settings.hooks.push(crate::commands::hooks::HookConfig {
+            id: "delivery-provider-corp".into(),
+            name: "Corp MR provider".into(),
+            event: "delivery_provider".into(),
+            action: crate::commands::hooks::HookAction::RunCommand {
+                command: "corp-delivery-provider".into(),
+                cwd: None,
+            },
+            enabled: true,
+            filter: Some("git.corp.example".into()),
+        });
+
+        let candidates =
+            delivery_provider_hooks_for(&settings, "ssh://git@git.corp.example/platform/app.git");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, "delivery-provider-corp");
+        assert_eq!(candidates[0].command, "corp-delivery-provider");
+    }
+
+    #[tokio::test]
+    async fn deliver_state_machine_uses_delivery_provider_hook_after_push() {
+        let root = feature_branch_repo("hook-deliver");
+        let hook = root.join("provider.py");
+        std::fs::write(
+            &hook,
+            r#"#!/usr/bin/env python3
+import json, sys
+req=json.load(sys.stdin)
+action=req.get('action')
+if action == 'open_or_get_pr':
+    print(json.dumps({'number': 77, 'url': 'https://git.corp.example/platform/app/-/merge_requests/77'}))
+elif action == 'ci_status':
+    print(json.dumps({'status': 'success'}))
+elif action == 'merge_pr':
+    print(json.dumps({'ok': True}))
+elif action == 'trigger_release':
+    print(json.dumps({'detail': 'corp release dispatched'}))
+else:
+    print(json.dumps({'error': 'unknown action'}))
+    sys.exit(2)
+"#,
+        )
+        .unwrap();
+        let remote = HookRemote::new(
+            "corp-mr".into(),
+            format!("python3 {}", hook.display()),
+            root.clone(),
+        );
+
+        let outcome = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            1,
+            &DeliverOpts {
+                title: Some("hook delivery".into()),
+                body: Some("body".into()),
+                requested_ceiling: None,
+                extra_excludes: vec![],
+            },
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(outcome.final_state, "delivered");
+        assert_eq!(outcome.pr_number, Some(77));
+        assert_eq!(
+            outcome.pr_url.as_deref(),
+            Some("https://git.corp.example/platform/app/-/merge_requests/77")
+        );
+        assert!(outcome
+            .steps
+            .iter()
+            .any(|s| s.step == "push" && s.status == "ok"));
+        assert!(outcome
+            .steps
+            .iter()
+            .any(|s| s.step == "pr" && s.detail.contains("PR/MR #77")));
+        assert!(outcome
+            .steps
+            .iter()
+            .any(|s| s.step == "merge" && s.status == "ok"));
+        assert!(outcome
+            .steps
+            .iter()
+            .any(|s| s.step == "release" && s.detail == "corp release dispatched"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn configured_gitlab_remote_is_resolved_from_enterprise_origin() {
+        let root = make_repo("gitlab-resolve");
+        let mut settings = crate::config::settings::Settings::default();
+        settings
+            .git_remotes
+            .push(crate::config::settings::GitRemoteConfig {
+                id: "gl1".into(),
+                name: "corp-gitlab".into(),
+                provider: crate::config::settings::GitProvider::Gitlab,
+                base_url: "https://gitlab.corp.example/api/v4".into(),
+                token_ref: Some("cf.test.gitlab.resolve".into()),
+                token: "".into(),
+                default_repo: Some("platform/app".into()),
+            });
+        crate::secrets::set_key("cf.test.gitlab.resolve", "token").unwrap();
+        git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@gitlab.corp.example:platform/app.git",
+            ],
+        )
+        .unwrap();
+
+        let remote = resolve_delivery_remote(&root, &settings)
+            .expect("GitLab remote token should resolve a delivery remote");
+        assert!(matches!(remote, EitherRemote::Gitlab(_)));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
     #[test]
@@ -1403,7 +2198,11 @@ mod tests {
             .args(["init", "--bare", "-q", origin.to_str().unwrap()])
             .status()
             .unwrap();
-        git(&root, &["remote", "add", "origin", origin.to_str().unwrap()]).unwrap();
+        git(
+            &root,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .unwrap();
         git(&root, &["push", "-q", "origin", "main"]).unwrap();
         git(&root, &["checkout", "-q", "-b", "feat/x"]).unwrap();
         std::fs::write(root.join("feature.rs"), "pub fn f() {}\n").unwrap();
