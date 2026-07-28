@@ -612,7 +612,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
 
     const unlisten = await onStream(id, (event: StreamEvent) => {
-      handleStreamEvent(event, id, assistantMsgId, set, get);
+      // Read the open bubble per event rather than closing over it: a steer
+      // splits the turn mid-flight, and a captured id would keep feeding the
+      // bubble that was closed at the split.
+      handleStreamEvent(event, id, get()._streamingMsgId[id] ?? assistantMsgId, set, get);
     });
     set((s) => ({ _unlisten: { ...s._unlisten, [id]: unlisten } }));
 
@@ -986,10 +989,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         },
       };
     });
+    // Position it the moment it is said, not when the loop gets to it. The
+    // wait for a round boundary can run for minutes, and without splitting now
+    // the agent's ongoing output keeps piling ABOVE the bubble — which is
+    // exactly the reported symptom: 引导气泡一直在最下边.
+    splitAssistantTurnAfterSteer(id, set);
     try {
       await invoke("queue_interjection", { sessionId: id, message: text });
     } catch (error) {
-      // Never leave a bubble claiming to be on its way when it isn't.
+      // Never leave a bubble claiming to be on its way when it isn't — and
+      // take the empty bubble the split opened for it with it.
       set((s) => {
         const prev = s.runtime[id];
         if (!prev) return {};
@@ -998,7 +1007,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             ...s.runtime,
             [id]: {
               ...prev,
-              messages: prev.messages.filter((m) => m.id !== msg.id),
+              messages: dropEmptyTail(prev.messages.filter((m) => m.id !== msg.id)),
               localMessages: prev.localMessages.filter((m) => m.id !== msg.id),
               revision: prev.revision + 1,
             },
@@ -1101,7 +1110,7 @@ function recoverUndeliveredSteers(
         ...s.runtime,
         [sessionId]: {
           ...prev,
-          messages: prev.messages.filter((m) => !ids.has(m.id)),
+          messages: dropEmptyTail(prev.messages.filter((m) => !ids.has(m.id))),
           localMessages: prev.localMessages.filter((m) => !ids.has(m.id)),
           revision: prev.revision + 1,
         },
@@ -1164,6 +1173,63 @@ function drainNextQueuedMessage(
   return true;
 }
 
+/// Drop a trailing assistant bubble that never received anything. The steer
+/// split opens one eagerly; if the steer is then withdrawn or never lands,
+/// that placeholder must not survive as a blank turn.
+function dropEmptyTail(messages: UIMessage[]): UIMessage[] {
+  const tail = messages[messages.length - 1];
+  const empty =
+    tail?.role === "assistant" &&
+    !tail.content &&
+    !(tail.toolCalls?.length ?? 0) &&
+    !(tail.segments?.length ?? 0);
+  return empty ? messages.slice(0, -1) : messages;
+}
+
+/// Freeze the assistant bubble that was streaming when the user spoke, and
+/// start a new one below their message, so the turn reads in the order it
+/// happened: work so far → what you said → what it did next.
+///
+/// Live-only. Hydrated history already interleaves correctly because the
+/// persisted rows carry the real ordering — this gap existed only on screen.
+function splitAssistantTurnAfterSteer(
+  sessionId: string,
+  set: (fn: (s: ChatStore) => Partial<ChatStore>) => void,
+) {
+  set((s) => {
+    const prev = s.runtime[sessionId];
+    const openId = s._streamingMsgId[sessionId];
+    if (!prev || !openId) return {};
+    const openIndex = prev.messages.findIndex((m) => m.id === openId);
+    // Nothing streamed yet this round: the empty bubble is still below the
+    // steer's insertion point, so there is nothing to split.
+    if (openIndex < 0) return {};
+
+    const now = Date.now();
+    const messages = prev.messages.slice();
+    const settled = messages[openIndex];
+    messages[openIndex] = {
+      ...settled,
+      durationMs: settled.durationMs ?? Math.max(0, now - settled.createdAt),
+    };
+    const resumed: UIMessage = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content: "",
+      createdAt: now,
+    };
+    messages.push(resumed);
+
+    return {
+      runtime: {
+        ...s.runtime,
+        [sessionId]: { ...prev, messages, revision: prev.revision + 1 },
+      },
+      _streamingMsgId: { ...s._streamingMsgId, [sessionId]: resumed.id },
+    };
+  });
+}
+
 function handleStreamEvent(
   event: StreamEvent,
   sessionId: string,
@@ -1187,6 +1253,7 @@ function handleStreamEvent(
       },
     };
   });
+
 
   // Queue drain — fire this session's next queued message as soon as its
   // stream lands in a terminal state (done OR error). We delay one tick so the

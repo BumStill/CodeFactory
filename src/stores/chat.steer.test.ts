@@ -142,6 +142,64 @@ describe("steering a run in flight", () => {
     expect(queue().map((item) => item.content)).toEqual(["第二条", "第三条"]);
   });
 
+  it("lands the bubble in position while it is still WAITING, not once delivered", async () => {
+    // The reported state: the turn was still running, the steer had not been
+    // drained yet, and output kept piling above the bubble — 一直在最下边.
+    // The bubble must take its place the moment it is said.
+    await useChatStore.getState().sendMessage("原始任务", SID);
+    streamMock.handler?.({ type: "text_delta", content: "先做第一步" });
+    await useChatStore.getState().steerRun("改用 chrome channel");
+
+    // Still pending — nothing has confirmed it.
+    expect(messages().find((m) => m.steerPending)?.content).toBe("改用 chrome channel");
+
+    // Work produced during the wait belongs BELOW it.
+    streamMock.handler?.({ type: "text_delta", content: "还在跑上一件事" });
+    expect(messages().map((m) => [m.role, m.content])).toEqual([
+      ["user", "原始任务"],
+      ["assistant", "先做第一步"],
+      ["user", "改用 chrome channel"],
+      ["assistant", "还在跑上一件事"],
+    ]);
+  });
+
+  it("puts work done after a steer BELOW it, not above", async () => {
+    // Field report: the live view read backwards. One growing assistant bubble
+    // plus a steer appended after it meant everything the agent did in
+    // response to the steer rendered above the steer that caused it.
+    await useChatStore.getState().sendMessage("原始任务", SID);
+    streamMock.handler?.({ type: "text_delta", content: "先做第一步" });
+    await useChatStore.getState().steerRun("改用 chrome channel");
+    streamMock.handler?.({
+      type: "steer_applied",
+      message_id: "db-1",
+      content: "改用 chrome channel",
+    });
+    streamMock.handler?.({ type: "text_delta", content: "好的，改用 chrome channel" });
+
+    const shape = messages().map((m) => [m.role, m.content]);
+    expect(shape).toEqual([
+      ["user", "原始任务"],
+      ["assistant", "先做第一步"],
+      ["user", "改用 chrome channel"],
+      ["assistant", "好的，改用 chrome channel"],
+    ]);
+  });
+
+  it("keeps feeding the new bubble after the split, not the closed one", async () => {
+    await useChatStore.getState().sendMessage("原始任务", SID);
+    streamMock.handler?.({ type: "text_delta", content: "第一段" });
+    await useChatStore.getState().steerRun("换个方向");
+    streamMock.handler?.({ type: "steer_applied", message_id: null, content: "换个方向" });
+    streamMock.handler?.({ type: "text_delta", content: "第二段" });
+    streamMock.handler?.({ type: "text_delta", content: "继续" });
+
+    const assistants = messages().filter((m) => m.role === "assistant");
+    expect(assistants.map((m) => m.content)).toEqual(["第一段", "第二段继续"]);
+    // The closed bubble is settled, not left looking mid-flight.
+    expect(assistants[0].durationMs).toBeGreaterThanOrEqual(0);
+  });
+
   it("leaves a confirmed steer alone when the turn ends", async () => {
     await useChatStore.getState().sendMessage("原始任务", SID);
     await useChatStore.getState().steerRun("已经送到了");
