@@ -41,3 +41,10 @@ rules:
     doc: AGENTS.md
     enforcement: review
     enforcer: AGENTS.md
+
+  - id: evidence-pack-retention
+    statement: "One-off timestamped evidence-pack snapshots don't accumulate in docs/evidence-packs/; only *-locked-* baselines are long-lived there."
+    doc: docs/evidence-packs/README.md
+    enforcement: check
+    enforcer: tools/governance/check_governance_rules.py
+    level: warn

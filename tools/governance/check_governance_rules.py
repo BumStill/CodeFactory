@@ -18,6 +18,7 @@ of validate_repo_governance_baseline.py.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -155,6 +156,35 @@ def check_design_doc_for_major(level: str) -> list[dict]:
     return []
 
 
+EVIDENCE_PACK_TIMESTAMP_RE = re.compile(r"T\d{2}-\d{2}-\d{2}Z")
+
+
+def check_evidence_pack_retention(level: str) -> list[dict]:
+    """Flag newly added one-off timestamped snapshots under docs/evidence-packs/."""
+    added = added_files()
+    offenders = [
+        p
+        for p in added
+        if p.startswith("docs/evidence-packs/")
+        and p.endswith(".md")
+        and "-locked-" not in p
+        and EVIDENCE_PACK_TIMESTAMP_RE.search(p)
+    ]
+    if not offenders:
+        return []
+    msg = (
+        f"{len(offenders)} new one-off timestamped evidence pack(s) added under "
+        f"docs/evidence-packs/ ({', '.join(offenders[:5])}"
+        f"{', ...' if len(offenders) > 5 else ''}). Per docs/evidence-packs/README.md, "
+        f"one-off iteration/regression snapshots belong outside the repo (or as a release "
+        f"asset) — only *-locked-* baselines should live here long-term."
+    )
+    if level == "error":
+        return [blocker(msg)]
+    annotate_warning(msg)
+    return []
+
+
 def main() -> int:
     failures: list[dict] = []
 
@@ -198,6 +228,8 @@ def main() -> int:
         # Run check-kind rules.
         if enf == "check" and rid == "design-doc-for-major":
             failures.extend(check_design_doc_for_major(rule.get("level", "warn")))
+        if enf == "check" and rid == "evidence-pack-retention":
+            failures.extend(check_evidence_pack_retention(rule.get("level", "warn")))
 
     if failures:
         print(f"governance-rules: {len(failures)} blocker(s)")
