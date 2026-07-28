@@ -206,6 +206,22 @@ export function applyCodexModels(models: CustomModel[]): Promise<void> {
   return invoke<void>("apply_codex_models", { models });
 }
 
+export interface BrowserSession {
+  session_id: string;
+  task_id?: string | null;
+  owner_session_id?: string | null;
+  updated_at_unix_secs: number;
+  expired: boolean;
+}
+
+export function listBrowserSessions(): Promise<BrowserSession[]> {
+  return invoke<BrowserSession[]>("list_browser_sessions");
+}
+
+export function closeBrowserSession(sessionId: string): Promise<void> {
+  return invoke<void>("close_browser_session", { sessionId });
+}
+
 // ── Benchmarks ─────────────────────────────────────────────────────────────
 
 export interface BenchmarkProfile {

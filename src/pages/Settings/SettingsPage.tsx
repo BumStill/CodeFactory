@@ -4,6 +4,7 @@ import {
   ArrowLeft, Plus, Trash2, Eye, EyeOff, Check, AlertCircle, ChevronDown,
   RefreshCw, Download, Package, LogIn, LogOut, Sparkles, Github, ExternalLink,
   ArrowRight, UserRound, GitPullRequestArrow, Gauge, Puzzle, ShieldCheck,
+  PanelTop,
 } from "lucide-react";
 import {
   invoke,
@@ -13,6 +14,8 @@ import {
   codexLoginOpen,
   codexLoginStatus,
   codexLoginCancel,
+  listBrowserSessions,
+  closeBrowserSession,
 } from "../../lib/tauri";
 import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
@@ -29,12 +32,13 @@ import type {
   CodexAccount,
   CodexLoginFlow,
   GithubCliCredentialStatus,
+  BrowserSession,
 } from "../../lib/tauri";
 import { CHATGPT_DEFAULT_MODEL, CHATGPT_ENDPOINT_KEY } from "../../lib/chatgptModels";
 import { syncChatGptCatalog } from "../../stores/chatgptCatalog";
 import { UsageDashboardSection } from "../../components/UsageDashboardSection";
 
-export type SettingsTab = "capabilities" | "usage" | "endpoints" | "permissions" | "general" | "hooks" | "remotes" | "appearance" | "about";
+export type SettingsTab = "capabilities" | "usage" | "endpoints" | "permissions" | "browser" | "general" | "hooks" | "remotes" | "appearance" | "about";
 
 interface Props {
   onBack: () => void;
@@ -666,6 +670,7 @@ export function SettingsPage({
     { id: "usage", label: "用量与预算" },
     { id: "endpoints", label: "端点" },
     { id: "permissions", label: "权限" },
+    { id: "browser", label: "浏览器会话" },
     { id: "general", label: "通用" },
     { id: "appearance", label: "外观" },
     { id: "hooks", label: "钩子" },
@@ -877,6 +882,9 @@ export function SettingsPage({
             </div>
           </div>
         )}
+
+        {/* ── Managed browser sessions ── */}
+        {tab === "browser" && <BrowserSessionsTab />}
 
         {/* ── General ── */}
         {tab === "general" && (
@@ -1134,6 +1142,117 @@ export function SettingsPage({
 
       </div>
     </div>
+  );
+}
+
+// ── BrowserSessionsTab ───────────────────────────────────────────────────────
+
+function BrowserSessionsTab() {
+  const [sessions, setSessions] = useState<BrowserSession[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [closing, setClosing] = useState<string | null>(null);
+  const [error, setError] = useState("");
+
+  const load = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setSessions(await listBrowserSessions());
+    } catch (loadError) {
+      setError(String(loadError));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  const close = async (sessionId: string) => {
+    setClosing(sessionId);
+    setError("");
+    try {
+      await closeBrowserSession(sessionId);
+      await load();
+    } catch (closeError) {
+      setError(String(closeError));
+    } finally {
+      setClosing(null);
+    }
+  };
+
+  return (
+    <section className="max-w-3xl space-y-4" aria-labelledby="browser-sessions-title">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 id="browser-sessions-title" className="text-base font-semibold text-gray-100">
+            受管浏览器会话
+          </h2>
+          <p className="mt-1 text-xs leading-5 text-gray-400">
+            这里只显示 CodeFactory 创建的自动化浏览器。结束会话不会关闭你的普通 Chrome 窗口。
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => void load()}
+          disabled={loading}
+          className="flex items-center gap-1 rounded border border-border bg-surface-1 px-2.5 py-1.5 text-xs text-gray-400 hover:text-gray-200 disabled:opacity-50"
+        >
+          <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+          刷新
+        </button>
+      </div>
+
+      {error && (
+        <div role="alert" className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-300">
+          {error}
+        </div>
+      )}
+
+      {!loading && sessions.length === 0 && (
+        <div className="flex items-center gap-3 rounded-xl border border-border bg-surface-1 p-4 text-sm text-gray-400">
+          <PanelTop size={18} className="text-emerald-400" />
+          当前没有活动的 CodeFactory 自动化浏览器。
+        </div>
+      )}
+
+      <div className="space-y-2">
+        {sessions.map((session) => (
+          <div
+            key={session.session_id}
+            className="flex items-center gap-3 rounded-xl border border-border bg-surface-1 p-3"
+          >
+            <span
+              aria-label={session.expired ? "租约已过期" : "会话活动中"}
+              className={`h-2.5 w-2.5 shrink-0 rounded-full ${
+                session.expired ? "bg-amber-400" : "bg-emerald-400"
+              }`}
+            />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-xs font-medium text-gray-200">
+                {session.task_id ? `任务 ${session.task_id}` : `会话 ${session.owner_session_id ?? "未知"}`}
+              </div>
+              <div className="mt-1 truncate font-mono text-[10px] text-gray-500">
+                {session.session_id}
+              </div>
+              <div className="mt-1 text-[10px] text-gray-500">
+                最后活动：{new Date(session.updated_at_unix_secs * 1000).toLocaleString()}
+              </div>
+            </div>
+            <button
+              type="button"
+              aria-label={`结束浏览器会话 ${session.session_id}`}
+              onClick={() => void close(session.session_id)}
+              disabled={closing === session.session_id}
+              className="rounded border border-red-500/30 px-2.5 py-1.5 text-xs text-red-700 hover:bg-red-500/10 disabled:opacity-50 dark:text-red-300"
+            >
+              {closing === session.session_id ? "正在结束…" : "结束会话"}
+            </button>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 

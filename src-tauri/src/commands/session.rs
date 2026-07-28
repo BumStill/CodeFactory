@@ -282,6 +282,7 @@ pub async fn delete_session(
     session_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
+    crate::tools::browser_session::close_all_for_owner_session(&session_id).await;
     let pool = state.db.read().await;
     sqlx::query("DELETE FROM sessions WHERE id = ?")
         .bind(&session_id)

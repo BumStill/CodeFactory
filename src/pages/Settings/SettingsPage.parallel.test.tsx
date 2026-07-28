@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
   codexAccount: vi.fn(),
   codexModels: vi.fn(),
   applyCodexModels: vi.fn(),
+  listBrowserSessions: vi.fn(),
+  closeBrowserSession: vi.fn(),
   invoke: vi.fn(),
   loadRemotes: vi.fn(),
   addRemote: vi.fn(),
@@ -113,6 +115,8 @@ vi.mock("../../lib/tauri", () => ({
   codexAccount: mocks.codexAccount,
   codexModels: mocks.codexModels,
   applyCodexModels: mocks.applyCodexModels,
+  listBrowserSessions: mocks.listBrowserSessions,
+  closeBrowserSession: mocks.closeBrowserSession,
 }));
 
 async function openGeneralTab() {
@@ -131,6 +135,8 @@ describe("SettingsPage parallel-task controls", () => {
     mocks.load.mockResolvedValue(undefined);
     mocks.save.mockResolvedValue(undefined);
     mocks.codexAccount.mockResolvedValue(null);
+    mocks.listBrowserSessions.mockResolvedValue([]);
+    mocks.closeBrowserSession.mockResolvedValue(undefined);
     // DataSection on the 通用 tab fetches the data dir on mount.
     mocks.invoke.mockResolvedValue("");
   });
@@ -168,6 +174,43 @@ describe("SettingsPage parallel-task controls", () => {
     expect(await screen.findByText(/减少常规工具确认/)).toBeInTheDocument();
     expect(screen.getByText(/不会改变当前消息是分析还是执行/)).toBeInTheDocument();
     expect(screen.queryByText(/每条消息都直接执行到交付物/)).not.toBeInTheDocument();
+  });
+
+  it("shows and closes only CodeFactory-managed browser sessions", async () => {
+    mocks.listBrowserSessions
+      .mockResolvedValueOnce([
+        {
+          session_id: "codefactory-task-123",
+          task_id: "task-123",
+          owner_session_id: "session-123",
+          updated_at_unix_secs: 1_780_000_000,
+          expired: false,
+        },
+      ])
+      .mockResolvedValueOnce([]);
+
+    render(<SettingsPage onBack={() => {}} initialTab="browser" />);
+
+    expect(
+      await screen.findByRole("heading", { name: "受管浏览器会话" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("任务 task-123")).toBeInTheDocument();
+    expect(screen.getByText(/不会关闭你的普通 Chrome/)).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "结束浏览器会话 codefactory-task-123",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(mocks.closeBrowserSession).toHaveBeenCalledWith(
+        "codefactory-task-123",
+      );
+    });
+    expect(
+      await screen.findByText("当前没有活动的 CodeFactory 自动化浏览器。"),
+    ).toBeInTheDocument();
   });
 
   it("hydrates defaults for settings saved before the fields existed", async () => {

@@ -34,6 +34,10 @@ impl ShellCommandPolicy {
 pub fn classify_command(command: &str) -> ShellCommandPolicy {
     let normalized = normalize(command);
 
+    if is_direct_playwright_command(&normalized) {
+        return deny("direct Playwright CLI is not allowed; use the native browser_session tool so CodeFactory can own and clean up the browser process");
+    }
+
     if let Some(reason) = contains_any(
         &normalized,
         &[
@@ -78,6 +82,13 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
     ShellCommandPolicy::Allow {
         risk: ShellRisk::Low,
     }
+}
+
+fn is_direct_playwright_command(command: &str) -> bool {
+    command.contains("playwright-cli")
+        || command.contains("@playwright/cli")
+        || command.contains("playwright-core/lib/entry/clidaemon")
+        || command.contains("playwright_cli.sh")
 }
 
 pub fn audit_footer(cwd: &std::path::Path, exit_code: Option<i32>, risk: ShellRisk) -> String {
@@ -136,5 +147,13 @@ mod tests {
                 reason: "matches permanent deny 'shutdown'",
             }
         );
+    }
+
+    #[test]
+    fn rejects_direct_playwright_cli_in_favor_of_managed_sessions() {
+        assert!(matches!(
+            classify_command("npx --package @playwright/cli playwright-cli open https://example.com"),
+            ShellCommandPolicy::Deny { .. }
+        ));
     }
 }
