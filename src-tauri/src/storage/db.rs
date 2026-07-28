@@ -646,6 +646,92 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         .await?;
     }
 
+    // Append-only structured execution-route snapshots. They remain beside
+    // the transcript, so old builds can ignore them without losing messages.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS chat_plan_events (
+            id             TEXT PRIMARY KEY,
+            session_id     TEXT NOT NULL,
+            root_turn_id   TEXT NOT NULL,
+            revision       INTEGER NOT NULL,
+            plan_json      TEXT NOT NULL,
+            explanation    TEXT,
+            waiting_reason TEXT,
+            change_reason  TEXT,
+            created_at     INTEGER NOT NULL,
+            UNIQUE(root_turn_id, revision),
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let plan_session_cascade: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM pragma_foreign_key_list('chat_plan_events')
+         WHERE \"table\" = 'sessions' AND on_delete = 'CASCADE'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if plan_session_cascade == 0 {
+        // Early development builds created this table before the ownership
+        // cascade was specified. Rebuild it transactionally so those databases
+        // do not retain orphaned plan history after a session is deleted.
+        let sessions_exist: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'sessions'",
+        )
+        .fetch_one(pool)
+        .await?;
+        let mut migration = pool.begin().await?;
+        sqlx::query("DROP TABLE IF EXISTS chat_plan_events_with_session_cascade")
+            .execute(&mut *migration)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE chat_plan_events_with_session_cascade (
+                id             TEXT PRIMARY KEY,
+                session_id     TEXT NOT NULL,
+                root_turn_id   TEXT NOT NULL,
+                revision       INTEGER NOT NULL,
+                plan_json      TEXT NOT NULL,
+                explanation    TEXT,
+                waiting_reason TEXT,
+                change_reason  TEXT,
+                created_at     INTEGER NOT NULL,
+                UNIQUE(root_turn_id, revision),
+                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            )",
+        )
+        .execute(&mut *migration)
+        .await?;
+        let copy_sql = if sessions_exist == 0 {
+            "INSERT INTO chat_plan_events_with_session_cascade
+             SELECT * FROM chat_plan_events"
+        } else {
+            "INSERT INTO chat_plan_events_with_session_cascade
+             SELECT event.* FROM chat_plan_events event
+             WHERE EXISTS (
+                 SELECT 1 FROM sessions session WHERE session.id = event.session_id
+             )"
+        };
+        sqlx::query(copy_sql).execute(&mut *migration).await?;
+        sqlx::query("DROP TABLE chat_plan_events")
+            .execute(&mut *migration)
+            .await?;
+        sqlx::query(
+            "ALTER TABLE chat_plan_events_with_session_cascade
+             RENAME TO chat_plan_events",
+        )
+        .execute(&mut *migration)
+        .await?;
+        migration.commit().await?;
+    }
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_chat_plan_events_session_turn
+         ON chat_plan_events(session_id, root_turn_id, revision DESC)",
+    )
+    .execute(pool)
+    .await?;
+
     // ── task_runs has a verification_results JSON column referenced by
     //    the verification engine. Some older DBs and all fresh installs
     //    miss it.
@@ -1272,12 +1358,125 @@ mod tests {
             "gate_events + both indexes. Got: {objects:?}"
         );
 
+        let plan_foreign_keys: Vec<(String, String)> = sqlx::query_as(
+            "SELECT \"table\", on_delete
+             FROM pragma_foreign_key_list('chat_plan_events')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            plan_foreign_keys,
+            vec![("sessions".to_string(), "CASCADE".to_string())],
+            "chat plan history must be deleted with its owning session"
+        );
+
         // The seeded row's data must survive the ALTER TABLE.
         let role: String = sqlx::query_scalar("SELECT role FROM messages WHERE id='m1'")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(role, "user");
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_repairs_plan_history_without_session_cascade() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        sqlx::query(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                total_input_tokens INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                role TEXT,
+                content TEXT,
+                model_id TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                created_at INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_plan_events (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                root_turn_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                plan_json TEXT NOT NULL,
+                explanation TEXT,
+                waiting_reason TEXT,
+                change_reason TEXT,
+                created_at INTEGER NOT NULL,
+                UNIQUE(root_turn_id, revision)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions
+             (id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('owned-session', 'owned', '/tmp', 'model', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (id, session_id, root_turn_id) in [
+            ("owned-event", "owned-session", "owned-root"),
+            ("orphan-event", "missing-session", "orphan-root"),
+        ] {
+            sqlx::query(
+                "INSERT INTO chat_plan_events
+                 (id, session_id, root_turn_id, revision, plan_json, created_at)
+                 VALUES (?, ?, ?, 1, '[]', 1)",
+            )
+            .bind(id)
+            .bind(session_id)
+            .bind(root_turn_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        ensure_schema(&pool).await.expect("repair schema");
+
+        let retained_ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM chat_plan_events ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(retained_ids, vec!["owned-event"]);
+        let plan_foreign_keys: Vec<(String, String)> = sqlx::query_as(
+            "SELECT \"table\", on_delete
+             FROM pragma_foreign_key_list('chat_plan_events')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            plan_foreign_keys,
+            vec![("sessions".to_string(), "CASCADE".to_string())]
+        );
     }
 
     /// ensure_schema must be safe to run twice — startup may execute it on

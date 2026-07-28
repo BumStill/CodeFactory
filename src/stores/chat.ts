@@ -8,9 +8,11 @@ import type {
   StreamEvent,
   ModelInfo,
   ReasoningEffort,
+  TurnPlanSnapshot,
   AnonTurn,
 } from "../lib/tauri";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { turnPlanFromEvent } from "../lib/chatPlan";
 import {
   markPermissionResponse,
   reduceChatStreamEvent,
@@ -65,6 +67,8 @@ export interface SessionRuntime extends ChatEventState {
   queue: QueuedMessage[];
   /** Raw persisted rows already loaded for this bounded history window. */
   persistedMessages: Message[];
+  /** Latest structured plan snapshot per loaded real user turn. */
+  persistedPlans: TurnPlanSnapshot[];
   /** Stable SQLite rowid cursor for the next older real-user-turn page. */
   historyBeforeRowid: number | null;
   hasOlderHistory: boolean;
@@ -91,6 +95,7 @@ const EMPTY_RUNTIME: SessionRuntime = {
   compressionToast: null,
   queue: [],
   persistedMessages: [],
+  persistedPlans: [],
   historyBeforeRowid: null,
   hasOlderHistory: false,
   loadingOlderHistory: false,
@@ -106,7 +111,7 @@ export function freshRuntime(
   history: Partial<
     Pick<
       SessionRuntime,
-      "persistedMessages" | "historyBeforeRowid" | "hasOlderHistory" | "historyTruncated"
+      "persistedMessages" | "persistedPlans" | "historyBeforeRowid" | "hasOlderHistory" | "historyTruncated"
     >
   > = {},
 ): SessionRuntime {
@@ -120,6 +125,7 @@ export function freshRuntime(
     compressionToast: null,
     queue: [],
     persistedMessages: history.persistedMessages ?? [],
+    persistedPlans: history.persistedPlans ?? [],
     historyBeforeRowid: history.historyBeforeRowid ?? null,
     hasOlderHistory: history.hasOlderHistory ?? false,
     loadingOlderHistory: false,
@@ -351,9 +357,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const localMessages =
         staleStreamingRevision != null ? currentRuntime?.localMessages ?? [] : [];
       const hydrated = freshRuntime(
-        [...dbMessagesToUI(page.messages), ...localMessages],
+        [...dbMessagesToUI(page.messages, page.plans ?? []), ...localMessages],
         {
           persistedMessages: page.messages,
+          persistedPlans: page.plans ?? [],
           historyBeforeRowid: page.next_before_rowid ?? null,
           hasOlderHistory: page.has_more,
           historyTruncated: page.truncated ?? false,
@@ -450,16 +457,21 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           page.messages,
           mergePersistedMessages(runtime.persistedMessages, latestPage.messages),
         );
+        const persistedPlans = mergePersistedPlans(
+          page.plans ?? [],
+          mergePersistedPlans(runtime.persistedPlans, latestPage.plans ?? []),
+        );
         return {
           runtime: {
             ...s.runtime,
             [id]: {
               ...runtime,
               messages: [
-                ...dbMessagesToUI(persistedMessages),
+                ...dbMessagesToUI(persistedMessages, persistedPlans),
                 ...runtime.localMessages,
               ],
               persistedMessages,
+              persistedPlans,
               historyBeforeRowid: page.next_before_rowid ?? null,
               hasOlderHistory: page.has_more,
               loadingOlderHistory: false,
@@ -1115,6 +1127,20 @@ function mergePersistedMessages(
   return merged;
 }
 
+function mergePersistedPlans(
+  older: TurnPlanSnapshot[],
+  newer: TurnPlanSnapshot[],
+): TurnPlanSnapshot[] {
+  const latest = new Map<string, TurnPlanSnapshot>();
+  for (const plan of [...older, ...newer]) {
+    const existing = latest.get(plan.root_turn_id);
+    if (!existing || existing.revision < plan.revision) {
+      latest.set(plan.root_turn_id, plan);
+    }
+  }
+  return [...latest.values()].sort((a, b) => a.created_at - b.created_at);
+}
+
 interface PersistedToolCall {
   id?: unknown;
   function?: {
@@ -1137,6 +1163,7 @@ function parsePersistedToolCalls(raw: string | null | undefined): ToolCallState[
     return parsed.flatMap((value) => {
       const call = value as PersistedToolCall;
       if (typeof call.id !== "string" || typeof call.function?.name !== "string") return [];
+      if (call.function.name === "update_plan") return [];
       const rawArgs = call.function.arguments;
       let args: unknown = rawArgs ?? {};
       if (typeof rawArgs === "string") {
@@ -1186,7 +1213,10 @@ function parsePersistedToolReplay(raw: string): {
 /** Rebuild persisted tool cards and fold role=tool replay rows into the
  * assistant declaration that owns them. Provider replay rows are transport
  * history, not standalone chat bubbles. */
-export function dbMessagesToUI(messages: Message[]): UIMessage[] {
+export function dbMessagesToUI(
+  messages: Message[],
+  plans: TurnPlanSnapshot[] = [],
+): UIMessage[] {
   const hydrated: UIMessage[] = [];
   const toolOwners = new Map<string, number>();
 
@@ -1242,6 +1272,35 @@ export function dbMessagesToUI(messages: Message[]): UIMessage[] {
       }
     }
     hydrated.push(uiMessage);
+  }
+
+  for (const plan of plans) {
+    const rootIndex = hydrated.findIndex(
+      (message) => message.id === plan.root_turn_id && message.role === "user",
+    );
+    if (rootIndex < 0) continue;
+    let nextRootIndex = hydrated.length;
+    for (let index = rootIndex + 1; index < hydrated.length; index += 1) {
+      if (hydrated[index].role === "user") {
+        nextRootIndex = index;
+        break;
+      }
+    }
+    const turnRows = hydrated.slice(rootIndex + 1, nextRootIndex);
+    const finalAssistant = [...turnRows]
+      .reverse()
+      .find((message) => message.role === "assistant" && message.content.trim());
+    if (!finalAssistant) continue;
+    finalAssistant.plan = turnPlanFromEvent(plan);
+    finalAssistant.durationMs = Math.max(
+      0,
+      finalAssistant.createdAt - hydrated[rootIndex].createdAt,
+    );
+    const turnTools = turnRows
+      .flatMap((message) => message.toolCalls ?? [])
+      .filter((tool) => tool.name !== "update_plan");
+    finalAssistant.turnToolCallCount = turnTools.length;
+    finalAssistant.turnToolCalls = turnTools.slice(-200);
   }
 
   return hydrated;

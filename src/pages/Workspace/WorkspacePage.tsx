@@ -37,6 +37,7 @@ import { QueueBadge } from "../../components/QueueBadge";
 import { useSettingsStore } from "../../stores/settings";
 import { useTasksStore } from "../../stores/tasks";
 import type { TaskRun, VerificationResult } from "../../lib/tauri";
+import type { ExternalJobState, TurnTimingProfile } from "../../lib/chatPlan";
 import { parseVerification, verificationSummary } from "../../lib/verification";
 
 interface WorkspacePageProps {
@@ -136,6 +137,18 @@ export function WorkspacePage({
   const draftProjects = useMemo(() => recentProjects(sessions ?? []), [sessions]);
   const projectTasks = useTasksStore((state) => state.tasks[sessionId]);
   const sessionTasks = projectTasks ?? [];
+  const externalJobs = useMemo<ExternalJobState[]>(
+    () =>
+      sessionTasks.map((task) => ({
+        id: task.id,
+        status: task.status,
+        startedAt: task.started_at ? Date.parse(task.started_at) : null,
+        completedAt: task.completed_at ? Date.parse(task.completed_at) : null,
+      })),
+    [sessionTasks],
+  );
+  const [turnTimingProfile, setTurnTimingProfile] =
+    useState<TurnTimingProfile | null>(null);
   const projectTaskCount = sessionTasks.length;
   const taskRunningCount = sessionTasks.filter((task) => task.status === "running").length;
   const taskPendingCount = sessionTasks.filter((task) => task.status === "pending").length;
@@ -156,6 +169,28 @@ export function WorkspacePage({
   const isProjectSession = Boolean(
     activeSession && activeSession.kind !== "quick" && activeSession.kind !== "anonymous",
   );
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!activeCwd || activeDraft) {
+      setTurnTimingProfile(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+    void Promise.resolve(
+      invoke<TurnTimingProfile>("get_turn_timing_profile", { cwd: activeCwd }),
+    )
+      .then((profile) => {
+        if (!cancelled) setTurnTimingProfile(profile);
+      })
+      .catch(() => {
+        if (!cancelled) setTurnTimingProfile(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeCwd, activeDraft, messages.length]);
 
   // Subscribe as soon as a project Session opens. `delegate_tasks` may create
   // the first task from the chat agent, so waiting for a task panel to mount
@@ -353,6 +388,8 @@ export function WorkspacePage({
             onOpenUsage={onOpenUsage}
             onOpenSession={onOpenSession}
             onPickProject={activeDraft ? setDraftProject : undefined}
+            timingProfile={turnTimingProfile}
+            externalJobs={externalJobs}
           />
           <ContextUsageBar sessionId={activeSession?.id} />
           {queue.length > 0 && (

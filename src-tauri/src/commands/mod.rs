@@ -3,6 +3,7 @@ pub mod backup;
 pub mod benchmark;
 pub mod browser_sessions;
 pub mod chat;
+pub mod chat_progress;
 pub mod checkpoints;
 pub mod control_plane;
 pub mod costs;

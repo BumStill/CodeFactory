@@ -137,3 +137,48 @@ live timeline 与 hydrated rows 必须经过同一个 `isFinalAssistantForTurn` 
 - 不删除或压缩工具审计数据；自然对话视图只是 presentation。
 - 回滚版本可以忽略新的 completion/continuity 状态，不得导致消息表不可读。
 - 公开发布前必须验证从旧数据库升级、执行中强制退出后重启、浅深色生产 CSS 和真实 App 用户路径。
+
+## 10. 执行路线、结果快照与估时
+
+### 结构化 plan event
+
+长任务开始执行后，模型使用 `update_plan` 工具提交有界快照：
+
+```ts
+type PlanStep = {
+  id: string;
+  title: string;
+  kind: "analysis" | "implementation" | "verification" | "delivery" | "external_job" | "other";
+  status: "pending" | "in_progress" | "completed";
+  externalJobId?: string;
+};
+
+type PlanEvent = {
+  rootTurnId: string;
+  revision: number;
+  steps: PlanStep[];
+  explanation?: string;
+  waitingReason?: string;
+  changeReason?: string;
+  createdAt: number;
+};
+```
+
+- `chat_plan_events` 按 revision 追加，不改写消息或伪造用户 turn。
+- 首次 plan、步骤状态变化、等待原因变化和步骤增删/重排都必须形成事件。
+- revision 大于 1 且步骤集合或顺序变化时，必须提供 `changeReason`。
+- live reducer 与 history hydration 使用同一 `TurnPlan` 视图模型。
+- `update_plan` 只暴露给有 AppHandle 且会持久化的桌面会话；匿名和 headless 路径既不展示该工具，也不注入要求调用它的提示，避免隐私写入和必然失败的工具调用。
+
+### 进度与时间区间
+
+- 进度百分比只等于结构化步骤中的 `completed / total`，并显示“来自 N 个计划步骤”。
+- 当前步骤取唯一 `in_progress` 项，下一步取其后的首个 `pending` 项。
+- 等待原因来自 plan event；外部 job 状态只通过结构化 `externalJobId` 关联现有 `task_runs`。
+- 时间区间来自同项目已完成 plan 阶段、成功 build/test 工具时长和已完成外部 job 时长的分位区间。
+- 历史查询取最近的有界样本；关联外部 job 的当前真实状态在进度卡中直接显示。
+- 相关历史样本少于 3 个时返回 `null`；禁止用固定速度、模型猜测或伪精确单点 ETA。
+
+### 结果快照
+
+终态结果快照由前端在 5 秒内从最终助手正文、最终 plan 和有界工具证据派生。重新总结只计算计划完成数、修改文件、验证命令、失败/等待证据和用时，不发起新的模型请求。完整过程仍引用原消息/工具记录，结果视图不复制完整 stdout 或 diff。

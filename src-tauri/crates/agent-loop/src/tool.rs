@@ -23,6 +23,7 @@ use std::path::PathBuf;
 pub struct ToolCtx {
     pub working_directory: PathBuf,
     pub session_id: Option<String>,
+    pub root_turn_id: Option<String>,
     pub task_id: Option<String>,
     pub knowledge_library_ids: Option<Vec<String>>,
     /// Budget-clamped per-call timeout. The sidecar puts this on its

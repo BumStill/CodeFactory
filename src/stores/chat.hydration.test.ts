@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { Message } from "../lib/tauri";
+import type { Message, TurnPlanSnapshot } from "../lib/tauri";
 import { dbMessagesToUI } from "./chat";
 
 describe("persisted chat hydration", () => {
@@ -387,6 +387,90 @@ describe("persisted chat hydration", () => {
         detail: "⚠ 以上回复未经完整验证：端到端环境不可用。",
       },
     ]);
+  });
+
+  it("restores the latest plan and bounded turn evidence on the final answer", () => {
+    const rows: Message[] = [
+      {
+        id: "root-turn",
+        session_id: "session-1",
+        role: "user",
+        content: "完成并验证。",
+        created_at: 1,
+      },
+      {
+        id: "tool-round",
+        session_id: "session-1",
+        role: "assistant",
+        content: "开始验证。",
+        tool_calls: JSON.stringify([
+          {
+            id: "plan-call",
+            type: "function",
+            function: { name: "update_plan", arguments: "{}" },
+          },
+          {
+            id: "build-call",
+            type: "function",
+            function: {
+              name: "bash",
+              arguments: JSON.stringify({ command: "pnpm build" }),
+            },
+          },
+        ]),
+        created_at: 2,
+      },
+      {
+        id: "build-result",
+        session_id: "session-1",
+        role: "tool",
+        content: JSON.stringify({
+          tool_call_id: "build-call",
+          content: "ok",
+          status: "done",
+        }),
+        created_at: 3,
+      },
+      {
+        id: "final",
+        session_id: "session-1",
+        role: "assistant",
+        content: "已完成。",
+        created_at: 4,
+      },
+    ];
+    const plans: TurnPlanSnapshot[] = [
+      {
+        root_turn_id: "root-turn",
+        revision: 3,
+        steps: [
+          {
+            id: "implement",
+            title: "实现",
+            kind: "implementation",
+            status: "completed",
+          },
+          {
+            id: "verify",
+            title: "验证",
+            kind: "verification",
+            status: "completed",
+          },
+        ],
+        created_at: 3,
+      },
+    ];
+
+    const hydrated = dbMessagesToUI(rows, plans);
+    expect(hydrated[1].toolCalls?.map((tool) => tool.name)).toEqual(["bash"]);
+    expect(hydrated[2].plan).toEqual(
+      expect.objectContaining({ rootTurnId: "root-turn", revision: 3 }),
+    );
+    expect(hydrated[2].turnToolCalls).toEqual([
+      expect.objectContaining({ id: "build-call", status: "done" }),
+    ]);
+    expect(hydrated[2].turnToolCallCount).toBe(1);
+    expect(hydrated[2].durationMs).toBe(3);
   });
 
 });

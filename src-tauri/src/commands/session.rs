@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use chrono::Utc;
 use serde::Serialize;
+use std::collections::HashSet;
 use tauri::State;
 use uuid::Uuid;
 
@@ -420,9 +421,34 @@ const PAYLOAD_OMITTED: &str = "[older tool output omitted from this history page
 #[derive(Debug, Clone, Serialize)]
 pub struct MessagePage {
     pub messages: Vec<Message>,
+    pub plans: Vec<TurnPlanSnapshot>,
     pub has_more: bool,
     pub next_before_rowid: Option<i64>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnPlanSnapshot {
+    pub root_turn_id: String,
+    pub revision: i64,
+    pub steps: Vec<codefactory_agent_loop::types::PlanStepEvent>,
+    pub explanation: Option<String>,
+    pub waiting_reason: Option<String>,
+    pub change_reason: Option<String>,
+    pub waiting_history: Vec<String>,
+    pub change_history: Vec<String>,
+    pub created_at: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct TurnPlanSnapshotRow {
+    root_turn_id: String,
+    revision: i64,
+    plan_json: String,
+    explanation: Option<String>,
+    waiting_reason: Option<String>,
+    change_reason: Option<String>,
+    created_at: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -528,6 +554,7 @@ async fn load_message_page_below(
     let Some(page_start) = page_start else {
         return Ok(MessagePage {
             messages: Vec::new(),
+            plans: Vec::new(),
             has_more: false,
             next_before_rowid: None,
             truncated: false,
@@ -589,9 +616,11 @@ async fn load_message_page_below(
     .fetch_one(pool)
     .await?
         != 0;
+    let plans = load_latest_turn_plans(pool, session_id, &messages).await?;
 
     let mut page = MessagePage {
         messages,
+        plans,
         has_more,
         next_before_rowid: has_more.then_some(effective_start),
         truncated: truncated || field_truncated,
@@ -614,6 +643,21 @@ async fn load_message_page_below(
         page.next_before_rowid = Some(effective_start);
         page.truncated = true;
     }
+    let retained_root_turns = page
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .completion_state
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+        })
+        .map(|message| message.id.as_str())
+        .collect::<HashSet<_>>();
+    page.plans
+        .retain(|plan| retained_root_turns.contains(plan.root_turn_id.as_str()));
 
     // A single row is field-bounded above, so normal app-authored metadata
     // leaves ample room. Keep a debug assertion and a release-safe fallback
@@ -644,6 +688,140 @@ async fn load_message_page_below(
         "MessagePage must stay within the Tauri bridge payload budget"
     );
     Ok(page)
+}
+
+async fn load_latest_turn_plans(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    messages: &[Message],
+) -> Result<Vec<TurnPlanSnapshot>, sqlx::Error> {
+    let roots = messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .completion_state
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+        })
+        .map(|message| message.id.as_str())
+        .collect::<HashSet<_>>();
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // A page contains at most 32 real user turns. Keep only the latest 21
+    // revisions for each root: one current snapshot plus enough bounded rows
+    // to recover ten distinct wait reasons and ten plan-change reasons. Filter
+    // by the page's roots before ranking so an old page remains recoverable
+    // even after thousands of newer plan events in the same session.
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT root_turn_id, revision, plan_json, explanation,
+                waiting_reason, change_reason, created_at
+         FROM (
+             SELECT root_turn_id, revision, plan_json, explanation,
+                    waiting_reason, change_reason, created_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY root_turn_id
+                        ORDER BY revision DESC, created_at DESC
+                    ) AS plan_row_number
+             FROM chat_plan_events
+             WHERE session_id = ",
+    );
+    query.push_bind(session_id);
+    query.push(" AND root_turn_id IN (");
+    {
+        let mut roots_query = query.separated(", ");
+        for root in &roots {
+            roots_query.push_bind(*root);
+        }
+    }
+    query.push(
+        ")
+         )
+         WHERE plan_row_number <= 21
+         ORDER BY root_turn_id, revision DESC, created_at DESC",
+    );
+    let rows = query
+        .build_query_as::<TurnPlanSnapshotRow>()
+        .fetch_all(pool)
+        .await?;
+    let mut latest = std::collections::HashMap::new();
+    let mut waiting_history: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut change_history: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        if !roots.contains(row.root_turn_id.as_str()) {
+            continue;
+        }
+        if let Some(reason) = row
+            .waiting_reason
+            .as_deref()
+            .filter(|reason| !reason.trim().is_empty())
+        {
+            let history = waiting_history.entry(row.root_turn_id.clone()).or_default();
+            if !history.iter().any(|existing| existing == reason) && history.len() < 10 {
+                history.push(reason.to_string());
+            }
+        }
+        if let Some(reason) = row
+            .change_reason
+            .as_deref()
+            .filter(|reason| !reason.trim().is_empty())
+        {
+            let history = change_history.entry(row.root_turn_id.clone()).or_default();
+            if !history.iter().any(|existing| existing == reason) && history.len() < 10 {
+                history.push(reason.to_string());
+            }
+        }
+        if latest.contains_key(&row.root_turn_id) {
+            continue;
+        }
+        let Ok(steps) = serde_json::from_str::<Vec<codefactory_agent_loop::types::PlanStepEvent>>(
+            &row.plan_json,
+        ) else {
+            continue;
+        };
+        if !(2..=8).contains(&steps.len()) {
+            continue;
+        }
+        latest.insert(
+            row.root_turn_id.clone(),
+            TurnPlanSnapshot {
+                root_turn_id: row.root_turn_id,
+                revision: row.revision,
+                steps,
+                explanation: row.explanation,
+                waiting_reason: row.waiting_reason,
+                change_reason: row.change_reason,
+                waiting_history: Vec::new(),
+                change_history: Vec::new(),
+                created_at: row.created_at,
+            },
+        );
+    }
+    let mut plans = latest
+        .into_values()
+        .map(|mut plan| {
+            plan.waiting_history = waiting_history
+                .remove(&plan.root_turn_id)
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .collect();
+            plan.change_history = change_history
+                .remove(&plan.root_turn_id)
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .collect();
+            plan
+        })
+        .collect::<Vec<_>>();
+    plans.sort_by_key(|plan| plan.created_at);
+    Ok(plans)
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
@@ -898,6 +1076,23 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_plan_events (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                root_turn_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                plan_json TEXT NOT NULL,
+                explanation TEXT,
+                waiting_reason TEXT,
+                change_reason TEXT,
+                created_at INTEGER NOT NULL,
+                UNIQUE(root_turn_id, revision)
+            )",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -971,6 +1166,153 @@ mod tests {
                 .all(|message| !newest_ids.contains(message.id.as_str())),
             "cursor pages must not overlap even when every created_at is identical",
         );
+    }
+
+    #[tokio::test]
+    async fn message_page_restores_latest_plan_with_bounded_wait_history() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open db");
+        create_materialization_schema(&pool).await;
+        sqlx::query(
+            "INSERT INTO sessions (
+                id, title, cwd, model_id, created_at, updated_at,
+                total_input_tokens, total_output_tokens, kind
+             ) VALUES ('plan-session', 'plan', '/tmp', 'model', 1, 1, 0, 0, 'project')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, created_at)
+             VALUES ('root-plan', 'plan-session', 'user', 'run', 1),
+                    ('final-plan', 'plan-session', 'assistant', 'done', 5)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let steps = |status: &str| {
+            serde_json::json!([
+                {
+                    "id": "inspect",
+                    "title": "确认",
+                    "kind": "analysis",
+                    "status": status,
+                    "external_job_id": null
+                },
+                {
+                    "id": "verify",
+                    "title": "验证",
+                    "kind": "verification",
+                    "status": if status == "completed" { "completed" } else { "pending" },
+                    "external_job_id": null
+                }
+            ])
+            .to_string()
+        };
+        for (revision, status, waiting_reason) in [
+            (1_i64, "in_progress", None),
+            (2_i64, "in_progress", Some("等待 CI")),
+            (3_i64, "completed", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO chat_plan_events (
+                    id, session_id, root_turn_id, revision, plan_json,
+                    waiting_reason, created_at
+                 ) VALUES (?, 'plan-session', 'root-plan', ?, ?, ?, ?)",
+            )
+            .bind(format!("event-{revision}"))
+            .bind(revision)
+            .bind(steps(status))
+            .bind(waiting_reason)
+            .bind(revision)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let page = load_message_page(&pool, "plan-session", None, 8)
+            .await
+            .expect("load page");
+        assert_eq!(page.plans.len(), 1);
+        assert_eq!(page.plans[0].revision, 3);
+        assert_eq!(page.plans[0].waiting_history, vec!["等待 CI"]);
+        assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_MESSAGE_PAGE_SERIALIZED_BYTES);
+    }
+
+    #[tokio::test]
+    async fn message_page_restores_plan_even_after_many_newer_events() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open db");
+        create_materialization_schema(&pool).await;
+        sqlx::query(
+            "INSERT INTO sessions (
+                id, title, cwd, model_id, created_at, updated_at,
+                total_input_tokens, total_output_tokens, kind
+             ) VALUES ('old-plan-session', 'plan', '/tmp', 'model', 1, 1, 0, 0, 'project')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, created_at)
+             VALUES ('old-root', 'old-plan-session', 'user', 'run', 1),
+                    ('old-final', 'old-plan-session', 'assistant', 'done', 2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let steps = serde_json::json!([
+            {
+                "id": "inspect",
+                "title": "确认",
+                "kind": "analysis",
+                "status": "completed",
+                "external_job_id": null
+            },
+            {
+                "id": "verify",
+                "title": "验证",
+                "kind": "verification",
+                "status": "completed",
+                "external_job_id": null
+            }
+        ])
+        .to_string();
+        sqlx::query(
+            "INSERT INTO chat_plan_events (
+                id, session_id, root_turn_id, revision, plan_json, created_at
+             ) VALUES ('old-event', 'old-plan-session', 'old-root', 1, ?, 3)",
+        )
+        .bind(&steps)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for revision in 1_i64..=600 {
+            sqlx::query(
+                "INSERT INTO chat_plan_events (
+                    id, session_id, root_turn_id, revision, plan_json, created_at
+                 ) VALUES (?, 'old-plan-session', 'newer-root', ?, ?, ?)",
+            )
+            .bind(format!("newer-event-{revision}"))
+            .bind(revision)
+            .bind(&steps)
+            .bind(10 + revision)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let page = load_message_page(&pool, "old-plan-session", None, 8)
+            .await
+            .expect("load page");
+        assert_eq!(page.plans.len(), 1);
+        assert_eq!(page.plans[0].root_turn_id, "old-root");
     }
 
     #[tokio::test]

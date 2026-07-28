@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { StreamEvent } from "../lib/tauri.js";
+import { turnPlanFromEvent, type TurnPlan } from "../lib/chatPlan.js";
 
 export interface ToolCallState {
   id: string;
@@ -46,6 +47,13 @@ export interface UIMessage {
    *  during live streaming — hydrated history is already interleaved as
    *  separate rows. */
   segments?: TurnSegment[];
+  /** Structured execution route for this root turn. It is persisted as a
+   * bounded plan-event snapshot and hydrated onto the final assistant row. */
+  plan?: TurnPlan;
+  /** Bounded, turn-wide tool evidence attached during history hydration so
+   * the result snapshot remains truthful after a session is reopened. */
+  turnToolCalls?: ToolCallState[];
+  turnToolCallCount?: number;
 }
 
 /** One slice of a streaming turn, in arrival order: narration text or a
@@ -137,6 +145,27 @@ export function reduceChatStreamEvent(
   msgId: string,
 ): ChatEventState {
   switch (event.type) {
+    case "plan_updated":
+      return {
+        ...state,
+        messages: updateMessageById(state.messages, msgId, (message) => {
+          if (message.plan && message.plan.revision >= event.revision) return message;
+          const plan = turnPlanFromEvent(event);
+          const waitingHistory = [
+            ...(message.plan?.waitingHistory ?? []),
+            ...(plan.waitingHistory ?? []),
+          ].filter((reason, index, all) => all.indexOf(reason) === index).slice(-10);
+          const changeHistory = [
+            ...(message.plan?.changeHistory ?? []),
+            ...(plan.changeHistory ?? []),
+          ].filter((reason, index, all) => all.indexOf(reason) === index).slice(-10);
+          return {
+            ...message,
+            plan: { ...plan, waitingHistory, changeHistory },
+          };
+        }),
+      };
+
     case "text_delta":
       return {
         ...state,
@@ -153,6 +182,10 @@ export function reduceChatStreamEvent(
       };
 
     case "tool_call_start":
+      // update_plan is a control-plane event. Its user-facing representation
+      // is the structured progress card emitted by plan_updated, never a
+      // low-level tool card in the transcript.
+      if (event.name === "update_plan") return state;
       return {
         ...state,
         messages: updateMessageById(state.messages, msgId, (m) => {

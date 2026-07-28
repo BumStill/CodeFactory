@@ -440,6 +440,18 @@ of suggestions, and the user just APPROVED it. Carry it out NOW.\n\
    it is the exact failure this rule exists to prevent. The tool is idempotent\n\
    and commits only real source files.";
 
+const STRUCTURED_EXECUTION_ROUTE_PROMPT: &str = "\
+\n\n# Structured execution route\n\
+For approved non-trivial execution, call `update_plan` before the first operational tool. \
+Keep 2-8 concise steps and update it whenever a step starts or completes, work is waiting, \
+or the plan changes. A changed step set or order after revision 1 requires a concrete \
+`change_reason`. Never invent a percentage or ETA in prose; the product computes those \
+from plan state and observed history. Do not use `update_plan` for trivial one-step answers.";
+
+fn supports_structured_plan(has_app: bool, anonymous: bool) -> bool {
+    has_app && !anonymous
+}
+
 pub struct AgentLoop {
     /// None in a headless run (no Tauri frontend). Present for the desktop
     /// app. Slice 1's EventSink already carries the UI stream; this remains
@@ -888,6 +900,10 @@ impl AgentLoop {
         for mcp_tool in &mcp_tools {
             tool_defs.push(mcp_tool_to_definition(mcp_tool));
         }
+        let supports_plan = supports_structured_plan(self.app.is_some(), self.anonymous);
+        if !supports_plan {
+            tool_defs.retain(|definition| definition.function.name != "update_plan");
+        }
         // Anonymous runs must leave NO DB trace. The knowledge tools
         // (kb_search / kb_get_chunk) write a `retrieval_events` audit row —
         // including the user's query text — keyed on the session, so withhold
@@ -927,6 +943,9 @@ impl AgentLoop {
             blocks,
             SYSTEM_PROMPT_BUDGET,
         );
+        if supports_plan {
+            system_prompt.push_str(STRUCTURED_EXECUTION_ROUTE_PROMPT);
+        }
         // Model-aware reinforcement for post-approval Execute turns (no-op for
         // high-compliance models and all non-Execute turns).
         system_prompt.push_str(compliance_booster(self.mode, &self.model_id));
@@ -1035,6 +1054,11 @@ impl AgentLoop {
         };
         let completion_instruction = latest_user_instruction(&history);
         let fact_check_instruction = effective_fact_check_instruction(&history);
+        let root_turn_id = history
+            .iter()
+            .rev()
+            .find(|message| message.role == "user" && message.completion_state.is_none())
+            .map(|message| message.id.clone());
         let messages = self.build_openai_messages(history, system_prompt);
         let inputs = codefactory_agent_loop::run::LoopInputs {
             messages,
@@ -1043,6 +1067,7 @@ impl AgentLoop {
             completion_instruction,
             fact_check_instruction,
             audit_session_id: self.audit_session_id(),
+            root_turn_id,
             knowledge_library_ids: knowledge_scope_for_tools(self.execution_context.as_ref()),
             cancel: self.cancel.clone(),
         };
@@ -2319,7 +2344,7 @@ fn decide_permission(
     // Skill-management tools create *disabled* skills — nothing is injected into
     // the system prompt until the user enables it on the Skills page, which is
     // the real gate. So they never need a per-call permission prompt.
-    if tool_name.starts_with("skill_") {
+    if tool_name.starts_with("skill_") || tool_name == "update_plan" {
         return PermissionDecision::Allow;
     }
     if tool_name == "bash" {
@@ -2409,6 +2434,13 @@ mod tests {
     // `completion_command_and_kind` (and its `ToolKind` result) moved to
     // agent-loop in slice 4.6; this test still exercises it via the re-export.
     use codefactory_agent_core::ToolKind;
+
+    #[test]
+    fn structured_plan_is_exposed_only_to_persisted_desktop_chat() {
+        assert!(supports_structured_plan(true, false));
+        assert!(!supports_structured_plan(true, true));
+        assert!(!supports_structured_plan(false, false));
+    }
 
     #[tokio::test]
     async fn session_reasoning_effort_reflects_the_current_row() {
