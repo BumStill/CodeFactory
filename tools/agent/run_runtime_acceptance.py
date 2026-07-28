@@ -412,6 +412,37 @@ def _latest_usage_snapshot(trajectory: list[dict[str, Any]]) -> dict[str, int]:
     return {}
 
 
+def _protocol_event_snapshot(message: dict[str, Any]) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "type": "event",
+        "name": str(message.get("name") or ""),
+        "usage": _usage_snapshot(message.get("usage")),
+    }
+    if event["name"] != "policy_denied_tool_batch":
+        return event
+
+    decisions: list[dict[str, str]] = []
+    raw_decisions = message.get("decisions")
+    if isinstance(raw_decisions, list):
+        for item in raw_decisions[:32]:
+            if not isinstance(item, dict):
+                continue
+            command = item.get("command")
+            rule = item.get("rule")
+            reason = item.get("reason")
+            if not all(isinstance(value, str) for value in (command, rule, reason)):
+                continue
+            decisions.append(
+                {
+                    "command": _truncate(command, 4096),
+                    "rule": _truncate(rule, 256),
+                    "reason": _truncate(reason, 2048),
+                }
+            )
+    event["decisions"] = decisions
+    return event
+
+
 def run_runtime_acceptance(
     *,
     instruction: str,
@@ -540,13 +571,7 @@ def run_runtime_acceptance(
                 finished = message
                 break
             if message_type == "event":
-                trajectory.append(
-                    {
-                        "type": "event",
-                        "name": str(message.get("name") or ""),
-                        "usage": _usage_snapshot(message.get("usage")),
-                    }
-                )
+                trajectory.append(_protocol_event_snapshot(message))
                 continue
             raise RuntimeError(f"Agent runtime returned unknown message type: {message_type}")
     except BaseException as exc:

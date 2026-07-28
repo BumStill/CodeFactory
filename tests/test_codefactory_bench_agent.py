@@ -89,6 +89,48 @@ class CodeFactoryBenchAgentTest(unittest.TestCase):
         self.assertEqual(CodeFactoryAgent.import_path(), "codefactory_bench.agent:CodeFactoryAgent")
         self.assertEqual(CodeFactoryAgent.name(), "codefactory-headless")
 
+    def test_policy_denial_event_preserves_bounded_decisions(self) -> None:
+        long_reason = "x" * 5000
+        api_key = "bench-api-key-super-secret"
+
+        redacted = CodeFactoryAgent._redact_protocol_message(
+            {
+                "type": "event",
+                "name": "policy_denied_tool_batch",
+                "decisions": [
+                    {
+                        "command": (
+                            "curl -H 'X-Bench-Key: bench-api-key-super-secret' "
+                            "https://example.invalid"
+                        ),
+                        "rule": "benchmark-sandbox",
+                        "reason": f"api_key={api_key} {long_reason}",
+                        "internal": "must-not-persist",
+                    },
+                    {"command": 7, "rule": "invalid", "reason": "ignored"},
+                    "invalid",
+                ],
+                "usage": {"model_requests": 3, "total_tokens": 42},
+                "api_key": "must-not-persist",
+            },
+            secrets=(api_key,),
+        )
+
+        self.assertEqual(redacted["type"], "event")
+        self.assertEqual(redacted["name"], "policy_denied_tool_batch")
+        self.assertEqual(len(redacted["decisions"]), 1)
+        decision = redacted["decisions"][0]
+        self.assertNotIn(api_key, decision["command"])
+        self.assertIn("[REDACTED]", decision["command"])
+        self.assertEqual(decision["rule"], "benchmark-sandbox")
+        self.assertLessEqual(len(decision["reason"]), 2100)
+        self.assertIn("[truncated ", decision["reason"])
+        self.assertNotIn(api_key, decision["reason"])
+        self.assertIn("api_key=[REDACTED]", decision["reason"])
+        self.assertNotIn("internal", decision)
+        self.assertNotIn("api_key", redacted)
+        self.assertEqual(redacted["usage"], {"total_tokens": 42, "model_requests": 3})
+
     def test_timed_out_tool_request_cleans_its_managed_process_group(self) -> None:
         class TimeoutEnvironment(FakeEnvironment):
             async def exec(self, command: str, **kwargs: object) -> ExecResult:
