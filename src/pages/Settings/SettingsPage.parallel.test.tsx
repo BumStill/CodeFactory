@@ -7,7 +7,6 @@ const mocks = vi.hoisted(() => ({
   load: vi.fn(),
   save: vi.fn(),
   saveApiKey: vi.fn(),
-  getApiKey: vi.fn(),
   loadModels: vi.fn(),
   codexLogin: vi.fn(),
   codexLogout: vi.fn(),
@@ -61,7 +60,6 @@ const settingsState = vi.hoisted(() => ({
   load: mocks.load,
   save: mocks.save,
   saveApiKey: mocks.saveApiKey,
-  getApiKey: mocks.getApiKey,
 }));
 
 const chatState = vi.hoisted(() => ({

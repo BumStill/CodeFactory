@@ -253,7 +253,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::settings::get_settings,
             commands::settings::save_settings,
-            commands::settings::get_api_key,
             commands::settings::save_api_key,
             commands::settings::delete_api_key,
             codex_auth::codex_login,

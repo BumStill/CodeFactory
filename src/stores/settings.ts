@@ -99,7 +99,6 @@ interface SettingsStore {
   setFontFamily: (family: string) => Promise<void>;
   setFontSize: (size: number) => Promise<void>;
   saveApiKey: (keyRef: string, value: string) => Promise<void>;
-  getApiKey: (keyRef: string) => Promise<string | null>;
 }
 
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
@@ -150,9 +149,5 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   saveApiKey: async (keyRef, value) => {
     await invoke("save_api_key", { keyRef, value });
-  },
-
-  getApiKey: async (keyRef) => {
-    return invoke<string | null>("get_api_key", { keyRef });
   },
 }));

@@ -8,7 +8,6 @@ const mocks = vi.hoisted(() => ({
   load: vi.fn(),
   save: vi.fn(),
   saveApiKey: vi.fn(),
-  getApiKey: vi.fn(),
   loadModels: vi.fn(),
   codexLogin: vi.fn(),
   codexLogout: vi.fn(),
@@ -55,7 +54,6 @@ const settingsState = vi.hoisted(() => ({
   load: mocks.load,
   save: mocks.save,
   saveApiKey: mocks.saveApiKey,
-  getApiKey: mocks.getApiKey,
   setTheme: vi.fn(),
   setFontFamily: vi.fn(),
   setFontSize: vi.fn(),
@@ -162,7 +160,6 @@ describe("SettingsPage Hooks and Remotes tabs", () => {
     mocks.load.mockResolvedValue(undefined);
     mocks.save.mockResolvedValue(undefined);
     mocks.saveApiKey.mockResolvedValue(undefined);
-    mocks.getApiKey.mockRejectedValue(new Error("settings page must not read saved API keys"));
     mocks.codexAccount.mockResolvedValue(null);
     mocks.loadRemotes.mockResolvedValue(undefined);
     mocks.addRemote.mockResolvedValue(undefined);

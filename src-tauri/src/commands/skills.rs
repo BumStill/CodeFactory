@@ -238,19 +238,48 @@ pub async fn install_skill_from_url(url: String, _app: AppHandle) -> Result<Skil
     install_user_skill_from_url(&url, false).await
 }
 
+const MAX_REMOTE_MANIFEST_BYTES: usize = 1024 * 1024; // 1 MiB — a system prompt has no business being bigger.
+
+/// A skill id becomes a directory name under the user skills dir — reject
+/// anything that isn't a plain path component (blocks path traversal via a
+/// malicious/compromised remote manifest, e.g. `id: "../../.."`).
+fn is_safe_skill_id(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 /// Fetch a JSON skill manifest from `url` and write it to the user skills dir.
 /// `enabled` controls whether it activates immediately. App-independent.
 pub async fn install_user_skill_from_url(url: &str, enabled: bool) -> Result<SkillManifest, String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("只支持 http(s) URL".to_string());
+    }
+
     let response = reqwest::get(url)
         .await
         .map_err(|e| format!("拉取失败: {e}"))?;
-    let raw = response
-        .text()
+    let bytes = response
+        .bytes()
         .await
         .map_err(|e| format!("读取响应失败: {e}"))?;
+    if bytes.len() > MAX_REMOTE_MANIFEST_BYTES {
+        return Err(format!(
+            "manifest 过大（{} 字节，上限 {} 字节）",
+            bytes.len(),
+            MAX_REMOTE_MANIFEST_BYTES
+        ));
+    }
+    let raw = String::from_utf8(bytes.to_vec()).map_err(|e| format!("响应不是合法 UTF-8: {e}"))?;
 
     let mf: ManifestFile =
         serde_json::from_str(&raw).map_err(|e| format!("manifest JSON 无效: {e}"))?;
+    if !is_safe_skill_id(&mf.id) {
+        return Err(format!("manifest id 不合法: {:?}", mf.id));
+    }
 
     let skill_dir = user_skills_dir().join(&mf.id);
     std::fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
@@ -1369,6 +1398,18 @@ pub async fn propose_skills_from_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_safe_skill_id_blocks_path_traversal() {
+        assert!(is_safe_skill_id("my-cool-skill"));
+        assert!(is_safe_skill_id("skill_v2.1"));
+        assert!(!is_safe_skill_id(""));
+        assert!(!is_safe_skill_id("."));
+        assert!(!is_safe_skill_id(".."));
+        assert!(!is_safe_skill_id("../../etc/passwd"));
+        assert!(!is_safe_skill_id("a/b"));
+        assert!(!is_safe_skill_id("a\\b"));
+    }
 
     #[test]
     fn headless_skill_prompts_read_enabled_skills_from_a_dir_without_an_app() {
