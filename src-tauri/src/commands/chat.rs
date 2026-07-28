@@ -553,6 +553,8 @@ pub async fn send_message(
     let session_id_clone = session_id.clone();
     let chat_cancels = state.chat_cancels.clone();
     let tracked_cancel_flag = cancel_flag.clone();
+    let interjections = state.interjections.clone();
+    let interjections_cleanup = state.interjections.clone();
     tokio::spawn(async move {
         let db_for_error = db.clone();
         let session_for_error = session_id_clone.clone();
@@ -574,7 +576,8 @@ pub async fn send_message(
                 mode,
             )
             .with_failover_plan(route_plan)
-            .with_cancel(cancel_flag);
+            .with_cancel(cancel_flag)
+            .with_steer(interjections);
             agent.run(history).await
         })
         .await;
@@ -643,6 +646,10 @@ pub async fn send_message(
         }
         clear_chat_running_if_current(&chat_cancels, &session_for_error, &tracked_cancel_flag)
             .await;
+        // A steer typed just as the turn ended was never drained. Drop it here
+        // so a later, unrelated turn cannot pick it up at its first round
+        // boundary; the frontend re-sends anything it never saw applied.
+        crate::commands::interjections::drain_for_session(&interjections_cleanup, &session_for_error).await;
         let reclaimed =
             crate::tools::browser_session::close_for_session(&session_for_error).await;
         if reclaimed > 0 {
@@ -768,6 +775,8 @@ pub async fn send_message_anonymous(
     let session_id_clone = session_id.clone();
     let chat_cancels = state.chat_cancels.clone();
     let tracked_cancel_flag = cancel_flag.clone();
+    let interjections = state.interjections.clone();
+    let interjections_cleanup = state.interjections.clone();
     tokio::spawn(async move {
         let completed_session_id = session_id_clone.clone();
         let loop_result = supervise_chat_task(async move {
@@ -789,7 +798,8 @@ pub async fn send_message_anonymous(
             )
             .anonymous()
             .with_failover_plan(route_plan)
-            .with_cancel(cancel_flag);
+            .with_cancel(cancel_flag)
+            .with_steer(interjections);
             agent.run(full_history).await
         })
         .await;
@@ -806,6 +816,13 @@ pub async fn send_message_anonymous(
         }
         clear_chat_running_if_current(&chat_cancels, &completed_session_id, &tracked_cancel_flag)
             .await;
+        // Same race as the persisted path: a steer that arrived after the last
+        // round boundary is dropped here rather than leaking into a later turn.
+        crate::commands::interjections::drain_for_session(
+            &interjections_cleanup,
+            &completed_session_id,
+        )
+        .await;
         let reclaimed =
             crate::tools::browser_session::close_for_session(&completed_session_id).await;
         if reclaimed > 0 {

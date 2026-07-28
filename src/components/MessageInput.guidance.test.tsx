@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Guidance-mode regression tests for the main chat input. During autonomous
-// task execution, text typed into the primary input should be queued as a
-// scheduler interjection ("引导下一步") instead of becoming a normal chat turn.
+// Steering regression tests for the main chat input. Whenever a run is in
+// flight — a streaming chat turn or an autonomous task run — typed text steers
+// it by default rather than waiting out the whole turn. ⌘/Ctrl+Enter is the
+// per-message escape hatch back to "do this after you finish".
 
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
@@ -38,7 +39,55 @@ describe("MessageInput guidance mode", () => {
     expect(onGuide).toHaveBeenCalledWith("先修中断后排队发送");
     expect(onSend).not.toHaveBeenCalled();
     expect(textarea).toHaveValue("");
-    expect(screen.getByText("Enter 引导下一步 · Shift+Enter 换行")).toBeInTheDocument();
+    expect(
+      screen.getByText("Enter 引导当前执行 · ⌘Enter 等这轮结束再发 · Shift+Enter 换行"),
+    ).toBeInTheDocument();
+  });
+
+  it("routes ⌘Enter to the normal send path so it queues for after the run", () => {
+    const onSend = vi.fn();
+    const onGuide = vi.fn();
+    render(
+      <MessageInput
+        onSend={onSend}
+        onGuide={onGuide}
+        onCancel={() => {}}
+        streaming={true}
+        guidanceActive={true}
+        disabled={false}
+        cwd="/proj"
+      />,
+    );
+    const textarea = screen.getByRole("textbox");
+
+    fireEvent.change(textarea, { target: { value: "这件事等你忙完再说" } });
+    fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
+
+    expect(onSend).toHaveBeenCalledWith("这件事等你忙完再说");
+    expect(onGuide).not.toHaveBeenCalled();
+  });
+
+  it("treats Ctrl+Enter the same way for non-mac keyboards", () => {
+    const onSend = vi.fn();
+    const onGuide = vi.fn();
+    render(
+      <MessageInput
+        onSend={onSend}
+        onGuide={onGuide}
+        onCancel={() => {}}
+        streaming={true}
+        guidanceActive={true}
+        disabled={false}
+        cwd="/proj"
+      />,
+    );
+    const textarea = screen.getByRole("textbox");
+
+    fireEvent.change(textarea, { target: { value: "稍后处理" } });
+    fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
+
+    expect(onSend).toHaveBeenCalledWith("稍后处理");
+    expect(onGuide).not.toHaveBeenCalled();
   });
 
   it("keeps the draft and reports an error when guidance cannot be queued", async () => {
@@ -61,11 +110,11 @@ describe("MessageInput guidance mode", () => {
     const textarea = screen.getByRole("textbox");
 
     await user.type(textarea, "先修失败测试{Enter}");
-    expect(screen.queryByText("已加入下一任务")).not.toBeInTheDocument();
+    expect(screen.queryByText("已送出")).not.toBeInTheDocument();
     expect(textarea).toHaveValue("先修失败测试");
 
     resolveGuide?.();
-    await waitFor(() => expect(screen.getByText("已加入下一任务")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("已送出")).toBeInTheDocument());
     expect(textarea).toHaveValue("");
   });
 

@@ -182,6 +182,10 @@ interface ChatStore {
     opts?: { grantFullAccess?: boolean },
   ) => Promise<void>;
   addLocalAssistantMessage: (content: string) => void;
+  /** Steer the in-flight run: the message reaches the model at its next round
+   *  boundary instead of waiting out the whole turn. Shows immediately as
+   *  pending; `steer_applied` confirms it actually landed. */
+  steerRun: (content: string) => Promise<void>;
   clearVisibleConversation: () => void;
   updateActiveSessionModel: (modelId: string) => Promise<void>;
   updateActiveSessionModelConfig: (config: {
@@ -948,6 +952,63 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
   },
 
+  steerRun: async (content) => {
+    const text = content.trim();
+    const id = get().activeSession?.id;
+    if (!text || !id) return;
+    // Only a streaming chat turn confirms delivery (`steer_applied`) and only
+    // it can recover an undelivered steer at its terminal state. When the
+    // interjection is bound for the task scheduler instead, an optimistic
+    // bubble would hang in "pending" forever with nothing to resolve it — the
+    // input's own confirmation is the honest feedback there.
+    if (!get().runtime[id]?.streaming) {
+      await invoke("queue_interjection", { sessionId: id, message: text });
+      return;
+    }
+    const msg: UIMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content: text,
+      createdAt: Date.now(),
+      steerPending: true,
+    };
+    set((s) => {
+      const prev = s.runtime[id] ?? freshRuntime();
+      return {
+        runtime: {
+          ...s.runtime,
+          [id]: {
+            ...prev,
+            messages: [...prev.messages, msg],
+            localMessages: [...prev.localMessages, msg],
+            revision: prev.revision + 1,
+          },
+        },
+      };
+    });
+    try {
+      await invoke("queue_interjection", { sessionId: id, message: text });
+    } catch (error) {
+      // Never leave a bubble claiming to be on its way when it isn't.
+      set((s) => {
+        const prev = s.runtime[id];
+        if (!prev) return {};
+        return {
+          runtime: {
+            ...s.runtime,
+            [id]: {
+              ...prev,
+              messages: prev.messages.filter((m) => m.id !== msg.id),
+              localMessages: prev.localMessages.filter((m) => m.id !== msg.id),
+              revision: prev.revision + 1,
+            },
+          },
+        };
+      });
+      throw error;
+    }
+  },
+
   clearVisibleConversation: () => {
     const id = get().activeSession?.id;
     if (!id) return;
@@ -1019,6 +1080,66 @@ function materializeAnonymousDraft(
   return anon;
 }
 
+/// Re-send steers the loop never reached. Returns true when one was recovered,
+/// so the caller defers the queue drain — the recovered steer becomes the next
+/// turn and anything queued still follows it in order.
+function recoverUndeliveredSteers(
+  sessionId: string,
+  set: (fn: (s: ChatStore) => Partial<ChatStore>) => void,
+  get: () => ChatStore,
+): boolean {
+  const runtime = get().runtime[sessionId];
+  const undelivered = runtime?.messages.filter((m) => m.steerPending) ?? [];
+  if (undelivered.length === 0) return false;
+
+  const ids = new Set(undelivered.map((m) => m.id));
+  set((s) => {
+    const prev = s.runtime[sessionId];
+    if (!prev) return {};
+    return {
+      runtime: {
+        ...s.runtime,
+        [sessionId]: {
+          ...prev,
+          messages: prev.messages.filter((m) => !ids.has(m.id)),
+          localMessages: prev.localMessages.filter((m) => !ids.has(m.id)),
+          revision: prev.revision + 1,
+        },
+      },
+    };
+  });
+
+  // Oldest first: the first becomes the next turn, the rest queue behind it so
+  // several rapid steers keep their order.
+  const [first, ...rest] = undelivered;
+  if (rest.length > 0) {
+    set((s) => {
+      const prev = s.runtime[sessionId];
+      if (!prev) return {};
+      return {
+        runtime: {
+          ...s.runtime,
+          [sessionId]: {
+            ...prev,
+            queue: [
+              ...rest.map((m) => ({
+                id: crypto.randomUUID(),
+                content: m.content,
+                enqueuedAt: m.createdAt,
+              })),
+              ...prev.queue,
+            ],
+          },
+        },
+      };
+    });
+  }
+  setTimeout(() => {
+    void get().sendMessage(first.content, sessionId);
+  }, 0);
+  return true;
+}
+
 function drainNextQueuedMessage(
   sessionId: string,
   set: (fn: (s: ChatStore) => Partial<ChatStore>) => void,
@@ -1072,6 +1193,13 @@ function handleStreamEvent(
   // just-completed send's React state settles before we re-enter.
   const nowStreaming = get().runtime[sessionId]?.streaming ?? false;
   if (wasStreaming && !nowStreaming) {
+    // A steer typed after the loop's last round boundary was never delivered.
+    // The backend drops it at turn cleanup so it can't leak into an unrelated
+    // later turn, which leaves us to re-send it as an ordinary message —
+    // otherwise the user watches their words vanish.
+    if (recoverUndeliveredSteers(sessionId, set, get)) {
+      return; // it becomes the next turn — defer the queue drain and post-mortem
+    }
     if (drainNextQueuedMessage(sessionId, set, get)) {
       return; // more conversation coming — defer post-mortem
     }

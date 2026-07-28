@@ -43,6 +43,10 @@ export interface UIMessage {
   completionState?: string;
   /** User-facing runtime warnings/notices retained for this turn. */
   gateActions?: GateActionState[];
+  /** A steer typed mid-run that the loop has not reached yet. Shown as sent
+   *  but undelivered, because until a round boundary drains it the model has
+   *  genuinely not seen it. Cleared by `steer_applied`. */
+  steerPending?: boolean;
   /** Turn timeline: narration and tool calls in arrival order. Only built
    *  during live streaming — hydrated history is already interleaved as
    *  separate rows. */
@@ -335,6 +339,21 @@ export function reduceChatStreamEvent(
           ],
         })),
       };
+
+    case "steer_applied": {
+      // Confirm the oldest still-pending steer with this text. Matching by
+      // content (not id) because the optimistic bubble was created before the
+      // backend had persisted anything to give it an id.
+      let confirmed = false;
+      return {
+        ...state,
+        messages: state.messages.map((m) => {
+          if (confirmed || !m.steerPending || m.content !== event.content) return m;
+          confirmed = true;
+          return { ...m, steerPending: undefined, id: event.message_id ?? m.id };
+        }),
+      };
+    }
 
     case "completion_gate_action":
       // The completion gate is a control loop, not a chat participant. Recovery

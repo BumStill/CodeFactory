@@ -304,6 +304,9 @@ pub struct LoopServices {
     pub hooks: Arc<dyn crate::services::LifecycleHooks>,
     pub context_policy: Arc<dyn crate::services::ContextPolicy>,
     pub fact_checker: Arc<dyn crate::services::FactChecker>,
+    /// Mid-run user input, drained at each round boundary. Surfaces with no
+    /// interactive user supply [`crate::services::NoSteering`].
+    pub steer: Arc<dyn crate::services::SteerInbox>,
 }
 
 /// Finish a tool batch that was cancelled mid-flight: persist each remaining
@@ -441,6 +444,7 @@ pub async fn run_agent_loop(
         hooks,
         context_policy,
         fact_checker,
+        steer,
     } = svc;
     let usage_identity = UsageIdentity {
         session_id: session_id.clone(),
@@ -511,6 +515,42 @@ pub async fn run_agent_loop(
                 });
                 emitted_terminal = true;
                 break;
+            }
+            // ── Mid-run steering ─────────────────────────────────────────────
+            // Same boundary, same discipline as cancellation above: the user's
+            // correction reaches the model before its next request, and no
+            // in-flight tool call is ever interrupted to deliver it.
+            for steer_text in steer.drain().await {
+                let message_id = persistence
+                    .persist_message(
+                        "user", &steer_text, None, None, None, None, None, None, None,
+                    )
+                    .await?;
+                messages.push(crate::types::ChatMessage {
+                    role: "user".into(),
+                    content: crate::types::MessageContent::Text(steer_text.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                });
+                // The objective just changed, so the completion gate is now
+                // judging against a goal this turn has not attempted yet.
+                // Without this reset a turn that already spent 2 of its 3
+                // recoveries would give the newly-stated goal almost no budget
+                // and release it with an "unverified" warning it never earned.
+                //
+                // The gate itself is NOT rebuilt from the new instruction: its
+                // requirements were derived once, but the evidence it has
+                // accumulated (mutations made, verifications run) describes
+                // work that actually happened and must not be discarded. Its
+                // core rule — a successful verification later than the last
+                // mutation — holds under any objective.
+                completion_recovery_attempts = 0;
+                events.emit(crate::types::StreamEvent::SteerApplied {
+                    message_id,
+                    content: steer_text,
+                });
             }
             // ── Context-window management ────────────────────────────────────
             // Estimate prompt tokens before sending. If we're over 75% of the
@@ -1453,6 +1493,7 @@ mod tests {
     struct ScriptedTransport {
         responses: Mutex<VecDeque<Result<ModelResponse, TransportError>>>,
         calls: Mutex<Vec<usize>>,
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
     }
 
     impl ScriptedTransport {
@@ -1460,11 +1501,18 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into_iter().map(Ok).collect()),
                 calls: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
             }
         }
 
         fn advertised_tool_counts(&self) -> Vec<usize> {
             self.calls.lock().expect("calls").clone()
+        }
+
+        /// The exact message list handed to the provider each round — the only
+        /// way to prove what the model actually saw.
+        fn requests(&self) -> Vec<Vec<ChatMessage>> {
+            self.requests.lock().expect("requests").clone()
         }
     }
 
@@ -1472,11 +1520,15 @@ mod tests {
     impl ModelTransport for ScriptedTransport {
         async fn complete(
             &self,
-            _messages: &[ChatMessage],
+            messages: &[ChatMessage],
             tools: &[ToolDefinition],
             _opts: &RoundOptions,
         ) -> Result<ModelResponse, TransportError> {
             self.calls.lock().expect("calls").push(tools.len());
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(messages.to_vec());
             self.responses
                 .lock()
                 .expect("responses")
@@ -1751,7 +1803,105 @@ mod tests {
             hooks: Arc::new(NoOpHooks),
             context_policy: Arc::new(FixedContext),
             fact_checker: Arc::new(NoOpFactChecker),
+            steer: Arc::new(crate::services::NoSteering),
         }
+    }
+
+    /// A steer inbox that starts empty and produces its message only on the
+    /// Nth drain — modelling a user who types while a tool is running, not one
+    /// who had already typed before the turn began.
+    #[derive(Default)]
+    struct ScriptedSteer {
+        deliver_on_drain: u32,
+        message: String,
+        drains: Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::SteerInbox for ScriptedSteer {
+        async fn drain(&self) -> Vec<String> {
+            let mut drains = self.drains.lock().expect("drains");
+            *drains += 1;
+            if *drains == self.deliver_on_drain {
+                vec![self.message.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_steer_typed_during_a_tool_call_lands_at_the_next_round_boundary() {
+        // Round 1 calls a tool; the user types while it runs; round 2 must
+        // already carry their correction.
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response("先看一下当前实现", vec![call("t1", "scripted", serde_json::json!({}))], 0),
+            response("好的，改用 chrome channel", vec![], 1),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let steer = Arc::new(ScriptedSteer {
+            deliver_on_drain: 2,
+            message: "改用 chrome channel".into(),
+            drains: Mutex::new(0),
+        });
+        let mut svc = services(transport.clone(), persistence.clone(), events.clone());
+        svc.steer = steer.clone();
+
+        run_agent_loop(inputs(), config(), svc).await.expect("loop runs");
+
+        // Persisted as a real user turn — the user's own words, not a
+        // framework control row.
+        let persisted = persistence.messages.lock().expect("messages").clone();
+        assert!(
+            persisted
+                .iter()
+                .any(|(role, content, _)| role == "user" && content == "改用 chrome channel"),
+            "steer must be persisted as a user message, got {persisted:?}",
+        );
+
+        // Announced exactly once, and only after it actually landed.
+        let applied: Vec<_> = events
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                StreamEvent::SteerApplied { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applied, vec!["改用 chrome channel".to_string()]);
+
+        // The model saw it before its second request — that is the whole point.
+        let second_request = transport.requests().get(1).cloned().expect("a second round ran");
+        assert!(
+            second_request.iter().any(|m| {
+                m.role == "user"
+                    && matches!(&m.content, MessageContent::Text(t) if t == "改用 chrome channel")
+            }),
+            "the correction must be in the next request, got {second_request:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_steer_inbox_changes_nothing() {
+        let transport = Arc::new(ScriptedTransport::new(vec![response("完成", vec![], 0)]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut svc = services(transport, persistence.clone(), events.clone());
+        svc.steer = Arc::new(ScriptedSteer::default());
+
+        run_agent_loop(inputs(), config(), svc).await.expect("loop runs");
+
+        assert!(!events
+            .events()
+            .iter()
+            .any(|event| matches!(event, StreamEvent::SteerApplied { .. })));
+        assert!(!persistence
+            .messages
+            .lock()
+            .expect("messages")
+            .iter()
+            .any(|(role, _, _)| role == "user"));
     }
 
     #[tokio::test]

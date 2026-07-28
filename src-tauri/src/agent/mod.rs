@@ -500,6 +500,10 @@ pub struct AgentLoop {
     /// polls it between rounds and stops cleanly — it never interrupts an
     /// in-flight tool call, and never touches the task scheduler.
     cancel: Option<Arc<AtomicBool>>,
+    /// Mid-run user input for THIS chat turn, drained at the same round
+    /// boundary as `cancel`. `None` for non-chat constructions, which have no
+    /// interactive user to steer them.
+    steer: Option<crate::commands::interjections::InterjectionQueue>,
     /// Root-turn safety latch shared by every provider round in this run.
     /// Once visible text or any tool activity starts, replaying the turn on a
     /// different endpoint is no longer safe.
@@ -705,6 +709,7 @@ impl AgentLoop {
             usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,
             cancel: None,
+            steer: None,
             turn_output_started: Arc::new(AtomicBool::new(false)),
             turn_side_effect_started: Arc::new(AtomicBool::new(false)),
         }
@@ -784,6 +789,7 @@ impl AgentLoop {
             usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,
             cancel: None,
+            steer: None,
             turn_output_started: Arc::new(AtomicBool::new(false)),
             turn_side_effect_started: Arc::new(AtomicBool::new(false)),
         }
@@ -896,6 +902,18 @@ impl AgentLoop {
     /// other call site leaves it `None`, so their behavior is unchanged.
     pub fn with_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
         self.cancel = Some(flag);
+        self
+    }
+
+    /// Attach the shared interjection queue so this chat turn can be steered
+    /// mid-run. Same queue the task scheduler drains, so one `queue_interjection`
+    /// means the same thing whichever is running. Only the interactive chat
+    /// path wires this; everything else stays `None` and unaffected.
+    pub fn with_steer(
+        mut self,
+        queue: crate::commands::interjections::InterjectionQueue,
+    ) -> Self {
+        self.steer = Some(queue);
         self
     }
 
@@ -1127,6 +1145,15 @@ impl AgentLoop {
             hooks,
             context_policy: std::sync::Arc::new(self.context_policy(expand_context_window)),
             fact_checker: std::sync::Arc::new(fact_checker::DesktopFactChecker { mode: self.mode }),
+            steer: match self.steer.clone() {
+                Some(queue) => std::sync::Arc::new(
+                    crate::commands::interjections::SessionSteerInbox {
+                        queue,
+                        session_id: self.session_id.clone(),
+                    },
+                ),
+                None => std::sync::Arc::new(codefactory_agent_loop::services::NoSteering),
+            },
         };
         // The desktop discards the returned RunOutcome (Done already emitted via
         // the sink); LoopError maps to AppError::Other verbatim (message-identical).

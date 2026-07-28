@@ -181,6 +181,34 @@ impl ContextCompactor for NoOpCompactor {
     }
 }
 
+/// Mid-run user input. The loop drains this at a round boundary — the same
+/// place it polls the cancel flag, and for the same reason: an in-flight tool
+/// call is never interrupted, but the user should not have to wait out a
+/// 150-step turn to correct its course.
+///
+/// Drained messages are real user input. Unlike the completion gate's injected
+/// prompts they are persisted to the transcript and replayed to the model.
+///
+/// Desktop reads the session's queue from the shared `InterjectionQueue`, which
+/// the task scheduler drains at its own boundary — one inbox, one command, two
+/// consumers. Headless uses [`NoSteering`].
+#[async_trait::async_trait]
+pub trait SteerInbox: Send + Sync {
+    /// Take everything pending, leaving the inbox empty. Oldest first.
+    async fn drain(&self) -> Vec<String>;
+}
+
+/// A steer inbox that is always empty — for surfaces with no interactive user
+/// (the eval sidecar, unattended runs).
+pub struct NoSteering;
+
+#[async_trait::async_trait]
+impl SteerInbox for NoSteering {
+    async fn drain(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

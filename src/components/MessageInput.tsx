@@ -200,7 +200,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
   ];
   const commandCandidate = parseSlashCommand(value.trim());
 
-  const submit = async () => {
+  const submit = async ({ forceQueue = false }: { forceQueue?: boolean } = {}) => {
     const text = value.trim();
     // Allow submission with attachments but no text — the markdown links
     // appended below count as content for the model.
@@ -217,7 +217,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
       void onCommand(command);
       return;
     }
-    if (guidanceActive && text && onGuide) {
+    if (guidanceActive && !forceQueue && text && onGuide) {
       setGuidanceState({ kind: "pending" });
       try {
         await onGuide(text);
@@ -290,7 +290,10 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
         return;
       }
       e.preventDefault();
-      void submit();
+      // While a run is in flight the default is to steer it. ⌘/Ctrl+Enter is
+      // the escape hatch for "this is a separate thing, do it after" — a
+      // per-message modifier, not a mode the user has to manage.
+      void submit({ forceQueue: e.metaKey || e.ctrlKey });
       return;
     }
     // Shell-style history recall. ↑ enters history only when the caret is at
@@ -461,7 +464,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
             dragOver
               ? "松开以附加文件"
               : guidanceActive
-              ? "执行中…输入对下一步的引导"
+              ? "执行中…直接输入即可引导当前执行"
               : disabled
               ? "发送消息，或用 /cwd <path> 切换目录"
               : "发送消息 · 粘贴/拖拽/回形针附加文件（图片 · pptx · docx · pdf · xlsx）"
@@ -503,7 +506,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
         )}
         {guidanceState.kind === "success" && (
           <span aria-live="polite" className="flex items-center gap-1 text-green-700 dark:text-green-400">
-            <Check size={11} /> 已加入下一任务
+            <Check size={11} /> 已送出
           </span>
         )}
         {guidanceState.kind === "error" && (
@@ -513,9 +516,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
         )}
         <span className="ml-auto">
           {guidanceActive
-            ? "Enter 引导下一步 · Shift+Enter 换行"
-            : streaming
-            ? "Enter 排队 · Shift+Enter 换行"
+            ? "Enter 引导当前执行 · ⌘Enter 等这轮结束再发 · Shift+Enter 换行"
             : "Enter 发送 · Shift+Enter 换行"}
         </span>
       </div>

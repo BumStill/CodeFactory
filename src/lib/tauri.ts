@@ -66,6 +66,7 @@ export type StreamEvent =
       reason: string;
     }
   | { type: "completion_gate_action"; kind: string; detail: string }
+  | { type: "steer_applied"; message_id: string | null; content: string }
   | {
       type: "runtime_error";
       code: string;

@@ -295,6 +295,14 @@ pub enum StreamEvent {
         kind: String,
         detail: String,
     },
+    /// Mid-run user input reached the model. Emitted at the round boundary
+    /// where it was actually applied, not when it was typed — the frontend
+    /// shows it as pending until this lands, so a turn that ends first can
+    /// never leave a delivered-looking message that the model never saw.
+    SteerApplied {
+        message_id: Option<String>,
+        content: String,
+    },
     Error {
         message: String,
     },
