@@ -4,7 +4,7 @@
 
 # CodeFactory
 
-**AI coding assistant for Windows — bring a folder, set a goal, ship faster.**
+**Local-first AI coding assistant for Windows & macOS — bring a folder, set a goal, ship faster.**
 
 [![Latest Release](https://img.shields.io/github/v/release/BumStill/CodeFactory)](https://github.com/BumStill/CodeFactory/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -29,9 +29,10 @@ work — running tests, applying multi-file edits, recovering from a flubbed
 refactor, knowing when to stop and ask — happens between the snippets.
 CodeFactory is built around that loop.
 
-It runs locally, your conversations and settings live in
-`%APPDATA%\com.codefactory.app\`, and there's no telemetry. Bring your own
-API key.
+It runs locally — your conversations and settings stay on your machine
+(`%APPDATA%\com.codefactory.app\` on Windows, `~/Library/Application
+Support/com.codefactory.app/` on macOS) — and there's no telemetry. Bring
+your own API key, or sign in with ChatGPT for the Codex-backed provider.
 
 ## Features
 
@@ -46,6 +47,8 @@ API key.
 | 🤖 **Subagents** | Conversation-native task delegation → parallel subagent dispatch, shared brief, verification engine, evidence pack auto-collection. Long-lived specs stay in the repository and travel with Git. |
 | 🪝 **Hooks & Skills** | Run scripts on tool events (commit-on-edit, lint-on-write). Create, edit, import, or let the agent search for skill packs (system prompts + slash commands) right from the chat box — pull in Superpowers / OpenSpec-style skills with a preview-then-enable step. |
 | 🌐 **MCP client** | Connect Model Context Protocol servers for arbitrary tool extension. |
+| 📦 **Docker sandbox** | Optional `sandbox_mode: Docker` runs every shell/tool command in a disposable container instead of your host shell. |
+| 🔔 **IM notifications** | Optional WeCom / Feishu / generic-JSON webhook pings you when a task finishes, fails, or needs permission — fire-and-forget, no secrets in the payload. |
 | 🔁 **Auto-update** | Signed updates over GitHub Releases. New version arrives → in-app banner → one-click install + relaunch. Your data stays. |
 
 ## Install
@@ -147,10 +150,10 @@ Everything lives on your machine:
 
 | What | Where |
 |---|---|
-| Sessions, messages, costs (SQLite) | `%APPDATA%\com.codefactory.app\codefactory.db` |
-| Settings (endpoints, permissions, hooks) | `%APPDATA%\com.codefactory.app\settings.json` |
-| API keys | Windows Credential Manager |
-| Daily DB backups (7 day retention) | `%APPDATA%\com.codefactory.app\codefactory.db.backup-YYYYMMDD` |
+| Sessions, messages, costs (SQLite) | `%APPDATA%\com.codefactory.app\codefactory.db` (Windows) / `~/Library/Application Support/com.codefactory.app/codefactory.db` (macOS) |
+| Settings (endpoints, permissions, hooks) | same app-data folder, `settings.json` |
+| API keys | OS keychain — Windows Credential Manager / macOS Keychain |
+| Daily DB backups (7 day retention) | same app-data folder, `codefactory.db.backup-YYYYMMDD` |
 
 Uninstall preserves all of the above. Reinstall picks up where you left off.
 
@@ -179,6 +182,21 @@ Uninstall preserves all of the above. Reinstall picks up where you left off.
 Backend lives in [src-tauri/src/](src-tauri/src/), frontend in
 [src/](src/). Conventional-commit messages drive
 auto-generated release notes via [`cliff.toml`](cliff.toml).
+
+## Memory & self-evolution
+
+CodeFactory's tagline is **软件工厂 · 本地助手 · 自进化** — it's meant to get
+better from its own use. Concretely, today: sessions are mined locally for
+reusable patterns with no model call and no data leaving your machine, and
+accepted lessons land in a per-project `memory.md` that's injected back into
+future context — automatically, no "remember" button required. Skill
+proposals and tool-permission tightening go through a human review step
+before they take effect. This is still an early, honestly-scoped version of
+the idea — memory has no decay/retirement loop yet, and full autonomous
+self-modification is not implemented. See
+[docs/self-evolution/README.md](docs/self-evolution/README.md) for the
+current state and phased roadmap, and [docs/BACKLOG.md](docs/BACKLOG.md) for
+what's planned next.
 
 ## Roadmap
 

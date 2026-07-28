@@ -179,21 +179,6 @@ pub async fn upsert_user_preference(
     })
 }
 
-#[command]
-pub async fn delete_user_preference(
-    cwd: String,
-    key: String,
-    state: State<'_, AppState>,
-) -> Result<(), AppError> {
-    let pool = state.db.read().await;
-    sqlx::query("DELETE FROM user_preferences WHERE cwd = ? AND key = ?")
-        .bind(&cwd)
-        .bind(&key)
-        .execute(&*pool)
-        .await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

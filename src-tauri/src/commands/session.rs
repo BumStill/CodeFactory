@@ -409,21 +409,6 @@ pub async fn update_session_title(
     Ok(session)
 }
 
-#[tauri::command]
-pub async fn get_messages(
-    session_id: String,
-    state: State<'_, AppState>,
-) -> Result<Vec<Message>, AppError> {
-    let pool = state.db.read().await;
-    let messages = sqlx::query_as::<_, Message>(
-        "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
-    )
-    .bind(&session_id)
-    .fetch_all(&*pool)
-    .await?;
-    Ok(messages)
-}
-
 const DEFAULT_MESSAGE_PAGE_USER_TURNS: i64 = 8;
 const MAX_MESSAGE_PAGE_USER_TURNS: i64 = 32;
 const MAX_MESSAGE_PAGE_ROWS: i64 = 400;

@@ -983,21 +983,6 @@ async fn accept_learning_event_for_pool(
     Ok((memory, cwd))
 }
 
-/// Accept is one user action but two audited stages: review then materialize.
-/// The learning row becomes accepted only after the side effect succeeds.
-#[command]
-pub async fn accept_learning_event(
-    event_id: String,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<ProjectMemory, AppError> {
-    let pool = state.db.read().await;
-    let (memory, cwd) = accept_learning_event_for_pool(&event_id, &pool).await?;
-    let event = format!("learning_events_updated:{cwd}");
-    let _ = app.emit(&event, ());
-    Ok(memory)
-}
-
 async fn reject_learning_event_for_pool(
     event_id: &str,
     pool: &SqlitePool,

@@ -177,21 +177,6 @@ pub async fn list_issues(
 }
 
 #[tauri::command]
-pub async fn get_issue(
-    remote_id: String,
-    repo: String,
-    number: u64,
-    state: State<'_, AppState>,
-) -> Result<RemoteIssue, String> {
-    let cfg = find_remote(&state, &remote_id).await?;
-    let client = make_client(&cfg)?;
-    match cfg.provider {
-        GitProvider::Github => crate::git_remote::github::get_issue(&client, &repo, number).await,
-        GitProvider::Gitlab => crate::git_remote::gitlab::get_issue(&client, &repo, number).await,
-    }
-}
-
-#[tauri::command]
 pub async fn create_issue(
     remote_id: String,
     repo: String,

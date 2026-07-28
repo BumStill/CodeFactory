@@ -883,9 +883,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             ...settings,
             permissions: { ...settings.permissions, full_access: true },
           });
-        } catch {
+        } catch (e) {
           // Persisting failed — fall back to allow-once so the call doesn't
           // hang. The user can enable full access from Settings instead.
+          // Surfaced (not silently swallowed): the user believes they just
+          // granted standing full access, so a failure here means every
+          // future tool call will keep prompting until they notice and
+          // retry from Settings.
+          console.error("Failed to persist full_access permission grant:", e);
         }
       }
     }

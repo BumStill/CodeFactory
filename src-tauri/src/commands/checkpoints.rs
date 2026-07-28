@@ -3,11 +3,9 @@
 //! when the agent takes a wrong turn. See agent/checkpoint.rs for the
 //! snapshot mechanics.
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tauri::State;
-use uuid::Uuid;
 
 use crate::agent::checkpoint::{self, CheckpointFileChange, CheckpointInfo};
 use crate::errors::AppError;
@@ -40,59 +38,6 @@ impl From<CheckpointRow> for CheckpointInfo {
     }
 }
 
-/// Create a checkpoint right before sending a user message off to the
-/// agent. Returns `None` when the cwd isn't a git repo (silent no-op).
-///
-/// Called by `commands::chat::send_message`. Also exposed as a Tauri
-/// command so the UI can request a manual checkpoint when convenient.
-#[tauri::command]
-pub async fn create_checkpoint(
-    session_id: String,
-    message_id: Option<String>,
-    cwd: String,
-    label: String,
-    state: State<'_, AppState>,
-) -> Result<Option<CheckpointInfo>, AppError> {
-    let sha = match checkpoint::create(Path::new(&cwd), &label) {
-        Ok(Some(s)) => s,
-        Ok(None) => return Ok(None),
-        Err(e) => {
-            // Don't fail the whole chat just because git misbehaved —
-            // surface it as a log line and continue without a checkpoint.
-            tracing::warn!("checkpoint creation failed: {e}");
-            return Ok(None);
-        }
-    };
-
-    let id = Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
-
-    let pool = state.db.read().await;
-    sqlx::query(
-        "INSERT INTO checkpoints (id, session_id, message_id, cwd, git_sha, label, created_at, reverted)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
-    )
-    .bind(&id)
-    .bind(&session_id)
-    .bind(&message_id)
-    .bind(&cwd)
-    .bind(&sha)
-    .bind(&label)
-    .bind(&now)
-    .execute(&*pool)
-    .await?;
-
-    Ok(Some(CheckpointInfo {
-        id,
-        session_id,
-        message_id,
-        cwd,
-        git_sha: sha,
-        label,
-        created_at: now,
-        reverted: false,
-    }))
-}
 
 #[tauri::command]
 pub async fn list_checkpoints(

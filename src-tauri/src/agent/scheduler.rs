@@ -820,7 +820,15 @@ impl TaskScheduler {
                                     worktree::cleanup(wt, true);
                                 }
                                 Ok(worktree::MergeOutcome::Conflict { message }) => {
-                                    let _ = journal::journal_mark_stale(&pool, &task_id).await;
+                                    if let Err(e) =
+                                        journal::journal_mark_stale(&pool, &task_id).await
+                                    {
+                                        tracing::warn!(
+                                            "scheduler: task {} journal_mark_stale failed after \
+                                             merge conflict ({e})",
+                                            task_id
+                                        );
+                                    }
                                     let note = format!(
                                         "Merge-back conflict: {message}. Work preserved on \
                                          branch '{}' with patch at {}.",
@@ -836,7 +844,15 @@ impl TaskScheduler {
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = journal::journal_mark_stale(&pool, &task_id).await;
+                                    if let Err(mark_stale_err) =
+                                        journal::journal_mark_stale(&pool, &task_id).await
+                                    {
+                                        tracing::warn!(
+                                            "scheduler: task {} journal_mark_stale failed after \
+                                             merge-back error ({mark_stale_err})",
+                                            task_id
+                                        );
+                                    }
                                     let note = format!(
                                         "Merge-back failed: {e}. Work preserved on branch '{}' \
                                          at {}.",

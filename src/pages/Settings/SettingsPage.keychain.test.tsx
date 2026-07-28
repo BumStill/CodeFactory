@@ -7,7 +7,6 @@ const mocks = vi.hoisted(() => ({
   load: vi.fn(),
   save: vi.fn(),
   saveApiKey: vi.fn(),
-  getApiKey: vi.fn(),
   loadModels: vi.fn(),
   codexLogin: vi.fn(),
   codexLogout: vi.fn(),
@@ -54,7 +53,6 @@ const settingsState = vi.hoisted(() => ({
   load: mocks.load,
   save: mocks.save,
   saveApiKey: mocks.saveApiKey,
-  getApiKey: mocks.getApiKey,
 }));
 
 const chatState = vi.hoisted(() => ({
@@ -118,7 +116,6 @@ describe("SettingsPage keychain handling", () => {
     mocks.load.mockResolvedValue(undefined);
     mocks.save.mockResolvedValue(undefined);
     mocks.saveApiKey.mockResolvedValue(undefined);
-    mocks.getApiKey.mockRejectedValue(new Error("settings page must not read saved API keys"));
     mocks.codexAccount.mockResolvedValue(null);
     mocks.applyCodexModels.mockResolvedValue(undefined);
     delete (settingsState.settings.endpoints as Record<string, unknown>).chatgpt;
@@ -127,14 +124,13 @@ describe("SettingsPage keychain handling", () => {
     settingsState.settings.theme = "dark";
   });
 
-  it("does not read saved API keys when opening the endpoint settings", async () => {
+  it("shows a masked placeholder for a saved key instead of reading it back", async () => {
     render(<SettingsPage onBack={() => {}} />);
 
     await waitFor(() => {
       expect(screen.getByDisplayValue("https://api.deepseek.com")).toBeInTheDocument();
     });
 
-    expect(mocks.getApiKey).not.toHaveBeenCalled();
     expect(screen.getByPlaceholderText("已保存，输入新密钥以替换")).toBeInTheDocument();
   });
 

@@ -238,19 +238,48 @@ pub async fn install_skill_from_url(url: String, _app: AppHandle) -> Result<Skil
     install_user_skill_from_url(&url, false).await
 }
 
+const MAX_REMOTE_MANIFEST_BYTES: usize = 1024 * 1024; // 1 MiB — a system prompt has no business being bigger.
+
+/// A skill id becomes a directory name under the user skills dir — reject
+/// anything that isn't a plain path component (blocks path traversal via a
+/// malicious/compromised remote manifest, e.g. `id: "../../.."`).
+fn is_safe_skill_id(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 /// Fetch a JSON skill manifest from `url` and write it to the user skills dir.
 /// `enabled` controls whether it activates immediately. App-independent.
 pub async fn install_user_skill_from_url(url: &str, enabled: bool) -> Result<SkillManifest, String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("只支持 http(s) URL".to_string());
+    }
+
     let response = reqwest::get(url)
         .await
         .map_err(|e| format!("拉取失败: {e}"))?;
-    let raw = response
-        .text()
+    let bytes = response
+        .bytes()
         .await
         .map_err(|e| format!("读取响应失败: {e}"))?;
+    if bytes.len() > MAX_REMOTE_MANIFEST_BYTES {
+        return Err(format!(
+            "manifest 过大（{} 字节，上限 {} 字节）",
+            bytes.len(),
+            MAX_REMOTE_MANIFEST_BYTES
+        ));
+    }
+    let raw = String::from_utf8(bytes.to_vec()).map_err(|e| format!("响应不是合法 UTF-8: {e}"))?;
 
     let mf: ManifestFile =
         serde_json::from_str(&raw).map_err(|e| format!("manifest JSON 无效: {e}"))?;
+    if !is_safe_skill_id(&mf.id) {
+        return Err(format!("manifest id 不合法: {:?}", mf.id));
+    }
 
     let skill_dir = user_skills_dir().join(&mf.id);
     std::fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
@@ -692,6 +721,13 @@ pub async fn delete_skill(id: String, app: AppHandle) -> Result<(), String> {
         return Err("Cannot delete built-in skills. Disable them instead.".to_string());
     }
 
+    // Deleting a still-disabled proposed skill is the user's rejection signal
+    // (see propose_skills_from_patterns) — record it so the same cluster
+    // never gets re-proposed.
+    if !manifest.enabled && manifest.tags.iter().any(|t| t == "proposed") {
+        record_rejected_proposal_key(&manifest.name);
+    }
+
     std::fs::remove_dir_all(&manifest.path).map_err(|e| e.to_string())
 }
 
@@ -1115,22 +1151,6 @@ pub async fn fetch_skill_from_source(source: &str) -> Result<Vec<SkillManifest>,
     install_marketplace_skill_by_id(s).await.map(|m| vec![m])
 }
 
-/// Aggregate slash commands from all enabled skills.
-#[tauri::command]
-pub async fn list_slash_commands(app: AppHandle) -> Result<Vec<SlashCommand>, String> {
-    let skills = list_skills(app.clone()).await?;
-    let mut commands = Vec::new();
-    for skill in skills.iter().filter(|s| s.enabled) {
-        let path = PathBuf::from(&skill.path).join("slash_commands.json");
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Ok(cmds) = serde_json::from_str::<Vec<SlashCommand>>(&raw) {
-                commands.extend(cmds);
-            }
-        }
-    }
-    Ok(commands)
-}
-
 // ── Self-evolution P2: skill auto-evolution ───────────────────────────────────
 //
 // Turn recurring TASK shapes into a skill the agent drafts for itself, stored
@@ -1142,6 +1162,37 @@ pub async fn list_slash_commands(app: AppHandle) -> Result<Vec<SlashCommand>, St
 
 const MIN_CLUSTER: usize = 4;
 const MAX_PROPOSALS_PER_RUN: usize = 3;
+
+/// Cluster keys the user has explicitly rejected (deleted a proposed skill
+/// for), so `propose_skills_from_patterns` never re-suggests them. A proposed
+/// skill's `name` is always set to its cluster key (see `write_proposal_skill`
+/// / `cluster_task_intents`), so recovering the key at delete time is exact —
+/// no need to invert the filesystem-slug transform.
+fn rejected_proposals_path() -> PathBuf {
+    user_skills_dir().join(".rejected_proposals.json")
+}
+
+fn load_rejected_proposal_keys() -> std::collections::HashSet<String> {
+    std::fs::read_to_string(rejected_proposals_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+
+fn record_rejected_proposal_key(key: &str) {
+    let mut keys = load_rejected_proposal_keys();
+    if !keys.insert(key.to_string()) {
+        return;
+    }
+    let path = rejected_proposals_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(&keys.into_iter().collect::<Vec<_>>()) {
+        let _ = std::fs::write(path, json);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TaskTitleRow {
@@ -1316,7 +1367,7 @@ pub async fn propose_skills_from_patterns(
         .collect();
 
     let drafts = cluster_task_intents(&task_rows);
-    let drafts = filter_covered(drafts, &existing_labels, &std::collections::HashSet::new());
+    let drafts = filter_covered(drafts, &existing_labels, &load_rejected_proposal_keys());
 
     let mut created = Vec::new();
     for d in drafts.into_iter().take(MAX_PROPOSALS_PER_RUN) {
@@ -1331,6 +1382,18 @@ pub async fn propose_skills_from_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_safe_skill_id_blocks_path_traversal() {
+        assert!(is_safe_skill_id("my-cool-skill"));
+        assert!(is_safe_skill_id("skill_v2.1"));
+        assert!(!is_safe_skill_id(""));
+        assert!(!is_safe_skill_id("."));
+        assert!(!is_safe_skill_id(".."));
+        assert!(!is_safe_skill_id("../../etc/passwd"));
+        assert!(!is_safe_skill_id("a/b"));
+        assert!(!is_safe_skill_id("a\\b"));
+    }
 
     #[test]
     fn headless_skill_prompts_read_enabled_skills_from_a_dir_without_an_app() {

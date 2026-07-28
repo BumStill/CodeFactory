@@ -51,15 +51,6 @@ pub async fn queue_interjection(
     Ok(())
 }
 
-#[command]
-pub async fn list_interjections(
-    session_id: String,
-    state: State<'_, AppState>,
-) -> Result<Vec<Interjection>, AppError> {
-    let q = state.interjections.lock().await;
-    Ok(q.get(&session_id).cloned().unwrap_or_default())
-}
-
 /// Drain (return + clear) the queue for a session. Used by the scheduler
 /// at the start of each task dispatch.
 pub async fn drain_for_session(

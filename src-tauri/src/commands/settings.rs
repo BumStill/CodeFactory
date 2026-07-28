@@ -24,14 +24,6 @@ pub async fn save_settings(
 }
 
 #[tauri::command]
-pub async fn get_api_key(key_ref: String) -> Result<Option<String>, AppError> {
-    crate::credential_broker::CredentialBroker::global()
-        .get(&key_ref)
-        .await
-        .map_err(|error| AppError::Other(error.message))
-}
-
-#[tauri::command]
 pub async fn save_api_key(key_ref: String, value: String) -> Result<(), AppError> {
     crate::credential_broker::CredentialBroker::global()
         .put(&key_ref, &value)
