@@ -1,5 +1,9 @@
 # Rust / Cargo build artifacts
 target/
+# The post-checkout hook links src-tauri/target at the shared cache, and a
+# symlink is not a directory — `target/` does not match it, so every worktree
+# offers it to `git add -A`. Match it as a plain path too.
+src-tauri/target
 .codefactory-cache/
 **/*.rs.bk
 
