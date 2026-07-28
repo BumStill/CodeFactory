@@ -562,8 +562,12 @@ const MessageRow = memo(function MessageRow({
 
   if (isUser) {
     return (
-      <div className="flex justify-end">
-        <div className="max-w-[85%] bg-surface-3 rounded-2xl rounded-br-sm px-4 py-2.5">
+      <div className="flex flex-col items-end">
+        <div
+          className={`max-w-[85%] bg-surface-3 rounded-2xl rounded-br-sm px-4 py-2.5 ${
+            msg.steerPending ? "opacity-60" : ""
+          }`}
+        >
           <div className="prose dark:prose-invert prose-sm max-w-none whitespace-pre-wrap text-sm text-gray-200 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
             <ReactMarkdown
               components={markdownComponents}
@@ -574,6 +578,12 @@ const MessageRow = memo(function MessageRow({
             </ReactMarkdown>
           </div>
         </div>
+        {/* Until a round boundary drains it the model genuinely has not seen
+            this, and saying so is cheaper than letting the user wonder why
+            nothing changed. */}
+        {msg.steerPending && (
+          <span className="mt-0.5 mr-1 text-[10px] text-gray-500">等待当前步骤结束…</span>
+        )}
       </div>
     );
   }

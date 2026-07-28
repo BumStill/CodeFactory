@@ -61,6 +61,26 @@ pub async fn drain_for_session(
     q.remove(session_id).unwrap_or_default()
 }
 
+/// The chat loop's view of the same queue. Both consumers drain at their own
+/// safe boundary — the scheduler before dispatching the next task, the agent
+/// loop before its next model request — so one `queue_interjection` call means
+/// the same thing to the user no matter which is running.
+pub struct SessionSteerInbox {
+    pub queue: InterjectionQueue,
+    pub session_id: String,
+}
+
+#[async_trait::async_trait]
+impl codefactory_agent_loop::services::SteerInbox for SessionSteerInbox {
+    async fn drain(&self) -> Vec<String> {
+        drain_for_session(&self.queue, &self.session_id)
+            .await
+            .into_iter()
+            .map(|item| item.message)
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

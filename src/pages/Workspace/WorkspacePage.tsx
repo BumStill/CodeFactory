@@ -72,7 +72,7 @@ export function WorkspacePage({
 }: WorkspacePageProps) {
   const {
     activeSession, draftSession, sessions,
-    sendOrQueue, cancelStream, removeFromQueue, setDraftProject, setDraftAnonymous,
+    sendOrQueue, steerRun, cancelStream, removeFromQueue, setDraftProject, setDraftAnonymous,
     respondPermission, exitAnonymous, renameSession, loadOlderMessages,
   } = useChatStore();
   const activeDraft = draftSession?.id === sessionId ? draftSession : null;
@@ -90,7 +90,6 @@ export function WorkspacePage({
   const isAnonymous = activeSession?.kind === "anonymous";
   const settings = useSettingsStore((state) => state.settings);
   const persistedRunActive = useTasksStore((state) => state.running[sessionId] ?? false);
-  const autonomousRunActive = activeDraft ? false : persistedRunActive;
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
@@ -110,10 +109,14 @@ export function WorkspacePage({
       return next;
     });
   };
+  // Steering covers both in-flight surfaces: a streaming chat turn and an
+  // autonomous task run. Same keystroke, same meaning, same queue — which of
+  // the two happens to be running is the framework's business, not the user's.
+  const steerActive = activeDraft ? false : streaming || persistedRunActive;
   const guideNextStep = async (message: string) => {
     const trimmed = message.trim();
     if (!trimmed || activeDraft) return;
-    await invoke("queue_interjection", { sessionId, message: trimmed });
+    await steerRun(trimmed);
   };
   // Double-click the session title (here or in the sidebar) to rename it inline.
   const [titleEditing, setTitleEditing] = useState(false);
@@ -414,7 +417,7 @@ export function WorkspacePage({
             onGuide={guideNextStep}
             onCancel={() => cancelStream()}
             streaming={streaming}
-            guidanceActive={autonomousRunActive}
+            guidanceActive={steerActive}
             disabled={!activeSession && !activeDraft}
             pendingInsert={pendingInsert}
             onInsertConsumed={() => setPendingInsert(undefined)}

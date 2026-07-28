@@ -251,6 +251,8 @@ where
         hooks: std::sync::Arc::new(codefactory_agent_loop::services::NoOpHooks),
         context_policy: std::sync::Arc::new(loop_services::FixedContext),
         fact_checker: std::sync::Arc::new(codefactory_agent_loop::services::NoOpFactChecker),
+        // Unattended eval runs have no user at the keyboard to steer them.
+        steer: std::sync::Arc::new(codefactory_agent_loop::services::NoSteering),
         compactor: std::sync::Arc::new(CharBudgetCompactor {
             max_chars: MAX_CONTEXT_CHARS,
             history: history.clone(),
