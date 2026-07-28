@@ -103,4 +103,22 @@ describe("respondPermission — full access", () => {
     const respondCall = invokeMock.mock.calls.find((c) => c[0] === "respond_to_permission");
     expect(respondCall![1]).toEqual({ toolCallId: "tc1", allow: true });
   });
+
+  it("falls back to allow-once (not silently) when persisting full_access fails", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "save_settings") throw new Error("disk full");
+      return undefined;
+    });
+
+    await useChatStore.getState().respondPermission(true, { grantFullAccess: true });
+
+    // The failure must be surfaced, not swallowed silently.
+    expect(consoleError).toHaveBeenCalled();
+    // The current call still goes through — it must not hang waiting on a
+    // persisted grant that never landed.
+    const respondCall = invokeMock.mock.calls.find((c) => c[0] === "respond_to_permission");
+    expect(respondCall![1]).toEqual({ toolCallId: "tc1", allow: true });
+    consoleError.mockRestore();
+  });
 });
