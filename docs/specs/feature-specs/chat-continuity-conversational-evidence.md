@@ -13,7 +13,7 @@
 | CF-CCE-R7 | 重启 hydration 遇到无活跃 owner 的悬空工具尾部时，5 秒内显示可恢复中断；不得继续显示旧计时或假运行 | SQLite fixture + real app |
 | CF-CCE-R8 | “继续执行”复用原 root goal 和检查点，从最后确认边界继续，不重复执行已成功的非幂等工具 | resume integration + side-effect counter |
 | CF-CCE-R9 | 助手正文是主阅读线；成功工具默认为无全周边框、无阴影的行内证据，运行/权限/失败使用轻背景或左侧状态线 | component + compiled CSS + real app |
-| CF-CCE-R10 | 相邻三个及以上例行成功工具可折叠；不得跨助手正文、失败、权限或用户消息分组，展开后顺序与审计内容不变 | timeline component tests |
+| CF-CCE-R10 | 相邻三个及以上例行成功工具可原位聚合，但当前运行中的 root turn 不得按固定 segment 阈值整体折叠；只有进入 completed、blocked、cancelled 或 failed 终态后才可收束较早过程。不得跨助手正文、失败、权限或用户消息分组，展开后顺序与审计内容不变 | timeline component tests + terminal transition real app |
 | CF-CCE-R11 | 工具折叠态不解析大 diff/完整输出，摘要有界且不泄漏 prompt、凭据或未脱敏参数 | lazy/payload tests |
 | CF-CCE-R12 | 主题 token 支持 Tailwind `<alpha-value>`；生产 CSS 必须真实生成工具证据使用的 border/background opacity 类 | production CSS assertion |
 | CF-CCE-R13 | 历史 hydration 按真实用户回合重组 narration、tool replay、continuity 和 final；同一回合密度与 live timeline 一致 | hydration/store + component fixture |
@@ -35,7 +35,7 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 
 ### 自然对话路径
 
-助手先解释正在检查的问题，随后出现低对比的搜索/读取证据行；助手给出判断，再显示编辑和测试证据；最后用正常回复交付结论。20 个成功工具不会形成 20 个黑框，相邻例行项可折叠，失败仍直接显示首行原因。
+助手先解释正在检查的问题，随后出现低对比的搜索/读取证据行；助手给出判断，再显示编辑和测试证据；最后用正常回复交付结论。运行中的回合始终保持连续阅读线；20 个成功工具不会形成 20 个黑框，相邻例行项可原位聚合，失败仍直接显示首行原因。终态到达后，较早过程才收束到展开入口。
 
 ### 历史恢复路径
 
@@ -60,10 +60,10 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 | Rust panic | spawned chat future 在工具完成后 panic | `npm run cargo:shared -- test --manifest-path src-tauri/Cargo.toml chat_task_panic -- --nocapture` | 2 秒内 interrupted 落库与事件；running/cancel owner 清理 |
 | Rust resume | 非幂等 fake tool 计数后模拟进程重启 | `npm run cargo:shared -- test --manifest-path src-tauri/Cargo.toml continuity_resume -- --nocapture` | 计数保持 1；从 tool outcome 后续跑；最终终态唯一 |
 | Frontend event | checkpoint/resumed/interrupted/terminal 乱序与迟到尾页 | `npm test -- --run src/stores/chatEvents.test.ts src/stores/chatEvents.gate.test.ts src/stores/chatEvents.longSession.test.ts` | 同一 root turn 定点更新；迟到 hydration 不覆盖 live segment |
-| Tool UI | success/running/permission/error 与 6 个连续成功项 | `npm test -- --run src/components/ToolCallCard.test.tsx src/components/ToolCallCard.error.test.tsx src/components/ToolCallCard.lazy.test.tsx src/components/MessageList.timeline.test.tsx` | success 无全边框；attention 有文字；分组边界正确；折叠不解析 diff |
+| Tool UI | success/running/permission/error、6 个连续成功项与超过 10 个 segment 的 active→terminal 回合 | `pnpm exec vitest run src/components/ToolCallCard.test.tsx src/components/ToolCallCard.error.test.tsx src/components/ToolCallCard.lazy.test.tsx src/components/MessageList.timeline.test.tsx` | success 无全边框；attention 有文字；分组边界正确；active 全量可见且无整体折叠入口；terminal 才收束；折叠不解析 diff |
 | History/Memory | 一个回合被持久化为多条 assistant/tool/notice 行；postmortem 生成安全 memory 候选 | `npm test -- --run src/components/MessageList.gate.test.tsx src/components/MessageList.renderIsolation.test.tsx src/stores/chatEvents.segments.test.ts` + Rust learning materialization tests | hydration 后仍是一条自然流；气泡无 Remember；安全 memory 自动写入且 marker 去重 |
 | Theme build | `border-border/25`、`bg-surface-1/30` 等 opacity token | `npm run build` 后检查 `dist/assets/*.css` | 生产 CSS 含 alpha 规则；浅色不回退为不透明 `#1e293b` 黑框 |
-| Browser | 20-tool fixture，短流、长流、失败、用户上翻 | `npm run dev`，用真实浏览器执行 1366×768 与 800×600 | 无横向溢出；正文优先；长执行折叠；上翻不强拉回 |
+| Browser | 20-tool fixture，短流、长流、active→terminal、失败、用户上翻 | `pnpm dev`，用真实浏览器执行 1366×768 与 800×600 | 无横向溢出；正文优先；active 长回合不整体折叠；terminal 后才收束；上翻不强拉回 |
 | Dev App | 低 segment budget、panic hook、强制退出/重启 fixture | `pnpm tauri dev` 或 `scripts/install-dev-app-wrapper.sh` 启动 `CodeFactoryDev.app` | 自动续段、panic 可见、重启 5 秒内可恢复；成功/边界路径各一次 |
 | Release App | 从公开 macOS/Windows 产物安装精确版本 | 标准 release workflow 后在产物上重走 Dev App 路径 | 版本匹配；真实 app 四视口/主题和连续性全部通过 |
 

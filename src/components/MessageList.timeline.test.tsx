@@ -3,7 +3,7 @@
 // Turn-timeline rendering. The 26-minute-turn screenshot showed every tool
 // card stacked above one 800-character narration wall. With segments, the
 // row renders in arrival order, mid-turn narration reads as light step
-// lines, and long turns collapse their early steps.
+// lines, and only settled long turns collapse their early steps.
 
 import { describe, it, expect } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
@@ -58,6 +58,82 @@ describe("MessageList turn timeline", () => {
     const finals = container.querySelectorAll("[data-segment='final']");
     expect(finals.length).toBe(1);
     expect(finals[0].textContent).toContain("最终总结");
+  });
+
+  it("keeps a long active turn flat until it reaches a terminal state", () => {
+    const segments: TurnSegment[] = [];
+    const toolCalls = [];
+    for (let i = 0; i < 12; i++) {
+      segments.push({ kind: "text", text: `执行中第 ${i} 步。` });
+      segments.push({ kind: "tool", toolCallId: `active-${i}` });
+      toolCalls.push({
+        id: `active-${i}`,
+        name: "bash",
+        args: "{}",
+        status: i === 11 ? "running" as const : "done" as const,
+        result: i === 11 ? undefined : "ok",
+      });
+    }
+    const long = msg({ content: "仍在执行。", segments, toolCalls });
+
+    const { rerender } = render(
+      <MessageList messages={[long]} streaming cwd={null} />,
+    );
+
+    expect(screen.getByText("执行中第 0 步。")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /展开较早的执行过程/ }),
+    ).not.toBeInTheDocument();
+
+    rerender(<MessageList messages={[long]} streaming={false} cwd={null} />);
+
+    expect(screen.queryByText("执行中第 0 步。")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /展开较早的执行过程，共 \d+ 条/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("still collapses an earlier settled turn while a newer turn is active", () => {
+    const earlierSegments: TurnSegment[] = [];
+    const earlierTools = [];
+    for (let i = 0; i < 12; i++) {
+      earlierSegments.push({ kind: "text", text: `历史第 ${i} 步。` });
+      earlierSegments.push({ kind: "tool", toolCallId: `history-${i}` });
+      earlierTools.push({
+        id: `history-${i}`,
+        name: "bash",
+        args: "{}",
+        status: "done" as const,
+        result: "ok",
+      });
+    }
+
+    render(
+      <MessageList
+        messages={[
+          msg({
+            id: "history",
+            content: "历史完成。",
+            segments: earlierSegments,
+            toolCalls: earlierTools,
+          }),
+          msg({ id: "next-user", role: "user", content: "继续。" }),
+          msg({
+            id: "active",
+            content: "正在继续。",
+            segments: [{ kind: "text", text: "当前步骤保持可见。" }],
+          }),
+        ]}
+        streaming
+        cwd={null}
+      />,
+    );
+
+    expect(screen.queryByText("历史第 0 步。")).not.toBeInTheDocument();
+    expect(screen.getByText("当前步骤保持可见。")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /展开较早的执行过程，共 \d+ 条/ }),
+    ).toBeInTheDocument();
   });
 
   it("collapses early steps of a very long turn behind a toggle", () => {
