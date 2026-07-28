@@ -2238,18 +2238,39 @@ fn build_system_prompt_for(mode: AgentMode, cwd: &Path) -> String {
     )
 }
 
+fn user_visible_time_context() -> String {
+    let now = chrono::Local::now();
+    let offset = now.format("%:z").to_string();
+    let zone = iana_time_zone::get_timezone().unwrap_or_else(|_| "system local time zone".into());
+    format!(
+        "# User-Visible Time\n\
+         User local time: {}\n\
+         User time zone: {}\n\
+         UTC offset: {}\n\
+         IANA zone: {}\n\
+         Default to the user's local time in progress updates, waits, ETAs, and summaries. \n\
+         Do not show raw UTC/API timestamps in normal user-facing prose; convert them to the user's local time first. \n\
+         Mention UTC only when the user asks for raw evidence, audit details, or exact API/log fields.",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        zone,
+        offset,
+        zone
+    )
+}
+
 /// Fixed agent contract plus the exact project root for this session. Keeping
 /// cwd in the non-evictable base prevents the model from guessing container
 /// conventions such as `/workspace` before its first tool call.
 fn base_system_prompt(mode: AgentMode, cwd: &Path) -> String {
     format!(
-        "{}\n\n{}\n\n{SELF_RECOVERY_CONTRACT}\n# Repository-Owned Intent\n\
+        "{}\n\n{}\n\n{}\n\n{SELF_RECOVERY_CONTRACT}\n# Repository-Owned Intent\n\
          Long-lived requirements, specifications, architecture decisions, and acceptance criteria belong to ordinary versioned files in the repository, not to Agent memory or an app-owned specification database. Before non-trivial planning or implementation, inspect `AGENTS.md`, the README, and relevant existing files such as `docs/specs` or `docs/design`; follow the repository's own convention rather than creating `.codefactory/specs`; plans and delegated task state belong to the current conversation; do not direct the user to a separate specification or planning screen. When a durable decision changes, edit the repository document through normal file tools so it appears in the diff and travels with Git.\n\n# Product Self-Repair Context\n\
          When the user reports behavior of the running product and the selected repository is that product's codebase, treat it as a product bug you can fix here. Inspect and fix it in this repository; do not stop at explaining the issue or asking the user to switch contexts.\n\n# Working Directory\n\
          The project root and default tool working directory is:\n{}\n\
          Use this exact path or paths relative to it. Do not assume `/workspace` or another container path.",
         mode.system_prompt(),
         EXECUTION_COMPLETION_CONTRACT,
+        user_visible_time_context(),
         cwd.to_string_lossy()
     )
 }
@@ -3066,6 +3087,31 @@ mod tests {
     //   2. system prompt — autonomous tells the model "don't ask, iterate"
     // These tests guard against accidentally regressing either by reverting
     // a constant or losing the autonomous prompt branch.
+
+    #[test]
+    fn base_prompt_injects_local_time_context_for_user_visible_updates() {
+        let prompt = base_system_prompt(AgentMode::Interactive, Path::new("/projects/CodeFactory"));
+        assert!(prompt.contains("# User-Visible Time"));
+        assert!(prompt.contains("User local time:"));
+        assert!(prompt.contains("User time zone:"));
+        assert!(prompt.contains("Default to the user's local time"));
+        assert!(prompt.contains("Do not show raw UTC/API timestamps"));
+        assert!(prompt.contains("only when the user asks for raw evidence"));
+    }
+
+    #[test]
+    fn local_time_context_is_machine_parseable_and_not_utc_only() {
+        let context = user_visible_time_context();
+        assert!(context.contains("# User-Visible Time"));
+        assert!(context.contains("User local time:"));
+        assert!(context.contains("User time zone:"));
+        let local_line = context
+            .lines()
+            .find(|line| line.starts_with("User local time:"))
+            .expect("local time line");
+        assert!(!local_line.ends_with('Z'));
+        assert!(context.contains("UTC offset:"));
+    }
 
     #[test]
     fn current_repository_is_treated_as_the_product_when_the_user_reports_app_behavior() {

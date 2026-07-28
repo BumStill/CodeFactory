@@ -60,6 +60,7 @@ thiserror = "2"
 tempfile  = "3"
 uuid     = { version = "1", features = ["v4"] }
 chrono   = { version = "0.4", features = ["serde"] }
+iana-time-zone = "0.1"
 base64   = "0.22"
 sha2     = "0.10"          # PKCE S256 challenge for Codex/ChatGPT OAuth
 getrandom = "0.2"          # PKCE verifier + CSRF state randomness (lighter than rand)

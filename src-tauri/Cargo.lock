@@ -408,6 +408,7 @@ dependencies = [
  "getrandom 0.2.17",
  "git2",
  "globset",
+ "iana-time-zone",
  "keyring",
  "libc",
  "memchr",
