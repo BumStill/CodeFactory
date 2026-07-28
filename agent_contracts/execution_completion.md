@@ -19,11 +19,20 @@ shared by the desktop Agent and headless evaluation runtime.
    the post-change verification must contain a machine-checked assertion, real
    test runner, or dedicated verifier that exits nonzero on mismatch. Printing
    expected and actual values is diagnostic evidence, not successful
-   verification. Examples copied from the request are smoke checks, not
+   verification. A file-existence, executable, PID, or other precondition
+   assertion does not verify requested output unless the target command's
+   actual output is captured or piped into the assertion. Examples copied from the request are smoke checks, not
    sufficient completion evidence for behavior over variable inputs. Also run
    a project test, dedicated verifier, generated or property check, or at least
    one machine-checked non-example case whose asserted data comes from the same
-   target under test. Discovery-only test modes such as no-run, collect, list,
+   target under test. Run a verifier or inline assertion as a standalone command
+   or in a fail-closed `&&` chain. A target-output pipeline is verification only
+   when its final stage is the machine assertion; piping a verifier or assertion
+   into a non-checking consumer masks its exit status. Suffixes such as
+   `; echo $?`, general `||` recovery, `|| true`, and `|| :` mask failures and
+   are not verification. An inline interpreter
+   assertion is verification only when it does not write the workspace and its
+   nonzero exit status reaches the tool result. Discovery-only test modes such as no-run, collect, list,
    help, or version are not execution evidence. Treat executable interpreter or shell heredocs as opaque
    state-changing actions; identifiers such as `test = ...` inside their payload
    must never masquerade as a shell assertion, and a separate machine-checked
@@ -74,15 +83,26 @@ shared by the desktop Agent and headless evaluation runtime.
 5. A failed command is diagnostic evidence, not completion. Diagnose, repair,
    and rerun the smallest relevant check. A timeout or tool transport failure
    must remain a failed tool result that the Agent can diagnose; it must not
-   crash the execution protocol or be treated as a successful check.
-6. Stop only when the requested behavior is verified, a precise external
+   crash the execution protocol or be treated as a successful check. When an
+   inline assertion traceback identifies the assertion that actually failed, a
+   later successful check may close that failure by replaying the same assertion
+   inside a broader fail-closed verification command. Unrelated successful
+   assertions must not close it.
+6. A policy-, permission-, user-, or hook-denied tool is not an executed action.
+   Preserve an auditable, credential-redacted `command`, `rule`, and `reason` for
+   every denial. After one fully non-executable batch, require one permitted
+   replacement tool call. If the required response contains no executable tool,
+   or the next batch is still fully non-executable, stop incomplete with the
+   denial decision and remaining evidence instead of consuming the remaining
+   model or wall budget.
+7. Stop only when the requested behavior is verified, a precise external
    blocker requires user action, or the execution budget is exhausted. Report
    the evidence and any remaining limitation without claiming success.
-7. Use the current execution environment's network capability when the task
+8. Use the current execution environment's network capability when the task
    requires ordinary source or dependency retrieval, while respecting the
    caller's active network policy. Do not invent a stricter network denial or
    bypass a restricted environment.
-8. The caller owns the total task deadline unless it explicitly supplies a
+9. The caller owns the total task deadline unless it explicitly supplies a
    shorter Agent wall timeout. Per-request, per-command, and step bounds remain
    active, but an implicit duplicate wall clock must not terminate a valid
    long-running task early. When the caller supplies a hard host deadline, the
@@ -91,7 +111,7 @@ shared by the desktop Agent and headless evaluation runtime.
    and terminate any child or in-flight tool process that does not exit within
    that deadline. No child may continue working against a workspace after the
    caller starts workspace cleanup.
-9. Reduce model round trips during autonomous work. Batch related workspace
+10. Reduce model round trips during autonomous work. Batch related workspace
    reads, compatible edits, and focused checks into one bounded tool call when
    their ordering and failure handling remain clear. Do not serialize a list of
    independent one-line inspections into separate model requests. The inspection
@@ -101,7 +121,7 @@ shared by the desktop Agent and headless evaluation runtime.
    functional probe opens a new bounded inspection window; an earlier mutation
    does not permit unlimited later reads. A failed read or runtime probe still
    consumes this diagnostic window and must not reset it.
-10. Treat the end of the first third of available execution time as a
+11. Treat the end of the first third of available execution time as a
    source-delivery checkpoint. After source edits, reserve the remaining two
    thirds for installation, a runtime check from outside the source directory,
    focused project tests, and repairs before further exploration or optional
@@ -117,14 +137,14 @@ shared by the desktop Agent and headless evaluation runtime.
    remaining time validating and repairing it. Research, dependency setup, or
    repeated inspection must not consume the final third while that artifact is
    still missing.
-11. If a required test runner is unavailable, install that runner and rerun the
+12. If a required test runner is unavailable, install that runner and rerun the
    same focused tests before making additional source edits. A masked zero exit
    from a shell pipeline does not turn a missing runner into successful tests.
-12. When a legacy project's tests fail at an API supplied by a newly installed
+13. When a legacy project's tests fail at an API supplied by a newly installed
    dependency, inspect the project's declared constraints and prefer a
    reproducible compatible dependency version before adding speculative source
    shims. Rerun the original failing test immediately after either repair.
-13. In the final third of a host-supplied wall-clock execution budget, or the
+14. In the final third of a host-supplied wall-clock execution budget, or the
    final eight model rounds when the host exposes only a round budget, an
    unresolved failed mutation or check permits one bounded
    read-only diagnostic. After that diagnostic, make the smallest corrective
@@ -141,7 +161,12 @@ shared by the desktop Agent and headless evaluation runtime.
    precise external blocker requires user action. If the provider accepts tools
    but rejects forced tool selection, retry once with automatic tool selection;
    the local state machine must still stop incomplete when no tool is returned.
-   Repeated text-only analysis must not consume the remaining execution budget.
+   A tool call rejected by policy is not an executed action and must not clear
+   the required-tool state. Record its command, rule, and reason, require one
+   bounded permitted replacement, and stop incomplete if the next tool batch is
+   also non-executable. Recovery must state how to preserve verifier exit status
+   before allowing another read or edit. Repeated text-only analysis or policy-denied batches
+   must not consume the remaining execution budget.
 
 ## Integrity Rules
 

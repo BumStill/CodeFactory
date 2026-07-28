@@ -237,7 +237,18 @@ class RuntimeAcceptanceTests(unittest.TestCase):
                     import json
                     import sys
 
-                    json.loads(sys.stdin.readline())
+                    start = json.loads(sys.stdin.readline())
+                    print(json.dumps({
+                        "type": "event",
+                        "name": "policy_denied_tool_batch",
+                        "decisions": [{
+                            "command": "curl https://example.invalid",
+                            "rule": "network_policy",
+                            "reason": "blocked api_key=" + start["api_key"],
+                            "internal": "must-not-persist",
+                        }],
+                        "usage": {"model_requests": 2, "total_tokens": 100},
+                    }), flush=True)
                     print(json.dumps({
                         "type": "event",
                         "name": "usage_snapshot",
@@ -277,6 +288,18 @@ class RuntimeAcceptanceTests(unittest.TestCase):
             self.assertEqual(result["usage"]["model_requests"], 3)
             self.assertEqual(result["usage"]["total_tokens"], 250)
             self.assertEqual(result["failure"]["type"], "RuntimeError")
+            trajectory = [
+                json.loads(line)
+                for line in (evidence_dir / "trajectory.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            denied = trajectory[0]
+            self.assertEqual(denied["name"], "policy_denied_tool_batch")
+            self.assertEqual(denied["decisions"][0]["command"], "curl https://example.invalid")
+            self.assertEqual(denied["decisions"][0]["rule"], "network_policy")
+            self.assertIn("[REDACTED]", denied["decisions"][0]["reason"])
+            self.assertNotIn("internal", denied["decisions"][0])
 
     def test_rejects_a_working_directory_that_is_not_a_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

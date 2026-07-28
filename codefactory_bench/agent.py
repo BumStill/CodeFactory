@@ -6,6 +6,7 @@ import json
 import math
 import os
 import posixpath
+import re
 import secrets
 import shlex
 import time
@@ -19,6 +20,9 @@ from harbor.models.agent.context import AgentContext
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = REPO_ROOT / "agent_contracts" / "execution_completion.md"
+SENSITIVE_ASSIGNMENT = re.compile(
+    r'''(?i)(["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|authorization|cookie|credential)["']?\s*[:=]\s*["']?)[^\s,;\'"`&\\}]+'''
+)
 
 
 class HostDeadlineExceeded(TimeoutError):
@@ -291,7 +295,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
 
                 message_type = message["type"]
                 if message_type == "tool_request":
-                    trajectory.append(self._redact_protocol_message(message))
+                    trajectory.append(
+                        self._redact_protocol_message(message, secrets=(api_key,))
+                    )
                     self._write_trajectory(trajectory, contract_sha)
                     tool_result = await self._execute_tool_request(
                         message, environment, working_directory, deadline
@@ -299,7 +305,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
                     tool_result["working_directory"] = working_directory
                     next_working_directory = working_directory
                     tool_result["next_working_directory"] = next_working_directory
-                    trajectory.append(self._redact_protocol_message(tool_result))
+                    trajectory.append(
+                        self._redact_protocol_message(tool_result, secrets=(api_key,))
+                    )
                     self._write_trajectory(trajectory, contract_sha)
                     if tool_result.get("return_code") == 0 and not project_root_confirmed:
                         (
@@ -313,7 +321,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
                             "project directory refresh",
                         )
                     tool_result["next_working_directory"] = next_working_directory
-                    trajectory[-1] = self._redact_protocol_message(tool_result)
+                    trajectory[-1] = self._redact_protocol_message(
+                        tool_result, secrets=(api_key,)
+                    )
                     self._write_trajectory(trajectory, contract_sha)
                     self._raise_if_host_deadline_elapsed(
                         deadline, "tool result delivery"
@@ -326,7 +336,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
                     self._write_trajectory(trajectory, contract_sha)
                     continue
                 if message_type == "event":
-                    trajectory.append(self._redact_protocol_message(message))
+                    trajectory.append(
+                        self._redact_protocol_message(message, secrets=(api_key,))
+                    )
                     self._write_trajectory(trajectory, contract_sha)
                     continue
                 if message_type == "finished":
@@ -673,7 +685,9 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
         )
 
     @staticmethod
-    def _redact_protocol_message(message: dict[str, Any]) -> dict[str, Any]:
+    def _redact_protocol_message(
+        message: dict[str, Any], *, secrets: tuple[str, ...] = ()
+    ) -> dict[str, Any]:
         allowed = {
             "type",
             "id",
@@ -688,10 +702,46 @@ find . -maxdepth 2 -type f 2>/dev/null | sed 's#^./##' | sort | head -200"""
             "step",
         }
         redacted = {key: value for key, value in message.items() if key in allowed}
+        if redacted.get("name") == "policy_denied_tool_batch":
+            decisions: list[dict[str, str]] = []
+            raw_decisions = message.get("decisions")
+            if isinstance(raw_decisions, list):
+                for item in raw_decisions[:32]:
+                    if not isinstance(item, dict):
+                        continue
+                    command = item.get("command")
+                    rule = item.get("rule")
+                    reason = item.get("reason")
+                    if not all(isinstance(value, str) for value in (command, rule, reason)):
+                        continue
+                    decisions.append(
+                        {
+                            "command": CodeFactoryAgent._truncate(
+                                CodeFactoryAgent._redact_text(command, secrets), 4096
+                            ),
+                            "rule": CodeFactoryAgent._truncate(
+                                CodeFactoryAgent._redact_text(rule, secrets), 256
+                            ),
+                            "reason": CodeFactoryAgent._truncate(
+                                CodeFactoryAgent._redact_text(reason, secrets), 2048
+                            ),
+                        }
+                    )
+            redacted["decisions"] = decisions
         usage = CodeFactoryAgent._usage_snapshot(message.get("usage"))
         if usage:
             redacted["usage"] = usage
         return redacted
+
+    @staticmethod
+    def _redact_text(value: str, secrets: tuple[str, ...]) -> str:
+        redacted = value
+        for secret in secrets:
+            if len(secret) >= 6:
+                redacted = redacted.replace(secret, "[REDACTED]")
+        return SENSITIVE_ASSIGNMENT.sub(
+            lambda match: f"{match.group(1)}[REDACTED]", redacted
+        )
 
     @staticmethod
     def _usage_snapshot(value: object) -> dict[str, int]:
