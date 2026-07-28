@@ -29,9 +29,9 @@ CodeFactory --browser-session-smoke <receipt.json>
 ## 自动化验证
 
 - `cargo check --manifest-path src-tauri/Cargo.toml -p codefactory --lib --bin codefactory`：通过。
-- `cargo test ... browser_session`：5 项通过。
+- `cargo test ... browser_session`：6 项通过（包含 Windows `npx.cmd` 启动器选择）。
 - `cargo test ... rejects_direct_playwright_cli_in_favor_of_managed_sessions`：通过。
-- 完整 Rust lib 测试：529 项通过、6 项忽略、0 项失败。
+- 完整 Rust lib 测试：530 项通过、6 项忽略、0 项失败。
 - `pnpm run build`：通过。
 - 完整 Vitest：76 个测试文件、348 项测试全部通过。
 

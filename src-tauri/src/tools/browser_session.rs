@@ -220,7 +220,7 @@ fn command_for(args: &Args, cwd: &Path) -> std::result::Result<Vec<String>, Stri
 }
 
 async fn run_cli(session_id: &str, command: &[String]) -> std::result::Result<String, String> {
-    let mut process = Command::new("npx").no_window();
+    let mut process = Command::new(npx_program()).no_window();
     process.args([
         "--yes",
         "--package",
@@ -250,6 +250,14 @@ async fn run_cli(session_id: &str, command: &[String]) -> std::result::Result<St
         Ok(text)
     } else {
         Err(format!("Managed browser session failed: {text}"))
+    }
+}
+
+fn npx_program() -> &'static str {
+    if cfg!(windows) {
+        "npx.cmd"
+    } else {
+        "npx"
     }
 }
 
@@ -476,5 +484,10 @@ mod tests {
         assert!(!lease_belongs_to_ctx(&lease, &ctx));
         ctx.task_id = Some("task-a".into());
         assert!(lease_belongs_to_ctx(&lease, &ctx));
+    }
+
+    #[test]
+    fn npx_launcher_matches_the_platform() {
+        assert_eq!(npx_program(), if cfg!(windows) { "npx.cmd" } else { "npx" });
     }
 }
