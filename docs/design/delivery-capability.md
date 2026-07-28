@@ -36,14 +36,26 @@ compatible like `SubagentIsolation`):
 
 The product default is `ThroughRelease`, matching the expectation that code work is done only when the user-visible artifact/update is live. Users can lower the ceiling in Settings when they want a manual PR/CI/merge stop.
 
-### Hybrid provider — no `gh` dependency
+### Hybrid provider — GitHub, GitLab, and hookable enterprise remotes
 
 Local ops (stage / commit / push) shell out to the `git` CLI, exactly like
 `commands/git.rs` and `checkpoint.rs` — no new runtime dependency. Remote ops
-(PR / CI / merge / release) go through the portable token+REST `git_remote`
-layer (`RemoteGitClient` + `git_remotes` tokens) via the `DeliveryRemote` trait
-(`GithubRemote` impl). `gh` is authenticated on some dev boxes but is **not** a
-safe end-user assumption, so it stays out of the product path.
+(PR / MR / CI / merge / release) go through the `DeliveryRemote` trait.
+Built-ins are:
+
+- GitHub: logged-in `gh` CLI first for GitHub checkouts, then configured
+  token+REST via `git_remotes`.
+- GitLab / enterprise GitLab: configured `git_remotes` token opens or reuses a
+  GitLab merge request; merge uses GitLab's MR merge endpoint.
+- `delivery_provider` hook: repositories can register a Hook (`event =
+  "delivery_provider"`, `RunCommand`) whose command receives JSON on stdin and
+  returns JSON on stdout for `open_or_get_pr`, `ci_status`, `merge_pr`, and
+  `trigger_release`. This is the plugin seam for private GitLab variants or
+  custom enterprise forge/release systems.
+
+A non-GitHub origin must never be reported as “no GitHub channel”. Missing
+credentials are provider-aware: GitLab asks for a GitLab remote token or a
+`delivery_provider` hook/plugin.
 
 ### Noise-safe staging — the structural guarantee
 

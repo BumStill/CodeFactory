@@ -160,6 +160,24 @@ pub async fn create_pr(
     Ok(parse_mr(&v))
 }
 
+/// Merge a GitLab merge request. GitLab uses project-local `iid` as the MR
+/// number in URLs. The `method` argument is accepted for interface parity with
+/// GitHub; GitLab's merge endpoint does not expose squash/merge/rebase as the
+/// same enum, so repository settings decide the actual server behavior.
+pub async fn merge_pr(
+    client: &RemoteGitClient,
+    repo: &str,
+    number: u64,
+    _method: &str,
+) -> Result<(), String> {
+    let path = format!(
+        "/projects/{}/merge_requests/{}/merge",
+        encode_repo(repo),
+        number
+    );
+    client.put(&path, json!({})).await.map(|_| ())
+}
+
 pub async fn list_repos(client: &RemoteGitClient) -> Result<Vec<RemoteRepo>, String> {
     let v = client
         .get("/projects?membership=true&per_page=100&order_by=last_activity_at")
