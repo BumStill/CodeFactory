@@ -643,6 +643,13 @@ pub async fn send_message(
         }
         clear_chat_running_if_current(&chat_cancels, &session_for_error, &tracked_cancel_flag)
             .await;
+        let reclaimed =
+            crate::tools::browser_session::close_for_session(&session_for_error).await;
+        if reclaimed > 0 {
+            tracing::info!(
+                "send_message: reclaimed {reclaimed} browser session(s) for {session_for_error}"
+            );
+        }
     });
     running_setup_guard.disarm();
 
@@ -799,6 +806,13 @@ pub async fn send_message_anonymous(
         }
         clear_chat_running_if_current(&chat_cancels, &completed_session_id, &tracked_cancel_flag)
             .await;
+        let reclaimed =
+            crate::tools::browser_session::close_for_session(&completed_session_id).await;
+        if reclaimed > 0 {
+            tracing::info!(
+                "anonymous chat: reclaimed {reclaimed} browser session(s) for {completed_session_id}"
+            );
+        }
     });
     running_setup_guard.disarm();
 

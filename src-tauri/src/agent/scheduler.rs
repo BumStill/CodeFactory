@@ -71,6 +71,7 @@ pub const SUBAGENT_ALLOWED_TOOLS: &[&str] = &[
     "write_file",
     "edit_file",
     "bash",
+    "browser_session",
 ];
 
 /// The EFFECTIVE dispatch inputs for this session, resolved the same way at
@@ -1041,6 +1042,13 @@ impl TaskScheduler {
                             summary: post_summary,
                         })
                         .await;
+                    let reclaimed =
+                        crate::tools::browser_session::close_for_task(&task_id).await;
+                    if reclaimed > 0 {
+                        tracing::info!(
+                            "scheduler: reclaimed {reclaimed} browser session(s) for task {task_id}"
+                        );
+                    }
 
                     dispatch_guard.settled = true;
                     drop(dispatch_guard); // frees the running slot

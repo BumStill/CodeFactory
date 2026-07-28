@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod bash;
+pub mod browser_session;
 pub mod delivery;
 pub mod delegate_tasks;
 pub mod parallel;
@@ -88,6 +89,7 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         knowledge::search_definition(),
         knowledge::get_chunk_definition(),
         bash::definition(),
+        browser_session::definition(),
         pptx::definition(),
         pptx_edit::read_definition(),
         pptx_edit::edit_definition(),
@@ -117,6 +119,7 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "kb_search" => knowledge::execute_search(args, ctx).await,
         "kb_get_chunk" => knowledge::execute_get_chunk(args, ctx).await,
         "bash" => bash::execute(args, ctx).await,
+        "browser_session" => browser_session::execute(args, ctx).await,
         "write_pptx" => pptx::execute(args, ctx).await,
         "read_pptx" => pptx_edit::execute_read(args, ctx).await,
         "edit_pptx" => pptx_edit::execute_edit(args, ctx).await,

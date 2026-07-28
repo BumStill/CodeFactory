@@ -130,6 +130,123 @@ pub fn run_evolution_smoke_cli() -> bool {
     }
 }
 
+/// Release/runtime smoke for the native browser-session manager. It exercises
+/// the production dispatch path against a real page, injects an action failure,
+/// and proves the lease is reclaimed before the process exits.
+#[cfg(not(test))]
+pub fn run_browser_session_smoke_cli() -> bool {
+    let mut args = std::env::args();
+    let _program = args.next();
+    let Some(flag) = args.next() else {
+        return false;
+    };
+    if flag != "--browser-session-smoke" {
+        return false;
+    }
+    let Some(output) = args.next() else {
+        eprintln!("usage: CodeFactory --browser-session-smoke <receipt.json>");
+        std::process::exit(2);
+    };
+    if args.next().is_some() {
+        eprintln!("usage: CodeFactory --browser-session-smoke <receipt.json>");
+        std::process::exit(2);
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("Browser-session smoke could not start: {error}");
+            std::process::exit(1);
+        });
+    let output_path = std::path::PathBuf::from(output);
+    let result = runtime.block_on(async {
+        let cwd = output_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        let owner_session_id = format!("browser-smoke-{}", uuid::Uuid::new_v4());
+        let ctx = tools::ExecCtx {
+            cwd,
+            app: None,
+            db: None,
+            session_id: Some(owner_session_id.clone()),
+            task_id: None,
+            knowledge_library_ids: None,
+            settings: None,
+        };
+
+        let opened = tools::browser_session::execute(
+            serde_json::json!({"action":"open","url":"https://example.com"}),
+            &ctx,
+        )
+        .await?;
+        if opened.is_error {
+            return Err(errors::AppError::Other(opened.content));
+        }
+        let session_id = opened
+            .content
+            .lines()
+            .find_map(|line| line.strip_prefix("Managed browser session: "))
+            .ok_or_else(|| errors::AppError::Other("smoke did not receive a session id".into()))?
+            .to_string();
+
+        let snapshot = tools::browser_session::execute(
+            serde_json::json!({"action":"snapshot","session_id":session_id}),
+            &ctx,
+        )
+        .await?;
+        let failed_action = tools::browser_session::execute(
+            serde_json::json!({
+                "action":"click",
+                "session_id":session_id,
+                "target":"e999999"
+            }),
+            &ctx,
+        )
+        .await?;
+        let lease_gone = !tools::browser_session::list_managed_sessions()
+            .iter()
+            .any(|session| session.session_id == session_id);
+        let receipt = serde_json::json!({
+            "status": if !snapshot.is_error && failed_action.is_error && lease_gone {
+                "passed"
+            } else {
+                "failed"
+            },
+            "native_tool": "browser_session",
+            "opened_session": session_id,
+            "snapshot_ok": !snapshot.is_error,
+            "failure_detected": failed_action.is_error,
+            "lease_reclaimed_after_failure": lease_gone,
+        });
+        std::fs::write(
+            &output_path,
+            serde_json::to_vec_pretty(&receipt).unwrap_or_default(),
+        )?;
+        tools::browser_session::close_for_session(&owner_session_id).await;
+        if receipt["status"] == "passed" {
+            Ok(receipt)
+        } else {
+            Err(errors::AppError::Other(receipt.to_string()))
+        }
+    });
+
+    match result {
+        Ok(receipt) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&receipt).unwrap_or_default()
+            );
+            true
+        }
+        Err(error) => {
+            eprintln!("Browser-session smoke failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Handle the release-only headless-construction smoke before Tauri
 /// initializes (keystone slice 3). Returns `false` for ordinary app startup
 /// and exits non-zero on smoke failure. Proves the packaged binary can build
@@ -248,6 +365,15 @@ pub fn run() {
                 Arc::new(Mutex::new(HashMap::new()));
             app.manage(scheduler_handles);
 
+            tauri::async_runtime::spawn(async {
+                let reclaimed = tools::browser_session::reclaim_on_startup().await;
+                if reclaimed > 0 {
+                    tracing::info!(
+                        "startup: reclaimed {reclaimed} browser session(s) from the previous run"
+                    );
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -273,6 +399,8 @@ pub fn run() {
             commands::benchmark::start_benchmark_provider_run,
             commands::benchmark::import_benchmark_results,
             commands::benchmark::benchmark_consistency_report,
+            commands::browser_sessions::list_browser_sessions,
+            commands::browser_sessions::close_browser_session,
             commands::checkpoints::list_checkpoints,
             commands::checkpoints::checkpoint_changeset,
             commands::checkpoints::revert_checkpoint,
