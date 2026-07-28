@@ -612,7 +612,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
 
     const unlisten = await onStream(id, (event: StreamEvent) => {
-      handleStreamEvent(event, id, assistantMsgId, set, get);
+      // Read the open bubble per event rather than closing over it: a steer
+      // splits the turn mid-flight, and a captured id would keep feeding the
+      // bubble that was closed at the split.
+      handleStreamEvent(event, id, get()._streamingMsgId[id] ?? assistantMsgId, set, get);
     });
     set((s) => ({ _unlisten: { ...s._unlisten, [id]: unlisten } }));
 
@@ -1164,6 +1167,48 @@ function drainNextQueuedMessage(
   return true;
 }
 
+/// Freeze the assistant bubble that was streaming when a steer landed, and
+/// start a new one after the steer so the turn reads in the order it happened.
+/// Live-only: hydrated history already interleaves correctly, because the
+/// persisted rows carry the real ordering.
+function splitAssistantTurnAfterSteer(
+  sessionId: string,
+  set: (fn: (s: ChatStore) => Partial<ChatStore>) => void,
+) {
+  set((s) => {
+    const prev = s.runtime[sessionId];
+    const openId = s._streamingMsgId[sessionId];
+    if (!prev || !openId) return {};
+    const openIndex = prev.messages.findIndex((m) => m.id === openId);
+    // Nothing streamed yet this round: the empty bubble is still below the
+    // steer's insertion point, so there is nothing to split.
+    if (openIndex < 0) return {};
+
+    const now = Date.now();
+    const messages = prev.messages.slice();
+    const settled = messages[openIndex];
+    messages[openIndex] = {
+      ...settled,
+      durationMs: settled.durationMs ?? Math.max(0, now - settled.createdAt),
+    };
+    const resumed: UIMessage = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content: "",
+      createdAt: now,
+    };
+    messages.push(resumed);
+
+    return {
+      runtime: {
+        ...s.runtime,
+        [sessionId]: { ...prev, messages, revision: prev.revision + 1 },
+      },
+      _streamingMsgId: { ...s._streamingMsgId, [sessionId]: resumed.id },
+    };
+  });
+}
+
 function handleStreamEvent(
   event: StreamEvent,
   sessionId: string,
@@ -1187,6 +1232,17 @@ function handleStreamEvent(
       },
     };
   });
+
+  // A live turn is ONE growing assistant bubble, and the steer bubble lands
+  // after it — so without a split, work the agent does in RESPONSE to the
+  // steer renders ABOVE the steer that caused it. Reload looked right (rows
+  // rebuild in DB order) while the live view read backwards.
+  //
+  // Close the bubble here and open a fresh one below the steer, so the
+  // transcript reads: work so far → what you said → what it did about it.
+  if (event.type === "steer_applied") {
+    splitAssistantTurnAfterSteer(sessionId, set);
+  }
 
   // Queue drain — fire this session's next queued message as soon as its
   // stream lands in a terminal state (done OR error). We delay one tick so the

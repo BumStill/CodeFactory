@@ -142,6 +142,43 @@ describe("steering a run in flight", () => {
     expect(queue().map((item) => item.content)).toEqual(["第二条", "第三条"]);
   });
 
+  it("puts work done after a steer BELOW it, not above", async () => {
+    // Field report: the live view read backwards. One growing assistant bubble
+    // plus a steer appended after it meant everything the agent did in
+    // response to the steer rendered above the steer that caused it.
+    await useChatStore.getState().sendMessage("原始任务", SID);
+    streamMock.handler?.({ type: "text_delta", content: "先做第一步" });
+    await useChatStore.getState().steerRun("改用 chrome channel");
+    streamMock.handler?.({
+      type: "steer_applied",
+      message_id: "db-1",
+      content: "改用 chrome channel",
+    });
+    streamMock.handler?.({ type: "text_delta", content: "好的，改用 chrome channel" });
+
+    const shape = messages().map((m) => [m.role, m.content]);
+    expect(shape).toEqual([
+      ["user", "原始任务"],
+      ["assistant", "先做第一步"],
+      ["user", "改用 chrome channel"],
+      ["assistant", "好的，改用 chrome channel"],
+    ]);
+  });
+
+  it("keeps feeding the new bubble after the split, not the closed one", async () => {
+    await useChatStore.getState().sendMessage("原始任务", SID);
+    streamMock.handler?.({ type: "text_delta", content: "第一段" });
+    await useChatStore.getState().steerRun("换个方向");
+    streamMock.handler?.({ type: "steer_applied", message_id: null, content: "换个方向" });
+    streamMock.handler?.({ type: "text_delta", content: "第二段" });
+    streamMock.handler?.({ type: "text_delta", content: "继续" });
+
+    const assistants = messages().filter((m) => m.role === "assistant");
+    expect(assistants.map((m) => m.content)).toEqual(["第一段", "第二段继续"]);
+    // The closed bubble is settled, not left looking mid-flight.
+    expect(assistants[0].durationMs).toBeGreaterThanOrEqual(0);
+  });
+
   it("leaves a confirmed steer alone when the turn ends", async () => {
     await useChatStore.getState().sendMessage("原始任务", SID);
     await useChatStore.getState().steerRun("已经送到了");
