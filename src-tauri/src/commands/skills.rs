@@ -692,6 +692,13 @@ pub async fn delete_skill(id: String, app: AppHandle) -> Result<(), String> {
         return Err("Cannot delete built-in skills. Disable them instead.".to_string());
     }
 
+    // Deleting a still-disabled proposed skill is the user's rejection signal
+    // (see propose_skills_from_patterns) — record it so the same cluster
+    // never gets re-proposed.
+    if !manifest.enabled && manifest.tags.iter().any(|t| t == "proposed") {
+        record_rejected_proposal_key(&manifest.name);
+    }
+
     std::fs::remove_dir_all(&manifest.path).map_err(|e| e.to_string())
 }
 
@@ -1143,6 +1150,37 @@ pub async fn list_slash_commands(app: AppHandle) -> Result<Vec<SlashCommand>, St
 const MIN_CLUSTER: usize = 4;
 const MAX_PROPOSALS_PER_RUN: usize = 3;
 
+/// Cluster keys the user has explicitly rejected (deleted a proposed skill
+/// for), so `propose_skills_from_patterns` never re-suggests them. A proposed
+/// skill's `name` is always set to its cluster key (see `write_proposal_skill`
+/// / `cluster_task_intents`), so recovering the key at delete time is exact —
+/// no need to invert the filesystem-slug transform.
+fn rejected_proposals_path() -> PathBuf {
+    user_skills_dir().join(".rejected_proposals.json")
+}
+
+fn load_rejected_proposal_keys() -> std::collections::HashSet<String> {
+    std::fs::read_to_string(rejected_proposals_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+
+fn record_rejected_proposal_key(key: &str) {
+    let mut keys = load_rejected_proposal_keys();
+    if !keys.insert(key.to_string()) {
+        return;
+    }
+    let path = rejected_proposals_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(&keys.into_iter().collect::<Vec<_>>()) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskTitleRow {
     pub title: String,
@@ -1316,7 +1354,7 @@ pub async fn propose_skills_from_patterns(
         .collect();
 
     let drafts = cluster_task_intents(&task_rows);
-    let drafts = filter_covered(drafts, &existing_labels, &std::collections::HashSet::new());
+    let drafts = filter_covered(drafts, &existing_labels, &load_rejected_proposal_keys());
 
     let mut created = Vec::new();
     for d in drafts.into_iter().take(MAX_PROPOSALS_PER_RUN) {
