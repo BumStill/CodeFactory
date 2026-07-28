@@ -1713,10 +1713,11 @@ mod tests {
                 name: "github".into(),
                 provider: crate::config::settings::GitProvider::Github,
                 base_url: "https://api.github.com".into(),
-                token_ref: Some("cf.test.gitlab.readiness".into()),
+                token_ref: Some("cf.test.github.readiness".into()),
                 token: "".into(),
                 default_repo: Some("BumStill/CodeFactory".into()),
             });
+        crate::secrets::set_key("cf.test.github.readiness", "token").unwrap();
         let note = delivery_readiness_with_gh(
             Some("https://github.com/BumStill/CodeFactory.git"),
             &settings,
