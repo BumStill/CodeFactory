@@ -3069,6 +3069,7 @@ impl CompletionGate {
         } else if verification_like
             && !outcome.succeeded()
             && verification_reached_test_scope(outcome)
+            && !is_inconclusive_remote_observation(outcome)
         {
             let failed_scope = VerificationScope::from_outcome(outcome);
             if !self
@@ -3643,6 +3644,26 @@ fn shell_failed_before_verification_started(output: &str) -> bool {
                 || line.contains("parse error near")
                 || line.contains("syntax error near unexpected token"))
     })
+}
+
+/// A read-only remote observation that hit the tool's time cap before the
+/// remote work finished.
+///
+/// It is a failed OBSERVATION, not a failed verification, and the difference
+/// decides whether a turn can ever complete. Filing it as a failure opens a
+/// ticket that every later success must "cover" by scope; a poll of the same
+/// run with different flags does not always cover it, so the ticket outlives
+/// the green pipeline that would have closed it. Measured on one 96-turn
+/// session: 56 of the 197 tool failures inside recovery-exhausted turns were
+/// timeouts, overwhelmingly CI polls against a release build that simply takes
+/// longer than the cap.
+///
+/// Only observation commands qualify. A test suite that times out did run the
+/// thing under test and hung — that stays a genuine failure.
+fn is_inconclusive_remote_observation(outcome: &ToolOutcome) -> bool {
+    let text = format!("{}\n{}", outcome.stdout, outcome.stderr).to_ascii_lowercase();
+    let timed_out = text.contains("command timed out") || text.contains("timed out after");
+    timed_out && is_long_running_observation_command(&outcome.command.to_ascii_lowercase())
 }
 
 fn verification_reached_test_scope(outcome: &ToolOutcome) -> bool {
@@ -6241,11 +6262,15 @@ mod tests {
         delivery.command = "gh workflow run 'Auto Release' --repo owner/repo".to_owned();
         gate.record(&delivery);
 
+        // A watch that actually landed on a red run. (It used to be a timeout
+        // here, but a timed-out observation no longer opens a ticket — see
+        // `a_timed_out_remote_poll_does_not_open_a_failure_ticket`. The subject
+        // of THIS test is scope matching, so it needs a genuine failure.)
         let failed_watch = "gh run watch 29833845752 --repo owner/repo --interval 20 --exit-status";
-        let mut timed_out = outcome(2, classify_command(failed_watch, 120_000), 1);
-        timed_out.command = failed_watch.to_owned();
-        timed_out.stderr = "Command timed out after 120s".to_owned();
-        gate.record(&timed_out);
+        let mut observed_failure = outcome(2, classify_command(failed_watch, 120_000), 1);
+        observed_failure.command = failed_watch.to_owned();
+        observed_failure.stderr = "Run Release completed with 'failure'".to_owned();
+        gate.record(&observed_failure);
         assert!(gate.evidence().failed_verification_fingerprint.is_some());
 
         // Poll cadence is operational, not verification scope. A retry of the
@@ -6256,6 +6281,115 @@ mod tests {
         completed.command = completed_watch.to_owned();
         completed.stdout = "Run Release has already completed with 'success'".to_owned();
         gate.record(&completed);
+        let evidence = gate.evidence();
+        assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
+    }
+
+    /// Field evidence, 2026-07: across one 96-turn session the gate fired on 20
+    /// turns and exhausted its recovery budget on 12. Inside those turns, 56 of
+    /// 197 tool failures were command timeouts — overwhelmingly CI polls against
+    /// a release build that outlives the tool's time cap.
+    ///
+    /// A timed-out poll is a failed OBSERVATION, not a failed verification. The
+    /// pipeline may be perfectly green; we simply stopped looking. Recording it
+    /// as a failure opens a ticket that every later success must then "cover",
+    /// which is how a delivery turn burns three recovery rounds with a green
+    /// run sitting right there. Absence of evidence is not evidence of failure.
+    #[test]
+    fn a_timed_out_remote_poll_does_not_open_a_failure_ticket() {
+        let mut gate = CompletionGate::default();
+        let mut merge = outcome(1, ToolKind::Mutation, 0);
+        merge.command = "gh pr merge 200 --repo owner/repo --squash".to_owned();
+        gate.record(&merge);
+
+        let poll = "gh run view 30152394315 --repo owner/repo --json status,conclusion";
+        let mut timed_out = outcome(2, classify_command(poll, 120_000), 1);
+        timed_out.command = poll.to_owned();
+        timed_out.stdout = "Command timed out after 120s".to_owned();
+        gate.record(&timed_out);
+        assert!(
+            gate.evidence().failed_verification_fingerprint.is_none(),
+            "an observation that never landed must not be filed as a failure",
+        );
+
+        // A later poll that does land settles the turn, with no stale ticket
+        // left to "cover".
+        let later = "gh run view 30152394315 --repo owner/repo --json conclusion";
+        let mut landed = outcome(3, classify_command(later, 120_000), 0);
+        landed.command = later.to_owned();
+        landed.stdout = "success".to_owned();
+        gate.record(&landed);
+        let evidence = gate.evidence();
+        assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
+    }
+
+    /// The ticket is redundant, not protective: with no successful observation
+    /// the positive requirement already blocks completion. Dropping the ticket
+    /// removes a sticky record that outlives a green pipeline; it does not let
+    /// an unverified delivery through.
+    #[test]
+    fn a_timeout_alone_still_leaves_the_delivery_unverified() {
+        let mut gate = CompletionGate::default();
+        let mut merge = outcome(1, ToolKind::Mutation, 0);
+        merge.command = "gh pr merge 200 --repo owner/repo --squash".to_owned();
+        gate.record(&merge);
+
+        let poll = "gh run view 30152394315 --repo owner/repo --json status,conclusion";
+        let mut timed_out = outcome(2, classify_command(poll, 120_000), 1);
+        timed_out.command = poll.to_owned();
+        timed_out.stdout = "Command timed out after 120s".to_owned();
+        gate.record(&timed_out);
+
+        let evidence = gate.evidence();
+        assert!(
+            !evidence.completed,
+            "a merge whose result was never observed must not be certified",
+        );
+        assert!(
+            evidence
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("successful verification")),
+            "blockers: {:?}",
+            evidence.blockers,
+        );
+    }
+
+    /// The distinction is about observing versus exercising. A test run that
+    /// times out DID run the thing under test and hung; that stays a failure.
+    #[test]
+    fn a_timed_out_local_test_still_opens_a_failure_ticket() {
+        let mut gate = CompletionGate::default();
+        let mut edit = outcome(1, ToolKind::Mutation, 0);
+        edit.command = "apply_patch src/lib.rs".to_owned();
+        gate.record(&edit);
+
+        let suite = "pnpm test";
+        let mut timed_out = outcome(2, classify_command(suite, 120_000), 1);
+        timed_out.command = suite.to_owned();
+        timed_out.stdout = "Command timed out after 120s".to_owned();
+        gate.record(&timed_out);
+        assert!(
+            gate.evidence().failed_verification_fingerprint.is_some(),
+            "a suite that hung is a real failure, not a missed observation",
+        );
+    }
+
+    /// End to end on the shape that actually occurs: merge, then poll the
+    /// release run and read its conclusion.
+    #[test]
+    fn asserting_the_release_conclusion_closes_a_delivery_turn() {
+        let mut gate = CompletionGate::default();
+        let mut merge = outcome(1, ToolKind::Mutation, 0);
+        merge.command = "gh pr merge 200 --repo owner/repo --squash".to_owned();
+        gate.record(&merge);
+        assert!(!gate.evidence().completed, "a merge alone settles nothing");
+
+        let poll = "gh run view 30152394315 --repo owner/repo --json conclusion -q .conclusion | grep -q success";
+        let mut verified = outcome(2, classify_command(poll, 120_000), 0);
+        verified.command = poll.to_owned();
+        gate.record(&verified);
+
         let evidence = gate.evidence();
         assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
     }
