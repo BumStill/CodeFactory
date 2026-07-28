@@ -137,3 +137,18 @@ jobs:
           if ($smoke.app_handle -ne "none") { throw "Headless smoke ran with an AppHandle" }
           if ($smoke.tool_count -lt 1) { throw "Headless tool surface was empty" }
           if ($smoke.events_recorded -ne 1) { throw "Headless event sink did not record" }
+
+      # The browser CLI may report an action error with exit code 0. Exercise
+      # the real binary and prove the native manager detects that output and
+      # removes its lease instead of leaving a headless browser daemon behind.
+      - name: Browser session lifecycle smoke
+        shell: pwsh
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP "browser-session-smoke.json"
+          cargo run --manifest-path src-tauri/Cargo.toml -- --browser-session-smoke $receipt
+          if ($LASTEXITCODE -ne 0) { throw "Browser session smoke exited $LASTEXITCODE" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if ($smoke.status -ne "passed") { throw "Browser session smoke did not pass" }
+          if (-not $smoke.snapshot_ok) { throw "Browser session smoke did not capture a snapshot" }
+          if (-not $smoke.failure_detected) { throw "CLI logical failure was not detected" }
+          if (-not $smoke.lease_reclaimed_after_failure) { throw "Browser lease survived failure" }
