@@ -374,6 +374,23 @@ pub enum StopReason {
 /// no DB, no `AppHandle` — so the desktop app and the sidecar run the SAME body.
 /// The desktop adapter builds the inputs/config/services and discards the
 /// returned [`RunOutcome`] (it already emitted `Done` via the sink).
+///
+/// The whole call is one `tracing` span (`agent_loop`) carrying the
+/// usage-attribution identity, so every `tracing::info!`/`warn!` emitted
+/// anywhere in this function — or in anything it calls synchronously, like
+/// `LoopServices` implementations — is attributable to one turn without
+/// manually stitching session/task ids across log lines.
+#[tracing::instrument(
+    name = "agent_loop",
+    skip(inputs, config, svc),
+    fields(
+        session_id = %config.session_id,
+        task_id = config.task_id.as_deref().unwrap_or(""),
+        surface = %config.surface,
+        endpoint = %config.endpoint_name,
+        model = %config.model_id,
+    )
+)]
 pub async fn run_agent_loop(
     inputs: LoopInputs,
     config: RunConfig,
