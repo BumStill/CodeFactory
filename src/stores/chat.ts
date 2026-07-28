@@ -989,10 +989,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         },
       };
     });
+    // Position it the moment it is said, not when the loop gets to it. The
+    // wait for a round boundary can run for minutes, and without splitting now
+    // the agent's ongoing output keeps piling ABOVE the bubble — which is
+    // exactly the reported symptom: 引导气泡一直在最下边.
+    splitAssistantTurnAfterSteer(id, set);
     try {
       await invoke("queue_interjection", { sessionId: id, message: text });
     } catch (error) {
-      // Never leave a bubble claiming to be on its way when it isn't.
+      // Never leave a bubble claiming to be on its way when it isn't — and
+      // take the empty bubble the split opened for it with it.
       set((s) => {
         const prev = s.runtime[id];
         if (!prev) return {};
@@ -1001,7 +1007,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             ...s.runtime,
             [id]: {
               ...prev,
-              messages: prev.messages.filter((m) => m.id !== msg.id),
+              messages: dropEmptyTail(prev.messages.filter((m) => m.id !== msg.id)),
               localMessages: prev.localMessages.filter((m) => m.id !== msg.id),
               revision: prev.revision + 1,
             },
@@ -1104,7 +1110,7 @@ function recoverUndeliveredSteers(
         ...s.runtime,
         [sessionId]: {
           ...prev,
-          messages: prev.messages.filter((m) => !ids.has(m.id)),
+          messages: dropEmptyTail(prev.messages.filter((m) => !ids.has(m.id))),
           localMessages: prev.localMessages.filter((m) => !ids.has(m.id)),
           revision: prev.revision + 1,
         },
@@ -1167,10 +1173,25 @@ function drainNextQueuedMessage(
   return true;
 }
 
-/// Freeze the assistant bubble that was streaming when a steer landed, and
-/// start a new one after the steer so the turn reads in the order it happened.
-/// Live-only: hydrated history already interleaves correctly, because the
-/// persisted rows carry the real ordering.
+/// Drop a trailing assistant bubble that never received anything. The steer
+/// split opens one eagerly; if the steer is then withdrawn or never lands,
+/// that placeholder must not survive as a blank turn.
+function dropEmptyTail(messages: UIMessage[]): UIMessage[] {
+  const tail = messages[messages.length - 1];
+  const empty =
+    tail?.role === "assistant" &&
+    !tail.content &&
+    !(tail.toolCalls?.length ?? 0) &&
+    !(tail.segments?.length ?? 0);
+  return empty ? messages.slice(0, -1) : messages;
+}
+
+/// Freeze the assistant bubble that was streaming when the user spoke, and
+/// start a new one below their message, so the turn reads in the order it
+/// happened: work so far → what you said → what it did next.
+///
+/// Live-only. Hydrated history already interleaves correctly because the
+/// persisted rows carry the real ordering — this gap existed only on screen.
 function splitAssistantTurnAfterSteer(
   sessionId: string,
   set: (fn: (s: ChatStore) => Partial<ChatStore>) => void,
@@ -1233,16 +1254,6 @@ function handleStreamEvent(
     };
   });
 
-  // A live turn is ONE growing assistant bubble, and the steer bubble lands
-  // after it — so without a split, work the agent does in RESPONSE to the
-  // steer renders ABOVE the steer that caused it. Reload looked right (rows
-  // rebuild in DB order) while the live view read backwards.
-  //
-  // Close the bubble here and open a fresh one below the steer, so the
-  // transcript reads: work so far → what you said → what it did about it.
-  if (event.type === "steer_applied") {
-    splitAssistantTurnAfterSteer(sessionId, set);
-  }
 
   // Queue drain — fire this session's next queued message as soon as its
   // stream lands in a terminal state (done OR error). We delay one tick so the

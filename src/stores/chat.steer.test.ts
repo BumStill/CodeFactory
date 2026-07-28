@@ -142,6 +142,27 @@ describe("steering a run in flight", () => {
     expect(queue().map((item) => item.content)).toEqual(["第二条", "第三条"]);
   });
 
+  it("lands the bubble in position while it is still WAITING, not once delivered", async () => {
+    // The reported state: the turn was still running, the steer had not been
+    // drained yet, and output kept piling above the bubble — 一直在最下边.
+    // The bubble must take its place the moment it is said.
+    await useChatStore.getState().sendMessage("原始任务", SID);
+    streamMock.handler?.({ type: "text_delta", content: "先做第一步" });
+    await useChatStore.getState().steerRun("改用 chrome channel");
+
+    // Still pending — nothing has confirmed it.
+    expect(messages().find((m) => m.steerPending)?.content).toBe("改用 chrome channel");
+
+    // Work produced during the wait belongs BELOW it.
+    streamMock.handler?.({ type: "text_delta", content: "还在跑上一件事" });
+    expect(messages().map((m) => [m.role, m.content])).toEqual([
+      ["user", "原始任务"],
+      ["assistant", "先做第一步"],
+      ["user", "改用 chrome channel"],
+      ["assistant", "还在跑上一件事"],
+    ]);
+  });
+
   it("puts work done after a steer BELOW it, not above", async () => {
     // Field report: the live view read backwards. One growing assistant bubble
     // plus a steer appended after it meant everything the agent did in
