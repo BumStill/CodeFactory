@@ -22,6 +22,10 @@
 | CF-CCE-R16 | 浅色/深色、1366×768/800×600 下无黑框墙、无整页横向溢出，正文保持第一视觉层 | four-viewport real app evidence |
 | CF-CCE-R17 | 普通短会话、超长历史、排队消息、匿名会话、completion recovery、sticky-scroll 和工具权限语义不得回归 | compatibility matrix |
 | CF-CCE-R18 | PR+CI、main、公开安装包和精确版本真实 App 验收完成前保持 `not live` | Release Harness evidence pack |
+| CF-CCE-R19 | 长任务以结构化 plan event 提交有界步骤、等待原因和计划变化；进度条展示当前/下一步，百分比只取 `completed / total` 并标明来源 | tool/event/store/component |
+| CF-CCE-R20 | 终态后 5 秒内形成结果快照；结果视图、完整过程切换和证据化重新总结只引用最终回复、plan 与真实工具 evidence | component + headless/real app |
+| CF-CCE-R21 | 时间估算结合任务阶段、同项目历史 build/test 时长和关联外部 job 状态；相关样本少于 3 个时不展示 | estimator unit + SQLite profile |
+| CF-CCE-R22 | 1000 个 plan/tool 事件仍遵守超长会话有界 hydration 和惰性 payload 契约，不造成新的无界数组或大输出复制 | store/perf fixture |
 
 ## Primary User Paths
 
@@ -66,8 +70,20 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 | Browser | 20-tool fixture，短流、长流、active→terminal、失败、用户上翻 | `pnpm dev`，用真实浏览器执行 1366×768 与 800×600 | 无横向溢出；正文优先；active 长回合不整体折叠；terminal 后才收束；上翻不强拉回 |
 | Dev App | 低 segment budget、panic hook、强制退出/重启 fixture | `pnpm tauri dev` 或 `scripts/install-dev-app-wrapper.sh` 启动 `CodeFactoryDev.app` | 自动续段、panic 可见、重启 5 秒内可恢复；成功/边界路径各一次 |
 | Release App | 从公开 macOS/Windows 产物安装精确版本 | 标准 release workflow 后在产物上重走 Dev App 路径 | 版本匹配；真实 app 四视口/主题和连续性全部通过 |
+| Structured plan | 首次计划、步骤推进、等待、增删步骤无 change reason | `pnpm test -- --run src/stores/chatPlan.test.ts src/components/TurnProgress.test.tsx` | revision 有序；当前/下一步正确；计划变化有理由；百分比来源明确 |
+| Result snapshot | completed/partial/failed 与 1000-event turn | `pnpm test -- --run src/components/TurnResultSnapshot.test.tsx` | 5 秒内本地形成；完整过程可切；重新总结不调用模型；证据有界 |
+| Time estimate | 0/2/3+ 历史样本、build/test、external job | `pnpm test -- --run src/lib/turnEstimate.test.ts` + Rust timing profile tests | 少于 3 不显示；区间和样本来源确定；不输出伪精确 ETA |
 
 测试名在实现时必须落到上述筛选关键字，避免矩阵变成不可执行的占位描述。若新增独立 headless 脚本，应加入 `package.json` 并由 CI 调用。
+
+## P0–P3 映射
+
+| 优先级 | Req IDs | 完成定义 |
+| --- | --- | --- |
+| P0 | R10 | 运行中平铺，终态才收束（PR #235） |
+| P1 | R19、R22 | 结构化执行路线、紧凑进度、等待/变更 |
+| P2 | R10、R13、R20、R22 | 结果快照、结果/过程切换、证据化重新总结 |
+| P3 | R21 | 有来源的时间区间；数据不足不展示 |
 
 ## Evidence Pack Requirements
 

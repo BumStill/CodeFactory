@@ -209,11 +209,30 @@ pub struct ModelsResponse {
 
 // ── Events sent to frontend via Tauri emit ───────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanStepEvent {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_job_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     TextDelta {
         content: String,
+    },
+    PlanUpdated {
+        root_turn_id: String,
+        revision: i64,
+        steps: Vec<PlanStepEvent>,
+        explanation: Option<String>,
+        waiting_reason: Option<String>,
+        change_reason: Option<String>,
+        created_at: i64,
     },
     ToolCallStart {
         id: String,

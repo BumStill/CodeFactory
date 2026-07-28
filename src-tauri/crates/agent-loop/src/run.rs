@@ -282,6 +282,7 @@ pub struct LoopInputs {
     pub completion_instruction: String,
     pub fact_check_instruction: String,
     pub audit_session_id: String,
+    pub root_turn_id: Option<String>,
     pub knowledge_library_ids: Option<Vec<String>>,
     pub cancel: Option<Arc<AtomicBool>>,
 }
@@ -403,6 +404,7 @@ pub async fn run_agent_loop(
         completion_instruction,
         fact_check_instruction,
         audit_session_id,
+        root_turn_id,
         knowledge_library_ids,
         cancel,
     } = inputs;
@@ -1005,6 +1007,7 @@ pub async fn run_agent_loop(
                 let tool_ctx = crate::tool::ToolCtx {
                     working_directory: cwd.clone(),
                     session_id: Some(audit_session_id.clone()),
+                    root_turn_id: root_turn_id.clone(),
                     task_id: task_id.clone(),
                     knowledge_library_ids: knowledge_library_ids.clone(),
                     timeout_sec: None,
@@ -1701,6 +1704,7 @@ mod tests {
             completion_instruction: "修复代码并运行测试验证".into(),
             fact_check_instruction: String::new(),
             audit_session_id: "audit".into(),
+            root_turn_id: Some("root".into()),
             knowledge_library_ids: None,
             cancel: None,
         }

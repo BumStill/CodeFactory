@@ -17,6 +17,7 @@ pub mod read;
 pub mod shell_policy;
 pub mod skill_mgmt;
 pub mod test_path;
+pub mod update_plan;
 pub mod workspace_path;
 pub mod write;
 pub mod xlsx;
@@ -57,6 +58,7 @@ pub struct ExecCtx {
     pub app: Option<tauri::AppHandle>,
     pub db: Option<sqlx::SqlitePool>,
     pub session_id: Option<String>,
+    pub root_turn_id: Option<String>,
     pub task_id: Option<String>,
     pub knowledge_library_ids: Option<Vec<String>>,
     /// A snapshot of settings for tools that need policy/config (the delivery
@@ -72,6 +74,7 @@ impl ExecCtx {
             cwd,
             db,
             session_id: None,
+            root_turn_id: None,
             task_id: None,
             knowledge_library_ids: None,
             settings: None,
@@ -106,6 +109,7 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         delegate_tasks::definition(),
         delivery::definition(),
         parallel::definition(),
+        update_plan::definition(),
     ]
 }
 
@@ -136,6 +140,7 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "delegate_tasks" => delegate_tasks::execute(args, ctx).await,
         "deliver_changes" => delivery::execute(args, ctx).await,
         "dispatch_parallel_tasks" => parallel::execute(args, ctx).await,
+        "update_plan" => update_plan::execute(args, ctx).await,
         other => Ok(ToolOutput::err(format!("Unknown tool: {other}"))),
     }
 }

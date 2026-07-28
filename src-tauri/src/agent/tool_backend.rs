@@ -54,6 +54,7 @@ impl ToolBackend for DesktopToolBackend {
             app: self.app.clone(),
             db: Some(self.db.clone()),
             session_id: ctx.session_id.clone(),
+            root_turn_id: ctx.root_turn_id.clone(),
             task_id: ctx.task_id.clone(),
             knowledge_library_ids: ctx.knowledge_library_ids.clone(),
             settings: Some(self.settings.read().await.clone()),

@@ -22,6 +22,22 @@ export function onSessionUpdated(
 
 export type StreamEvent =
   | { type: "text_delta"; content: string }
+  | {
+      type: "plan_updated";
+      root_turn_id: string;
+      revision: number;
+      steps: Array<{
+        id: string;
+        title: string;
+        kind: "analysis" | "implementation" | "verification" | "delivery" | "external_job" | "other";
+        status: "pending" | "in_progress" | "completed";
+        external_job_id?: string | null;
+      }>;
+      explanation?: string | null;
+      waiting_reason?: string | null;
+      change_reason?: string | null;
+      created_at: number;
+    }
   | { type: "tool_call_start"; id: string; name: string; args: unknown }
   | { type: "tool_call_args_delta"; index: number; chunk: string }
   | { type: "tool_call_end"; index: number }
@@ -102,9 +118,28 @@ export interface Message {
 
 export interface MessagePage {
   messages: Message[];
+  plans?: TurnPlanSnapshot[];
   has_more: boolean;
   next_before_rowid?: number | null;
   truncated?: boolean;
+}
+
+export interface TurnPlanSnapshot {
+  root_turn_id: string;
+  revision: number;
+  steps: Array<{
+    id: string;
+    title: string;
+    kind: "analysis" | "implementation" | "verification" | "delivery" | "external_job" | "other";
+    status: "pending" | "in_progress" | "completed";
+    external_job_id?: string | null;
+  }>;
+  explanation?: string | null;
+  waiting_reason?: string | null;
+  change_reason?: string | null;
+  waiting_history?: string[];
+  change_history?: string[];
+  created_at: number;
 }
 
 export interface ModelInfo {

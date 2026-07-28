@@ -12,6 +12,15 @@ import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import { ChatGptAuthRecovery } from "./ChatGptAuthRecovery";
 import { formatDuration, useNowTick } from "../lib/duration";
+import { TurnProgress } from "./TurnProgress";
+import {
+  summarizeTurnEvidence,
+  TurnResultSnapshot,
+} from "./TurnResultSnapshot";
+import type {
+  ExternalJobState,
+  TurnTimingProfile,
+} from "../lib/chatPlan";
 import type { UIMessage } from "../stores/chat";
 import {
   isModelRouteExhaustedError,
@@ -36,6 +45,8 @@ interface Props {
   loadingOlderHistory?: boolean;
   historyTruncated?: boolean;
   onLoadOlder?: () => Promise<void>;
+  timingProfile?: TurnTimingProfile | null;
+  externalJobs?: ExternalJobState[];
 }
 
 // ── Shiki singleton ──────────────────────────────────────────────────────────
@@ -235,6 +246,8 @@ export function MessageList({
   loadingOlderHistory = false,
   historyTruncated = false,
   onLoadOlder,
+  timingProfile = null,
+  externalJobs = [],
 }: Props) {
   const resolvedConversationKey = conversationKey ?? messages[0]?.id ?? null;
   const contentSignal = messages.length === 0
@@ -283,6 +296,11 @@ export function MessageList({
   );
   const lastAssistantId =
     [...visible].reverse().find((m) => m.role === "assistant")?.id ?? null;
+  const activePlanMessage = streaming
+    ? [...visible]
+        .reverse()
+        .find((message) => message.role === "assistant" && message.plan)
+    : undefined;
   const lastAssistantIdsByUserTurn = new Set<string>();
   let pendingLastAssistantId: string | null = null;
   for (const message of visible) {
@@ -301,6 +319,16 @@ export function MessageList({
         ref={scrollerRef}
         className="absolute inset-0 overflow-y-auto px-4 py-4"
       >
+        {activePlanMessage?.plan && (
+          <div className="sticky top-0 z-20 mb-3 flex justify-center">
+            <ActiveTurnProgress
+              plan={activePlanMessage.plan}
+              startedAt={activePlanMessage.createdAt}
+              timingProfile={timingProfile}
+              externalJobs={externalJobs}
+            />
+          </div>
+        )}
         {hasOlderHistory && (
           <div className="flex justify-center">
             <button
@@ -393,6 +421,29 @@ function SuccessfulToolGroup({ tools }: { tools: NonNullable<UIMessage["toolCall
       </button>
       {open && <div className="ml-2 border-l border-border/40 pl-2">{tools.map((tool) => <ToolCallCard key={tool.id} tc={tool} />)}</div>}
     </div>
+  );
+}
+
+function ActiveTurnProgress({
+  plan,
+  startedAt,
+  timingProfile,
+  externalJobs,
+}: {
+  plan: NonNullable<UIMessage["plan"]>;
+  startedAt: number;
+  timingProfile: TurnTimingProfile | null;
+  externalJobs: ExternalJobState[];
+}) {
+  const nowMs = useNowTick(true);
+  return (
+    <TurnProgress
+      plan={plan}
+      timingProfile={timingProfile}
+      externalJobs={externalJobs}
+      elapsedMs={Math.max(0, nowMs - startedAt)}
+      nowMs={nowMs}
+    />
   );
 }
 
@@ -740,6 +791,21 @@ const MessageRow = memo(function MessageRow({
           {isStreamingTail ? `运行中 · ${durationLabel}` : `用时 ${durationLabel}`}
         </div>
       )}
+      {isSettledAnswer && msg.plan && (() => {
+        const evidence = summarizeTurnEvidence(msg.turnToolCalls ?? msg.toolCalls ?? []);
+        if (msg.turnToolCallCount != null) evidence.operationCount = msg.turnToolCallCount;
+        return (
+          <TurnResultSnapshot
+            plan={msg.plan}
+            evidence={evidence}
+            durationMs={msg.durationMs ?? null}
+            processExpanded={showAllSteps}
+            onToggleProcess={
+              collapsible ? () => setShowAllSteps((value) => !value) : undefined
+            }
+          />
+        );
+      })()}
     </div>
   );
 });
