@@ -1278,6 +1278,7 @@ async fn ensure_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::no_window::NoWindow;
     use sqlx::sqlite::SqlitePoolOptions;
 
     /// Synthesise the exact "old user DB" shape from the v0.3.7 regression:
@@ -1825,11 +1826,13 @@ mod tests {
 
         #[cfg(unix)]
         let mut child = std::process::Command::new("sh")
+            .no_window()
             .args(["-c", "sleep 0.1"])
             .spawn()
             .unwrap();
         #[cfg(windows)]
         let mut child = std::process::Command::new("cmd")
+            .no_window()
             .args(["/C", "ping -n 2 127.0.0.1 >NUL"])
             .spawn()
             .unwrap();

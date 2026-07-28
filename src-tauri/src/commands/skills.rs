@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+use crate::util::no_window::NoWindow;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1117,6 +1118,7 @@ pub async fn fetch_skill_from_source(source: &str) -> Result<Vec<SkillManifest>,
         let tmp_for_clone = tmp.clone();
         let status = tokio::task::spawn_blocking(move || {
             std::process::Command::new("git")
+                .no_window()
                 .args(["clone", "--depth", "1", &url])
                 .arg(&tmp_for_clone)
                 .status()

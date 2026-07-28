@@ -674,6 +674,7 @@ fn provider_secret_lookup_timeout() -> Duration {
 #[cfg(target_os = "macos")]
 fn macos_security_keychain_secret(account: &str, timeout: Duration) -> Result<Option<String>> {
     let mut child = Command::new("security")
+        .no_window()
         .args([
             "find-generic-password",
             "-s",
