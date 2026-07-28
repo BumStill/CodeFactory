@@ -557,11 +557,15 @@ const MessageRow = memo(function MessageRow({
     : isSettledAnswer && msg.durationMs != null
       ? formatDuration(msg.durationMs)
       : null;
-  // Long turns: collapse everything before the visible tail window.
+  // Keep the active turn as one continuous reading flow. Once the turn
+  // reaches a terminal state, collapse its older segments behind the
+  // existing disclosure so completed history stays compact.
   const COLLAPSE_THRESHOLD = 10;
   const TAIL_VISIBLE = 4;
-  const collapsible = timeline && timeline.length > COLLAPSE_THRESHOLD;
-  const visibleFrom = collapsible && !showAllSteps ? timeline.length - TAIL_VISIBLE : 0;
+  const collapsible =
+    !isStreamingTail && (timeline?.length ?? 0) > COLLAPSE_THRESHOLD;
+  const visibleFrom =
+    collapsible && !showAllSteps ? (timeline?.length ?? 0) - TAIL_VISIBLE : 0;
   const hiddenSteps = collapsible && !showAllSteps ? visibleFrom : 0;
   const groupedTimeline = timeline
     ? timeline.reduce<Array<{ kind: "segment"; segment: TurnSegment; index: number } | { kind: "tools"; tools: NonNullable<UIMessage["toolCalls"]>; startIndex: number; endIndex: number }>>((items, segment, index) => {
