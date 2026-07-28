@@ -17,7 +17,7 @@
 | CF-CCE-R11 | 工具折叠态不解析大 diff/完整输出，摘要有界且不泄漏 prompt、凭据或未脱敏参数 | lazy/payload tests |
 | CF-CCE-R12 | 主题 token 支持 Tailwind `<alpha-value>`；生产 CSS 必须真实生成工具证据使用的 border/background opacity 类 | production CSS assertion |
 | CF-CCE-R13 | 历史 hydration 按真实用户回合重组 narration、tool replay、continuity 和 final；同一回合密度与 live timeline 一致 | hydration/store + component fixture |
-| CF-CCE-R14 | `Remember` 每个真实用户回合最多一个，只显示在已终态的最终助手正文；step/notice/checkpoint/interrupted/rejected 均不显示 | component + hydration regression |
+| CF-CCE-R14 | 聊天气泡不再显示手动 `Remember` 入口；长期项目记忆由会话后学习自动物化，Profile 保留查看/编辑入口；step/notice/checkpoint/interrupted/rejected 均不出现手动记忆控件 | component + learning materialization regression |
 | CF-CCE-R15 | 连续性与工具状态可键盘操作、读屏可感知且不只依赖颜色；减少动态效果设置有效 | accessibility component + real app |
 | CF-CCE-R16 | 浅色/深色、1366×768/800×600 下无黑框墙、无整页横向溢出，正文保持第一视觉层 | four-viewport real app evidence |
 | CF-CCE-R17 | 普通短会话、超长历史、排队消息、匿名会话、completion recovery、sticky-scroll 和工具权限语义不得回归 | compatibility matrix |
@@ -39,7 +39,7 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 
 ### 历史恢复路径
 
-用户重启并打开长会话。UI 按真实用户回合恢复同一条对话流，工具证据密度与 live 相同；技术 message row 不制造额外大间距。每个已完成回合仅最终回复显示一次 `Remember`，悬空回合显示恢复状态而非假完成。
+用户重启并打开长会话。UI 按真实用户回合恢复同一条对话流，工具证据密度与 live 相同；技术 message row 不制造额外大间距。聊天气泡不显示手动记忆入口，悬空回合显示恢复状态而非假完成。
 
 ## Applicable Harnesses
 
@@ -61,7 +61,7 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 | Rust resume | 非幂等 fake tool 计数后模拟进程重启 | `npm run cargo:shared -- test --manifest-path src-tauri/Cargo.toml continuity_resume -- --nocapture` | 计数保持 1；从 tool outcome 后续跑；最终终态唯一 |
 | Frontend event | checkpoint/resumed/interrupted/terminal 乱序与迟到尾页 | `npm test -- --run src/stores/chatEvents.test.ts src/stores/chatEvents.gate.test.ts src/stores/chatEvents.longSession.test.ts` | 同一 root turn 定点更新；迟到 hydration 不覆盖 live segment |
 | Tool UI | success/running/permission/error 与 6 个连续成功项 | `npm test -- --run src/components/ToolCallCard.test.tsx src/components/ToolCallCard.error.test.tsx src/components/ToolCallCard.lazy.test.tsx src/components/MessageList.timeline.test.tsx` | success 无全边框；attention 有文字；分组边界正确；折叠不解析 diff |
-| History/Remember | 一个回合被持久化为多条 assistant/tool/notice 行 | `npm test -- --run src/components/MessageList.gate.test.tsx src/components/MessageList.renderIsolation.test.tsx src/stores/chatEvents.segments.test.ts` | hydration 后仍是一条自然流；只有 final 有一个 Remember |
+| History/Memory | 一个回合被持久化为多条 assistant/tool/notice 行；postmortem 生成安全 memory 候选 | `npm test -- --run src/components/MessageList.gate.test.tsx src/components/MessageList.renderIsolation.test.tsx src/stores/chatEvents.segments.test.ts` + Rust learning materialization tests | hydration 后仍是一条自然流；气泡无 Remember；安全 memory 自动写入且 marker 去重 |
 | Theme build | `border-border/25`、`bg-surface-1/30` 等 opacity token | `npm run build` 后检查 `dist/assets/*.css` | 生产 CSS 含 alpha 规则；浅色不回退为不透明 `#1e293b` 黑框 |
 | Browser | 20-tool fixture，短流、长流、失败、用户上翻 | `npm run dev`，用真实浏览器执行 1366×768 与 800×600 | 无横向溢出；正文优先；长执行折叠；上翻不强拉回 |
 | Dev App | 低 segment budget、panic hook、强制退出/重启 fixture | `pnpm tauri dev` 或 `scripts/install-dev-app-wrapper.sh` 启动 `CodeFactoryDev.app` | 自动续段、panic 可见、重启 5 秒内可恢复；成功/边界路径各一次 |
@@ -79,7 +79,7 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 - live 与 hydration 的同一 20-tool fixture 对比；
 - 浅色/深色 × 1366×768/800×600 截图，包含成功、运行、失败和中断；
 - 生产 CSS 中 opacity token 的编译结果，不以 jsdom className 断言替代；
-- 每个用户回合 `Remember` 数量断言；
+- 聊天气泡无手动 `Remember` 控件的组件断言，以及安全 memory 候选自动写入/去重的文件证据；
 - PR、CI、merge、release workflow、公开 artifact URL/校验和、安装后精确版本。
 
 ## 兼容与发布边界
@@ -88,4 +88,4 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 - 不以自动续跑为由绕过工具权限、用户取消或不可逆决策确认。
 - 不删除旧消息和工具审计数据；旧数据库必须可升级、可回滚读取。
 - jsdom/Vitest、Rust 单测、`npm run build`、PR 绿色或 workflow 成功均不能单独证明完成。
-- 只有公开发布版本的真实 App 通过连续执行、中断恢复、自然工具证据、四视口/主题和 Remember 验收后，状态才可从 `not live` 改为 `live`。
+- 只有公开发布版本的真实 App 通过连续执行、中断恢复、自然工具证据、四视口/主题和自动记忆验收后，状态才可从 `not live` 改为 `live`。

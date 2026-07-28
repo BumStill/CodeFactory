@@ -187,7 +187,7 @@ usage/cost 必须按实际执行每次 model call 的 route 归属；失败请�
 usage，不得记为零成本事实，只能记 `usage_unknown`。
 
 hydration 将 route 事件聚合回所属真实用户回合，最终 effective route 可审计但不创造
-新的用户消息或额外 `Remember`。
+新的用户消息或手动记忆入口。
 
 ## 8. 可行动终态
 

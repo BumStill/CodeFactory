@@ -7,7 +7,7 @@
 //! Conventions:
 //!   - Lives at `<cwd>/.codefactory/memory.md`
 //!   - Plain markdown, no special syntax required
-//!   - UI's "Remember" button appends new facts here
+//!   - Automatic learning appends safe, stable facts here; Profile edits it
 //!   - Legacy top-level `CODEFACTORY.md` still read for back-compat
 //!     (see agent/mod.rs build_system_prompt)
 //!
@@ -91,7 +91,7 @@ pub async fn append_project_memory(cwd: String, fact: String) -> Result<ProjectM
     if header_needed {
         to_write.push_str("# Project memory\n\n");
         to_write.push_str("Auto-injected into every chat session in this repo.\n");
-        to_write.push_str("Use the Remember button in the chat UI to add new entries.\n");
+        to_write.push_str("CodeFactory updates this file through automatic learning and the Profile memory editor.\n");
         to_write.push_str("\n");
     }
     to_write.push_str(&format!("{separator}- ({date}) {fact}"));

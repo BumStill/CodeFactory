@@ -44,7 +44,7 @@ describe("turn timeline segments", () => {
     expect(segments[4]).toEqual({ kind: "text", text: "完成。" });
   });
 
-  it("keeps the legacy concatenated content in sync for consumers like Remember", () => {
+  it("keeps the legacy concatenated content in sync for consumers like automatic learning", () => {
     const state = play([
       { type: "text_delta", content: "步骤一。" },
       { type: "tool_call_start", id: "t1", name: "bash", args: {} },
