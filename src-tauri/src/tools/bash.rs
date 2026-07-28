@@ -52,6 +52,8 @@ pub fn definition() -> ToolDefinition {
 pub mod sandbox {
     use std::path::Path;
 
+    use crate::util::no_window::NoWindow;
+
     pub struct SandboxInvocation {
         pub program: String,
         pub args: Vec<String>,
@@ -87,6 +89,7 @@ pub mod sandbox {
     /// Cheap liveness probe for the container runtime binary.
     pub fn runtime_available(program: &str) -> bool {
         std::process::Command::new(program)
+            .no_window()
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -142,7 +145,7 @@ async fn execute_inner(
         .map(|s| s.sandbox_mode)
         .unwrap_or_default();
     let mut launched_program = String::new();
-    let mut cmd = match sandbox_mode {
+    let cmd = match sandbox_mode {
         crate::config::settings::SandboxMode::Docker => {
             if cfg!(windows) {
                 return Ok(ToolOutput::err(
@@ -351,6 +354,7 @@ mod tests {
     #[tokio::test]
     async fn successful_command_output_includes_shell_audit_metadata() {
         if std::process::Command::new("powershell")
+            .no_window()
             .args([
                 "-NonInteractive",
                 "-NoProfile",

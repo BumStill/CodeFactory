@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+use crate::util::no_window::NoWindow;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -41,6 +42,7 @@ fn resolve_shell() -> String {
 
 fn which_powershell() -> bool {
     std::process::Command::new("powershell.exe")
+        .no_window()
         .args(["-NoProfile", "-Command", "exit 0"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

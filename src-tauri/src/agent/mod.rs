@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+use crate::util::no_window::NoWindow;
 pub mod anthropic_client;
 pub mod attachments;
 pub mod checkpoint;
@@ -1744,6 +1745,7 @@ fn command_exists(cmd: &str) -> bool {
 
 fn which_available(cmd: &str) -> bool {
     std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+        .no_window()
         .arg(cmd)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
