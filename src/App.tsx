@@ -135,9 +135,9 @@ export default function App() {
       {settings && !settings.onboarded && (
         <OnboardingWizard
           modelReady={Object.values(settings.endpoints ?? {}).length > 0}
-          ceiling={settings.delivery_ceiling ?? "pr_only"}
+          ceiling={settings.delivery_ceiling ?? "through_release"}
           onCeilingChange={(ceiling) =>
-            void useSettingsStore.getState().save({ ...settings, delivery_ceiling: ceiling })
+            void useSettingsStore.getState().save({ ...settings, delivery_ceiling: ceiling, delivery_ceiling_explicit: true })
           }
           onDone={() =>
             void useSettingsStore.getState().save({ ...settings, onboarded: true })

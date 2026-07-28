@@ -608,14 +608,14 @@ fn finish(mut outcome: DeliveryOutcome, branch: &str, ceiling: DeliveryCeiling) 
     } else {
         format!("已交付分支 {branch}(步骤: {})", done.join(" → "))
     };
-    // "Delivered" at a partial ceiling must say WHY merge/release didn't
-    // happen — a bare "已交付" reads as "it stopped short again".
+    // A partial ceiling must explain WHY merge/release didn't happen. Avoid
+    // implying the user explicitly configured the boundary; defaults and legacy
+    // settings can create one too.
     if outcome.final_state == "delivered"
         && ceiling.rank() < DeliveryCeiling::ThroughRelease.rank()
     {
         outcome.summary.push_str(&format!(
-            "\n已到达配置的交付上限({});未执行其后的合并/发布属预期行为。\
-             要让交付自动进行到发布,请在设置→交付里把上限调整为 through_release。",
+            "\n本次交付停止在边界({});未继续合并/发布。若本任务应以上线为完成,请继续调用 deliver_changes(through_release) 或把自动交付边界设为 through_release。",
             ceiling_label(ceiling)
         ));
     }
@@ -1229,7 +1229,7 @@ mod tests {
             false,
         )
         .expect("configured remote must produce a capability note");
-        assert!(note.contains("pr_only"));
+        assert!(note.contains("through_release"));
         assert!(note.contains("deliver_changes"));
     }
 
@@ -1254,9 +1254,8 @@ mod tests {
 
     #[test]
     fn delivered_summary_names_the_ceiling_boundary() {
-        // "Delivered" at pr_only must say WHY there was no merge/release and
-        // how to raise the ceiling — the user reads a bare "已交付" as "it
-        // stopped short again".
+        // A partial delivery boundary must say WHY there was no merge/release;
+        // the user reads a bare "已交付" as "it stopped short again".
         let outcome = DeliveryOutcome {
             steps: vec![StepResult::ok("pr", "opened")],
             branch: Some("b".into()),
@@ -1267,11 +1266,11 @@ mod tests {
             summary: String::new(),
         };
         let done = finish(outcome.clone(), "b", DeliveryCeiling::PrOnly);
-        assert!(done.summary.contains("交付上限"));
+        assert!(done.summary.contains("停止在边界"));
         assert!(done.summary.contains("through_release"));
 
         let full = finish(outcome, "b", DeliveryCeiling::ThroughRelease);
-        assert!(!full.summary.contains("交付上限"));
+        assert!(!full.summary.contains("停止在边界"));
     }
 
     #[test]

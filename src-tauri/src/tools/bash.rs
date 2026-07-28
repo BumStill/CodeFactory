@@ -15,8 +15,8 @@ use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
 const OUTPUT_LIMIT: usize = 30_000;
-const DEFAULT_TIMEOUT_SECS: u64 = 120;
-const MAX_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_TIMEOUT_SECS: u64 = 300;
+const MAX_TIMEOUT_SECS: u64 = 1800;
 
 #[derive(Deserialize)]
 struct Args {
@@ -34,7 +34,7 @@ pub fn definition() -> ToolDefinition {
         function: FunctionDefinition {
             name: "bash".into(),
             description:
-                "Run a shell command in the project directory. Returns stdout+stderr. Timeout 120s, or up to 300s for builds and dependency installation."
+                "Run a shell command in the project directory. Returns stdout+stderr. Default timeout 300s; long-running builds, installs, CI watches, and release polling may run up to 1800s."
                     .into(),
             parameters: json!({
                 "type": "object",

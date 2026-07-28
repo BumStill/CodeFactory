@@ -478,9 +478,11 @@ export interface Settings {
    *  missing → "shared". "worktree" runs each task in its own git worktree
    *  and merges verified diffs back; non-git cwds fall back to shared. */
   subagent_isolation?: 'shared' | 'worktree';
-  /** How far the agent auto-delivers code changes. The user owns this ceiling.
-   *  Optional for backward compat — missing → "pr_only". */
+  /** How far the agent auto-delivers code changes. The user can lower this boundary.
+   *  Optional for backward compat — missing → "through_release". */
   delivery_ceiling?: 'off' | 'pr_only' | 'through_ci_green' | 'through_merge' | 'through_release';
+  /** Whether the user explicitly chose a delivery ceiling; legacy missing/old defaults are migrated. */
+  delivery_ceiling_explicit?: boolean;
   /** One-way IM notifications for task terminals / turn errors / permission waits. Empty URL = off. */
   im_webhook_url?: string;
   im_webhook_format?: 'wecom' | 'feishu' | 'generic';
