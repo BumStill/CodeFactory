@@ -3,9 +3,7 @@ use serde::Deserialize;
 use tauri::State;
 
 use crate::errors::AppError;
-use crate::knowledge::{
-    KnowledgeLibrary, KnowledgeScanSummary, KnowledgeSearchQuery, KnowledgeSearchResult,
-};
+use crate::knowledge::{KnowledgeLibrary, KnowledgeScanSummary};
 use crate::AppState;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,11 +57,3 @@ pub async fn delete_knowledge_library(
     crate::knowledge::delete_library(&pool, &library_id).await
 }
 
-#[tauri::command]
-pub async fn search_knowledge(
-    query: KnowledgeSearchQuery,
-    state: State<'_, AppState>,
-) -> Result<Vec<KnowledgeSearchResult>, AppError> {
-    let pool = state.db.read().await;
-    crate::knowledge::search(&pool, query).await
-}

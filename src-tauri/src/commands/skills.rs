@@ -1151,22 +1151,6 @@ pub async fn fetch_skill_from_source(source: &str) -> Result<Vec<SkillManifest>,
     install_marketplace_skill_by_id(s).await.map(|m| vec![m])
 }
 
-/// Aggregate slash commands from all enabled skills.
-#[tauri::command]
-pub async fn list_slash_commands(app: AppHandle) -> Result<Vec<SlashCommand>, String> {
-    let skills = list_skills(app.clone()).await?;
-    let mut commands = Vec::new();
-    for skill in skills.iter().filter(|s| s.enabled) {
-        let path = PathBuf::from(&skill.path).join("slash_commands.json");
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Ok(cmds) = serde_json::from_str::<Vec<SlashCommand>>(&raw) {
-                commands.extend(cmds);
-            }
-        }
-    }
-    Ok(commands)
-}
-
 // ── Self-evolution P2: skill auto-evolution ───────────────────────────────────
 //
 // Turn recurring TASK shapes into a skill the agent drafts for itself, stored

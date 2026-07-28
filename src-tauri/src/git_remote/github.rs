@@ -101,16 +101,6 @@ pub async fn list_issues(
         .collect())
 }
 
-pub async fn get_issue(
-    client: &RemoteGitClient,
-    repo: &str,
-    number: u64,
-) -> Result<RemoteIssue, String> {
-    let path = format!("/repos/{}/issues/{}", repo, number);
-    let v = client.get(&path).await?;
-    Ok(parse_issue(&v))
-}
-
 pub async fn create_issue(
     client: &RemoteGitClient,
     repo: &str,

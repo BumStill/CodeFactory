@@ -9,11 +9,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 use std::process::Command;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter};
 
 use crate::errors::AppError;
 use crate::storage::tasks;
-use crate::AppState;
 use crate::util::no_window::NoWindow;
 
 // ── Data structures ───────────────────────────────────────────────────────────
@@ -674,28 +673,6 @@ r#"# Evidence Pack — {spec_req_id}: {spec_title}
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn generate_evidence_pack(
-    cwd: String,
-    spec_req_id: String,
-    spec_title: String,
-    session_id: String,
-    task_run_ids: Vec<String>,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let pool = state.db.read().await.clone();
-    collect_evidence_pack(
-        &cwd,
-        &spec_req_id,
-        &spec_title,
-        &session_id,
-        &task_run_ids,
-        &pool,
-    )
-    .await
-    .map_err(|e| e.to_string())
-}
 
 #[tauri::command]
 pub async fn list_evidence_packs(cwd: String) -> Result<Vec<EvidencePackMeta>, String> {

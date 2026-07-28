@@ -198,19 +198,6 @@ pub async fn list_tasks(
     Ok(rows.into_iter().map(TaskRunView::from).collect())
 }
 
-#[tauri::command]
-pub async fn get_task_detail(
-    task_id: String,
-    state: State<'_, AppState>,
-) -> Result<TaskRunView, String> {
-    let pool = state.db.read().await;
-    let row = tasks::get_task(&pool, &task_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    row.map(TaskRunView::from)
-        .ok_or_else(|| format!("Task '{}' not found", task_id))
-}
-
 /// Returns the dependency edges for a task (real DB ids of tasks it depends on).
 #[tauri::command]
 pub async fn get_task_dependencies(
@@ -397,23 +384,6 @@ pub async fn retry_failed_tasks(
 ) -> Result<u64, AppError> {
     let pool = state.db.read().await;
     tasks::retry_failed_tasks(&pool, &session_id).await
-}
-
-/// Return the persisted verification results for a task.
-/// Returns an empty Vec when the task hasn't been verified yet.
-#[tauri::command]
-pub async fn get_verification_results(
-    task_id: String,
-    state: State<'_, AppState>,
-) -> Result<Vec<VerificationResult>, String> {
-    let pool = state.db.read().await;
-    let raw = tasks::get_verification_results(&pool, &task_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    match raw {
-        None => Ok(Vec::new()),
-        Some(json) => serde_json::from_str(&json).map_err(|e| e.to_string()),
-    }
 }
 
 /// Auto-detect a verification plan for the session's cwd, run it

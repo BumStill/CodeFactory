@@ -164,19 +164,6 @@ pub async fn save_verification_results(
     Ok(())
 }
 
-/// Read verification results JSON for a task (returns None if not yet run).
-pub async fn get_verification_results(
-    pool: &SqlitePool,
-    task_id: &str,
-) -> Result<Option<String>> {
-    let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT verification_results FROM task_runs WHERE id = ?")
-            .bind(task_id)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.and_then(|(v,)| v))
-}
-
 // Scaffolding: generic status setter. The live scheduler uses the specific
 // `mark_task_*` helpers below; this stays for arbitrary status transitions.
 #[allow(dead_code)]

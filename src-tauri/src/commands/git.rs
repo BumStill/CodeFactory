@@ -458,21 +458,3 @@ pub async fn git_create_branch(
     }
     Ok(())
 }
-
-#[tauri::command]
-pub async fn git_push(cwd: String, remote: String, branch: String) -> Result<(), String> {
-    let remote = if remote.trim().is_empty() { "origin".to_string() } else { remote };
-    if branch.trim().is_empty() {
-        return Err("Branch is required for push".to_string());
-    }
-    run_git(&cwd, &["push", &remote, &branch]).map(|_| ())
-}
-
-#[tauri::command]
-pub async fn git_pull(cwd: String, remote: String, branch: String) -> Result<(), String> {
-    let remote = if remote.trim().is_empty() { "origin".to_string() } else { remote };
-    if branch.trim().is_empty() {
-        return Err("Branch is required for pull".to_string());
-    }
-    run_git(&cwd, &["pull", &remote, &branch]).map(|_| ())
-}
