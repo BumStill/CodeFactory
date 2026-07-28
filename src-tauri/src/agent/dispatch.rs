@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Invisible plan/act dispatch for the chat surface.
 //!
-//! The chat panel runs [`AgentMode::Interactive`] by default: plan-first,
-//! ask before non-trivial work, let the user steer. The problem that
-//! motivated this module: once the user has *approved* a proposal, the
-//! interactive contract still tells the model to reply with a plan and end
-//! with "Ready to proceed?" — so it re-confirms work the user already
-//! greenlit. That's the instruction-compliance bug.
+//! The chat panel runs [`AgentMode::Interactive`] only when the user's current
+//! intent is to discuss, inspect, ask a question, or explicitly request a plan.
+//! Direct execution requests ("修复", "上线", "直接改", "implement", "ship")
+//! switch that single turn to [`AgentMode::Execute`] even on the first message.
+//! The problem that motivated this module: an old broad plan-first contract made
+//! the agent answer clear commands with another plan plus "Ready to proceed?".
+//! Intent now wins over ceremony.
 //!
 //! The fix is deliberately **invisible**: there is no user-facing plan/act
 //! toggle. The framework decides each turn's contract from the conversation
@@ -115,6 +116,76 @@ const WEAK_EN: &[&str] = &[
     "ok", "okay", "k", "yes", "yeah", "yep", "yup", "sure", "fine", "go", "right",
 ];
 
+/// Explicit planning / analysis-only cues. These deliberately keep the turn in
+/// Interactive even if the sentence mentions implementation words.
+const PLAN_ONLY_CJK: &[&str] = &[
+    "先给我方案",
+    "给个方案",
+    "出个方案",
+    "分析一下",
+    "评估一下",
+    "只分析",
+    "只评估",
+    "不要改",
+    "别改",
+    "不要执行",
+    "别执行",
+    "不要动代码",
+    "别动代码",
+];
+const PLAN_ONLY_EN_PHRASES: &[&str] = &[
+    "what's the plan",
+    "whats the plan",
+    "give me a plan",
+    "propose a plan",
+    "analyze the options",
+    "explain the options",
+    "do not implement",
+    "don't implement",
+    "do not change",
+    "don't change",
+    "do not execute",
+    "don't execute",
+    "without changing anything",
+];
+const PLAN_ONLY_EN_WORDS: &[&str] = &["analyze", "analyse", "explain", "evaluate"];
+
+/// Direct execution cues. These are not approvals of an earlier proposal; they
+/// are first-class user intent to act now.
+const DIRECT_EXEC_CJK: &[&str] = &[
+    "修复",
+    "解决",
+    "上线",
+    "发布",
+    "直接改",
+    "改掉",
+    "删掉",
+    "删除",
+    "实现",
+    "加上",
+    "开始搞",
+    "开始做",
+    "赶紧处理",
+    "赶紧修",
+    "搞定",
+    "落地",
+    "处理一下",
+];
+const DIRECT_EXEC_EN_WORDS: &[&str] = &[
+    "fix",
+    "repair",
+    "implement",
+    "build",
+    "ship",
+    "release",
+    "publish",
+    "deploy",
+    "remove",
+    "delete",
+    "change",
+    "update",
+];
+
 /// Tokenize on non-alphanumeric boundaries for whole-word English matching.
 /// CJK runs survive as multi-char tokens but we match those by substring, so
 /// the tokenization only matters for the ASCII cues.
@@ -187,11 +258,41 @@ pub fn is_approval(user_msg: &str) -> bool {
     toks.iter().any(|t| WEAK_EN.contains(t))
 }
 
+fn is_explicit_planning_request(user_msg: &str) -> bool {
+    let m = user_msg.trim().to_lowercase();
+    if m.is_empty() {
+        return false;
+    }
+    let toks = tokens(&m);
+    PLAN_ONLY_CJK.iter().any(|cue| m.contains(cue))
+        || PLAN_ONLY_EN_PHRASES.iter().any(|cue| m.contains(cue))
+        || toks.iter().any(|token| PLAN_ONLY_EN_WORDS.contains(token))
+}
+
+fn is_direct_execution_request(user_msg: &str) -> bool {
+    let m = user_msg.trim().to_lowercase();
+    if m.is_empty() || is_explicit_planning_request(&m) {
+        return false;
+    }
+    let toks = tokens(&m);
+    if toks.iter().any(|t| NEGATIONS_EN.contains(t)) {
+        return false;
+    }
+    DIRECT_EXEC_CJK.iter().any(|cue| m.contains(cue))
+        || toks.iter().any(|token| DIRECT_EXEC_EN_WORDS.contains(token))
+}
+
 /// The framework's per-turn contract decision for a chat message.
 ///
 /// `prev_assistant` is the most recent assistant message already in history
 /// (None on the first turn). `user_msg` is the message being sent now.
 pub fn decide_chat_mode(prev_assistant: Option<&str>, user_msg: &str) -> AgentMode {
+    // Intent-first: if the user directly asks us to fix/implement/ship/change,
+    // act now. A plan is only the right response when the user explicitly asks
+    // for planning/analysis or the request is genuinely not executable yet.
+    if is_direct_execution_request(user_msg) {
+        return AgentMode::Execute;
+    }
     // A clear, imperative go-ahead executes even if our previous turn didn't end
     // with a question — models don't reliably emit "Ready to proceed?", so we
     // don't make the contract hinge on it. Permission policy is evaluated
@@ -315,6 +416,41 @@ mod tests {
             decide_chat_mode(Some("我已经重构了解析器。"), "好"),
             AgentMode::Interactive
         );
+    }
+
+    #[test]
+    fn intent_first_direct_execution_requests_execute_without_prior_plan() {
+        for instruction in [
+            "修复这个重复总结问题",
+            "赶紧修复上线吧，已经严重影响使用了",
+            "直接改，不要问 ready to proceed",
+            "把这个按钮删掉并发布",
+            "fix this bug and ship it",
+            "please implement the endpoint now",
+        ] {
+            assert_eq!(
+                decide_chat_mode(None, instruction),
+                AgentMode::Execute,
+                "{instruction:?} is a direct execution request and must not trigger plan-first confirmation"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_planning_or_analysis_requests_stay_interactive() {
+        for instruction in [
+            "先给我方案，不要改代码",
+            "分析一下解决方案",
+            "只评估风险，别执行",
+            "what's the plan before changing anything?",
+            "explain the options, do not implement yet",
+        ] {
+            assert_eq!(
+                decide_chat_mode(None, instruction),
+                AgentMode::Interactive,
+                "{instruction:?} explicitly asks for planning/analysis instead of execution"
+            );
+        }
     }
 
     #[test]

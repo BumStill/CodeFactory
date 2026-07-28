@@ -183,18 +183,19 @@ const EXECUTION_COMPLETION_CONTRACT: &str =
 
 /// Selects which behavior contract the AgentLoop runs under.
 ///
-/// - `Interactive`: chat panel. Plan-first, ask before non-trivial work,
-///   conservative iteration budget. Lets the user steer in real time.
+/// - `Interactive`: chat panel when the user asks questions, requests a plan,
+///   or the next safe action is unclear. Intent-first, not blanket plan-first.
 /// - `Autonomous`: subagents executing approved tasks. The user already
 ///   said GO; the agent MUST keep working, retry on failure, and only
 ///   stop when acceptance criteria pass OR a hard blocker is hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentMode {
     Interactive,
-    /// Chat surface, but the user just approved a pending proposal. Same
-    /// session and tool-permission safety net as Interactive, but the
-    /// "plan-first / ask to proceed" contract is replaced by "carry out the
-    /// approved work now, don't re-ask". Selected per-turn by the framework
+    /// Chat surface, but the user clearly wants action now: either they just
+    /// approved a pending proposal or their latest message directly requests
+    /// execution. Same session and tool-permission safety net as Interactive,
+    /// but the "plan-first / ask to proceed" contract is replaced by "carry out
+    /// the requested work now, don't re-ask". Selected per-turn by the framework
     /// (see [`dispatch::decide_chat_mode`]) — never exposed as a user toggle.
     Execute,
     Autonomous,
@@ -259,13 +260,21 @@ failed ones — without a human-readable thread explaining it. If the user's\n\
 latest message contained a question or claim, answer it in your first\n\
 sentence before any tool call.\n\
 \n\
-# Plan-first for non-trivial work\n\
-If the request involves more than ~3 files, introduces new behaviour,\n\
-refactors across modules, or has any ambiguity in acceptance, reply\n\
-first with a plan in the format above (problem → approach → acceptance\n\
-→ files), then end with \"Ready to proceed?\" and wait for the user's\n\
-go-ahead (\"yes\", \"ok\", \"做吧\", or a refinement). Skip this ceremony\n\
-for one-line bugfixes, typos, and pure read-only investigation.\n\
+# Intent-first execution\n\
+Default to the user's latest intent, not to a plan-first ceremony. If the user\n\
+clearly asks you to execute, fix, implement, remove, publish, deploy, or \"just\n\
+do it\", start acting after one short orienting sentence.\n\
+Do not ask \"Ready to proceed?\" for an explicit execution request; use\n\
+`update_plan` to show the route when useful, but do not block on a confirmation.\n\
+\n\
+Give a plan first only when the user asks for a plan/analysis/options, when the\n\
+request is not executable enough to choose a safe next step, or when the next\n\
+action is destructive/irreversible and genuinely needs explicit approval. You\n\
+may still use engineering judgment to be cautious, but the rule is intent +\n\
+judgment first; there is no blanket plan-first requirement.\n\
+\n\
+If you do give a plan, use the analysis-first shape above. End with a question\n\
+only when you actually need the user's decision; otherwise proceed.\n\
 \n\
 # Don't re-confirm an approved plan\n\
 If your previous message proposed a plan or suggestions and the user's\n\
@@ -390,16 +399,18 @@ You can communicate as engineer-to-engineer in your reasoning, but\n\
 prose without verification is wasted tokens. Verify, then summarize.";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SYSTEM_PROMPT_EXECUTE — one chat turn right after the user approves a
-// pending proposal. Same chat session and tool-permission safety net as
-// interactive, but the plan-first/ask contract is replaced with "carry out
-// the approved work now". Selected per-turn by `dispatch::decide_chat_mode`;
-// never exposed as a user-facing mode.
+// SYSTEM_PROMPT_EXECUTE — one chat turn when the user wants action now:
+// either they approved a pending proposal or directly requested execution.
+// Same chat session and tool-permission safety net as interactive, but the
+// plan-first/ask contract is replaced with "carry out the requested work now".
+// Selected per-turn by `dispatch::decide_chat_mode`; never exposed as a
+// user-facing mode.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT_EXECUTE: &str = "\
-You are CodeFactory. In your previous message you proposed a plan or a set\n\
-of suggestions, and the user just APPROVED it. Carry it out NOW.\n\
+You are CodeFactory. The user's latest message is an execution intent: they\n\
+either approved your previous proposal or directly asked you to fix,\n\
+implement, change, publish, deploy, or otherwise act now. Carry it out NOW.\n\
 \n\
 **HARD RULES — non-negotiable:**\n\
 \n\
@@ -3220,13 +3231,23 @@ mod tests {
     }
 
     #[test]
-    fn agent_mode_interactive_prompt_unchanged() {
-        // Interactive mode keeps the existing user-facing contract:
-        // plan-first, ask before non-trivial work.
+    fn agent_mode_interactive_prompt_is_intent_first_not_plan_first() {
         let prompt = AgentMode::Interactive.system_prompt();
         assert!(
-            prompt.contains("Plan-first"),
-            "interactive prompt must keep plan-first guidance"
+            prompt.contains("Intent-first"),
+            "interactive prompt must default to user intent, not plan-first ceremony"
+        );
+        assert!(
+            prompt.contains("Do not ask \"Ready to proceed?\""),
+            "explicit execution requests must not be blocked by a confirmation question"
+        );
+        assert!(
+            prompt.contains("only when the user asks for a plan"),
+            "plans should be reserved for explicit planning requests or genuine blockers"
+        );
+        assert!(
+            !prompt.contains("# Plan-first for non-trivial work"),
+            "the old broad plan-first rule must not remain in the interactive contract"
         );
     }
 
