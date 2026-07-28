@@ -292,6 +292,7 @@ export function MessageList({
   const visible = messages.filter(
     (m) =>
       m.role !== "tool" &&
+      m.completionState !== "rejected_candidate" &&
       (m.role !== "system" || m.completionState === "turn_notice"),
   );
   const lastAssistantId =
