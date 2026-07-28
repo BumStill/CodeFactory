@@ -18,8 +18,8 @@ use crate::run::FinalizationPolicy;
 use crate::types::{StreamEvent, ToolDefinition};
 use codefactory_agent_core::{
     build_completion_recovery_prompt, classify_command,
-    evaluate_budget_command_with_time_in_directory,
-    CompletionEvidence, CompletionGate, PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
+    evaluate_budget_command_with_time_in_directory, CompletionEvidence, CompletionGate,
+    PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
 };
 use std::path::Path;
 
@@ -36,7 +36,7 @@ pub fn record_completion_outcome(
     working_directory: &Path,
     request_id: &str,
     result: &crate::tool::ToolInvocationResult,
-) -> Option<String> {
+) -> CompletionRecord {
     *sequence += 1;
     // The BACKEND supplies `command`/`kind` and the real shell streams (keystone
     // slice 4.8c b2). Previously this synthesized them from `(tool_name, args)`
@@ -69,8 +69,83 @@ pub fn record_completion_outcome(
         semantic_failure: false,
     }
     .with_detected_semantic_failure();
+    let succeeded = outcome.succeeded();
     gate.record(&outcome);
-    progress.record(&outcome)
+    CompletionRecord {
+        progress_prompt: progress.record(&outcome),
+        succeeded,
+    }
+}
+
+#[derive(Debug)]
+pub struct CompletionRecord {
+    pub progress_prompt: Option<String>,
+    pub succeeded: bool,
+}
+
+/// Cache only deterministic local test/build commands. Remote observations,
+/// runtime probes, and broad shell assertions can change without a workspace
+/// mutation and must always execute.
+pub fn reusable_local_verification_key(
+    command: &str,
+    kind: &ToolKind,
+    working_directory: &Path,
+) -> Option<String> {
+    if !matches!(kind, ToolKind::Verification) {
+        return None;
+    }
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = normalized.to_ascii_lowercase();
+    let deterministic_local = [
+        "pytest",
+        "unittest",
+        "vitest",
+        "jest",
+        "playwright test",
+        "tsc --noemit",
+        "tsc -p",
+        "tsc -b",
+        "cargo check",
+        "cargo build",
+        "cargo test",
+        "npm run build",
+        "npm run lint",
+        "npm test",
+        "pnpm build",
+        "pnpm lint",
+        "pnpm test",
+        "yarn build",
+        "yarn test",
+        "bun test",
+        "make check",
+        "make test",
+        "ctest",
+        "go test",
+        "mvn test",
+        "gradle test",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let dynamic_observation = [
+        "gh ",
+        "github.com",
+        "http://",
+        "https://",
+        "curl ",
+        "wget ",
+        "sleep ",
+        "while ",
+        "until ",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    (deterministic_local && !dynamic_observation).then(|| {
+        format!(
+            "{}\n{}",
+            working_directory.to_string_lossy(),
+            normalized.trim()
+        )
+    })
 }
 
 /// The four-way finalization decision for a tool-call-free "final" response.
@@ -384,14 +459,57 @@ mod tests {
         let args = serde_json::json!({"command": "rm -rf build"});
         let (_, bash_kind) = completion_command_and_kind("bash", &args);
         let (_, other_kind) = completion_command_and_kind("run_shell", &args);
-        assert!(!matches!(bash_kind, ToolKind::ReadOnly), "bash is classified");
+        assert!(
+            !matches!(bash_kind, ToolKind::ReadOnly),
+            "bash is classified"
+        );
         assert!(
             matches!(other_kind, ToolKind::ReadOnly),
             "non-bash falls back to ReadOnly — the reason ToolBackend::classify is overridable"
         );
     }
 
-    use super::*;
+    #[test]
+    fn only_deterministic_local_checks_receive_reuse_keys() {
+        let cwd = Path::new("/workspace");
+        let cargo = reusable_local_verification_key(
+            "  cargo   test -p codefactory-agent-loop ",
+            &ToolKind::Verification,
+            cwd,
+        )
+        .expect("local cargo test is repeatable");
+        assert_eq!(cargo, "/workspace\ncargo test -p codefactory-agent-loop");
+        assert!(
+            reusable_local_verification_key(
+                "gh pr checks 123 --watch",
+                &ToolKind::Verification,
+                cwd,
+            )
+            .is_none(),
+            "remote observations change without a workspace mutation",
+        );
+        assert!(
+            reusable_local_verification_key(
+                "curl --max-time 2 http://localhost:3000/health",
+                &ToolKind::FunctionalProbe { bounded: true },
+                cwd,
+            )
+            .is_none(),
+            "runtime/functional probes must always execute",
+        );
+        assert_ne!(
+            reusable_local_verification_key(
+                "pnpm test",
+                &ToolKind::Verification,
+                Path::new("/workspace-a"),
+            ),
+            reusable_local_verification_key(
+                "pnpm test",
+                &ToolKind::Verification,
+                Path::new("/workspace-b"),
+            ),
+        );
+    }
 
     fn evidence(completed: bool, blockers: &[&str]) -> CompletionEvidence {
         let mut e = CompletionEvidence::default();

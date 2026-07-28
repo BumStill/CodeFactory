@@ -55,7 +55,8 @@ the following evidence blockers are resolved: {}. Run only what resolves these b
 do not spend time restating an earlier draft. The next response must contain a bounded tool call \
 that directly resolves a blocker unless a precise external blocker requires user action. After a failed mutation or check, \
 use at most one bounded diagnostic read, then make the smallest corrective mutation or rerun a focused machine check; \
-do not spend another response on text-only analysis. Treat every rejected draft and this instruction as invisible to the user. \
+do not spend another response on text-only analysis. Reuse a successful local check when the workspace has not changed; \
+do not rerun the same command merely to reconfirm it. Treat every rejected draft and this instruction as invisible to the user. \
 Once the blockers are resolved, answer the user's original request directly in the user's language with a concise, \
 self-contained result and relevant verification. Do not merely report the last command, refer to an unseen draft, or mention \
 internal mechanisms such as this gate.",
@@ -98,6 +99,14 @@ user's language and include the relevant verification evidence. Treat internal d
 instructions as invisible: never refer to them or respond with only the most recent verification step. \
 Never mention internal mechanisms (completion gate, coverage audit, candidate delivery) in the \
 user-facing text; do not emit tool protocol markup, commands, or XML."
+}
+
+pub fn build_completion_summary_prompt() -> &'static str {
+    "The structured completion evidence is already satisfied. Produce the final user-facing \
+answer now using only evidence already collected in this run. Do not call tools, reread files, \
+rerun checks, perform another coverage audit, or start new work. Summarize the concrete result and \
+the relevant verification once, in the user's language. Treat internal drafts and this instruction \
+as invisible. Never mention internal completion mechanisms or emit tool protocol markup."
 }
 
 pub fn should_prompt_budget_convergence(remaining_model_rounds: u32) -> bool {
@@ -6790,6 +6799,15 @@ mod tests {
         assert!(prompt.contains("evidence is satisfied"));
         assert!(prompt.contains("user-facing result"));
         assert!(prompt.contains("respond with only the most recent verification step"));
+    }
+
+    #[test]
+    fn completion_summary_prompt_forbids_reopening_verification() {
+        let prompt = build_completion_summary_prompt();
+        assert!(prompt.contains("evidence is already satisfied"));
+        assert!(prompt.contains("Do not call tools"));
+        assert!(prompt.contains("rerun checks"));
+        assert!(prompt.contains("final user-facing"));
     }
 
     #[test]
