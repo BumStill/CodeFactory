@@ -6,6 +6,8 @@ use std::process::Command as StdCommand;
 
 use tokio::process::Command;
 
+use super::no_window::NoWindow;
+
 /// GUI-launched desktop apps on macOS do not inherit a login-shell PATH.
 /// Prepending the common developer-tool locations keeps `node`, `npm`, `pnpm`,
 /// `cargo`, and similar tools available without overriding the user's PATH.
@@ -136,8 +138,13 @@ pub fn shell_invocation(command: &str) -> ShellInvocation {
 }
 
 fn command_exists(program: &str) -> bool {
-    StdCommand::new(program).arg("--version").output().is_ok()
+    StdCommand::new(program)
+        .no_window()
+        .arg("--version")
+        .output()
+        .is_ok()
         || StdCommand::new(program)
+            .no_window()
             .arg("-c")
             .arg("exit 0")
             .output()

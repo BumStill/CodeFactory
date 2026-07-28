@@ -69,6 +69,40 @@ describe("MessageList model route failover", () => {
     expect(line.className).not.toMatch(/\bborder\b|\bbg-|rounded/);
   });
 
+  it("does not blame the model connection while a tool command is still running", () => {
+    render(
+      <MessageList
+        messages={[
+          assistant({
+            transportRetries: [
+              {
+                label: "OpenAI-compatible chat stream request",
+                attempt: 1,
+                maxAttempts: 3,
+                delayMs: 300,
+                reason: "HTTP 503 Service Unavailable",
+              },
+            ],
+            toolCalls: [
+              {
+                id: "tool-1",
+                name: "bash",
+                args: JSON.stringify({ command: "poll ci" }),
+                status: "running",
+              },
+            ],
+          }),
+        ]}
+        streaming
+        cwd={null}
+      />,
+    );
+
+    expect(screen.queryByText("模型连接不稳定，正在重新连接…")).toBeNull();
+    expect(screen.getByText("模型连接曾短暂不稳定，已完成重连")).toBeInTheDocument();
+    expect(screen.getByText(/HTTP 503 Service Unavailable/)).toBeInTheDocument();
+  });
+
   it("renders repeated same-route retries as one quiet expandable evidence line", () => {
     render(
       <MessageList
