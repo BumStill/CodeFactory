@@ -149,6 +149,12 @@ pub struct Settings {
     /// Container image used when `sandbox_mode` is `Docker`.
     #[serde(default = "default_sandbox_image")]
     pub sandbox_image: String,
+    /// True once the user explicitly saves a delivery ceiling from Settings or
+    /// onboarding. Older settings files may contain `pr_only` only because it
+    /// used to be the product default; without this marker, load-time migration
+    /// treats that value as legacy default rather than a user decision.
+    #[serde(default)]
+    pub delivery_ceiling_explicit: bool,
     /// Merge strategy used when the ceiling reaches `ThroughMerge`+.
     #[serde(default)]
     pub delivery_merge_method: MergeMethod,
@@ -198,8 +204,8 @@ impl Default for UsageBudget {
 }
 
 /// How far the agent carries a code change toward production, unattended. The
-/// user selects the ceiling; a per-call request may only LOWER it, never raise
-/// it above what the user configured.
+/// user may lower this boundary, but the product default is to finish the job:
+/// PR, CI, merge, and release when the task asks for delivery.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryCeiling {
@@ -207,14 +213,15 @@ pub enum DeliveryCeiling {
     /// use, but delivery is not part of the agent's definition of "done".
     Off,
     /// Commit the real changed source files, push, and open a PR, then stop.
-    #[default]
     PrOnly,
     /// …then poll CI to a conclusion; stop before merging.
     ThroughCiGreen,
     /// …then merge the PR (per `delivery_merge_method`); stop before release.
     ThroughMerge,
-    /// …then trigger a release. Deliberate by design — only reached when the
-    /// user explicitly raises the ceiling this far.
+    /// Commit, push, open a PR, poll CI, merge, and trigger a release.
+    /// This is the default because users judge delivery by the visible shipped
+    /// result, not by the existence of an intermediate PR.
+    #[default]
     ThroughRelease,
 }
 
@@ -591,11 +598,12 @@ impl Default for Settings {
             reasoning_effort: ReasoningEffort::Medium,
             max_parallel_tasks: default_max_parallel_tasks(),
             subagent_isolation: SubagentIsolation::Shared,
-            delivery_ceiling: DeliveryCeiling::PrOnly,
+            delivery_ceiling: DeliveryCeiling::ThroughRelease,
             im_webhook_url: String::new(),
             im_webhook_format: ImWebhookFormat::Wecom,
             sandbox_mode: SandboxMode::Off,
             sandbox_image: default_sandbox_image(),
+            delivery_ceiling_explicit: false,
             delivery_merge_method: MergeMethod::Squash,
             delivery_exclude_globs: Vec::new(),
             delivery_ci_timeout_secs: default_delivery_ci_timeout_secs(),
@@ -648,18 +656,19 @@ mod delivery_ceiling_tests {
     use super::*;
 
     #[test]
-    fn default_ceiling_is_pr_only() {
+    fn default_ceiling_allows_release_delivery() {
         let s = Settings::default();
-        assert_eq!(s.delivery_ceiling, DeliveryCeiling::PrOnly);
+        assert_eq!(s.delivery_ceiling, DeliveryCeiling::ThroughRelease);
         assert_eq!(s.delivery_merge_method, MergeMethod::Squash);
         assert_eq!(s.delivery_ci_timeout_secs, 1800);
         assert!(s.delivery_exclude_globs.is_empty());
     }
 
     #[test]
-    fn legacy_settings_without_delivery_fields_default_to_pr_only() {
-        // A settings.json written before delivery existed must load with the
-        // PrOnly default, not fail to deserialize.
+    fn legacy_settings_without_delivery_fields_default_to_release_delivery() {
+        // A settings.json written before delivery existed did not express a
+        // user preference. It must not be silently treated as "PR only"; the
+        // agent's default promise is to carry approved code work to release.
         let legacy = serde_json::json!({
             "endpoints": {},
             "default_endpoint": "openrouter",
@@ -668,8 +677,26 @@ mod delivery_ceiling_tests {
             "shell": { "shell": "bash" }
         });
         let s: Settings = serde_json::from_value(legacy).expect("legacy settings must parse");
-        assert_eq!(s.delivery_ceiling, DeliveryCeiling::PrOnly);
+        assert_eq!(s.delivery_ceiling, DeliveryCeiling::ThroughRelease);
         assert_eq!(s.delivery_ci_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn legacy_written_pr_only_default_migrates_to_release_until_user_explicitly_saves() {
+        let mut legacy_default = Settings::default();
+        legacy_default.delivery_ceiling = DeliveryCeiling::PrOnly;
+        legacy_default.delivery_ceiling_explicit = false;
+        assert!(migrate_legacy_delivery_ceiling_default(&mut legacy_default));
+        assert_eq!(
+            legacy_default.delivery_ceiling,
+            DeliveryCeiling::ThroughRelease
+        );
+
+        let mut user_choice = Settings::default();
+        user_choice.delivery_ceiling = DeliveryCeiling::PrOnly;
+        user_choice.delivery_ceiling_explicit = true;
+        assert!(!migrate_legacy_delivery_ceiling_default(&mut user_choice));
+        assert_eq!(user_choice.delivery_ceiling, DeliveryCeiling::PrOnly);
     }
 
     #[test]
@@ -968,6 +995,14 @@ fn migrate_settings_file(
     Ok(())
 }
 
+fn migrate_legacy_delivery_ceiling_default(settings: &mut Settings) -> bool {
+    if !settings.delivery_ceiling_explicit && settings.delivery_ceiling == DeliveryCeiling::PrOnly {
+        settings.delivery_ceiling = DeliveryCeiling::ThroughRelease;
+        return true;
+    }
+    false
+}
+
 pub fn load() -> Settings {
     let new_path = config_path();
 
@@ -1060,13 +1095,21 @@ pub fn load() -> Settings {
         }
     }
 
+    // Delivery migration: `pr_only` used to be the serde/default value, so many
+    // settings files contain it without a user ever choosing PR-only. Treat an
+    // unmarked `pr_only` as the old default and move it to the product default:
+    // finish through release. Once the user saves a ceiling, the explicit marker
+    // protects their chosen lower boundary.
+    let migrated_delivery_ceiling = migrate_legacy_delivery_ceiling_default(&mut settings);
+
     match persist_git_remote_inline_tokens(&mut settings) {
-        Ok(true) => {
-            if let Err(e) = save(&settings) {
-                tracing::warn!("settings: failed to persist redacted git remote settings: {e}");
+        Ok(changed) => {
+            if changed || migrated_delivery_ceiling {
+                if let Err(e) = save(&settings) {
+                    tracing::warn!("settings: failed to persist migrated settings: {e}");
+                }
             }
         }
-        Ok(false) => {}
         Err(e) => {
             tracing::warn!("settings: failed to migrate git remote token: {e}");
         }

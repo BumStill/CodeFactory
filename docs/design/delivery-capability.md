@@ -29,16 +29,12 @@ must be able to carry code work through delivery.
 compatible like `SubagentIsolation`):
 
 - `Off` — never auto-deliver (the tool still exists for explicit use).
-- `PrOnly` (**default**) — commit → push → open PR, then stop.
+- `PrOnly` — commit → push → open PR, then stop (manual review boundary).
 - `ThroughCiGreen` — …+ poll CI to a conclusion.
 - `ThroughMerge` — …+ merge (per `delivery_merge_method`).
-- `ThroughRelease` — …+ trigger a release (deliberate; opt-in only).
+- `ThroughRelease` (**default**) — …+ trigger a release, because user-visible delivery is the shipped artifact/update path.
 
-The app never hardcodes a policy; the user selects the ceiling in Settings. A
-per-call `ceiling` arg may only *lower* it (`clamp_request`), never raise it.
-Default `PrOnly` breaks the "green build but no PR" stall while leaving
-merge/release human-gated out of the box — the user raises the ceiling to go
-further, up to unattended release.
+The product default is `ThroughRelease`, matching the expectation that code work is done only when the user-visible artifact/update is live. Users can lower the ceiling in Settings when they want a manual PR/CI/merge stop.
 
 ### Hybrid provider — no `gh` dependency
 

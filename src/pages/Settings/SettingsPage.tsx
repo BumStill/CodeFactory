@@ -530,7 +530,7 @@ export function SettingsPage({
       reasoning_effort: settings.reasoning_effort ?? "medium",
       max_parallel_tasks: settings.max_parallel_tasks ?? 3,
       subagent_isolation: settings.subagent_isolation ?? "shared",
-      delivery_ceiling: settings.delivery_ceiling ?? "pr_only",
+      delivery_ceiling: settings.delivery_ceiling ?? "through_release",
       im_webhook_url: settings.im_webhook_url ?? "",
       im_webhook_format: settings.im_webhook_format ?? "wecom",
       sandbox_mode: settings.sandbox_mode ?? "off",
@@ -648,6 +648,7 @@ export function SettingsPage({
       max_parallel_tasks: Math.min(8, Math.max(1, Math.round(generalDraft.max_parallel_tasks) || 3)),
       subagent_isolation: generalDraft.subagent_isolation,
       delivery_ceiling: generalDraft.delivery_ceiling,
+      delivery_ceiling_explicit: true,
       im_webhook_url: generalDraft.im_webhook_url.trim(),
       im_webhook_format: generalDraft.im_webhook_format,
       sandbox_mode: generalDraft.sandbox_mode,
@@ -1016,8 +1017,7 @@ export function SettingsPage({
             <div className="space-y-1">
               <label className="text-xs text-gray-500">自动交付上限</label>
               <p className="text-[11px] leading-5 text-gray-600">
-                代码改动测试通过后,AI 自动把工作推进到哪一步为止。由你决定边界:从只开 PR
-                到一路合并、发布上线。合并/发布受远端分支保护与凭据权限约束；CodeFactory 会优先使用
+                代码改动测试通过后,AI 自动把工作推进到哪一步为止。默认一路合并、发布上线；如果你想人工接管,可以把边界降到 PR 或 CI。合并/发布受远端分支保护与凭据权限约束；CodeFactory 会优先使用
                 「远程仓库」令牌，也会自动复用已登录的 GitHub CLI。
               </p>
               <select
@@ -1032,10 +1032,10 @@ export function SettingsPage({
                 className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
               >
                 <option value="off">关闭(不自动交付)</option>
-                <option value="pr_only">提交 + 推送 + 开 PR(默认)</option>
+                <option value="pr_only">提交 + 推送 + 开 PR</option>
                 <option value="through_ci_green">…并等 CI 通过</option>
                 <option value="through_merge">…并合并</option>
-                <option value="through_release">…并发布上线</option>
+                <option value="through_release">…并发布上线(默认)</option>
               </select>
             </div>
 

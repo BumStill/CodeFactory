@@ -176,8 +176,8 @@ describe("SettingsPage parallel-task controls", () => {
     expect(screen.getByRole("spinbutton")).toHaveValue(3);
     expect(screen.getByDisplayValue("共享目录(默认)")).toBeInTheDocument();
     // Delivery ceiling: a legacy settings.json (no delivery_ceiling) hydrates to
-    // the PrOnly default, not blank.
-    expect(screen.getByDisplayValue("提交 + 推送 + 开 PR(默认)")).toBeInTheDocument();
+    // release delivery by default, so approved work reaches the visible shipped result.
+    expect(screen.getByDisplayValue("…并发布上线(默认)")).toBeInTheDocument();
   });
 
   it("does not expose the unsupported Ultra orchestration label as a global effort", async () => {
@@ -191,15 +191,16 @@ describe("SettingsPage parallel-task controls", () => {
   it("saves the selected delivery ceiling", async () => {
     await openGeneralTab();
 
-    fireEvent.change(screen.getByDisplayValue("提交 + 推送 + 开 PR(默认)"), {
-      target: { value: "through_release" },
+    fireEvent.change(screen.getByDisplayValue("…并发布上线(默认)"), {
+      target: { value: "pr_only" },
     });
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() => {
       expect(mocks.save).toHaveBeenCalledTimes(1);
     });
-    expect(mocks.save.mock.calls[0][0].delivery_ceiling).toBe("through_release");
+    expect(mocks.save.mock.calls[0][0].delivery_ceiling).toBe("pr_only");
+    expect(mocks.save.mock.calls[0][0].delivery_ceiling_explicit).toBe(true);
   });
 
   it("saves the edited parallelism cap and isolation mode", async () => {

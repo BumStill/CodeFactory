@@ -26,7 +26,7 @@ function setup(status: { gh: boolean; token: boolean; model: boolean }) {
   render(
     <OnboardingWizard
       modelReady={status.model}
-      ceiling="pr_only"
+      ceiling="through_release"
       onCeilingChange={() => {}}
       onDone={onDone}
     />,
@@ -40,6 +40,12 @@ describe("OnboardingWizard", () => {
     await waitFor(() => expect(screen.getByText(/快速就绪/)).toBeTruthy());
     const root = screen.getByTestId("onboarding-wizard");
     expect(root.className).not.toContain("inset-0");
+  });
+
+  it("defaults delivery to release instead of PR-only", async () => {
+    setup({ gh: true, token: false, model: true });
+    await waitFor(() => expect(screen.getByDisplayValue("发布上线(默认)")).toBeTruthy());
+    expect(screen.queryByDisplayValue("开 PR 为止(默认)")).not.toBeInTheDocument();
   });
 
   it("shows green checks when the model and a logged-in gh are already there", async () => {

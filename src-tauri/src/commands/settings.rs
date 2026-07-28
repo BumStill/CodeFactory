@@ -17,6 +17,11 @@ pub async fn save_settings(
 ) -> Result<Settings, AppError> {
     let mut current = state.settings.write().await;
     crate::codex_auth::reconcile_chatgpt_settings(&current, &mut new_settings);
+    if new_settings.delivery_ceiling != current.delivery_ceiling
+        || !current.delivery_ceiling_explicit
+    {
+        new_settings.delivery_ceiling_explicit = true;
+    }
     settings::persist_git_remote_inline_tokens(&mut new_settings)?;
     settings::save(&new_settings)?;
     *current = new_settings.clone();

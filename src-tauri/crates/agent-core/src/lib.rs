@@ -492,11 +492,32 @@ pub enum ToolKind {
     FunctionalProbe { bounded: bool },
 }
 
+fn is_long_running_observation_command(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "gh run watch",
+            "gh pr checks",
+            "gh run view",
+            "gh pr view",
+            "gh release view",
+            "gh release download",
+            "workflow_dispatch",
+            "auto-release",
+            "release.yml",
+            "while gh ",
+            "until gh ",
+        ],
+    ) || (contains_any(lower, &["sleep ", "for ", "while ", "until "])
+        && contains_any(lower, &["gh run", "gh pr", "gh release", "github.com"]))
+}
+
 pub fn effective_command_timeout_sec(command: &str, requested: u64, maximum: u64) -> u64 {
     let maximum = maximum.max(1);
     let requested = requested.clamp(1, maximum);
     let lower = command.to_ascii_lowercase();
-    if is_dependency_install_command(&lower)
+    if is_long_running_observation_command(&lower)
+        || is_dependency_install_command(&lower)
         || contains_any(
             &lower,
             &[
@@ -6393,6 +6414,22 @@ mod tests {
         );
         assert_eq!(effective_command_timeout_sec("cargo test", 30, 300), 30);
         assert_eq!(effective_command_timeout_sec("npm install", 30, 120), 120);
+        assert_eq!(
+            effective_command_timeout_sec(
+                "gh run watch 30319853083 --repo BumStill/CodeFactory --interval 10 --exit-status",
+                120,
+                1800,
+            ),
+            1800
+        );
+        assert_eq!(
+            effective_command_timeout_sec(
+                "while gh run view 30319853083 --json status; do sleep 10; done",
+                120,
+                1800,
+            ),
+            1800
+        );
     }
 
     #[test]
