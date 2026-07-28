@@ -17,6 +17,8 @@
 | CF-SCC-R11 | 取消文案明确表示停止后续生成，不自动回滚已提交、已推送或已执行的外部状态 | component + real app |
 | CF-SCC-R12 | PR+CI、真实 CodeFactory App 和精确发布产物验证前保持 `not live` | evidence pack |
 | CF-SCC-R13 | 自动事实纠偏只允许进入执行型回合；交付类纠偏还必须核对当前用户明确要求的交付动作。检测不得跨段拼接示例、引用或假设中的关键词，不得把分析/设计回答改写成 `deliver_changes` 等无关执行。内部 `turn_notice` 必须保留可审计的 system 来源，不能冒充新的用户目标 | Rust failure-first regression + exact field-session replay + real app |
+| CF-SCC-R14 | 同一回合中，相同工作目录、相同命令的确定性本地验证在 workspace 未发生新 mutation 时只执行一次；后续相同调用复用已有成功结果。失败验证、远端状态观察、Runtime/Functional Probe 不得复用；任何 workspace mutation 都保守失效已有本地验证结果 | Rust failure-first loop regression |
+| CF-SCC-R15 | completion evidence 满足后，产品 Autonomous 的最后一轮只生成用户总结，不再执行工具、不触发事实纠偏，也不把重复绿测记作新进展。即使模型在该轮返回 tool call，也必须保持未执行并最多重试一次纯总结；Benchmark 保留原 coverage audit 语义 | Rust event/tool-execution sequence + real app |
 
 ## Primary User Paths
 
