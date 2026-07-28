@@ -529,12 +529,17 @@ pub const NO_TOKEN_PR_MESSAGE: &str = "已提交并推送,但没有可用的 Git
 
 fn no_remote_channel_message(origin_url: Option<&str>) -> String {
     if let Some(origin) = origin_url {
-        if let Some(project) = parse_gitlab_project_path(origin) {
-            return format!(
-                "已提交并推送,但 GitLab 项目 {project} 没有可用的 merge request 通道。\
+        if parse_owner_repo(origin).is_some() {
+            return NO_TOKEN_PR_MESSAGE.to_string();
+        }
+        if host_looks_like_gitlab(origin) {
+            if let Some(project) = parse_gitlab_project_path(origin) {
+                return format!(
+                    "已提交并推送,但 GitLab 项目 {project} 没有可用的 merge request 通道。\
 请在 设置→远程仓库 配置该 GitLab/企业 GitLab 的 token,或启用仓库 delivery provider hook/plugin;\
 不要把这当成缺 GitHub 通道,在 GitLab token/provider 配好前不要再调用 deliver_changes 重试。"
-            );
+                );
+            }
         }
     }
     NO_TOKEN_PR_MESSAGE.to_string()
@@ -1855,6 +1860,16 @@ mod tests {
     fn no_token_message_offers_the_gh_cli_path_first() {
         assert!(NO_TOKEN_PR_MESSAGE.contains("gh auth login"));
         assert!(NO_TOKEN_PR_MESSAGE.contains("远程仓库"));
+    }
+
+    #[test]
+    fn no_remote_channel_message_keeps_github_https_as_github() {
+        let message = no_remote_channel_message(Some("https://github.com/BumStill/CodeFactory.git"));
+        assert!(message.contains("GitHub 通道"));
+        assert!(message.contains("gh auth login"));
+        assert!(message.contains("开 PR"));
+        assert!(!message.contains("GitLab 项目"));
+        assert!(!message.contains("merge request"));
     }
 
     #[test]
