@@ -614,6 +614,10 @@ const MessageRow = memo(function MessageRow({
     (timeline
       ? lastTextIndex === timeline.length - 1
       : !msg.toolCalls || msg.toolCalls.length === 0);
+  const hasActiveTool = (msg.toolCalls ?? []).some(
+    (tool) => tool.status === "running" || tool.status === "waiting_permission",
+  );
+  const isWaitingOnModelTransport = isStreamingTail && !hasActiveTool;
   const durationLabel = isStreamingTail
     ? formatDuration(Math.max(0, nowMs - msg.createdAt))
     : isSettledAnswer && msg.durationMs != null
@@ -746,7 +750,7 @@ const MessageRow = memo(function MessageRow({
         return (
           <details className="w-fit max-w-full text-[13px] leading-5 text-gray-500">
             <summary className="cursor-pointer select-none hover:text-gray-400">
-              {isStreamingTail ? "模型连接不稳定，正在重新连接…" : "模型连接曾短暂不稳定，已完成重连"}
+              {isWaitingOnModelTransport ? "模型连接不稳定，正在重新连接…" : "模型连接曾短暂不稳定，已完成重连"}
             </summary>
             <div className="ml-4 mt-1 space-y-0.5 text-[13px] leading-5 text-gray-600">
               {msg.transportRetries.map((retry, index) => (
