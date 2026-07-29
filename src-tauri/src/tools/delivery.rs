@@ -8,6 +8,8 @@
 use serde_json::{json, Value};
 
 use super::{ExecCtx, ToolOutput};
+#[cfg(test)]
+use super::ToolExecutionStatus;
 use crate::agent::delivery::{self, DeliverOpts};
 use crate::config::settings::DeliveryCeiling;
 use crate::errors::Result;
@@ -78,7 +80,16 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         persist_delivery_ref(db, session_id, &outcome).await?;
     }
 
-    Ok(ToolOutput::ok(render_report(&outcome)))
+    Ok(tool_output_for_outcome(&outcome))
+}
+
+fn tool_output_for_outcome(outcome: &delivery::DeliveryOutcome) -> ToolOutput {
+    let report = render_report(outcome);
+    if outcome.final_state == "blocked" {
+        ToolOutput::blocked(report)
+    } else {
+        ToolOutput::ok(report)
+    }
 }
 
 async fn persist_delivery_ref(
@@ -183,6 +194,16 @@ mod tests {
             pr_url: None,
             pr_number: None,
             final_state: final_state.into(),
+            stage: "ci".into(),
+            code: if final_state == "blocked" {
+                "delivery_ci_blocked"
+            } else {
+                "delivery_ceiling_reached"
+            }
+            .into(),
+            recoverable: final_state == "blocked",
+            next_action: None,
+            reached_state: "local".into(),
             summary: "summary".into(),
         }
     }
@@ -201,6 +222,13 @@ mod tests {
     fn delivered_report_carries_no_attribution_warning() {
         let report = render_report(&outcome("delivered"));
         assert!(!report.contains("不得归因"));
+    }
+
+    #[test]
+    fn business_blocker_maps_to_blocked_tool_status() {
+        let output = tool_output_for_outcome(&outcome("blocked"));
+        assert_eq!(output.status, ToolExecutionStatus::Blocked);
+        assert!(!output.is_error, "blocked is not a tool crash");
     }
     #[tokio::test]
     async fn session_delivery_reference_is_durable_and_replaced_by_latest_pr() {

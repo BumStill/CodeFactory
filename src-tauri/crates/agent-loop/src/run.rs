@@ -227,6 +227,15 @@ pub enum FinalizationPolicy {
     Benchmark,
 }
 
+/// Hard capability boundary for one user root turn. Permissions may require
+/// approval for an allowed action, but can never widen this contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnCapability {
+    ReviewOnly,
+    Implement,
+    Deliver,
+}
+
 /// Per-run configuration that the surface supplies; keeps divergent constants
 /// (gate benchmark flag, tracker window, recovery limit, wall budget) explicit
 /// instead of forked per copy. The usage-attribution identity + flags live here
@@ -235,6 +244,7 @@ pub enum FinalizationPolicy {
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub finalization: FinalizationPolicy,
+    pub turn_capability: TurnCapability,
     /// `CompletionGate` benchmark mode: false (desktop) / true (sidecar).
     pub gate_benchmark: bool,
     /// `ProgressTracker` window: 8 (desktop) / 4 (sidecar).
@@ -308,6 +318,50 @@ pub struct LoopServices {
     /// Mid-run user input, drained at each round boundary. Surfaces with no
     /// interactive user supply [`crate::services::NoSteering`].
     pub steer: Arc<dyn crate::services::SteerInbox>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_turn_activity(
+    persistence: &dyn Persistence,
+    events: &dyn EventSink,
+    root_turn_id: Option<&str>,
+    phase: &str,
+    status: &str,
+    activity_kind: &str,
+    activity_label: &str,
+    waiting_reason: Option<&str>,
+    terminal_reason: Option<&str>,
+) -> Result<(), LoopError> {
+    let Some(root_turn_id) = root_turn_id else {
+        return Ok(());
+    };
+    let update = crate::journal::TurnActivityUpdate {
+        root_turn_id: root_turn_id.to_string(),
+        phase: phase.to_string(),
+        status: status.to_string(),
+        recent_activity_kind: activity_kind.to_string(),
+        recent_activity_label: activity_label.to_string(),
+        waiting_reason: waiting_reason.map(str::to_string),
+        terminal_reason: terminal_reason.map(str::to_string),
+    };
+    let revision = persistence.update_turn_activity(&update).await?;
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    events.emit(crate::types::StreamEvent::TurnActivityUpdated {
+        root_turn_id: update.root_turn_id,
+        revision,
+        phase: update.phase,
+        status: update.status,
+        recent_activity_kind: update.recent_activity_kind,
+        recent_activity_label: update.recent_activity_label,
+        waiting_reason: update.waiting_reason,
+        updated_at,
+        terminal_reason: update.terminal_reason,
+    });
+    Ok(())
 }
 
 /// Finish a tool batch that was cancelled mid-flight: persist each remaining
@@ -414,6 +468,7 @@ pub async fn run_agent_loop(
     } = inputs;
     let RunConfig {
         finalization,
+        turn_capability,
         recovery_limit,
         max_iterations,
         wall_budget_applies: wall_budget,
@@ -486,6 +541,7 @@ pub async fn run_agent_loop(
     let mut successful_local_verifications = BTreeSet::new();
     let mut progress_tracker = codefactory_agent_core::ProgressTracker::new(progress_window as u32);
     let mut finalization_pending = false;
+    let mut blocker_summary_pending = false;
     let mut completion_summary_retry_used = false;
     let mut completion_recovery_attempts = 0_u32;
     let mut fact_check_used = false;
@@ -498,6 +554,18 @@ pub async fn run_agent_loop(
     let mut total_input_tokens = 0_u64;
     let mut total_output_tokens = 0_u64;
     let mut last_final_text = String::new();
+    publish_turn_activity(
+        persistence.as_ref(),
+        events.as_ref(),
+        root_turn_id.as_deref(),
+        "working",
+        "active",
+        "turn_running",
+        "正在执行任务",
+        None,
+        None,
+    )
+    .await?;
     loop {
         let segment_start_evidence = completion_gate.evidence();
         for segment_iteration in 0..max_iterations {
@@ -526,7 +594,15 @@ pub async fn run_agent_loop(
             for steer_text in steer.drain().await {
                 let message_id = persistence
                     .persist_message(
-                        "user", &steer_text, None, None, None, None, None, None, None,
+                        "user",
+                        &steer_text,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     )
                     .await?;
                 messages.push(crate::types::ChatMessage {
@@ -581,8 +657,8 @@ pub async fn run_agent_loop(
                 }
             }
 
-            let summary_only_round = finalization_pending
-                && matches!(finalization, FinalizationPolicy::BlockOnIncomplete);
+            let summary_only_round = finalization_pending;
+            let blocker_summary_round = summary_only_round && blocker_summary_pending;
             let active_tool_defs =
                 crate::policy::active_tool_definitions(tool_defs, finalization_pending);
             let required_tool_response = require_tool_next && !finalization_pending;
@@ -692,6 +768,7 @@ pub async fn run_agent_loop(
                 Err(e) => return Err(e.into()),
             };
             finalization_pending = false;
+            blocker_summary_pending = false;
             require_tool_next = false;
             persist_route_change(persistence.as_ref(), events.as_ref(), route_change.as_ref())
                 .await?;
@@ -716,10 +793,6 @@ pub async fn run_agent_loop(
                 )
                 .await;
             }
-            if !text.is_empty() {
-                last_final_text = text.clone();
-            }
-
             if is_cancelled(cancel.as_ref()) {
                 tracing::info!("chat turn cancelled by user (session {session_id})");
                 events.emit(crate::types::StreamEvent::Done {
@@ -834,10 +907,36 @@ pub async fn run_agent_loop(
                     reasoning_content: None,
                 });
                 finalization_pending = true;
+                blocker_summary_pending = blocker_summary_round;
                 continue;
             }
 
             if tool_calls.is_empty() {
+                if blocker_summary_round {
+                    last_final_text = text.clone();
+                    publish_turn_activity(
+                        persistence.as_ref(),
+                        events.as_ref(),
+                        root_turn_id.as_deref(),
+                        "finalizing",
+                        "blocked",
+                        "blocked",
+                        "任务已在明确边界停止",
+                        None,
+                        Some("tool_blocked"),
+                    )
+                    .await?;
+                    let (done_in, done_out) = usage
+                        .as_ref()
+                        .map(|u| (u.prompt_tokens, u.completion_tokens))
+                        .unwrap_or((0, 0));
+                    events.emit(crate::types::StreamEvent::Done {
+                        input_tokens: done_in,
+                        output_tokens: done_out,
+                    });
+                    emitted_terminal = true;
+                    break;
+                }
                 // Systemic fact-check: a tool-call-free reply asserting a
                 // machine-verifiable obstacle (delivery blocked / command
                 // missing / waiting on a checkable condition) gets ONE live
@@ -941,6 +1040,19 @@ pub async fn run_agent_loop(
                     }
                     crate::policy::CompletionFinalization::Complete => {}
                 }
+                last_final_text = text.clone();
+                publish_turn_activity(
+                    persistence.as_ref(),
+                    events.as_ref(),
+                    root_turn_id.as_deref(),
+                    "finalizing",
+                    "completed",
+                    "completed",
+                    "任务已完成",
+                    None,
+                    None,
+                )
+                .await?;
                 // Always emit a terminal Done so the frontend's `streaming`
                 // flag clears — even when the provider omitted usage on the
                 // final turn. Previously Done was gated behind `usage`, so a
@@ -959,6 +1071,7 @@ pub async fn run_agent_loop(
 
             let mut result_messages = Vec::new();
             let mut progress_prompt = None;
+            let mut blocked_tool_result = false;
             let completion_evidence_before_tool_batch = completion_gate.evidence();
 
             for (tool_index, tc) in tool_calls.iter().enumerate() {
@@ -1003,6 +1116,33 @@ pub async fn run_agent_loop(
                     name: tc.function.name.clone(),
                     args: args.clone(),
                 });
+                let activity_label = match tc.function.name.as_str() {
+                    "read_file" | "glob" | "grep" | "kb_search" | "kb_get_chunk" => {
+                        "正在检查相关信息"
+                    }
+                    "write_file" | "edit_file" => "正在修改工作区",
+                    "bash" => "正在执行命令",
+                    "deliver_changes" => "正在执行交付",
+                    "delegate_tasks" | "dispatch_parallel_tasks" => "正在执行子任务",
+                    "browser_session" => "正在检查浏览器页面",
+                    _ => "正在执行工具",
+                };
+                publish_turn_activity(
+                    persistence.as_ref(),
+                    events.as_ref(),
+                    root_turn_id.as_deref(),
+                    if tc.function.name == "deliver_changes" {
+                        "delivering"
+                    } else {
+                        "working"
+                    },
+                    "active",
+                    "tool",
+                    activity_label,
+                    None,
+                    None,
+                )
+                .await?;
 
                 let remaining = max_iterations.saturating_sub(segment_iteration + 1) as u32;
                 let completion_evidence = completion_gate.evidence();
@@ -1045,6 +1185,12 @@ pub async fn run_agent_loop(
                 // Inspection budget first (b5), then the completion-policy
                 // budget — matching the sidecar's ordering. Both are off on the
                 // desktop unless the surface opts in.
+                let capability_denial = crate::policy::capability_denial(
+                    turn_capability,
+                    &tc.function.name,
+                    &classified_command,
+                    &classified_kind,
+                );
                 let inspection_denial = if inspection_budget {
                     crate::policy::inspection_budget_denial(
                         progress_tracker.read_only_exhausted(),
@@ -1054,7 +1200,9 @@ pub async fn run_agent_loop(
                 } else {
                     None
                 };
-                let denial_content = if let Some(denial) = inspection_denial.or_else(|| {
+                let denial_content = if let Some(content) = capability_denial {
+                    Some(content)
+                } else if let Some(denial) = inspection_denial.or_else(|| {
                     crate::policy::autonomous_budget_denial(
                         wall_budget,
                         remaining,
@@ -1175,20 +1323,20 @@ pub async fn run_agent_loop(
                         }));
                     }
                 };
+                blocked_tool_result |=
+                    matches!(output.status, crate::tool::ToolExecutionStatus::Blocked);
                 persistence
                     .record_tool_call_outcome(
                         tc,
-                        if output.is_error { "error" } else { "done" },
-                        if output.is_error {
-                            None
-                        } else {
-                            Some(&output.content)
+                        match output.status {
+                            crate::tool::ToolExecutionStatus::Done => "done",
+                            crate::tool::ToolExecutionStatus::Blocked => "blocked",
+                            crate::tool::ToolExecutionStatus::Error => "error",
                         },
-                        if output.is_error {
-                            Some(&output.content)
-                        } else {
-                            None
-                        },
+                        (!matches!(output.status, crate::tool::ToolExecutionStatus::Error))
+                            .then_some(output.content.as_str()),
+                        matches!(output.status, crate::tool::ToolExecutionStatus::Error)
+                            .then_some(output.content.as_str()),
                         duration_ms,
                     )
                     .await?;
@@ -1234,11 +1382,12 @@ pub async fn run_agent_loop(
                     tool_call_id: tc.id.clone(),
                     content: output.content.clone(),
                     is_error: output.is_error,
-                    status: if output.is_error {
-                        "error".into()
-                    } else {
-                        "done".into()
-                    },
+                    status: match output.status {
+                        crate::tool::ToolExecutionStatus::Done => "done",
+                        crate::tool::ToolExecutionStatus::Blocked => "blocked",
+                        crate::tool::ToolExecutionStatus::Error => "error",
+                    }
+                    .into(),
                 });
 
                 result_messages.push(crate::types::ChatMessage {
@@ -1273,6 +1422,33 @@ pub async fn run_agent_loop(
                 reasoning_content: reasoning,
             });
             messages.extend(result_messages);
+            if blocked_tool_result {
+                finalization_pending = true;
+                blocker_summary_pending = true;
+                publish_turn_activity(
+                    persistence.as_ref(),
+                    events.as_ref(),
+                    root_turn_id.as_deref(),
+                    "finalizing",
+                    "blocked",
+                    "blocked",
+                    "正在整理阻断结果",
+                    None,
+                    Some("tool_blocked"),
+                )
+                .await?;
+                messages.push(crate::types::ChatMessage {
+                    role: "user".into(),
+                    content: crate::types::MessageContent::Text(
+                        "工具返回了结构化 blocked。不要重试该工具；请只用已有事实生成一次简洁阻断总结，说明停在哪一步、已完成什么和下一步。".into(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                });
+                continue;
+            }
             if let Some(prompt) = progress_prompt {
                 messages.push(crate::types::ChatMessage {
                     role: "user".into(),
@@ -1290,12 +1466,7 @@ pub async fn run_agent_loop(
             {
                 last_completion_nudge_sequence = evidence.last_successful_verification_sequence;
                 finalization_pending = true;
-                let ready_prompt = if matches!(finalization, FinalizationPolicy::BlockOnIncomplete)
-                {
-                    codefactory_agent_core::build_completion_summary_prompt()
-                } else {
-                    codefactory_agent_core::build_completion_ready_prompt()
-                };
+                let ready_prompt = codefactory_agent_core::build_completion_summary_prompt();
                 persistence
                     .persist_gate_message(ready_prompt, "gate_ready")
                     .await?;
@@ -1303,6 +1474,18 @@ pub async fn run_agent_loop(
                     kind: "ready".into(),
                     detail: String::new(),
                 });
+                publish_turn_activity(
+                    persistence.as_ref(),
+                    events.as_ref(),
+                    root_turn_id.as_deref(),
+                    "finalizing",
+                    "active",
+                    "finalizing",
+                    "正在形成最终结果",
+                    None,
+                    None,
+                )
+                .await?;
                 messages.push(crate::types::ChatMessage {
                     role: "user".into(),
                     content: crate::types::MessageContent::Text(ready_prompt.to_string()),
@@ -1311,6 +1494,35 @@ pub async fn run_agent_loop(
                     name: None,
                     reasoning_content: None,
                 });
+            } else if !matches!(turn_capability, TurnCapability::ReviewOnly) && !evidence.completed
+            {
+                require_tool_next = true;
+                messages.push(crate::types::ChatMessage {
+                    role: "user".into(),
+                    content: crate::types::MessageContent::Text(
+                        codefactory_agent_core::build_completion_recovery_prompt(&evidence),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                });
+                events.emit(crate::types::StreamEvent::CompletionGateAction {
+                    kind: "evidence_needed".into(),
+                    detail: evidence.blockers.join("; "),
+                });
+                publish_turn_activity(
+                    persistence.as_ref(),
+                    events.as_ref(),
+                    root_turn_id.as_deref(),
+                    "recovering",
+                    "active",
+                    "verification",
+                    "正在补充缺失验证",
+                    Some("验证证据不足"),
+                    None,
+                )
+                .await?;
             } else if wall_budget {
                 let remaining = max_iterations.saturating_sub(segment_iteration + 1);
                 if codefactory_agent_core::should_prompt_budget_convergence(remaining as u32) {
@@ -1758,6 +1970,7 @@ mod tests {
                     "updated src/lib.rs".into()
                 },
                 is_error: false,
+                status: crate::tool::ToolExecutionStatus::Done,
                 command: call.function.name.clone(),
                 kind: if verification {
                     ToolKind::Verification
@@ -1825,6 +2038,11 @@ mod tests {
                     "updated src/lib.rs".into()
                 },
                 is_error: failed,
+                status: if failed {
+                    crate::tool::ToolExecutionStatus::Error
+                } else {
+                    crate::tool::ToolExecutionStatus::Done
+                },
                 command,
                 kind,
                 return_code: Some(if failed { 1 } else { 0 }),
@@ -1959,6 +2177,7 @@ mod tests {
     fn config() -> RunConfig {
         RunConfig {
             finalization: FinalizationPolicy::ReleaseWithWarning,
+            turn_capability: TurnCapability::Implement,
             gate_benchmark: false,
             progress_window: 8,
             recovery_limit: 0,
@@ -2029,7 +2248,11 @@ mod tests {
         // Round 1 calls a tool; the user types while it runs; round 2 must
         // already carry their correction.
         let transport = Arc::new(ScriptedTransport::new(vec![
-            response("先看一下当前实现", vec![call("t1", "scripted", serde_json::json!({}))], 0),
+            response(
+                "先看一下当前实现",
+                vec![call("t1", "scripted", serde_json::json!({}))],
+                0,
+            ),
             response("好的，改用 chrome channel", vec![], 1),
         ]));
         let persistence = Arc::new(RecordingPersistence::default());
@@ -2042,7 +2265,9 @@ mod tests {
         let mut svc = services(transport.clone(), persistence.clone(), events.clone());
         svc.steer = steer.clone();
 
-        run_agent_loop(inputs(), config(), svc).await.expect("loop runs");
+        run_agent_loop(inputs(), config(), svc)
+            .await
+            .expect("loop runs");
 
         // Persisted as a real user turn — the user's own words, not a
         // framework control row.
@@ -2066,7 +2291,11 @@ mod tests {
         assert_eq!(applied, vec!["改用 chrome channel".to_string()]);
 
         // The model saw it before its second request — that is the whole point.
-        let second_request = transport.requests().get(1).cloned().expect("a second round ran");
+        let second_request = transport
+            .requests()
+            .get(1)
+            .cloned()
+            .expect("a second round ran");
         assert!(
             second_request.iter().any(|m| {
                 m.role == "user"
@@ -2084,7 +2313,9 @@ mod tests {
         let mut svc = services(transport, persistence.clone(), events.clone());
         svc.steer = Arc::new(ScriptedSteer::default());
 
-        run_agent_loop(inputs(), config(), svc).await.expect("loop runs");
+        run_agent_loop(inputs(), config(), svc)
+            .await
+            .expect("loop runs");
 
         assert!(!events
             .events()
@@ -2608,6 +2839,7 @@ mod tests {
         ) = identity();
         let desktop = RunConfig {
             finalization: FinalizationPolicy::ReleaseWithWarning,
+            turn_capability: TurnCapability::Implement,
             gate_benchmark: false,
             progress_window: 8,
             recovery_limit: 3,
@@ -2630,6 +2862,7 @@ mod tests {
         };
         let sidecar = RunConfig {
             finalization: FinalizationPolicy::Benchmark,
+            turn_capability: TurnCapability::Implement,
             gate_benchmark: true,
             progress_window: 4,
             recovery_limit: 1,

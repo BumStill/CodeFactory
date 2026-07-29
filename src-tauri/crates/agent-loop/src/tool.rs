@@ -16,6 +16,13 @@ use crate::types::{ToolCall, ToolDefinition};
 use codefactory_agent_core::ToolKind;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExecutionStatus {
+    Done,
+    Blocked,
+    Error,
+}
+
 /// Per-invocation context the loop hands to a backend. No `AppHandle`, no
 /// `SqlitePool` — those live inside the concrete backend, not on the wire
 /// between the loop and the trait.
@@ -40,6 +47,7 @@ pub struct ToolInvocationResult {
     /// Model-facing body + `ToolResult` event content.
     pub content: String,
     pub is_error: bool,
+    pub status: ToolExecutionStatus,
     /// The executed command string → `ToolOutcome.command`.
     pub command: String,
     /// The backend classifies: a shell command via `classify_command`, a named
@@ -138,6 +146,7 @@ mod tests {
             Ok(ToolInvocationResult {
                 content: format!("stub:{}", call.function.name),
                 is_error: false,
+                status: ToolExecutionStatus::Done,
                 command: call.function.name.clone(),
                 kind: ToolKind::ReadOnly,
                 return_code: Some(0),

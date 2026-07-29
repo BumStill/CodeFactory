@@ -9,12 +9,12 @@
 //! to these, so its call sites and the #135/#136 gate tests are unchanged and
 //! pin behaviour byte-for-byte.
 //!
-//! Mapping (desktop): Interactive/Execute → `ReleaseWithWarning`, recovery 3,
-//! `wall_budget_applies=false`; Autonomous →
-//! `BlockOnIncomplete`, recovery 1, wall budget on. The `Benchmark` arm serves
-//! the sidecar (4.8) and is never produced on the desktop path.
+//! Mapping (desktop): Interactive/Execute → `ReleaseWithWarning`, recovery 1,
+//! `wall_budget_applies=false`; Autonomous → `BlockOnIncomplete`, recovery 1,
+//! wall budget on. The `Benchmark` arm serves the sidecar (4.8) and is never
+//! produced on the desktop path.
 
-use crate::run::FinalizationPolicy;
+use crate::run::{FinalizationPolicy, TurnCapability};
 use crate::types::{StreamEvent, ToolDefinition};
 use codefactory_agent_core::{
     build_completion_recovery_prompt, classify_command,
@@ -53,19 +53,22 @@ pub fn record_completion_outcome(
         sequence: *sequence,
         started_at_ms: 0,
         finished_at_ms: 0,
-        return_code: result
-            .return_code
-            .or(Some(if result.is_error { 1 } else { 0 })),
+        return_code: result.return_code.or(Some(match result.status {
+            crate::tool::ToolExecutionStatus::Done => 0,
+            crate::tool::ToolExecutionStatus::Blocked | crate::tool::ToolExecutionStatus::Error => {
+                1
+            }
+        })),
         stdout: if result.stdout.is_empty() {
             result.content.clone()
         } else {
             result.stdout.clone()
         },
         stderr: result.stderr.clone(),
-        error: result
-            .error
-            .clone()
-            .or_else(|| result.is_error.then(|| result.content.clone())),
+        error: result.error.clone().or_else(|| {
+            (!matches!(result.status, crate::tool::ToolExecutionStatus::Done))
+                .then(|| result.content.clone())
+        }),
         semantic_failure: false,
     }
     .with_detected_semantic_failure();
@@ -309,10 +312,12 @@ pub fn completion_recovery_attempts_after_tool_batch(
     attempts
 }
 
-/// Whether the completion-ready coverage-audit nudge applies. Autonomous +
-/// Benchmark only (never the chat ReleaseWithWarning surface).
+/// Only unattended execution enters an automatic tools-disabled finalization
+/// round as soon as its evidence ledger is complete. Interactive/Execute may
+/// still have later planned mutations, so they finalize when the model
+/// actually attempts a tool-free answer.
 pub fn completion_ready_applies(policy: FinalizationPolicy) -> bool {
-    !matches!(policy, FinalizationPolicy::ReleaseWithWarning)
+    matches!(policy, FinalizationPolicy::BlockOnIncomplete)
 }
 
 pub fn openai_tool_controls(
@@ -375,15 +380,117 @@ pub fn completion_command_and_kind(
         .unwrap_or_else(|| tool_name.to_owned());
     let kind = if tool_name == "bash" {
         classify_command(&command, 300_000)
+    } else if tool_name == "browser_session" {
+        match args.get("action").and_then(serde_json::Value::as_str) {
+            Some("click" | "fill" | "press") => ToolKind::Mutation,
+            Some("open" | "snapshot" | "screenshot" | "close") => ToolKind::RuntimeProbe,
+            _ => ToolKind::Mutation,
+        }
     } else if tool_name.starts_with("write_")
         || tool_name.starts_with("edit_")
-        || matches!(tool_name, "write_file" | "edit_file" | "delegate_tasks")
+        || matches!(
+            tool_name,
+            "write_file"
+                | "edit_file"
+                | "delegate_tasks"
+                | "dispatch_parallel_tasks"
+                | "deliver_changes"
+                | "skill_create"
+                | "skill_update"
+                | "skill_delete"
+        )
     {
         ToolKind::Mutation
     } else {
         ToolKind::ReadOnly
     };
     (command, kind)
+}
+
+fn is_delivery_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        "git commit",
+        "git push",
+        "git tag",
+        "gh pr create",
+        "gh pr merge",
+        "gh workflow run",
+        "gh release create",
+        "glab mr create",
+        "glab mr merge",
+        "npm publish",
+        "pnpm publish",
+        "cargo publish",
+        "kubectl apply",
+        "helm upgrade",
+        "vercel --prod",
+        "netlify deploy",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn is_review_safe_named_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file"
+            | "glob"
+            | "grep"
+            | "kb_search"
+            | "kb_get_chunk"
+            | "read_pptx"
+            | "read_xlsx"
+            | "skill_list"
+            | "skill_search"
+            | "skill_fetch"
+            | "bash"
+            | "browser_session"
+    ) || [
+        "read_", "get_", "list_", "search_", "find_", "inspect_", "query_", "fetch_",
+    ]
+    .iter()
+    .any(|prefix| tool_name.starts_with(prefix))
+}
+
+pub fn tool_visible_for_capability(capability: TurnCapability, tool_name: &str) -> bool {
+    match capability {
+        TurnCapability::ReviewOnly => is_review_safe_named_tool(tool_name),
+        TurnCapability::Implement => tool_name != "deliver_changes",
+        TurnCapability::Deliver => true,
+    }
+}
+
+/// Structural intent gate, evaluated before the permission gateway.
+pub fn capability_denial(
+    capability: TurnCapability,
+    tool_name: &str,
+    command: &str,
+    kind: &ToolKind,
+) -> Option<String> {
+    match capability {
+        TurnCapability::ReviewOnly => {
+            let mutating = matches!(kind, ToolKind::Mutation | ToolKind::BackgroundServiceStart);
+            if mutating || !is_review_safe_named_tool(tool_name) {
+                Some(format!(
+                    "本回合是只读审视，已阻止 `{tool_name}`；需要修改时请由用户明确要求实施。"
+                ))
+            } else {
+                None
+            }
+        }
+        TurnCapability::Implement => {
+            if tool_name == "deliver_changes" || is_delivery_command(command) {
+                Some(
+                    "本回合只授权本地实施，已阻止提交、推送、PR、合并或发布；需要交付时请由用户明确要求。"
+                        .into(),
+                )
+            } else {
+                None
+            }
+        }
+        TurnCapability::Deliver => None,
+    }
 }
 
 /// A completion-policy denial, kept STRUCTURED so each surface can word it its
@@ -447,6 +554,57 @@ mod tests {
         // The reason switches once a mutation has been seen.
         let d = inspection_budget_denial(true, true, &ToolKind::ReadOnly).unwrap();
         assert!(d.reason.contains("post-change inspection is exhausted"));
+    }
+
+    #[test]
+    fn turn_capability_is_a_hard_gate_before_permission() {
+        assert!(capability_denial(
+            TurnCapability::ReviewOnly,
+            "edit_file",
+            "edit_file",
+            &ToolKind::Mutation,
+        )
+        .is_some());
+        assert!(capability_denial(
+            TurnCapability::ReviewOnly,
+            "bash",
+            "git status --short",
+            &ToolKind::ReadOnly,
+        )
+        .is_none());
+        assert!(capability_denial(
+            TurnCapability::Implement,
+            "deliver_changes",
+            "deliver_changes",
+            &ToolKind::Mutation,
+        )
+        .is_some());
+        assert!(capability_denial(
+            TurnCapability::Implement,
+            "bash",
+            "git push origin feat/x",
+            &ToolKind::Mutation,
+        )
+        .is_some());
+        assert!(capability_denial(
+            TurnCapability::Deliver,
+            "deliver_changes",
+            "deliver_changes",
+            &ToolKind::Mutation,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn delivery_and_parallel_tools_are_never_classified_as_read_only() {
+        for name in [
+            "deliver_changes",
+            "delegate_tasks",
+            "dispatch_parallel_tasks",
+        ] {
+            let (_, kind) = completion_command_and_kind(name, &serde_json::json!({}));
+            assert_eq!(kind, ToolKind::Mutation, "{name}");
+        }
     }
 
     #[test]
@@ -615,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_nudge_skips_the_release_with_warning_surface() {
+    fn ready_nudge_is_reserved_for_unattended_execution() {
         assert!(!completion_ready_applies(
             FinalizationPolicy::ReleaseWithWarning
         ));

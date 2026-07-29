@@ -19,7 +19,7 @@ use crate::agent::verification::{self, VerificationResult};
 use crate::commands::evidence;
 use crate::errors::AppError;
 use crate::storage::tasks::{
-    self, classify_task_failure, TaskConnectorContext, TaskFailureAttribution, TaskRun,
+    self, classify_task_failure, TaskAttempt, TaskConnectorContext, TaskFailureAttribution, TaskRun,
 };
 use crate::util::no_window::NoWindow;
 use crate::AppState;
@@ -95,6 +95,8 @@ pub struct TaskRunView {
     pub task: TaskRun,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_attribution: Option<TaskFailureAttribution>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<TaskAttempt>,
 }
 
 impl From<TaskRun> for TaskRunView {
@@ -103,6 +105,7 @@ impl From<TaskRun> for TaskRunView {
         Self {
             task,
             failure_attribution,
+            attempts: Vec::new(),
         }
     }
 }
@@ -195,7 +198,13 @@ pub async fn list_tasks(
 ) -> Result<Vec<TaskRunView>, AppError> {
     let pool = state.db.read().await;
     let rows = tasks::list_session_tasks(&pool, &session_id).await?;
-    Ok(rows.into_iter().map(TaskRunView::from).collect())
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut view = TaskRunView::from(row);
+        view.attempts = tasks::list_task_attempts(&pool, &view.task.id).await?;
+        views.push(view);
+    }
+    Ok(views)
 }
 
 /// Returns the dependency edges for a task (real DB ids of tasks it depends on).

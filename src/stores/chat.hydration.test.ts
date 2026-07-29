@@ -2,7 +2,11 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { Message, TurnPlanSnapshot } from "../lib/tauri";
+import type {
+  Message,
+  TurnActivitySnapshot,
+  TurnPlanSnapshot,
+} from "../lib/tauri";
 import { dbMessagesToUI } from "./chat";
 
 describe("persisted chat hydration", () => {
@@ -471,6 +475,49 @@ describe("persisted chat hydration", () => {
     ]);
     expect(hydrated[2].turnToolCallCount).toBe(1);
     expect(hydrated[2].durationMs).toBe(3);
+  });
+
+  it("restores persisted activity onto the owning turn", () => {
+    const rows: Message[] = [
+      {
+        id: "root-turn",
+        session_id: "session-1",
+        role: "user",
+        content: "修复并验证",
+        created_at: 1,
+      },
+      {
+        id: "assistant",
+        session_id: "session-1",
+        role: "assistant",
+        content: "当前被外部条件阻断。",
+        created_at: 2,
+      },
+    ];
+    const states: TurnActivitySnapshot[] = [
+      {
+        root_turn_id: "root-turn",
+        revision: 7,
+        phase: "finalizing",
+        status: "blocked",
+        recent_activity_kind: "blocked",
+        recent_activity_label: "任务已在明确边界停止",
+        waiting_reason: null,
+        updated_at: 3,
+        terminal_reason: "tool_blocked",
+      },
+    ];
+
+    const hydrated = dbMessagesToUI(rows, [], states);
+
+    expect(hydrated[1].turnActivity).toEqual(
+      expect.objectContaining({
+        rootTurnId: "root-turn",
+        revision: 7,
+        status: "blocked",
+        terminalReason: "tool_blocked",
+      }),
+    );
   });
 
 });

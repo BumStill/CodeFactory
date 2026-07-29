@@ -234,6 +234,17 @@ pub enum StreamEvent {
         change_reason: Option<String>,
         created_at: i64,
     },
+    TurnActivityUpdated {
+        root_turn_id: String,
+        revision: i64,
+        phase: String,
+        status: String,
+        recent_activity_kind: String,
+        recent_activity_label: String,
+        waiting_reason: Option<String>,
+        updated_at: i64,
+        terminal_reason: Option<String>,
+    },
     ToolCallStart {
         id: String,
         name: String,

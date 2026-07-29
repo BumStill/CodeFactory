@@ -99,6 +99,13 @@ pub struct DeliveryOutcome {
     /// Terminal state: "delivered" (reached ceiling), "blocked" (a step
     /// couldn't proceed — never a loop), or "noop" (nothing to deliver).
     pub final_state: String,
+    /// Structured truth fields used by persistence/UI; never inferred from the
+    /// localized report body.
+    pub stage: String,
+    pub code: String,
+    pub recoverable: bool,
+    pub next_action: Option<String>,
+    pub reached_state: String,
     /// Human summary the agent echoes to the user.
     pub summary: String,
 }
@@ -106,11 +113,36 @@ pub struct DeliveryOutcome {
 impl DeliveryOutcome {
     fn blocked_at(mut self, step: StepResult) -> Self {
         let msg = step.detail.clone();
+        self.stage = step.step.clone();
+        self.code = format!("delivery_{}_blocked", step.step);
+        self.recoverable = true;
+        self.next_action = Some(msg.clone());
+        self.reached_state = reached_state_from_steps(&self.steps);
         self.steps.push(step);
         self.final_state = "blocked".into();
         self.summary = msg;
         self
     }
+}
+
+fn reached_state_from_steps(steps: &[StepResult]) -> String {
+    steps
+        .iter()
+        .rev()
+        .find(|step| step.status == "ok")
+        .map(|step| match step.step.as_str() {
+            "commit" => "committed",
+            "push" => "pushed",
+            "pr" => "pr_open",
+            "ci" => "ci_green",
+            "merge" => "merged",
+            "release" => "release_triggered",
+            "deploy" => "deployment_succeeded",
+            "live" => "live_verified",
+            _ => "local",
+        })
+        .unwrap_or("local")
+        .to_string()
 }
 
 /// Options for a single delivery call (from the agent tool). All optional so
@@ -142,6 +174,15 @@ pub enum ObservationStatus {
     Failure(String),
     Pending(String),
     Unsupported(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeliveryCapabilities {
+    pub review: bool,
+    pub ci: bool,
+    pub merge: bool,
+    pub release: bool,
+    pub live: bool,
 }
 
 fn parse_observation_status(status: &str, detail: Option<String>) -> ObservationStatus {
@@ -256,6 +297,8 @@ pub fn load_delivery_config(root: &Path) -> Result<Option<RepositoryDeliveryConf
 /// native async-fn-in-trait with generic (static) dispatch — no `async_trait`
 /// dependency, no dynamic dispatch.
 pub trait DeliveryRemote {
+    fn capabilities(&self) -> DeliveryCapabilities;
+
     /// Return the existing open PR for `head`, or open a new one. Idempotent:
     /// callers rely on this never double-opening.
     fn open_or_get_pr(
@@ -477,6 +520,52 @@ fn generate_commit_message(root: &Path, branch: &str, title: Option<&str>) -> St
     format!("{subject}\n\nDelivered by CodeFactory ({count} file(s) changed).")
 }
 
+fn delivery_preflight<R: DeliveryRemote>(
+    repo: &RepoContext,
+    ceiling: DeliveryCeiling,
+    remote: Option<&R>,
+) -> Result<(), StepResult> {
+    let Some(remote) = remote else {
+        return Err(StepResult::blocked(
+            "preflight",
+            no_remote_channel_message(repo.remote_url.as_deref()),
+        ));
+    };
+    let capabilities = remote.capabilities();
+    let config = load_delivery_config(&repo.root)
+        .map_err(|error| StepResult::blocked("preflight", error))?;
+    let has_repository_live = config
+        .as_ref()
+        .and_then(|item| item.live.as_ref())
+        .is_some();
+    let missing = if ceiling.rank() >= DeliveryCeiling::PrOnly.rank() && !capabilities.review {
+        Some("review adapter")
+    } else if ceiling.rank() >= DeliveryCeiling::ThroughCiGreen.rank() && !capabilities.ci {
+        Some("CI observer")
+    } else if ceiling.rank() >= DeliveryCeiling::ThroughMerge.rank() && !capabilities.merge {
+        Some("merge adapter")
+    } else if ceiling.rank() >= DeliveryCeiling::ThroughRelease.rank() && !capabilities.release {
+        Some("release adapter")
+    } else if ceiling.rank() >= DeliveryCeiling::ThroughRelease.rank()
+        && !capabilities.live
+        && !has_repository_live
+    {
+        Some("live verifier")
+    } else {
+        None
+    };
+    match missing {
+        Some(capability) => Err(StepResult::blocked(
+            "preflight",
+            format!(
+                "交付预检未通过:目标 {} 缺少 {capability}；尚未执行 stage、commit 或 push。",
+                ceiling_label(ceiling)
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 // ── The state machine ───────────────────────────────────────────────────────
 
 /// Run delivery up to the effective ceiling. `remote` is `None` when no git
@@ -502,6 +591,11 @@ pub async fn deliver<R: DeliveryRemote>(
         pr_url: None,
         pr_number: None,
         final_state: "delivered".into(),
+        stage: "preflight".into(),
+        code: "delivery_ready".into(),
+        recoverable: false,
+        next_action: None,
+        reached_state: "local".into(),
         summary: String::new(),
     };
 
@@ -529,6 +623,17 @@ pub async fn deliver<R: DeliveryRemote>(
             ),
         ));
     }
+
+    if let Err(blocker) = delivery_preflight(&repo, ceiling, remote) {
+        return outcome.blocked_at(blocker);
+    }
+    outcome.steps.push(StepResult::ok(
+        "preflight",
+        format!(
+            "目标 {} 的 provider/auth/review 链已就绪",
+            ceiling_label(ceiling)
+        ),
+    ));
 
     // ── Commit (noise-safe) ─────────────────────────────────────────────────
     let staged = match stage_scoped(&repo.root, &opts.extra_excludes) {
@@ -801,14 +906,14 @@ async fn wait_for_http_live(live: &LiveHttpAssertion, sha: &str) -> Result<(), S
 /// path AND the model-behavior contract: surface it to the user and wait —
 /// retrying deliver_changes cannot succeed until a token exists. (The app's
 /// only historical deliver_changes call died exactly here.)
-pub const NO_TOKEN_PR_MESSAGE: &str = "已提交并推送,但没有可用的 GitHub 通道,无法开 PR。\
+pub const NO_TOKEN_PR_MESSAGE: &str = "交付预检未通过：没有可用的 GitHub 通道，无法开 PR，尚未提交或推送。\
 两条路任选其一(推荐前者):1) 在终端执行 `gh auth login` 登录 GitHub CLI——登录一次,\
 交付链即刻可用,无需在应用里配任何令牌;2) 在设置→远程仓库为该仓库配置访问令牌。\
 把这两条路原样告诉用户;在用户完成其一之前,不要再调用 deliver_changes 重试。";
 
 fn no_remote_channel_message(origin_url: Option<&str>) -> String {
     let Some(origin) = origin_url else {
-        return "已提交并推送,但仓库没有可识别的 review provider。请配置实际 Git remote 和 delivery_provider hook/plugin；在 provider 配好前不要重试 deliver_changes。".into();
+        return "交付预检未通过：仓库没有可识别的 review provider，尚未提交或推送。请配置实际 Git remote 和 delivery_provider hook/plugin；在 provider 配好前不要重试 deliver_changes。".into();
     };
     let family = classify_forge(origin);
     match family {
@@ -818,18 +923,18 @@ fn no_remote_channel_message(origin_url: Option<&str>) -> String {
                 NO_TOKEN_PR_MESSAGE.to_string()
             } else {
                 format!(
-                    "已提交并推送,但 GitHub Enterprise 主机 {host} 没有可用的 PR 通道。请先运行 `gh auth login --hostname {host}`，或为该主机配置 GitHub remote token / delivery_provider hook；在通道配置完成前不要重试 deliver_changes。"
+                    "交付预检未通过：GitHub Enterprise 主机 {host} 没有可用的 PR 通道，尚未提交或推送。请先运行 `gh auth login --hostname {host}`，或为该主机配置 GitHub remote token / delivery_provider hook；在通道配置完成前不要重试 deliver_changes。"
                 )
             }
         }
         ForgeFamily::Gitlab => {
             let project = parse_gitlab_project_path(origin).unwrap_or_else(|| "unknown".into());
             format!(
-                "已提交并推送,但 GitLab 项目 {project} 没有可用的 merge request 通道。请在 设置→远程仓库 配置该 GitLab/企业 GitLab 的 token,或启用仓库 delivery_provider hook/plugin；不要把这当成缺 GitHub 通道。"
+                "交付预检未通过：GitLab 项目 {project} 没有可用的 merge request 通道，尚未提交或推送。请在 设置→远程仓库 配置该 GitLab/企业 GitLab 的 token,或启用仓库 delivery_provider hook/plugin；不要把这当成缺 GitHub 通道。"
             )
         }
         other => format!(
-            "已提交并推送,但 {} remote ({}) 没有内置 review adapter。请配置仓库 delivery_provider hook/plugin 来实现 PR/MR/Change、CI、合并和发布；不要用 GitHub CLI 登录作为通用修复。",
+            "交付预检未通过：{} remote ({}) 没有内置 review adapter，尚未提交或推送。请配置仓库 delivery_provider hook/plugin 来实现 PR/MR/Change、CI、合并和发布；不要用 GitHub CLI 登录作为通用修复。",
             other.label(),
             remote_host(origin).unwrap_or_else(|| "unknown-host".into())
         ),
@@ -959,6 +1064,9 @@ fn block_unverified_release(
 }
 
 fn finish(mut outcome: DeliveryOutcome, branch: &str, ceiling: DeliveryCeiling) -> DeliveryOutcome {
+    outcome.stage = "complete".into();
+    outcome.code = "delivery_ceiling_reached".into();
+    outcome.reached_state = reached_state_from_steps(&outcome.steps);
     let done: Vec<&str> = outcome
         .steps
         .iter()
@@ -1185,6 +1293,16 @@ impl HookRemote {
 }
 
 impl DeliveryRemote for HookRemote {
+    fn capabilities(&self) -> DeliveryCapabilities {
+        DeliveryCapabilities {
+            review: true,
+            ci: true,
+            merge: true,
+            release: true,
+            live: true,
+        }
+    }
+
     async fn open_or_get_pr(
         &self,
         title: &str,
@@ -1353,14 +1471,30 @@ fn gh_hosts_file_indicates_authenticated_for_host(hostname: &str) -> bool {
     };
     let header = format!("{}:", hostname.trim().to_ascii_lowercase());
     let mut in_host_block = false;
+    let mut has_user = false;
+    let mut has_token = false;
     for line in content.lines() {
         let t = line.trim();
         if t.to_ascii_lowercase() == header {
             in_host_block = true;
+            has_user = false;
+            has_token = false;
             continue;
         }
         if in_host_block {
             if t.starts_with("user:") && t.strip_prefix("user:").unwrap_or("").trim().len() > 0 {
+                has_user = true;
+            }
+            if t.starts_with("oauth_token:")
+                && !t
+                    .strip_prefix("oauth_token:")
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+            {
+                has_token = true;
+            }
+            if has_user && has_token {
                 return true;
             }
             // Any non-indented top-level key ends the selected host block.
@@ -1449,6 +1583,16 @@ impl GhCliRemote {
 }
 
 impl DeliveryRemote for GhCliRemote {
+    fn capabilities(&self) -> DeliveryCapabilities {
+        DeliveryCapabilities {
+            review: true,
+            ci: true,
+            merge: true,
+            release: true,
+            live: false,
+        }
+    }
+
     async fn open_or_get_pr(
         &self,
         title: &str,
@@ -1546,6 +1690,15 @@ pub enum EitherRemote {
 }
 
 impl DeliveryRemote for EitherRemote {
+    fn capabilities(&self) -> DeliveryCapabilities {
+        match self {
+            EitherRemote::Hook(r) => r.capabilities(),
+            EitherRemote::Gh(r) => r.capabilities(),
+            EitherRemote::Github(r) => r.capabilities(),
+            EitherRemote::Gitlab(r) => r.capabilities(),
+        }
+    }
+
     async fn open_or_get_pr(
         &self,
         title: &str,
@@ -1610,7 +1763,8 @@ impl DeliveryRemote for EitherRemote {
 
 fn hook_remote_for(cwd: &Path, settings: &crate::config::settings::Settings) -> Option<HookRemote> {
     let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
-    let origin = git(Path::new(&root), &["remote", "get-url", "origin"]).ok()?;
+    let remote = default_remote(Path::new(&root));
+    let origin = git(Path::new(&root), &["remote", "get-url", &remote]).ok()?;
     let hook = delivery_provider_hooks_for(settings, &origin)
         .into_iter()
         .next()?;
@@ -1637,22 +1791,19 @@ pub fn resolve_delivery_remote(
     if let Some(hook) = hook_remote_for(cwd, settings) {
         return Some(EitherRemote::Hook(hook));
     }
-    let gitlab = gitlab_remote_for(cwd, settings);
-    let github = github_remote_for(cwd, settings);
-    let gh_ok = github.is_some()
-        && selected_remote_url(cwd)
-            .and_then(|origin| remote_host(&origin))
-            .map(|host| gh_cli_available_for_host(&host))
-            .unwrap_or_else(|| gh_cli_available());
-    match resolve_remote_kind(gh_ok, github.is_some() || gitlab.is_some()) {
-        Some(RemoteKind::GhCli) => gh_remote_for(cwd)
-            .map(EitherRemote::Gh)
-            .or(github.map(EitherRemote::Github))
-            .or(gitlab.map(EitherRemote::Gitlab)),
-        Some(RemoteKind::RestToken) => github
-            .map(EitherRemote::Github)
-            .or(gitlab.map(EitherRemote::Gitlab)),
-        None => None,
+    let selected = selected_remote_url(cwd)?;
+    match classify_forge(&selected) {
+        ForgeFamily::Github => {
+            let host = remote_host(&selected).unwrap_or_else(|| "github.com".into());
+            if gh_cli_available_for_host(&host) {
+                if let Some(remote) = gh_remote_for(cwd) {
+                    return Some(EitherRemote::Gh(remote));
+                }
+            }
+            github_remote_for(cwd, settings).map(EitherRemote::Github)
+        }
+        ForgeFamily::Gitlab => gitlab_remote_for(cwd, settings).map(EitherRemote::Gitlab),
+        _ => None,
     }
 }
 
@@ -1928,6 +2079,16 @@ pub fn gitlab_remote_for(
 }
 
 impl DeliveryRemote for GitlabRemote {
+    fn capabilities(&self) -> DeliveryCapabilities {
+        DeliveryCapabilities {
+            review: true,
+            ci: false,
+            merge: true,
+            release: false,
+            live: false,
+        }
+    }
+
     async fn open_or_get_pr(
         &self,
         title: &str,
@@ -1968,6 +2129,16 @@ impl DeliveryRemote for GitlabRemote {
 }
 
 impl DeliveryRemote for GithubRemote {
+    fn capabilities(&self) -> DeliveryCapabilities {
+        DeliveryCapabilities {
+            review: true,
+            ci: true,
+            merge: true,
+            release: true,
+            live: false,
+        }
+    }
+
     async fn open_or_get_pr(
         &self,
         title: &str,
@@ -2263,6 +2434,11 @@ mod tests {
             pr_url: Some("https://github.com/x/y/pull/1".into()),
             pr_number: Some(1),
             final_state: "delivered".into(),
+            stage: "complete".into(),
+            code: "delivery_ceiling_reached".into(),
+            recoverable: false,
+            next_action: None,
+            reached_state: "pr_open".into(),
             summary: String::new(),
         };
         let done = finish(outcome.clone(), "b", DeliveryCeiling::PrOnly);
@@ -2463,6 +2639,11 @@ mod tests {
             pr_url: Some("https://example.test/pr/1".into()),
             pr_number: Some(1),
             final_state: "delivered".into(),
+            stage: "release".into(),
+            code: "release_triggered".into(),
+            recoverable: false,
+            next_action: None,
+            reached_state: "release_triggered".into(),
             summary: String::new(),
         };
         outcome = block_unverified_release(outcome, "未配置 live verifier");
@@ -2789,6 +2970,16 @@ else:
         merge_ok: bool,
     }
     impl DeliveryRemote for StubRemote {
+        fn capabilities(&self) -> DeliveryCapabilities {
+            DeliveryCapabilities {
+                review: true,
+                ci: true,
+                merge: true,
+                release: true,
+                live: true,
+            }
+        }
+
         async fn open_or_get_pr(
             &self,
             _t: &str,
@@ -2872,6 +3063,72 @@ else:
     }
 
     #[tokio::test]
+    async fn missing_review_provider_blocks_before_commit_or_push() {
+        let root = feature_branch_repo("preflight-no-provider");
+        let before_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let before_status = git(
+            &root,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )
+        .unwrap();
+        let before_upstream = git(
+            &root,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+        )
+        .ok();
+
+        let out = deliver::<StubRemote>(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            1,
+            &DeliverOpts::default(),
+            None,
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "blocked");
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before_head);
+        assert_eq!(
+            git(
+                &root,
+                &["status", "--porcelain=v1", "--untracked-files=all"],
+            )
+            .unwrap(),
+            before_status,
+            "preflight blocker must not stage or commit the worktree"
+        );
+        assert_eq!(
+            git(
+                &root,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}"
+                ],
+            )
+            .ok(),
+            before_upstream,
+            "preflight blocker must not push or create upstream state"
+        );
+        assert!(
+            out.steps
+                .iter()
+                .all(|step| !matches!(step.step.as_str(), "commit" | "push")),
+            "{:?}",
+            out.steps
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
     async fn through_merge_stops_when_ci_fails() {
         let root = feature_branch_repo("cifail");
         let remote = StubRemote {
@@ -2928,7 +3185,7 @@ else:
     }
 
     #[tokio::test]
-    async fn no_remote_configured_blocks_at_pr_after_local_push() {
+    async fn no_remote_configured_blocks_in_preflight_before_local_mutation() {
         let root = feature_branch_repo("noremote");
         let out = deliver(
             &root,
@@ -2941,19 +3198,23 @@ else:
         )
         .await;
         assert_eq!(out.final_state, "blocked");
-        // Local steps still succeeded; only the PR step is blocked.
+        // Provider/auth are checked before staging, committing, or pushing.
         assert!(out
             .steps
             .iter()
-            .any(|s| s.step == "commit" && s.status == "ok"));
-        assert!(out
+            .any(|s| s.step == "preflight" && s.status == "blocked"));
+        assert!(!out
             .steps
             .iter()
-            .any(|s| s.step == "push" && s.status == "ok"));
-        assert!(out
+            .any(|s| s.step == "commit" || s.step == "push" || s.step == "pr"));
+        assert!(!git(&root, &["status", "--porcelain"])
+            .expect("status")
+            .trim()
+            .is_empty());
+        assert!(!out
             .steps
             .iter()
-            .any(|s| s.step == "pr" && s.status == "blocked"));
+            .any(|s| s.status == "ok" && s.step != "repo"));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 

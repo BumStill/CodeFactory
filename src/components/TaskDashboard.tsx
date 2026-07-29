@@ -376,6 +376,33 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
               <code className="text-gray-500 truncate">{task.sub_session_id}</code>
             </div>
           )}
+          {task.attempts && task.attempts.length > 0 && (
+            <div>
+              <span className="text-gray-600">尝试记录：</span>
+              <div className="mt-1 space-y-1">
+                {task.attempts.map((attempt) => (
+                  <div
+                    key={attempt.id}
+                    className="rounded bg-surface-2 px-2 py-1 text-[10px] text-gray-400"
+                  >
+                    <span>第 {attempt.attempt_index} 次</span>
+                    <span className="mx-1 text-gray-700">·</span>
+                    <span>{attempt.status}</span>
+                    {attempt.failure_code && (
+                      <span className="ml-1 text-amber-500">
+                        {attempt.failure_code}
+                      </span>
+                    )}
+                    {attempt.sub_session_id && (
+                      <code className="ml-2 text-gray-600">
+                        {attempt.sub_session_id.slice(0, 8)}
+                      </code>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           {task.error && (
             <div className="text-red-400">
               <span className="text-gray-600">错误：</span>

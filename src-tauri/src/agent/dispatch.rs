@@ -27,7 +27,13 @@
 //! boundaries in Chinese); English cues are matched as whole tokens so
 //! "go" doesn't fire on "google" and "approve" doesn't fire on "disapprove".
 
-use super::AgentMode;
+use super::{AgentMode, TurnCapability};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatContract {
+    pub mode: AgentMode,
+    pub capability: TurnCapability,
+}
 
 /// Negation cues — substring-matched (CJK). If any appears we refuse to read
 /// the message as approval. A false negative just makes the agent ask (safe);
@@ -186,6 +192,28 @@ const DIRECT_EXEC_EN_WORDS: &[&str] = &[
     "update",
 ];
 
+const DELIVERY_CJK: &[&str] = &[
+    "提交代码",
+    "提交 pr",
+    "开 pr",
+    "创建 pr",
+    "合并 pr",
+    "合并并发布",
+    "发布上线",
+    "上线",
+    "发布",
+    "推送",
+    "交付",
+];
+const DELIVERY_EN_WORDS: &[&str] = &["ship", "release", "publish", "deploy", "push", "merge"];
+const DELIVERY_EN_PHRASES: &[&str] = &[
+    "open a pr",
+    "create a pr",
+    "create pr",
+    "merge the pr",
+    "pull request",
+];
+
 /// Tokenize on non-alphanumeric boundaries for whole-word English matching.
 /// CJK runs survive as multi-char tokens but we match those by substring, so
 /// the tokenization only matters for the ASCII cues.
@@ -279,7 +307,57 @@ fn is_direct_execution_request(user_msg: &str) -> bool {
         return false;
     }
     DIRECT_EXEC_CJK.iter().any(|cue| m.contains(cue))
-        || toks.iter().any(|token| DIRECT_EXEC_EN_WORDS.contains(token))
+        || toks
+            .iter()
+            .any(|token| DIRECT_EXEC_EN_WORDS.contains(token))
+}
+
+fn is_delivery_request(user_msg: &str) -> bool {
+    let m = user_msg.trim().to_lowercase();
+    if m.is_empty() || is_explicit_planning_request(&m) {
+        return false;
+    }
+    let toks = tokens(&m);
+    DELIVERY_CJK.iter().any(|cue| m.contains(cue))
+        || DELIVERY_EN_PHRASES.iter().any(|cue| m.contains(cue))
+        || toks.iter().any(|token| DELIVERY_EN_WORDS.contains(token))
+}
+
+pub fn decide_chat_contract(prev_assistant: Option<&str>, user_msg: &str) -> ChatContract {
+    if is_explicit_planning_request(user_msg) {
+        return ChatContract {
+            mode: AgentMode::Interactive,
+            capability: TurnCapability::ReviewOnly,
+        };
+    }
+    if is_delivery_request(user_msg) {
+        return ChatContract {
+            mode: AgentMode::Execute,
+            capability: TurnCapability::Deliver,
+        };
+    }
+    if is_direct_execution_request(user_msg) {
+        return ChatContract {
+            mode: AgentMode::Execute,
+            capability: TurnCapability::Implement,
+        };
+    }
+    let approval = is_strong_approval(user_msg)
+        || prev_assistant.is_some_and(|p| is_pending_proposal(p) && is_approval(user_msg));
+    if approval {
+        return ChatContract {
+            mode: AgentMode::Execute,
+            capability: if prev_assistant.is_some_and(is_delivery_request) {
+                TurnCapability::Deliver
+            } else {
+                TurnCapability::Implement
+            },
+        };
+    }
+    ChatContract {
+        mode: AgentMode::Interactive,
+        capability: TurnCapability::ReviewOnly,
+    }
 }
 
 /// The framework's per-turn contract decision for a chat message.
@@ -287,23 +365,7 @@ fn is_direct_execution_request(user_msg: &str) -> bool {
 /// `prev_assistant` is the most recent assistant message already in history
 /// (None on the first turn). `user_msg` is the message being sent now.
 pub fn decide_chat_mode(prev_assistant: Option<&str>, user_msg: &str) -> AgentMode {
-    // Intent-first: if the user directly asks us to fix/implement/ship/change,
-    // act now. A plan is only the right response when the user explicitly asks
-    // for planning/analysis or the request is genuinely not executable yet.
-    if is_direct_execution_request(user_msg) {
-        return AgentMode::Execute;
-    }
-    // A clear, imperative go-ahead executes even if our previous turn didn't end
-    // with a question — models don't reliably emit "Ready to proceed?", so we
-    // don't make the contract hinge on it. Permission policy is evaluated
-    // later and never changes this semantic mode.
-    if is_strong_approval(user_msg) {
-        return AgentMode::Execute;
-    }
-    match prev_assistant {
-        Some(p) if is_pending_proposal(p) && is_approval(user_msg) => AgentMode::Execute,
-        _ => AgentMode::Interactive,
-    }
+    decide_chat_contract(prev_assistant, user_msg).mode
 }
 
 #[cfg(test)]
@@ -451,6 +513,38 @@ mod tests {
                 "{instruction:?} explicitly asks for planning/analysis instead of execution"
             );
         }
+    }
+
+    #[test]
+    fn turn_capability_separates_review_implementation_and_delivery() {
+        assert_eq!(
+            decide_chat_contract(None, "先系统分析，不要修改代码").capability,
+            TurnCapability::ReviewOnly
+        );
+        assert_eq!(
+            decide_chat_contract(None, "修复这个重复验证问题").capability,
+            TurnCapability::Implement
+        );
+        assert_eq!(
+            decide_chat_contract(None, "修复完成后提交 PR、合并并发布上线").capability,
+            TurnCapability::Deliver
+        );
+    }
+
+    #[test]
+    fn short_approval_inherits_delivery_only_from_the_approved_proposal() {
+        assert_eq!(
+            decide_chat_contract(Some("我会修复、开 PR 并发布。可以开始吗？"), "做吧").capability,
+            TurnCapability::Deliver
+        );
+        assert_eq!(
+            decide_chat_contract(Some("我会在本地修复并验证。可以开始吗？"), "做吧").capability,
+            TurnCapability::Implement
+        );
+        assert_eq!(
+            decide_chat_contract(Some("这是只读审视方案。"), "好的").capability,
+            TurnCapability::ReviewOnly
+        );
     }
 
     #[test]

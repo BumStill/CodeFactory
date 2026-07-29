@@ -340,9 +340,9 @@ pub async fn send_message(
     // Persist user message unless draft materialization already wrote it in
     // the same transaction as the session row. The count still determines
     // first-turn title behavior for legacy create-then-send callers.
-    let is_first_message = {
+    let (is_first_message, root_turn_id) = {
         let pool = state.db.read().await;
-        if !user_message_persisted.unwrap_or(false) {
+        let inserted_id = if !user_message_persisted.unwrap_or(false) {
             let msg_id = Uuid::new_v4().to_string();
             let now = Utc::now().timestamp_millis();
             sqlx::query(
@@ -355,14 +355,84 @@ pub async fn send_message(
             .bind(now)
             .execute(&*pool)
             .await?;
-        }
+            Some(msg_id)
+        } else {
+            None
+        };
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages WHERE session_id = ?")
             .bind(&session_id)
             .fetch_one(&*pool)
             .await?;
-        count.0 == 1
+        let root_turn_id = match inserted_id {
+            Some(id) => id,
+            None => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM messages
+                 WHERE session_id=? AND role='user' AND completion_state IS NULL
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                )
+                .bind(&session_id)
+                .fetch_one(&*pool)
+                .await?
+            }
+        };
+        (count.0 == 1, root_turn_id)
     };
+
+    {
+        let pool = state.db.read().await;
+        let now = Utc::now().timestamp_millis();
+        let ordinal: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM chat_task_segments WHERE session_id=?",
+        )
+        .bind(&session_id)
+        .fetch_one(&*pool)
+        .await?;
+        let segment_id = Uuid::new_v4().to_string();
+        let title: String = content.chars().take(60).collect();
+        sqlx::query(
+            "INSERT OR IGNORE INTO chat_task_segments
+             (id, session_id, ordinal, title, status, goal_root_turn_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+        )
+        .bind(&segment_id)
+        .bind(&session_id)
+        .bind(ordinal)
+        .bind(if title.trim().is_empty() {
+            "新任务"
+        } else {
+            &title
+        })
+        .bind(&root_turn_id)
+        .bind(now)
+        .bind(now)
+        .execute(&*pool)
+        .await?;
+        let segment_id: String = sqlx::query_scalar(
+            "SELECT id FROM chat_task_segments WHERE session_id=? AND goal_root_turn_id=?",
+        )
+        .bind(&session_id)
+        .bind(&root_turn_id)
+        .fetch_one(&*pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, task_segment_id, revision, phase, status,
+              started_at, updated_at, recent_activity_kind, recent_activity_label)
+             VALUES (?, ?, ?, 1, 'planning', 'active', ?, ?, 'turn_started', '正在理解任务')
+             ON CONFLICT(root_turn_id) DO UPDATE SET
+               revision=chat_turn_state.revision+1, phase='planning', status='active',
+               updated_at=excluded.updated_at, completed_at=NULL, terminal_reason=NULL",
+        )
+        .bind(&root_turn_id)
+        .bind(&session_id)
+        .bind(&segment_id)
+        .bind(now)
+        .bind(now)
+        .execute(&*pool)
+        .await?;
+    }
 
     // Fetch session for cwd + model
     let session = {
@@ -534,12 +604,18 @@ pub async fn send_message(
     // Full access is a permission policy only. It may reduce approval prompts
     // after a tool is selected, but it must never turn a diagnostic question
     // into an execute-contract turn.
+    let contract = crate::agent::decide_chat_contract(prev_assistant.as_deref(), &content);
     let mode = select_chat_mode(
         settings.permissions.full_access,
         prev_assistant.as_deref(),
         &content,
     );
-    tracing::info!("send_message: dispatch mode = {:?}", mode);
+    debug_assert_eq!(mode, contract.mode);
+    tracing::info!(
+        "send_message: dispatch mode = {:?}, capability = {:?}",
+        contract.mode,
+        contract.capability
+    );
 
     let db = state.db.read().await.clone();
     let settings_state = state.settings.clone();
@@ -551,6 +627,7 @@ pub async fn send_message(
     let app_clone = app.clone();
     let event_name = format!("stream:{}", session_id);
     let session_id_clone = session_id.clone();
+    let root_turn_for_error = root_turn_id.clone();
     let chat_cancels = state.chat_cancels.clone();
     let tracked_cancel_flag = cancel_flag.clone();
     let interjections = state.interjections.clone();
@@ -573,8 +650,9 @@ pub async fn send_message(
                 pending_permissions,
                 mcp_manager,
                 None,
-                mode,
+                contract.mode,
             )
+            .with_turn_capability(contract.capability)
             .with_failover_plan(route_plan)
             .with_cancel(cancel_flag)
             .with_steer(interjections);
@@ -613,6 +691,22 @@ pub async fn send_message(
             {
                 tracing::warn!("failed to persist turn error: {persist_err}");
             }
+            let now = chrono::Utc::now().timestamp_millis();
+            if let Err(persist_err) = sqlx::query(
+                "UPDATE chat_turn_state SET revision=revision+1, phase='finalizing',
+                 status='interrupted', recent_activity_kind='error',
+                 recent_activity_label='执行意外中断', updated_at=?,
+                 completed_at=?, terminal_reason='turn_error'
+                 WHERE root_turn_id=?",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(&root_turn_for_error)
+            .execute(&db_for_error)
+            .await
+            {
+                tracing::warn!("failed to persist turn activity error: {persist_err}");
+            }
             {
                 let settings = settings_for_notify.read().await;
                 crate::notify::send(
@@ -649,9 +743,12 @@ pub async fn send_message(
         // A steer typed just as the turn ended was never drained. Drop it here
         // so a later, unrelated turn cannot pick it up at its first round
         // boundary; the frontend re-sends anything it never saw applied.
-        crate::commands::interjections::drain_for_session(&interjections_cleanup, &session_for_error).await;
-        let reclaimed =
-            crate::tools::browser_session::close_for_session(&session_for_error).await;
+        crate::commands::interjections::drain_for_session(
+            &interjections_cleanup,
+            &session_for_error,
+        )
+        .await;
+        let reclaimed = crate::tools::browser_session::close_for_session(&session_for_error).await;
         if reclaimed > 0 {
             tracing::info!(
                 "send_message: reclaimed {reclaimed} browser session(s) for {session_for_error}"
@@ -740,6 +837,13 @@ pub async fn send_message_anonymous(
         cwd
     };
 
+    let prev_assistant = history
+        .iter()
+        .rev()
+        .find(|turn| turn.role == "assistant")
+        .map(|turn| turn.content.as_str());
+    let contract = crate::agent::decide_chat_contract(prev_assistant, &content);
+
     // Build in-memory history: prior turns from the frontend + this new message.
     let mut full_history: Vec<crate::storage::Message> = history
         .into_iter()
@@ -797,6 +901,7 @@ pub async fn send_message_anonymous(
                 None,
             )
             .anonymous()
+            .with_turn_capability(contract.capability)
             .with_failover_plan(route_plan)
             .with_cancel(cancel_flag)
             .with_steer(interjections);

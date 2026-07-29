@@ -358,10 +358,14 @@ export function MessageList({
   );
   const lastAssistantId =
     [...visible].reverse().find((m) => m.role === "assistant")?.id ?? null;
-  const activePlanMessage = streaming
+  const activeProgressMessage = streaming
     ? [...visible]
         .reverse()
-        .find((message) => message.role === "assistant" && message.plan)
+        .find(
+          (message) =>
+            message.role === "assistant" &&
+            (message.plan || message.turnActivity),
+        )
     : undefined;
   const lastAssistantIdsByUserTurn = new Set<string>();
   let pendingLastAssistantId: string | null = null;
@@ -381,11 +385,12 @@ export function MessageList({
         ref={scrollerRef}
         className="absolute inset-0 overflow-y-auto px-4 py-4"
       >
-        {activePlanMessage?.plan && (
+        {activeProgressMessage && (
           <div className="sticky top-0 z-20 mb-3 flex justify-center">
             <ActiveTurnProgress
-              plan={activePlanMessage.plan}
-              startedAt={activePlanMessage.createdAt}
+              plan={activeProgressMessage.plan}
+              activity={activeProgressMessage.turnActivity}
+              startedAt={activeProgressMessage.createdAt}
               timingProfile={timingProfile}
               externalJobs={externalJobs}
             />
@@ -488,16 +493,33 @@ function SuccessfulToolGroup({ tools }: { tools: NonNullable<UIMessage["toolCall
 
 function ActiveTurnProgress({
   plan,
+  activity,
   startedAt,
   timingProfile,
   externalJobs,
 }: {
-  plan: NonNullable<UIMessage["plan"]>;
+  plan?: UIMessage["plan"];
+  activity?: UIMessage["turnActivity"];
   startedAt: number;
   timingProfile: TurnTimingProfile | null;
   externalJobs: ExternalJobState[];
 }) {
   const nowMs = useNowTick(true);
+  if (!plan) {
+    return (
+      <div
+        role="status"
+        data-testid="turn-activity-progress"
+        className="flex max-w-[min(34rem,calc(100vw-2rem))] items-center gap-2 rounded-full border border-border bg-surface-2/95 px-3 py-1.5 text-[11px] text-gray-300 shadow-lg backdrop-blur"
+      >
+        <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-accent" />
+        <span className="truncate">{activity?.label || "正在处理任务"}</span>
+        <span className="shrink-0 text-gray-600">
+          {formatDuration(Math.max(0, nowMs - startedAt))}
+        </span>
+      </div>
+    );
+  }
   return (
     <TurnProgress
       plan={plan}

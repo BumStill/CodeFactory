@@ -11,13 +11,16 @@ Owner：agent delivery
 ## Requirements Traceability
 
 - **REQ-DEL-001 Provider-aware discovery**：从实际 push remote 的 URL 识别 forge family 与 host；GitHub CLI 认证必须按该 host 探测。未知/非 GitHub remote 不得提示 `gh auth login` 是通用修复。
-- **REQ-DEL-002 Remote-neutral local delivery**：默认分支、ahead 判断和 push 使用解析出的 remote，不硬编码 `origin`；没有 review adapter 时允许完成 commit/push，但 PR/MR 阶段必须给出 provider-aware blocker。
+- **REQ-DEL-002 Remote-neutral local delivery**：默认分支、ahead 判断和 push 使用解析出的 remote，不硬编码 `origin`；当请求 ceiling 需要 PR/MR 时，缺少 review adapter 或认证必须在任何 stage/commit/push 前阻断，避免留下无法继续的半交付外部状态。
 - **REQ-DEL-003 Layered states**：结果必须区分 `release_triggered`、`deployment_pending/succeeded`、`live_verified`；只有 live verifier 成功后才可使用“已上线/上线已验证”。
 - **REQ-DEL-004 Hook adapters**：现有 `delivery_provider` JSON hook 除 PR/MR、CI、merge、release 外，支持 `deployment_status` 与 `verify_live`，用于 Zeabur 和企业 CD。
 - **REQ-DEL-005 Repository-owned live checks**：仓库可提交 `.codefactory/delivery.json`，配置无密钥 HTTP live assertion；支持状态码、响应正文包含值，以及用 `$GIT_SHA`/`$GIT_SHA_SHORT` 绑定本次交付版本。
 - **REQ-DEL-006 Fail closed**：未配置部署观察或 live verifier、部署仍 pending、线上断言不匹配时，不得返回 `delivered` 或声称上线；应返回可恢复的 `blocked` 并保留已完成步骤。
 - **REQ-DEL-007 Backward compatibility**：旧 Settings、旧 hook 和没有 `.codefactory/delivery.json` 的仓库继续可读；旧 hook 对新 action 返回 unsupported 时显示“未配置上线验证”，不得崩溃或伪造成功。
 - **REQ-DEL-008 Verification phase boundary**：重型验证（完整测试、构建、治理、主路径验收）必须在 merge/release 前完成；发布后只做轻量事实确认与 live smoke，不得把发布后的重复全量测试当作常规完成条件。发布后只有在 pre-release 证据缺失/过期、release workflow 在发布阶段生成或修改了需重新验证的代码/制品逻辑，或 release/live smoke 失败时，才扩大到针对性重验。
+- **REQ-DEL-009 Side-effect-free preflight**：首次 stage/commit/push 前必须解析 repo、branch、default branch、push remote、provider、认证、review adapter，以及目标 ceiling 所需的 CI、merge、release、deployment、live 能力。任一必需能力缺失时返回结构化 `blocked`，HEAD、index、working tree、upstream 和远端调用计数保持不变。
+- **REQ-DEL-010 Structured outcome truth**：工具结果必须携带结构化 `status`、`stage`、`code`、`recoverable`、`next_action`、`reached_state`。业务阻断落 `tool_calls.status=blocked`；进程/协议崩溃才落 `error`；不得出现正文写 blocked 而轨迹写 done。
+- **REQ-DEL-011 Delivery state vocabulary**：状态至少区分 `local`、`committed`、`pushed`、`pr_open`、`ci_green`、`merged`、`release_triggered`、`artifact_published`、`deployment_pending`、`deployment_succeeded`、`live_verified`、`blocked`。只有 `live_verified` 可使用“已上线”。
 
 ## Repository-owned configuration
 
@@ -61,7 +64,7 @@ Owner：agent delivery
 ## Primary User Path
 
 1. Agent 完成改动并在发布前验证本地行为：相关测试、构建、治理与主路径验收必须晚于最后一次源码/配置修改。
-2. `deliver_changes` 解析实际 remote、提交并推送。
+2. `deliver_changes` 先无副作用 preflight；只有目标 ceiling 的必需能力全部可用后才提交并推送。
 3. provider adapter 打开 PR/MR/Change，等待 CI 并合并；CI 是发布前质量门禁。
 4. release action 只记录“已触发”，不记录“已上线”。
 5. 发布后只执行轻量事实确认：tag/commit 归属、release 非 draft、资产存在、latest/updater 指针、release workflow 结论。

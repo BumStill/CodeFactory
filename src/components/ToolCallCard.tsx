@@ -335,6 +335,8 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
       <CheckCircle size={12} className="text-green-500 shrink-0" />
     ) : tc.status === "cancelled" ? (
       <Ban size={12} className="text-gray-500 shrink-0" aria-label="已取消" />
+    ) : tc.status === "blocked" ? (
+      <AlertCircle size={12} className="text-amber-400 shrink-0" aria-label="已阻断" />
     ) : tc.status === "error" || tc.status === "denied" || tc.isError ? (
       <AlertCircle size={12} className="text-red-400 shrink-0" />
     ) : (
@@ -345,6 +347,8 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
   const shellClass = needsAttention
     ? tc.status === "error" || tc.status === "denied" || tc.isError
       ? "rounded-r-sm border-l border-red-500/50 bg-transparent"
+      : tc.status === "blocked"
+        ? "rounded-r-md border-l-2 border-amber-500/50 bg-amber-500/[0.035]"
       : tc.status === "waiting_permission"
         ? "rounded-r-md border-l-2 border-amber-500/40 bg-amber-500/[0.025]"
         : "rounded-r-md border-l-2 border-accent/35 bg-accent/[0.025]"
@@ -379,6 +383,11 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
           behind the expand toggle. */}
       {!open && (tc.isError || tc.status === "error") && tc.result && (
         <div className="ml-7 max-w-[56ch] truncate px-1.5 pb-1 text-[13px] font-mono leading-5 text-red-700 dark:text-red-300">
+          {firstNonEmptyLine(tc.result)}
+        </div>
+      )}
+      {!open && tc.status === "blocked" && tc.result && (
+        <div className="ml-7 max-w-[56ch] truncate px-1.5 pb-1 text-[13px] leading-5 text-amber-700 dark:text-amber-300">
           {firstNonEmptyLine(tc.result)}
         </div>
       )}

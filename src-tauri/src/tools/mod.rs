@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod bash;
 pub mod browser_session;
-pub mod delivery;
 pub mod delegate_tasks;
-pub mod parallel;
+pub mod delivery;
 pub mod docx;
 pub mod edit;
 pub mod file_lock;
 pub mod glob;
 pub mod grep;
 pub mod knowledge;
+pub mod parallel;
 pub mod path_sanity;
 pub mod pptx;
 pub mod pptx_edit;
@@ -28,10 +28,19 @@ use std::path::PathBuf;
 
 use crate::errors::Result;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionStatus {
+    Done,
+    Blocked,
+    Error,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    pub status: ToolExecutionStatus,
 }
 
 impl ToolOutput {
@@ -39,12 +48,21 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            status: ToolExecutionStatus::Done,
+        }
+    }
+    pub fn blocked(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            status: ToolExecutionStatus::Blocked,
         }
     }
     pub fn err(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: true,
+            status: ToolExecutionStatus::Error,
         }
     }
 }
@@ -248,22 +266,22 @@ mod headless_contract_tests {
         assert!(!out.is_error, "write_file headless: {}", out.content);
 
         // read_file sees it
-        let out = dispatch("read_file", json!({ "path": "note.txt" }), &ctx).await.unwrap();
+        let out = dispatch("read_file", json!({ "path": "note.txt" }), &ctx)
+            .await
+            .unwrap();
         assert!(!out.is_error, "read_file headless: {}", out.content);
         assert!(out.content.contains("headless line one"));
 
         // grep finds it
-        let out = dispatch(
-            "grep",
-            json!({ "pattern": "second", "path": "." }),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let out = dispatch("grep", json!({ "pattern": "second", "path": "." }), &ctx)
+            .await
+            .unwrap();
         assert!(!out.is_error, "grep headless: {}", out.content);
 
         // bash runs
-        let out = dispatch("bash", json!({ "command": "echo headless-ok" }), &ctx).await.unwrap();
+        let out = dispatch("bash", json!({ "command": "echo headless-ok" }), &ctx)
+            .await
+            .unwrap();
         assert!(!out.is_error, "bash headless: {}", out.content);
         assert!(out.content.contains("headless-ok"));
 

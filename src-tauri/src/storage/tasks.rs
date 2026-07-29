@@ -107,6 +107,101 @@ pub struct TaskRun {
     pub spec_title: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq, Eq)]
+pub struct TaskAttempt {
+    pub id: String,
+    pub task_id: String,
+    pub attempt_index: i32,
+    pub sub_session_id: Option<String>,
+    pub status: String,
+    pub failure_code: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub error: Option<String>,
+    pub result: Option<String>,
+    pub verification_results: Option<String>,
+}
+
+pub async fn start_task_attempt(
+    pool: &SqlitePool,
+    id: &str,
+    task_id: &str,
+    attempt_index: i32,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO task_attempts
+         (id, task_id, attempt_index, status, started_at)
+         VALUES (?, ?, ?, 'running', ?)
+         ON CONFLICT(task_id, attempt_index) DO UPDATE SET
+            status='running', completed_at=NULL, failure_code=NULL, error=NULL",
+    )
+    .bind(id)
+    .bind(task_id)
+    .bind(attempt_index)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn attach_attempt_sub_session(
+    pool: &SqlitePool,
+    attempt_id: &str,
+    sub_session_id: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE task_attempts SET sub_session_id = ? WHERE id = ?")
+        .bind(sub_session_id)
+        .bind(attempt_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE task_runs SET sub_session_id = ?
+         WHERE id = (SELECT task_id FROM task_attempts WHERE id = ?)",
+    )
+    .bind(sub_session_id)
+    .bind(attempt_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn finish_task_attempt(
+    pool: &SqlitePool,
+    attempt_id: &str,
+    status: &str,
+    failure_code: Option<&str>,
+    error: Option<&str>,
+    result: Option<&str>,
+    verification_results: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE task_attempts SET status=?, failure_code=?, completed_at=?,
+            error=?, result=?, verification_results=? WHERE id=?",
+    )
+    .bind(status)
+    .bind(failure_code)
+    .bind(Utc::now().to_rfc3339())
+    .bind(error)
+    .bind(result)
+    .bind(verification_results)
+    .bind(attempt_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_task_attempts(pool: &SqlitePool, task_id: &str) -> Result<Vec<TaskAttempt>> {
+    Ok(sqlx::query_as::<_, TaskAttempt>(
+        "SELECT * FROM task_attempts WHERE task_id=? ORDER BY attempt_index ASC",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await?)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TaskFailureAttribution {
     pub kind: String,
@@ -154,13 +249,11 @@ pub async fn save_verification_results(
     task_id: &str,
     results_json: &str,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE task_runs SET verification_results = ? WHERE id = ?",
-    )
-    .bind(results_json)
-    .bind(task_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE task_runs SET verification_results = ? WHERE id = ?")
+        .bind(results_json)
+        .bind(task_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -330,10 +423,7 @@ pub async fn set_sub_session(pool: &SqlitePool, id: &str, sub_session_id: &str) 
     Ok(())
 }
 
-pub async fn list_session_tasks(
-    pool: &SqlitePool,
-    session_id: &str,
-) -> Result<Vec<TaskRun>> {
+pub async fn list_session_tasks(pool: &SqlitePool, session_id: &str) -> Result<Vec<TaskRun>> {
     let rows = sqlx::query_as::<_, TaskRun>(
         "SELECT * FROM task_runs WHERE session_id = ? ORDER BY created_at ASC",
     )
@@ -660,6 +750,26 @@ mod tests {
         .execute(&pool)
         .await
         .expect("create schema");
+        sqlx::query(
+            "CREATE TABLE task_attempts (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                attempt_index INTEGER NOT NULL,
+                sub_session_id TEXT,
+                status TEXT NOT NULL,
+                failure_code TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                error TEXT,
+                result TEXT,
+                verification_results TEXT,
+                UNIQUE(task_id, attempt_index),
+                UNIQUE(sub_session_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create attempt schema");
         pool
     }
 
@@ -690,8 +800,12 @@ mod tests {
     #[tokio::test]
     async fn retry_failed_tasks_resets_repairable_rows_to_pending() {
         let pool = test_pool().await;
-        insert_task(&pool, &task("failed-1", "failed")).await.unwrap();
-        insert_task(&pool, &task("cancelled-1", "cancelled")).await.unwrap();
+        insert_task(&pool, &task("failed-1", "failed"))
+            .await
+            .unwrap();
+        insert_task(&pool, &task("cancelled-1", "cancelled"))
+            .await
+            .unwrap();
         let mut provider = task("provider-1", "failed");
         provider.error = Some("HTTP 402 Insufficient Balance from provider".into());
         provider.verification_results = None;
@@ -700,7 +814,9 @@ mod tests {
         runtime.error = Some("npm executable is unavailable in this environment".into());
         runtime.verification_results = None;
         insert_task(&pool, &runtime).await.unwrap();
-        insert_task(&pool, &task("completed-1", "completed")).await.unwrap();
+        insert_task(&pool, &task("completed-1", "completed"))
+            .await
+            .unwrap();
 
         let changed = retry_failed_tasks(&pool, "session-1").await.unwrap();
         assert_eq!(changed, 2);
@@ -726,6 +842,67 @@ mod tests {
             assert_eq!(blocked.status, "failed");
             assert!(blocked.error.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn task_attempts_keep_every_child_session_and_terminal_result() {
+        let pool = test_pool().await;
+        insert_task(&pool, &task("task-1", "running"))
+            .await
+            .unwrap();
+
+        start_task_attempt(&pool, "attempt-1", "task-1", 1)
+            .await
+            .unwrap();
+        attach_attempt_sub_session(&pool, "attempt-1", "child-session-1")
+            .await
+            .unwrap();
+        finish_task_attempt(
+            &pool,
+            "attempt-1",
+            "failed",
+            Some("verification_failed"),
+            Some("one check failed"),
+            None,
+            Some(r#"[{"check":"pnpm test","passed":false}]"#),
+        )
+        .await
+        .unwrap();
+
+        start_task_attempt(&pool, "attempt-2", "task-1", 2)
+            .await
+            .unwrap();
+        attach_attempt_sub_session(&pool, "attempt-2", "child-session-2")
+            .await
+            .unwrap();
+        finish_task_attempt(
+            &pool,
+            "attempt-2",
+            "completed",
+            None,
+            None,
+            Some("fixed"),
+            Some(r#"[{"check":"pnpm test","passed":true}]"#),
+        )
+        .await
+        .unwrap();
+
+        let attempts = list_task_attempts(&pool, "task-1").await.unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].sub_session_id.as_deref(), Some("child-session-1"));
+        assert_eq!(attempts[0].failure_code.as_deref(), Some("verification_failed"));
+        assert_eq!(attempts[1].sub_session_id.as_deref(), Some("child-session-2"));
+        assert_eq!(attempts[1].status, "completed");
+        assert_eq!(
+            get_task(&pool, "task-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .sub_session_id
+                .as_deref(),
+            Some("child-session-2"),
+            "task row keeps only the latest convenience pointer while attempts retain history",
+        );
     }
 
     #[test]
@@ -785,10 +962,21 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(changed, 1);
-        assert_eq!(get_task(&pool, "provider-1").await.unwrap().unwrap().status, "pending");
-        assert_eq!(get_task(&pool, "provider-2").await.unwrap().unwrap().status, "failed");
-        assert_eq!(get_task(&pool, "completed").await.unwrap().unwrap().status, "completed");
-        assert_eq!(get_task(&pool, "foreign").await.unwrap().unwrap().status, "failed");
+        assert_eq!(
+            get_task(&pool, "provider-1").await.unwrap().unwrap().status,
+            "pending"
+        );
+        assert_eq!(
+            get_task(&pool, "provider-2").await.unwrap().unwrap().status,
+            "failed"
+        );
+        assert_eq!(
+            get_task(&pool, "completed").await.unwrap().unwrap().status,
+            "completed"
+        );
+        assert_eq!(
+            get_task(&pool, "foreign").await.unwrap().unwrap().status,
+            "failed"
+        );
     }
-
 }

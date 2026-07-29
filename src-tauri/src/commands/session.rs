@@ -452,9 +452,23 @@ const PAYLOAD_OMITTED: &str = "[older tool output omitted from this history page
 pub struct MessagePage {
     pub messages: Vec<Message>,
     pub plans: Vec<TurnPlanSnapshot>,
+    pub turn_states: Vec<TurnActivitySnapshot>,
     pub has_more: bool,
     pub next_before_rowid: Option<i64>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct TurnActivitySnapshot {
+    pub root_turn_id: String,
+    pub revision: i64,
+    pub phase: String,
+    pub status: String,
+    pub recent_activity_kind: String,
+    pub recent_activity_label: String,
+    pub waiting_reason: Option<String>,
+    pub updated_at: i64,
+    pub terminal_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -585,6 +599,7 @@ async fn load_message_page_below(
         return Ok(MessagePage {
             messages: Vec::new(),
             plans: Vec::new(),
+            turn_states: Vec::new(),
             has_more: false,
             next_before_rowid: None,
             truncated: false,
@@ -654,10 +669,12 @@ async fn load_message_page_below(
     .await?
         != 0;
     let plans = load_latest_turn_plans(pool, session_id, &messages).await?;
+    let turn_states = load_turn_activity_states(pool, session_id, &messages).await?;
 
     let mut page = MessagePage {
         messages,
         plans,
+        turn_states,
         has_more,
         next_before_rowid: has_more.then_some(effective_start),
         truncated: truncated || field_truncated,
@@ -695,6 +712,8 @@ async fn load_message_page_below(
         .collect::<HashSet<_>>();
     page.plans
         .retain(|plan| retained_root_turns.contains(plan.root_turn_id.as_str()));
+    page.turn_states
+        .retain(|state| retained_root_turns.contains(state.root_turn_id.as_str()));
 
     // A single row is field-bounded above, so normal app-authored metadata
     // leaves ample room. Keep a debug assertion and a release-safe fallback
@@ -725,6 +744,60 @@ async fn load_message_page_below(
         "MessagePage must stay within the Tauri bridge payload budget"
     );
     Ok(page)
+}
+
+async fn load_turn_activity_states(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    messages: &[Message],
+) -> Result<Vec<TurnActivitySnapshot>, sqlx::Error> {
+    let roots = messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .completion_state
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+        })
+        .map(|message| message.id.as_str())
+        .collect::<HashSet<_>>();
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT root_turn_id, revision, phase, status,
+                recent_activity_kind, recent_activity_label,
+                waiting_reason, updated_at, terminal_reason
+         FROM chat_turn_state
+         WHERE session_id = ",
+    );
+    query.push_bind(session_id);
+    query.push(" AND root_turn_id IN (");
+    {
+        let mut roots_query = query.separated(", ");
+        for root in &roots {
+            roots_query.push_bind(*root);
+        }
+    }
+    query.push(") ORDER BY updated_at ASC");
+    match query
+        .build_query_as::<TurnActivitySnapshot>()
+        .fetch_all(pool)
+        .await
+    {
+        Ok(states) => Ok(states),
+        Err(error) if error.to_string().contains("no such table: chat_turn_state") => {
+            // Read-only compatibility for legacy/minimal databases. Normal app
+            // startup creates the additive table before serving commands, but
+            // history must remain readable even if a copied database has not
+            // run the newest migration yet.
+            Ok(Vec::new())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn load_latest_turn_plans(

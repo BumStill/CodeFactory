@@ -12,7 +12,9 @@
 //! unit-test EXE links no Tauri entrypoints (#166). It is constructed only in
 //! `run_openai`/`run_anthropic`, which the test EXE dead-strips.
 
-use codefactory_agent_loop::tool::{ToolBackend, ToolCtx, ToolError, ToolInvocationResult};
+use codefactory_agent_loop::tool::{
+    ToolBackend, ToolCtx, ToolError, ToolExecutionStatus, ToolInvocationResult,
+};
 
 use crate::openrouter::types::{ToolCall, ToolDefinition};
 
@@ -63,33 +65,37 @@ impl ToolBackend for DesktopToolBackend {
         // MCP-first, then native dispatch — precedence and the `Unknown tool`
         // sentinel are preserved. An MCP error becomes an `is_error` result the
         // model sees; a native-dispatch `Err` is FATAL and aborts the turn.
-        let output = if let Some(server_id) =
-            self.mcp_manager.find_tool_server(&call.function.name).await
-        {
-            match self
-                .mcp_manager
-                .call_tool(&server_id, &call.function.name, args.clone())
-                .await
-            {
-                Ok(text) => crate::tools::ToolOutput::ok(text),
-                Err(e) => crate::tools::ToolOutput::err(format!("MCP error: {e}")),
-            }
-        } else {
-            match crate::tools::dispatch(&call.function.name, args.clone(), &exec_ctx).await {
-                Ok(output) => output,
-                Err(error) => {
-                    return Err(ToolError {
-                        message: error.to_string(),
-                    })
+        let output =
+            if let Some(server_id) = self.mcp_manager.find_tool_server(&call.function.name).await {
+                match self
+                    .mcp_manager
+                    .call_tool(&server_id, &call.function.name, args.clone())
+                    .await
+                {
+                    Ok(text) => crate::tools::ToolOutput::ok(text),
+                    Err(e) => crate::tools::ToolOutput::err(format!("MCP error: {e}")),
                 }
-            }
-        };
+            } else {
+                match crate::tools::dispatch(&call.function.name, args.clone(), &exec_ctx).await {
+                    Ok(output) => output,
+                    Err(error) => {
+                        return Err(ToolError {
+                            message: error.to_string(),
+                        })
+                    }
+                }
+            };
 
         let (command, kind) =
             codefactory_agent_loop::policy::completion_command_and_kind(&call.function.name, args);
         Ok(ToolInvocationResult {
             content: output.content,
             is_error: output.is_error,
+            status: match output.status {
+                crate::tools::ToolExecutionStatus::Done => ToolExecutionStatus::Done,
+                crate::tools::ToolExecutionStatus::Blocked => ToolExecutionStatus::Blocked,
+                crate::tools::ToolExecutionStatus::Error => ToolExecutionStatus::Error,
+            },
             // The loop now feeds the gate from these fields (slice 4.8c b2), so
             // the backend owns classification. This is exactly the rule the loop
             // applied inline before — `classify_command` for `bash`, the

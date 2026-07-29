@@ -681,6 +681,14 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
               </span>
             </div>
           )}
+          {task.attempts && task.attempts.length > 0 && (
+            <div className="mt-0.5 text-[9px] text-gray-600">
+              {task.attempts.length} 次执行记录
+              {task.attempts[task.attempts.length - 1]?.status === "failed" && (
+                <span className="ml-1 text-amber-500">最近一次失败</span>
+              )}
+            </div>
+          )}
        </div>
       </div>
       {verifOpen && verif && (

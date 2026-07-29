@@ -63,4 +63,3 @@ pub(crate) fn should_finish_after_model_error(wall_time: Option<(u64, u64)>, out
     };
     outcome_count > 0 && remaining <= (total / 15).max(60)
 }
-

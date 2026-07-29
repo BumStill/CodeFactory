@@ -56,4 +56,3 @@ pub async fn delete_knowledge_library(
     let pool = state.db.read().await;
     crate::knowledge::delete_library(&pool, &library_id).await
 }
-

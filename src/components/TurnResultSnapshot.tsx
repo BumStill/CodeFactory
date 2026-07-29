@@ -46,7 +46,7 @@ export function summarizeTurnEvidence(toolCalls: ToolCallState[]): TurnEvidenceS
   let failureCount = 0;
   for (const tool of toolCalls) {
     const args = parseArgs(tool.args);
-    if (tool.isError || tool.status === "error" || tool.status === "denied" || tool.status === "cancelled") {
+    if (tool.isError || tool.status === "blocked" || tool.status === "error" || tool.status === "denied" || tool.status === "cancelled") {
       failureCount += 1;
     }
     if (tool.name === "write_file" || tool.name === "edit_file") {

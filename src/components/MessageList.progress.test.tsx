@@ -64,6 +64,39 @@ describe("MessageList structured progress and result", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows a compact activity snapshot before a structured plan exists", () => {
+    render(
+      <MessageList
+        messages={[
+          { id: "user", role: "user", content: "检查并修复", createdAt: 1 },
+          {
+            id: "assistant",
+            role: "assistant",
+            content: "",
+            createdAt: Date.now() - 5_000,
+            turnActivity: {
+              rootTurnId: "user",
+              revision: 4,
+              phase: "recovering",
+              status: "active",
+              kind: "verification",
+              label: "正在补充缺失验证",
+              waitingReason: "验证证据不足",
+              updatedAt: Date.now(),
+              terminalReason: null,
+            },
+          },
+        ]}
+        streaming
+        cwd={null}
+      />,
+    );
+
+    expect(screen.getByTestId("turn-activity-progress")).toHaveTextContent(
+      "正在补充缺失验证",
+    );
+  });
+
   it("forms a local result snapshot immediately after the terminal state", () => {
     render(<MessageList messages={messages(true)} streaming={false} cwd={null} />);
 

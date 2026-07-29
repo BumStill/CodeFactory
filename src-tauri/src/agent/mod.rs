@@ -25,7 +25,7 @@ pub mod user_context;
 pub mod verification;
 pub mod worktree;
 
-pub use dispatch::decide_chat_mode;
+pub use dispatch::{decide_chat_contract, decide_chat_mode};
 
 #[cfg(test)]
 use codefactory_agent_core::CompletionEvidence;
@@ -75,6 +75,7 @@ use codefactory_agent_loop::protocol::{
 #[cfg(test)]
 use codefactory_agent_loop::run::cancelled_tool_suffix;
 use codefactory_agent_loop::run::FinalizationPolicy;
+pub use codefactory_agent_loop::run::TurnCapability;
 
 /// Desktop `AgentMode` → the loop crate's `FinalizationPolicy`.
 fn finalization_policy(mode: AgentMode) -> FinalizationPolicy {
@@ -87,7 +88,7 @@ fn finalization_policy(mode: AgentMode) -> FinalizationPolicy {
 /// Rejected-final-response recovery budget per run (was `completion_recovery_limit`).
 fn recovery_limit_for(mode: AgentMode) -> u32 {
     match mode {
-        AgentMode::Interactive | AgentMode::Execute => 3,
+        AgentMode::Interactive | AgentMode::Execute => 1,
         AgentMode::Autonomous => 1,
     }
 }
@@ -486,6 +487,8 @@ pub struct AgentLoop {
     /// Selects segment checkpoint cadence and system prompt. Interactive for
     /// chat panel use, Autonomous for subagent / approved-task runs.
     mode: AgentMode,
+    /// Per-turn hard capability boundary; independent from full-access/trust.
+    turn_capability: TurnCapability,
     /// Stable for one AgentLoop execution; combined with the provider-round
     /// index to make usage persistence idempotent without collapsing genuine
     /// multi-round tool work.
@@ -707,6 +710,10 @@ impl AgentLoop {
             mcp_manager,
             execution_context,
             mode,
+            turn_capability: match mode {
+                AgentMode::Interactive => TurnCapability::ReviewOnly,
+                AgentMode::Execute | AgentMode::Autonomous => TurnCapability::Implement,
+            },
             usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,
             cancel: None,
@@ -787,6 +794,10 @@ impl AgentLoop {
             mcp_manager,
             execution_context,
             mode,
+            turn_capability: match mode {
+                AgentMode::Interactive => TurnCapability::ReviewOnly,
+                AgentMode::Execute | AgentMode::Autonomous => TurnCapability::Implement,
+            },
             usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,
             cancel: None,
@@ -801,6 +812,11 @@ impl AgentLoop {
     /// policy, and usage attribution for the lifetime of this run.
     pub fn with_failover_plan(mut self, plan: failover::RouteCandidatePlan) -> Self {
         self.route_state = failover::ActiveRouteState::from_plan(plan);
+        self
+    }
+
+    pub fn with_turn_capability(mut self, capability: TurnCapability) -> Self {
+        self.turn_capability = capability;
         self
     }
 
@@ -910,10 +926,7 @@ impl AgentLoop {
     /// mid-run. Same queue the task scheduler drains, so one `queue_interjection`
     /// means the same thing whichever is running. Only the interactive chat
     /// path wires this; everything else stays `None` and unaffected.
-    pub fn with_steer(
-        mut self,
-        queue: crate::commands::interjections::InterjectionQueue,
-    ) -> Self {
+    pub fn with_steer(mut self, queue: crate::commands::interjections::InterjectionQueue) -> Self {
         self.steer = Some(queue);
         self
     }
@@ -942,6 +955,12 @@ impl AgentLoop {
             tool_defs
                 .retain(|d| d.function.name != "kb_search" && d.function.name != "kb_get_chunk");
         }
+        tool_defs.retain(|definition| {
+            codefactory_agent_loop::policy::tool_visible_for_capability(
+                self.turn_capability,
+                &definition.function.name,
+            )
+        });
         // Assemble the system prompt under ONE shared budget: the fixed base
         // persona (always kept), then project knowledge (memory/README/config),
         // enabled skills, and the user's preferences/learnings. Blocks render in
@@ -1103,6 +1122,7 @@ impl AgentLoop {
         };
         let config = codefactory_agent_loop::run::RunConfig {
             finalization: finalization_policy(self.mode),
+            turn_capability: self.turn_capability,
             gate_benchmark: false,
             progress_window: 8,
             recovery_limit: recovery_limit_for(self.mode),
@@ -1147,12 +1167,12 @@ impl AgentLoop {
             context_policy: std::sync::Arc::new(self.context_policy(expand_context_window)),
             fact_checker: std::sync::Arc::new(fact_checker::DesktopFactChecker { mode: self.mode }),
             steer: match self.steer.clone() {
-                Some(queue) => std::sync::Arc::new(
-                    crate::commands::interjections::SessionSteerInbox {
+                Some(queue) => {
+                    std::sync::Arc::new(crate::commands::interjections::SessionSteerInbox {
                         queue,
                         session_id: self.session_id.clone(),
-                    },
-                ),
+                    })
+                }
                 None => std::sync::Arc::new(codefactory_agent_loop::services::NoSteering),
             },
         };
@@ -2511,6 +2531,11 @@ mod tests {
         codefactory_agent_loop::tool::ToolInvocationResult {
             content: content.to_string(),
             is_error,
+            status: if is_error {
+                codefactory_agent_loop::tool::ToolExecutionStatus::Error
+            } else {
+                codefactory_agent_loop::tool::ToolExecutionStatus::Done
+            },
             command,
             kind,
             return_code: None,
@@ -3397,7 +3422,11 @@ mod tests {
             PermissionDecision::Allow
         );
         assert_eq!(
-            decide_permission(&trusted, "bash", Some("Remove-Item -Recurse -Force .\\dist")),
+            decide_permission(
+                &trusted,
+                "bash",
+                Some("Remove-Item -Recurse -Force .\\dist")
+            ),
             PermissionDecision::Ask
         );
     }
@@ -4028,23 +4057,15 @@ mod tests {
 
     #[test]
     fn completion_recovery_prompt_respects_mode_rejection_limits() {
-        // User-facing chat gets several tool-backed repair opportunities. The
-        // limit still prevents the historical unbounded near-duplicate loop,
-        // while one incidental verifier/precondition mistake no longer ends
-        // an otherwise active product-fix session.
+        // Every surface gets one targeted repair opportunity. A second miss
+        // terminates with a truthful blocker instead of restarting the same
+        // verification loop.
         let unsatisfied = CompletionGate::new(true).evidence();
         assert!(!unsatisfied.completed);
-        for attempts in 0..3 {
-            assert!(
-                completion_recovery_prompt(&unsatisfied, attempts, AgentMode::Interactive,)
-                    .is_some()
-            );
-            assert!(
-                completion_recovery_prompt(&unsatisfied, attempts, AgentMode::Execute).is_some()
-            );
-        }
-        assert!(completion_recovery_prompt(&unsatisfied, 3, AgentMode::Interactive).is_none());
-        assert!(completion_recovery_prompt(&unsatisfied, 3, AgentMode::Execute).is_none());
+        assert!(completion_recovery_prompt(&unsatisfied, 0, AgentMode::Interactive).is_some());
+        assert!(completion_recovery_prompt(&unsatisfied, 0, AgentMode::Execute).is_some());
+        assert!(completion_recovery_prompt(&unsatisfied, 1, AgentMode::Interactive).is_none());
+        assert!(completion_recovery_prompt(&unsatisfied, 1, AgentMode::Execute).is_none());
         assert!(completion_recovery_prompt(&unsatisfied, 0, AgentMode::Autonomous).is_some());
         assert!(completion_recovery_prompt(&unsatisfied, 1, AgentMode::Autonomous).is_none());
         assert!(completion_recovery_requires_tool(AgentMode::Interactive));
@@ -4077,26 +4098,26 @@ mod tests {
         // respawns those).
         let unsatisfied = CompletionGate::new(true).evidence();
         assert!(matches!(
-            completion_finalization(&unsatisfied, 1, AgentMode::Interactive),
+            completion_finalization(&unsatisfied, 0, AgentMode::Interactive),
             CompletionFinalization::Recover(_)
         ));
         assert!(matches!(
-            completion_finalization(&unsatisfied, 3, AgentMode::Interactive),
+            completion_finalization(&unsatisfied, 1, AgentMode::Interactive),
             CompletionFinalization::ReleaseWithWarning(_)
         ));
         assert!(matches!(
-            completion_finalization(&unsatisfied, 3, AgentMode::Execute),
+            completion_finalization(&unsatisfied, 1, AgentMode::Execute),
             CompletionFinalization::ReleaseWithWarning(_)
         ));
         if let CompletionFinalization::ReleaseWithWarning(warning) =
-            completion_finalization(&unsatisfied, 3, AgentMode::Interactive)
+            completion_finalization(&unsatisfied, 1, AgentMode::Interactive)
         {
             // Human-readable Chinese, no internal-contract terminology.
             assert!(warning.contains("未经完整验证"));
             assert!(!warning.contains("Completion blocked"));
         }
         assert!(matches!(
-            completion_finalization(&unsatisfied, 3, AgentMode::Autonomous),
+            completion_finalization(&unsatisfied, 1, AgentMode::Autonomous),
             CompletionFinalization::Blocked(_)
         ));
 
@@ -4142,15 +4163,10 @@ mod tests {
     }
 
     #[test]
-    fn completion_ready_nudge_is_autonomous_only() {
-        // The ready ("coverage audit") nudge freezes the toolset for the next
-        // round to force wrap-up. evidence.completed only means "some mutation
-        // got verified" — in a long interactive TDD session that fires on any
-        // mid-task tsc/vitest pass and forcibly stops the turn while the model
-        // is announcing its next step (2026-07-17 session: agent stopped with
-        // a "还不能结束,仍缺少证据" essay after 6 minutes). With the user
-        // present, THEY decide when the work is done; the nudge is an
-        // autonomous-contract mechanism only.
+    fn completion_ready_nudge_is_unattended_only() {
+        // Interactive/Execute can have later planned mutations after an
+        // intermediate green check, so their finalization begins only when the
+        // model actually attempts a tool-free answer.
         assert!(!completion_ready_applies(AgentMode::Interactive));
         assert!(!completion_ready_applies(AgentMode::Execute));
         assert!(completion_ready_applies(AgentMode::Autonomous));
