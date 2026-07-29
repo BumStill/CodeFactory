@@ -196,7 +196,9 @@ describe("MessageList theme readability", () => {
       />,
     );
 
-    expect(screen.getByText("Checking the workspace.")).toHaveClass("text-[15px]");
+    expect(
+      screen.getByText("Checking the workspace.").closest("[data-segment='step']"),
+    ).toHaveClass("text-[15px]");
     expect(screen.getByText(/运行中/)).toHaveClass("text-[11px]");
   });
 

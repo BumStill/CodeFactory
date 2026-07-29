@@ -270,6 +270,30 @@ function TypingDots() {
   );
 }
 
+const TimelineMarkdownSegment = memo(function TimelineMarkdownSegment({
+  text,
+  isFinal,
+  showTypingDots,
+}: {
+  text: string;
+  isFinal: boolean;
+  showTypingDots: boolean;
+}) {
+  return (
+    <div
+      data-segment={isFinal ? "final" : "step"}
+      className={
+        isFinal
+          ? "prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
+          : "prose dark:prose-invert prose-sm max-w-none py-0.5 text-[15px] leading-6 text-gray-300 [&_pre]:!p-0 [&_pre]:!bg-transparent [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1 [&_h1]:mt-2 [&_h2]:mt-2 [&_h3]:mt-1.5 [&_h4]:mt-1.5 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
+      }
+    >
+      <MarkdownContent content={text} />
+      {showTypingDots && <TypingDots />}
+    </div>
+  );
+});
+
 // ── Main component ───────────────────────────────────────────────────────────
 export function MessageList({
   messages,
@@ -732,26 +756,13 @@ const MessageRow = memo(function MessageRow({
               return tc ? <ToolCallCard key={`tool-${segment.toolCallId}`} tc={tc} /> : null;
             }
             const isFinal = index === lastTextIndex;
-            if (!isFinal) {
-              return (
-                <div
-                  key={`seg-${index}`}
-                  data-segment="step"
-                  className="py-0.5 text-[15px] leading-6 text-gray-300 whitespace-pre-wrap"
-                >
-                  {segment.text}
-                </div>
-              );
-            }
             return (
-              <div
+              <TimelineMarkdownSegment
                 key={`seg-${index}`}
-                data-segment="final"
-                className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
-              >
-                <MarkdownContent content={segment.text} />
-                {isStreamingTail && <TypingDots />}
-              </div>
+                text={segment.text}
+                isFinal={isFinal}
+                showTypingDots={isFinal && isStreamingTail}
+              />
             );
           })}
         </>

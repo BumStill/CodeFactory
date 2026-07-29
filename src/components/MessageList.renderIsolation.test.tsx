@@ -50,6 +50,49 @@ describe("MessageList render isolation", () => {
     expect(markdownRender).toHaveBeenCalledWith("history-119 delta");
   });
 
+  it("does not re-render completed timeline Markdown when only the live segment changes", () => {
+    const segments = Array.from({ length: 40 }, (_, index) => [
+      { kind: "text" as const, text: `**completed-${index}**` },
+      { kind: "tool" as const, toolCallId: `tool-${index}` },
+    ]).flat();
+    segments.push({ kind: "text" as const, text: "live tail" });
+    const toolCalls = Array.from({ length: 40 }, (_, index) => ({
+      id: `tool-${index}`,
+      name: "bash",
+      args: "{}",
+      status: "done" as const,
+      result: "ok",
+    }));
+    const message: UIMessage = {
+      id: "timeline",
+      role: "assistant",
+      content: "live tail",
+      segments,
+      toolCalls,
+      createdAt: 1,
+    };
+    const { rerender } = render(
+      <MessageList messages={[message]} streaming conversationKey="timeline" />,
+    );
+    markdownRender.mockClear();
+
+    const nextSegments = segments.slice();
+    nextSegments[nextSegments.length - 1] = {
+      kind: "text",
+      text: "live tail delta",
+    };
+    rerender(
+      <MessageList
+        messages={[{ ...message, content: "live tail delta", segments: nextSegments }]}
+        streaming
+        conversationKey="timeline"
+      />,
+    );
+
+    expect(markdownRender).toHaveBeenCalledTimes(1);
+    expect(markdownRender).toHaveBeenCalledWith("live tail delta");
+  });
+
   it("keeps the initial eight-turn production shape bounded with many persisted tool calls", () => {
     const messages: UIMessage[] = Array.from(
       { length: 8 },

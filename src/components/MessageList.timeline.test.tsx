@@ -60,6 +60,52 @@ describe("MessageList turn timeline", () => {
     expect(finals[0].textContent).toContain("最终总结");
   });
 
+  it("preserves Markdown when a live tail becomes an intermediate step", () => {
+    const formatted = [
+      "**当前验证状态**",
+      "",
+      "- 已通过 `pnpm test`",
+      "- [查看详情](https://example.com/check)",
+    ].join("\n");
+    const first = msg({
+      content: formatted,
+      segments: [{ kind: "text", text: formatted }],
+    });
+    const { container, rerender } = render(
+      <MessageList messages={[first]} streaming cwd={null} />,
+    );
+
+    expect(container.querySelector("[data-segment='final'] strong")).toHaveTextContent(
+      "当前验证状态",
+    );
+    expect(container.querySelector("[data-segment='final'] code")).toHaveTextContent(
+      "pnpm test",
+    );
+
+    const continued = msg({
+      content: `${formatted}继续执行。`,
+      segments: [
+        { kind: "text", text: formatted },
+        { kind: "tool", toolCallId: "t1" },
+        { kind: "text", text: "继续执行。" },
+      ],
+      toolCalls: [
+        { id: "t1", name: "bash", args: "{}", status: "done", result: "ok" },
+      ],
+    });
+    rerender(<MessageList messages={[continued]} streaming cwd={null} />);
+
+    const step = container.querySelector("[data-segment='step']");
+    expect(step?.querySelector("strong")).toHaveTextContent("当前验证状态");
+    expect(step?.querySelector("code")).toHaveTextContent("pnpm test");
+    expect(step?.querySelector("li")).toHaveTextContent("已通过 pnpm test");
+    expect(step?.querySelector("a")).toHaveAttribute(
+      "href",
+      "https://example.com/check",
+    );
+    expect(step).not.toHaveTextContent("**当前验证状态**");
+  });
+
   it("keeps a long active turn flat until it reaches a terminal state", () => {
     const segments: TurnSegment[] = [];
     const toolCalls = [];
