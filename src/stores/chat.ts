@@ -160,7 +160,7 @@ interface ChatStore {
   models: ModelInfo[];
   activeModel: string;
 
-  loadSessions: () => Promise<void>;
+  loadSessions: () => Promise<Session[]>;
   createSession: (cwd: string, model: string) => Promise<Session>;
   selectSession: (id: string) => Promise<void>;
   loadOlderMessages: () => Promise<void>;
@@ -281,6 +281,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   loadSessions: async () => {
     const sessions = await invoke<Session[]>("list_sessions");
     set({ sessions });
+    return sessions;
   },
 
   createSession: async (cwd, model) => {

@@ -25,7 +25,7 @@ export default function App() {
   const [evidenceViewerPath, setEvidenceViewerPath] = useState<string | null>(null);
   const loadSettings = useSettingsStore((s) => s.load);
   const settings = useSettingsStore((s) => s.settings);
-  const { beginDraft, selectSession } = useChatStore();
+  const { beginDraft, loadSessions, selectSession } = useChatStore();
   // Which conversation is open is DERIVED from the store, never copied into
   // React state. The shell used to hold its own id, which could drift from the
   // store — the chat pane showed one conversation while tasks, git and
@@ -34,15 +34,37 @@ export default function App() {
   const openSession = useChatStore(openSessionId);
   const startupDraftStarted = useRef(false);
 
-  // Workspace is the application shell. Start it with one virtual draft:
-  // no DB row, scratch directory or history entry exists until first send.
+  // Workspace is the application shell. On first launch, open the most recent
+  // persisted session if one exists; only fall back to an in-memory draft when
+  // there is no history. This keeps returning users on their latest task
+  // without changing the explicit “新会话” action, which still opens a blank
+  // draft and does not touch the backend until first send.
   useEffect(() => {
     if (startupDraftStarted.current) return;
     startupDraftStarted.current = true;
-    if (!useChatStore.getState().draftSession && !useChatStore.getState().activeSession) {
-      beginDraft();
-    }
-  }, [beginDraft]);
+    if (useChatStore.getState().draftSession || useChatStore.getState().activeSession) return;
+
+    let cancelled = false;
+    void loadSessions()
+      .then((sessions) => {
+        if (cancelled) return;
+        if (useChatStore.getState().draftSession || useChatStore.getState().activeSession) return;
+        const latest = sessions[0];
+        if (latest) {
+          void selectSession(latest.id);
+        } else {
+          beginDraft();
+        }
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        console.error("Failed to load sessions on startup", error);
+        if (!useChatStore.getState().draftSession && !useChatStore.getState().activeSession) {
+          beginDraft();
+        }
+      });
+    return () => { cancelled = true; };
+  }, [beginDraft, loadSessions, selectSession]);
 
   useEffect(() => { loadSettings(); }, [loadSettings]);
 
