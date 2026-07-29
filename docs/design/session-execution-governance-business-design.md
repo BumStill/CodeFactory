@@ -11,6 +11,7 @@
 3. 交付先证明整条目标链可达，再产生 commit/push 等副作用。
 4. 缺验证只补一次明确证据；仍不足就如实结束为 verification incomplete。
 5. 长任务仍是一条可见会话；内部按 task segment、进度快照和 attempt history 收敛。
+6. 用户说“继续”或运行中纠正方向时，系统必须更新真正的执行契约，而不是只让模型读到一句话、工具层却保持旧状态。
 
 ## 用户价值与边界
 
@@ -23,6 +24,8 @@
 
 - Review-only 回合 mutation backend 调用数为 0。
 - 每个 root turn completion recovery 不超过 1。
+- “只读审视 → 用户批准 → 实施”路径不再出现第二次确认，下一次 mutation 可执行。
+- capability/permission 拒绝后的状态不得显示“任务已完成”。
 - `deliver_changes` 的业务 blocked 与 DB/stream/UI status 完全一致。
 - 100 次同阶段进度更新在 UI 中仍是 1 个最新状态。
 - 同一逻辑子任务多次重试只显示 1 张任务卡，attempt 可追溯。

@@ -25,7 +25,10 @@ pub mod user_context;
 pub mod verification;
 pub mod worktree;
 
-pub use dispatch::{decide_chat_contract, decide_chat_mode};
+pub use dispatch::{
+    decide_chat_contract, decide_chat_mode, is_contextual_approval, proposal_capability,
+    steer_capability_override,
+};
 
 #[cfg(test)]
 use codefactory_agent_core::CompletionEvidence;
@@ -955,12 +958,10 @@ impl AgentLoop {
             tool_defs
                 .retain(|d| d.function.name != "kb_search" && d.function.name != "kb_get_chunk");
         }
-        tool_defs.retain(|definition| {
-            codefactory_agent_loop::policy::tool_visible_for_capability(
-                self.turn_capability,
-                &definition.function.name,
-            )
-        });
+        // Capability visibility is applied inside the shared loop on every
+        // round. A mid-run user steer may legitimately move ReviewOnly ->
+        // Implement/Deliver (or tighten back to ReviewOnly), so filtering once
+        // here would permanently hide tools for the rest of the root turn.
         // Assemble the system prompt under ONE shared budget: the fixed base
         // persona (always kept), then project knowledge (memory/README/config),
         // enabled skills, and the user's preferences/learnings. Blocks render in
@@ -1101,8 +1102,9 @@ impl AgentLoop {
             mcp_manager: self.mcp_manager.clone(),
             settings: self.settings.clone(),
         };
-        let completion_instruction = latest_user_instruction(&history);
-        let fact_check_instruction = effective_fact_check_instruction(&history);
+        let effective_instruction = effective_fact_check_instruction(&history);
+        let completion_instruction = effective_instruction.clone();
+        let fact_check_instruction = effective_instruction;
         let root_turn_id = history
             .iter()
             .rev()
@@ -1538,20 +1540,38 @@ fn effective_fact_check_instruction(history: &[Message]) -> String {
         return String::new();
     };
 
-    if !dispatch::is_approval(&user_message.content) {
+    if !dispatch::is_contextual_approval(&user_message.content) {
         return user_message.content.clone();
     }
 
     let previous_proposal = history[..user_index]
         .iter()
         .rev()
-        .find(|message| message.role == "assistant" && message.completion_state.is_none())
+        .find(|message| {
+            message.role == "assistant"
+                && message.completion_state.is_none()
+                && dispatch::proposal_capability(&message.content).is_some()
+        })
         .map(|message| message.content.trim())
         .filter(|content| !content.is_empty());
 
     match previous_proposal {
         Some(proposal) => format!("{proposal}\n\n用户批准：{}", user_message.content),
-        None => user_message.content.clone(),
+        None => history[..user_index]
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == "user"
+                    && message.completion_state.is_none()
+                    && !dispatch::is_contextual_approval(&message.content)
+            })
+            .map(|message| {
+                format!(
+                    "{}\n\n用户要求继续：{}",
+                    message.content, user_message.content
+                )
+            })
+            .unwrap_or_else(|| user_message.content.clone()),
     }
 }
 

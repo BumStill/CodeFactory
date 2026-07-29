@@ -312,6 +312,12 @@ pub fn completion_recovery_attempts_after_tool_batch(
     attempts
 }
 
+pub fn completion_recovery_attempts_after_steer(attempts: u32) -> u32 {
+    // A steer may refine or authorize the objective, but it must never mint a
+    // fresh set of recovery rounds for the same root turn.
+    attempts
+}
+
 /// Only unattended execution enters an automatic tools-disabled finalization
 /// round as soon as its evidence ledger is complete. Interactive/Execute may
 /// still have later planned mutations, so they finalize when the model
@@ -337,12 +343,29 @@ pub fn openai_tool_controls(
 pub fn active_tool_definitions(
     tool_defs: &[ToolDefinition],
     finalization_pending: bool,
-) -> &[ToolDefinition] {
+) -> Vec<ToolDefinition> {
     if finalization_pending {
-        &[]
+        Vec::new()
     } else {
-        tool_defs
+        tool_defs.to_vec()
     }
+}
+
+pub fn active_tool_definitions_for_capability(
+    tool_defs: &[ToolDefinition],
+    finalization_pending: bool,
+    capability: TurnCapability,
+) -> Vec<ToolDefinition> {
+    if finalization_pending {
+        return Vec::new();
+    }
+    tool_defs
+        .iter()
+        .filter(|definition| {
+            tool_visible_for_capability(capability, &definition.function.name)
+        })
+        .cloned()
+        .collect()
 }
 
 pub fn completion_command_and_kind(
@@ -446,11 +469,7 @@ fn is_review_safe_named_tool(tool_name: &str) -> bool {
             | "skill_fetch"
             | "bash"
             | "browser_session"
-    ) || [
-        "read_", "get_", "list_", "search_", "find_", "inspect_", "query_", "fetch_",
-    ]
-    .iter()
-    .any(|prefix| tool_name.starts_with(prefix))
+    )
 }
 
 pub fn tool_visible_for_capability(capability: TurnCapability, tool_name: &str) -> bool {
@@ -473,7 +492,7 @@ pub fn capability_denial(
             let mutating = matches!(kind, ToolKind::Mutation | ToolKind::BackgroundServiceStart);
             if mutating || !is_review_safe_named_tool(tool_name) {
                 Some(format!(
-                    "本回合是只读审视，已阻止 `{tool_name}`；需要修改时请由用户明确要求实施。"
+                    "本回合是只读审视，已阻止 `{tool_name}`；继续完成当前只读目标，不要要求用户重复确认。"
                 ))
             } else {
                 None
@@ -593,6 +612,42 @@ mod tests {
             &ToolKind::Mutation,
         )
         .is_none());
+    }
+
+    #[test]
+    fn review_denial_does_not_ask_the_user_to_repeat_authorization() {
+        let denial = capability_denial(
+            TurnCapability::ReviewOnly,
+            "bash",
+            "touch sentinel",
+            &ToolKind::Mutation,
+        )
+        .expect("mutation must be denied");
+        assert!(!denial.contains("请由用户明确要求"));
+        assert!(denial.contains("不要要求用户重复确认"));
+    }
+
+    #[test]
+    fn review_only_fails_closed_for_unknown_name_prefixed_tools() {
+        for name in ["read_and_delete", "get_and_publish", "list_then_write"] {
+            assert!(!tool_visible_for_capability(
+                TurnCapability::ReviewOnly,
+                name
+            ));
+            assert!(capability_denial(
+                TurnCapability::ReviewOnly,
+                name,
+                name,
+                &ToolKind::ReadOnly,
+            )
+            .is_some());
+        }
+    }
+
+    #[test]
+    fn steer_never_refills_the_turn_recovery_budget() {
+        assert_eq!(completion_recovery_attempts_after_steer(0), 0);
+        assert_eq!(completion_recovery_attempts_after_steer(1), 1);
     }
 
     #[test]

@@ -4,13 +4,19 @@
 
 ### Turn capability
 
-`TurnCapability = ReviewOnly | Implement | Deliver` 在接收用户消息时由框架确定，并作为不可扩大的 run config 传入 AgentLoop：
+`TurnCapability = ReviewOnly | Implement | Deliver` 在接收用户消息时由框架确定。它对模型和权限设置不可扩大，但真实用户在运行中发送的 steer 可以在下一安全轮次边界形成 capability revision：
 
 - ReviewOnly：读取、搜索、状态探测、无副作用验证。
 - Implement：增加本地 mutation；拒绝 commit/push/PR/merge/release/deploy。
 - Deliver：允许完整交付工具和明确的交付 shell。
 
-Tool schema 先按 capability 过滤；执行前再以真实 tool name、arguments 和 command classification 做第二道门禁。未知 MCP 在 ReviewOnly 中 fail closed。
+Tool schema 每轮按当前 capability 过滤；执行前再以真实 tool name、arguments 和 command classification 做第二道门禁。未知 MCP 在 ReviewOnly 中 fail closed。一次性预过滤是错误的，因为 ReviewOnly 起步的 root turn 在用户明确批准实施后会永久看不到写工具。
+
+### Continuation 与 steer
+
+`继续` 是控制事件，不再依赖上一回复末尾的问号。新 root 优先继承最近可执行 proposal；运行中 steer 则通过 `SteerInbox.capability_override` 在下一模型请求前原子更新硬门禁。能力变化会清除旧的结构拒绝标记，但不会清零累计 completion recovery。
+
+有效目标、completion gate 与 fact checker 使用同一份继承后的 instruction，避免“目标已是实施、能力仍是只读”的分裂。结构拒绝如果未被后续用户 capability revision 恢复，终态写为 blocked。
 
 ### Delivery preflight
 
@@ -35,7 +41,10 @@ Tool schema 先按 capability 过滤；执行前再以真实 tool name、argumen
 ```text
 user message
   -> decide turn capability
-  -> filter advertised tools
+  -> resolve effective objective / proposal
+  -> filter advertised tools for current capability
+  -> optional user steer capability revision
+  -> re-filter advertised tools
   -> AgentLoop execution gate
   -> tool outcome status
   -> evidence ledger / progress snapshot

@@ -196,6 +196,15 @@ impl ContextCompactor for NoOpCompactor {
 pub trait SteerInbox: Send + Sync {
     /// Take everything pending, leaving the inbox empty. Oldest first.
     async fn drain(&self) -> Vec<String>;
+
+    /// A real user steer may change the current turn's structural capability.
+    /// Surfaces without an intent dispatcher keep the current capability.
+    fn capability_override(
+        &self,
+        _content: &str,
+    ) -> Option<crate::run::TurnCapability> {
+        None
+    }
 }
 
 /// A steer inbox that is always empty — for surfaces with no interactive user

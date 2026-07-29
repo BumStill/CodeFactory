@@ -23,6 +23,11 @@
 | CF-SCC-R17 | `review_only` 只能看到并执行读取、搜索、状态探测和无副作用验证；`write/edit`、变更型 shell、交付、并行/委派以及未知 MCP 工具必须在 AgentLoop 结构层拒绝，不能依赖模型自律 | scripted transport + backend call counter + temp repo |
 | CF-SCC-R18 | `implement` 允许本地实现和验证但不允许 commit/push/PR/merge/release/deploy；只有当前用户明确要求交付，或明确批准包含交付的上一方案时，才进入 `deliver` | dispatch inheritance + bash/tool policy + real app |
 | CF-SCC-R19 | 结构门禁拒绝必须落为 `denied` 工具 outcome 并继续形成一次正常用户答复；内部拒绝原因不能冒充新的用户目标或触发隐藏交付纠偏 | event sequence + persistence + hydration |
+| CF-SCC-R20 | 「继续/可以继续」是显式状态转换，不依赖上一条助手回复是否以问号结尾。它必须继承最近的可执行方案；没有可执行方案时至少进入 Implement，除非当前文本明确要求继续分析/审视或停止修改 | dispatch matrix + real app |
+| CF-SCC-R21 | 运行中的真实用户 steer 必须在下一安全轮次边界重算 capability：可由 ReviewOnly 升为 Implement/Deliver，也可按“停止修改，只分析”收紧为 ReviewOnly。模型和权限设置均无权自行改变 capability | scripted loop + real app |
+| CF-SCC-R22 | capability 变化后必须重新按新 capability 暴露工具；先前一次性过滤的 tool schema 不得造成整条 root turn 永久锁死 | scripted tool-schema regression |
+| CF-SCC-R23 | steer 不得清零 root turn 的累计 recovery 次数；结构门禁拒绝后的终态必须为 blocked，不得写 `completed/任务已完成`，用户也不得被要求重复授权 | state-machine unit + SQLite truth |
+| CF-SCC-R24 | ReviewOnly 只允许显式登记的只读工具；未知 MCP 即使名称以 `read_/get_/list_` 开头也必须 fail closed。Git branch/switch/checkout/fetch/pull/stash 均属于本地仓库状态变更 | backend counter + command classification |
 
 ## Primary User Paths
 
@@ -33,6 +38,21 @@
 ### 执行与恢复路径
 
 用户明确要求实施，或点击结构化「继续执行」后进入 Execute。仅实施请求得到 `implement`，包含提交、PR、合并、发布或上线的明确请求得到 `deliver`。模型尝试结束但验证证据不足时，正文中的候选草稿和内部 recovery prompt 保持隐藏；同一位置显示一句紧凑状态，说明正在补充哪一项证据。每个 root turn 只允许一次定向恢复；仍不足时形成唯一的 `verification_incomplete` 结果，不能继续生成候选—拒绝—重试循环。
+
+运行中发送的新消息属于 steer revision，不是普通模型上下文附注。框架先根据用户原文更新结构 capability，再进入下一次模型调用；升级后重新开放对应工具，降级后下一次 mutation 必须在 permission 之前被拒绝。任何 steer 都不能补充 recovery 配额。
+
+## 状态转换矩阵
+
+| 当前状态 | 用户输入 | 下一状态 |
+| --- | --- | --- |
+| terminal/idle | 明确分析、不要修改 | 新 ReviewOnly root |
+| terminal/idle | 明确修复/实施 | 新 Implement root |
+| terminal/idle | 明确 PR/发布/上线 | 新 Deliver root |
+| terminal/idle | 继续/可以继续 | 继承最近可执行方案；无可执行方案时 Implement |
+| Active ReviewOnly | 明确开始实施/执行批准方案 | 下一安全边界升级 Implement |
+| Active ReviewOnly/Implement | 明确发布交付 | 下一安全边界升级 Deliver |
+| Active Implement/Deliver | 停止修改、继续分析 | 下一安全边界收紧 ReviewOnly |
+| 任意 active | capability/permission 拒绝且无法继续 | blocked，绝不 completed |
 
 ### 历史恢复路径
 
