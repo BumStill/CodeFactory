@@ -66,6 +66,24 @@ untracked `??` entries that pass the built-in noise denylist (`.claude/`,
 `.codefactory/attachments/`, …) plus the user's `delivery_exclude_globs`. Local
 junk can never be swept into a delivery commit.
 
+### Verification phase boundary — heavy before publish, light after
+
+Delivery distinguishes quality gates from release-fact checks. Heavyweight
+verification — project tests, type checks, builds, governance checks, and
+primary-path acceptance — belongs before merge and release. Once GitHub (or any
+forge/release system) has published an immutable tag and release assets, the
+post-release step should not rerun the whole project suite by default. It should
+only confirm the facts users can observe: the PR/MR is merged, the release tag
+contains the intended merge commit, the release is no longer a draft, required
+assets exist and are downloadable, the latest/updater pointer resolves to that
+version, and any configured deployment/live smoke passes.
+
+Escalate back to targeted heavy verification only when pre-release evidence is
+missing or stale, the release workflow generates/modifies code or packaging
+logic after the gate, or a release/live smoke fails. Rerunning full suites after
+publish as a routine completion ritual is intentionally disallowed: it cannot
+change the already-published artifact and it wastes user-visible delivery time.
+
 ### Idempotent / resumable state machine
 
 `deliver()` walks steps up to the effective ceiling; each checks reality first:

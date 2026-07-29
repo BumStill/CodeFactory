@@ -17,6 +17,7 @@ Owner：agent delivery
 - **REQ-DEL-005 Repository-owned live checks**：仓库可提交 `.codefactory/delivery.json`，配置无密钥 HTTP live assertion；支持状态码、响应正文包含值，以及用 `$GIT_SHA`/`$GIT_SHA_SHORT` 绑定本次交付版本。
 - **REQ-DEL-006 Fail closed**：未配置部署观察或 live verifier、部署仍 pending、线上断言不匹配时，不得返回 `delivered` 或声称上线；应返回可恢复的 `blocked` 并保留已完成步骤。
 - **REQ-DEL-007 Backward compatibility**：旧 Settings、旧 hook 和没有 `.codefactory/delivery.json` 的仓库继续可读；旧 hook 对新 action 返回 unsupported 时显示“未配置上线验证”，不得崩溃或伪造成功。
+- **REQ-DEL-008 Verification phase boundary**：重型验证（完整测试、构建、治理、主路径验收）必须在 merge/release 前完成；发布后只做轻量事实确认与 live smoke，不得把发布后的重复全量测试当作常规完成条件。发布后只有在 pre-release 证据缺失/过期、release workflow 在发布阶段生成或修改了需重新验证的代码/制品逻辑，或 release/live smoke 失败时，才扩大到针对性重验。
 
 ## Repository-owned configuration
 
@@ -59,13 +60,21 @@ Owner：agent delivery
 
 ## Primary User Path
 
-1. Agent 完成改动并验证本地行为。
+1. Agent 完成改动并在发布前验证本地行为：相关测试、构建、治理与主路径验收必须晚于最后一次源码/配置修改。
 2. `deliver_changes` 解析实际 remote、提交并推送。
-3. provider adapter 打开 PR/MR/Change，等待 CI 并合并。
+3. provider adapter 打开 PR/MR/Change，等待 CI 并合并；CI 是发布前质量门禁。
 4. release action 只记录“已触发”，不记录“已上线”。
-5. deployment observer 等待 Zeabur/其他 CD 得到成功结论。
-6. live verifier 对真实 URL 执行绑定本次 commit 的断言。
-7. 只有第 6 步通过，结果才显示 `live_verified` 和“上线已验证”。
+5. 发布后只执行轻量事实确认：tag/commit 归属、release 非 draft、资产存在、latest/updater 指针、release workflow 结论。
+6. deployment observer 等待 Zeabur/其他 CD 得到成功结论。
+7. live verifier 对真实 URL 执行绑定本次 commit 的断言。
+8. 只有第 7 步通过，结果才显示 `live_verified` 和“上线已验证”。发布后不得常规重跑全量测试；那类验证应前置到第 1–3 步。
+
+## Verification boundary
+
+- 发布前：运行完整或相关的测试、构建、类型检查、治理检查、主路径验收，并等待 PR/CI 绿灯。
+- 发布后：只验证发布事实与用户可见入口，包括 release workflow 结论、tag 包含 merge commit、release 已发布且资产齐全、latest/updater 指向新版本、配置的 deployment/live smoke 通过。
+- 禁止模式：GitHub release 已发布后，为了“证明发布”再无条件重跑全量 Rust/前端/build/headless；这些只能证明源码当前还能过，不能改变已发布资产，且会浪费用户时间。
+- 升级条件：若发布脚本在 release 阶段生成了新代码、资产签名/打包逻辑改变、pre-release 证据缺失或 live smoke 失败，才运行最小相关重验。
 
 ## Testing Matrix
 
