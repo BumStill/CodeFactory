@@ -50,7 +50,17 @@ Batching fixes all four, and you lose nothing: you can still release in minutes
    build must be green and artifacts complete before publish, and the "latest"
    pointer must resolve to the **highest** version (guard against
    out-of-order/rerun publishes stealing "latest").
-6. **The pipeline is resilient.** Transient infra failures (push 500s, registry
+6. **Put heavyweight verification before publishing.** Full local/project tests,
+   type checks, builds, governance checks, and primary-path acceptance belong
+   before merge/release. After a release is published, verification should be
+   limited to release facts: the intended commit is contained in the tag, the
+   release is not a draft, required assets are present and downloadable, the
+   updater/latest pointer resolves to that version, and any configured live smoke
+   proves the shipped artifact/service is reachable. Do **not** rerun full test
+   suites after publish unless the release workflow changed code after the
+   pre-release gate, the pre-release evidence is missing/stale, or a release/live
+   smoke actually failed and needs repair.
+7. **The pipeline is resilient.** Transient infra failures (push 500s, registry
    download drops) retry rather than abort. See the repo's release workflows.
 
 ## How to apply it in a new repo
