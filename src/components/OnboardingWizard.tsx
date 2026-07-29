@@ -77,8 +77,8 @@ export function OnboardingWizard({
             </>
           ) : (
             <span className="text-gray-400">
-              ① 还没有可用模型:在 <span className="text-gray-200">设置 → 端点</span> 登录
-              ChatGPT(推荐)或填入 API Key。
+              ① 还没有可用模型:在 <span className="text-gray-200">设置 → 端点</span> 填入
+              API Key,或用 ChatGPT 登录(非官方通道,可能失效)。
             </span>
           )}
         </div>
