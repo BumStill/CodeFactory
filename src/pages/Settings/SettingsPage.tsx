@@ -596,17 +596,37 @@ export function SettingsPage({
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
-  const tabs: { id: Tab; label: string }[] = [
-    { id: "capabilities", label: "功能" },
-    { id: "usage", label: "用量与预算" },
-    { id: "endpoints", label: "端点" },
-    { id: "browser", label: "浏览器会话" },
-    { id: "general", label: "通用" },
-    { id: "appearance", label: "外观" },
-    { id: "hooks", label: "钩子" },
-    { id: "remotes", label: "远程仓库" },
-    { id: "about", label: "关于" },
+  const tabGroups: {
+    label: string;
+    tabs: { id: Tab; label: string; description: string }[];
+  }[] = [
+    {
+      label: "工作流",
+      tabs: [
+        { id: "capabilities", label: "功能", description: "进入画像、资源、评测和控制平面等跨会话能力。" },
+        { id: "usage", label: "用量与预算", description: "查看模型调用、Token 成本趋势和预算提醒。" },
+        { id: "general", label: "通用", description: "设置 shell、并行任务、交付上限、通知、沙箱和数据备份。" },
+      ],
+    },
+    {
+      label: "模型与连接",
+      tabs: [
+        { id: "endpoints", label: "端点", description: "配置模型登录、API 端点和新会话默认路由策略。" },
+        { id: "browser", label: "浏览器会话", description: "查看并结束 CodeFactory 创建的受管自动化浏览器。" },
+        { id: "hooks", label: "钩子", description: "配置工具、任务和验证事件触发的本地自动化。" },
+        { id: "remotes", label: "远程仓库", description: "配置代码交付使用的 GitHub/GitLab 凭据或复用 GitHub CLI。" },
+      ],
+    },
+    {
+      label: "应用",
+      tabs: [
+        { id: "appearance", label: "外观", description: "调整主题、字体和字号。" },
+        { id: "about", label: "关于", description: "查看版本、检查更新并打开项目主页。" },
+      ],
+    },
   ];
+  const allTabs = tabGroups.flatMap((group) => group.tabs);
+  const activeTab = allTabs.find((t) => t.id === tab) ?? allTabs[0];
 
   return (
     <div className="flex h-full flex-col bg-surface-0 text-gray-200">
@@ -621,25 +641,50 @@ export function SettingsPage({
         <span className="text-sm font-semibold">设置</span>
 
         {/* Tabs */}
-        <div className="ml-4 flex max-w-full gap-1 overflow-x-auto">
-          {tabs.map((t) => (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              className={`px-3 py-1 rounded text-xs transition-colors ${
-                tab === t.id
-                  ? "bg-surface-3 text-gray-200"
-                  : "text-gray-500 hover:text-gray-300 hover:bg-surface-2"
-              }`}
-            >
-              {t.label}
-            </button>
+        <nav
+          aria-label="设置分类"
+          role="tablist"
+          className="ml-4 flex max-w-full items-center gap-3 overflow-x-auto"
+        >
+          {tabGroups.map((group) => (
+            <div key={group.label} className="flex shrink-0 items-center gap-1.5">
+              <span className="text-[10px] font-medium text-gray-600">{group.label}</span>
+              <div className="flex items-center gap-1">
+                {group.tabs.map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={tab === t.id}
+                    aria-controls={`settings-panel-${t.id}`}
+                    id={`settings-tab-${t.id}`}
+                    onClick={() => setTab(t.id)}
+                    className={`px-3 py-1 rounded text-xs transition-colors ${
+                      tab === t.id
+                        ? "bg-surface-3 text-gray-200 shadow-sm"
+                        : "text-gray-500 hover:text-gray-300 hover:bg-surface-2"
+                    }`}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            </div>
           ))}
-        </div>
+        </nav>
       </header>
 
       {/* Body */}
-      <div className="flex-1 overflow-y-auto p-5">
+      <div
+        id={`settings-panel-${activeTab.id}`}
+        role="tabpanel"
+        aria-labelledby={`settings-tab-${activeTab.id}`}
+        className="flex-1 overflow-y-auto p-5"
+      >
+        <div className="mb-5 max-w-3xl rounded-lg border border-border bg-surface-1 px-3 py-2.5">
+          <div className="text-sm font-medium text-gray-200">{activeTab.label}</div>
+          <p className="mt-1 text-xs leading-5 text-gray-500">{activeTab.description}</p>
+        </div>
 
         {/* ── Product capabilities moved out of the Workspace toolbar ── */}
         {tab === "capabilities" && (
