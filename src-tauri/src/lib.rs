@@ -2,6 +2,7 @@
 mod agent;
 mod ai_text;
 mod benchmark;
+mod browser;
 mod benchmark_consistency;
 mod codex_auth;
 mod commands;
