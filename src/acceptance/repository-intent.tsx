@@ -239,7 +239,7 @@ useTasksStore.setState({
 });
 
 function AcceptanceApp() {
-  const [settingsTab, setSettingsTab] = React.useState<"endpoints" | "permissions" | null>(null);
+  const [settingsTab, setSettingsTab] = React.useState<"endpoints" | null>(null);
   return (
     <div className="h-screen">
       {settingsTab ? (
@@ -248,8 +248,8 @@ function AcceptanceApp() {
         <WorkspacePage
           sessionId={sessionId}
           onNewConversation={() => {}}
-          onOpenSettings={(tab) => {
-            const target = tab === "permissions" ? "permissions" : "endpoints";
+          onOpenSettings={() => {
+            const target = "endpoints";
             (window as typeof window & { __settingsTab?: string }).__settingsTab = target;
             setSettingsTab(target);
           }}

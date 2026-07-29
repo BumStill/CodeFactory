@@ -19,18 +19,39 @@ use std::time::Duration;
 
 use codefactory_agent_loop::services::{PermissionGateway, PermissionOutcome};
 
+use sqlx::SqlitePool;
+
 use crate::config::settings::Settings;
 use crate::openrouter::types::{StreamEvent, ToolCall};
 use crate::PendingPermissionMap;
 
 use super::events::EventSink;
-use super::{await_permission_response, decide_permission, PermissionDecision, PermissionResponse};
+use super::{
+    await_permission_response, decide_permission, permission_policy_for_mode, PermissionDecision,
+    PermissionResponse,
+};
 
 pub(super) struct DesktopPermissionGateway {
     pub(super) settings: Arc<tokio::sync::RwLock<Settings>>,
+    pub(super) db: SqlitePool,
+    pub(super) session_id: String,
     pub(super) events: Arc<dyn EventSink>,
     pub(super) pending_permissions: PendingPermissionMap,
     pub(super) cancel: Option<Arc<AtomicBool>>,
+}
+
+async fn resolve_session_permission_policy(db: &SqlitePool, session_id: &str) -> crate::config::settings::PermissionPolicy {
+    let mode = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT permission_mode FROM sessions WHERE id = ?",
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .unwrap_or_else(|| "standard".to_string());
+    permission_policy_for_mode(&mode)
 }
 
 #[async_trait::async_trait]
@@ -41,10 +62,7 @@ impl PermissionGateway for DesktopPermissionGateway {
         args: &serde_json::Value,
         bash_command: Option<&str>,
     ) -> PermissionOutcome {
-        let policy = {
-            let settings = self.settings.read().await;
-            settings.permissions.clone()
-        };
+        let policy = resolve_session_permission_policy(&self.db, &self.session_id).await;
         match decide_permission(&policy, &tool_call.function.name, bash_command) {
             PermissionDecision::Allow => PermissionOutcome::Allow,
             PermissionDecision::Ask => self.request_permission(tool_call, args.clone()).await,
@@ -95,5 +113,43 @@ impl DesktopPermissionGateway {
             ),
             PermissionResponse::Cancelled => PermissionOutcome::Cancelled,
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+    use crate::agent::{decide_permission, PermissionDecision};
+
+    #[tokio::test]
+    async fn session_permission_policy_is_read_from_session_row() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, permission_mode TEXT NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sessions (id, permission_mode) VALUES ('safe-session', 'safe'), ('trusted-session', 'trusted')")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let safe = resolve_session_permission_policy(&db, "safe-session").await;
+        assert_eq!(decide_permission(&safe, "write_file", None), PermissionDecision::Ask);
+
+        let trusted = resolve_session_permission_policy(&db, "trusted-session").await;
+        assert_eq!(
+            decide_permission(&trusted, "bash", Some("pnpm test")),
+            PermissionDecision::Allow
+        );
+
+        let missing = resolve_session_permission_policy(&db, "missing").await;
+        assert_eq!(decide_permission(&missing, "bash", Some("pnpm test")), PermissionDecision::Ask);
     }
 }

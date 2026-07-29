@@ -23,7 +23,7 @@ describe("PermissionDialog tool-args preview", () => {
           toolName: "edit_file",
           args: { path: "src/app.ts", old_string: "old line", new_string: "new line" },
         })}
-        fullAccess={false}
+        trusted={false}
         {...noop}
       />,
     );
@@ -41,7 +41,7 @@ describe("PermissionDialog tool-args preview", () => {
           toolName: "write_file",
           args: { path: "src/new.ts", content: "export const x = 1;" },
         })}
-        fullAccess={false}
+        trusted={false}
         {...noop}
       />,
     );
@@ -51,11 +51,24 @@ describe("PermissionDialog tool-args preview", () => {
     expect(screen.queryByText(/"content"/)).not.toBeInTheDocument();
   });
 
+  it("offers to trust only the current session", () => {
+    render(
+      <PermissionDialog
+        request={baseRequest({ toolName: "bash", args: { command: "pnpm test" } })}
+        trusted={false}
+        {...noop}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "信任本会话并允许" })).toBeInTheDocument();
+    expect(screen.queryByText("完全访问并允许")).toBeNull();
+  });
+
   it("falls back to raw JSON for tools without a structured preview", () => {
     render(
       <PermissionDialog
         request={baseRequest({ toolName: "bash", args: { command: "ls -la" } })}
-        fullAccess={false}
+        trusted={false}
         {...noop}
       />,
     );

@@ -22,6 +22,7 @@ import { SessionSidebar } from "../../components/SessionSidebar";
 import { DraftScopeBar } from "../../components/DraftScopeBar";
 import { ModelPicker } from "../../components/ModelPicker";
 import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
+import { PermissionModePicker } from "../../components/PermissionModePicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
 import { GitStatusBar } from "../../components/GitStatusBar";
@@ -34,7 +35,6 @@ import { recentProjects } from "../../lib/projects";
 import { invoke } from "../../lib/tauri";
 import { useChatStore, activeRuntime } from "../../stores/chat";
 import { QueueBadge } from "../../components/QueueBadge";
-import { useSettingsStore } from "../../stores/settings";
 import { useTasksStore } from "../../stores/tasks";
 import type { TaskRun, VerificationResult } from "../../lib/tauri";
 import type { ExternalJobState, TurnTimingProfile } from "../../lib/chatPlan";
@@ -44,7 +44,7 @@ interface WorkspacePageProps {
   sessionId: string;
   /** Start a blank conversation, optionally scoped to a project directory. */
   onNewConversation: (cwd?: string | null) => void;
-  onOpenSettings: (tab?: "capabilities" | "endpoints" | "permissions") => void;
+  onOpenSettings: (tab?: "capabilities" | "endpoints") => void;
   onOpenUsage?: () => void;
   /** Switch the workspace to another session in-place (from the sidebar). */
   onOpenSession: (id: string) => void;
@@ -88,7 +88,6 @@ export function WorkspacePage({
     historyTruncated,
   } = useChatStore(activeRuntime);
   const isAnonymous = activeSession?.kind === "anonymous";
-  const settings = useSettingsStore((state) => state.settings);
   const persistedRunActive = useTasksStore((state) => state.running[sessionId] ?? false);
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
@@ -308,6 +307,7 @@ export function WorkspacePage({
         {/* Per-session reasoning override needs a DB row; anonymous chats use
             the global default, so the picker is hidden for them. */}
         {!isAnonymous && <ReasoningEffortPicker />}
+        <PermissionModePicker />
 
         <div className="flex items-center gap-1.5">
           <GitStatusBar
@@ -477,7 +477,7 @@ export function WorkspacePage({
       {pendingPermission && (
         <PermissionDialog
           request={pendingPermission}
-          fullAccess={settings?.permissions.full_access ?? false}
+          trusted={(activeSession?.permission_mode ?? "standard") === "trusted"}
           onAllow={() => respondPermission(true)}
           onDeny={() => respondPermission(false)}
           onAllowFullAccess={() => respondPermission(true, { grantFullAccess: true })}
@@ -496,7 +496,7 @@ export function WorkspacePage({
 function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onRequestRepair, onClose }: {
   sessionId: string;
   highlightedTaskId?: string | null;
-  onOpenSettings: (tab: "endpoints" | "permissions") => void;
+  onOpenSettings: (tab: "endpoints") => void;
   onRequestRepair: (task: TaskRun) => void;
   onClose: () => void;
 }) {
@@ -589,7 +589,7 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onRequestRe
             <button aria-label={`已修复，重试 ${providerBlockedTasks.length} 项`} title={`重试：${providerBlockedTasks.map((task) => task.title).join("、")}`} onClick={() => void handleRetryBlocked(providerBlockedTasks)} disabled={blockedRetryBusy} className="flex items-center gap-1 rounded bg-emerald-500/10 px-2 py-1 text-[10px] text-emerald-700 disabled:opacity-40 dark:text-emerald-300"><RefreshCw size={9} />已修复，重试 {providerBlockedTasks.length} 项</button></>
           )}
           {!isRunning && permissionBlockedTasks.length > 0 && (
-            <><button onClick={() => onOpenSettings("permissions")} className="rounded bg-accent/10 px-2 py-1 text-[10px] text-accent hover:bg-accent/20">打开权限设置</button>
+            <><button onClick={() => onOpenSettings("endpoints")} className="rounded bg-accent/10 px-2 py-1 text-[10px] text-accent hover:bg-accent/20">调整会话权限</button>
             <button onClick={() => void handleRetryBlocked(permissionBlockedTasks)} disabled={blockedRetryBusy} className="rounded bg-emerald-500/10 px-2 py-1 text-[10px] text-emerald-700 disabled:opacity-40 dark:text-emerald-300">已授权，重试 {permissionBlockedTasks.length} 项</button></>
           )}
           {!isRunning && conversationBlockedTasks.length > 0 && (

@@ -1273,6 +1273,8 @@ impl AgentLoop {
     fn permission_gateway(&self) -> permission_gateway::DesktopPermissionGateway {
         permission_gateway::DesktopPermissionGateway {
             settings: self.settings.clone(),
+            db: self.db.clone(),
+            session_id: self.session_id.clone(),
             events: self.events.clone(),
             pending_permissions: self.pending_permissions.clone(),
             cancel: self.cancel.clone(),
@@ -2376,6 +2378,55 @@ enum PermissionDecision {
     Deny(String),
 }
 
+pub(super) fn permission_policy_for_mode(mode: &str) -> PermissionPolicy {
+    let read_tools = vec![
+        "read_file".to_string(),
+        "glob".to_string(),
+        "grep".to_string(),
+        "read_pptx".to_string(),
+        "read_xlsx".to_string(),
+        "kb_search".to_string(),
+        "kb_get_chunk".to_string(),
+    ];
+    let standard_tools = vec![
+        "read_file".to_string(),
+        "glob".to_string(),
+        "grep".to_string(),
+        "read_pptx".to_string(),
+        "write_file".to_string(),
+        "edit_file".to_string(),
+        "write_pptx".to_string(),
+        "edit_pptx".to_string(),
+        "format_pptx".to_string(),
+        "write_docx".to_string(),
+        "read_xlsx".to_string(),
+        "edit_xlsx".to_string(),
+        "kb_search".to_string(),
+        "kb_get_chunk".to_string(),
+        "update_plan".to_string(),
+    ];
+    match mode {
+        "safe" => PermissionPolicy {
+            allow: read_tools,
+            ask: vec!["*".to_string()],
+            deny: vec![],
+            full_access: false,
+        },
+        "trusted" => PermissionPolicy {
+            allow: vec!["*".to_string()],
+            ask: vec![],
+            deny: vec![],
+            full_access: true,
+        },
+        _ => PermissionPolicy {
+            allow: standard_tools,
+            ask: vec!["bash".to_string(), "browser_session".to_string()],
+            deny: vec![],
+            full_access: false,
+        },
+    }
+}
+
 fn decide_permission(
     policy: &PermissionPolicy,
     tool_name: &str,
@@ -3315,6 +3366,39 @@ mod tests {
         assert_eq!(
             decide_permission(&policy, "write_file", None),
             PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn permission_modes_hide_tool_lists_behind_presets() {
+        let safe = permission_policy_for_mode("safe");
+        assert_eq!(
+            decide_permission(&safe, "write_file", None),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            decide_permission(&safe, "read_file", None),
+            PermissionDecision::Allow
+        );
+
+        let standard = permission_policy_for_mode("standard");
+        assert_eq!(
+            decide_permission(&standard, "write_file", None),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            decide_permission(&standard, "bash", Some("pnpm test")),
+            PermissionDecision::Ask
+        );
+
+        let trusted = permission_policy_for_mode("trusted");
+        assert_eq!(
+            decide_permission(&trusted, "bash", Some("pnpm test")),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            decide_permission(&trusted, "bash", Some("Remove-Item -Recurse -Force .\\dist")),
+            PermissionDecision::Ask
         );
     }
 

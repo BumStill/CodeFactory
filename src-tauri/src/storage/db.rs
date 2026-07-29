@@ -1100,6 +1100,17 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ensure_column(pool, "sessions", "kind", "TEXT NOT NULL DEFAULT 'project'").await?;
     // Per-session reasoning effort override (NULL → use the global default).
     ensure_column(pool, "sessions", "reasoning_effort", "TEXT").await?;
+    // Per-session permission preset. Existing sessions get standard so old
+    // global allow/ask/deny details no longer leak into the primary UX.
+    ensure_column(pool, "sessions", "permission_mode", "TEXT NOT NULL DEFAULT 'standard'").await?;
+    if table_exists(pool, "sessions").await? {
+        sqlx::query(
+            "UPDATE sessions SET permission_mode = 'standard'
+             WHERE permission_mode IS NULL OR permission_mode NOT IN ('safe','standard','trusted')",
+        )
+        .execute(pool)
+        .await?;
+    }
     // Model runtime ownership moved from global Settings to the session.
     // Existing rows stay fixed and unresolved rather than silently crossing
     // providers after upgrade.
@@ -1547,12 +1558,19 @@ mod tests {
                 .unwrap();
         assert!(cols.contains(&"endpoint_id".to_string()), "{cols:?}");
         assert!(cols.contains(&"model_policy".to_string()), "{cols:?}");
+        assert!(cols.contains(&"permission_mode".to_string()), "{cols:?}");
         let policy: String =
             sqlx::query_scalar("SELECT model_policy FROM sessions WHERE id='legacy'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
         assert_eq!(policy, "fixed");
+        let permission_mode: String =
+            sqlx::query_scalar("SELECT permission_mode FROM sessions WHERE id='legacy'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(permission_mode, "standard");
 
         let attempts: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master

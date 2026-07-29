@@ -8,6 +8,7 @@ import type {
   StreamEvent,
   ModelInfo,
   ReasoningEffort,
+  PermissionMode,
   TurnPlanSnapshot,
   AnonTurn,
 } from "../lib/tauri";
@@ -53,6 +54,7 @@ export interface DraftSession {
   cwd: string | null;
   anonymous: boolean;
   modelId: string;
+  permissionMode?: PermissionMode;
   text: string;
 }
 
@@ -193,6 +195,7 @@ interface ChatStore {
     modelId: string;
     policy: "fixed" | "prefer" | "auto";
   }) => Promise<void>;
+  updateActiveSessionPermissionMode: (mode: PermissionMode) => Promise<void>;
   updateActiveSessionReasoningEffort: (effort: ReasoningEffort | null) => Promise<void>;
   exitAnonymous: () => void;
 
@@ -248,6 +251,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       cwd,
       anonymous,
       modelId: get().activeModel,
+      permissionMode: "standard",
       text: "",
     };
     // Bumping the selection id cancels any in-flight session hydration, so a
@@ -826,6 +830,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }));
   },
 
+  updateActiveSessionPermissionMode: async (mode) => {
+    const session = get().activeSession;
+    if (!session) return;
+    const updated = await invoke<Session>("update_session_permission_mode", {
+      sessionId: session.id,
+      mode,
+    });
+    set((state) => ({
+      activeSession: updated,
+      sessions: state.sessions.map((item) => item.id === updated.id ? updated : item),
+    }));
+  },
+
   updateActiveSessionReasoningEffort: async (effort) => {
     const activeSession = get().activeSession;
     if (!activeSession) return;
@@ -888,29 +905,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     if (!id) return;
     const pending = get().runtime[id]?.pendingPermission;
     if (!pending) return;
-    // "完全访问并允许": persist full_access so this call AND every subsequent
-    // tool call stops prompting. The running agent loop re-reads settings from
-    // the shared handle on each tool call, so flipping it here (before we
-    // unblock the current call) takes effect for the rest of this turn too, and
-    // `save_settings` persists it for future sessions + reflects it in Settings.
-    // Previously this button was a no-op alias of "仅允许一次".
+    // “信任本会话并允许”：只把当前会话切到 trusted。权限不再是全局设置，
+    // 也不要求用户维护工具 allow/ask/deny 明细；运行中的 agent 每次工具
+    // 判断都会重读 sessions.permission_mode。
     if (allow && opts?.grantFullAccess) {
-      const { settings, save } = useSettingsStore.getState();
-      if (settings && !settings.permissions.full_access) {
-        try {
-          await save({
-            ...settings,
-            permissions: { ...settings.permissions, full_access: true },
-          });
-        } catch (e) {
-          // Persisting failed — fall back to allow-once so the call doesn't
-          // hang. The user can enable full access from Settings instead.
-          // Surfaced (not silently swallowed): the user believes they just
-          // granted standing full access, so a failure here means every
-          // future tool call will keep prompting until they notice and
-          // retry from Settings.
-          console.error("Failed to persist full_access permission grant:", e);
-        }
+      try {
+        await get().updateActiveSessionPermissionMode("trusted");
+      } catch (e) {
+        // Persisting failed — fall back to allow-once so the call doesn't hang.
+        console.error("Failed to persist trusted permission mode for session:", e);
       }
     }
     await invoke("respond_to_permission", { toolCallId: pending.toolCallId, allow });
