@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The permission dialog's "完全访问并允许" button must actually GRANT full
-// access — persist it so the running turn AND future sessions stop prompting —
-// not silently behave like "仅允许一次". For several releases the two buttons
-// were wired to the identical `respondPermission(true)` no-op, so the
-// full-access button lied. This pins the real contract.
+// The permission dialog's "信任本会话并允许" button must grant trust to the
+// CURRENT session only. Permissions are no longer a global tool-list settings
+// page; this pins that the button persists sessions.permission_mode='trusted'
+// before allowing the current call.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { useChatStore, freshRuntime } from "./chat";
@@ -72,18 +71,21 @@ beforeEach(() => {
   seedPending();
 });
 
-describe("respondPermission — full access", () => {
-  it("persists full_access, then responds allow for the current call", async () => {
+describe("respondPermission — session permission mode", () => {
+  it("persists trusted mode on the current session, then responds allow", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "update_session_permission_mode") {
+        return { ...session, permission_mode: (args as { mode: string }).mode };
+      }
+      return undefined;
+    });
+
     await useChatStore.getState().respondPermission(true, { grantFullAccess: true });
 
-    const saveCall = invokeMock.mock.calls.find((c) => c[0] === "save_settings");
-    expect(saveCall, "save_settings must be invoked").toBeTruthy();
-    expect((saveCall![1] as { newSettings: Settings }).newSettings.permissions.full_access).toBe(
-      true,
-    );
-    // Shared settings now reflect full access — the running turn re-reads this.
-    expect(useSettingsStore.getState().settings?.permissions.full_access).toBe(true);
-    // The current call is still allowed.
+    const modeCall = invokeMock.mock.calls.find((c) => c[0] === "update_session_permission_mode");
+    expect(modeCall![1]).toEqual({ sessionId: "A", mode: "trusted" });
+    expect(useChatStore.getState().activeSession?.permission_mode).toBe("trusted");
+    expect(invokeMock.mock.calls.some((c) => c[0] === "save_settings")).toBe(false);
     const respondCall = invokeMock.mock.calls.find((c) => c[0] === "respond_to_permission");
     expect(respondCall![1]).toEqual({ toolCallId: "tc1", allow: true });
   });
@@ -95,28 +97,16 @@ describe("respondPermission — full access", () => {
     expect(respondCall![1]).toEqual({ toolCallId: "tc1", allow: true });
   });
 
-  it("does not re-persist when full access is already enabled", async () => {
-    useSettingsStore.setState({ settings: mkSettings(true) });
-    seedPending();
-    await useChatStore.getState().respondPermission(true, { grantFullAccess: true });
-    expect(invokeMock.mock.calls.some((c) => c[0] === "save_settings")).toBe(false);
-    const respondCall = invokeMock.mock.calls.find((c) => c[0] === "respond_to_permission");
-    expect(respondCall![1]).toEqual({ toolCallId: "tc1", allow: true });
-  });
-
-  it("falls back to allow-once (not silently) when persisting full_access fails", async () => {
+  it("falls back to allow-once (not silently) when persisting trusted mode fails", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "save_settings") throw new Error("disk full");
+      if (cmd === "update_session_permission_mode") throw new Error("db full");
       return undefined;
     });
 
     await useChatStore.getState().respondPermission(true, { grantFullAccess: true });
 
-    // The failure must be surfaced, not swallowed silently.
     expect(consoleError).toHaveBeenCalled();
-    // The current call still goes through — it must not hang waiting on a
-    // persisted grant that never landed.
     const respondCall = invokeMock.mock.calls.find((c) => c[0] === "respond_to_permission");
     expect(respondCall![1]).toEqual({ toolCallId: "tc1", allow: true });
     consoleError.mockRestore();

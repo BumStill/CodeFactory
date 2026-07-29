@@ -77,7 +77,7 @@ async function assertWorkspace(page, tag) {
   await header.waitFor();
   await sidebar.waitFor();
   assert((await header.getByRole("button", { name: "新建空白会话" }).count()) === 0, `[${tag}] duplicate header new-session action remains`);
-  assert((await page.getByRole("button", { name: "新建", exact: true }).count()) === 1, `[${tag}] workspace must expose exactly one new-session menu`);
+  assert((await page.getByRole("button", { name: "新建会话", exact: true }).count()) === 1, `[${tag}] workspace must expose exactly one new-session menu`);
   assert((await header.getByRole("button", { name: "收起会话侧栏" }).count()) === 1, `[${tag}] collapse control missing`);
   assert((await conversation.getByText("会话执行详情", { exact: true }).count()) === 0, `[${tag}] fixed execution detail remains in conversation`);
   assert((await conversation.getByText("在会话内执行仓库需求", { exact: true }).count()) === 0, `[${tag}] delegated task leaked into conversation`);
@@ -173,7 +173,7 @@ async function assertWorkspace(page, tag) {
   assert((await page.getByRole("complementary", { name: "会话列表" }).count()) === 0, `[${tag}] collapsed state did not persist across reload`);
   await page.getByRole("banner", { name: "会话工具栏" }).getByRole("button", { name: "展开会话侧栏" }).click();
   await page.getByRole("complementary", { name: "会话列表" }).waitFor();
-  assert((await page.getByRole("button", { name: "新建", exact: true }).count()) === 1, `[${tag}] restored sidebar changed the single new-session entry contract`);
+  assert((await page.getByRole("button", { name: "新建会话", exact: true }).count()) === 1, `[${tag}] restored sidebar changed the single new-session entry contract`);
   await page.reload({ waitUntil: "networkidle" });
   await page.getByRole("complementary", { name: "会话列表" }).waitFor({ timeout: 10_000 });
   assert((await page.getByRole("banner", { name: "会话工具栏" }).getByRole("button", { name: "收起会话侧栏" }).count()) === 1, `[${tag}] expanded state did not persist across reload`);

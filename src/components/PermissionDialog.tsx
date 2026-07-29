@@ -7,7 +7,7 @@ import { DiffViewer, parseUnifiedDiffResult } from "./DiffViewer";
 
 interface Props {
   request: PendingPermission;
-  fullAccess: boolean;
+  trusted: boolean;
   onAllow: () => void;
   onDeny: () => void;
   onAllowFullAccess: () => void;
@@ -74,7 +74,7 @@ function ToolArgsPreview({ request }: { request: PendingPermission }) {
 
 export function PermissionDialog({
   request,
-  fullAccess,
+  trusted,
   onAllow,
   onDeny,
   onAllowFullAccess,
@@ -95,9 +95,9 @@ export function PermissionDialog({
         <div className="max-h-[45vh] overflow-auto px-4 py-3">
           <div className="mb-2 text-xs uppercase tracking-wide text-gray-600">参数</div>
           <ToolArgsPreview request={request} />
-          {fullAccess && (
+          {trusted && (
             <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
-              已启用完全访问，后续匹配的工具调用将不再提示。
+              当前会话已处于信任模式，普通工具会减少确认；高风险命令仍会拦截。
             </div>
           )}
         </div>
@@ -122,7 +122,7 @@ export function PermissionDialog({
             className="inline-flex items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-900 dark:text-amber-100 hover:bg-amber-500/20"
           >
             <Unlock size={13} />
-            完全访问并允许
+            信任本会话并允许
           </button>
         </div>
       </div>

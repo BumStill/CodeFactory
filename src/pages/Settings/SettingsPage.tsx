@@ -38,7 +38,7 @@ import { CHATGPT_DEFAULT_MODEL, CHATGPT_ENDPOINT_KEY } from "../../lib/chatgptMo
 import { syncChatGptCatalog } from "../../stores/chatgptCatalog";
 import { UsageDashboardSection } from "../../components/UsageDashboardSection";
 
-export type SettingsTab = "capabilities" | "usage" | "endpoints" | "permissions" | "browser" | "general" | "hooks" | "remotes" | "appearance" | "about";
+export type SettingsTab = "capabilities" | "usage" | "endpoints" | "browser" | "general" | "hooks" | "remotes" | "appearance" | "about";
 
 interface Props {
   onBack: () => void;
@@ -79,63 +79,6 @@ interface HookConfig {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-function TagList({
-  label,
-  tags,
-  onChange,
-}: {
-  label: string;
-  tags: string[];
-  onChange: (t: string[]) => void;
-}) {
-  const [input, setInput] = useState("");
-
-  const add = () => {
-    const v = input.trim();
-    if (v && !tags.includes(v)) onChange([...tags, v]);
-    setInput("");
-  };
-
-  return (
-    <div className="space-y-1.5">
-      <span className="text-xs text-gray-500">{label}</span>
-      <div className="flex flex-wrap gap-1 min-h-[28px]">
-        {tags.map((t) => (
-          <span
-            key={t}
-            className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-surface-3 text-xs text-gray-300"
-          >
-            {t}
-            <button
-              onClick={() => onChange(tags.filter((x) => x !== t))}
-              className="text-gray-600 hover:text-red-400"
-            >
-              ×
-            </button>
-          </span>
-        ))}
-      </div>
-      <div className="flex gap-1">
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && add()}
-          placeholder="添加工具名称…"
-          className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
-        />
-        <button
-          onClick={add}
-          className="px-2 py-1 rounded bg-surface-3 hover:bg-surface-4 text-xs text-gray-400 border border-border"
-        >
-          添加
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// ── Endpoint editor ───────────────────────────────────────────────────────────
 
 interface EndpointDraft {
   key: string;       // map key in settings.endpoints
@@ -481,11 +424,9 @@ export function SettingsPage({
   onOpenControlPlane,
 }: Props) {
   const { settings, load, save, saveApiKey } = useSettingsStore();
-  const [tab, setTab] = useState<Tab>(initialTab ?? "endpoints");
+  const [tab, setTab] = useState<Tab>((initialTab as Tab | undefined) ?? "endpoints");
   const [endpointDrafts, setEndpointDrafts] = useState<EndpointDraft[]>([]);
   const [showAddEp, setShowAddEp] = useState(false);
-  const [permDraft, setPermDraft] = useState<Settings["permissions"] | null>(null);
-  const [permSaved, setPermSaved] = useState(false);
   const [generalDraft, setGeneralDraft] = useState<{
     default_model: string;
     shell: string;
@@ -525,7 +466,6 @@ export function SettingsPage({
       })),
     );
 
-    setPermDraft({ ...settings.permissions });
     setGeneralDraft({
       default_model: settings.default_model,
       shell: settings.shell.shell,
@@ -542,7 +482,7 @@ export function SettingsPage({
     });
   }, [settings]);
 
-  if (!settings || !permDraft || !generalDraft) {
+  if (!settings || !generalDraft) {
     return (
       <div className="flex h-full items-center justify-center text-xs text-gray-600">
         正在加载设置…
@@ -625,15 +565,6 @@ export function SettingsPage({
     ]);
   };
 
-  // ── Permissions handlers ───────────────────────────────────────────────────
-
-  const handleSavePerms = async () => {
-    if (!permDraft) return;
-    await save({ ...settings, permissions: permDraft });
-    setPermSaved(true);
-    setTimeout(() => setPermSaved(false), 1500);
-  };
-
   // ── General handlers ───────────────────────────────────────────────────────
 
   const handleSaveGeneral = async () => {
@@ -669,7 +600,6 @@ export function SettingsPage({
     { id: "capabilities", label: "功能" },
     { id: "usage", label: "用量与预算" },
     { id: "endpoints", label: "端点" },
-    { id: "permissions", label: "权限" },
     { id: "browser", label: "浏览器会话" },
     { id: "general", label: "通用" },
     { id: "appearance", label: "外观" },
@@ -827,59 +757,6 @@ export function SettingsPage({
                 onClose={() => setShowAddEp(false)}
               />
             )}
-          </div>
-        )}
-
-        {/* ── Permissions ── */}
-        {tab === "permissions" && (
-          <div className="max-w-xl space-y-4">
-            <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-              工具权限
-            </h2>
-
-            <label className="flex items-start gap-3 rounded-lg border border-border bg-surface-1 px-3 py-2.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={permDraft.full_access}
-                onChange={(e) =>
-                  setPermDraft({ ...permDraft, full_access: e.target.checked })
-                }
-                className="mt-0.5"
-              />
-              <span>
-                <span className="block text-xs font-medium text-gray-200">信任模式（减少确认）</span>
-                <span className="block text-xs leading-5 text-gray-500">
-                  开启后减少常规工具确认；高风险与永久拒绝规则仍生效。它不会改变当前消息是分析还是执行。仅在信任的项目中使用。
-                </span>
-              </span>
-            </label>
-
-            <div className="space-y-3 rounded-lg border border-border bg-surface-1 p-3">
-              <TagList
-                label="允许(自动批准)"
-                tags={permDraft.allow}
-                onChange={(t) => setPermDraft({ ...permDraft, allow: t })}
-              />
-              <TagList
-                label="询问(提示用户)"
-                tags={permDraft.ask}
-                onChange={(t) => setPermDraft({ ...permDraft, ask: t })}
-              />
-              <TagList
-                label="拒绝(始终阻止)"
-                tags={permDraft.deny}
-                onChange={(t) => setPermDraft({ ...permDraft, deny: t })}
-              />
-            </div>
-
-            <div className="flex justify-end">
-              <button
-                onClick={handleSavePerms}
-                className="flex items-center gap-1 px-4 py-1.5 rounded bg-accent hover:bg-accent-hover text-xs text-white transition-colors"
-              >
-                {permSaved ? <><Check size={11} /> 已保存</> : "保存权限"}
-              </button>
-            </div>
           </div>
         )}
 
@@ -1884,7 +1761,15 @@ function ChatGptLoginCard() {
             <Sparkles size={16} />
           </div>
           <div className="min-w-0">
-            <p className="text-sm text-gray-200">使用 ChatGPT 登录</p>
+            <div className="flex items-center gap-1.5">
+              <p className="text-sm text-gray-200">使用 ChatGPT 登录</p>
+              <span
+                className="shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[9px] text-amber-700 dark:text-amber-400"
+                title="OpenAI 未提供第三方应用使用 ChatGPT 订阅的官方通道"
+              >
+                非官方通道
+              </span>
+            </div>
             {account === undefined ? (
               <p className="text-xs text-gray-600">检查登录状态…</p>
             ) : loggedIn ? (
@@ -1986,6 +1871,20 @@ function ChatGptLoginCard() {
           <AlertCircle size={12} className="mt-0.5 shrink-0" /> {error}
         </p>
       )}
+
+      {/* Honest labelling: OpenAI documents "Sign in with ChatGPT" for its own
+          Codex surfaces (CLI, web, IDE extension, app) and offers no sanctioned
+          path for third-party apps to spend a user's subscription. This login
+          works, but it is not a supported channel and can stop working without
+          notice — say so where the user decides, not in a changelog. */}
+      <p className="flex items-start gap-1.5 border-t border-border/70 pt-2 text-[11px] leading-5 text-gray-500">
+        <AlertCircle size={11} className="mt-0.5 shrink-0 text-amber-600 dark:text-amber-500" />
+        <span>
+          这是<span className="text-gray-400">非官方通道</span>：OpenAI 只为自家 Codex
+          客户端提供订阅登录，未开放给第三方应用。用量记在你自己的 ChatGPT
+          订阅上，通道可能随时失效。要稳定长期使用，请改用 API Key 或其他端点。
+        </span>
+      </p>
     </div>
   );
 }

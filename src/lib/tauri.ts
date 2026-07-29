@@ -94,6 +94,8 @@ export interface Session {
    *  chat that is NEVER persisted (frontend-memory only — see sendMessageAnonymous).
    *  Optional for backward compat — old code paths default to "project". */
   kind?: "project" | "quick" | "anonymous";
+  /** Per-session tool permission preset. Missing legacy rows behave as standard. */
+  permission_mode?: PermissionMode;
   /** Per-session reasoning effort override; null/undefined → global default. */
   reasoning_effort?: ReasoningEffort | null;
 }
@@ -494,6 +496,7 @@ export interface ProjectMemory {
 }
 
 export type Theme = 'dark' | 'light' | 'system';
+export type PermissionMode = 'safe' | 'standard' | 'trusted';
 
 export interface Settings {
   endpoints: Record<string, Endpoint>;

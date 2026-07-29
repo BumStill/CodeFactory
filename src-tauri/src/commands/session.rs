@@ -19,6 +19,16 @@ fn validate_model_policy(policy: &str) -> Result<(), AppError> {
     }
 }
 
+fn validate_permission_mode(mode: &str) -> Result<(), AppError> {
+    if matches!(mode, "safe" | "standard" | "trusted") {
+        Ok(())
+    } else {
+        Err(AppError::Other(format!(
+            "Unsupported permission mode '{mode}'"
+        )))
+    }
+}
+
 fn new_session_model_policy(settings: &crate::config::Settings) -> &str {
     match settings.default_model_policy.as_str() {
         "fixed" | "prefer" | "auto" => settings.default_model_policy.as_str(),
@@ -196,6 +206,26 @@ pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Session>, A
 /// Intentionally does NOT bump `updated_at`: changing the effort is a settings
 /// tweak, not activity, so it shouldn't resurface the session to the top of the
 /// quick-session switcher (which orders by updated_at).
+#[tauri::command]
+pub async fn update_session_permission_mode(
+    session_id: String,
+    mode: String,
+    state: State<'_, AppState>,
+) -> Result<Session, AppError> {
+    validate_permission_mode(&mode)?;
+    let pool = state.db.read().await;
+    sqlx::query("UPDATE sessions SET permission_mode = ? WHERE id = ?")
+        .bind(&mode)
+        .bind(&session_id)
+        .execute(&*pool)
+        .await?;
+    let session = sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = ?")
+        .bind(&session_id)
+        .fetch_one(&*pool)
+        .await?;
+    Ok(session)
+}
+
 #[tauri::command]
 pub async fn update_session_reasoning_effort(
     session_id: String,

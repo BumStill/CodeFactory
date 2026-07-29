@@ -143,6 +143,25 @@ describe("picking a project never opens its history", () => {
     useChatStore.getState().beginDraft();
   });
 
+  it("shows a per-session permission mode selector in the conversation toolbar", () => {
+    useChatStore.setState({
+      activeSession: { ...projectSession, permission_mode: "standard" },
+      draftSession: null,
+      runtime: { [projectSession.id]: { ...useChatStore.getState().runtime[projectSession.id], messages: [], streaming: false, queue: [], pendingPermission: null } as never },
+    });
+
+    render(
+      <WorkspacePage
+        sessionId="s-old"
+        onNewConversation={() => {}}
+        onOpenSettings={() => {}}
+        onOpenSession={() => {}}
+      />,
+    );
+
+    expect(screen.getByLabelText("会话权限")).toHaveValue("standard");
+  });
+
   it("never asks the user to classify the work before starting it", async () => {
     render(<Shell />);
     await screen.findByRole("main", { name: "会话窗口" });

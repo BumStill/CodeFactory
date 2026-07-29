@@ -128,6 +128,13 @@ async function openGeneralTab() {
 }
 
 describe("SettingsPage parallel-task controls", () => {
+  it("does not expose a global permissions tab", () => {
+    render(<SettingsPage onBack={() => {}} />);
+
+    expect(screen.queryByRole("button", { name: "权限" })).toBeNull();
+    expect(screen.queryByText("工具权限")).toBeNull();
+  });
+
   beforeEach(() => {
     for (const mock of Object.values(mocks)) {
       mock.mockReset();
@@ -168,12 +175,12 @@ describe("SettingsPage parallel-task controls", () => {
     }
   });
 
-  it("describes full access as permission policy rather than execution intent", async () => {
-    render(<SettingsPage onBack={() => {}} initialTab="permissions" />);
+  it("keeps permission policy out of global settings", () => {
+    render(<SettingsPage onBack={() => {}} />);
 
-    expect(await screen.findByText(/减少常规工具确认/)).toBeInTheDocument();
-    expect(screen.getByText(/不会改变当前消息是分析还是执行/)).toBeInTheDocument();
-    expect(screen.queryByText(/每条消息都直接执行到交付物/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "权限" })).toBeNull();
+    expect(screen.queryByText(/减少常规工具确认/)).toBeNull();
+    expect(screen.queryByText(/每条消息都直接执行到交付物/)).toBeNull();
   });
 
   it("shows and closes only CodeFactory-managed browser sessions", async () => {

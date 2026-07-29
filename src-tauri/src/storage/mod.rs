@@ -33,6 +33,10 @@ pub struct Session {
     /// hidden from the Recent Projects list and reused across visits.
     #[serde(default = "default_session_kind")]
     pub kind: String,
+    /// Per-session permission preset: safe | standard | trusted.
+    #[serde(default = "default_permission_mode")]
+    #[sqlx(default)]
+    pub permission_mode: String,
     /// Per-session reasoning effort override (minimal/low/medium/high).
     /// None → fall back to the global Settings.reasoning_effort default.
     #[serde(default)]
@@ -44,6 +48,9 @@ fn default_session_kind() -> String {
 }
 fn default_model_policy() -> String {
     "fixed".into()
+}
+fn default_permission_mode() -> String {
+    "standard".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
