@@ -337,42 +337,80 @@ fn compare_proves_release_contains_merge(status: &str) -> bool {
     matches!(status, "ahead" | "identical")
 }
 
-fn github_owner_repo(cwd: &Path) -> Result<String, String> {
+fn default_git_remote_name(cwd: &Path) -> String {
     let output = Command::new("git")
         .no_window()
         .arg("-C")
         .arg(cwd)
-        .args(["remote", "get-url", "origin"])
+        .arg("remote")
+        .output();
+    let Ok(output) = output else {
+        return "origin".into();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let remotes: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if remotes.contains(&"origin") {
+        "origin".into()
+    } else {
+        remotes.first().copied().unwrap_or("origin").into()
+    }
+}
+
+fn workspace_remote_url(cwd: &Path) -> Result<String, String> {
+    let remote = default_git_remote_name(cwd);
+    let output = Command::new("git")
+        .no_window()
+        .arg("-C")
+        .arg(cwd)
+        .args(["remote", "get-url", &remote])
         .output()
-        .map_err(|error| format!("无法读取 Git origin: {error}"))?;
+        .map_err(|error| format!("无法读取 Git remote {remote}: {error}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    let origin = String::from_utf8_lossy(&output.stdout);
-    let trimmed = origin.trim().trim_end_matches(".git");
-    let after_host = trimmed
-        .split_once("github.com")
-        .map(|(_, path)| path)
-        .ok_or_else(|| "当前 origin 不是 GitHub 仓库".to_string())?;
-    let parts: Vec<&str> = after_host
-        .trim_start_matches([':', '/'])
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect();
-    if parts.len() < 2 {
-        return Err("无法从 origin 解析 GitHub owner/repo".into());
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn github_repo_from_remote_url(origin: &str) -> Result<(String, String), String> {
+    let host = crate::agent::delivery::remote_host(origin)
+        .ok_or_else(|| "无法从 Git remote 解析 host".to_string())?;
+    if crate::agent::delivery::classify_forge(origin) != crate::agent::delivery::ForgeFamily::Github
+    {
+        let family = crate::agent::delivery::classify_forge(origin).label();
+        return Err(format!(
+            "当前 remote 是 {family}({host})，workspace_delivery_status 尚未内置该平台状态查询；请配置 delivery_provider hook，不能按 GitHub 状态判断上线。"
+        ));
     }
-    Ok(format!("{}/{}", parts[0], parts[1]))
+    let repo = crate::agent::delivery::remote_repo_path(origin)
+        .and_then(|path| {
+            let mut parts = path.split('/');
+            Some(format!("{}/{}", parts.next()?, parts.next()?))
+        })
+        .ok_or_else(|| "无法从 remote 解析 GitHub owner/repo".to_string())?;
+    Ok((host, repo))
+}
+
+fn github_owner_repo(cwd: &Path) -> Result<(String, String), String> {
+    let origin = workspace_remote_url(cwd)?;
+    github_repo_from_remote_url(&origin)
 }
 
 async fn workspace_github_client(
     cwd: &Path,
     state: &AppState,
 ) -> Result<(RemoteGitClient, String), String> {
-    let repo = github_owner_repo(cwd)?;
-    if let Some(token) = crate::util::github_cli::auth_token("github.com") {
+    let (host, repo) = github_owner_repo(cwd)?;
+    if let Some(token) = crate::util::github_cli::auth_token(&host) {
+        let base_url = if host == "github.com" {
+            "https://api.github.com".to_string()
+        } else {
+            format!("https://{host}/api/v3")
+        };
         return Ok((
-            RemoteGitClient::new("https://api.github.com", &token, GitProvider::Github),
+            RemoteGitClient::new(&base_url, &token, GitProvider::Github),
             repo,
         ));
     }
@@ -383,15 +421,28 @@ async fn workspace_github_client(
         .find(|remote| {
             matches!(remote.provider, GitProvider::Github)
                 && remote.default_repo.as_deref() == Some(repo.as_str())
+                && remote.base_url.contains(&host)
         })
         .or_else(|| {
-            settings
-                .git_remotes
-                .iter()
-                .find(|remote| matches!(remote.provider, GitProvider::Github))
+            settings.git_remotes.iter().find(|remote| {
+                matches!(remote.provider, GitProvider::Github)
+                    && remote.default_repo.as_deref() == Some(repo.as_str())
+            })
+        })
+        .or_else(|| {
+            settings.git_remotes.iter().find(|remote| {
+                matches!(remote.provider, GitProvider::Github) && remote.base_url.contains(&host)
+            })
         })
         .ok_or_else(|| {
-            "GitHub 远程状态不可用：请运行 gh auth login 或配置远程仓库 token".to_string()
+            let login = if host == "github.com" {
+                "gh auth login".to_string()
+            } else {
+                format!("gh auth login --hostname {host}")
+            };
+            format!(
+                "GitHub remote 状态不可用：请运行 `{login}`，或为 {host}/{repo} 配置远程仓库 token。"
+            )
         })?;
     let token = settings::resolve_git_remote_token(remote).map_err(|error| error.to_string())?;
     Ok((
@@ -544,6 +595,23 @@ mod workspace_delivery_tests {
         assert_eq!(snapshot.state, "merged");
         assert_eq!(snapshot.head_sha, "head123");
         assert_eq!(snapshot.merge_commit_sha.as_deref(), Some("merge456"));
+    }
+
+    #[test]
+    fn github_repo_from_remote_url_supports_enterprise_and_rejects_other_forges() {
+        assert_eq!(
+            github_repo_from_remote_url("git@github.corp.example:team/app.git").unwrap(),
+            ("github.corp.example".into(), "team/app".into())
+        );
+        assert_eq!(
+            github_repo_from_remote_url("https://github.com/acme/repo.git").unwrap(),
+            ("github.com".into(), "acme/repo".into())
+        );
+        let err = github_repo_from_remote_url("git@gitlab.corp.example:platform/app.git")
+            .expect_err("GitLab must not be handled as GitHub status");
+        assert!(err.contains("GitLab"));
+        assert!(err.contains("delivery_provider hook"));
+        assert!(err.contains("不能按 GitHub 状态判断上线"));
     }
 
     #[test]

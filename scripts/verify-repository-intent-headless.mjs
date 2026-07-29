@@ -88,14 +88,16 @@ async function assertWorkspace(page, tag) {
   assert(await localGit.getByText("已同步", { exact: true }).isVisible(), `[${tag}] upstream sync state missing`);
   const delivery = header.getByRole("button", { name: "会话交付状态" });
   await delivery.waitFor();
-  for (const text of ["PR #175", "CI 通过", "已合并", "v1.63.0 已上线"]) {
+  for (const text of ["PR #175", "CI 通过", "已合并", "v1.63.0 已创建"]) {
     assert(await delivery.getByText(text, { exact: true }).isVisible(), `[${tag}] delivery summary missing: ${text}`);
   }
   await delivery.click();
   const deliveryDrawer = page.getByRole("dialog", { name: "交付详情" });
   await deliveryDrawer.waitFor();
   assert(await deliveryDrawer.getByText("feat/workspace-ui → main", { exact: true }).isVisible(), `[${tag}] PR branch relation missing`);
-  assert(await deliveryDrawer.getByText("3373a69", { exact: true }).isVisible(), `[${tag}] PR head SHA missing from GitHub CI step`);
+  assert(await deliveryDrawer.getByText("3373a69", { exact: true }).isVisible(), `[${tag}] PR head SHA missing from CI step`);
+  assert(await deliveryDrawer.getByText(/release artifact 可见/).isVisible(), `[${tag}] release must not be described as live`);
+  assert(await deliveryDrawer.getByText(/真实上线还需要 deliver_changes 的部署观察或 live verifier 通过/).isVisible(), `[${tag}] live verifier explanation missing`);
   await deliveryDrawer.getByRole("button", { name: "关闭交付详情" }).click();
   await deliveryDrawer.waitFor({ state: "detached" });
   assert((await header.getByRole("button", { name: /检查点|恢复/ }).count()) === 0, `[${tag}] checkpoint counter must not remain in header`);

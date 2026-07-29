@@ -53,7 +53,7 @@ describe("WorkspaceDeliveryStatus", () => {
     expect(status).toHaveTextContent("PR #175");
     expect(status).toHaveTextContent("CI 通过");
     expect(status).toHaveTextContent("已合并");
-    expect(status).toHaveTextContent("v1.63.0 已上线");
+    expect(status).toHaveTextContent("v1.63.0 已创建");
     expect(mocks.invoke).toHaveBeenCalledWith("workspace_delivery_status", {
       cwd: "/repo",
       branch: "feat/workspace-ui",
@@ -63,6 +63,8 @@ describe("WorkspaceDeliveryStatus", () => {
     await userEvent.click(status);
     const drawer = screen.getByRole("dialog", { name: "交付详情" });
     expect(drawer).toHaveTextContent("feat/workspace-ui → main");
+    expect(drawer).toHaveTextContent("release artifact 可见");
+    expect(drawer).toHaveTextContent("真实上线还需要 deliver_changes 的部署观察或 live verifier 通过");
     expect(drawer).toHaveTextContent("6");
   });
 

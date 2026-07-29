@@ -108,13 +108,13 @@ export function WorkspaceDeliveryStatus({ cwd, sessionId, currentBranch, message
         aria-label="会话交付状态"
         onClick={() => setOpen(true)}
         className={`inline-flex h-7 max-w-[390px] shrink items-center gap-1.5 overflow-hidden rounded-md border px-2 text-[11px] transition-colors hover:brightness-110 ${tone}`}
-        title="查看本会话对应的 GitHub PR、CI、合并与发布状态"
+        title="查看本会话对应的 PR/MR、CI、合并、发布与线上验证状态"
       >
         <GitPullRequest size={12} className="shrink-0" />
         {unavailable ? (
           <span className="whitespace-nowrap">远程状态不可用</span>
         ) : !snapshot ? (
-          <span className="inline-flex items-center gap-1 whitespace-nowrap"><LoaderCircle size={11} className="animate-spin" />读取 GitHub…</span>
+          <span className="inline-flex items-center gap-1 whitespace-nowrap"><LoaderCircle size={11} className="animate-spin" />读取交付状态…</span>
         ) : !pr ? (
           <span className="whitespace-nowrap">未关联 PR</span>
         ) : (
@@ -124,7 +124,7 @@ export function WorkspaceDeliveryStatus({ cwd, sessionId, currentBranch, message
             <span className="shrink-0">{ci}</span>
             <StatusDivider />
             <span className="shrink-0">{prStateLabel(pr)}</span>
-            {snapshot.release && <><StatusDivider /><span className="truncate">{snapshot.release.tag} 已上线</span></>}
+            {snapshot.release && <><StatusDivider /><span className="truncate">{snapshot.release.tag} 已创建</span></>}
           </>
         )}
       </button>
@@ -142,13 +142,13 @@ export function WorkspaceDeliveryStatus({ cwd, sessionId, currentBranch, message
               <GitPullRequest size={16} className="mt-0.5 text-accent" />
               <div className="min-w-0 flex-1">
                 <h2 className="text-sm font-semibold text-gray-100">交付详情</h2>
-                <p className="mt-0.5 text-[11px] text-gray-600">状态直接来自 GitHub PR 和该 PR head commit 的 check-runs。</p>
+                <p className="mt-0.5 text-[11px] text-gray-600">状态来自会话关联的 PR/MR、CI、发布与线上验证；未验证 live 时不会标记为上线。</p>
               </div>
               <button aria-label="关闭交付详情" onClick={() => setOpen(false)} className="rounded p-1 text-gray-600 hover:bg-surface-3 hover:text-gray-200"><X size={14} /></button>
             </header>
             <div className="flex-1 overflow-y-auto p-4">
               {unavailable ? (
-                <EmptyState title="远程状态不可用" detail="请检查网络，并运行 gh auth login 或在设置中配置 GitHub 远程凭据。" />
+                <EmptyState title="远程状态不可用" detail="请检查网络，并确认该仓库已配置匹配的 Git provider、CLI 登录、远程令牌或 delivery_provider hook。" />
               ) : !pr ? (
                 <EmptyState title="未关联 PR" detail="在功能分支创建或交付 PR 后，这里会显示该会话的完整交付链。" />
               ) : (
@@ -164,11 +164,11 @@ export function WorkspaceDeliveryStatus({ cwd, sessionId, currentBranch, message
                   </section>
                   <ol aria-label="交付链" className="space-y-1">
                     <DeliveryStep icon={<GitPullRequest size={13} />} label="PR" value={prStateLabel(pr)} success={pr.state === "merged" || pr.state === "open"} />
-                    <DeliveryStep icon={snapshot?.ci_status === "pending" ? <LoaderCircle size={13} className="animate-spin" /> : <Check size={13} />} label="GitHub CI" value={ci} success={snapshot?.ci_status === "success"} detail={pr.head_sha.slice(0, 7)} />
+                    <DeliveryStep icon={snapshot?.ci_status === "pending" ? <LoaderCircle size={13} className="animate-spin" /> : <Check size={13} />} label="CI" value={ci} success={snapshot?.ci_status === "success"} detail={pr.head_sha.slice(0, 7)} />
                     <DeliveryStep icon={<GitMerge size={13} />} label="合并" value={pr.state === "merged" ? "已合并" : "待合并"} success={pr.state === "merged"} detail={pr.merge_commit_sha?.slice(0, 7)} />
-                    <DeliveryStep icon={<Rocket size={13} />} label="发布" value={snapshot?.release ? `${snapshot.release.tag} 已上线` : "未发现包含此合并的正式版本"} success={Boolean(snapshot?.release)} />
+                    <DeliveryStep icon={<Rocket size={13} />} label="发布" value={snapshot?.release ? `${snapshot.release.tag} 已创建` : "未发现包含此合并的正式版本"} success={Boolean(snapshot?.release)} />
                   </ol>
-                  <p className="text-[10px] leading-relaxed text-gray-700">CI 只绑定上方 PR 的 head SHA；发布只有在 GitHub latest release 的 tag 包含该 PR merge commit 时才标记为已上线。</p>
+                  <p className="text-[10px] leading-relaxed text-gray-700">CI 绑定上方 PR/MR 的 head SHA；发布版本只表示 release artifact 可见，真实上线还需要 deliver_changes 的部署观察或 live verifier 通过。</p>
                 </div>
               )}
             </div>
