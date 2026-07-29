@@ -17,6 +17,7 @@
 //! in a driver, so a second backend cannot accidentally ship with weaker rules.
 
 pub mod install;
+pub mod page;
 pub mod policy;
 pub mod profile;
 
