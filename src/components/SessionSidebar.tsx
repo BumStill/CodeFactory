@@ -63,30 +63,29 @@ export function SessionSidebar({
   const draftActive = draftSession?.id === currentSessionId;
   const draftProject = draftActive ? draftSession?.cwd ?? null : null;
 
-  // A project is expanded when it holds the open conversation (or the open
-  // draft's directory); otherwise the user drives it. Tracking only the
-  // *overrides* keeps the auto-expand working as the session changes.
+  // A project expands when the user opens it, or when it contains the open
+  // conversation/draft. Once expanded, keep it open across later session
+  // switches; switching rows is not a collapse command. The only way to close a
+  // visible project is clicking that project row again.
   const activeProjectCwd = useMemo(() => {
     if (draftProject) return draftProject;
     const current = sessions.find((s) => s.id === currentSessionId);
     return current && current.kind !== "quick" ? current.cwd : null;
   }, [currentSessionId, draftProject, sessions]);
-  const [overrides, setOverrides] = useState<Record<string, boolean>>({});
-  const isExpanded = (cwd: string) => overrides[cwd] ?? cwd === activeProjectCwd;
+  const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({});
+  const isExpanded = (cwd: string) => Boolean(expandedProjects[cwd] || cwd === activeProjectCwd);
   const toggleProject = (cwd: string) =>
-    setOverrides((prev) => ({ ...prev, [cwd]: !isExpanded(cwd) }));
+    setExpandedProjects((prev) => ({ ...prev, [cwd]: !isExpanded(cwd) }));
 
-  // Moving into a project re-expands it, dropping any earlier collapse. Without
-  // this, opening a conversation inside a project the user had collapsed would
-  // leave no row highlighted anywhere — "which conversation am I in?" with no
-  // answer on screen, which is the confusion this rail exists to remove.
+  // Remember projects that became visible because they held the active
+  // conversation. Without this, clicking a standalone/quick session would make
+  // the previously expanded project snap shut even though the user never asked
+  // to collapse it.
   useEffect(() => {
     if (!activeProjectCwd) return;
-    setOverrides((prev) => {
-      if (!(activeProjectCwd in prev)) return prev;
-      const next = { ...prev };
-      delete next[activeProjectCwd];
-      return next;
+    setExpandedProjects((prev) => {
+      if (prev[activeProjectCwd]) return prev;
+      return { ...prev, [activeProjectCwd]: true };
     });
   }, [activeProjectCwd, currentSessionId]);
 
@@ -138,7 +137,7 @@ export function SessionSidebar({
                   expanded={isExpanded(entry.project.cwd)}
                   onToggle={() => toggleProject(entry.project.cwd)}
                   onNewConversation={() => {
-                    setOverrides((prev) => ({ ...prev, [entry.project.cwd]: true }));
+                    setExpandedProjects((prev) => ({ ...prev, [entry.project.cwd]: true }));
                     onNewConversation(entry.project.cwd);
                   }}
                 >

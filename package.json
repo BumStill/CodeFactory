@@ -1,6 +1,6 @@
 {
   "name": "codefactory",
-  "version": "1.72.0",
+  "version": "1.72.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -23,6 +23,7 @@
     "test:streaming-markdown:headless": "node scripts/verify-streaming-markdown-headless.mjs",
     "test:permission-mode:headless": "node scripts/verify-permission-mode-headless.mjs",
     "test:startup-session:headless": "node scripts/verify-startup-session-headless.mjs",
+    "test:sidebar-expansion:headless": "node scripts/verify-sidebar-expansion-headless.mjs",
     "test:watch": "vitest",
     "test:scrollbar:headless": "node scripts/verify-scrollbar-auto-hide-headless.mjs"
   },
