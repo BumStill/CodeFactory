@@ -9,6 +9,7 @@ import {
 } from "../stores/slashCommands";
 import { invoke } from "../lib/tauri";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { ImagePreview } from "./ImagePreview";
 
 interface SkillSlashCommand {
   name: string;
@@ -42,6 +43,12 @@ function isImageAttachment(name: string): boolean {
 function attachmentImageSrc(path: string): string {
   const localPath = path.startsWith("file://") ? path.slice("file://".length) : path;
   return convertFileSrc(localPath);
+}
+
+function attachmentImageMarkdown(name: string, path: string): string {
+  const url = path.startsWith("file://") ? path : `file://${path}`;
+  const destination = /\s/.test(url) ? `<${url}>` : url;
+  return `![${name}](${destination})`;
 }
 
 interface Props {
@@ -244,7 +251,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
       const blocks: string[] = [];
       const images = attachments.filter((a) => isImageAttachment(a.name));
       const docs = attachments.filter((a) => !isImageAttachment(a.name));
-      for (const a of images) blocks.push(`![${a.name}](file://${a.path})`);
+      for (const a of images) blocks.push(attachmentImageMarkdown(a.name, a.path));
       if (docs.length > 0) {
         const lines = docs.map((a) => `- ${a.name} — 本地路径: ${a.path}`).join("\n");
         blocks.push(
@@ -371,10 +378,11 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
                 className="group relative overflow-hidden rounded-xl border border-border bg-surface-3 p-1 shadow-sm"
                 title={a.path}
               >
-                <img
+                <ImagePreview
                   src={attachmentImageSrc(a.path)}
                   alt={a.name}
-                  className="block h-20 w-28 rounded-lg bg-surface-2 object-cover"
+                  thumbnailClassName="block h-20 w-28 rounded-lg bg-surface-2 object-cover transition-opacity hover:opacity-90"
+                  title={a.path}
                 />
                 <figcaption className="mt-1 flex max-w-28 items-center gap-1 text-[10px] text-gray-400">
                   <span className="truncate">{a.name}</span>

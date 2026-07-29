@@ -101,7 +101,10 @@ fn find_file_image_links(text: &str) -> Vec<(usize, usize, String)> {
                     let url_start = alt_end + 2;
                     if let Some(url_rel_end) = text[url_start..].find(')') {
                         let url_end = url_start + url_rel_end;
-                        let url = &text[url_start..url_end];
+                        let mut url = &text[url_start..url_end];
+                        if url.starts_with('<') && url.ends_with('>') && url.len() >= 2 {
+                            url = &url[1..url.len() - 1];
+                        }
                         if let Some(raw) = url.strip_prefix("file://") {
                             // Cross-platform unwrap:
                             //   Unix  : "file:///abs/path"  → raw = "/abs/path"  → keep as-is
@@ -253,6 +256,19 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].r#type, "image_url");
         std::fs::remove_file(&path).ok();
+    }
+
+
+    #[test]
+    fn angle_wrapped_file_urls_with_spaces_parse() {
+        let parsed = find_file_image_links(
+            "![s](<file:///Users/leo/Projects/AI foundation/.codefactory/attachments/x y.png>)",
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].2,
+            "/Users/leo/Projects/AI foundation/.codefactory/attachments/x y.png"
+        );
     }
 
     #[test]

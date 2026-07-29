@@ -9,7 +9,8 @@
 // visual bug we shipped in v0.5.1 and want to prevent regressing.
 
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 const convertFileSrcMock = vi.hoisted(() => vi.fn((path: string) => `asset://localhost/${encodeURIComponent(path)}`));
 vi.mock("@tauri-apps/api/core", () => ({ convertFileSrc: convertFileSrcMock }));
@@ -212,6 +213,41 @@ describe("MessageList theme readability", () => {
     expect(convertFileSrcMock).toHaveBeenCalledWith("/proj/.codefactory/attachments/image.png");
     expect(image).toHaveAttribute("src", "asset://localhost/%2Fproj%2F.codefactory%2Fattachments%2Fimage.png");
     expect(image?.className).toMatch(/max-h-80/);
+  });
+
+  it("renders markdown image links with spaces in file paths as visible image previews", () => {
+    const { container } = render(
+      <MessageList
+        messages={[baseMsg({ content: "![IMG_6190.png](file:///Users/leo/Projects/AI foundation/.codefactory/attachments/1785309543980-84d170b1.png)" })]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+
+    const image = container.querySelector("img[alt='IMG_6190.png']");
+    expect(image, "expected image markdown with spaces in its file path to render as <img>").toBeTruthy();
+    expect(convertFileSrcMock).toHaveBeenCalledWith("/Users/leo/Projects/AI foundation/.codefactory/attachments/1785309543980-84d170b1.png");
+    expect(screen.queryByText(/!\[IMG_6190\.png\]/)).not.toBeInTheDocument();
+  });
+
+  it("opens message image previews in a larger viewer", async () => {
+    const user = userEvent.setup();
+    render(
+      <MessageList
+        messages={[baseMsg({ content: "![image.png](file:///proj/.codefactory/attachments/image.png)" })]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "放大查看 image.png" }));
+
+    const dialog = screen.getByRole("dialog", { name: "图片预览" });
+    expect(dialog).toBeInTheDocument();
+    expect(within(dialog).getByRole("img", { name: "image.png" })).toHaveAttribute(
+      "src",
+      "asset://localhost/%2Fproj%2F.codefactory%2Fattachments%2Fimage.png",
+    );
   });
 
   it("renders image attachments inside user message bubbles instead of raw markdown links", () => {
