@@ -114,6 +114,22 @@ describe("SessionSidebar", () => {
     expect(screen.getByText("CodeFactory 旧会话")).toBeInTheDocument();
   });
 
+  it("keeps an expanded project open when switching to another conversation", () => {
+    const { rerender } = render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+    );
+
+    expect(screen.getByText("CodeFactory 主线")).toBeInTheDocument();
+    expect(screen.getByText("CodeFactory 旧会话")).toBeInTheDocument();
+
+    rerender(
+      <SessionSidebar currentSessionId="q1" onOpenSession={noop} onNewConversation={noop} />,
+    );
+
+    expect(screen.getByText("CodeFactory 主线")).toBeInTheDocument();
+    expect(screen.getByText("CodeFactory 旧会话")).toBeInTheDocument();
+  });
+
   it("clicking a folder expands it instead of opening a conversation", () => {
     const onOpen = vi.fn();
     render(
