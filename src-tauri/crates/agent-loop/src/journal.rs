@@ -65,10 +65,25 @@ pub struct UsageRow<'a> {
     pub cost_source: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct TurnActivityUpdate {
+    pub root_turn_id: String,
+    pub phase: String,
+    pub status: String,
+    pub recent_activity_kind: String,
+    pub recent_activity_label: String,
+    pub waiting_reason: Option<String>,
+    pub terminal_reason: Option<String>,
+}
+
 /// Write-only persistence. Every method no-ops (returning the "not written"
 /// value) when the run is anonymous, inside the impl.
 #[async_trait::async_trait]
 pub trait Persistence: Send + Sync {
+    async fn update_turn_activity(&self, _update: &TurnActivityUpdate) -> PersistResult<i64> {
+        Ok(0)
+    }
+
     /// A redacted user/assistant/tool message. Returns the new id, or `None`
     /// when not written (anonymous) — the `None` is control-flow load-bearing.
     #[allow(clippy::too_many_arguments)]

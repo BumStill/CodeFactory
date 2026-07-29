@@ -22,7 +22,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use codefactory_agent_core::{classify_command, effective_command_timeout_sec, PolicyDecision, ToolKind};
+use codefactory_agent_core::{
+    classify_command, effective_command_timeout_sec, PolicyDecision, ToolKind,
+};
 use codefactory_agent_loop::events::EventSink;
 use codefactory_agent_loop::journal::Budget;
 use codefactory_agent_loop::services::{
@@ -173,6 +175,11 @@ where
         let (_, kind) = self.classify(call, args);
         Ok(ToolInvocationResult {
             is_error: error.is_some() || return_code.is_some_and(|c| c != 0),
+            status: if error.is_some() || return_code.is_some_and(|c| c != 0) {
+                codefactory_agent_loop::tool::ToolExecutionStatus::Error
+            } else {
+                codefactory_agent_loop::tool::ToolExecutionStatus::Done
+            },
             content,
             command,
             kind,
@@ -393,10 +400,14 @@ where
     async fn emit_usage_snapshot(&self) {
         let usage = { self.io.usage.lock().await.clone() };
         let mut out = self.io.output.lock().await;
-        let _ = write_output(&mut *out, &OutputMessage::UsageSnapshot {
-            name: "usage_snapshot".to_string(),
-            usage,
-        }).await;
+        let _ = write_output(
+            &mut *out,
+            &OutputMessage::UsageSnapshot {
+                name: "usage_snapshot".to_string(),
+                usage,
+            },
+        )
+        .await;
         self.emitted_usage_this_round
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -483,7 +494,11 @@ where
             usage.add_response(&response);
         }
 
-        let message = match response.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")) {
+        let message = match response
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+        {
             Some(message) => message.clone(),
             None => {
                 self.emit_usage_snapshot().await;

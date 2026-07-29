@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { WorkspacePage } from "./pages/Workspace/WorkspacePage";
 import { ResourcesPage } from "./pages/Resources/ResourcesPage";
 import { ControlPlanePage } from "./pages/ControlPlane/ControlPlanePage";
@@ -32,16 +32,12 @@ export default function App() {
   // interjections addressed another (and a stale id produced an unhandled
   // rejection that silently kept the old conversation on screen).
   const openSession = useChatStore(openSessionId);
-  const startupDraftStarted = useRef(false);
-
   // Workspace is the application shell. On first launch, open the most recent
   // persisted session if one exists; only fall back to an in-memory draft when
   // there is no history. This keeps returning users on their latest task
   // without changing the explicit “新会话” action, which still opens a blank
   // draft and does not touch the backend until first send.
   useEffect(() => {
-    if (startupDraftStarted.current) return;
-    startupDraftStarted.current = true;
     if (useChatStore.getState().draftSession || useChatStore.getState().activeSession) return;
 
     let cancelled = false;

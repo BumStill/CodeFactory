@@ -8,7 +8,19 @@ export interface ToolCallState {
   args: string;
   result?: string;
   isError?: boolean;
-  status: "waiting_permission" | "running" | "done" | "error" | "denied" | "cancelled";
+  status: "waiting_permission" | "running" | "done" | "blocked" | "error" | "denied" | "cancelled";
+}
+
+export interface TurnActivityState {
+  rootTurnId: string;
+  revision: number;
+  phase: string;
+  status: string;
+  kind: string;
+  label: string;
+  waitingReason: string | null;
+  updatedAt: number;
+  terminalReason: string | null;
 }
 
 export interface PendingPermission {
@@ -54,6 +66,9 @@ export interface UIMessage {
   /** Structured execution route for this root turn. It is persisted as a
    * bounded plan-event snapshot and hydrated onto the final assistant row. */
   plan?: TurnPlan;
+  /** Single latest runtime snapshot for a turn. Revisions replace each other
+   * instead of appending more transcript rows. */
+  turnActivity?: TurnActivityState;
   /** Bounded, turn-wide tool evidence attached during history hydration so
    * the result snapshot remains truthful after a session is reopened. */
   turnToolCalls?: ToolCallState[];
@@ -166,6 +181,33 @@ export function reduceChatStreamEvent(
           return {
             ...message,
             plan: { ...plan, waitingHistory, changeHistory },
+          };
+        }),
+      };
+
+    case "turn_activity_updated":
+      return {
+        ...state,
+        messages: updateMessageById(state.messages, msgId, (message) => {
+          if (
+            message.turnActivity &&
+            message.turnActivity.revision >= event.revision
+          ) {
+            return message;
+          }
+          return {
+            ...message,
+            turnActivity: {
+              rootTurnId: event.root_turn_id,
+              revision: event.revision,
+              phase: event.phase,
+              status: event.status,
+              kind: event.recent_activity_kind,
+              label: event.recent_activity_label,
+              waitingReason: event.waiting_reason ?? null,
+              updatedAt: event.updated_at,
+              terminalReason: event.terminal_reason ?? null,
+            },
           };
         }),
       };

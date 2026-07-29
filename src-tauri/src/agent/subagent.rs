@@ -102,6 +102,7 @@ fn resolved_subagent_model(settings: &Settings) -> Result<String> {
 /// 4. Walks the sub-session's tool-call records to derive the result summary.
 pub async fn run_subagent(
     brief: SubagentBrief,
+    attempt_id: &str,
     pool: &SqlitePool,
     parent_session_id: &str,
     settings: &Settings,
@@ -149,6 +150,7 @@ pub async fn run_subagent(
     .bind(parent_session_id)
     .execute(pool)
     .await?;
+    crate::storage::tasks::attach_attempt_sub_session(pool, attempt_id, &sub_session_id).await?;
 
     // 2. Persist the brief as the first user message of the sub-session.
     let brief_text = render_brief(&brief);

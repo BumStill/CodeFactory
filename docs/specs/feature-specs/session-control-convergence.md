@@ -7,7 +7,7 @@
 | CF-SCC-R1 | `permissions.full_access` 只影响工具权限决策，不得直接选择 `AgentMode::Execute` | Rust dispatch unit + settings compatibility |
 | CF-SCC-R2 | 分析、解释、状态查询和诊断请求在 Full access 下仍按普通交互回合处理；除非用户明确要求修改/实施，否则不得因为权限配置扩大成代码交付任务 | Rust command contract + real app |
 | CF-SCC-R3 | 明确批准的实施请求和结构化「继续执行」动作仍进入 Execute，不得因 R1 退回重复确认 | Rust dispatch unit + real app |
-| CF-SCC-R4 | Interactive/Execute 单个执行 segment 最多允许 3 次同策略 completion recovery；累计次数不得因普通读取清零。该 guard 不得成为用户目标终点 | Rust failure-first unit + continuity integration |
+| CF-SCC-R4 | Interactive/Execute 单个 root turn 最多允许 1 次定向 completion recovery；恢复提示只列尚缺 evidence，累计次数不得因普通读取或跨 segment 清零。第二次仍不足必须形成唯一的 `verification_incomplete` 终态，不得再次生成候选回复 | Rust failure-first unit + continuity integration |
 | CF-SCC-R5 | 连续无进展计数可以在证据进展后清零，但必须与不可重置的累计恢复次数分离 | Rust state-machine unit |
 | CF-SCC-R6 | recovery/ready 的内部 prompt 和被拒绝候选回复继续不进入聊天正文；用户必须看到脱敏的恢复状态卡，而不是只看到 `Thinking` | reducer + component + real app |
 | CF-SCC-R7 | 恢复状态卡至少显示阶段、恢复次数、继续原因、当前步骤、最近活动时间和累计耗时；不得泄漏内部 prompt 或未脱敏的命令参数 | component + privacy negative assertions |
@@ -19,6 +19,10 @@
 | CF-SCC-R13 | 自动事实纠偏只允许进入执行型回合；交付类纠偏还必须核对当前用户明确要求的交付动作。检测不得跨段拼接示例、引用或假设中的关键词，不得把分析/设计回答改写成 `deliver_changes` 等无关执行。内部 `turn_notice` 必须保留可审计的 system 来源，不能冒充新的用户目标 | Rust failure-first regression + exact field-session replay + real app |
 | CF-SCC-R14 | 同一回合中，相同工作目录、相同命令的确定性本地验证在 workspace 未发生新 mutation 时只执行一次；后续相同调用复用已有成功结果。失败验证、远端状态观察、Runtime/Functional Probe 不得复用；任何 workspace mutation 都保守失效已有本地验证结果 | Rust failure-first loop regression |
 | CF-SCC-R15 | completion evidence 满足后，产品 Autonomous 的最后一轮只生成用户总结，不再执行工具、不触发事实纠偏，也不把重复绿测记作新进展。即使模型在该轮返回 tool call，也必须保持未执行并最多重试一次纯总结；Benchmark 保留原 coverage audit 语义 | Rust event/tool-execution sequence + real app |
+| CF-SCC-R16 | 每个用户 root turn 必须在模型调用前形成独立于权限设置的 `review_only / implement / deliver` capability。Full access 只能放宽已允许工具的审批，不能扩大 capability | Rust dispatch + settings compatibility |
+| CF-SCC-R17 | `review_only` 只能看到并执行读取、搜索、状态探测和无副作用验证；`write/edit`、变更型 shell、交付、并行/委派以及未知 MCP 工具必须在 AgentLoop 结构层拒绝，不能依赖模型自律 | scripted transport + backend call counter + temp repo |
+| CF-SCC-R18 | `implement` 允许本地实现和验证但不允许 commit/push/PR/merge/release/deploy；只有当前用户明确要求交付，或明确批准包含交付的上一方案时，才进入 `deliver` | dispatch inheritance + bash/tool policy + real app |
+| CF-SCC-R19 | 结构门禁拒绝必须落为 `denied` 工具 outcome 并继续形成一次正常用户答复；内部拒绝原因不能冒充新的用户目标或触发隐藏交付纠偏 | event sequence + persistence + hydration |
 
 ## Primary User Paths
 
@@ -28,7 +32,7 @@
 
 ### 执行与恢复路径
 
-用户明确要求实施，或点击结构化「继续执行」后进入 Execute。模型尝试结束但验证证据不足时，正文中的候选草稿和内部 recovery prompt 保持隐藏；同一位置显示一句紧凑状态，说明正在补充验证、最近正在做什么以及为什么还不能结束。当前 segment 的恢复 guard 达到边界后，系统保存检查点并自动续段；只有任务完成或存在具体不可恢复 blocker 时才关闭 root turn。续段失败时显示可恢复中断，不得空白停止。
+用户明确要求实施，或点击结构化「继续执行」后进入 Execute。仅实施请求得到 `implement`，包含提交、PR、合并、发布或上线的明确请求得到 `deliver`。模型尝试结束但验证证据不足时，正文中的候选草稿和内部 recovery prompt 保持隐藏；同一位置显示一句紧凑状态，说明正在补充哪一项证据。每个 root turn 只允许一次定向恢复；仍不足时形成唯一的 `verification_incomplete` 结果，不能继续生成候选—拒绝—重试循环。
 
 ### 历史恢复路径
 
@@ -47,7 +51,7 @@
 
 ## Applicable Harnesses
 
-- Spec Harness：CF-SCC-R1..R13，并与 CF-CCE-R1..R18 的连续性契约联合验证。
+- Spec Harness：CF-SCC-R1..R19，并与 CF-CCE-R1..R25 的连续性契约联合验证。
 - Compatibility Harness：旧 settings、旧 completion state、旧会话 hydration。
 - Viewport Harness：1366×768、800×600 下状态卡与输入区不重叠。
 - Observation Harness：真实 App 中 Full access 诊断、Execute 恢复和取消路径。

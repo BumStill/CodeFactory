@@ -38,6 +38,18 @@ export type StreamEvent =
       change_reason?: string | null;
       created_at: number;
     }
+  | {
+      type: "turn_activity_updated";
+      root_turn_id: string;
+      revision: number;
+      phase: string;
+      status: string;
+      recent_activity_kind: string;
+      recent_activity_label: string;
+      waiting_reason?: string | null;
+      updated_at: number;
+      terminal_reason?: string | null;
+    }
   | { type: "tool_call_start"; id: string; name: string; args: unknown }
   | { type: "tool_call_args_delta"; index: number; chunk: string }
   | { type: "tool_call_end"; index: number }
@@ -46,7 +58,7 @@ export type StreamEvent =
       tool_call_id: string;
       content: string;
       is_error: boolean;
-      status: "done" | "error" | "denied" | "cancelled";
+      status: "done" | "blocked" | "error" | "denied" | "cancelled";
     }
   | { type: "permission_request"; tool_call_id: string; tool_name: string; args: unknown }
   | { type: "done"; input_tokens: number; output_tokens: number }
@@ -122,9 +134,22 @@ export interface Message {
 export interface MessagePage {
   messages: Message[];
   plans?: TurnPlanSnapshot[];
+  turn_states?: TurnActivitySnapshot[];
   has_more: boolean;
   next_before_rowid?: number | null;
   truncated?: boolean;
+}
+
+export interface TurnActivitySnapshot {
+  root_turn_id: string;
+  revision: number;
+  phase: string;
+  status: string;
+  recent_activity_kind: string;
+  recent_activity_label: string;
+  waiting_reason?: string | null;
+  updated_at: number;
+  terminal_reason?: string | null;
 }
 
 export interface TurnPlanSnapshot {
@@ -662,6 +687,21 @@ export interface TaskRun {
    *  ad-hoc Workspace tasks. Surfaces the spec→task link in the task tree. */
   spec_req_id?: string | null;
   spec_title?: string | null;
+  attempts?: TaskAttempt[];
+}
+
+export interface TaskAttempt {
+  id: string;
+  task_id: string;
+  attempt_index: number;
+  sub_session_id: string | null;
+  status: string;
+  failure_code: string | null;
+  started_at: string;
+  completed_at: string | null;
+  error: string | null;
+  result: string | null;
+  verification_results: string | null;
 }
 
 export interface TaskInput {

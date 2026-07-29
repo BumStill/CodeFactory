@@ -26,6 +26,9 @@
 | CF-CCE-R20 | 终态后 5 秒内形成结果快照；结果视图、完整过程切换和证据化重新总结只引用最终回复、plan 与真实工具 evidence | component + headless/real app |
 | CF-CCE-R21 | 时间估算结合任务阶段、同项目历史 build/test 时长和关联外部 job 状态；相关样本少于 3 个时不展示 | estimator unit + SQLite profile |
 | CF-CCE-R22 | 1000 个 plan/tool 事件仍遵守超长会话有界 hydration 和惰性 payload 契约，不造成新的无界数组或大输出复制 | store/perf fixture |
+| CF-CCE-R23 | 同一可见会话按 root turn 持久化内部 task segment；每个 segment 至少包含 `segment_id`、`goal_digest`、`status`、`checkpoint`、`handoff`、开始/结束时间。新目标只加载当前 segment 与有界 handoff，不回灌旧 recovery/tool 噪音 | SQLite migration + context fixture + restart |
+| CF-CCE-R24 | 每个 root turn 的实时进度是一个可覆盖快照，至少包含 `phase`、`current_step`、`next_step`、`waiting_reason`、`updated_at`、`elapsed_ms`。重复微更新保留审计事件但 UI/store 不追加同义 assistant message | reducer coalescing + hydration + 100-event fixture |
+| CF-CCE-R25 | `task_run` 是逻辑子任务，retry 是 `task_attempts` 的 append-only 记录。每个 attempt 保存 ordinal、sub-session、状态、失败码、时间和 evidence；UI 只显示一张任务卡并可展开 attempts，空 child 也必须成为失败 attempt | additive migration + scheduler + component |
 
 ## Primary User Paths
 
@@ -103,5 +106,6 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 - 不把内部 segment 数、iteration 数或 context refresh 次数展示为用户任务上限。
 - 不以自动续跑为由绕过工具权限、用户取消或不可逆决策确认。
 - 不删除旧消息和工具审计数据；旧数据库必须可升级、可回滚读取。
+- `task_segments`、`turn_progress_snapshots` 与 `task_attempts` 只能 additive migration；旧 `task_runs.sub_session_id` 继续作为最近一次兼容字段读取。
 - jsdom/Vitest、Rust 单测、`npm run build`、PR 绿色或 workflow 成功均不能单独证明完成。
 - 只有公开发布版本的真实 App 通过连续执行、中断恢复、自然工具证据、四视口/主题和自动记忆验收后，状态才可从 `not live` 改为 `live`。

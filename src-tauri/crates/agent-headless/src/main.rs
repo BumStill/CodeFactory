@@ -1,13 +1,13 @@
+#[cfg(test)]
+use codefactory_agent_core::classify_command;
 use codefactory_agent_core::{
     build_product_system_prompt, build_system_prompt, execution_contract_sha256,
 };
-#[cfg(test)]
-use codefactory_agent_core::classify_command;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
+use serde_json::Value;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{self, AsyncBufRead, AsyncWrite, BufReader, BufWriter};
@@ -30,15 +30,6 @@ use compaction::*;
 use policy::*;
 use protocol::*;
 use transport::*;
-
-
-
-
-
-
-
-
-
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Usage {
@@ -94,7 +85,6 @@ enum HeadlessError {
     Loop(String),
 }
 
-
 #[tokio::main]
 async fn main() {
     let stdin = io::stdin();
@@ -122,11 +112,11 @@ where
     R: AsyncBufRead + Unpin + Send + Sync + 'static,
     W: AsyncWrite + Unpin + Send + Sync + 'static,
 {
-    use std::sync::atomic::AtomicBool;
     use loop_services::{
-        CharBudgetCompactor, DelegatingToolBackend, Jsonl, JsonlEventSink, SidecarTransport,
-        SidecarPermissions, WallClockBudget,
+        CharBudgetCompactor, DelegatingToolBackend, Jsonl, JsonlEventSink, SidecarPermissions,
+        SidecarTransport, WallClockBudget,
     };
+    use std::sync::atomic::AtomicBool;
 
     let mut input = input;
     let config = read_start(&mut input).await?;
@@ -195,6 +185,7 @@ where
 
     let run_config = codefactory_agent_loop::run::RunConfig {
         finalization: codefactory_agent_loop::run::FinalizationPolicy::Benchmark,
+        turn_capability: codefactory_agent_loop::run::TurnCapability::Implement,
         gate_benchmark: true,
         progress_window: 4,
         recovery_limit: 1,
@@ -315,28 +306,6 @@ where
         Err(error) => Err(HeadlessError::Loop(error.to_string())),
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[cfg(test)]
 mod tests {

@@ -16,7 +16,9 @@
 //! anonymous runs.)
 
 use chrono::Utc;
-use codefactory_agent_loop::journal::{PersistError, PersistResult, Persistence, UsageRow};
+use codefactory_agent_loop::journal::{
+    PersistError, PersistResult, Persistence, TurnActivityUpdate, UsageRow,
+};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -125,6 +127,57 @@ impl SqlitePersistence {
 
 #[async_trait::async_trait]
 impl Persistence for SqlitePersistence {
+    async fn update_turn_activity(&self, update: &TurnActivityUpdate) -> PersistResult<i64> {
+        if self.anonymous {
+            return Ok(0);
+        }
+        let now = Utc::now().timestamp_millis();
+        let terminal = matches!(
+            update.status.as_str(),
+            "completed" | "blocked" | "cancelled" | "interrupted"
+        );
+        sqlx::query(
+            "UPDATE chat_turn_state SET
+               revision=revision+1, phase=?, status=?,
+               recent_activity_kind=?, recent_activity_label=?,
+               waiting_reason=?, updated_at=?,
+               completed_at=CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE NULL END,
+               terminal_reason=?
+             WHERE root_turn_id=?",
+        )
+        .bind(&update.phase)
+        .bind(&update.status)
+        .bind(&update.recent_activity_kind)
+        .bind(&update.recent_activity_label)
+        .bind(&update.waiting_reason)
+        .bind(now)
+        .bind(terminal)
+        .bind(now)
+        .bind(&update.terminal_reason)
+        .bind(&update.root_turn_id)
+        .execute(&self.db)
+        .await
+        .map_err(perr)?;
+        if terminal {
+            sqlx::query(
+                "UPDATE chat_task_segments SET status=?, updated_at=?
+                 WHERE id=(SELECT task_segment_id FROM chat_turn_state WHERE root_turn_id=?)",
+            )
+            .bind(&update.status)
+            .bind(now)
+            .bind(&update.root_turn_id)
+            .execute(&self.db)
+            .await
+            .map_err(perr)?;
+        }
+        sqlx::query_scalar("SELECT revision FROM chat_turn_state WHERE root_turn_id=?")
+            .bind(&update.root_turn_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(perr)
+            .map(|value| value.unwrap_or(0))
+    }
+
     async fn persist_message(
         &self,
         role: &str,

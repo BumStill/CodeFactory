@@ -10,6 +10,7 @@ import type {
   ReasoningEffort,
   PermissionMode,
   TurnPlanSnapshot,
+  TurnActivitySnapshot,
   AnonTurn,
 } from "../lib/tauri";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -366,7 +367,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const localMessages =
         staleStreamingRevision != null ? currentRuntime?.localMessages ?? [] : [];
       const hydrated = freshRuntime(
-        [...dbMessagesToUI(page.messages, page.plans ?? []), ...localMessages],
+        [
+          ...dbMessagesToUI(
+            page.messages,
+            page.plans ?? [],
+            page.turn_states ?? [],
+          ),
+          ...localMessages,
+        ],
         {
           persistedMessages: page.messages,
           persistedPlans: page.plans ?? [],
@@ -470,13 +478,21 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           page.plans ?? [],
           mergePersistedPlans(runtime.persistedPlans, latestPage.plans ?? []),
         );
+        const turnStates = mergeTurnActivityStates(
+          page.turn_states ?? [],
+          latestPage.turn_states ?? [],
+        );
         return {
           runtime: {
             ...s.runtime,
             [id]: {
               ...runtime,
               messages: [
-                ...dbMessagesToUI(persistedMessages, persistedPlans),
+                ...dbMessagesToUI(
+                  persistedMessages,
+                  persistedPlans,
+                  turnStates,
+                ),
                 ...runtime.localMessages,
               ],
               persistedMessages,
@@ -1340,6 +1356,20 @@ function mergePersistedPlans(
   return [...latest.values()].sort((a, b) => a.created_at - b.created_at);
 }
 
+function mergeTurnActivityStates(
+  older: TurnActivitySnapshot[],
+  newer: TurnActivitySnapshot[],
+): TurnActivitySnapshot[] {
+  const latest = new Map<string, TurnActivitySnapshot>();
+  for (const state of [...older, ...newer]) {
+    const existing = latest.get(state.root_turn_id);
+    if (!existing || existing.revision < state.revision) {
+      latest.set(state.root_turn_id, state);
+    }
+  }
+  return [...latest.values()].sort((a, b) => a.updated_at - b.updated_at);
+}
+
 interface PersistedToolCall {
   id?: unknown;
   function?: {
@@ -1389,7 +1419,7 @@ function parsePersistedToolCalls(raw: string | null | undefined): ToolCallState[
 function parsePersistedToolReplay(raw: string): {
   toolCallId: string;
   content: string;
-  status: "done" | "error" | "denied" | "cancelled";
+  status: "done" | "blocked" | "error" | "denied" | "cancelled";
 } | null {
   try {
     const replay = JSON.parse(raw) as PersistedToolReplay;
@@ -1398,6 +1428,7 @@ function parsePersistedToolReplay(raw: string): {
     }
     const status =
       replay.status === "error" ||
+      replay.status === "blocked" ||
       replay.status === "denied" ||
       replay.status === "cancelled" ||
       replay.status === "done"
@@ -1415,6 +1446,7 @@ function parsePersistedToolReplay(raw: string): {
 export function dbMessagesToUI(
   messages: Message[],
   plans: TurnPlanSnapshot[] = [],
+  turnStates: TurnActivitySnapshot[] = [],
 ): UIMessage[] {
   const hydrated: UIMessage[] = [];
   const toolOwners = new Map<string, number>();
@@ -1500,6 +1532,36 @@ export function dbMessagesToUI(
       .filter((tool) => tool.name !== "update_plan");
     finalAssistant.turnToolCallCount = turnTools.length;
     finalAssistant.turnToolCalls = turnTools.slice(-200);
+  }
+
+  for (const activity of turnStates) {
+    const rootIndex = hydrated.findIndex(
+      (message) =>
+        message.id === activity.root_turn_id && message.role === "user",
+    );
+    if (rootIndex < 0) continue;
+    let nextRootIndex = hydrated.length;
+    for (let index = rootIndex + 1; index < hydrated.length; index += 1) {
+      if (hydrated[index].role === "user") {
+        nextRootIndex = index;
+        break;
+      }
+    }
+    const assistant = [...hydrated.slice(rootIndex + 1, nextRootIndex)]
+      .reverse()
+      .find((message) => message.role === "assistant");
+    if (!assistant) continue;
+    assistant.turnActivity = {
+      rootTurnId: activity.root_turn_id,
+      revision: activity.revision,
+      phase: activity.phase,
+      status: activity.status,
+      kind: activity.recent_activity_kind,
+      label: activity.recent_activity_label,
+      waitingReason: activity.waiting_reason ?? null,
+      updatedAt: activity.updated_at,
+      terminalReason: activity.terminal_reason ?? null,
+    };
   }
 
   return hydrated;

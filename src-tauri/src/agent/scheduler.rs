@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{Mutex, Semaphore};
+use uuid::Uuid;
 
 use crate::agent::hooks::{HookEvent, HookRunner};
 use crate::agent::journal;
@@ -582,8 +583,20 @@ impl TaskScheduler {
                             );
                         }
 
+                        let attempt_id = Uuid::new_v4().to_string();
+                        if let Err(error) =
+                            tasks::start_task_attempt(&pool, &attempt_id, &task_id, attempt as i32)
+                                .await
+                        {
+                            let message = format!("attempt journal start failed: {error}");
+                            tracing::error!("scheduler: task {} {message}", task_id);
+                            prev_error = Some(message);
+                            continue;
+                        }
+
                         let subagent_result = subagent::run_subagent(
                             brief,
+                            &attempt_id,
                             &pool,
                             &session_id_for_task,
                             &settings,
@@ -595,6 +608,17 @@ impl TaskScheduler {
                         match subagent_result {
                             Err(e) => {
                                 let msg = e.to_string();
+                                tasks::finish_task_attempt(
+                                    &pool,
+                                    &attempt_id,
+                                    "failed",
+                                    Some("subagent_error"),
+                                    Some(&msg),
+                                    None,
+                                    None,
+                                )
+                                .await
+                                .ok();
                                 tracing::warn!(
                                     "scheduler: task {} attempt {attempt} error: {msg}",
                                     task_id
@@ -628,6 +652,17 @@ impl TaskScheduler {
                                 if let Some(ref ac) = result.acceptance_check {
                                     if !ac.passed {
                                         let msg = format!("Acceptance check failed: {}", ac.reason);
+                                        tasks::finish_task_attempt(
+                                            &pool,
+                                            &attempt_id,
+                                            "failed",
+                                            Some("acceptance_failed"),
+                                            Some(&msg),
+                                            Some(&result.summary),
+                                            None,
+                                        )
+                                        .await
+                                        .ok();
                                         tracing::warn!(
                                             "scheduler: task {} attempt {attempt} acceptance failed: {}",
                                             task_id,
@@ -678,6 +713,8 @@ impl TaskScheduler {
                                     &task_id,
                                 )
                                 .await;
+                                let verif_json =
+                                    serde_json::to_string(&verif_results).unwrap_or_default();
 
                                 // Persist verification results.
                                 if let Ok(json) = serde_json::to_string(&verif_results) {
@@ -693,6 +730,17 @@ impl TaskScheduler {
                                     MAX_ATTEMPTS,
                                 ) {
                                     VerificationAttemptDecision::Retry { error } => {
+                                        tasks::finish_task_attempt(
+                                            &pool,
+                                            &attempt_id,
+                                            "failed",
+                                            Some("verification_failed"),
+                                            Some(&error),
+                                            None,
+                                            Some(&verif_json),
+                                        )
+                                        .await
+                                        .ok();
                                         tracing::warn!(
                                             "scheduler: task {} attempt {attempt} failed verification",
                                             task_id
@@ -717,6 +765,23 @@ impl TaskScheduler {
                                         continue;
                                     }
                                     VerificationAttemptDecision::Finish(outcome) => {
+                                        let status = if outcome.completed {
+                                            "completed"
+                                        } else {
+                                            "failed"
+                                        };
+                                        tasks::finish_task_attempt(
+                                            &pool,
+                                            &attempt_id,
+                                            status,
+                                            (!outcome.completed).then_some("verification_failed"),
+                                            (!outcome.completed)
+                                                .then_some(outcome.summary.as_str()),
+                                            Some(&outcome.summary),
+                                            Some(&verif_json),
+                                        )
+                                        .await
+                                        .ok();
                                         final_outcome = Some(outcome);
                                         break;
                                     }
@@ -889,8 +954,11 @@ impl TaskScheduler {
                         } else {
                             crate::notify::NotifyEvent::TaskFailed
                         },
-                        format!("{task_title}
-{}", hook_summary.chars().take(200).collect::<String>()),
+                        format!(
+                            "{task_title}
+{}",
+                            hook_summary.chars().take(200).collect::<String>()
+                        ),
                     );
                     match final_outcome {
                         Some(result) if result.completed => {
@@ -1042,8 +1110,7 @@ impl TaskScheduler {
                             summary: post_summary,
                         })
                         .await;
-                    let reclaimed =
-                        crate::tools::browser_session::close_for_task(&task_id).await;
+                    let reclaimed = crate::tools::browser_session::close_for_task(&task_id).await;
                     if reclaimed > 0 {
                         tracing::info!(
                             "scheduler: reclaimed {reclaimed} browser session(s) for task {task_id}"

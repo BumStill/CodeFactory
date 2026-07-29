@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 import App from "./App";
 import { useChatStore } from "./stores/chat";
 
@@ -111,5 +112,18 @@ describe("App default workspace entry", () => {
       expect.stringMatching(/create_session|materialize_draft_session/),
       expect.anything(),
     );
+  });
+
+  it("still opens one draft when React StrictMode replays the startup effect", async () => {
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+
+    const workspace = await screen.findByRole("main", { name: "会话工作区" });
+    expect(workspace).toHaveAttribute("data-session-id", "draft-start");
+    expect(mocks.beginDraft).toHaveBeenCalledTimes(1);
+    expect(mocks.createSession).not.toHaveBeenCalled();
   });
 });
