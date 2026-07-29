@@ -173,7 +173,7 @@ describe("SettingsPage Hooks and Remotes tabs", () => {
     const user = userEvent.setup();
     render(<SettingsPage onBack={() => {}} />);
 
-    await user.click(screen.getByRole("button", { name: "钩子" }));
+    await user.click(screen.getByRole("tab", { name: "钩子" }));
 
     expect(await screen.findByText("Auto commit")).toBeInTheDocument();
     expect(mocks.invoke).toHaveBeenCalledWith("list_hooks");
@@ -197,7 +197,7 @@ describe("SettingsPage Hooks and Remotes tabs", () => {
     const user = userEvent.setup();
     render(<SettingsPage onBack={() => {}} />);
 
-    await user.click(screen.getByRole("button", { name: "钩子" }));
+    await user.click(screen.getByRole("tab", { name: "钩子" }));
     await user.click(await screen.findByRole("button", { name: /添加钩子/ }));
 
     await user.type(screen.getByLabelText("名称"), "Log shell commands");
@@ -229,7 +229,7 @@ describe("SettingsPage Hooks and Remotes tabs", () => {
     const user = userEvent.setup();
     render(<SettingsPage onBack={() => {}} />);
 
-    await user.click(screen.getByRole("button", { name: "远程仓库" }));
+    await user.click(screen.getByRole("tab", { name: "远程仓库" }));
 
     expect(await screen.findByText("origin")).toBeInTheDocument();
     expect(mocks.loadRemotes).toHaveBeenCalled();
@@ -246,7 +246,7 @@ describe("SettingsPage Hooks and Remotes tabs", () => {
     const user = userEvent.setup();
     render(<SettingsPage onBack={() => {}} />);
 
-    await user.click(screen.getByRole("button", { name: "远程仓库" }));
+    await user.click(screen.getByRole("tab", { name: "远程仓库" }));
 
     expect(await screen.findByText(/已登录 GitHub CLI/)).toBeInTheDocument();
     expect(screen.getByText(/无需重复配置 token/)).toBeInTheDocument();
@@ -258,7 +258,7 @@ describe("SettingsPage Hooks and Remotes tabs", () => {
     const user = userEvent.setup();
     render(<SettingsPage onBack={() => {}} />);
 
-    await user.click(screen.getByRole("button", { name: "远程仓库" }));
+    await user.click(screen.getByRole("tab", { name: "远程仓库" }));
     await user.click(await screen.findByRole("button", { name: /添加远程仓库/ }));
 
     await user.type(screen.getByLabelText("名称"), "GitLab CI");
@@ -276,4 +276,22 @@ describe("SettingsPage Hooks and Remotes tabs", () => {
       default_repo: "group/project",
     }));
   });
+
+  it("exposes settings navigation as grouped tabs with a current-page purpose", async () => {
+    const user = userEvent.setup();
+    render(<SettingsPage onBack={() => {}} />);
+
+    const nav = screen.getByRole("tablist", { name: "设置分类" });
+    expect(nav).toBeInTheDocument();
+    expect(screen.getByText("工作流")).toBeInTheDocument();
+    expect(screen.getByText("模型与连接")).toBeInTheDocument();
+
+    expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName("端点");
+    expect(screen.getByText("配置模型登录、API 端点和新会话默认路由策略。")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "远程仓库" }));
+    expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName("远程仓库");
+    expect(screen.getByText("配置代码交付使用的 GitHub/GitLab 凭据或复用 GitHub CLI。") ).toBeInTheDocument();
+  });
+
 });

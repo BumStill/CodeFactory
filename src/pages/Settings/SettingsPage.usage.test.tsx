@@ -199,7 +199,7 @@ async function openUsageTab() {
       onOpenJobLog={mocks.openJobLog}
     />,
   );
-  await user.click(screen.getByRole("button", { name: "用量与预算" }));
+  await user.click(screen.getByRole("tab", { name: "用量与预算" }));
   return user;
 }
 
