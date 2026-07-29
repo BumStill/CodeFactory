@@ -599,7 +599,12 @@ pub async fn send_message(
     let prev_assistant = history
         .iter()
         .rev()
-        .find(|m| m.role == "assistant" && m.completion_state.is_none())
+        .find(|m| {
+            m.role == "assistant"
+                && m.completion_state.is_none()
+                && (!crate::agent::is_contextual_approval(&content)
+                    || crate::agent::proposal_capability(&m.content).is_some())
+        })
         .map(|m| m.content.clone());
     // Full access is a permission policy only. It may reduce approval prompts
     // after a tool is selected, but it must never turn a diagnostic question
@@ -840,7 +845,11 @@ pub async fn send_message_anonymous(
     let prev_assistant = history
         .iter()
         .rev()
-        .find(|turn| turn.role == "assistant")
+        .find(|turn| {
+            turn.role == "assistant"
+                && (!crate::agent::is_contextual_approval(&content)
+                    || crate::agent::proposal_capability(&turn.content).is_some())
+        })
         .map(|turn| turn.content.as_str());
     let contract = crate::agent::decide_chat_contract(prev_assistant, &content);
 

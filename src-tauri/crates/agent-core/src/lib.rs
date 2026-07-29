@@ -817,6 +817,13 @@ fn has_workspace_mutation(command: &str) -> bool {
             "cp ",
             "install ",
             "git apply",
+            "git branch -m",
+            "git branch -M",
+            "git switch ",
+            "git checkout ",
+            "git fetch ",
+            "git pull ",
+            "git stash ",
         ],
     ) || has_non_transient_output_redirect(command)
 }
@@ -5086,6 +5093,27 @@ mod tests {
         );
 
         assert_eq!(classify_command(command, 30_000), ToolKind::Mutation);
+    }
+
+    #[test]
+    fn local_git_state_changes_are_mutations_in_review_only_turns() {
+        for command in [
+            "git branch -m feature/new-name",
+            "git switch -c feature/new-name",
+            "git checkout -b feature/new-name",
+            "git fetch --prune origin main",
+            "git stash push -u",
+        ] {
+            assert_eq!(
+                classify_command(command, 30_000),
+                ToolKind::Mutation,
+                "{command:?} changes local repository state"
+            );
+        }
+        assert_eq!(
+            classify_command("git status --short --branch", 30_000),
+            ToolKind::ReadOnly
+        );
     }
 
     #[test]

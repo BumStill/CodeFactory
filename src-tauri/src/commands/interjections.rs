@@ -79,6 +79,13 @@ impl codefactory_agent_loop::services::SteerInbox for SessionSteerInbox {
             .map(|item| item.message)
             .collect()
     }
+
+    fn capability_override(
+        &self,
+        content: &str,
+    ) -> Option<codefactory_agent_loop::run::TurnCapability> {
+        crate::agent::steer_capability_override(content)
+    }
 }
 
 #[cfg(test)]

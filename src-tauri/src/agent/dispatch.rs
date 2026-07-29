@@ -138,6 +138,11 @@ const PLAN_ONLY_CJK: &[&str] = &[
     "别执行",
     "不要动代码",
     "别动代码",
+    "继续分析",
+    "继续审视",
+    "继续评估",
+    "继续讨论",
+    "继续看看",
 ];
 const PLAN_ONLY_EN_PHRASES: &[&str] = &[
     "what's the plan",
@@ -171,6 +176,8 @@ const DIRECT_EXEC_CJK: &[&str] = &[
     "加上",
     "开始搞",
     "开始做",
+    "开始实施",
+    "批准的执行",
     "赶紧处理",
     "赶紧修",
     "搞定",
@@ -291,6 +298,42 @@ fn is_explicit_planning_request(user_msg: &str) -> bool {
     if m.is_empty() {
         return false;
     }
+    let explicitly_leaves_review = [
+        "别只分析",
+        "不要只分析",
+        "别只审视",
+        "不要只审视",
+        "别再分析",
+        "不要再分析",
+        "别再审视",
+        "不要再审视",
+        "stop analyzing",
+        "stop reviewing",
+        "don't just analyze",
+        "do not just analyze",
+        "don't just review",
+        "do not just review",
+    ]
+    .iter()
+    .any(|cue| m.contains(cue))
+        && [
+            "继续执行",
+            "继续实施",
+            "开始执行",
+            "开始实施",
+            "执行完",
+            "实施完",
+            "动手",
+            "implement",
+            "execute",
+            "proceed",
+            "continue",
+        ]
+        .iter()
+        .any(|cue| m.contains(cue));
+    if explicitly_leaves_review {
+        return false;
+    }
     let toks = tokens(&m);
     PLAN_ONLY_CJK.iter().any(|cue| m.contains(cue))
         || PLAN_ONLY_EN_PHRASES.iter().any(|cue| m.contains(cue))
@@ -323,6 +366,105 @@ fn is_delivery_request(user_msg: &str) -> bool {
         || toks.iter().any(|token| DELIVERY_EN_WORDS.contains(token))
 }
 
+fn is_explicit_continuation_request(user_msg: &str) -> bool {
+    let m = user_msg.trim().to_lowercase();
+    if m.is_empty() || is_explicit_planning_request(&m) {
+        return false;
+    }
+    let diagnostic = ["为什么", "为何", "原因", "怎么会", "why", "how"]
+        .iter()
+        .any(|cue| m.contains(cue));
+    if diagnostic {
+        return false;
+    }
+    let compact = m
+        .chars()
+        .filter(|character| !character.is_whitespace() && !"，。！？,.!?".contains(*character))
+        .collect::<String>();
+    compact == "继续"
+        || compact == "可以继续"
+        || compact == "好的继续"
+        || compact == "开始"
+        || m.contains("继续做")
+        || m.contains("接着做")
+        || m.contains("继续执行")
+        || m.contains("继续实施")
+        || m.contains("继续完成")
+        || m.contains("resume")
+        || m.contains("continue")
+}
+
+pub fn proposal_capability(previous_assistant: &str) -> Option<TurnCapability> {
+    let text = previous_assistant.trim().to_lowercase();
+    if text.is_empty() {
+        return None;
+    }
+    if [
+        "开 pr",
+        "创建 pr",
+        "合并 pr",
+        "发布上线",
+        "发布。",
+        "推送",
+        "交付",
+        "open a pr",
+        "create a pr",
+        "merge the pr",
+        "release",
+        "publish",
+        "deploy",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue))
+    {
+        return Some(TurnCapability::Deliver);
+    }
+    let actionable = is_pending_proposal(&text)
+        || [
+            "可实施",
+            "实施方案",
+            "修复方案",
+            "落地方案",
+            "实现步骤",
+            "改动范围",
+            "下一步修改",
+            "开始实施",
+            "我会修复",
+            "我会修改",
+            "我会实现",
+            "implementation plan",
+            "next step",
+            "i will fix",
+            "i will implement",
+        ]
+        .iter()
+        .any(|cue| text.contains(cue));
+    actionable.then_some(TurnCapability::Implement)
+}
+
+pub fn is_contextual_approval(user_msg: &str) -> bool {
+    is_explicit_continuation_request(user_msg) || is_approval(user_msg)
+}
+
+/// A mid-run user steer can change the hard capability at the next safe round
+/// boundary. This is separate from normal permission approval: it changes the
+/// user's objective, and therefore must reach the structural gate itself.
+pub fn steer_capability_override(user_msg: &str) -> Option<TurnCapability> {
+    if is_explicit_planning_request(user_msg) {
+        return Some(TurnCapability::ReviewOnly);
+    }
+    if is_delivery_request(user_msg) {
+        return Some(TurnCapability::Deliver);
+    }
+    if is_direct_execution_request(user_msg)
+        || is_explicit_continuation_request(user_msg)
+        || is_strong_approval(user_msg)
+    {
+        return Some(TurnCapability::Implement);
+    }
+    None
+}
+
 pub fn decide_chat_contract(prev_assistant: Option<&str>, user_msg: &str) -> ChatContract {
     if is_explicit_planning_request(user_msg) {
         return ChatContract {
@@ -342,16 +484,24 @@ pub fn decide_chat_contract(prev_assistant: Option<&str>, user_msg: &str) -> Cha
             capability: TurnCapability::Implement,
         };
     }
-    let approval = is_strong_approval(user_msg)
-        || prev_assistant.is_some_and(|p| is_pending_proposal(p) && is_approval(user_msg));
+    if is_explicit_continuation_request(user_msg) {
+        return ChatContract {
+            mode: AgentMode::Execute,
+            capability: prev_assistant
+                .and_then(proposal_capability)
+                .unwrap_or(TurnCapability::Implement),
+        };
+    }
+    let approved_proposal = prev_assistant
+        .and_then(proposal_capability)
+        .filter(|_| is_approval(user_msg));
+    let approval = is_strong_approval(user_msg) || approved_proposal.is_some();
     if approval {
         return ChatContract {
             mode: AgentMode::Execute,
-            capability: if prev_assistant.is_some_and(is_delivery_request) {
-                TurnCapability::Deliver
-            } else {
-                TurnCapability::Implement
-            },
+            capability: approved_proposal
+                .or_else(|| prev_assistant.and_then(proposal_capability))
+                .unwrap_or(TurnCapability::Implement),
         };
     }
     ChatContract {
@@ -562,5 +712,56 @@ mod tests {
                 "{instruction:?} must not fall back to the 30-round interactive contract"
             );
         }
+    }
+
+    #[test]
+    fn continuation_is_an_explicit_state_transition_not_a_question_heuristic() {
+        for instruction in ["继续", "可以，继续", "继续做", "接着做"] {
+            assert_eq!(
+                decide_chat_contract(
+                    Some("这是已经审视完成的可实施方案。下一步按上述步骤修改并验证。"),
+                    instruction,
+                )
+                .capability,
+                TurnCapability::Implement,
+                "{instruction:?} must enter implementation even when the proposal does not end in a question"
+            );
+        }
+        assert_eq!(
+            decide_chat_contract(
+                Some("我会修复、开 PR、合并并发布。"),
+                "可以，继续",
+            )
+            .capability,
+            TurnCapability::Deliver,
+        );
+    }
+
+    #[test]
+    fn explicit_mid_turn_correction_can_change_the_active_capability() {
+        assert_eq!(
+            steer_capability_override("先把之前批准的执行了，再回来分析原因"),
+            Some(TurnCapability::Implement),
+        );
+        assert_eq!(
+            steer_capability_override("别只审视了，继续实施，把刚才这个方案执行完。"),
+            Some(TurnCapability::Implement),
+        );
+        assert_eq!(
+            steer_capability_override("不要只分析了，继续执行"),
+            Some(TurnCapability::Implement),
+        );
+        assert_eq!(
+            steer_capability_override("继续"),
+            Some(TurnCapability::Implement),
+        );
+        assert_eq!(
+            steer_capability_override("继续发布上线"),
+            Some(TurnCapability::Deliver),
+        );
+        assert_eq!(
+            steer_capability_override("先别修改，继续分析"),
+            Some(TurnCapability::ReviewOnly),
+        );
     }
 }

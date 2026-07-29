@@ -468,7 +468,7 @@ pub async fn run_agent_loop(
     } = inputs;
     let RunConfig {
         finalization,
-        turn_capability,
+        turn_capability: initial_turn_capability,
         recovery_limit,
         max_iterations,
         wall_budget_applies: wall_budget,
@@ -489,6 +489,7 @@ pub async fn run_agent_loop(
         gate_benchmark,
         progress_window,
     } = config;
+    let mut turn_capability = initial_turn_capability;
     let LoopServices {
         transport,
         tools: tool_backend,
@@ -544,6 +545,7 @@ pub async fn run_agent_loop(
     let mut blocker_summary_pending = false;
     let mut completion_summary_retry_used = false;
     let mut completion_recovery_attempts = 0_u32;
+    let mut structural_denial_seen = false;
     let mut fact_check_used = false;
     let mut require_tool_next = false;
     let mut model_round_index = 0_usize;
@@ -592,6 +594,29 @@ pub async fn run_agent_loop(
             // correction reaches the model before its next request, and no
             // in-flight tool call is ever interrupted to deliver it.
             for steer_text in steer.drain().await {
+                if let Some(next_capability) = steer.capability_override(&steer_text) {
+                    if next_capability != turn_capability {
+                        structural_denial_seen = false;
+                    }
+                    turn_capability = next_capability;
+                    let label = match next_capability {
+                        TurnCapability::ReviewOnly => "已切换为只读审视",
+                        TurnCapability::Implement => "已按用户指令继续实施",
+                        TurnCapability::Deliver => "已按用户指令继续交付",
+                    };
+                    publish_turn_activity(
+                        persistence.as_ref(),
+                        events.as_ref(),
+                        root_turn_id.as_deref(),
+                        "working",
+                        "active",
+                        "intent_changed",
+                        label,
+                        None,
+                        None,
+                    )
+                    .await?;
+                }
                 let message_id = persistence
                     .persist_message(
                         "user",
@@ -625,7 +650,10 @@ pub async fn run_agent_loop(
                 // work that actually happened and must not be discarded. Its
                 // core rule — a successful verification later than the last
                 // mutation — holds under any objective.
-                completion_recovery_attempts = 0;
+                completion_recovery_attempts =
+                    crate::policy::completion_recovery_attempts_after_steer(
+                        completion_recovery_attempts,
+                    );
                 events.emit(crate::types::StreamEvent::SteerApplied {
                     message_id,
                     content: steer_text,
@@ -659,8 +687,11 @@ pub async fn run_agent_loop(
 
             let summary_only_round = finalization_pending;
             let blocker_summary_round = summary_only_round && blocker_summary_pending;
-            let active_tool_defs =
-                crate::policy::active_tool_definitions(tool_defs, finalization_pending);
+            let active_tool_defs = crate::policy::active_tool_definitions_for_capability(
+                tool_defs,
+                finalization_pending,
+                turn_capability,
+            );
             let required_tool_response = require_tool_next && !finalization_pending;
             // Resolve reasoning effort ONCE per round via ContextPolicy (slice
             // 4.6): it re-reads db+settings each round (freshness) and returns ""
@@ -673,7 +704,7 @@ pub async fn run_agent_loop(
                 reasoning_effort: context_policy.round_reasoning_effort().await,
             };
             let call_result = transport
-                .complete(&messages, active_tool_defs, &round_options)
+                .complete(&messages, &active_tool_defs, &round_options)
                 .await;
             let crate::transport::ModelResponse {
                 text,
@@ -715,7 +746,7 @@ pub async fn run_agent_loop(
                         detail: notice.clone(),
                     });
                     transport
-                        .complete(&messages, active_tool_defs, &round_options)
+                        .complete(&messages, &active_tool_defs, &round_options)
                         .await?
                 }
                 // Transient provider saturation (Anthropic 529/overloaded, 503,
@@ -739,7 +770,7 @@ pub async fn run_agent_loop(
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                         match transport
-                            .complete(&messages, active_tool_defs, &round_options)
+                            .complete(&messages, &active_tool_defs, &round_options)
                             .await
                         {
                             Ok(ok) => {
@@ -924,6 +955,31 @@ pub async fn run_agent_loop(
                         "任务已在明确边界停止",
                         None,
                         Some("tool_blocked"),
+                    )
+                    .await?;
+                    let (done_in, done_out) = usage
+                        .as_ref()
+                        .map(|u| (u.prompt_tokens, u.completion_tokens))
+                        .unwrap_or((0, 0));
+                    events.emit(crate::types::StreamEvent::Done {
+                        input_tokens: done_in,
+                        output_tokens: done_out,
+                    });
+                    emitted_terminal = true;
+                    break;
+                }
+                if structural_denial_seen {
+                    last_final_text = text.clone();
+                    publish_turn_activity(
+                        persistence.as_ref(),
+                        events.as_ref(),
+                        root_turn_id.as_deref(),
+                        "finalizing",
+                        "blocked",
+                        "blocked",
+                        "任务因结构边界停止",
+                        None,
+                        Some("capability_denied"),
                     )
                     .await?;
                     let (done_in, done_out) = usage
@@ -1191,6 +1247,7 @@ pub async fn run_agent_loop(
                     &classified_command,
                     &classified_kind,
                 );
+                let capability_denied = capability_denial.is_some();
                 let inspection_denial = if inspection_budget {
                     crate::policy::inspection_budget_denial(
                         progress_tracker.read_only_exhausted(),
@@ -1241,6 +1298,9 @@ pub async fn run_agent_loop(
                 };
 
                 if let Some(content) = denial_content {
+                    if capability_denied {
+                        structural_denial_seen = true;
+                    }
                     persistence
                         .record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
                         .await?;
@@ -2241,6 +2301,106 @@ mod tests {
                 Vec::new()
             }
         }
+
+        fn capability_override(&self, content: &str) -> Option<TurnCapability> {
+            (content == "继续执行").then_some(TurnCapability::Implement)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_steer_upgrades_the_hard_gate_before_the_next_tool_batch() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "先检查",
+                vec![call(
+                    "t1",
+                    "bash",
+                    serde_json::json!({"command": "git status --short"}),
+                )],
+                0,
+            ),
+            response(
+                "收到，开始实施",
+                vec![call("t2", "scripted", serde_json::json!({}))],
+                1,
+            ),
+            response(
+                "验证",
+                vec![call(
+                    "t3",
+                    "bash",
+                    serde_json::json!({"command": "pnpm test"}),
+                )],
+                2,
+            ),
+            response("完成", vec![], 3),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let steer = Arc::new(ScriptedSteer {
+            deliver_on_drain: 2,
+            message: "继续执行".into(),
+            drains: Mutex::new(0),
+        });
+        let mut cfg = config();
+        cfg.turn_capability = TurnCapability::ReviewOnly;
+        cfg.max_iterations = 4;
+        let mut svc = services(transport, persistence, events.clone());
+        svc.steer = steer;
+
+        run_agent_loop(inputs(), cfg, svc)
+            .await
+            .expect("loop runs");
+
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult {
+                tool_call_id,
+                status,
+                ..
+            } if tool_call_id == "t2" && status == "done"
+        )));
+        assert!(!events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult {
+                tool_call_id,
+                status,
+                ..
+            } if tool_call_id == "t2" && status == "denied"
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_structural_capability_denial_cannot_end_as_task_completed() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "尝试修改",
+                vec![call("t1", "scripted", serde_json::json!({}))],
+                0,
+            ),
+            response("当前边界下未执行修改。", vec![], 1),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut cfg = config();
+        cfg.turn_capability = TurnCapability::ReviewOnly;
+
+        run_agent_loop(
+            inputs(),
+            cfg,
+            services(transport, persistence, events.clone()),
+        )
+        .await
+        .expect("loop runs");
+
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated { status, .. } if status == "blocked"
+        )));
+        assert!(!events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated { status, .. } if status == "completed"
+        )));
     }
 
     #[tokio::test]
