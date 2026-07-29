@@ -13,6 +13,7 @@ CodeFactory 的核心价值是让用户在一个持续会话中完成真实软�
 - 超长会话默认只加载足以继续工作的最新历史，启动成本不再与全量会话线性绑定。
 - 更早历史仍可按需访问，不迁移、不删除、不静默截断 SQLite 中的原始记录。
 - 流式尾部更新不得反复解析和渲染不变的历史工具卡。
+- 流式时间线中的文本段不得因后续工具或文本到达而丢失 Markdown 语义。
 - 即使前端漏掉最后一个 stream 事件，回合终态也能从持久化尾页重新同步。
 - 修复必须兼容旧数据库、旧 completion state、历史 tool replay 和当前会话控制语义。
 
@@ -41,6 +42,8 @@ CodeFactory 的核心价值是让用户在一个持续会话中完成真实软�
 | CF-LSR-R12 | 原故障等比例 fixture 的 WebContent 峰值不超过 700 MB、稳定值不超过 500 MB、静置 CPU 不超过 10% | packaged/dev app | process observation |
 | CF-LSR-R13 | 普通短会话、匿名会话、后台流式会话和队列语义不得回归 | desktop UI + store | existing full suite + focused tests |
 | CF-LSR-R14 | PR、main CI、公开安装包和精确版本真实 App 验证完成前保持 `not live` | release | release evidence pack |
+| CF-LSR-R15 | 文本段从当前尾部变为中间执行步骤时，标题、列表、行内代码、链接等 Markdown 语义必须保持；只允许改变视觉层级 | MessageList | failure-first component + real app |
+| CF-LSR-R16 | 已完成文本段必须按稳定文本缓存；新的 stream delta 不得重新解析所有不变的历史 Markdown 段 | MessageList | render-count regression |
 
 ## 架构设计
 
@@ -74,6 +77,8 @@ CodeFactory 的核心价值是让用户在一个持续会话中完成真实软�
 
 - reducer 使用定点更新 helper：查找目标消息、复制数组、只替换一个对象。
 - `MessageRow` 与 `ToolCallCard` 使用 `React.memo`；未变消息引用保持稳定。
+- 时间线文本统一经过 Markdown renderer；中间步骤只使用较轻的容器样式，不降级为纯文本。
+- 单个时间线文本段由 memoized component 持有。reducer 保持既有段对象引用，只有当前接收 delta 的尾段需要重新解析 Markdown。
 - `ToolCallCard` 的 diff/知识结果解析放入依赖 `open` 的 `useMemo`，折叠态不读取完整结果。
 - 折叠失败卡的摘要用有界首行扫描，最多构造 200 个字符，不对多 MiB 结果执行 `split/map`。
 - `MessageList` 使用稳定 session id 作为 conversation key，向上分页不会被误判为切换会话。
@@ -112,11 +117,17 @@ CodeFactory 的核心价值是让用户在一个持续会话中完成真实软�
 - 重同步失败不弹阻断式错误；保留当前消息，并提供可诊断日志。
 - 若未来 watchdog 检测到 WebView 长任务，应提供“重新加载当前会话尾部”，但本切片先消除已知无界成本。
 
+### 流式时间线格式
+
+- 当前文本段和已经完成的中间文本段使用相同 Markdown 语义。
+- 中间步骤可使用较轻颜色和紧凑间距，但 `**标题**`、反引号、列表、链接不得显示为原始标记。
+- 后续工具调用或新文本段到达时，已显示内容不得发生“从格式化文本闪回原始 Markdown”的视觉跳变。
+
 ## Primary User Paths
 
 ### 成功路径
 
-用户启动 CodeFactory，打开一个含数千条历史消息的会话。真实 App 在 5 秒内恢复交互并显示最近工作和最终回复（内部页查询与 hydration 目标 2 秒）；发送新请求后工具调用、流式正文和终态正常更新，历史区域不重复重渲染。
+用户启动 CodeFactory，打开一个含数千条历史消息的会话。真实 App 在 5 秒内恢复交互并显示最近工作和最终回复（内部页查询与 hydration 目标 2 秒）；发送新请求后工具调用、流式正文和终态正常更新，历史区域不重复重渲染。格式化状态报告在后续工具和文本到达后仍保持标题、列表和行内代码语义。
 
 ### 历史路径
 
@@ -152,6 +163,7 @@ CodeFactory 的核心价值是让用户在一个持续会话中完成真实软�
 | Store unit | 3743-message fixture | 首次调用分页接口；加载更早合并并去重 |
 | Reducer unit | 3743 UI messages + text/tool/done | 仅目标对象引用变化；终态关闭 streaming |
 | Component unit | 折叠 1726 工具卡 | diff parser 调用为 0；展开目标卡后只调用 1 次 |
+| Component unit | Markdown 文本 → tool → 新文本 | 原文本从尾段变为中间步骤后，标题、列表、行内代码仍为结构化 DOM；不变段不重复渲染 |
 | Browser/headless | 生产故障会话等比例 fixture 首屏与上翻 | 初始 8 回合 fixture DOM <=250；内部加载 <=2s；锚点漂移 <=4px |
 | Dev App | 原 SQLite 的隔离副本 | 最新回复可见；流式成功和边界路径；RSS/CPU 达标 |
 | Release App | 公开安装包 | 精确版本、真实 GUI、原故障等比例 fixture 达标 |
