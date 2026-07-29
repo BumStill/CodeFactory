@@ -90,7 +90,7 @@ export function OnboardingWizard({
             <>
               <Check size={13} className="mt-0.5 text-emerald-500 shrink-0" />
               <span className="text-gray-300">
-                GitHub CLI 已就绪——PR/CI/合并/发布零配置可用。
+                GitHub CLI 已就绪——GitHub/GHE 的 PR/CI/合并/发布可零配置使用；其他 Git 平台可用远程令牌或 delivery_provider hook。
               </span>
             </>
           ) : channel.rest_token ? (
@@ -100,7 +100,7 @@ export function OnboardingWizard({
             </>
           ) : (
             <span className="text-gray-400">
-              ② 交付链未就绪:推荐在终端执行
+              ② GitHub/GHE 交付可在终端执行
               <button
                 type="button"
                 onClick={copyGhLogin}
@@ -109,7 +109,7 @@ export function OnboardingWizard({
                 gh auth login
                 {copied ? <Check size={10} className="text-emerald-500" /> : <Copy size={10} />}
               </button>
-              登录一次即可;或在设置 → 远程仓库配置令牌。
+              登录一次即可；GitLab/Bitbucket/Azure/Gitea/Forgejo/Gerrit/Zeabur 等请在设置 → 远程仓库配置令牌或 delivery_provider hook。
             </span>
           )}
         </div>

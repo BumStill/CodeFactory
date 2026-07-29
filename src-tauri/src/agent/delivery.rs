@@ -134,6 +134,123 @@ pub enum CiStatus {
     None,
 }
 
+/// A deployment/live observer must distinguish an actual successful assertion
+/// from an action that merely started or is not configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservationStatus {
+    Success(String),
+    Failure(String),
+    Pending(String),
+    Unsupported(String),
+}
+
+fn parse_observation_status(status: &str, detail: Option<String>) -> ObservationStatus {
+    match status {
+        "success" => ObservationStatus::Success(detail.unwrap_or_else(|| "verified".into())),
+        "pending" => ObservationStatus::Pending(detail.unwrap_or_else(|| "pending".into())),
+        "failure" => ObservationStatus::Failure(detail.unwrap_or_else(|| "failure".into())),
+        "unsupported" | "none" => {
+            ObservationStatus::Unsupported(detail.unwrap_or_else(|| "not configured".into()))
+        }
+        other => ObservationStatus::Failure(format!("unknown observation status: {other}")),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepositoryDeliveryConfig {
+    #[serde(default = "delivery_config_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub remote: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default = "default_deployment_timeout_secs")]
+    pub deployment_timeout_secs: u32,
+    #[serde(default)]
+    pub live: Option<LiveHttpAssertion>,
+}
+
+fn delivery_config_schema_version() -> u32 {
+    1
+}
+
+fn default_deployment_timeout_secs() -> u32 {
+    900
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveHttpAssertion {
+    pub url: String,
+    #[serde(default = "default_http_method")]
+    pub method: String,
+    #[serde(default = "default_expected_status")]
+    pub expected_status: u16,
+    /// Required for a valid live assertion: HTTP 200 alone is not evidence.
+    pub body_contains: String,
+    #[serde(default = "default_live_timeout_secs")]
+    pub timeout_secs: u32,
+    #[serde(default = "default_live_poll_interval_secs")]
+    pub poll_interval_secs: u32,
+}
+
+fn default_http_method() -> String {
+    "GET".into()
+}
+fn default_expected_status() -> u16 {
+    200
+}
+fn default_live_timeout_secs() -> u32 {
+    300
+}
+fn default_live_poll_interval_secs() -> u32 {
+    10
+}
+
+impl LiveHttpAssertion {
+    fn expected_body(&self, sha: &str) -> String {
+        let short = sha.get(..7).unwrap_or(sha);
+        self.body_contains
+            .replace("$GIT_SHA_SHORT", short)
+            .replace("$GIT_SHA", sha)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.url.trim().is_empty() {
+            return Err("live.url cannot be empty".into());
+        }
+        if !self.method.eq_ignore_ascii_case("GET") {
+            return Err("only GET live assertions are supported".into());
+        }
+        if self.body_contains.trim().is_empty() {
+            return Err(
+                "live.body_contains is required; HTTP status alone cannot verify上线".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+pub fn load_delivery_config(root: &Path) -> Result<Option<RepositoryDeliveryConfig>, String> {
+    let path = root.join(".codefactory").join("delivery.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+    let config: RepositoryDeliveryConfig =
+        serde_json::from_str(&raw).map_err(|e| format!("解析 {} 失败: {e}", path.display()))?;
+    if config.schema_version != 1 {
+        return Err(format!(
+            "不支持 delivery schema_version {}",
+            config.schema_version
+        ));
+    }
+    if let Some(live) = &config.live {
+        live.validate()?;
+    }
+    Ok(Some(config))
+}
+
 /// Portable remote operations (token+REST). Implemented by `GithubRemote`;
 /// stubbed in tests so the state machine is exercised without a network. Uses
 /// native async-fn-in-trait with generic (static) dispatch — no `async_trait`
@@ -155,6 +272,31 @@ pub trait DeliveryRemote {
         method: MergeMethod,
     ) -> impl std::future::Future<Output = Result<(), String>>;
     fn trigger_release(&self) -> impl std::future::Future<Output = Result<String, String>>;
+
+    /// Observe the external CD platform (Zeabur, Vercel, Argo CD, etc.).
+    /// Defaulting to Unsupported keeps existing built-in and test adapters
+    /// source-compatible while making absence of deployment evidence explicit.
+    fn deployment_status(
+        &self,
+        _sha: &str,
+        _provider: Option<&str>,
+    ) -> impl std::future::Future<Output = Result<ObservationStatus, String>> {
+        std::future::ready(Ok(ObservationStatus::Unsupported(
+            "deployment observer not configured".into(),
+        )))
+    }
+
+    /// Run a provider-specific real-service assertion. Repositories should
+    /// prefer the repository-owned HTTP assertion when possible.
+    fn verify_live(
+        &self,
+        _sha: &str,
+        _url: Option<&str>,
+    ) -> impl std::future::Future<Output = Result<ObservationStatus, String>> {
+        std::future::ready(Ok(ObservationStatus::Unsupported(
+            "live verifier not configured".into(),
+        )))
+    }
 }
 
 // ── Local git helper ────────────────────────────────────────────────────────
@@ -194,6 +336,32 @@ pub struct RepoContext {
     pub root: PathBuf,
     pub branch: String,
     pub default_branch: String,
+    pub remote: String,
+    pub remote_url: Option<String>,
+}
+
+fn default_remote(root: &Path) -> String {
+    let remotes = git(root, &["remote"]).unwrap_or_default();
+    let names: Vec<&str> = remotes.lines().filter(|s| !s.trim().is_empty()).collect();
+    if names.contains(&"origin") {
+        "origin".into()
+    } else {
+        names.first().copied().unwrap_or("origin").into()
+    }
+}
+
+fn remote_default_branch(root: &Path, remote: &str) -> Option<String> {
+    git(
+        root,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            &format!("refs/remotes/{remote}/HEAD"),
+        ],
+    )
+    .ok()
+    .and_then(|s| s.rsplit('/').next().map(|s| s.to_string()))
 }
 
 pub fn resolve_repo(cwd: &Path, default_branch_hint: Option<&str>) -> Result<RepoContext, String> {
@@ -204,24 +372,18 @@ pub fn resolve_repo(cwd: &Path, default_branch_hint: Option<&str>) -> Result<Rep
     if branch == "HEAD" {
         return Err("detached HEAD — check out a branch before delivering".into());
     }
-    // Prefer the remote's default branch; fall back to a hint or common names.
-    let default_branch = git(
-        &root,
-        &[
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ],
-    )
-    .ok()
-    .and_then(|s| s.rsplit('/').next().map(|s| s.to_string()))
-    .or_else(|| default_branch_hint.map(|s| s.to_string()))
-    .unwrap_or_else(|| "main".to_string());
+    let remote = default_remote(&root);
+    let remote_url = git(&root, &["remote", "get-url", &remote]).ok();
+    // Prefer the selected remote's default branch; fall back to a hint or common names.
+    let default_branch = remote_default_branch(&root, &remote)
+        .or_else(|| default_branch_hint.map(|s| s.to_string()))
+        .unwrap_or_else(|| "main".to_string());
     Ok(RepoContext {
         root,
         branch,
         default_branch,
+        remote,
+        remote_url,
     })
 }
 
@@ -287,11 +449,11 @@ fn has_staged_changes(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn branch_is_ahead_of(root: &Path, base: &str, branch: &str) -> bool {
-    // rev-list base..branch — nonzero count means the branch has commits to push.
+fn branch_is_ahead_of(root: &Path, remote: &str, base: &str, branch: &str) -> bool {
+    // rev-list remote/base..branch — nonzero count means the branch has commits to push.
     git(
         root,
-        &["rev-list", "--count", &format!("origin/{base}..{branch}")],
+        &["rev-list", "--count", &format!("{remote}/{base}..{branch}")],
     )
     .ok()
     .and_then(|s| s.trim().parse::<u64>().ok())
@@ -405,7 +567,7 @@ pub async fn deliver<R: DeliveryRemote>(
 
     // Nothing to deliver at all: branch has no commits beyond base and there
     // was nothing to commit. Report a clean noop rather than open an empty PR.
-    if !branch_is_ahead_of(&repo.root, &repo.default_branch, &repo.branch)
+    if !branch_is_ahead_of(&repo.root, &repo.remote, &repo.default_branch, &repo.branch)
         && outcome.steps.iter().all(|s| s.status == "skipped")
     {
         outcome.final_state = "noop".into();
@@ -414,10 +576,10 @@ pub async fn deliver<R: DeliveryRemote>(
     }
 
     // ── Push ────────────────────────────────────────────────────────────────
-    match git(&repo.root, &["push", "-u", "origin", &repo.branch]) {
+    match git(&repo.root, &["push", "-u", &repo.remote, &repo.branch]) {
         Ok(_) => outcome.steps.push(StepResult::ok(
             "push",
-            format!("推送 {} 到 origin", repo.branch),
+            format!("推送 {} 到 {}", repo.branch, repo.remote),
         )),
         Err(e) => {
             return outcome.blocked_at(StepResult::blocked(
@@ -433,10 +595,9 @@ pub async fn deliver<R: DeliveryRemote>(
 
     // ── Open (or reuse) PR/MR ───────────────────────────────────────────────
     let Some(remote) = remote else {
-        let origin = git(&repo.root, &["remote", "get-url", "origin"]).ok();
         return outcome.blocked_at(StepResult::blocked(
             "pr",
-            no_remote_channel_message(origin.as_deref()),
+            no_remote_channel_message(repo.remote_url.as_deref()),
         ));
     };
     let title = opts.title.clone().unwrap_or_else(|| {
@@ -515,7 +676,125 @@ pub async fn deliver<R: DeliveryRemote>(
         }
     }
 
+    match verify_release_live(
+        &repo.root,
+        remote,
+        &outcome.commit_sha.clone().unwrap_or_default(),
+    )
+    .await
+    {
+        Ok(live_steps) => outcome.steps.extend(live_steps),
+        Err(blocker) => return block_unverified_release(outcome, blocker),
+    }
+
     finish(outcome, &repo.branch, ceiling)
+}
+
+async fn verify_release_live<R: DeliveryRemote>(
+    root: &Path,
+    remote: &R,
+    sha: &str,
+) -> Result<Vec<StepResult>, String> {
+    let config = load_delivery_config(root)?;
+    let mut steps = Vec::new();
+    let provider = config.as_ref().and_then(|c| c.provider.as_deref());
+    let deployment_timeout_secs = config
+        .as_ref()
+        .map(|c| c.deployment_timeout_secs)
+        .unwrap_or_else(default_deployment_timeout_secs);
+
+    let deployment = wait_for_deployment(remote, sha, provider, deployment_timeout_secs).await?;
+    if let Some(detail) = deployment {
+        steps.push(StepResult::ok("deploy", detail));
+    }
+
+    if let Some(live) = config.as_ref().and_then(|c| c.live.as_ref()) {
+        wait_for_http_live(live, sha).await?;
+        steps.push(StepResult::ok(
+            "live",
+            format!("线上验证通过: {} 包含本次提交标识", live.url),
+        ));
+        return Ok(steps);
+    }
+
+    match remote.verify_live(sha, None).await? {
+        ObservationStatus::Success(detail) => {
+            steps.push(StepResult::ok("live", detail));
+            Ok(steps)
+        }
+        ObservationStatus::Pending(detail) => Err(format!(
+            "线上验证仍在等待: {detail};稍后重新调用 deliver_changes 续跑。"
+        )),
+        ObservationStatus::Failure(detail) => Err(format!("线上验证失败: {detail}")),
+        ObservationStatus::Unsupported(detail) => Err(format!(
+            "发布已触发,但没有可用的 live verifier: {detail};不能声明已上线。"
+        )),
+    }
+}
+
+async fn wait_for_deployment<R: DeliveryRemote>(
+    remote: &R,
+    sha: &str,
+    provider: Option<&str>,
+    timeout_secs: u32,
+) -> Result<Option<String>, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+    loop {
+        match remote.deployment_status(sha, provider).await? {
+            ObservationStatus::Success(detail) => return Ok(Some(detail)),
+            ObservationStatus::Failure(detail) => return Err(format!("部署失败: {detail}")),
+            ObservationStatus::Unsupported(_) => return Ok(None),
+            ObservationStatus::Pending(detail) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "部署在 {timeout_secs}s 内仍未完成: {detail};稍后重新调用 deliver_changes 续跑。"
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn wait_for_http_live(live: &LiveHttpAssertion, sha: &str) -> Result<(), String> {
+    live.validate()?;
+    let expected_body = live.expected_body(sha);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(live.timeout_secs as u64);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            live.poll_interval_secs.max(1).min(30) as u64,
+        ))
+        .build()
+        .map_err(|e| format!("创建 live verifier HTTP client 失败: {e}"))?;
+    let mut last_error = String::new();
+    loop {
+        match client.get(&live.url).send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                match resp.text().await {
+                    Ok(body) => {
+                        if status == live.expected_status && body.contains(&expected_body) {
+                            return Ok(());
+                        }
+                        last_error = format!(
+                            "HTTP {status}, expected {}, body missing '{}'",
+                            live.expected_status, expected_body
+                        );
+                    }
+                    Err(e) => last_error = format!("读取 live 响应失败: {e}"),
+                }
+            }
+            Err(e) => last_error = format!("请求 live URL 失败: {e}"),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("线上验证超时: {last_error}"));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(
+            live.poll_interval_secs.max(1) as u64,
+        ))
+        .await;
+    }
 }
 
 /// Blocked-at-PR message when no remote token is configured. Carries the fix
@@ -528,21 +807,33 @@ pub const NO_TOKEN_PR_MESSAGE: &str = "已提交并推送,但没有可用的 Git
 把这两条路原样告诉用户;在用户完成其一之前,不要再调用 deliver_changes 重试。";
 
 fn no_remote_channel_message(origin_url: Option<&str>) -> String {
-    if let Some(origin) = origin_url {
-        if parse_owner_repo(origin).is_some() {
-            return NO_TOKEN_PR_MESSAGE.to_string();
-        }
-        if host_looks_like_gitlab(origin) {
-            if let Some(project) = parse_gitlab_project_path(origin) {
-                return format!(
-                    "已提交并推送,但 GitLab 项目 {project} 没有可用的 merge request 通道。\
-请在 设置→远程仓库 配置该 GitLab/企业 GitLab 的 token,或启用仓库 delivery provider hook/plugin;\
-不要把这当成缺 GitHub 通道,在 GitLab token/provider 配好前不要再调用 deliver_changes 重试。"
-                );
+    let Some(origin) = origin_url else {
+        return "已提交并推送,但仓库没有可识别的 review provider。请配置实际 Git remote 和 delivery_provider hook/plugin；在 provider 配好前不要重试 deliver_changes。".into();
+    };
+    let family = classify_forge(origin);
+    match family {
+        ForgeFamily::Github => {
+            let host = remote_host(origin).unwrap_or_else(|| "github.com".into());
+            if host == "github.com" {
+                NO_TOKEN_PR_MESSAGE.to_string()
+            } else {
+                format!(
+                    "已提交并推送,但 GitHub Enterprise 主机 {host} 没有可用的 PR 通道。请先运行 `gh auth login --hostname {host}`，或为该主机配置 GitHub remote token / delivery_provider hook；在通道配置完成前不要重试 deliver_changes。"
+                )
             }
         }
+        ForgeFamily::Gitlab => {
+            let project = parse_gitlab_project_path(origin).unwrap_or_else(|| "unknown".into());
+            format!(
+                "已提交并推送,但 GitLab 项目 {project} 没有可用的 merge request 通道。请在 设置→远程仓库 配置该 GitLab/企业 GitLab 的 token,或启用仓库 delivery_provider hook/plugin；不要把这当成缺 GitHub 通道。"
+            )
+        }
+        other => format!(
+            "已提交并推送,但 {} remote ({}) 没有内置 review adapter。请配置仓库 delivery_provider hook/plugin 来实现 PR/MR/Change、CI、合并和发布；不要用 GitHub CLI 登录作为通用修复。",
+            other.label(),
+            remote_host(origin).unwrap_or_else(|| "unknown-host".into())
+        ),
     }
-    NO_TOKEN_PR_MESSAGE.to_string()
 }
 
 fn ceiling_label(ceiling: DeliveryCeiling) -> &'static str {
@@ -579,10 +870,11 @@ pub fn delivery_readiness_with_gh(
     }
     let origin = origin_url?;
     if let Some(owner_repo) = parse_owner_repo(origin) {
+        let host = remote_host(origin).unwrap_or_else(|| "github.com".into());
         if gh_available {
             return Some(format!(
                 "\n\n# Delivery capability\n\
-                 Repo {owner_repo}: a logged-in GitHub CLI is available — the delivery chain \
+                 Repo {owner_repo} on {host}: a logged-in GitHub CLI is available for this host — the delivery chain \
                  (PR/CI/merge/release, up to ceiling {}) works with ZERO app-side token setup. \
                  Never ask the user to configure a remote token while gh is available.",
                 ceiling_label(settings.delivery_ceiling)
@@ -600,11 +892,16 @@ pub fn delivery_readiness_with_gh(
                 ceiling_label(settings.delivery_ceiling)
             )
         } else {
+            let gh_login = if host == "github.com" {
+                "gh auth login".to_string()
+            } else {
+                format!("gh auth login --hostname {host}")
+            };
             format!(
                 "\n\n# Delivery capability (BROKEN — surface early)\n\
-                 The delivery chain for {owner_repo} cannot open a PR: no logged-in GitHub CLI \
-                 and no configured token. If this task involves delivering code, say so in your \
-                 FIRST reply and offer both fixes — preferred: run `gh auth login` once in a \
+                 The delivery chain for {owner_repo} on {host} cannot open a PR: no logged-in GitHub CLI \
+                 for this host and no configured token. If this task involves delivering code, say so in your \
+                 FIRST reply and offer both fixes — preferred: run `{gh_login}` once in a \
                  terminal (zero app-side config); alternative: 设置→远程仓库 token setup — and \
                  do NOT call deliver_changes until one of them is done. Local work (tests, \
                  edits, commits) can proceed in the meantime."
@@ -643,14 +940,22 @@ pub fn delivery_readiness_with_gh(
     })
 }
 
-/// Wrapper reading the cwd's `origin` URL; see [`delivery_readiness_from_origin`].
+/// Wrapper reading the cwd's selected remote URL; see [`delivery_readiness_from_origin`].
 pub fn delivery_readiness_note(
     cwd: &Path,
     settings: &crate::config::settings::Settings,
 ) -> Option<String> {
     let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
-    let origin = git(Path::new(&root), &["remote", "get-url", "origin"]).ok();
+    let remote = default_remote(Path::new(&root));
+    let origin = git(Path::new(&root), &["remote", "get-url", &remote]).ok();
     delivery_readiness_from_origin(origin.as_deref(), settings)
+}
+
+fn block_unverified_release(
+    outcome: DeliveryOutcome,
+    detail: impl Into<String>,
+) -> DeliveryOutcome {
+    outcome.blocked_at(StepResult::blocked("live", detail))
 }
 
 fn finish(mut outcome: DeliveryOutcome, branch: &str, ceiling: DeliveryCeiling) -> DeliveryOutcome {
@@ -947,6 +1252,40 @@ impl DeliveryRemote for HookRemote {
             .detail
             .unwrap_or_else(|| format!("delivery provider hook '{}' triggered release", self.id)))
     }
+
+    async fn deployment_status(
+        &self,
+        sha: &str,
+        provider: Option<&str>,
+    ) -> Result<ObservationStatus, String> {
+        let value = self.run_json(json!({
+            "action": "deployment_status",
+            "sha": sha,
+            "provider": provider,
+        }))?;
+        let response: HookStatusResponse = serde_json::from_value(value).map_err(|e| {
+            format!(
+                "delivery provider hook '{}' deployment response invalid: {e}",
+                self.id
+            )
+        })?;
+        Ok(parse_observation_status(&response.status, response.detail))
+    }
+
+    async fn verify_live(&self, sha: &str, url: Option<&str>) -> Result<ObservationStatus, String> {
+        let value = self.run_json(json!({
+            "action": "verify_live",
+            "sha": sha,
+            "url": url,
+        }))?;
+        let response: HookStatusResponse = serde_json::from_value(value).map_err(|e| {
+            format!(
+                "delivery provider hook '{}' live response invalid: {e}",
+                self.id
+            )
+        })?;
+        Ok(parse_observation_status(&response.status, response.detail))
+    }
 }
 
 /// gh CLI first (the user already authenticated it once, system-wide), the
@@ -967,26 +1306,30 @@ pub fn resolve_remote_kind(gh_available: bool, has_rest_token: bool) -> Option<R
 /// binary is missing OR no host is authenticated — exactly the two cases
 /// where the REST fallback should take over.
 pub fn gh_cli_available() -> bool {
+    gh_cli_available_for_host("github.com")
+}
+
+pub fn gh_cli_available_for_host(hostname: &str) -> bool {
     // Standard PATH first.
-    if gh_auth_status("gh") {
+    if gh_auth_status_for_host("gh", hostname) {
         return true;
     }
     // macOS GUI apps don't inherit the shell PATH. Homebrew installs `gh`
     // into one of these well-known prefixes — check them directly.
     for prefix in &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
-        if gh_auth_status(prefix) {
+        if gh_auth_status_for_host(prefix, hostname) {
             return true;
         }
     }
     // PATH and brew probes both missed: check the credential file directly.
-    // `gh auth status` succeeds ↔ ~/.config/gh/hosts.yml has a non-empty
-    // `github.com` user entry with an oauth_token.
-    gh_hosts_file_indicates_authenticated()
+    // `gh auth status --hostname <host>` succeeds ↔ ~/.config/gh/hosts.yml has
+    // a non-empty user entry for that host with an oauth_token.
+    gh_hosts_file_indicates_authenticated_for_host(hostname)
 }
 
-fn gh_auth_status(bin: &str) -> bool {
+fn gh_auth_status_for_host(bin: &str, hostname: &str) -> bool {
     dev_command(bin)
-        .args(["auth", "status"])
+        .args(["auth", "status", "--hostname", hostname])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -994,11 +1337,11 @@ fn gh_auth_status(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Read `~/.config/gh/hosts.yml` and check for a `github.com` entry with
-/// a non-empty user. This is the same credential file `gh auth status`
-/// checks; reading it directly works even when the `gh` binary is not in
-/// the GUI app's PATH (common on macOS with Homebrew).
-fn gh_hosts_file_indicates_authenticated() -> bool {
+/// Read `~/.config/gh/hosts.yml` and check for a host entry with a non-empty
+/// user. This is the same credential file `gh auth status --hostname` checks;
+/// reading it directly works even when the `gh` binary is not in the GUI app's
+/// PATH (common on macOS with Homebrew).
+fn gh_hosts_file_indicates_authenticated_for_host(hostname: &str) -> bool {
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => return false,
@@ -1008,18 +1351,19 @@ fn gh_hosts_file_indicates_authenticated() -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let mut in_github_block = false;
+    let header = format!("{}:", hostname.trim().to_ascii_lowercase());
+    let mut in_host_block = false;
     for line in content.lines() {
         let t = line.trim();
-        if t == "github.com:" {
-            in_github_block = true;
+        if t.to_ascii_lowercase() == header {
+            in_host_block = true;
             continue;
         }
-        if in_github_block {
+        if in_host_block {
             if t.starts_with("user:") && t.strip_prefix("user:").unwrap_or("").trim().len() > 0 {
                 return true;
             }
-            // Any non-indented top-level key ends the github.com block.
+            // Any non-indented top-level key ends the selected host block.
             if !t.starts_with(' ') && t.ends_with(':') {
                 return false;
             }
@@ -1076,20 +1420,11 @@ pub struct GhCliRemote {
 /// probe authentication — pair with [`gh_cli_available`].
 pub fn gh_remote_for(cwd: &Path) -> Option<GhCliRemote> {
     let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
-    let origin = git(Path::new(&root), &["remote", "get-url", "origin"]).ok()?;
+    let remote = default_remote(Path::new(&root));
+    let origin = git(Path::new(&root), &["remote", "get-url", &remote]).ok()?;
     let repo = parse_owner_repo(&origin)?;
-    let default_branch = git(
-        Path::new(&root),
-        &[
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ],
-    )
-    .ok()
-    .and_then(|s| s.rsplit('/').next().map(String::from))
-    .unwrap_or_else(|| "main".to_string());
+    let default_branch =
+        remote_default_branch(Path::new(&root), &remote).unwrap_or_else(|| "main".to_string());
     Some(GhCliRemote {
         cwd: PathBuf::from(root),
         repo,
@@ -1249,6 +1584,28 @@ impl DeliveryRemote for EitherRemote {
             EitherRemote::Gitlab(r) => r.trigger_release().await,
         }
     }
+
+    async fn deployment_status(
+        &self,
+        sha: &str,
+        provider: Option<&str>,
+    ) -> Result<ObservationStatus, String> {
+        match self {
+            EitherRemote::Hook(r) => r.deployment_status(sha, provider).await,
+            EitherRemote::Gh(r) => r.deployment_status(sha, provider).await,
+            EitherRemote::Github(r) => r.deployment_status(sha, provider).await,
+            EitherRemote::Gitlab(r) => r.deployment_status(sha, provider).await,
+        }
+    }
+
+    async fn verify_live(&self, sha: &str, url: Option<&str>) -> Result<ObservationStatus, String> {
+        match self {
+            EitherRemote::Hook(r) => r.verify_live(sha, url).await,
+            EitherRemote::Gh(r) => r.verify_live(sha, url).await,
+            EitherRemote::Github(r) => r.verify_live(sha, url).await,
+            EitherRemote::Gitlab(r) => r.verify_live(sha, url).await,
+        }
+    }
 }
 
 fn hook_remote_for(cwd: &Path, settings: &crate::config::settings::Settings) -> Option<HookRemote> {
@@ -1267,6 +1624,12 @@ fn hook_remote_for(cwd: &Path, settings: &crate::config::settings::Settings) -> 
 /// Resolve the best available remote for `cwd`: configured delivery provider
 /// hooks first, then logged-in gh CLI for GitHub, then built-in REST tokens.
 /// `None` → delivery blocks with provider-aware guidance.
+fn selected_remote_url(cwd: &Path) -> Option<String> {
+    let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
+    let remote = default_remote(Path::new(&root));
+    git(Path::new(&root), &["remote", "get-url", &remote]).ok()
+}
+
 pub fn resolve_delivery_remote(
     cwd: &Path,
     settings: &crate::config::settings::Settings,
@@ -1276,7 +1639,11 @@ pub fn resolve_delivery_remote(
     }
     let gitlab = gitlab_remote_for(cwd, settings);
     let github = github_remote_for(cwd, settings);
-    let gh_ok = github.is_some() && gh_cli_available();
+    let gh_ok = github.is_some()
+        && selected_remote_url(cwd)
+            .and_then(|origin| remote_host(&origin))
+            .map(|host| gh_cli_available_for_host(&host))
+            .unwrap_or_else(|| gh_cli_available());
     match resolve_remote_kind(gh_ok, github.is_some() || gitlab.is_some()) {
         Some(RemoteKind::GhCli) => gh_remote_for(cwd)
             .map(EitherRemote::Gh)
@@ -1302,53 +1669,144 @@ pub struct GithubRemote {
 
 /// Extract `owner/name` from a GitHub remote URL (https or ssh).
 fn parse_owner_repo(url: &str) -> Option<String> {
-    let u = url.trim().trim_end_matches(".git");
-    let path = if let Some(rest) = u.strip_prefix("git@github.com:") {
-        rest
-    } else if let Some(rest) = u.strip_prefix("ssh://git@github.com/") {
-        rest
-    } else if let Some(rest) = u.strip_prefix("https://github.com/") {
-        rest
-    } else if let Some(rest) = u.strip_prefix("http://github.com/") {
-        rest
-    } else {
+    let host = remote_host(url)?;
+    if classify_forge(url) != ForgeFamily::Github {
         return None;
-    };
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() >= 2 {
-        Some(format!("{}/{}", parts[0], parts[1]))
-    } else {
-        None
     }
+    parse_owner_repo_for_host(url, &host)
 }
 
-fn remote_host(url: &str) -> Option<String> {
+pub(crate) fn remote_host(url: &str) -> Option<String> {
     let u = url.trim();
     if let Some(rest) = u.strip_prefix("git@") {
-        return rest.split_once(':').map(|(host, _)| host.to_ascii_lowercase());
+        return rest
+            .split_once(':')
+            .map(|(host, _)| host.to_ascii_lowercase());
     }
-    if let Some(rest) = u.strip_prefix("ssh://git@") {
-        return rest.split_once('/').map(|(host, _)| host.to_ascii_lowercase());
+    if let Some(rest) = u.strip_prefix("ssh://") {
+        let authority = rest.split('/').next()?;
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        return Some(
+            host_port
+                .split(':')
+                .next()
+                .unwrap_or(host_port)
+                .to_ascii_lowercase(),
+        );
     }
     if let Some(rest) = u.strip_prefix("https://") {
-        return rest.split_once('/').map(|(host, _)| host.to_ascii_lowercase());
+        return rest
+            .split_once('/')
+            .map(|(host, _)| host.to_ascii_lowercase());
     }
     if let Some(rest) = u.strip_prefix("http://") {
-        return rest.split_once('/').map(|(host, _)| host.to_ascii_lowercase());
+        return rest
+            .split_once('/')
+            .map(|(host, _)| host.to_ascii_lowercase());
     }
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeFamily {
+    Github,
+    Gitlab,
+    Bitbucket,
+    AzureDevops,
+    Gitea,
+    Forgejo,
+    Gerrit,
+    CodeCommit,
+    Generic,
+}
+
+impl ForgeFamily {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Github => "GitHub",
+            Self::Gitlab => "GitLab",
+            Self::Bitbucket => "Bitbucket",
+            Self::AzureDevops => "Azure DevOps",
+            Self::Gitea => "Gitea",
+            Self::Forgejo => "Forgejo",
+            Self::Gerrit => "Gerrit",
+            Self::CodeCommit => "AWS CodeCommit",
+            Self::Generic => "企业/通用 Git",
+        }
+    }
+}
+
+pub fn classify_forge(url: &str) -> ForgeFamily {
+    let host = remote_host(url).unwrap_or_default();
+    let lower = url.to_ascii_lowercase();
+    if host == "github.com" || host.starts_with("github.") || host.contains(".github.") {
+        ForgeFamily::Github
+    } else if host == "gitlab.com" || host.starts_with("gitlab.") || host.contains(".gitlab.") {
+        ForgeFamily::Gitlab
+    } else if host == "bitbucket.org"
+        || host.starts_with("bitbucket.")
+        || host.contains(".bitbucket.")
+    {
+        ForgeFamily::Bitbucket
+    } else if host == "dev.azure.com"
+        || host.ends_with("visualstudio.com")
+        || lower.contains("/_git/")
+    {
+        ForgeFamily::AzureDevops
+    } else if host.contains("forgejo") {
+        ForgeFamily::Forgejo
+    } else if host.contains("gitea") {
+        ForgeFamily::Gitea
+    } else if host.starts_with("review.") || lower.contains(":29418/") {
+        ForgeFamily::Gerrit
+    } else if host.starts_with("git-codecommit.") && host.ends_with("amazonaws.com") {
+        ForgeFamily::CodeCommit
+    } else {
+        ForgeFamily::Generic
+    }
+}
+
+pub(crate) fn remote_repo_path(url: &str) -> Option<String> {
+    let u = url.trim().trim_end_matches(".git");
+    let path = if let Some(rest) = u.strip_prefix("git@") {
+        rest.split_once(':')?.1
+    } else if let Some(rest) = u.strip_prefix("ssh://") {
+        let (_, path) = rest.split_once('/')?;
+        path
+    } else if let Some(rest) = u.strip_prefix("https://") {
+        let (_, path) = rest.split_once('/')?;
+        path
+    } else if let Some(rest) = u.strip_prefix("http://") {
+        let (_, path) = rest.split_once('/')?;
+        path
+    } else {
+        return None;
+    };
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    (parts.len() >= 2).then(|| parts.join("/"))
+}
+
+fn parse_owner_repo_for_host(url: &str, expected_host: &str) -> Option<String> {
+    if remote_host(url).as_deref() != Some(&expected_host.to_ascii_lowercase()) {
+        return None;
+    }
+    let path = remote_repo_path(url)?;
+    let parts: Vec<&str> = path.split('/').collect();
+    (parts.len() >= 2).then(|| format!("{}/{}", parts[0], parts[1]))
+}
+
 fn host_looks_like_gitlab(url: &str) -> bool {
     remote_host(url)
-        .map(|host| host == "gitlab.com" || host.starts_with("gitlab.") || host.contains(".gitlab."))
+        .map(|host| {
+            host == "gitlab.com" || host.starts_with("gitlab.") || host.contains(".gitlab.")
+        })
         .unwrap_or(false)
 }
 
 /// Extract a GitLab project path from SaaS or enterprise GitLab remotes. Unlike
 /// GitHub's fixed `owner/repo`, GitLab projects can live under nested groups, so
 /// every path segment after the host belongs to the project id.
-fn parse_gitlab_project_path(url: &str) -> Option<String> {
+pub(crate) fn parse_gitlab_project_path(url: &str) -> Option<String> {
     let u = url.trim().trim_end_matches(".git");
     let path = if let Some(rest) = u.strip_prefix("git@") {
         rest.split_once(':')?.1
@@ -1404,7 +1862,8 @@ pub fn github_remote_for(
 ) -> Option<GithubRemote> {
     use crate::config::settings::GitProvider;
     let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
-    let origin = git(Path::new(&root), &["remote", "get-url", "origin"]).ok()?;
+    let remote_name = default_remote(Path::new(&root));
+    let origin = git(Path::new(&root), &["remote", "get-url", &remote_name]).ok()?;
     let owner_repo = parse_owner_repo(&origin)?;
 
     // Prefer a git_remotes entry whose default_repo matches; else the first
@@ -1428,18 +1887,8 @@ pub fn github_remote_for(
         &token,
         remote.provider.clone(),
     );
-    let default_branch = git(
-        Path::new(&root),
-        &[
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ],
-    )
-    .ok()
-    .and_then(|s| s.rsplit('/').next().map(String::from))
-    .unwrap_or_else(|| "main".to_string());
+    let default_branch =
+        remote_default_branch(Path::new(&root), &remote_name).unwrap_or_else(|| "main".to_string());
 
     Some(GithubRemote {
         client,
@@ -1465,7 +1914,8 @@ pub fn gitlab_remote_for(
 ) -> Option<GitlabRemote> {
     use crate::config::settings::GitProvider;
     let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
-    let origin = git(Path::new(&root), &["remote", "get-url", "origin"]).ok()?;
+    let remote_name = default_remote(Path::new(&root));
+    let origin = git(Path::new(&root), &["remote", "get-url", &remote_name]).ok()?;
     let repo = parse_gitlab_project_path(&origin)?;
     let remote = configured_remote_for(settings, GitProvider::Gitlab, &repo)?;
     let token = crate::config::settings::resolve_git_remote_token(remote).ok()?;
@@ -1864,7 +2314,8 @@ mod tests {
 
     #[test]
     fn no_remote_channel_message_keeps_github_https_as_github() {
-        let message = no_remote_channel_message(Some("https://github.com/BumStill/CodeFactory.git"));
+        let message =
+            no_remote_channel_message(Some("https://github.com/BumStill/CodeFactory.git"));
         assert!(message.contains("GitHub 通道"));
         assert!(message.contains("gh auth login"));
         assert!(message.contains("开 PR"));
@@ -1922,6 +2373,145 @@ mod tests {
             Some("BumStill/CodeFactory")
         );
         assert_eq!(parse_owner_repo("https://gitlab.com/x/y.git"), None);
+    }
+
+    #[test]
+    fn provider_discovery_covers_common_forges_without_defaulting_to_github() {
+        let cases = [
+            ("https://github.com/acme/app.git", ForgeFamily::Github),
+            ("git@github.corp.example:acme/app.git", ForgeFamily::Github),
+            ("https://gitlab.com/acme/app.git", ForgeFamily::Gitlab),
+            ("git@gitlab.corp.example:acme/app.git", ForgeFamily::Gitlab),
+            ("https://bitbucket.org/acme/app.git", ForgeFamily::Bitbucket),
+            (
+                "https://dev.azure.com/acme/project/_git/app",
+                ForgeFamily::AzureDevops,
+            ),
+            ("git@gitea.example.com:acme/app.git", ForgeFamily::Gitea),
+            (
+                "ssh://git@forgejo.example.com/acme/app.git",
+                ForgeFamily::Forgejo,
+            ),
+            ("ssh://review.example.com:29418/app", ForgeFamily::Gerrit),
+            (
+                "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/app",
+                ForgeFamily::CodeCommit,
+            ),
+            (
+                "ssh://git@git.corp.example/acme/app.git",
+                ForgeFamily::Generic,
+            ),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(classify_forge(url), expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn non_github_missing_channel_messages_never_prescribe_gh_auth() {
+        for url in [
+            "https://bitbucket.org/acme/app.git",
+            "https://dev.azure.com/acme/project/_git/app",
+            "ssh://git@gitea.example.com/acme/app.git",
+            "ssh://review.example.com:29418/app",
+            "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/app",
+            "ssh://git@git.corp.example/acme/app.git",
+        ] {
+            let message = no_remote_channel_message(Some(url));
+            assert!(!message.contains("gh auth login"), "{url}: {message}");
+            assert!(message.contains("delivery_provider"), "{url}: {message}");
+        }
+    }
+
+    #[test]
+    fn repository_delivery_config_expands_sha_bound_live_assertion() {
+        let root = make_repo("live-config");
+        std::fs::create_dir_all(root.join(".codefactory")).unwrap();
+        std::fs::write(
+            root.join(".codefactory/delivery.json"),
+            r#"{
+              "schema_version": 1,
+              "provider": "zeabur",
+              "deployment_timeout_secs": 42,
+              "live": {
+                "url": "https://example.test/health",
+                "expected_status": 200,
+                "body_contains": "build:$GIT_SHA_SHORT",
+                "timeout_secs": 30,
+                "poll_interval_secs": 2
+              }
+            }"#,
+        )
+        .unwrap();
+        let config = load_delivery_config(&root).unwrap().unwrap();
+        assert_eq!(config.provider.as_deref(), Some("zeabur"));
+        assert_eq!(config.deployment_timeout_secs, 42);
+        let live = config.live.unwrap();
+        assert_eq!(live.expected_body("1234567890abcdef"), "build:1234567");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn release_without_live_evidence_is_not_reported_as_delivered_or_live() {
+        let mut outcome = DeliveryOutcome {
+            steps: vec![
+                StepResult::ok("merge", "merged"),
+                StepResult::ok("release", "release triggered"),
+            ],
+            branch: Some("feat/x".into()),
+            commit_sha: Some("abc123".into()),
+            pr_url: Some("https://example.test/pr/1".into()),
+            pr_number: Some(1),
+            final_state: "delivered".into(),
+            summary: String::new(),
+        };
+        outcome = block_unverified_release(outcome, "未配置 live verifier");
+        assert_eq!(outcome.final_state, "blocked");
+        assert!(outcome
+            .steps
+            .iter()
+            .any(|s| s.step == "live" && s.status == "blocked"));
+        assert!(!outcome.summary.contains("已上线"));
+    }
+
+    #[test]
+    fn hook_status_parser_distinguishes_pending_failure_unsupported_and_success() {
+        assert_eq!(
+            parse_observation_status("success", None),
+            ObservationStatus::Success("verified".into())
+        );
+        assert_eq!(
+            parse_observation_status("pending", Some("building".into())),
+            ObservationStatus::Pending("building".into())
+        );
+        assert_eq!(
+            parse_observation_status("failure", Some("boom".into())),
+            ObservationStatus::Failure("boom".into())
+        );
+        assert_eq!(
+            parse_observation_status("unsupported", None),
+            ObservationStatus::Unsupported("not configured".into())
+        );
+    }
+
+    #[test]
+    fn parse_owner_repo_supports_github_enterprise_host() {
+        assert_eq!(
+            parse_owner_repo_for_host(
+                "git@github.corp.example:team/app.git",
+                "github.corp.example"
+            )
+            .as_deref(),
+            Some("team/app")
+        );
+        assert_eq!(
+            parse_owner_repo_for_host(
+                "https://github.corp.example/team/app.git",
+                "github.corp.example"
+            )
+            .as_deref(),
+            Some("team/app")
+        );
     }
 
     #[test]
@@ -2003,6 +2593,10 @@ elif action == 'merge_pr':
     print(json.dumps({'ok': True}))
 elif action == 'trigger_release':
     print(json.dumps({'detail': 'corp release dispatched'}))
+elif action == 'deployment_status':
+    print(json.dumps({'status': 'success', 'detail': 'corp deployment ready'}))
+elif action == 'verify_live':
+    print(json.dumps({'status': 'success', 'detail': 'corp live verified'}))
 else:
     print(json.dumps({'error': 'unknown action'}))
     sys.exit(2)
@@ -2026,6 +2620,20 @@ else:
         assert_eq!(
             remote.trigger_release().await.unwrap(),
             "corp release dispatched"
+        );
+        assert_eq!(
+            remote
+                .deployment_status("abc123", Some("zeabur"))
+                .await
+                .unwrap(),
+            ObservationStatus::Success("corp deployment ready".into())
+        );
+        assert_eq!(
+            remote
+                .verify_live("abc123", Some("https://app.example.test"))
+                .await
+                .unwrap(),
+            ObservationStatus::Success("corp live verified".into())
         );
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
@@ -2070,6 +2678,10 @@ elif action == 'merge_pr':
     print(json.dumps({'ok': True}))
 elif action == 'trigger_release':
     print(json.dumps({'detail': 'corp release dispatched'}))
+elif action == 'deployment_status':
+    print(json.dumps({'status': 'success', 'detail': 'corp deployment ready'}))
+elif action == 'verify_live':
+    print(json.dumps({'status': 'success', 'detail': 'corp live verified'}))
 else:
     print(json.dumps({'error': 'unknown action'}))
     sys.exit(2)
@@ -2399,7 +3011,7 @@ else:
         // We can't intercept dirs::home_dir(), so test the parser indirectly
         // via a real sample. On a machine without a real hosts.yml this test
         // still validates the logic doesn't panic.
-        let _ = gh_hosts_file_indicates_authenticated();
+        let _ = gh_hosts_file_indicates_authenticated_for_host("github.com");
     }
 
     /// Verify the hosts.yml parser handles edge cases without panicking.
