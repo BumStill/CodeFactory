@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   })),
   createSession: vi.fn(),
   selectSession: vi.fn(),
+  loadSessions: vi.fn(async () => [] as Array<{ id: string }>),
   invoke: vi.fn(),
 }));
 
@@ -36,20 +37,34 @@ vi.mock("./stores/settings", () => ({
 // actually re-renders the shell the way it does in the app.
 interface FakeChatState {
   activeModel: string;
+  sessions: Array<{ id: string }>;
   activeSession: { id: string } | null;
   draftSession: { id: string } | null;
   createSession: typeof mocks.createSession;
-  selectSession: typeof mocks.selectSession;
+  loadSessions: () => Promise<Array<{ id: string }>>;
+  selectSession: (id: string) => Promise<void>;
   beginDraft: (opts?: { cwd?: string | null }) => { id: string };
 }
 vi.mock("./stores/chat", async () => {
   const { create } = await import("zustand");
   const useChatStore = create<FakeChatState>((set) => ({
     activeModel: "model",
+    sessions: [],
     activeSession: null,
     draftSession: null,
     createSession: mocks.createSession,
-    selectSession: mocks.selectSession,
+    loadSessions: async () => {
+      const sessions = await mocks.loadSessions();
+      set({ sessions });
+      return sessions;
+    },
+    selectSession: async (id: string) => {
+      await mocks.selectSession(id);
+      set((state) => ({
+        activeSession: state.sessions.find((session) => session.id === id) ?? { id },
+        draftSession: null,
+      }));
+    },
     beginDraft: (opts) => {
       const draft = mocks.beginDraft(opts);
       set({ draftSession: draft, activeSession: null });
@@ -68,14 +83,28 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 describe("App default workspace entry", () => {
   beforeEach(() => {
     Object.values(mocks).forEach((mock) => mock.mockClear());
-    useChatStore.setState({ activeSession: null, draftSession: null });
+    mocks.loadSessions.mockResolvedValue([]);
+    useChatStore.setState({ sessions: [], activeSession: null, draftSession: null });
   });
 
-  it("opens directly into the workspace with one in-memory draft and no backend session creation", async () => {
+  it("opens the latest existing session on first launch", async () => {
+    mocks.loadSessions.mockResolvedValue([{ id: "latest" }, { id: "older" }]);
+
+    render(<App />);
+
+    const workspace = await screen.findByRole("main", { name: "会话工作区" });
+    expect(workspace).toHaveAttribute("data-session-id", "latest");
+    expect(mocks.loadSessions).toHaveBeenCalledTimes(1);
+    expect(mocks.selectSession).toHaveBeenCalledWith("latest");
+    expect(mocks.beginDraft).not.toHaveBeenCalled();
+  });
+
+  it("opens directly into the workspace with one in-memory draft when there is no history", async () => {
     render(<App />);
 
     const workspace = await screen.findByRole("main", { name: "会话工作区" });
     expect(workspace).toHaveAttribute("data-session-id", "draft-start");
+    expect(mocks.loadSessions).toHaveBeenCalledTimes(1);
     expect(mocks.beginDraft).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(mocks.createSession).not.toHaveBeenCalled());
     expect(mocks.invoke).not.toHaveBeenCalledWith(

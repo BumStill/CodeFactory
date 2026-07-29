@@ -13,6 +13,7 @@ export interface FakeChatState {
   activeSession: { id: string } | null;
   draftSession: { id: string; cwd: string | null } | null;
   beginDraft: (opts?: { cwd?: string | null; anonymous?: boolean }) => { id: string; cwd: string | null };
+  loadSessions: () => Promise<Array<{ id: string }>>;
   selectSession: (id: string) => Promise<void>;
   createSession: (...args: unknown[]) => unknown;
 }
@@ -41,6 +42,7 @@ export async function createFakeChatModule(opts: {
     activeSession: null,
     draftSession: null,
     createSession: opts.createSession ?? (() => undefined),
+    loadSessions: async () => [],
     beginDraft: (draftOpts) => {
       opts.onBeginDraft?.(draftOpts);
       const draft = { id: opts.draftId ?? "draft-start", cwd: draftOpts?.cwd ?? null };
