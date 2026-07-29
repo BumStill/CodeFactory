@@ -16,7 +16,8 @@
 //   - drag-drop events fired by the OS
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 const invokeMock = vi.hoisted(() => vi.fn());
 const convertFileSrcMock = vi.hoisted(() => vi.fn((path: string) => `asset://localhost/${encodeURIComponent(path)}`));
@@ -100,6 +101,59 @@ describe("MessageInput attachments", () => {
       },
     });
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("opens attachment tray image previews in a larger viewer", async () => {
+    invokeMock.mockResolvedValue({
+      path: "/proj/.codefactory/attachments/preview.png",
+      name: "preview.png",
+      size_bytes: 4,
+    });
+    const user = userEvent.setup();
+    setup();
+
+    fireEvent.paste(screen.getByRole("textbox"), {
+      clipboardData: {
+        items: [
+          { kind: "file", type: "image/png", getAsFile: () => makeImageFile() },
+        ],
+      },
+    });
+
+    await screen.findByRole("img", { name: "screenshot.png" });
+    await user.click(screen.getByRole("button", { name: "放大查看 screenshot.png" }));
+
+    const dialog = screen.getByRole("dialog", { name: "图片预览" });
+    expect(within(dialog).getByRole("img", { name: "screenshot.png" })).toHaveAttribute(
+      "src",
+      "asset://localhost/%2Fproj%2F.codefactory%2Fattachments%2Fpreview.png",
+    );
+  });
+
+
+  it("wraps attachment markdown destinations with spaces so previews survive reload", async () => {
+    invokeMock.mockResolvedValue({
+      path: "/proj/AI foundation/.codefactory/attachments/space path.png",
+      name: "space path.png",
+      size_bytes: 4,
+    });
+    const { onSend } = setup();
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        items: [
+          { kind: "file", type: "image/png", getAsFile: () => makeImageFile() },
+        ],
+      },
+    });
+    await waitFor(() => expect(screen.queryByText("screenshot.png")).toBeInTheDocument());
+
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    expect(onSend).toHaveBeenCalledWith(
+      "![screenshot.png](<file:///proj/AI foundation/.codefactory/attachments/space path.png>)",
+    );
   });
 
   it("submit with attachments appends file:// markdown link to outgoing message", async () => {

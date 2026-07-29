@@ -8,6 +8,7 @@ import type { Components } from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
 import { Check, Copy, ChevronDown, ChevronUp } from "lucide-react";
 import { ToolCallCard } from "./ToolCallCard";
+import { ImagePreview } from "./ImagePreview";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import { ChatGptAuthRecovery } from "./ChatGptAuthRecovery";
@@ -126,11 +127,48 @@ const allowedLocalImageUrl: UrlTransform = (value, key, node): string => {
   return defaultUrlTransform(value);
 };
 
+function localFilePathFromUrl(url: string): string {
+  const path = url.slice("file://".length);
+  try {
+    return decodeURI(path);
+  } catch {
+    return path;
+  }
+}
+
 function previewImageSrc(src: string | undefined): string {
   if (!src) return "";
-  if (src.startsWith("file://")) return convertFileSrc(src.slice("file://".length));
+  if (src.startsWith("file://")) return convertFileSrc(localFilePathFromUrl(src));
   if (/^\/|^[A-Za-z]:[\\/]/.test(src)) return convertFileSrc(src);
   return src;
+}
+
+
+function normalizeLocalImageMarkdown(text: string): string {
+  // react-markdown/commonmark treats whitespace inside a destination as the
+  // end of the URL unless the destination is wrapped in <...>. Older persisted
+  // messages and current send payloads store local image links as
+  // `![name](file:///Users/me/Project With Spaces/.codefactory/attachments/x.png)`,
+  // so normalize just those local-image links before markdown parsing.
+  return text.replace(
+    /!\[([^\]\n]*)\]\((file:\/\/[^)\n]+\.(?:png|jpe?g|gif|webp))\)/gi,
+    (match, alt: string, url: string) => {
+      if (!/\s/.test(url) || (url.startsWith("<") && url.endsWith(">"))) return match;
+      return `![${alt}](<${url}>)`;
+    },
+  );
+}
+
+function MarkdownContent({ content }: { content: string }) {
+  return (
+    <ReactMarkdown
+      components={markdownComponents}
+      remarkPlugins={[remarkGfm]}
+      urlTransform={allowedLocalImageUrl}
+    >
+      {normalizeLocalImageMarkdown(content)}
+    </ReactMarkdown>
+  );
 }
 
 function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
@@ -147,14 +185,13 @@ function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
   }
   return (
     <span className="my-2 inline-block max-w-full align-top">
-      <img
+      <ImagePreview
         src={previewSrc}
         alt={label}
-        className="max-h-80 max-w-full rounded-lg border border-border bg-surface-2 object-contain"
-        loading="lazy"
+        thumbnailClassName="max-h-80 max-w-full rounded-lg border border-border bg-surface-2 object-contain transition-opacity hover:opacity-90"
+        caption={alt}
         onError={() => setFailed(true)}
       />
-      {alt && <span className="mt-1 block text-[10px] text-gray-500">{alt}</span>}
     </span>
   );
 }
@@ -251,13 +288,7 @@ const TimelineMarkdownSegment = memo(function TimelineMarkdownSegment({
           : "prose dark:prose-invert prose-sm max-w-none py-0.5 text-[15px] leading-6 text-gray-300 [&_pre]:!p-0 [&_pre]:!bg-transparent [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1 [&_h1]:mt-2 [&_h2]:mt-2 [&_h3]:mt-1.5 [&_h4]:mt-1.5 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
       }
     >
-      <ReactMarkdown
-        components={markdownComponents}
-        remarkPlugins={[remarkGfm]}
-        urlTransform={allowedLocalImageUrl}
-      >
-        {text}
-      </ReactMarkdown>
+      <MarkdownContent content={text} />
       {showTypingDots && <TypingDots />}
     </div>
   );
@@ -599,13 +630,7 @@ const MessageRow = memo(function MessageRow({
           }`}
         >
           <div className="prose dark:prose-invert prose-sm max-w-none whitespace-pre-wrap text-sm text-gray-200 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
-            <ReactMarkdown
-              components={markdownComponents}
-              remarkPlugins={[remarkGfm]}
-              urlTransform={allowedLocalImageUrl}
-            >
-              {msg.content}
-            </ReactMarkdown>
+            <MarkdownContent content={msg.content} />
           </div>
         </div>
         {/* Until a round boundary drains it the model genuinely has not seen
@@ -799,7 +824,7 @@ const MessageRow = memo(function MessageRow({
         ))}
       {!timeline && msg.content && (
         <div className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
-          <ReactMarkdown components={markdownComponents} remarkPlugins={[remarkGfm]} urlTransform={allowedLocalImageUrl}>{msg.content}</ReactMarkdown>
+          <MarkdownContent content={msg.content} />
           {isStreamingTail && <TypingDots />}
         </div>
       )}
