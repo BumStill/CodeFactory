@@ -124,6 +124,29 @@ pub fn shell_invocation(command: &str) -> ShellInvocation {
 
     #[cfg(unix)]
     {
+        // bash first, deliberately — even on macOS where the user's login
+        // shell is zsh.
+        //
+        // The commands here are written by the model, and every prompt, doc
+        // and example in this project is POSIX/bash-flavoured. zsh reads that
+        // dialect differently, sometimes loudly and sometimes not:
+        //   - `status=…` fails outright; it is a read-only special (`$?`), and
+        //     also the most natural name for a CI-polling script's variable.
+        //     Eight scripts died on this in one 2026-07 session. `emulate sh`
+        //     does not lift it.
+        //   - an unmatched glob aborts the entire command instead of passing
+        //     through, so later steps never run.
+        //   - unquoted `$var` does NOT word-split, so `for f in $files` walks
+        //     one item instead of N — no error, just a wrong answer.
+        //
+        // PATH does not depend on this choice: `apply_developer_path` sets it
+        // explicitly, overriding whatever the login shell would compute.
+        if command_exists("/bin/bash") {
+            return ShellInvocation {
+                program: "/bin/bash",
+                args: vec!["-lc".into(), command.into()],
+            };
+        }
         if command_exists("/bin/zsh") {
             return ShellInvocation {
                 program: "/bin/zsh",

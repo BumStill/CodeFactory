@@ -390,6 +390,68 @@ mod tests {
         assert!(output.content.contains("cwd="));
     }
 
+    /// The model writes POSIX/bash-flavoured shell — every prompt, doc and
+    /// example in this project assumes it. Running that under zsh silently
+    /// changes what it means.
+    ///
+    /// Field evidence, 2026-07: `zsh: read-only variable: status` killed eight
+    /// agent-written CI polling scripts in one session, because `status` is a
+    /// read-only special in zsh (an alias for `$?`) and is also the most
+    /// natural name for the variable those scripts need. `emulate sh` does not
+    /// lift it.
+    ///
+    /// These assert the DIALECT the tool runs, not which binary provides it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_runs_posix_dialect_not_zsh_specials() {
+        let cwd = std::env::temp_dir().join(format!("codefactory-dialect-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+
+        // 1. `status` must be an ordinary variable.
+        let assigned = execute(
+            json!({ "command": "status=ok; printf 'got:%s' \"$status\"" }),
+            &ExecCtx::new(cwd.clone(), None),
+        )
+        .await
+        .expect("tool returns output");
+        assert!(
+            !assigned.is_error && assigned.content.contains("got:ok"),
+            "status= must not be read-only: {}",
+            assigned.content,
+        );
+
+        // 2. Unquoted expansion word-splits. zsh returns 1 here and says
+        //    nothing about it — the failure mode is a wrong answer, not an
+        //    error.
+        let split = execute(
+            json!({ "command": "f='a b'; set -- $f; printf 'count:%s' \"$#\"" }),
+            &ExecCtx::new(cwd.clone(), None),
+        )
+        .await
+        .expect("tool returns output");
+        assert!(
+            split.content.contains("count:2"),
+            "unquoted expansion must word-split: {}",
+            split.content,
+        );
+
+        // 3. A glob that matches nothing passes through instead of aborting
+        //    the whole command, so a later step still runs.
+        let glob = execute(
+            json!({ "command": "ls *.codefactory-no-such-suffix 2>/dev/null; printf 'reached'" }),
+            &ExecCtx::new(cwd.clone(), None),
+        )
+        .await
+        .expect("tool returns output");
+        assert!(
+            glob.content.contains("reached"),
+            "an unmatched glob must not abort the command: {}",
+            glob.content,
+        );
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_command_uses_available_platform_shell() {
