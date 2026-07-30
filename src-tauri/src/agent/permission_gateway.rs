@@ -4,7 +4,7 @@
 //! Folds the loop's `decide_permission` + `request_permission` behind the
 //! [`PermissionGateway`] trait: it reads the live permission policy and, on
 //! `Ask`, prompts the frontend and waits for a response (or a cancellation /
-//! 600s timeout). Owns only `Arc` handles — the settings lock, the event sink,
+//! bounded timeout). Owns only `Arc` handles — the settings lock, the event sink,
 //! the pending-permission map, and the cancel flag. It holds NO `AppHandle`
 //! directly (the `AppHandle` stays inside the `dyn EventSink`), so — unlike the
 //! tool/hook backends — it needs no `#[cfg(not(test))]` gating for #166.
@@ -17,7 +17,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use codefactory_agent_loop::services::{PermissionGateway, PermissionOutcome};
+use codefactory_agent_loop::services::{
+    PermissionDenial, PermissionDenialReason, PermissionGateway, PermissionOutcome,
+};
 
 use sqlx::SqlitePool;
 
@@ -27,9 +29,11 @@ use crate::PendingPermissionMap;
 
 use super::events::EventSink;
 use super::{
-    await_permission_response, decide_permission, permission_policy_for_mode, PermissionDecision,
-    PermissionResponse,
+    await_permission_response, decide_permission_for_call, permission_policy_for_mode,
+    PermissionDecision, PermissionResponse,
 };
+
+const PERMISSION_WAIT: Duration = Duration::from_secs(60);
 
 pub(super) struct DesktopPermissionGateway {
     pub(super) settings: Arc<tokio::sync::RwLock<Settings>>,
@@ -38,9 +42,13 @@ pub(super) struct DesktopPermissionGateway {
     pub(super) events: Arc<dyn EventSink>,
     pub(super) pending_permissions: PendingPermissionMap,
     pub(super) cancel: Option<Arc<AtomicBool>>,
+    pub(super) browser_read_granted: bool,
 }
 
-async fn resolve_session_permission_policy(db: &SqlitePool, session_id: &str) -> crate::config::settings::PermissionPolicy {
+async fn resolve_session_permission_policy(
+    db: &SqlitePool,
+    session_id: &str,
+) -> crate::config::settings::PermissionPolicy {
     let mode = sqlx::query_scalar::<_, Option<String>>(
         "SELECT permission_mode FROM sessions WHERE id = ?",
     )
@@ -63,14 +71,24 @@ impl PermissionGateway for DesktopPermissionGateway {
         bash_command: Option<&str>,
     ) -> PermissionOutcome {
         let policy = resolve_session_permission_policy(&self.db, &self.session_id).await;
-        match decide_permission(&policy, &tool_call.function.name, bash_command) {
+        match decide_permission_for_call(
+            &policy,
+            &tool_call.function.name,
+            args,
+            bash_command,
+            self.browser_read_granted,
+        ) {
             PermissionDecision::Allow => PermissionOutcome::Allow,
             PermissionDecision::Ask => self.request_permission(tool_call, args.clone()).await,
             PermissionDecision::Deny(reason) => {
                 tracing::warn!("Tool '{}' denied: {reason}", tool_call.function.name);
-                PermissionOutcome::Deny(format!(
-                    "Tool call denied: {reason}. Please try a different approach."
-                ))
+                PermissionOutcome::Deny(PermissionDenial {
+                    content: format!(
+                        "Tool call denied by policy: {reason}. Choose only an action that stays inside the current policy."
+                    ),
+                    reason: PermissionDenialReason::PolicyDenied,
+                    duration_ms: 0,
+                })
             }
         }
     }
@@ -78,20 +96,24 @@ impl PermissionGateway for DesktopPermissionGateway {
 
 impl DesktopPermissionGateway {
     /// Register a pending permission, prompt the frontend, and wait for the
-    /// user's response (or a cancellation / 600s timeout). Verbatim from the old
-    /// `AgentLoop::request_permission`, mapping the `PermissionResponse` onto the
-    /// loop's `PermissionOutcome`.
-    async fn request_permission(&self, tc: &ToolCall, args: serde_json::Value) -> PermissionOutcome {
+    /// user's response (or a cancellation / bounded timeout).
+    async fn request_permission(
+        &self,
+        tc: &ToolCall,
+        args: serde_json::Value,
+    ) -> PermissionOutcome {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         self.pending_permissions
             .lock()
             .await
             .insert(tc.id.clone(), sender);
 
+        let expires_at = chrono::Utc::now().timestamp_millis() + PERMISSION_WAIT.as_millis() as i64;
         self.events.emit(StreamEvent::PermissionRequest {
             tool_call_id: tc.id.clone(),
             tool_name: tc.function.name.clone(),
             args,
+            expires_at,
         });
         {
             let settings = self.settings.read().await;
@@ -102,20 +124,32 @@ impl DesktopPermissionGateway {
             );
         }
 
+        let started = std::time::Instant::now();
         let response =
-            await_permission_response(receiver, self.cancel.as_ref(), Duration::from_secs(600))
-                .await;
+            await_permission_response(receiver, self.cancel.as_ref(), PERMISSION_WAIT).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
         self.pending_permissions.lock().await.remove(&tc.id);
         match response {
             PermissionResponse::Allow => PermissionOutcome::Allow,
-            PermissionResponse::Deny => PermissionOutcome::Deny(
-                "Tool call denied by user. Please try a different approach.".to_string(),
-            ),
+            PermissionResponse::DeniedByUser => PermissionOutcome::Deny(PermissionDenial {
+                content: "Tool call denied by the user. The requested action was not executed; do not bypass this decision with another tool.".to_string(),
+                reason: PermissionDenialReason::DeniedByUser,
+                duration_ms,
+            }),
+            PermissionResponse::TimedOut => PermissionOutcome::Deny(PermissionDenial {
+                content: "Permission request timed out after 60 seconds without a user decision. This was not a user denial. The requested action was not executed; do not substitute another source as equivalent evidence.".to_string(),
+                reason: PermissionDenialReason::TimedOut,
+                duration_ms,
+            }),
+            PermissionResponse::ChannelClosed => PermissionOutcome::Deny(PermissionDenial {
+                content: "Permission request was interrupted because its response channel closed. No user decision was recorded and the requested action was not executed.".to_string(),
+                reason: PermissionDenialReason::ChannelClosed,
+                duration_ms,
+            }),
             PermissionResponse::Cancelled => PermissionOutcome::Cancelled,
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -141,7 +175,10 @@ mod tests {
             .unwrap();
 
         let safe = resolve_session_permission_policy(&db, "safe-session").await;
-        assert_eq!(decide_permission(&safe, "write_file", None), PermissionDecision::Ask);
+        assert_eq!(
+            decide_permission(&safe, "write_file", None),
+            PermissionDecision::Ask
+        );
 
         let trusted = resolve_session_permission_policy(&db, "trusted-session").await;
         assert_eq!(
@@ -150,6 +187,9 @@ mod tests {
         );
 
         let missing = resolve_session_permission_policy(&db, "missing").await;
-        assert_eq!(decide_permission(&missing, "bash", Some("pnpm test")), PermissionDecision::Ask);
+        assert_eq!(
+            decide_permission(&missing, "bash", Some("pnpm test")),
+            PermissionDecision::Ask
+        );
     }
 }

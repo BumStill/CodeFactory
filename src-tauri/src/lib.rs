@@ -2,8 +2,8 @@
 mod agent;
 mod ai_text;
 mod benchmark;
-mod browser;
 mod benchmark_consistency;
+mod browser;
 mod codex_auth;
 mod commands;
 mod config;
@@ -244,6 +244,126 @@ pub fn run_browser_session_smoke_cli() -> bool {
         }
         Err(error) => {
             eprintln!("Browser-session smoke failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Release/runtime smoke for the existing-Chrome attachment path. It exercises
+/// the native tool (never a naked Playwright process), verifies signed-in
+/// Chrome can be observed, and proves cleanup detaches without closing Chrome.
+#[cfg(not(test))]
+pub fn run_browser_chrome_attach_smoke_cli() -> bool {
+    let mut args = std::env::args();
+    let _program = args.next();
+    let Some(flag) = args.next() else {
+        return false;
+    };
+    if flag != "--browser-chrome-attach-smoke" {
+        return false;
+    }
+    let Some(output) = args.next() else {
+        eprintln!("usage: CodeFactory --browser-chrome-attach-smoke <receipt.json>");
+        std::process::exit(2);
+    };
+    if args.next().is_some() {
+        eprintln!("usage: CodeFactory --browser-chrome-attach-smoke <receipt.json>");
+        std::process::exit(2);
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("Chrome-attachment smoke could not start: {error}");
+            std::process::exit(1);
+        });
+    let output_path = std::path::PathBuf::from(output);
+    let result = runtime.block_on(async {
+        let cwd = output_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        let owner_session_id = format!("browser-attach-smoke-{}", uuid::Uuid::new_v4());
+        let ctx = tools::ExecCtx {
+            cwd,
+            app: None,
+            db: None,
+            session_id: Some(owner_session_id.clone()),
+            root_turn_id: None,
+            task_id: None,
+            knowledge_library_ids: None,
+            settings: None,
+        };
+
+        let attached =
+            tools::browser_session::execute(serde_json::json!({"action":"attach"}), &ctx).await?;
+        if attached.status != tools::ToolExecutionStatus::Done {
+            return Err(errors::AppError::Other(attached.content));
+        }
+        let session_id = attached
+            .content
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Attached user Chrome session: ")
+                    .and_then(|value| value.split('.').next())
+            })
+            .ok_or_else(|| {
+                errors::AppError::Other("attach smoke did not receive a session id".into())
+            })?
+            .to_string();
+        let attached_kind = tools::browser_session::list_managed_sessions()
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .map(|session| session.kind.as_str())
+            == Some("attached_chrome");
+        let tabs = tools::browser_session::execute(
+            serde_json::json!({"action":"tabs","session_id":session_id}),
+            &ctx,
+        )
+        .await?;
+        let closed = tools::browser_session::execute(
+            serde_json::json!({"action":"close","session_id":session_id}),
+            &ctx,
+        )
+        .await?;
+        let lease_gone = !tools::browser_session::list_managed_sessions()
+            .iter()
+            .any(|session| session.session_id == session_id);
+        let receipt = serde_json::json!({
+            "status": if attached_kind && !tabs.is_error && !closed.is_error && lease_gone {
+                "passed"
+            } else {
+                "failed"
+            },
+            "native_tool": "browser_session",
+            "connection_kind": "attached_chrome",
+            "tab_observation_ok": !tabs.is_error,
+            "detached_without_managed_close": closed.content.contains("Chrome was left open"),
+            "lease_reclaimed_after_detach": lease_gone,
+        });
+        std::fs::write(
+            &output_path,
+            serde_json::to_vec_pretty(&receipt).unwrap_or_default(),
+        )?;
+        tools::browser_session::close_for_session(&owner_session_id).await;
+        if receipt["status"] == "passed" && receipt["detached_without_managed_close"] == true {
+            Ok(receipt)
+        } else {
+            Err(errors::AppError::Other(receipt.to_string()))
+        }
+    });
+
+    match result {
+        Ok(receipt) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&receipt).unwrap_or_default()
+            );
+            true
+        }
+        Err(error) => {
+            eprintln!("Chrome-attachment smoke failed: {error}");
             std::process::exit(1);
         }
     }

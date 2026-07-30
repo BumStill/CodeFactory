@@ -42,12 +42,42 @@ pub struct NoOpHooks;
 impl LifecycleHooks for NoOpHooks {}
 
 /// The loop's per-tool authorization outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDenialReason {
+    PolicyDenied,
+    DeniedByUser,
+    TimedOut,
+    ChannelClosed,
+}
+
+impl PermissionDenialReason {
+    pub fn terminal_reason(self) -> &'static str {
+        match self {
+            Self::PolicyDenied => "permission_policy_denied",
+            Self::DeniedByUser => "permission_denied_by_user",
+            Self::TimedOut => "permission_timed_out",
+            Self::ChannelClosed => "permission_channel_closed",
+        }
+    }
+
+    pub fn stops_tool_chain(self) -> bool {
+        !matches!(self, Self::PolicyDenied)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDenial {
+    pub content: String,
+    pub reason: PermissionDenialReason,
+    pub duration_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionOutcome {
     /// Run the tool.
     Allow,
     /// Skip the tool; feed this content back to the model as the tool result.
-    Deny(String),
+    Deny(PermissionDenial),
     /// The user cancelled while a prompt was pending: the loop finishes the
     /// remaining tool batch as cancelled and stops.
     Cancelled,
@@ -150,7 +180,8 @@ impl ContextCompactor for DefaultCompressor {
         system_prompt: &str,
         context_limit: u32,
     ) -> CompactionOutcome {
-        let compression = crate::context::compress_if_needed(messages, system_prompt, context_limit);
+        let compression =
+            crate::context::compress_if_needed(messages, system_prompt, context_limit);
         CompactionOutcome {
             // Storage repair is not enough: compression can change the final
             // provider payload, so enforce the tool-call protocol at the last
@@ -199,10 +230,7 @@ pub trait SteerInbox: Send + Sync {
 
     /// A real user steer may change the current turn's structural capability.
     /// Surfaces without an intent dispatcher keep the current capability.
-    fn capability_override(
-        &self,
-        _content: &str,
-    ) -> Option<crate::run::TurnCapability> {
+    fn capability_override(&self, _content: &str) -> Option<crate::run::TurnCapability> {
         None
     }
 }
@@ -288,7 +316,11 @@ mod tests {
         }
         let c: std::sync::Arc<dyn ContextCompactor> = std::sync::Arc::new(DropAllButLast);
         let out = c.compact(vec![msg("a"), msg("b"), msg("c")], "sys", 1_000);
-        assert_eq!(out.messages.len(), 1, "custom rule fully replaced the default");
+        assert_eq!(
+            out.messages.len(),
+            1,
+            "custom rule fully replaced the default"
+        );
         assert!(out.compacted);
         assert_eq!(out.elided_count, 2);
 
@@ -324,8 +356,12 @@ mod tests {
             },
         };
         assert_eq!(
-            g.authorize(&tc, &serde_json::json!({"command": "rm -rf /"}), Some("rm -rf /"))
-                .await,
+            g.authorize(
+                &tc,
+                &serde_json::json!({"command": "rm -rf /"}),
+                Some("rm -rf /")
+            )
+            .await,
             PermissionOutcome::Allow
         );
     }

@@ -27,6 +27,7 @@ export interface PendingPermission {
   toolCallId: string;
   toolName: string;
   args: unknown;
+  expiresAt?: number;
 }
 
 export interface UIMessage {
@@ -257,6 +258,7 @@ export function reduceChatStreamEvent(
           toolCallId: event.tool_call_id,
           toolName: event.tool_name,
           args: event.args,
+          expiresAt: event.expires_at,
         },
         messages: upsertToolCall(state.messages, msgId, {
           id: event.tool_call_id,

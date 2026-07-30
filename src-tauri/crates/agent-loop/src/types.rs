@@ -267,6 +267,7 @@ pub enum StreamEvent {
         tool_call_id: String,
         tool_name: String,
         args: serde_json::Value,
+        expires_at: i64,
     },
     Done {
         input_tokens: u32,

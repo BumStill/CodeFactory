@@ -361,9 +361,7 @@ pub fn active_tool_definitions_for_capability(
     }
     tool_defs
         .iter()
-        .filter(|definition| {
-            tool_visible_for_capability(capability, &definition.function.name)
-        })
+        .filter(|definition| tool_visible_for_capability(capability, &definition.function.name))
         .cloned()
         .collect()
 }
@@ -406,7 +404,10 @@ pub fn completion_command_and_kind(
     } else if tool_name == "browser_session" {
         match args.get("action").and_then(serde_json::Value::as_str) {
             Some("click" | "fill" | "press") => ToolKind::Mutation,
-            Some("open" | "snapshot" | "screenshot" | "close") => ToolKind::RuntimeProbe,
+            Some("screenshot") => ToolKind::Mutation,
+            Some("open" | "attach" | "snapshot" | "tabs" | "select_tab" | "close") => {
+                ToolKind::RuntimeProbe
+            }
             _ => ToolKind::Mutation,
         }
     } else if tool_name.starts_with("write_")
@@ -634,13 +635,10 @@ mod tests {
                 TurnCapability::ReviewOnly,
                 name
             ));
-            assert!(capability_denial(
-                TurnCapability::ReviewOnly,
-                name,
-                name,
-                &ToolKind::ReadOnly,
-            )
-            .is_some());
+            assert!(
+                capability_denial(TurnCapability::ReviewOnly, name, name, &ToolKind::ReadOnly,)
+                    .is_some()
+            );
         }
     }
 
@@ -659,6 +657,30 @@ mod tests {
         ] {
             let (_, kind) = completion_command_and_kind(name, &serde_json::json!({}));
             assert_eq!(kind, ToolKind::Mutation, "{name}");
+        }
+    }
+
+    #[test]
+    fn browser_screenshot_is_a_workspace_mutation_but_observation_stays_read_only() {
+        let (_, screenshot) = completion_command_and_kind(
+            "browser_session",
+            &serde_json::json!({"action":"screenshot","path":"proof/page.png"}),
+        );
+        assert_eq!(screenshot, ToolKind::Mutation);
+        assert!(capability_denial(
+            TurnCapability::ReviewOnly,
+            "browser_session",
+            "browser_session screenshot",
+            &screenshot,
+        )
+        .is_some());
+
+        for action in ["open", "attach", "snapshot", "tabs", "select_tab", "close"] {
+            let (_, kind) = completion_command_and_kind(
+                "browser_session",
+                &serde_json::json!({"action":action}),
+            );
+            assert_eq!(kind, ToolKind::RuntimeProbe, "{action}");
         }
     }
 

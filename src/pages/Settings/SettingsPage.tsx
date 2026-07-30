@@ -1112,7 +1112,7 @@ function BrowserSessionsTab() {
             受管浏览器会话
           </h2>
           <p className="mt-1 text-xs leading-5 text-gray-400">
-            这里只显示 CodeFactory 创建的自动化浏览器。结束会话不会关闭你的普通 Chrome 窗口。
+            这里显示 CodeFactory 创建的自动化浏览器和已连接的用户 Chrome。结束受管会话会关闭自动化浏览器；断开连接只会停止控制，不会关闭你的普通 Chrome 窗口。
           </p>
         </div>
         <button
@@ -1124,6 +1124,18 @@ function BrowserSessionsTab() {
           <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           刷新
         </button>
+      </div>
+
+      <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 px-4 py-3 text-xs leading-5 text-gray-400">
+        <div className="font-medium text-gray-200">读取普通 Chrome 登录态前的一次性设置</div>
+        <div className="mt-1">
+          在普通 Chrome 打开{" "}
+          <code className="select-all rounded bg-surface-2 px-1 py-0.5 text-blue-700 dark:text-blue-300">
+            chrome://inspect/#remote-debugging
+          </code>
+          ，开启 “Allow remote debugging for this browser instance”。这是 Chrome 自己的安全边界；
+          CodeFactory 不会代替你静默开启，也不会在失败后改用本地源码冒充现网页面。
+        </div>
       </div>
 
       {error && (
@@ -1155,6 +1167,9 @@ function BrowserSessionsTab() {
               <div className="truncate text-xs font-medium text-gray-200">
                 {session.task_id ? `任务 ${session.task_id}` : `会话 ${session.owner_session_id ?? "未知"}`}
               </div>
+              <div className="mt-1 text-[10px] text-gray-500">
+                {session.kind === "attached_chrome" ? "用户 Chrome（复用现有登录）" : "CodeFactory 受管浏览器"}
+              </div>
               <div className="mt-1 truncate font-mono text-[10px] text-gray-500">
                 {session.session_id}
               </div>
@@ -1169,7 +1184,11 @@ function BrowserSessionsTab() {
               disabled={closing === session.session_id}
               className="rounded border border-red-500/30 px-2.5 py-1.5 text-xs text-red-700 hover:bg-red-500/10 disabled:opacity-50 dark:text-red-300"
             >
-              {closing === session.session_id ? "正在结束…" : "结束会话"}
+              {closing === session.session_id
+                ? "正在结束…"
+                : session.kind === "attached_chrome"
+                  ? "断开连接"
+                  : "结束会话"}
             </button>
           </div>
         ))}

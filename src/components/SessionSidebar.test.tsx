@@ -71,6 +71,23 @@ describe("SessionSidebar", () => {
     expect(screen.queryByText("独立任务")).not.toBeInTheDocument();
   });
 
+  it("marks a background session that is waiting for permission", () => {
+    fakeChatState.runtime = {
+      q1: {
+        streaming: true,
+        pendingPermission: { toolCallId: "tc-1", toolName: "bash", args: {} },
+      },
+    };
+    try {
+      render(
+        <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+      );
+      expect(screen.getByLabelText("等待批准")).toBeInTheDocument();
+    } finally {
+      fakeChatState.runtime = {};
+    }
+  });
+
   it("leaves a folder used once as an ordinary row, not a group", () => {
     const onOpen = vi.fn();
     render(
