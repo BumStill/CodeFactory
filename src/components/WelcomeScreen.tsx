@@ -194,7 +194,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
                   <span className="min-w-0 flex-1 truncate text-xs text-gray-200">
                     接着上次说：{scopedSessions[0].title || "未命名会话"}
                   </span>
-                  <span className="shrink-0 text-[10px] text-gray-600">
+                  <span className="shrink-0 text-[11px] text-gray-600">
                     {folderName(scopedSessions[0].cwd)}
                   </span>
                 </div>
@@ -209,7 +209,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
                 >
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-gray-300 truncate flex-1">{s.title || "未命名"}</span>
-                    <span className="text-[10px] text-gray-600 font-mono truncate max-w-[140px]" title={s.cwd}>
+                    <span className="max-w-[140px] truncate font-mono text-[11px] text-gray-600" title={s.cwd}>
                       {s.kind === "quick" ? "独立任务" : folderName(s.cwd)}
                     </span>
                   </div>

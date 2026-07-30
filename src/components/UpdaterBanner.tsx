@@ -72,7 +72,7 @@ export function UpdaterBanner() {
       {phase.kind === "downloading" && (
         <div className="p-3 space-y-2">
           <div className="flex items-center gap-2 text-xs text-gray-300">
-            <RefreshCw size={12} className="text-accent animate-spin" />
+            <RefreshCw size={12} className="text-accent animate-spin motion-reduce:animate-none" />
             <span>正在下载更新…</span>
           </div>
           <div className="h-1 bg-surface-3 rounded-full overflow-hidden">
@@ -85,7 +85,7 @@ export function UpdaterBanner() {
               }}
             />
           </div>
-          <div className="text-[10px] text-gray-600 text-right tabular-nums">
+          <div className="text-[11px] text-gray-600 text-right tabular-nums">
             {(phase.received / 1024 / 1024).toFixed(1)} MB
             {phase.total && ` / ${(phase.total / 1024 / 1024).toFixed(1)} MB`}
           </div>
@@ -94,7 +94,7 @@ export function UpdaterBanner() {
 
       {phase.kind === "installing" && (
         <div className="flex items-center gap-2 p-3 text-xs text-gray-300">
-          <RefreshCw size={12} className="text-accent animate-spin" />
+          <RefreshCw size={12} className="text-accent animate-spin motion-reduce:animate-none" />
           <span>安装中…</span>
         </div>
       )}

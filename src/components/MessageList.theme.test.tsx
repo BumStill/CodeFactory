@@ -63,6 +63,30 @@ describe("MessageList theme readability", () => {
     const cls = code!.className;
     // Forbidden: unconditional text-amber-200 (was the v0.5.1 bug).
     expect(cls).not.toMatch(/(^|\s)text-amber-200(\s|$)/);
+    expect(cls).not.toMatch(/\btext-amber-/);
+  });
+
+  it("centers the transcript in a bounded modern reading column", () => {
+    render(
+      <MessageList messages={[baseMsg()]} streaming={false} cwd={null} />,
+    );
+
+    expect(screen.getByTestId("conversation-reading-column")).toHaveClass(
+      "max-w-[880px]",
+    );
+  });
+
+  it("uses Chinese processing copy instead of an English thinking hint", () => {
+    render(
+      <MessageList
+        messages={[baseMsg({ content: "", toolCalls: [] })]}
+        streaming
+        cwd={null}
+      />,
+    );
+
+    expect(screen.getByText("正在处理")).toBeInTheDocument();
+    expect(screen.queryByText("Thinking")).not.toBeInTheDocument();
   });
 
   it("shows model transport retries as a quiet expandable assistant status", () => {

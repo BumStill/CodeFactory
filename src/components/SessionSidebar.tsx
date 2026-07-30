@@ -28,6 +28,7 @@ import {
   Pencil,
   Trash2,
   MoreHorizontal,
+  Search,
   ShieldQuestion,
 } from "lucide-react";
 import { useChatStore } from "../stores/chat";
@@ -60,7 +61,17 @@ export function SessionSidebar({
     void loadSessions();
   }, []);
 
-  const rail = useMemo(() => buildSessionRail(sessions), [sessions]);
+  const [query, setQuery] = useState("");
+  const filteredSessions = useMemo(() => {
+    const normalized = query.trim().toLocaleLowerCase();
+    if (!normalized) return sessions;
+    return sessions.filter((session) =>
+      `${session.title ?? ""}\n${session.cwd ?? ""}`
+        .toLocaleLowerCase()
+        .includes(normalized),
+    );
+  }, [query, sessions]);
+  const rail = useMemo(() => buildSessionRail(filteredSessions), [filteredSessions]);
   const draftActive = draftSession?.id === currentSessionId;
   const draftProject = draftActive ? draftSession?.cwd ?? null : null;
 
@@ -93,38 +104,54 @@ export function SessionSidebar({
   return (
     <div className="flex flex-col min-h-0 flex-1">
       {/* ── Toolbar: one unambiguous "new blank conversation" action. ──── */}
-      <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-3">
-        <span className="text-[11px] font-medium text-gray-400">会话</span>
-        <button
-          onClick={() => onNewConversation(null)}
-          aria-label="新建会话"
-          title="新建会话（空白，可在输入框上方选择项目）"
-          className="flex h-7 w-7 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
-        >
-          <Plus size={15} />
-        </button>
+      <div className="shrink-0 border-b border-border/80 px-2 pb-2">
+        <div className="flex h-11 items-center justify-between px-1">
+          <span className="text-[13px] font-semibold text-gray-300">会话</span>
+          <button
+            onClick={() => onNewConversation(null)}
+            aria-label="新建会话"
+            title="新建会话（空白，可在输入框上方选择项目）"
+            className="flex h-8 w-8 items-center justify-center rounded-lg text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
+          >
+            <Plus size={16} />
+          </button>
+        </div>
+        <label className="flex h-8 items-center gap-2 rounded-lg border border-border/70 bg-surface-2 px-2 text-gray-500 transition-colors focus-within:border-accent/50 focus-within:text-gray-400">
+          <Search size={13} aria-hidden="true" className="shrink-0" />
+          <span className="sr-only">搜索会话</span>
+          <input
+            type="search"
+            aria-label="搜索会话"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索会话"
+            className="min-w-0 flex-1 bg-transparent text-[13px] text-gray-300 placeholder:text-gray-600 outline-none"
+          />
+        </label>
       </div>
 
-      <div className="flex-1 overflow-y-auto scrollbar-auto-hide px-1.5 py-2">
+      <div className="flex-1 overflow-y-auto scrollbar-auto-hide px-1.5 py-2.5">
         {draftActive && draftSession && (
           <div
             aria-current="page"
             data-draft-row
-            className="relative mb-1 flex min-h-10 w-full items-center gap-2 rounded-md bg-surface-3 px-2 py-1.5 text-left before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded before:bg-accent"
+            className="relative mb-1 flex min-h-10 w-full items-center gap-2 rounded-lg bg-surface-3 px-2 py-1.5 text-left before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded before:bg-accent"
           >
             <MessageSquare size={12} className="shrink-0 text-accent" />
-            <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-gray-100">
+            <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-gray-100">
               新会话
             </span>
-            <span className="text-[9px] text-accent">{draftSession.anonymous ? "匿名草稿" : "草稿"}</span>
+            <span className="text-[11px] text-accent">{draftSession.anonymous ? "匿名草稿" : "草稿"}</span>
           </div>
         )}
 
         {rail.length === 0 ? (
-          <p className="px-2 py-8 text-center text-[11px] leading-relaxed text-gray-600">
-            还没有会话
+          <p className="px-2 py-8 text-center text-[13px] leading-relaxed text-gray-600">
+            {query ? "没有匹配的会话" : "还没有会话"}
             <br />
-            <span className="text-gray-700">点右上角「＋」开始</span>
+            <span className="text-[11px] text-gray-600">
+              {query ? "试试标题或项目路径" : "点右上角「＋」开始"}
+            </span>
           </p>
         ) : (
           <ul className="space-y-0.5">
@@ -194,39 +221,34 @@ function ProjectRow({
 }) {
   return (
     <li>
-      <div
-        role="button"
-        tabIndex={0}
-        aria-expanded={expanded}
-        title={cwd}
-        onClick={onToggle}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            onToggle();
-          }
-        }}
-        className="group flex min-h-8 w-full cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-left transition-colors hover:bg-surface-2"
-      >
-        {expanded ? (
-          <FolderOpen size={11} className="shrink-0 text-gray-400" />
-        ) : (
-          <Folder size={11} className="shrink-0 text-gray-500" />
-        )}
-        <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-gray-200">{name}</span>
-        <span className="shrink-0 text-[9px] text-gray-600">{count}</span>
-        <span
-          role="button"
+      <div className="group flex min-h-9 w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-surface-2">
+        <button
+          type="button"
+          aria-label={`${expanded ? "收起" : "展开"}项目 ${name}`}
+          aria-expanded={expanded}
+          title={cwd}
+          onClick={onToggle}
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 self-stretch rounded-md text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/60"
+        >
+          {expanded ? (
+            <FolderOpen size={11} className="shrink-0 text-gray-400" />
+          ) : (
+            <Folder size={11} className="shrink-0 text-gray-500" />
+          )}
+          <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-gray-200">
+            {name}
+          </span>
+          <span className="shrink-0 text-[11px] tabular-nums text-gray-600">{count}</span>
+        </button>
+        <button
+          type="button"
           aria-label={`在 ${name} 里新建会话`}
           title="在此项目里新建会话"
-          onClick={(e) => {
-            e.stopPropagation();
-            onNewConversation();
-          }}
-          className="flex shrink-0 items-center rounded p-0.5 text-gray-600 opacity-0 transition-opacity hover:bg-surface-3 hover:text-gray-200 group-hover:opacity-100 group-focus-within:opacity-100"
+          onClick={onNewConversation}
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-gray-600 opacity-0 transition-opacity hover:bg-surface-3 hover:text-gray-200 group-hover:opacity-100 group-focus-within:opacity-100"
         >
           <Plus size={12} />
-        </span>
+        </button>
       </div>
       {expanded && <ul className="mt-0.5 space-y-0.5 pl-3">{children}</ul>}
     </li>
@@ -284,146 +306,152 @@ function SessionRow({
     setEditing(false);
     if (t && t !== session.title) onRename(t);
   };
+  const title = session.title || "未命名会话";
+  const statusIndicator = waitingPermission ? (
+    <ShieldQuestion size={12} className="shrink-0 text-status-warning" aria-label="等待批准" />
+  ) : streaming ? (
+    <Loader2
+      size={11}
+      className="shrink-0 animate-spin text-status-progress motion-reduce:animate-none"
+      aria-label="运行中"
+    />
+  ) : null;
+  const metadata = (
+    <div className="mt-0.5 flex min-w-0 items-center gap-1 pl-[18px] text-[11px] leading-4 text-gray-600">
+      {!nested && projectName && (
+        <>
+          <span className="truncate">{projectName}</span>
+          <span aria-hidden="true">·</span>
+        </>
+      )}
+      <span className="shrink-0">{formatRelativeTime(session.updated_at)}</span>
+    </div>
+  );
 
   return (
     <li>
       <div
-        role="button"
         data-session-row
-        tabIndex={0}
-        aria-current={active ? "page" : undefined}
-        onClick={() => {
-          if (!editing) onClick();
-        }}
-        onKeyDown={(e) => {
-          if (!editing && e.key === "Enter") onClick();
-        }}
-        className={`group relative min-h-8 w-full cursor-pointer rounded-md px-2 py-1 text-left transition-colors before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded ${
+        className={`group relative flex min-h-10 w-full items-start rounded-lg px-2 py-1.5 text-left transition-colors before:absolute before:inset-y-1.5 before:left-0 before:w-0.5 before:rounded ${
           active ? "bg-surface-3 before:bg-accent" : "before:bg-transparent hover:bg-surface-2"
         }`}
       >
-        <div className="flex items-center gap-1.5">
-          <MessageSquare size={11} className={`shrink-0 ${active ? "text-accent" : "text-gray-600"}`} />
-          {editing ? (
-            <input
-              autoFocus
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              onClick={(e) => e.stopPropagation()}
-              onKeyDown={(e) => {
-                e.stopPropagation();
-                if (e.key === "Enter") commitRename();
-                if (e.key === "Escape") setEditing(false);
-              }}
-              onBlur={commitRename}
-              className="min-w-0 flex-1 rounded border border-accent/50 bg-surface-3 px-1 text-[12px] text-gray-100 outline-none"
-            />
-          ) : (
-            <span
-              title="双击重命名"
-              onDoubleClick={(e) => {
-                e.stopPropagation();
-                startRename();
-              }}
-              className={`flex-1 truncate text-[12px] ${
-                active ? "font-medium text-gray-100" : "text-gray-300"
-              }`}
-            >
-              {session.title || "未命名会话"}
-            </span>
-          )}
-          {waitingPermission ? (
-            <ShieldQuestion
-              size={12}
-              className="shrink-0 text-amber-400"
-              aria-label="等待批准"
-            />
-          ) : streaming && (
-            <Loader2 size={11} className="shrink-0 animate-spin text-accent" aria-label="运行中" />
-          )}
-          {!editing && !confirming && (
-            <div className="relative shrink-0" ref={menuRef}>
-              <span
-                role="button"
-                title="更多操作"
-                aria-label="更多操作"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setMenuOpen((v) => !v);
+        {editing ? (
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5">
+              <MessageSquare
+                size={11}
+                className={`shrink-0 ${active ? "text-accent" : "text-gray-600"}`}
+              />
+              <input
+                autoFocus
+                aria-label="重命名会话"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commitRename();
+                  if (e.key === "Escape") setEditing(false);
                 }}
-                className={`flex items-center rounded p-0.5 transition-opacity hover:bg-surface-3 hover:text-gray-200 ${
-                  menuOpen
-                    ? "text-gray-200 opacity-100"
-                    : "text-gray-600 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+                onBlur={commitRename}
+                className="min-w-0 flex-1 rounded-md border border-accent/50 bg-surface-3 px-1.5 py-0.5 text-[13px] text-gray-100 outline-none"
+              />
+              {statusIndicator}
+            </div>
+            {metadata}
+          </div>
+        ) : (
+          <button
+            type="button"
+            aria-label={`打开会话 ${title}`}
+            aria-current={active ? "page" : undefined}
+            title={`${title} · 双击标题可重命名`}
+            onClick={onClick}
+            className="min-w-0 flex-1 cursor-pointer rounded-md text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/60"
+          >
+            <div className="flex items-center gap-1.5">
+              <MessageSquare
+                size={11}
+                className={`shrink-0 ${active ? "text-accent" : "text-gray-600"}`}
+              />
+              <span
+                title={`${title} · 双击重命名`}
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  startRename();
+                }}
+                className={`flex-1 truncate text-[13px] ${
+                  active ? "font-medium text-gray-100" : "text-gray-300"
                 }`}
               >
-                <MoreHorizontal size={13} />
+                {title}
               </span>
-              {menuOpen && (
-                <div className="absolute right-0 top-full z-50 mt-1 min-w-[100px] overflow-hidden rounded-md border border-border bg-surface-2 py-0.5 shadow-xl">
-                  <span
-                    role="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      startRename();
-                    }}
-                    className="flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-gray-300 hover:bg-surface-3"
-                  >
-                    <Pencil size={11} />
-                    重命名
-                  </span>
-                  <span
-                    role="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setMenuOpen(false);
-                      setConfirming(true);
-                    }}
-                    className="flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-red-400 hover:bg-red-500/15"
-                  >
-                    <Trash2 size={11} />
-                    删除
-                  </span>
-                </div>
-              )}
+              {statusIndicator}
             </div>
-          )}
-          {confirming && (
-            <span className="flex shrink-0 items-center gap-1">
-              <span
-                role="button"
-                title="确认删除"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onDelete();
-                }}
-                className="rounded bg-red-500/15 px-1 py-0.5 text-[9px] text-red-400 hover:bg-red-500/25"
-              >
-                删除
-              </span>
-              <span
-                role="button"
-                title="取消"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setConfirming(false);
-                }}
-                className="rounded px-1 py-0.5 text-[9px] text-gray-500 hover:bg-surface-3"
-              >
-                取消
-              </span>
-            </span>
-          )}
-        </div>
-        <div className="mt-0.5 flex min-w-0 items-center gap-1 pl-[18px] text-[9px] text-gray-600">
-          {!nested && projectName && (
-            <>
-              <span className="truncate">{projectName}</span>
-              <span aria-hidden="true">·</span>
-            </>
-          )}
-          <span className="shrink-0">{formatRelativeTime(session.updated_at)}</span>
-        </div>
+            {metadata}
+          </button>
+        )}
+        {!editing && !confirming && (
+          <div className="relative shrink-0" ref={menuRef}>
+            <button
+              type="button"
+              title="更多操作"
+              aria-label="更多操作"
+              onClick={() => setMenuOpen((v) => !v)}
+              className={`flex items-center rounded p-0.5 transition-opacity hover:bg-surface-3 hover:text-gray-200 ${
+                menuOpen
+                  ? "text-gray-200 opacity-100"
+                  : "text-gray-600 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+              }`}
+            >
+              <MoreHorizontal size={13} />
+            </button>
+            {menuOpen && (
+              <div className="absolute right-0 top-full z-50 mt-1 min-w-[100px] overflow-hidden rounded-md border border-border bg-surface-2 py-0.5 shadow-xl">
+                <button
+                  type="button"
+                  onClick={startRename}
+                  className="flex min-h-8 w-full items-center gap-1.5 px-2.5 py-1.5 text-[13px] text-gray-300 hover:bg-surface-3"
+                >
+                  <Pencil size={11} />
+                  重命名
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    setConfirming(true);
+                  }}
+                  className="flex min-h-8 w-full items-center gap-1.5 px-2.5 py-1.5 text-[13px] text-status-danger hover:bg-status-danger-soft"
+                >
+                  <Trash2 size={11} />
+                  删除
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+        {confirming && (
+          <span className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              aria-label="确认删除"
+              title="确认删除"
+              onClick={onDelete}
+              className="inline-flex min-h-7 items-center rounded-md bg-status-danger-soft px-1.5 text-[11px] text-status-danger hover:brightness-95"
+            >
+              删除
+            </button>
+            <button
+              type="button"
+              aria-label="取消删除"
+              title="取消"
+              onClick={() => setConfirming(false)}
+              className="inline-flex min-h-7 items-center rounded-md px-1.5 text-[11px] text-gray-500 hover:bg-surface-3"
+            >
+              取消
+            </button>
+          </span>
+        )}
       </div>
     </li>
   );

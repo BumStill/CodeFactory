@@ -79,7 +79,7 @@ describe("ToolCallCard — open generated file", () => {
 
   it.each([
     ["running", "border-l-2", "bg-accent/[0.025]"],
-    ["waiting_permission", "border-l-2", "bg-amber-500/[0.025]"],
+    ["waiting_permission", "border-l-2", "bg-status-warning-soft/45"],
     ["error", "border-l", "bg-transparent"],
   ] as const)("uses a quiet left status rail instead of a full frame for %s", (status, rail, tone) => {
     const { container } = render(

@@ -126,7 +126,7 @@ export function OnboardingWizard({
             <option value="pr_only">开 PR 为止</option>
             <option value="through_ci_green">等 CI 通过</option>
             <option value="through_merge">合并</option>
-            <option value="through_release">发布上线(默认)</option>
+            <option value="through_release">创建正式发布(默认)</option>
           </select>
         </div>
       </div>
