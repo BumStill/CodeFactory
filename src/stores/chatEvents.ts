@@ -321,10 +321,11 @@ export function reduceChatStreamEvent(
         pendingPermission: null,
         messages: updateMessageById(state.messages, msgId, (m) => {
           if (modelRoutesExhausted) {
+            const presentation = presentChatInvocationError(event.message);
             return {
               ...m,
-              content: MODEL_ROUTE_EXHAUSTED_GUIDANCE,
-              failureEvidence: event.message,
+              content: presentation.content,
+              failureEvidence: presentation.failureEvidence,
               durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
             };
           }

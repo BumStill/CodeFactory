@@ -120,4 +120,20 @@ describe("model route failover stream events", () => {
     expect(presentation.content).toContain("尚未配置凭据");
     expect(presentation.content).toContain("模型设置");
   });
+
+  it("keeps the same credential guidance when exhaustion arrives as a stream error", () => {
+    const next = reduceChatStreamEvent(
+      baseState(),
+      {
+        type: "error",
+        message:
+          "所有可用模型端点均不可用：DeepSeek / deepseek-v4-pro（CREDENTIAL_ACCESS_REQUIRED: deepseek 凭据读取失败）。请检查模型设置后重试。",
+      },
+      "assistant-1",
+    );
+
+    expect(next.messages[0].content).toContain("DeepSeek / deepseek-v4-pro");
+    expect(next.messages[0].content).toContain("无法读取已配置凭据");
+    expect(next.messages[0].failureEvidence).toContain("CREDENTIAL_ACCESS_REQUIRED");
+  });
 });
