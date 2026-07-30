@@ -34,7 +34,9 @@ CodeFactory 曾把规范编辑、AI 生成、任务拆解和远程 Issue 导入�
 1. 用户打开一个项目会话并描述非平凡代码任务。
 2. CodeFactory 向会话 Agent 提供有界的仓库权威索引：先读取 `AGENTS.md` 与 README，
    并发现仓库已经采用的 `docs/specs/`、`docs/design/` 等普通文档；仓库规则决定最终路径。
-3. Agent 读取与任务相关的仓库规范；计划只在当前对话中表达，不创建独立工作台记录。
+3. Agent 读取与任务相关的仓库规范；执行期任务状态只在当前对话中表达，不创建独立工作台记录。
+   超过一屏的长方案按 `planning-turn-document-authoring.md`（`CF-PLAN-DOC`）落盘为仓库文档，
+   会话只保留摘要、文档路径和待决问题。
 4. 如任务可以安全并行，Agent 调用 `delegate_tasks`；任务存在后，执行详情在会话内部浮现。
 5. 如本次决策应长期保留，Agent 直接创建或修改 `docs/specs/`、`docs/design/` 等普通
    仓库文件；这些变更与代码一起进入 diff、commit、PR 和 Git 历史。
