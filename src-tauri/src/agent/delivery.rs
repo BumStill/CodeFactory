@@ -172,9 +172,41 @@ fn reached_state_from_steps(steps: &[StepResult]) -> String {
 pub struct DeliverOpts {
     pub title: Option<String>,
     pub body: Option<String>,
+    /// Release cadence signal persisted into the final commit. `None` follows
+    /// the repository's ordinary configured delivery policy.
+    pub release_urgency: Option<ReleaseUrgency>,
     /// A per-call ceiling; clamped to at most the user's configured ceiling.
     pub requested_ceiling: Option<DeliveryCeiling>,
     pub extra_excludes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseUrgency {
+    Immediate,
+    Hold,
+}
+
+impl ReleaseUrgency {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Hold => "hold",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeCommitMessage {
+    pub title: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryPr {
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub body: String,
 }
 
 /// CI conclusion for a commit.
@@ -328,12 +360,13 @@ pub trait DeliveryRemote {
         body: &str,
         head: &str,
         base: &str,
-    ) -> impl std::future::Future<Output = Result<(u64, String), String>>;
+    ) -> impl std::future::Future<Output = Result<DeliveryPr, String>>;
     fn ci_status(&self, sha: &str) -> impl std::future::Future<Output = Result<CiStatus, String>>;
     fn merge_pr(
         &self,
         number: u64,
         method: MergeMethod,
+        commit_message: Option<&MergeCommitMessage>,
     ) -> impl std::future::Future<Output = Result<(), String>>;
     fn trigger_release(&self) -> impl std::future::Future<Output = Result<String, String>>;
 
@@ -405,6 +438,10 @@ struct DeliveryReceipt {
     commit_sha: String,
     pr_number: u64,
     pr_url: String,
+    #[serde(default)]
+    pr_title: Option<String>,
+    #[serde(default)]
+    pr_body: Option<String>,
     release_detail: Option<String>,
 }
 
@@ -473,7 +510,7 @@ fn read_delivery_receipt(repo: &RepoContext, sha: &str) -> Result<Option<Deliver
     }
     if !matches!(
         receipt.state.as_str(),
-        "intent_merge" | "merged" | "intent_release" | "release_triggered"
+        "pr_open" | "intent_merge" | "merged" | "intent_release" | "release_triggered"
     ) {
         return Err(format!(
             "本地交付回执状态 {} 无法识别，拒绝重复外部动作",
@@ -650,6 +687,204 @@ fn generate_commit_message(root: &Path, branch: &str, title: Option<&str>) -> St
         .unwrap_or(branch)
         .replace(['-', '_'], " ");
     format!("{subject}\n\nDelivered by CodeFactory ({count} file(s) changed).")
+}
+
+fn release_urgency_trailers(message: &str) -> Vec<String> {
+    final_footer_lines(message)
+        .iter()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("Release-Urgency")
+                .then(|| value.trim().to_ascii_lowercase())
+        })
+        .collect()
+}
+
+fn final_footer_lines(message: &str) -> Vec<&str> {
+    let lines: Vec<&str> = message.trim_end().lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|line| line.trim().is_empty())
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    lines[start..].iter().copied().collect()
+}
+
+fn breaking_change_trailers(message: &str) -> Vec<String> {
+    final_footer_lines(message)
+        .iter()
+        .filter_map(|line| {
+            let line = line.trim();
+            (line.starts_with("BREAKING CHANGE:") || line.starts_with("BREAKING-CHANGE:"))
+                .then(|| line.to_string())
+        })
+        .collect()
+}
+
+fn missing_release_metadata(expected_message: &str, actual_message: &str) -> Vec<String> {
+    let expected_urgencies = release_urgency_trailers(expected_message);
+    let actual_urgencies = release_urgency_trailers(actual_message);
+    let expected_breaking_changes = breaking_change_trailers(expected_message);
+    let actual_breaking_changes = breaking_change_trailers(actual_message);
+
+    let mut missing: Vec<String> = expected_urgencies
+        .iter()
+        .filter(|value| !actual_urgencies.contains(value))
+        .map(|value| format!("Release-Urgency: {value}"))
+        .collect();
+    missing.extend(
+        expected_breaking_changes
+            .iter()
+            .filter(|value| !actual_breaking_changes.contains(value))
+            .cloned(),
+    );
+    missing
+}
+
+fn append_release_urgency(message: String, urgency: Option<ReleaseUrgency>) -> String {
+    let Some(urgency) = urgency else {
+        return message;
+    };
+    let value = urgency.as_str();
+    if release_urgency_trailers(&message)
+        .iter()
+        .any(|existing| existing == value)
+    {
+        return message;
+    }
+    let footer_started = !release_urgency_trailers(&message).is_empty()
+        || !breaking_change_trailers(&message).is_empty();
+    format!(
+        "{}{}Release-Urgency: {value}",
+        message.trim_end(),
+        if footer_started { "\n" } else { "\n\n" },
+    )
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReleaseMetadata {
+    urgencies: Vec<String>,
+    breaking_changes: Vec<String>,
+}
+
+impl ReleaseMetadata {
+    fn is_empty(&self) -> bool {
+        self.urgencies.is_empty() && self.breaking_changes.is_empty()
+    }
+}
+
+fn branch_release_metadata(
+    root: &Path,
+    remote: &str,
+    base: &str,
+    pr_body: Option<&str>,
+    explicit: Option<ReleaseUrgency>,
+) -> Result<ReleaseMetadata, String> {
+    let range = format!("{remote}/{base}..HEAD");
+    let bodies = git(root, &["log", "--format=%B%x1e", &range])?;
+    let mut metadata = ReleaseMetadata::default();
+    for body in bodies.split('\x1e') {
+        metadata.urgencies.extend(release_urgency_trailers(body));
+        metadata
+            .breaking_changes
+            .extend(breaking_change_trailers(body));
+    }
+    if let Some(body) = pr_body {
+        metadata.urgencies.extend(release_urgency_trailers(body));
+        metadata
+            .breaking_changes
+            .extend(breaking_change_trailers(body));
+    }
+    if let Some(urgency) = explicit {
+        metadata.urgencies.push(urgency.as_str().to_string());
+    }
+    metadata.urgencies.sort();
+    metadata.urgencies.dedup();
+    metadata.breaking_changes.sort();
+    metadata.breaking_changes.dedup();
+    Ok(metadata)
+}
+
+fn guarded_release_reason(urgencies: &[String]) -> Option<String> {
+    let hold = urgencies.iter().any(|value| value == "hold");
+    let invalid: Vec<&str> = urgencies
+        .iter()
+        .map(String::as_str)
+        .filter(|value| !matches!(*value, "immediate" | "hold"))
+        .collect();
+    if !hold && invalid.is_empty() {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    if hold {
+        reasons.push("Release-Urgency: hold".to_string());
+    }
+    if !invalid.is_empty() {
+        reasons.push(format!("非法 Release-Urgency: {}", invalid.join(", ")));
+    }
+    Some(reasons.join("; "))
+}
+
+fn squash_merge_message(title: &str, body: &str, metadata: &ReleaseMetadata) -> MergeCommitMessage {
+    let mut merge_body = body.trim_end().to_string();
+    let existing_urgencies = release_urgency_trailers(body);
+    let existing_breaking_changes = breaking_change_trailers(body);
+    let mut footer_started =
+        !existing_urgencies.is_empty() || !existing_breaking_changes.is_empty();
+    for breaking_change in &metadata.breaking_changes {
+        if existing_breaking_changes.contains(breaking_change) {
+            continue;
+        }
+        if !merge_body.is_empty() {
+            merge_body.push_str(if footer_started { "\n" } else { "\n\n" });
+        }
+        merge_body.push_str(breaking_change);
+        footer_started = true;
+    }
+    for urgency in &metadata.urgencies {
+        if existing_urgencies.contains(urgency) {
+            continue;
+        }
+        if !merge_body.is_empty() {
+            merge_body.push_str(if footer_started { "\n" } else { "\n\n" });
+        }
+        merge_body.push_str(&format!("Release-Urgency: {urgency}"));
+        footer_started = true;
+    }
+    MergeCommitMessage {
+        title: title.to_string(),
+        body: merge_body,
+    }
+}
+
+struct PreparedReleasePolicy {
+    guard: Option<String>,
+    merge_commit_message: Option<MergeCommitMessage>,
+    durable_body: String,
+}
+
+fn prepare_release_policy(
+    root: &Path,
+    remote: &str,
+    base: &str,
+    title: &str,
+    body: &str,
+    explicit: Option<ReleaseUrgency>,
+) -> Result<PreparedReleasePolicy, String> {
+    let metadata = branch_release_metadata(root, remote, base, Some(body), explicit)?;
+    let guard = guarded_release_reason(&metadata.urgencies);
+    let merge_commit_message =
+        (!metadata.is_empty()).then(|| squash_merge_message(title, body, &metadata));
+    let durable_body = merge_commit_message
+        .as_ref()
+        .map(|message| message.body.clone())
+        .unwrap_or_else(|| body.to_string());
+    Ok(PreparedReleasePolicy {
+        guard,
+        merge_commit_message,
+        durable_body,
+    })
 }
 
 /// What a delivery can actually reach, plus the `preflight` step that explains it.
@@ -855,7 +1090,10 @@ pub async fn deliver<R: DeliveryRemote>(
         }
     };
     if has_staged_changes(&repo.root) {
-        let msg = generate_commit_message(&repo.root, &repo.branch, opts.title.as_deref());
+        let msg = append_release_urgency(
+            generate_commit_message(&repo.root, &repo.branch, opts.title.as_deref()),
+            opts.release_urgency,
+        );
         if let Err(e) = git(
             &repo.root,
             &[
@@ -947,6 +1185,40 @@ pub async fn deliver<R: DeliveryRemote>(
             }
         }
     }
+    let mut pr_title = prior_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.pr_title.clone())
+        .or_else(|| opts.title.clone())
+        .unwrap_or_else(|| {
+            generate_commit_message(&repo.root, &repo.branch, None)
+                .lines()
+                .next()
+                .unwrap_or(&repo.branch)
+                .to_string()
+        });
+    let mut pr_body = prior_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.pr_body.clone())
+        .or_else(|| opts.body.clone())
+        .unwrap_or_else(|| {
+            "由 CodeFactory 自动交付。\n\n🤖 Generated with CodeFactory".to_string()
+        });
+    let mut release_policy = match prepare_release_policy(
+        &repo.root,
+        &repo.remote,
+        &repo.default_branch,
+        &pr_title,
+        &pr_body,
+        opts.release_urgency,
+    ) {
+        Ok(values) => values,
+        Err(error) => {
+            return outcome.blocked_at(StepResult::blocked(
+                "policy",
+                format!("无法审计发布元数据，未继续远端交付: {error}"),
+            ))
+        }
+    };
     let resumed_after_merge = prior_receipt
         .as_ref()
         .map(|receipt| matches!(receipt.state.as_str(), "merged" | "release_triggered"))
@@ -976,31 +1248,77 @@ pub async fn deliver<R: DeliveryRemote>(
         }
 
         // ── Open (or reuse) PR/MR ───────────────────────────────────────────
-        let title = opts.title.clone().unwrap_or_else(|| {
-            generate_commit_message(&repo.root, &repo.branch, None)
-                .lines()
-                .next()
-                .unwrap_or(&repo.branch)
-                .to_string()
-        });
-        let body = opts.body.clone().unwrap_or_else(|| {
-            "由 CodeFactory 自动交付。\n\n🤖 Generated with CodeFactory".to_string()
-        });
-        let (pr_number, pr_url) = match remote
-            .open_or_get_pr(&title, &body, &repo.branch, &repo.default_branch)
+        let had_pr_receipt = prior_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.state == "pr_open");
+        let remote_pr = match remote
+            .open_or_get_pr(&pr_title, &pr_body, &repo.branch, &repo.default_branch)
             .await
         {
-            Ok(v) => v,
+            Ok(pr) => pr,
             Err(e) => {
-                return outcome.blocked_at(StepResult::blocked("pr", format!("开 PR/MR 失败: {e}")))
+                return outcome.blocked_at(StepResult::blocked(
+                    "pr",
+                    format!("开 PR/MR 或读取远端真实正文失败: {e}"),
+                ))
             }
         };
+        let pr_number = remote_pr.number;
+        let pr_url = remote_pr.url;
+        pr_title = remote_pr.title;
+        pr_body = remote_pr.body;
+        release_policy = match prepare_release_policy(
+            &repo.root,
+            &repo.remote,
+            &repo.default_branch,
+            &pr_title,
+            &pr_body,
+            opts.release_urgency,
+        ) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "policy",
+                    format!("无法审计远端 PR 发布元数据，未继续交付: {error}"),
+                ))
+            }
+        };
+        if had_pr_receipt {
+            outcome.steps.push(StepResult::ok(
+                "pr",
+                format!("复用并刷新远端 PR/MR #{pr_number}: {pr_url}"),
+            ));
+        } else {
+            outcome.steps.push(StepResult::ok(
+                "pr",
+                format!("PR/MR #{pr_number}: {pr_url}"),
+            ));
+        }
         outcome.pr_number = Some(pr_number);
         outcome.pr_url = Some(pr_url.clone());
-        outcome.steps.push(StepResult::ok(
-            "pr",
-            format!("PR/MR #{pr_number}: {pr_url}"),
-        ));
+        let pr_receipt = DeliveryReceipt {
+            version: 1,
+            state: "pr_open".into(),
+            remote: repo.remote.clone(),
+            remote_identity: receipt_remote_identity(&repo),
+            base_branch: repo.default_branch.clone(),
+            head_branch: repo.branch.clone(),
+            commit_sha: sha.clone(),
+            pr_number,
+            pr_url: pr_url.clone(),
+            pr_title: Some(pr_title.clone()),
+            pr_body: Some(release_policy.durable_body.clone()),
+            release_detail: None,
+        };
+        if let Err(error) = write_delivery_receipt(&repo, &sha, &pr_receipt) {
+            return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                "receipt",
+                format!(
+                    "PR/MR #{pr_number} 已创建或复用，但 PR 阶段回执写入失败: {error}；\
+未继续 CI/merge，避免无参数恢复时丢失发布元数据。"
+                ),
+            ));
+        }
 
         if ceiling.rank() < DeliveryCeiling::ThroughCiGreen.rank() {
             return finish(outcome, &repo.branch);
@@ -1029,6 +1347,45 @@ pub async fn deliver<R: DeliveryRemote>(
         }
 
         // ── Merge ───────────────────────────────────────────────────────────
+        let refreshed_pr = match remote
+            .open_or_get_pr(&pr_title, &pr_body, &repo.branch, &repo.default_branch)
+            .await
+        {
+            Ok(pr) if pr.number == pr_number => pr,
+            Ok(pr) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "policy",
+                    format!(
+                        "合并前远端 PR 身份变化: 预期 #{pr_number}，实际 #{}；未执行合并",
+                        pr.number
+                    ),
+                ))
+            }
+            Err(error) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "policy",
+                    format!("合并前无法刷新远端 PR 正文，未执行合并: {error}"),
+                ))
+            }
+        };
+        pr_title = refreshed_pr.title;
+        pr_body = refreshed_pr.body;
+        release_policy = match prepare_release_policy(
+            &repo.root,
+            &repo.remote,
+            &repo.default_branch,
+            &pr_title,
+            &pr_body,
+            opts.release_urgency,
+        ) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "policy",
+                    format!("合并前无法审计远端 PR 发布元数据，未执行合并: {error}"),
+                ))
+            }
+        };
         let intent = DeliveryReceipt {
             version: 1,
             state: "intent_merge".into(),
@@ -1039,6 +1396,8 @@ pub async fn deliver<R: DeliveryRemote>(
             commit_sha: sha.clone(),
             pr_number,
             pr_url: pr_url.clone(),
+            pr_title: Some(pr_title.clone()),
+            pr_body: Some(release_policy.durable_body.clone()),
             release_detail: None,
         };
         if let Err(error) = write_delivery_receipt(&repo, &sha, &intent) {
@@ -1047,7 +1406,14 @@ pub async fn deliver<R: DeliveryRemote>(
                 format!("合并前无法写入本地意图回执，未执行合并: {error}"),
             ));
         }
-        if let Err(e) = remote.merge_pr(pr_number, merge_method).await {
+        if let Err(e) = remote
+            .merge_pr(
+                pr_number,
+                merge_method,
+                release_policy.merge_commit_message.as_ref(),
+            )
+            .await
+        {
             return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                 "merge",
                 format!("合并请求返回失败: {e}(服务端可能已接收；已保留 intent_merge 回执)。"),
@@ -1067,6 +1433,8 @@ pub async fn deliver<R: DeliveryRemote>(
             commit_sha: sha.clone(),
             pr_number,
             pr_url,
+            pr_title: Some(pr_title.clone()),
+            pr_body: Some(release_policy.durable_body.clone()),
             release_detail: None,
         };
         if let Err(error) = write_delivery_receipt(&repo, &sha, &receipt) {
@@ -1086,6 +1454,17 @@ pub async fn deliver<R: DeliveryRemote>(
     }
 
     // ── Release (deliberate) ────────────────────────────────────────────────
+    if !release_already_triggered {
+        if let Some(reason) = release_policy.guard.as_ref() {
+            return outcome.blocked_at(StepResult::blocked(
+                "release",
+                format!(
+                    "发布批次受保护，未触发 release: {reason}。确认依赖和完整批次后，\
+请从 Auto Release 手动设置 allow_guarded_batch=true；普通 force 不能绕过。"
+                ),
+            ));
+        }
+    }
     if let Some(receipt) = prior_receipt
         .as_ref()
         .filter(|receipt| receipt.state == "release_triggered")
@@ -1109,6 +1488,8 @@ pub async fn deliver<R: DeliveryRemote>(
             commit_sha: sha.clone(),
             pr_number: outcome.pr_number.unwrap_or_default(),
             pr_url: outcome.pr_url.clone().unwrap_or_default(),
+            pr_title: Some(pr_title.clone()),
+            pr_body: Some(release_policy.durable_body.clone()),
             release_detail: None,
         };
         if let Err(error) = write_delivery_receipt(&repo, &sha, &intent) {
@@ -1132,6 +1513,8 @@ pub async fn deliver<R: DeliveryRemote>(
                     commit_sha: sha.clone(),
                     pr_number: outcome.pr_number.unwrap_or_default(),
                     pr_url: outcome.pr_url.clone().unwrap_or_default(),
+                    pr_title: Some(pr_title.clone()),
+                    pr_body: Some(release_policy.durable_body.clone()),
                     release_detail: Some(detail),
                 };
                 match write_delivery_receipt(&repo, &sha, &receipt) {
@@ -1605,6 +1988,8 @@ pub fn delivery_provider_hooks_for(
 struct HookPrResponse {
     number: u64,
     url: String,
+    title: String,
+    body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1695,7 +2080,7 @@ impl DeliveryRemote for HookRemote {
         body: &str,
         head: &str,
         base: &str,
-    ) -> Result<(u64, String), String> {
+    ) -> Result<DeliveryPr, String> {
         let value = self.run_json(json!({
             "action": "open_or_get_pr",
             "title": title,
@@ -1709,7 +2094,12 @@ impl DeliveryRemote for HookRemote {
                 self.id
             )
         })?;
-        Ok((response.number, response.url))
+        Ok(DeliveryPr {
+            number: response.number,
+            url: response.url,
+            title: response.title,
+            body: response.body,
+        })
     }
 
     async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
@@ -1729,11 +2119,18 @@ impl DeliveryRemote for HookRemote {
         })
     }
 
-    async fn merge_pr(&self, number: u64, method: MergeMethod) -> Result<(), String> {
+    async fn merge_pr(
+        &self,
+        number: u64,
+        method: MergeMethod,
+        commit_message: Option<&MergeCommitMessage>,
+    ) -> Result<(), String> {
         let value = self.run_json(json!({
             "action": "merge_pr",
             "number": number,
             "method": method.as_str(),
+            "commit_title": commit_message.map(|message| message.title.as_str()),
+            "commit_body": commit_message.map(|message| message.body.as_str()),
         }))?;
         let _response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
             format!(
@@ -1907,13 +2304,28 @@ fn gh_pr_create_args(title: &str, body: &str, head: &str, base: &str) -> Vec<Str
     ]
 }
 
-fn gh_pr_merge_args(number: u64, method: MergeMethod) -> Vec<String> {
+fn gh_pr_merge_args(
+    number: u64,
+    method: MergeMethod,
+    commit_message: Option<&MergeCommitMessage>,
+) -> Vec<String> {
     let flag = match method {
         MergeMethod::Squash => "--squash",
         MergeMethod::Merge => "--merge",
         MergeMethod::Rebase => "--rebase",
     };
-    vec!["pr".into(), "merge".into(), number.to_string(), flag.into()]
+    let mut args = vec!["pr".into(), "merge".into(), number.to_string(), flag.into()];
+    if method == MergeMethod::Squash {
+        if let Some(message) = commit_message {
+            args.extend([
+                "--subject".into(),
+                message.title.clone(),
+                "--body".into(),
+                message.body.clone(),
+            ]);
+        }
+    }
+    args
 }
 
 fn gh_workflow_run_args(workflow: &str, git_ref: &str) -> Vec<String> {
@@ -1985,7 +2397,7 @@ impl DeliveryRemote for GhCliRemote {
         body: &str,
         head: &str,
         base: &str,
-    ) -> Result<(u64, String), String> {
+    ) -> Result<DeliveryPr, String> {
         // Reuse an open PR for this head first — idempotence contract.
         let existing = self.gh(&[
             "pr".into(),
@@ -1997,14 +2409,24 @@ impl DeliveryRemote for GhCliRemote {
             "--state".into(),
             "open".into(),
             "--json".into(),
-            "number,url".into(),
+            "number,url,title,body".into(),
             "--limit".into(),
             "1".into(),
         ])?;
         if let Ok(list) = serde_json::from_str::<serde_json::Value>(&existing) {
             if let Some(pr) = list.as_array().and_then(|a| a.first()) {
-                if let (Some(n), Some(u)) = (pr["number"].as_u64(), pr["url"].as_str()) {
-                    return Ok((n, u.to_string()));
+                if let (Some(n), Some(u), Some(t), Some(b)) = (
+                    pr["number"].as_u64(),
+                    pr["url"].as_str(),
+                    pr["title"].as_str(),
+                    pr["body"].as_str(),
+                ) {
+                    return Ok(DeliveryPr {
+                        number: n,
+                        url: u.to_string(),
+                        title: t.to_string(),
+                        body: b.to_string(),
+                    });
                 }
             }
         }
@@ -2014,13 +2436,23 @@ impl DeliveryRemote for GhCliRemote {
             "view".into(),
             head.into(),
             "--json".into(),
-            "number,url".into(),
+            "number,url,title,body".into(),
         ])?;
         let v: serde_json::Value = serde_json::from_str(&created)
             .map_err(|e| format!("gh pr view returned non-JSON: {e}"))?;
-        match (v["number"].as_u64(), v["url"].as_str()) {
-            (Some(n), Some(u)) => Ok((n, u.to_string())),
-            _ => Err("gh pr view missing number/url".into()),
+        match (
+            v["number"].as_u64(),
+            v["url"].as_str(),
+            v["title"].as_str(),
+            v["body"].as_str(),
+        ) {
+            (Some(n), Some(u), Some(t), Some(b)) => Ok(DeliveryPr {
+                number: n,
+                url: u.to_string(),
+                title: t.to_string(),
+                body: b.to_string(),
+            }),
+            _ => Err("gh pr view missing number/url/title/body".into()),
         }
     }
 
@@ -2053,8 +2485,45 @@ impl DeliveryRemote for GhCliRemote {
         })
     }
 
-    async fn merge_pr(&self, number: u64, method: MergeMethod) -> Result<(), String> {
-        self.gh(&gh_pr_merge_args(number, method)).map(|_| ())
+    async fn merge_pr(
+        &self,
+        number: u64,
+        method: MergeMethod,
+        commit_message: Option<&MergeCommitMessage>,
+    ) -> Result<(), String> {
+        self.gh(&gh_pr_merge_args(number, method, commit_message))?;
+        if method != MergeMethod::Squash {
+            return Ok(());
+        }
+        let Some(expected_message) = commit_message.map(|message| message.body.as_str()) else {
+            return Ok(());
+        };
+        let merge_sha = self.gh(&[
+            "pr".into(),
+            "view".into(),
+            number.to_string(),
+            "--json".into(),
+            "mergeCommit".into(),
+            "--jq".into(),
+            ".mergeCommit.oid".into(),
+        ])?;
+        if merge_sha.trim().is_empty() {
+            return Err("squash merge succeeded but GitHub returned no merge commit SHA".into());
+        }
+        let merged_message = self.gh(&[
+            "api".into(),
+            format!("repos/{}/commits/{merge_sha}", self.repo),
+            "--jq".into(),
+            ".commit.message".into(),
+        ])?;
+        let missing = missing_release_metadata(expected_message, &merged_message);
+        if !missing.is_empty() {
+            return Err(format!(
+                "squash merge commit {merge_sha} lost release metadata: {}",
+                missing.join(", ")
+            ));
+        }
+        Ok(())
     }
 
     async fn trigger_release(&self) -> Result<String, String> {
@@ -2091,7 +2560,7 @@ impl DeliveryRemote for EitherRemote {
         body: &str,
         head: &str,
         base: &str,
-    ) -> Result<(u64, String), String> {
+    ) -> Result<DeliveryPr, String> {
         match self {
             EitherRemote::Hook(r) => r.open_or_get_pr(title, body, head, base).await,
             EitherRemote::Gh(r) => r.open_or_get_pr(title, body, head, base).await,
@@ -2107,12 +2576,17 @@ impl DeliveryRemote for EitherRemote {
             EitherRemote::Gitlab(r) => r.ci_status(sha).await,
         }
     }
-    async fn merge_pr(&self, number: u64, method: MergeMethod) -> Result<(), String> {
+    async fn merge_pr(
+        &self,
+        number: u64,
+        method: MergeMethod,
+        commit_message: Option<&MergeCommitMessage>,
+    ) -> Result<(), String> {
         match self {
-            EitherRemote::Hook(r) => r.merge_pr(number, method).await,
-            EitherRemote::Gh(r) => r.merge_pr(number, method).await,
-            EitherRemote::Github(r) => r.merge_pr(number, method).await,
-            EitherRemote::Gitlab(r) => r.merge_pr(number, method).await,
+            EitherRemote::Hook(r) => r.merge_pr(number, method, commit_message).await,
+            EitherRemote::Gh(r) => r.merge_pr(number, method, commit_message).await,
+            EitherRemote::Github(r) => r.merge_pr(number, method, commit_message).await,
+            EitherRemote::Gitlab(r) => r.merge_pr(number, method, commit_message).await,
         }
     }
     async fn trigger_release(&self) -> Result<String, String> {
@@ -2481,11 +2955,16 @@ impl DeliveryRemote for GitlabRemote {
         body: &str,
         head: &str,
         base: &str,
-    ) -> Result<(u64, String), String> {
+    ) -> Result<DeliveryPr, String> {
         if let Ok(mrs) = crate::git_remote::gitlab::list_prs(&self.client, &self.repo, "open").await
         {
             if let Some(mr) = mrs.into_iter().find(|mr| mr.head_branch == head) {
-                return Ok((mr.number, mr.url));
+                return Ok(DeliveryPr {
+                    number: mr.number,
+                    url: mr.url,
+                    title: mr.title,
+                    body: mr.body,
+                });
             }
         }
         let mr = crate::git_remote::gitlab::create_pr(
@@ -2498,14 +2977,24 @@ impl DeliveryRemote for GitlabRemote {
             false,
         )
         .await?;
-        Ok((mr.number, mr.url))
+        Ok(DeliveryPr {
+            number: mr.number,
+            url: mr.url,
+            title: mr.title,
+            body: mr.body,
+        })
     }
 
     async fn ci_status(&self, _sha: &str) -> Result<CiStatus, String> {
         Ok(CiStatus::None)
     }
 
-    async fn merge_pr(&self, number: u64, method: MergeMethod) -> Result<(), String> {
+    async fn merge_pr(
+        &self,
+        number: u64,
+        method: MergeMethod,
+        _commit_message: Option<&MergeCommitMessage>,
+    ) -> Result<(), String> {
         crate::git_remote::gitlab::merge_pr(&self.client, &self.repo, number, method.as_str()).await
     }
 
@@ -2531,12 +3020,17 @@ impl DeliveryRemote for GithubRemote {
         body: &str,
         head: &str,
         base: &str,
-    ) -> Result<(u64, String), String> {
+    ) -> Result<DeliveryPr, String> {
         // Idempotency: reuse an existing open PR for this head branch.
         if let Ok(prs) = crate::git_remote::github::list_prs(&self.client, &self.repo, "open").await
         {
             if let Some(pr) = prs.into_iter().find(|p| p.head_branch == head) {
-                return Ok((pr.number, pr.url));
+                return Ok(DeliveryPr {
+                    number: pr.number,
+                    url: pr.url,
+                    title: pr.title,
+                    body: pr.body,
+                });
             }
         }
         let pr = crate::git_remote::github::create_pr(
@@ -2549,7 +3043,12 @@ impl DeliveryRemote for GithubRemote {
             false,
         )
         .await?;
-        Ok((pr.number, pr.url))
+        Ok(DeliveryPr {
+            number: pr.number,
+            url: pr.url,
+            title: pr.title,
+            body: pr.body,
+        })
     }
 
     async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
@@ -2562,8 +3061,21 @@ impl DeliveryRemote for GithubRemote {
         })
     }
 
-    async fn merge_pr(&self, number: u64, method: MergeMethod) -> Result<(), String> {
-        crate::git_remote::github::merge_pr(&self.client, &self.repo, number, method.as_str()).await
+    async fn merge_pr(
+        &self,
+        number: u64,
+        method: MergeMethod,
+        commit_message: Option<&MergeCommitMessage>,
+    ) -> Result<(), String> {
+        crate::git_remote::github::merge_pr(
+            &self.client,
+            &self.repo,
+            number,
+            method.as_str(),
+            commit_message.map(|message| message.title.as_str()),
+            commit_message.map(|message| message.body.as_str()),
+        )
+        .await
     }
 
     async fn trigger_release(&self) -> Result<String, String> {
@@ -2585,7 +3097,7 @@ mod tests {
     use super::*;
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     #[test]
@@ -2865,13 +3377,150 @@ mod tests {
                 "pr", "create", "--title", "t", "--body", "b", "--head", "feat/x", "--base", "main"
             ]
         );
-        let merge = gh_pr_merge_args(42, MergeMethod::Squash);
-        assert_eq!(merge, vec!["pr", "merge", "42", "--squash"]);
+        let merge_message = MergeCommitMessage {
+            title: "fix: preserve release policy".into(),
+            body: "Release-Urgency: hold".into(),
+        };
+        let merge = gh_pr_merge_args(42, MergeMethod::Squash, Some(&merge_message));
+        assert_eq!(
+            merge,
+            vec![
+                "pr",
+                "merge",
+                "42",
+                "--squash",
+                "--subject",
+                "fix: preserve release policy",
+                "--body",
+                "Release-Urgency: hold",
+            ]
+        );
         let release = gh_workflow_run_args("auto-release.yml", "main");
         assert_eq!(
             release,
             vec!["workflow", "run", "auto-release.yml", "--ref", "main"]
         );
+    }
+
+    #[test]
+    fn release_urgency_is_only_read_from_the_footer_and_survives_squash() {
+        assert!(release_urgency_trailers(
+            "fix: safe\n\nThis prose says Release-Urgency: hold but is not a trailer."
+        )
+        .is_empty());
+        let trailers =
+            release_urgency_trailers("fix: guarded\n\nDetails.\n\nRelease-Urgency: hold");
+        assert_eq!(trailers, vec!["hold"]);
+
+        let metadata = ReleaseMetadata {
+            urgencies: trailers,
+            breaking_changes: Vec::new(),
+        };
+        let message = squash_merge_message("fix: guarded", "PR details", &metadata);
+        assert_eq!(message.title, "fix: guarded");
+        assert!(message.body.ends_with("Release-Urgency: hold"));
+        assert_eq!(release_urgency_trailers(&message.body), vec!["hold"]);
+
+        let mixed = squash_merge_message(
+            "fix: mixed",
+            "PR details",
+            &ReleaseMetadata {
+                urgencies: vec!["hold".into(), "immediate".into()],
+                breaking_changes: Vec::new(),
+            },
+        );
+        assert!(mixed
+            .body
+            .ends_with("Release-Urgency: hold\nRelease-Urgency: immediate"));
+        assert_eq!(
+            release_urgency_trailers(&mixed.body),
+            vec!["hold", "immediate"]
+        );
+
+        let breaking_commit = append_release_urgency(
+            "fix: change format\n\nBREAKING CHANGE: migration required".into(),
+            Some(ReleaseUrgency::Immediate),
+        );
+        assert!(breaking_commit
+            .ends_with("BREAKING CHANGE: migration required\nRelease-Urgency: immediate"));
+        assert_eq!(
+            breaking_change_trailers(&breaking_commit),
+            vec!["BREAKING CHANGE: migration required"]
+        );
+        assert_eq!(
+            breaking_change_trailers("fix: change format\n\nBREAKING-CHANGE: migration required"),
+            vec!["BREAKING-CHANGE: migration required"]
+        );
+    }
+
+    #[test]
+    fn branch_breaking_change_and_urgency_survive_squash_in_one_footer_block() {
+        let root = make_repo("squash-release-metadata");
+        let origin = root.parent().unwrap().join("origin.git");
+        git(
+            &root,
+            &["init", "--bare", origin.to_str().expect("origin path")],
+        )
+        .unwrap();
+        git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.to_str().expect("origin path"),
+            ],
+        )
+        .unwrap();
+        git(&root, &["push", "-u", "origin", "main"]).unwrap();
+        git(&root, &["checkout", "-b", "feature/breaking"]).unwrap();
+        git(
+            &root,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fix: change persisted format",
+                "-m",
+                "BREAKING CHANGE: old databases require migration\nRelease-Urgency: hold",
+            ],
+        )
+        .unwrap();
+
+        let metadata = branch_release_metadata(
+            &root,
+            "origin",
+            "main",
+            Some("Reviewed migration.\n\nRelease-Urgency: immediate"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.breaking_changes,
+            vec!["BREAKING CHANGE: old databases require migration"]
+        );
+        assert_eq!(metadata.urgencies, vec!["hold", "immediate"]);
+
+        let message = squash_merge_message(
+            "fix: change persisted format",
+            "Reviewed migration.\n\nRelease-Urgency: immediate",
+            &metadata,
+        );
+        assert!(message.body.ends_with(
+            "Release-Urgency: immediate\n\
+BREAKING CHANGE: old databases require migration\n\
+Release-Urgency: hold"
+        ));
+        assert_eq!(
+            breaking_change_trailers(&message.body),
+            vec!["BREAKING CHANGE: old databases require migration"]
+        );
+        assert_eq!(
+            release_urgency_trailers(&message.body),
+            vec!["immediate", "hold"]
+        );
+
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
     #[test]
@@ -3163,7 +3812,12 @@ import json, os, sys
 req=json.load(sys.stdin)
 action=req.get('action')
 if action == 'open_or_get_pr':
-    print(json.dumps({'number': 42, 'url': 'https://git.corp.example/platform/app/-/merge_requests/42'}))
+    print(json.dumps({
+        'number': 42,
+        'url': 'https://git.corp.example/platform/app/-/merge_requests/42',
+        'title': req.get('title', ''),
+        'body': req.get('body', ''),
+    }))
 elif action == 'ci_status':
     print(json.dumps({'status': 'success'}))
 elif action == 'merge_pr':
@@ -3186,14 +3840,19 @@ else:
             root.clone(),
         );
 
-        let (number, url) = remote
+        let pr = remote
             .open_or_get_pr("title", "body", "feat/x", "main")
             .await
             .expect("hook open_or_get_pr");
-        assert_eq!(number, 42);
-        assert!(url.contains("merge_requests/42"));
+        assert_eq!(pr.number, 42);
+        assert!(pr.url.contains("merge_requests/42"));
+        assert_eq!(pr.title, "title");
+        assert_eq!(pr.body, "body");
         assert_eq!(remote.ci_status("abc123").await.unwrap(), CiStatus::Success);
-        remote.merge_pr(42, MergeMethod::Squash).await.unwrap();
+        remote
+            .merge_pr(42, MergeMethod::Squash, None)
+            .await
+            .unwrap();
         assert_eq!(
             remote.trigger_release().await.unwrap(),
             "corp release dispatched"
@@ -3248,7 +3907,12 @@ import json, sys
 req=json.load(sys.stdin)
 action=req.get('action')
 if action == 'open_or_get_pr':
-    print(json.dumps({'number': 77, 'url': 'https://git.corp.example/platform/app/-/merge_requests/77'}))
+    print(json.dumps({
+        'number': 77,
+        'url': 'https://git.corp.example/platform/app/-/merge_requests/77',
+        'title': req.get('title', ''),
+        'body': req.get('body', ''),
+    }))
 elif action == 'ci_status':
     print(json.dumps({'status': 'success'}))
 elif action == 'merge_pr':
@@ -3279,6 +3943,7 @@ else:
             &DeliverOpts {
                 title: Some("hook delivery".into()),
                 body: Some("body".into()),
+                release_urgency: None,
                 requested_ceiling: None,
                 extra_excludes: vec![],
             },
@@ -3377,6 +4042,8 @@ else:
         ci: AtomicUsize,
         merge: AtomicUsize,
         release: AtomicUsize,
+        merge_commit_message: Mutex<Option<MergeCommitMessage>>,
+        remote_pr_text: Mutex<Option<(String, String)>>,
     }
 
     fn stub_calls() -> Arc<StubCalls> {
@@ -3400,23 +4067,42 @@ else:
 
         async fn open_or_get_pr(
             &self,
-            _t: &str,
-            _b: &str,
+            t: &str,
+            b: &str,
             _h: &str,
             _base: &str,
-        ) -> Result<(u64, String), String> {
+        ) -> Result<DeliveryPr, String> {
             self.calls.open_pr.fetch_add(1, Ordering::SeqCst);
-            Ok(self
+            let (number, url) = self
                 .existing_pr
                 .clone()
-                .unwrap_or((7, "https://example/pr/7".into())))
+                .unwrap_or((7, "https://example/pr/7".into()));
+            let (title, body) = self
+                .calls
+                .remote_pr_text
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| (t.to_string(), b.to_string()));
+            Ok(DeliveryPr {
+                number,
+                url,
+                title,
+                body,
+            })
         }
         async fn ci_status(&self, _sha: &str) -> Result<CiStatus, String> {
             self.calls.ci.fetch_add(1, Ordering::SeqCst);
             Ok(self.ci.clone())
         }
-        async fn merge_pr(&self, _n: u64, _m: MergeMethod) -> Result<(), String> {
+        async fn merge_pr(
+            &self,
+            _n: u64,
+            _m: MergeMethod,
+            commit_message: Option<&MergeCommitMessage>,
+        ) -> Result<(), String> {
             self.calls.merge.fetch_add(1, Ordering::SeqCst);
+            *self.calls.merge_commit_message.lock().unwrap() = commit_message.cloned();
             if self.merge_ok {
                 self.calls.merged.store(true, Ordering::SeqCst);
                 Ok(())
@@ -3484,6 +4170,130 @@ else:
         assert!(steps.contains(&"pr"));
         assert!(!steps.contains(&"ci"), "PrOnly must stop before CI");
         assert!(!steps.contains(&"merge"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn pr_only_metadata_survives_a_parameterless_resume_through_release() {
+        let root = feature_branch_repo("pr-metadata-resume");
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let first = deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts {
+                title: Some("fix: resume guarded metadata".into()),
+                body: Some(
+                    "Reviewed migration.\n\n\
+BREAKING CHANGE: old databases require migration\n\
+Release-Urgency: hold"
+                        .into(),
+                ),
+                ..DeliverOpts::default()
+            },
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+        assert_eq!(first.final_state, "delivered", "{:?}", first.steps);
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
+
+        let resumed = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(resumed.final_state, "blocked", "{:?}", resumed.steps);
+        assert_eq!(resumed.reached_state, "merged");
+        assert_eq!(resumed.code, "delivery_release_blocked");
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let merge_message = calls
+            .merge_commit_message
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("resume must preserve the explicit squash message");
+        assert_eq!(
+            breaking_change_trailers(&merge_message.body),
+            vec!["BREAKING CHANGE: old databases require migration"]
+        );
+        assert_eq!(release_urgency_trailers(&merge_message.body), vec!["hold"]);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn remote_pr_metadata_is_refreshed_before_a_parameterless_merge() {
+        let root = feature_branch_repo("remote-pr-metadata-refresh");
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let first = deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts {
+                title: Some("fix: refresh remote policy".into()),
+                body: Some("Initial review notes.".into()),
+                ..DeliverOpts::default()
+            },
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+        assert_eq!(first.final_state, "delivered", "{:?}", first.steps);
+
+        *calls.remote_pr_text.lock().unwrap() = Some((
+            "fix: refresh remote policy".into(),
+            "Maintainer updated the policy.\n\n\
+BREAKING CHANGE: old clients require migration\n\
+Release-Urgency: hold"
+                .into(),
+        ));
+        let resumed = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(resumed.reached_state, "merged");
+        assert_eq!(resumed.code, "delivery_release_blocked");
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let message = calls
+            .merge_commit_message
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("remote policy metadata must drive the squash message");
+        assert_eq!(
+            breaking_change_trailers(&message.body),
+            vec!["BREAKING CHANGE: old clients require migration"]
+        );
+        assert_eq!(release_urgency_trailers(&message.body), vec!["hold"]);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
@@ -3827,6 +4637,44 @@ else:
     }
 
     #[tokio::test]
+    async fn a_hold_trailer_survives_commit_and_merge_but_blocks_release_dispatch() {
+        let root = feature_branch_repo("release-hold");
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let outcome = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts {
+                title: Some("fix: guarded delivery".into()),
+                body: Some("Requires a companion change.".into()),
+                release_urgency: Some(ReleaseUrgency::Hold),
+                ..DeliverOpts::default()
+            },
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(outcome.final_state, "blocked");
+        assert_eq!(outcome.reached_state, "merged");
+        assert_eq!(outcome.code, "delivery_release_blocked");
+        assert!(outcome.summary.contains("allow_guarded_batch=true"));
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let commit_message = git(&root, &["show", "-s", "--format=%B", "HEAD"]).unwrap();
+        assert_eq!(release_urgency_trailers(&commit_message), vec!["hold"]);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
     async fn release_receipt_resumes_observation_when_release_adapter_is_temporarily_missing() {
         let root = feature_branch_repo("resume-release-receipt");
         let calls = stub_calls();
@@ -3923,6 +4771,8 @@ else:
             commit_sha: sha.clone(),
             pr_number: 7,
             pr_url: "https://example/pr/7".into(),
+            pr_title: None,
+            pr_body: None,
             release_detail: Some("dispatched".into()),
         };
         write_delivery_receipt(&repo, &sha, &other_remote).unwrap();
@@ -3976,6 +4826,8 @@ else:
                 commit_sha: sha.clone(),
                 pr_number: 7,
                 pr_url: "https://example/pr/7".into(),
+                pr_title: None,
+                pr_body: None,
                 release_detail: None,
             };
             write_delivery_receipt(&repo, &sha, &receipt).unwrap();

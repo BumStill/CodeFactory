@@ -1,10 +1,21 @@
 name: Auto Release
 
-# RELEASE CADENCE PRINCIPLE — merge continuously, release deliberately.
+# RELEASE CADENCE PRINCIPLE — merge continuously, release adaptively.
 # This does NOT run on every merge. A release is cut on demand
 # (workflow_dispatch) or once daily (schedule), batching everything merged
 # since the last tag into ONE versioned release — and only when there's a
 # user-facing change (feat/fix) to ship. See docs/principles/release-cadence.md.
+#
+# With healthy gates and infrastructure, the daily schedule is the normal
+# maximum wait (≤24h for anything releasable), not the only exit and not a
+# promise of a version per day:
+# a schedule tick with no feat/fix produces no release. Severity and size
+# choose the speed, carried in a commit trailer any tool can read:
+#   Release-Urgency: immediate  → merge operator dispatches right after merge
+#   Release-Urgency: hold       → blocks cuts until a maintainer explicitly
+#                                  allows the reviewed batch
+# Absent (the default) means "rides the next scheduled cut".
+# The trailer is a decision signal; it deliberately does not add a merge trigger.
 #
 # It then determines the version slot from ALL commits since the last tag,
 # bumps the three version files, pushes a vX.Y.Z tag, then dispatches
@@ -18,6 +29,10 @@ on:
     inputs:
       force:
         description: "Cut a release even with no feat/fix since the last tag"
+        type: boolean
+        default: false
+      allow_guarded_batch:
+        description: "Release a fully reviewed batch containing hold/invalid urgency trailers"
         type: boolean
         default: false
   schedule:
@@ -68,29 +83,21 @@ jobs:
           # Batch the whole window since the last tag — NOT just one commit.
           LAST=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
           RANGE="${LAST:+$LAST..}HEAD"
-          # Conventional-commit subjects in the window, minus bump commits.
-          MSGS=$(git log --format=%s "$RANGE" | grep -v '^chore: bump version to' || true)
-          SLOT=none
-          while IFS= read -r m; do
-            [ -z "$m" ] && continue
-            if echo "$m" | grep -qE '^feat[^:]*!:|BREAKING[ -]CHANGE'; then SLOT=major; break; fi
-            if echo "$m" | grep -qE '^feat(\([^)]+\))?:'; then SLOT=minor; continue; fi
-            if [ "$SLOT" = none ] && echo "$m" | grep -qE '^fix(\([^)]+\))?:'; then SLOT=patch; fi
-          done <<< "$MSGS"
-          # Principle: only user-facing changes ship. No feat/fix → no release
-          # (chore/ci/docs/refactor/test ride the next feat/fix release), unless
-          # explicitly forced.
-          if [ "$SLOT" = none ]; then
-            if [ "${{ github.event.inputs.force }}" = "true" ]; then
-              echo "No feat/fix since ${LAST:-repo start}, but force=true → patch."
-              SLOT=patch
-            else
-              echo "Nothing to release: no feat/fix since ${LAST:-repo start}."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-            fi
+          # The policy lives in a tested script instead of duplicated shell
+          # fragments. `force` only overrides the no-feat/fix rule; it can never
+          # bypass a held or malformed batch by accident.
+          python3 tools/release/plan_release.py \
+            --range "$RANGE" \
+            --force "${{ github.event.inputs.force }}" \
+            --allow-guarded-batch "${{ github.event.inputs.allow_guarded_batch }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+          SKIP=$(tail -n 6 "$GITHUB_OUTPUT" | sed -n 's/^skip=//p')
+          REASON=$(tail -n 6 "$GITHUB_OUTPUT" | sed -n 's/^skip_reason=//p')
+          if [ "$SKIP" = true ]; then
+            echo "::warning::Release skipped for $RANGE: $REASON"
           fi
-          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
-          echo "Range: $RANGE  Slot: $SLOT"
+          echo "Range: $RANGE"
 
       - name: Setup Node.js
         if: steps.slot.outputs.skip != 'true'
