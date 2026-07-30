@@ -1247,6 +1247,7 @@ pub async fn run_agent_loop(
                     &tc.function.name,
                     &classified_command,
                     &classified_kind,
+                    &args,
                 );
                 let capability_denied = capability_denial.is_some();
                 let inspection_denial = if inspection_budget {
@@ -1939,6 +1940,7 @@ mod tests {
         responses: Mutex<VecDeque<Result<ModelResponse, TransportError>>>,
         calls: Mutex<Vec<usize>>,
         requests: Mutex<Vec<Vec<ChatMessage>>>,
+        advertised_tools: Mutex<Vec<Vec<ToolDefinition>>>,
     }
 
     impl ScriptedTransport {
@@ -1947,11 +1949,19 @@ mod tests {
                 responses: Mutex::new(responses.into_iter().map(Ok).collect()),
                 calls: Mutex::new(Vec::new()),
                 requests: Mutex::new(Vec::new()),
+                advertised_tools: Mutex::new(Vec::new()),
             }
         }
 
         fn advertised_tool_counts(&self) -> Vec<usize> {
             self.calls.lock().expect("calls").clone()
+        }
+
+        /// The exact tool schemas handed to the provider each round — the only
+        /// way to prove which tools the model could actually see, and what their
+        /// descriptions told it.
+        fn advertised_tools(&self) -> Vec<Vec<ToolDefinition>> {
+            self.advertised_tools.lock().expect("tools").clone()
         }
 
         /// The exact message list handed to the provider each round — the only
@@ -1970,6 +1980,10 @@ mod tests {
             _opts: &RoundOptions,
         ) -> Result<ModelResponse, TransportError> {
             self.calls.lock().expect("calls").push(tools.len());
+            self.advertised_tools
+                .lock()
+                .expect("tools")
+                .push(tools.to_vec());
             self.requests
                 .lock()
                 .expect("requests")
@@ -2481,6 +2495,113 @@ mod tests {
             event,
             StreamEvent::TurnActivityUpdated { status, .. } if status == "completed"
         )));
+    }
+
+    /// End-to-end through the real loop, not just the pure rule.
+    ///
+    /// `policy::capability_denial` unit tests prove the DECISION; they cannot
+    /// prove the WIRING — that the loop passes the tool args to the gate, that
+    /// the allowed write actually reaches the tool backend, and that the write
+    /// tools are advertised to the model in the first place. The 2026-07-30
+    /// field report was exactly a wiring problem: the rule "review turns don't
+    /// mutate" was working as written, and that was the bug.
+    #[tokio::test]
+    async fn a_review_turn_writes_its_planning_document_and_still_refuses_code() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "把这份方案落盘",
+                vec![
+                    call(
+                        "t1",
+                        "write_file",
+                        serde_json::json!({
+                            "path": "docs/plans/embedded-browser-pane.md",
+                            "content": "# 内置浏览器 pane\n",
+                        }),
+                    ),
+                    call(
+                        "t2",
+                        "write_file",
+                        serde_json::json!({
+                            "path": "src/browser/pane.rs",
+                            "content": "pub fn open() {}",
+                        }),
+                    ),
+                ],
+                0,
+            ),
+            response(
+                "方案已写入 docs/plans/embedded-browser-pane.md；代码改动等你确认后再做。",
+                vec![],
+                1,
+            ),
+        ]));
+        let events = Arc::new(CollectingEventSink::new());
+        let tools = Arc::new(CountingTools::default());
+        let mut cfg = config();
+        cfg.turn_capability = TurnCapability::ReviewOnly;
+        let mut loop_inputs = inputs();
+        loop_inputs.tool_defs = vec![
+            write_tool_definition("write_file"),
+            write_tool_definition("edit_file"),
+            tool_definition(),
+        ];
+        let mut svc = services(
+            transport.clone(),
+            Arc::new(RecordingPersistence::default()),
+            events.clone(),
+        );
+        svc.tools = tools.clone();
+
+        run_agent_loop(loop_inputs, cfg, svc)
+            .await
+            .expect("loop runs");
+
+        // The planning document really executed …
+        assert_eq!(
+            tools.executed(),
+            vec!["write_file docs/plans/embedded-browser-pane.md".to_string()],
+            "the planning document must reach the tool backend, and the code write must not"
+        );
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult { tool_call_id, status, .. }
+                if tool_call_id == "t1" && status == "done"
+        )));
+        // … and the code write in the SAME batch was still refused.
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult { tool_call_id, status, .. }
+                if tool_call_id == "t2" && status == "denied"
+        )));
+
+        // The model must SEE the write tools, carrying their document-only
+        // bound; otherwise it falls back to a shell heredoc the gate blocks.
+        let first_round = transport
+            .advertised_tools()
+            .into_iter()
+            .next()
+            .expect("at least one round");
+        let write = first_round
+            .iter()
+            .find(|definition| definition.function.name == "write_file")
+            .expect("write_file is advertised on a review turn");
+        assert!(
+            write.function.description.contains("docs/"),
+            "advertised description must state the document-only bound: {}",
+            write.function.description
+        );
+    }
+
+    fn write_tool_definition(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: name.into(),
+                description: "Create or overwrite a file with the given content.".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }
     }
 
     #[tokio::test]

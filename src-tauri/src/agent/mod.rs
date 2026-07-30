@@ -2385,7 +2385,12 @@ fn user_visible_time_context() -> String {
 fn base_system_prompt(mode: AgentMode, cwd: &Path) -> String {
     format!(
         "{}\n\n{}\n\n{}\n\n{SELF_RECOVERY_CONTRACT}\n# Repository-Owned Intent\n\
-         Long-lived requirements, specifications, architecture decisions, and acceptance criteria belong to ordinary versioned files in the repository, not to Agent memory or an app-owned specification database. Before non-trivial planning or implementation, inspect `AGENTS.md`, the README, and relevant existing files such as `docs/specs` or `docs/design`; follow the repository's own convention rather than creating `.codefactory/specs`; plans and delegated task state belong to the current conversation; do not direct the user to a separate specification or planning screen. When a durable decision changes, edit the repository document through normal file tools so it appears in the diff and travels with Git.\n\n# Product Self-Repair Context\n\
+         Long-lived requirements, specifications, architecture decisions, and acceptance criteria belong to ordinary versioned files in the repository, not to Agent memory or an app-owned specification database. Before non-trivial planning or implementation, inspect `AGENTS.md`, the README, and relevant existing files such as `docs/specs` or `docs/design`; follow the repository's own convention rather than creating `.codefactory/specs`; delegated task state belongs to the current conversation; do not direct the user to a separate specification or planning screen. When a durable decision changes, edit the repository document through normal file tools so it appears in the diff and travels with Git.\n\n# A Long Plan Is A Document, Not A Chat Wall\n\
+         When a plan, design, or proposal runs past roughly one screen — several phases, multiple files, alternatives weighed, or acceptance criteria — do NOT flatten it into the reply. Persist it and keep the conversation short:\n\
+         1. Write the full plan to a versioned document with `write_file` (or `edit_file` to revise one that exists). Follow the repository's own convention — `docs/specs/`, `docs/design/`, `docs/long-tasks/` when present — and fall back to `docs/plans/<slug>.md` only when the repository has no convention yet.\n\
+         2. In the chat leave only: the problem in one sentence, three to six decision bullets, the document path, and any genuinely open question. Nothing else. The document is the artifact; the reply is the summary of it.\n\
+         3. Revising a plan means editing that document, not re-pasting a longer version into the conversation.\n\
+         This holds on analysis and review turns too. Writing the planning document IS the deliverable of a turn that must not touch code, and it is explicitly permitted there — a turn restricted from changing the product is not restricted from recording the decision. Use `write_file`/`edit_file` on the document; never write files through a shell heredoc, `apply_patch`, or an inline script.\n\n# Product Self-Repair Context\n\
          When the user reports behavior of the running product and the selected repository is that product's codebase, treat it as a product bug you can fix here. Inspect and fix it in this repository; do not stop at explaining the issue or asking the user to switch contexts.\n\n# Working Directory\n\
          The project root and default tool working directory is:\n{}\n\
          Use this exact path or paths relative to it. Do not assume `/workspace` or another container path.",
@@ -3420,7 +3425,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_intent_belongs_to_git_while_plans_belong_to_the_session() {
+    fn repository_intent_belongs_to_git_while_task_state_belongs_to_the_session() {
         for mode in [
             AgentMode::Interactive,
             AgentMode::Execute,
@@ -3431,10 +3436,42 @@ mod tests {
             assert!(prompt.contains("AGENTS.md"));
             assert!(prompt.contains("docs/specs"));
             assert!(prompt.contains("docs/design"));
-            assert!(prompt
-                .contains("plans and delegated task state belong to the current conversation"));
+            assert!(
+                prompt.contains("delegated task state belongs to the current conversation"),
+                "live task state stays in the session"
+            );
+            assert!(
+                !prompt
+                    .contains("plans and delegated task state belong to the current conversation"),
+                "a long plan is no longer session-only — it is persisted as a repository document"
+            );
             assert!(prompt
                 .contains("do not direct the user to a separate specification or planning screen"));
+        }
+    }
+
+    /// 2026-07-30 field report: a design discussion produced a full spec inside
+    /// the chat because nothing told the agent to persist it, and the review-only
+    /// gate blocked it from doing so anyway (see
+    /// `docs/specs/feature-specs/planning-turn-document-authoring.md`).
+    #[test]
+    fn a_long_plan_is_persisted_as_a_document_instead_of_flattened_into_chat() {
+        for mode in [
+            AgentMode::Interactive,
+            AgentMode::Execute,
+            AgentMode::Autonomous,
+        ] {
+            let prompt = base_system_prompt(mode, Path::new("/projects/CodeFactory"));
+            assert!(prompt.contains("# A Long Plan Is A Document, Not A Chat Wall"));
+            // The threshold, the destination, and what the chat keeps instead.
+            assert!(prompt.contains("do NOT flatten it into the reply"));
+            assert!(prompt.contains("docs/plans/<slug>.md"));
+            assert!(prompt.contains("the document path"));
+            // Review turns must be told the document write is allowed there,
+            // otherwise the model self-censors and dumps the plan into the chat.
+            assert!(prompt.contains("deliverable of a turn that must not touch code"));
+            // And it must not reach for the escape hatches the gate blocks.
+            assert!(prompt.contains("never write files through a shell heredoc"));
         }
     }
 
