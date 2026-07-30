@@ -1,7 +1,7 @@
 # CodeFactory 仓库协作规则（AGENTS）
 
 ## 最高原则（适用本仓库与任何未来仓库）
-- **持续合并，刻意发版**：合并 ≠ 发版。发布管线**不由 push/merge 触发**；版本在需要时按需（`workflow_dispatch`）或每日（`schedule`）**成批**切出，把"自上个 tag 起的所有合并"汇成一个版本，且**仅当存在 `feat`/`fix` 时才发**（`chore`/`ci`/`docs`/`refactor`/`test` 搭下一次 feat/fix 一起发）。完整规则见 `docs/principles/release-cadence.md`，这是跨仓最高原则，可原样复制到任何仓库。
+- **持续合并，刻意发版**：合并 ≠ 发版。发布管线**不由 push/merge 触发**；版本在需要时按需（`workflow_dispatch`，包括用户已配置的 `deliver_changes -> through_release`）或每日（`schedule`）**成批**切出，把"自上个 tag 起的所有合并"汇成一个版本，且**仅当存在 `feat`/`fix` 时才发**（`chore`/`ci`/`docs`/`refactor`/`test` 搭下一次 feat/fix 一起发）。需越过普通等待边界的变更在最终 main commit 加 `Release-Urgency: immediate`；`Release-Urgency: hold` 会阻断所有切版，只有在依赖就绪、审查完整批次后才能用独立的 `allow_guarded_batch=true` 明确放行，普通 `force` 不得绕过。Squash 合并必须显式保留并复验 trailer。完整规则见 `docs/principles/release-cadence.md`，这是跨仓最高原则，可原样复制到任何仓库。
 
 ## 入口顺序
 - 日常任务先读 `docs/repo-quick-profile.md`、当前任务说明和 quick gate 结果。

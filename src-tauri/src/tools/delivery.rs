@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 #[cfg(test)]
 use super::ToolExecutionStatus;
 use super::{ExecCtx, ToolOutput};
-use crate::agent::delivery::{self, DeliverOpts};
+use crate::agent::delivery::{self, DeliverOpts, ReleaseUrgency};
 use crate::config::settings::DeliveryCeiling;
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
@@ -33,6 +33,11 @@ pub fn definition() -> ToolDefinition {
                 "properties": {
                     "title": { "type": "string", "description": "Optional PR/commit title. Defaults to a message derived from the branch + changed files." },
                     "body":  { "type": "string", "description": "Optional PR body." },
+                    "release_urgency": {
+                        "type": "string",
+                        "enum": ["immediate", "hold"],
+                        "description": "Optional release-cadence signal. `immediate` is preserved in the final commit and requests the express lane; `hold` is preserved and blocks release until the whole batch is explicitly reviewed."
+                    },
                     "ceiling": {
                         "type": "string",
                         "enum": ["off", "pr_only", "through_ci_green", "through_merge", "through_release"],
@@ -51,6 +56,10 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 
     let title = args.get("title").and_then(Value::as_str).map(String::from);
     let body = args.get("body").and_then(Value::as_str).map(String::from);
+    let release_urgency = match release_urgency_from_args(&args) {
+        Ok(value) => value,
+        Err(message) => return Ok(ToolOutput::err(message)),
+    };
     let requested_ceiling = args
         .get("ceiling")
         .and_then(Value::as_str)
@@ -59,6 +68,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let opts = DeliverOpts {
         title,
         body,
+        release_urgency,
         requested_ceiling,
         extra_excludes: settings.delivery_exclude_globs.clone(),
     };
@@ -191,6 +201,29 @@ fn parse_ceiling(s: &str) -> Option<DeliveryCeiling> {
     }
 }
 
+fn parse_release_urgency(s: &str) -> Option<ReleaseUrgency> {
+    match s {
+        "immediate" => Some(ReleaseUrgency::Immediate),
+        "hold" => Some(ReleaseUrgency::Hold),
+        _ => None,
+    }
+}
+
+fn release_urgency_from_args(args: &Value) -> std::result::Result<Option<ReleaseUrgency>, String> {
+    let Some(raw) = args.get("release_urgency") else {
+        return Ok(None);
+    };
+    let Some(value) = raw.as_str() else {
+        return Err("deliver_changes.release_urgency 必须是 immediate 或 hold".into());
+    };
+    parse_release_urgency(value).map(Some).ok_or_else(|| {
+        format!(
+            "无效的 deliver_changes.release_urgency: {value}; 只允许 immediate 或 hold，\
+未执行任何交付动作。"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +278,23 @@ mod tests {
     fn delivered_report_carries_no_attribution_warning() {
         let report = render_report(&outcome("delivered"));
         assert!(!report.contains("不得归因"));
+    }
+
+    #[test]
+    fn release_urgency_parser_accepts_only_the_governed_values() {
+        assert_eq!(
+            parse_release_urgency("immediate"),
+            Some(ReleaseUrgency::Immediate)
+        );
+        assert_eq!(parse_release_urgency("hold"), Some(ReleaseUrgency::Hold));
+        assert_eq!(parse_release_urgency("soon"), None);
+        assert!(
+            release_urgency_from_args(&json!({"release_urgency": "soon"}))
+                .unwrap_err()
+                .contains("未执行任何交付动作")
+        );
+        assert!(release_urgency_from_args(&json!({"release_urgency": 1})).is_err());
+        assert_eq!(release_urgency_from_args(&json!({})).unwrap(), None);
     }
 
     #[test]
