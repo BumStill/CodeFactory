@@ -26,7 +26,8 @@
     "test:sidebar-expansion:headless": "node scripts/verify-sidebar-expansion-headless.mjs",
     "test:image-preview:headless": "node scripts/verify-image-preview-headless.mjs",
     "test:watch": "vitest",
-    "test:scrollbar:headless": "node scripts/verify-scrollbar-auto-hide-headless.mjs"
+    "test:scrollbar:headless": "node scripts/verify-scrollbar-auto-hide-headless.mjs",
+    "ext:build": "node scripts/build-extension.mjs"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.19",
