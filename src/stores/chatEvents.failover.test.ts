@@ -110,4 +110,14 @@ describe("model route failover stream events", () => {
     expect(presentation.failureEvidence).toContain("deepseek：凭据读取超时");
     expect(presentation.failureEvidence).not.toMatch(/^Error:/);
   });
+
+  it("keeps a fixed endpoint credential failure actionable in the visible message", () => {
+    const presentation = presentChatInvocationError(
+      "所有可用模型端点均不可用：DeepSeek / deepseek-v4-pro（AUTH_MISSING: deepseek 尚未配置凭据，请在模型设置中配置 API Key）。请检查模型设置后重试。",
+    );
+
+    expect(presentation.content).toContain("DeepSeek / deepseek-v4-pro");
+    expect(presentation.content).toContain("尚未配置凭据");
+    expect(presentation.content).toContain("模型设置");
+  });
 });

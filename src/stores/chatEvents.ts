@@ -103,6 +103,19 @@ export function isModelRouteExhaustedError(message: string): boolean {
   return message.startsWith(MODEL_ROUTE_EXHAUSTED_PREFIX);
 }
 
+function credentialFailureGuidance(message: string): string | null {
+  const details = message.slice(MODEL_ROUTE_EXHAUSTED_PREFIX.length);
+  const route = details.split("（", 1)[0]?.trim();
+  if (!route) return null;
+  if (details.includes("AUTH_MISSING")) {
+    return `${route} 当前不可用：尚未配置凭据。请打开模型设置配置该端点的 API Key 后重试。`;
+  }
+  if (details.includes("CREDENTIAL_ACCESS_REQUIRED")) {
+    return `${route} 当前不可用：无法读取已配置凭据。请打开模型设置重新保存该端点的 API Key 后重试。`;
+  }
+  return null;
+}
+
 export function presentChatInvocationError(error: unknown): Pick<
   UIMessage,
   "content" | "failureEvidence"
@@ -110,7 +123,7 @@ export function presentChatInvocationError(error: unknown): Pick<
   const message = String(error).replace(/^Error:\s*/i, "");
   if (isModelRouteExhaustedError(message)) {
     return {
-      content: MODEL_ROUTE_EXHAUSTED_GUIDANCE,
+      content: credentialFailureGuidance(message) ?? MODEL_ROUTE_EXHAUSTED_GUIDANCE,
       failureEvidence: message,
     };
   }

@@ -11,7 +11,7 @@ use codefactory_agent_loop::services::ContextPolicy;
 use std::sync::Arc;
 
 use super::failover::ActiveRouteState;
-use crate::config::settings::{ApiStyle, Settings};
+use crate::config::settings::Settings;
 
 pub(super) struct DesktopContextPolicy {
     pub(super) settings: Arc<tokio::sync::RwLock<Settings>>,
@@ -52,9 +52,6 @@ impl ContextPolicy for DesktopContextPolicy {
 
     async fn round_reasoning_effort(&self) -> String {
         let route = self.route_state.current();
-        if !matches!(route.api_style, ApiStyle::Chatgpt) {
-            return String::new();
-        }
         // Re-read per round (freshness): a mid-run sessions.reasoning_effort
         // change takes effect next round. Verbatim from the old
         // AgentLoop::resolve_round_reasoning_effort.
@@ -69,5 +66,46 @@ impl ContextPolicy for DesktopContextPolicy {
         )
         .as_str()
         .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::failover::{ActiveRouteState, RouteCandidate, RouteCandidatePlan};
+    use crate::config::settings::{ApiStyle, ReasoningEffort};
+
+    #[tokio::test]
+    async fn preserves_reasoning_effort_for_chatgpt_failover_from_openai_route() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, reasoning_effort TEXT)")
+            .execute(&db)
+            .await
+            .expect("sessions schema");
+
+        let mut settings = Settings::default();
+        settings.reasoning_effort = ReasoningEffort::Medium;
+        let primary = RouteCandidate {
+            endpoint_name: "deepseek".to_string(),
+            model_id: "deepseek-v4-pro".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            credential_ref: Some("deepseek-api-key".to_string()),
+            legacy_inline_api_key: None,
+            supports_vision: false,
+            api_style: ApiStyle::Openai,
+        };
+        let policy = DesktopContextPolicy {
+            settings: Arc::new(tokio::sync::RwLock::new(settings)),
+            db,
+            session_id: "session-1".to_string(),
+            route_state: ActiveRouteState::from_plan(RouteCandidatePlan::new(primary)),
+            expand_context_window: true,
+        };
+
+        assert_eq!(policy.round_reasoning_effort().await, "medium");
     }
 }

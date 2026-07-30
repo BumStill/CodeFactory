@@ -207,6 +207,7 @@ interface ChatStore {
   _streamingMsgId: Record<string, string | undefined>;
   _draftMaterialization: Promise<Session> | null;
   _selectionRequestId: number;
+  _modelsRequestId: number;
 }
 
 /** Selector: the active session's runtime slice (or the empty default). Use as
@@ -245,6 +246,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   _streamingMsgId: {},
   _draftMaterialization: null,
   _selectionRequestId: 0,
+  _modelsRequestId: 0,
 
   beginDraft: ({ cwd = null, anonymous = false } = {}) => {
     const draft: DraftSession = {
@@ -779,10 +781,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   loadModels: async (endpoint) => {
+    const requestId = get()._modelsRequestId + 1;
+    set({ _modelsRequestId: requestId, models: [] });
     try {
       const models = await invoke<ModelInfo[]>("list_models", { endpointName: endpoint });
+      if (get()._modelsRequestId !== requestId) return;
       set({ models });
     } catch {
+      if (get()._modelsRequestId !== requestId) return;
       // silently ignore — user hasn't set key yet
     }
   },
