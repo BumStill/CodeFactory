@@ -131,6 +131,54 @@ fn scheme_of(url: &str) -> Option<String> {
         .then_some(scheme)
 }
 
+/// Build the permission key for a browser call from the tool's arguments.
+///
+/// The key is what the user sees in the prompt and what they can allow-list, so
+/// it is `<action>` or `<action>:<host>` — readable, and stable enough that
+/// "always allow reading github.com" keeps working across pages.
+pub fn permission_cmd(args: &serde_json::Value) -> Option<String> {
+    let action = args.get("action")?.as_str()?;
+    match args.get("url").and_then(|url| url.as_str()).and_then(host_of) {
+        Some(host) => Some(format!("{action}:{host}")),
+        None => Some(action.to_string()),
+    }
+}
+
+/// Classify a call from the key [`permission_cmd`] produced.
+///
+/// The gate that calls this is a pure function with no database access, so it
+/// cannot tell a signed-in profile from a throwaway one. It therefore judges
+/// every call by the stricter, signed-in rules: the cost is an extra prompt when
+/// browsing a throwaway profile, and the alternative — assuming throwaway —
+/// would skip prompts on the profile that holds the user's accounts.
+pub fn classify_cmd(cmd: &str) -> BrowserPermission {
+    let (action, host) = match cmd.split_once(':') {
+        Some((action, host)) => (action, Some(host)),
+        None => (cmd, None),
+    };
+    // Reconstruct a URL only to reuse one scheme/host rule for both paths.
+    let url = host.map(|host| format!("https://{host}/"));
+    let mut verdict = classify(
+        BrowserAction::from_tool_action(action),
+        url.as_deref(),
+        &ProfileScope::Persistent {
+            name: "unknown".into(),
+        },
+        &GrantedHosts::new(),
+    );
+    // The key carries a host, not a scheme, so a non-web scheme has to be
+    // caught where the raw URL is still available — in the tool. Reading the
+    // reconstructed https URL back would always look fine.
+    if let BrowserPermission::Ask { subject } = &verdict {
+        if host.is_none() {
+            verdict = BrowserPermission::Ask {
+                subject: subject.clone(),
+            };
+        }
+    }
+    verdict
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +298,32 @@ mod tests {
             BrowserAction::from_tool_action("close"),
             BrowserAction::Lifecycle
         );
+    }
+
+    #[test]
+    fn the_permission_key_is_readable_and_host_scoped() {
+        // What the user sees in the prompt, and what they can allow-list.
+        let args = serde_json::json!({"action": "open", "url": "https://Mail.Example.com:443/x"});
+        assert_eq!(permission_cmd(&args).as_deref(), Some("open:mail.example.com"));
+
+        // Actions on an already-open page carry no host.
+        let args = serde_json::json!({"action": "read", "session_id": "codefactory-1"});
+        assert_eq!(permission_cmd(&args).as_deref(), Some("read"));
+
+        assert_eq!(permission_cmd(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn the_gate_judges_every_call_by_the_signed_in_rules() {
+        // The gate cannot see which profile is in play, so reading asks and
+        // acting asks — erring toward a prompt rather than toward silence.
+        assert!(matches!(
+            classify_cmd("open:mail.example.com"),
+            BrowserPermission::Ask { .. }
+        ));
+        assert!(matches!(classify_cmd("click"), BrowserPermission::Ask { .. }));
+        // Closing a session is not an action on a site.
+        assert_eq!(classify_cmd("close"), BrowserPermission::Allow);
     }
 
     #[test]

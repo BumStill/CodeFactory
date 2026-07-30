@@ -63,7 +63,15 @@ impl PermissionGateway for DesktopPermissionGateway {
         bash_command: Option<&str>,
     ) -> PermissionOutcome {
         let policy = resolve_session_permission_policy(&self.db, &self.session_id).await;
-        match decide_permission(&policy, &tool_call.function.name, bash_command) {
+        // `bash_command` is the generic per-call detail the gate matches on. For
+        // the browser it has to be the action plus the host, so the prompt can
+        // name the site and the user can allow-list one host rather than the
+        // whole tool.
+        let browser_cmd = (tool_call.function.name == "browser_session")
+            .then(|| crate::browser::policy::permission_cmd(args))
+            .flatten();
+        let gate_cmd = browser_cmd.as_deref().or(bash_command);
+        match decide_permission(&policy, &tool_call.function.name, gate_cmd) {
             PermissionDecision::Allow => PermissionOutcome::Allow,
             PermissionDecision::Ask => self.request_permission(tool_call, args.clone()).await,
             PermissionDecision::Deny(reason) => {
@@ -123,6 +131,18 @@ mod tests {
 
     use super::*;
     use crate::agent::{decide_permission, PermissionDecision};
+    use crate::config::settings::PermissionPolicy;
+
+    /// Build a policy explicitly. PermissionPolicy has no Default on purpose —
+    /// an "empty policy" is not a meaningful default for a security type.
+    fn policy(allow: &[&str], full_access: bool) -> PermissionPolicy {
+        PermissionPolicy {
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            ask: Vec::new(),
+            deny: Vec::new(),
+            full_access,
+        }
+    }
 
     #[tokio::test]
     async fn session_permission_policy_is_read_from_session_row() {
@@ -151,5 +171,56 @@ mod tests {
 
         let missing = resolve_session_permission_policy(&db, "missing").await;
         assert_eq!(decide_permission(&missing, "bash", Some("pnpm test")), PermissionDecision::Ask);
+    }
+
+    #[test]
+    fn full_access_does_not_silently_grant_acting_as_the_user_in_a_browser() {
+        // A blanket allow-everything is about the user's own machine. Clicking
+        // "send" on a site they are signed in to is a different thing, and the
+        // browser rules run ahead of full_access precisely so it stays a prompt.
+        let trusted = policy(&[], true);
+        assert_eq!(
+            decide_permission(&trusted, "browser_session", Some("click")),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            decide_permission(&trusted, "browser_session", Some("open:mail.example.com")),
+            PermissionDecision::Ask
+        );
+        // …but bash still honours full access, so this is scoped to the browser.
+        assert_eq!(
+            decide_permission(&trusted, "bash", Some("pnpm test")),
+            PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn a_host_can_be_allow_listed_without_opening_the_whole_tool() {
+        let scoped = policy(&["browser_session(read:github.com)"], false);
+        assert_eq!(
+            decide_permission(&scoped, "browser_session", Some("read:github.com")),
+            PermissionDecision::Allow
+        );
+        // A different host is not covered by that grant.
+        assert_eq!(
+            decide_permission(&scoped, "browser_session", Some("read:bank.example.com")),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn the_gate_key_carries_no_scheme_so_the_tool_owns_that_rule() {
+        // Documented division of labour: the permission key is action + host, so
+        // a non-web scheme cannot be judged here. `browser_session::open` checks
+        // the raw URL and refuses before launching anything — asserted there.
+        assert_eq!(
+            crate::browser::policy::permission_cmd(&serde_json::json!({
+                "action": "open",
+                "url": "file:///etc/passwd"
+            }))
+            .as_deref(),
+            // No host in a file URL, so the key degrades to the bare action.
+            Some("open")
+        );
     }
 }

@@ -2494,6 +2494,39 @@ fn decide_permission(
         }
     }
 
+    // Browsing a signed-in profile acts as the user across every account in it,
+    // so — like bash's shell policy — the browser rules run ahead of the generic
+    // allow/ask/deny lists and ahead of full_access. A blanket "allow
+    // everything" must not silently grant acting as the user on a live site.
+    if tool_name == "browser_session" {
+        if let Some(cmd) = cmd {
+            match crate::browser::policy::classify_cmd(cmd) {
+                crate::browser::policy::BrowserPermission::Deny { reason } => {
+                    return PermissionDecision::Deny(reason);
+                }
+                crate::browser::policy::BrowserPermission::Ask { .. } => {
+                    // Still consult the allow list first, so "always allow
+                    // reading github.com" keeps working; only fall back to Ask.
+                    let key = format!("{tool_name}({cmd})");
+                    for pattern in &policy.deny {
+                        if glob_match(pattern, &key) || glob_match(pattern, tool_name) {
+                            return PermissionDecision::Deny(format!(
+                                "Denied by policy: matches '{pattern}'"
+                            ));
+                        }
+                    }
+                    for pattern in &policy.allow {
+                        if glob_match(pattern, &key) {
+                            return PermissionDecision::Allow;
+                        }
+                    }
+                    return PermissionDecision::Ask;
+                }
+                crate::browser::policy::BrowserPermission::Allow => {}
+            }
+        }
+    }
+
     let key = match cmd {
         Some(c) => format!("{}({})", tool_name, c),
         None => tool_name.to_string(),
