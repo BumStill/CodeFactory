@@ -44,7 +44,7 @@ describe("OnboardingWizard", () => {
 
   it("defaults delivery to release instead of PR-only", async () => {
     setup({ gh: true, token: false, model: true });
-    await waitFor(() => expect(screen.getByDisplayValue("发布上线(默认)")).toBeTruthy());
+    await waitFor(() => expect(screen.getByDisplayValue("创建正式发布(默认)")).toBeTruthy());
     expect(screen.queryByDisplayValue("开 PR 为止(默认)")).not.toBeInTheDocument();
   });
 

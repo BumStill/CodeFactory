@@ -140,7 +140,7 @@ describe("MessageList model route failover", () => {
   });
 
   it("shows route exhaustion as actionable guidance with expandable technical evidence", () => {
-    render(
+    const { container } = render(
       <MessageList
         messages={[
           assistant({
@@ -161,10 +161,15 @@ describe("MessageList model route failover", () => {
     expect(screen.getByText(/请检查模型设置中的凭据、余额或端点状态/)).toBeInTheDocument();
     expect(screen.getByText("查看失败详情").closest("details")).toBeInTheDocument();
     expect(screen.getByText(/chatgpt\/gpt-5.5/)).toBeInTheDocument();
+    const resolutionCard = container.querySelector(
+      '[data-testid="failure-resolution-card"]',
+    );
+    expect(resolutionCard).toHaveAttribute("data-status-tone", "warning");
+    expect(screen.getByText("需要处理")).toBeInTheDocument();
   });
 
   it("keeps actionable route-exhaustion guidance after a failed turn is reloaded", () => {
-    render(
+    const { container } = render(
       <MessageList
         messages={[
           assistant({
@@ -181,5 +186,9 @@ describe("MessageList model route failover", () => {
     expect(screen.getByText(/所有已配置且有凭据的模型端点都暂时不可用/)).toBeInTheDocument();
     expect(screen.getByText(/模型设置/)).toBeInTheDocument();
     expect(screen.getByText("查看失败详情")).toBeInTheDocument();
+    expect(screen.getByText("需要处理")).toBeInTheDocument();
+    expect(
+      container.querySelector('[data-testid="failure-resolution-card"]'),
+    ).toHaveAttribute("data-status-tone", "warning");
   });
 });

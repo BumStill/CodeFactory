@@ -22,6 +22,18 @@ export default {
         border: themeColor("--border-color"),
         accent: themeColor("--accent-color"),
         "accent-hover": themeColor("--accent-hover-color"),
+        // Semantic roles keep workflow meaning consistent across every surface.
+        // `success` is intentionally separate from ordinary in-progress state.
+        "status-progress": themeColor("--status-progress"),
+        "status-progress-soft": themeColor("--status-progress-soft"),
+        "status-success": themeColor("--status-success"),
+        "status-success-soft": themeColor("--status-success-soft"),
+        "status-warning": themeColor("--status-warning"),
+        "status-warning-soft": themeColor("--status-warning-soft"),
+        "status-danger": themeColor("--status-danger"),
+        "status-danger-soft": themeColor("--status-danger-soft"),
+        "status-info": themeColor("--status-info"),
+        "status-info-soft": themeColor("--status-info-soft"),
         // Override gray shades with CSS vars so every existing text-gray-* /
         // bg-gray-* class automatically flips between light and dark themes.
         // The semantic mapping inverts the scale: in light mode gray-200 is

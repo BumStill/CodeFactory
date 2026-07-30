@@ -33,6 +33,8 @@ function messages(terminal: boolean): UIMessage[] {
       plan: terminal
         ? {
             ...plan,
+            waitingReason: null,
+            waitingHistory: ["等待 CI"],
             steps: plan.steps.map((step) => ({ ...step, status: "completed" })),
           }
         : plan,
@@ -100,8 +102,26 @@ describe("MessageList structured progress and result", () => {
   it("forms a local result snapshot immediately after the terminal state", () => {
     render(<MessageList messages={messages(true)} streaming={false} cwd={null} />);
 
-    expect(screen.getByTestId("turn-result-snapshot")).toHaveTextContent("任务结果");
-    fireEvent.click(screen.getByRole("button", { name: "证据化重新总结" }));
+    expect(screen.getByTestId("turn-result-snapshot")).toHaveTextContent("已完成");
+    fireEvent.click(screen.getByRole("button", { name: "结果摘要" }));
     expect(screen.getByRole("status")).toHaveTextContent("完成 3/3 个计划步骤");
+  });
+
+  it("does not mark a completed plan green when the same turn has failure evidence", () => {
+    const failed = messages(true);
+    failed[1] = {
+      ...failed[1],
+      failureEvidence: "provider credential unavailable",
+    };
+
+    render(<MessageList messages={failed} streaming={false} cwd={null} />);
+
+    expect(screen.getByTestId("turn-result-snapshot")).toHaveAttribute(
+      "data-status-tone",
+      "warning",
+    );
+    expect(screen.getByTestId("turn-result-snapshot")).toHaveTextContent(
+      "需要处理",
+    );
   });
 });

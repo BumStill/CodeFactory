@@ -21,6 +21,7 @@
 - `endpoint-capability-failover.md`: 首选模型服务不可用时，基于本机已配置端点、凭据与本轮能力做有界自动接管，保持上下文和工具连续性并提供可行动失败说明。
 - `settings-hooks-remotes-tabs.md`: Settings 中 Hooks 与 Git remotes 管理能力的历史规格。
 - `token-cost-dashboard.md`: token 用量与成本可见性的历史规格。
+- `agent-workbench-experience.md`: Workspace 现代视觉层级、语义状态、会话阅读、composer、后台作业与真实交付链体验规格。
 
 ## 模板
 - `requirements-traceability-template.md`

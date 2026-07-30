@@ -131,8 +131,8 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0">
         <FileText size={14} className="text-gray-400" />
         <span className="text-xs font-semibold text-gray-200 flex-1">本地 Git</span>
-        <button onClick={onOpenHistory} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-gray-500 hover:bg-surface-3 hover:text-gray-200" title="提交历史"><History size={11} />历史</button>
-        <button onClick={onOpenRemote} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-gray-500 hover:bg-surface-3 hover:text-gray-200" title="远程仓库（问题与拉取请求）"><GitPullRequest size={11} />远程</button>
+        <button onClick={onOpenHistory} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200" title="提交历史"><History size={11} />历史</button>
+        <button onClick={onOpenRemote} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200" title="远程仓库（问题与拉取请求）"><GitPullRequest size={11} />远程</button>
         <button
           onClick={() => refreshStatus()}
           className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors"
@@ -151,7 +151,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
 
       {/* Action bar */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border bg-surface-2 shrink-0">
-        <label className="inline-flex items-center gap-1 text-[10px] text-gray-600">
+        <label className="inline-flex items-center gap-1 text-[11px] text-gray-600">
           分支
           <select
             aria-label="切换本地分支"
@@ -192,7 +192,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
       </div>
 
       {error && (
-        <div className="px-3 py-1.5 text-[11px] text-red-400 border-b border-border bg-red-950/20 shrink-0">
+        <div className="px-3 py-1.5 text-[11px] text-status-danger border-b border-border bg-status-danger-soft shrink-0">
           {error}
         </div>
       )}
@@ -202,7 +202,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
         {/* Files list */}
         <div className="w-[260px] border-r border-border overflow-y-auto shrink-0">
           {rows.length === 0 && (
-            <div className="px-3 py-4 text-[11px] text-gray-700 text-center">
+            <div className="px-3 py-4 text-center text-[11px] text-gray-600">
               无变更
             </div>
           )}
@@ -226,7 +226,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
           />
           {status && status.untracked.length > 0 && (
             <div>
-              <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 bg-surface-2 sticky top-0">
+              <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wider text-gray-600 bg-surface-2 sticky top-0">
                 未跟踪 ({status.untracked.length})
               </div>
               {status.untracked.map((p) => (
@@ -248,7 +248,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
         {/* Diff view */}
         <div className="flex-1 overflow-y-auto p-2 min-w-0">
           {!activeFile && (
-            <div className="text-[11px] text-gray-700 text-center pt-8">
+            <div className="pt-8 text-center text-[11px] text-gray-600">
               选择文件以查看差异
             </div>
           )}
@@ -259,10 +259,10 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
             <>
               <div className="text-[11px] text-gray-500 mb-2 truncate">
                 {activeFile.path}{" "}
-                <span className="text-gray-700">({activeFile.staged ? "已暂存" : "未暂存"})</span>
+                <span className="text-gray-600">({activeFile.staged ? "已暂存" : "未暂存"})</span>
               </div>
               {diff.trim().length === 0 ? (
-                <div className="text-[11px] text-gray-700">
+                <div className="text-[11px] text-gray-600">
                   无可用差异（文件可能为二进制或完全新增）。
                 </div>
               ) : (
@@ -294,7 +294,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
               className="w-full bg-surface-3 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50 resize-none font-mono"
               autoFocus
             />
-            {error && <div className="text-[11px] text-red-400">{error}</div>}
+            {error && <div className="text-[11px] text-status-danger">{error}</div>}
             <div className="flex justify-end gap-2">
               <button
                 disabled={committing}
@@ -334,7 +334,7 @@ function FileGroup({ label, files, group, selected, activeFile, onToggle, onSele
   const staged = group === "staged";
   return (
     <div>
-      <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 bg-surface-2 sticky top-0">
+      <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wider text-gray-600 bg-surface-2 sticky top-0">
         {label} ({files.length})
       </div>
       {files.map((f) => (
@@ -382,9 +382,9 @@ function FileRow({ path, status, group, selected, active, onToggle, onClick }: R
           title="选择暂存"
         />
       )}
-      {group === "staged" && <Plus size={10} className="text-green-400 shrink-0" />}
+      {group === "staged" && <Plus size={10} className="text-accent shrink-0" />}
       <span
-        className={`text-[10px] font-mono shrink-0 w-3 text-center ${statusBadge.color}`}
+        className={`text-[11px] font-mono shrink-0 w-3 text-center ${statusBadge.color}`}
         title={status}
       >
         {statusBadge.letter}
@@ -399,15 +399,15 @@ function FileRow({ path, status, group, selected, active, onToggle, onClick }: R
 function badge(status: string): { letter: string; color: string } {
   switch (status) {
     case "modified":
-      return { letter: "M", color: "text-yellow-400" };
+      return { letter: "M", color: "text-accent" };
     case "added":
-      return { letter: "A", color: "text-green-400" };
+      return { letter: "A", color: "text-status-info" };
     case "deleted":
-      return { letter: "D", color: "text-red-400" };
+      return { letter: "D", color: "text-gray-500" };
     case "renamed":
-      return { letter: "R", color: "text-blue-400" };
+      return { letter: "R", color: "text-status-info" };
     case "typechange":
-      return { letter: "T", color: "text-purple-400" };
+      return { letter: "T", color: "text-accent" };
     default:
       return { letter: "?", color: "text-gray-500" };
   }

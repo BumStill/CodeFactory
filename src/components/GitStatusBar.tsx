@@ -46,17 +46,17 @@ export function GitStatusBar({ cwd, onOpenChanges }: Props) {
       className="inline-flex h-7 max-w-[270px] shrink-0 items-center gap-1.5 rounded-md border border-border bg-surface-2 px-2 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
       title="查看本地变更、提交历史、分支和恢复点"
     >
-      <GitBranch size={12} className={refreshing ? "animate-pulse" : ""} />
+      <GitBranch size={12} className={refreshing ? "animate-pulse motion-reduce:animate-none" : ""} />
       <span className="max-w-[110px] truncate font-medium text-gray-300">{branch}</span><span aria-hidden="true"> · </span>
       {dirty > 0 && (
         <span className="inline-flex items-center gap-1 whitespace-nowrap">
-          <Circle size={7} className="fill-amber-500 text-amber-500" />
+          <Circle size={7} className="fill-status-warning text-status-warning" />
           {dirty} 个本地变更
         </span>
       )}
       {syncLabel && <span className="whitespace-nowrap text-gray-600">{syncLabel}</span>}
       {status && status.ahead > 0 && <span className="inline-flex items-center gap-0.5 whitespace-nowrap"><ArrowUp size={10} />领先 {status.ahead}</span>}
-      {status && status.behind > 0 && <span className="inline-flex items-center gap-0.5 whitespace-nowrap text-amber-600 dark:text-amber-400"><ArrowDown size={10} />落后 {status.behind}</span>}
+      {status && status.behind > 0 && <span className="inline-flex items-center gap-0.5 whitespace-nowrap text-status-warning"><ArrowDown size={10} />落后 {status.behind}</span>}
     </button>
   );
 }

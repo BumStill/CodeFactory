@@ -74,26 +74,26 @@ export function WelcomeUsageCard({ anonymous, onOpenUsage }: Props) {
       </div>
 
       {anonymous ? (
-        <p className="text-xs text-amber-700 dark:text-amber-300">匿名会话本次临时用量，不计入今日统计</p>
+        <p className="text-xs text-status-warning">匿名会话本次临时用量，不计入今日统计</p>
       ) : dashboard ? (
         <div className="grid gap-4 min-[580px]:grid-cols-[minmax(150px,0.75fr)_minmax(280px,1.5fr)] min-[580px]:items-end min-[580px]:gap-6">
           <div className="min-w-0">
             <div className="flex items-baseline gap-1.5">
               <span className="font-mono text-2xl font-semibold tracking-tight text-gray-100">{formatUsageTokens(todayTokens)}</span>
-              <span className="text-[10px] uppercase tracking-wide text-gray-400">Tokens</span>
+              <span className="text-[11px] uppercase tracking-wide text-gray-400">Tokens</span>
             </div>
             <div className="mt-1 flex flex-wrap items-center gap-x-2 text-[11px] text-gray-400">
               <span>{today?.requests ?? 0} 次请求</span>
               {costLabel && costLabel !== "费用不可用" && <><span aria-hidden>·</span><span>{costLabel}</span></>}
             </div>
             {budgetRatio != null ? (
-              <div className="mt-1 text-[10px] text-gray-400">已使用日预算 {Math.round(budgetRatio * 100)}%</div>
+              <div className="mt-1 text-[11px] text-gray-400">已使用日预算 {Math.round(budgetRatio * 100)}%</div>
             ) : sevenDayAverage != null ? (
-              <div className="mt-1 text-[10px] text-gray-400">近 7 个完整日均值 {formatUsageTokens(Math.round(sevenDayAverage))}</div>
+              <div className="mt-1 text-[11px] text-gray-400">近 7 个完整日均值 {formatUsageTokens(Math.round(sevenDayAverage))}</div>
             ) : null}
           </div>
           <div className="min-w-0">
-            <div className="mb-1.5 flex items-center justify-between text-[10px] text-gray-400">
+            <div className="mb-1.5 flex items-center justify-between text-[11px] text-gray-400">
               <span>过去 4 周</span>
               <span aria-hidden>较低 · 较高</span>
             </div>
@@ -107,7 +107,7 @@ export function WelcomeUsageCard({ anonymous, onOpenUsage }: Props) {
       ) : failed ? (
         <p className="text-xs text-gray-400">用量统计暂不可用</p>
       ) : (
-        <p className="inline-flex items-center gap-1.5 text-xs text-gray-400"><Loader2 size={11} className="animate-spin" />正在读取本机用量</p>
+        <p className="inline-flex items-center gap-1.5 text-xs text-gray-400"><Loader2 size={11} className="animate-spin motion-reduce:animate-none" />正在读取本机用量</p>
       )}
     </section>
   );

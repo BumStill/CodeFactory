@@ -947,7 +947,7 @@ export function SettingsPage({
             <div className="space-y-1">
               <label className="text-xs text-gray-500">自动交付上限</label>
               <p className="text-[11px] leading-5 text-gray-600">
-                代码改动测试通过后,AI 自动把工作推进到哪一步为止。默认一路合并、发布上线；如果你想人工接管,可以把边界降到 PR 或 CI。合并/发布受远端分支保护与凭据权限约束；CodeFactory 会优先使用
+                代码改动测试通过后，AI 自动把工作推进到哪一步为止。默认一路合并并创建正式发布；如果你想人工接管，可以把边界降到 PR 或 CI。正式发布只代表 release artifact 已创建，不代表部署或线上验证通过。合并/发布受远端分支保护与凭据权限约束；CodeFactory 会优先使用
                 「远程仓库」令牌，也会自动复用已登录的 GitHub CLI。
               </p>
               <select
@@ -965,7 +965,7 @@ export function SettingsPage({
                 <option value="pr_only">提交 + 推送 + 开 PR</option>
                 <option value="through_ci_green">…并等 CI 通过</option>
                 <option value="through_merge">…并合并</option>
-                <option value="through_release">…并发布上线(默认)</option>
+                <option value="through_release">…并创建正式发布(默认)</option>
               </select>
             </div>
 

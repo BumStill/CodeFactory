@@ -6,22 +6,34 @@
 
 [data-theme="dark"] {
   /* RGB channels let Tailwind's `/opacity` modifiers remain theme-aware. */
-  --surface-0: 13 13 13;
-  --surface-1: 17 17 17;
-  --surface-2: 22 22 22;
-  --surface-3: 26 26 26;
-  --surface-4: 34 34 34;
-  --border-color: 42 42 42;
-  --accent-color: 59 130 246;
-  --accent-hover-color: 37 99 235;
+  --surface-0: 8 12 19;
+  --surface-1: 12 17 26;
+  --surface-2: 17 24 36;
+  --surface-3: 24 33 48;
+  --surface-4: 34 45 63;
+  --border-color: 46 59 78;
+  --accent-color: 96 165 250;
+  --accent-hover-color: 59 130 246;
 
-  /* Gray scale — Tailwind default values, unchanged for dark mode */
+  /* Semantic state roles. Success is reserved for a verified outcome. */
+  --status-progress: 96 165 250;
+  --status-progress-soft: 24 47 82;
+  --status-success: 52 211 153;
+  --status-success-soft: 18 61 52;
+  --status-warning: 251 191 36;
+  --status-warning-soft: 68 52 22;
+  --status-danger: 248 113 113;
+  --status-danger-soft: 73 31 38;
+  --status-info: 34 211 238;
+  --status-info-soft: 17 57 70;
+
+  /* Gray scale — muted text remains WCAG AA across surface-0…4. */
   --gray-100: 243 244 246;
   --gray-200: 229 231 235;
   --gray-300: 209 213 219;
   --gray-400: 156 163 175;
-  --gray-500: 107 114 128;
-  --gray-600: 75 85 99;
+  --gray-500: 139 151 171;
+  --gray-600: 136 149 170;
   --gray-700: 55 65 81;
   --gray-900: 17 24 39;
 
@@ -34,36 +46,52 @@
 }
 
 [data-theme="light"] {
-  --surface-0: 240 240 240;
-  --surface-1: 248 248 248;
+  /*
+   * Cool-neutral surfaces provide visible depth without turning the product
+   * into a stack of gray boxes: canvas → pane → content → hover → selected.
+   */
+  --surface-0: 239 243 248;
+  --surface-1: 247 249 252;
   --surface-2: 255 255 255;
-  --surface-3: 235 235 235;
-  --surface-4: 226 226 226;
-  --border-color: 212 212 212;
+  --surface-3: 232 238 246;
+  --surface-4: 220 228 239;
+  --border-color: 203 213 225;
   --accent-color: 37 99 235;
   --accent-hover-color: 29 78 216;
 
+  /* Semantic state roles. Normal activity is progress blue, never green. */
+  --status-progress: 29 78 216;
+  --status-progress-soft: 219 234 254;
+  --status-success: 4 120 87;
+  --status-success-soft: 209 250 229;
+  --status-warning: 146 64 14;
+  --status-warning-soft: 254 243 199;
+  --status-danger: 185 28 28;
+  --status-danger-soft: 254 226 226;
+  --status-info: 14 116 144;
+  --status-info-soft: 207 250 254;
+
   /*
    * Gray scale — semantically inverted for light backgrounds.
-   * All values calibrated against surface-1 (#f8f8f8, L≈0.956):
+   * All values calibrated against surface-1 (#f7f9fc):
    *
    *  gray-200  #1e293b  13:1   primary text          (≡ dark-mode "bright")
    *  gray-300  #334155   9:1   secondary / hover-active text
    *  gray-400  #4b5563   6:1   muted text
-   *  gray-500  #64748b  4.5:1  subtle text            (WCAG AA normal ✓)
-   *  gray-600  #6b7a99  3.5:1  icon resting state     (WCAG AA UI ✓)
+   *  gray-500  #4e5d73  5.2:1+ subtle text            (WCAG AA on surface-0…4 ✓)
+   *  gray-600  #56657b  4.6:1+ quiet text / icons     (WCAG AA on surface-0…4 ✓)
    *  gray-700  #9aaabb  2.0:1  placeholder / decorative
    *  gray-900  #e2e8f0  1.1:1  barely-there bg tint
    *
    * Pattern  text-gray-600 hover:text-gray-300  reads:
-   *   rest → visible-but-subtle (#6b7a99)  hover → darker-active (#334155)
+   *   rest → visible-but-subtle (#56657b)  hover → darker-active (#334155)
    */
   --gray-100: 15 23 42;
   --gray-200: 30 41 59;
   --gray-300: 51 65 85;
   --gray-400: 75 85 99;
-  --gray-500: 100 116 139;
-  --gray-600: 107 122 153;
+  --gray-500: 78 93 115;
+  --gray-600: 86 101 123;
   --gray-700: 154 170 187;
   --gray-900: 226 232 240;
 
