@@ -536,6 +536,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
             tool_name   TEXT NOT NULL,
             arguments   TEXT NOT NULL DEFAULT '{}',
             result      TEXT,
+            metadata    TEXT,
             status      TEXT NOT NULL DEFAULT 'pending',
             error       TEXT,
             duration_ms INTEGER,
@@ -550,6 +551,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_tool_calls_status ON tool_calls(status)")
         .execute(pool)
         .await?;
+    ensure_column(pool, "tool_calls", "metadata", "TEXT").await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -1719,7 +1721,14 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        for expected in ["arguments", "result", "status", "error", "duration_ms"] {
+        for expected in [
+            "arguments",
+            "result",
+            "metadata",
+            "status",
+            "error",
+            "duration_ms",
+        ] {
             assert!(
                 tool_cols.contains(&expected.to_string()),
                 "tool_calls must expose {expected}. Got: {tool_cols:?}"

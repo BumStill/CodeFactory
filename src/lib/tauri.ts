@@ -59,6 +59,7 @@ export type StreamEvent =
       content: string;
       is_error: boolean;
       status: "done" | "blocked" | "error" | "denied" | "cancelled";
+      metadata?: Record<string, unknown> | null;
     }
   | {
       type: "permission_request";

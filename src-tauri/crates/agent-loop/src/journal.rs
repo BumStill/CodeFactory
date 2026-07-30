@@ -140,6 +140,16 @@ pub trait Persistence: Send + Sync {
         duration_ms: u64,
     ) -> PersistResult<()>;
 
+    /// Persist machine-readable tool metadata separately from the model-facing
+    /// result text. Default no-op keeps headless/anonymous surfaces compatible.
+    async fn record_tool_call_metadata(
+        &self,
+        _tool_call: &ToolCall,
+        _metadata: &serde_json::Value,
+    ) -> PersistResult<()> {
+        Ok(())
+    }
+
     /// Persist a cancelled tool batch. The per-item DB write is anonymous-gated;
     /// the content strings are returned UNCONDITIONALLY (the event/UI path needs
     /// them even in anonymous runs).
