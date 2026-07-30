@@ -108,6 +108,13 @@ jobs:
       - name: Cargo test (agent-loop crate)
         run: cargo test --manifest-path src-tauri/Cargo.toml -p codefactory-agent-loop --quiet
 
+      # Same reason as agent-loop: the headless eval sidecar is its own workspace
+      # member, so neither the root `cargo test` nor the agent-loop step compiles
+      # it. Without this step its tests are invisible to CI — which is exactly how
+      # #260 shipped three red sidecar tests (tool_choice regressions) unnoticed.
+      - name: Cargo test (agent-headless crate)
+        run: cargo test --manifest-path src-tauri/Cargo.toml -p codefactory-agent-headless --quiet
+
       - name: Evolution executable closed-loop smoke
         shell: pwsh
         run: |

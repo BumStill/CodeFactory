@@ -1611,7 +1611,15 @@ pub async fn run_agent_loop(
                     name: None,
                     reasoning_content: None,
                 });
-            } else if !matches!(turn_capability, TurnCapability::ReviewOnly) && !evidence.completed
+            // `required_tool_response` is this round's own tool_choice: when it
+            // is set, the batch we just finished IS the forced recovery. Making
+            // that batch re-arm the flag would lock the turn into back-to-back
+            // `required` rounds — the model could never speak again until the
+            // evidence ledger closed. One forced tool, then a normal `auto`
+            // round, whether the recovery tool succeeded, failed, or was denied.
+            } else if !matches!(turn_capability, TurnCapability::ReviewOnly)
+                && !evidence.completed
+                && !required_tool_response
             {
                 require_tool_next = true;
                 messages.push(crate::types::ChatMessage {
