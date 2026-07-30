@@ -348,3 +348,41 @@ mod tests {
         assert!(json.contains("\"total_bytes\":null"));
     }
 }
+
+/// Live check: really download Chromium and confirm the binary runs.
+///
+/// Ignored by default — it pulls ~150 MB. Run it explicitly when changing the
+/// installer:
+///
+///   cargo test --lib browser::download::live -- --ignored --nocapture
+#[cfg(test)]
+mod live {
+    #[tokio::test]
+    #[ignore = "downloads ~150 MB"]
+    async fn chromium_downloads_and_reports_its_version() {
+        let install = super::ensure_installed(&|progress| {
+            if let super::Progress::Downloading { received_bytes, .. } = progress {
+                if received_bytes % 50_000_000 < 1_000_000 {
+                    eprintln!("… {} MB", received_bytes / 1_000_000);
+                }
+            }
+        })
+        .await
+        .expect("download");
+
+        eprintln!("installed {} at {}", install.version, install.binary.display());
+        assert!(install.binary.is_file());
+
+        // The real proof is that the binary executes.
+        let output = std::process::Command::new(&install.binary)
+            .arg("--version")
+            .output()
+            .expect("run chromium");
+        let reported = String::from_utf8_lossy(&output.stdout);
+        eprintln!("--version says: {}", reported.trim());
+        assert!(
+            reported.contains("Chrome") || reported.contains("Chromium"),
+            "unexpected --version output: {reported}"
+        );
+    }
+}

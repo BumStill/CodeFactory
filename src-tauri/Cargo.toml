@@ -71,6 +71,7 @@ codefactory-agent-loop = { path = "crates/agent-loop" }
 async-trait = "0.1"       # impl the agent-loop ToolBackend trait (DesktopToolBackend)
 chromiumoxide = "0.9.1"
 futures = "0.3.33"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

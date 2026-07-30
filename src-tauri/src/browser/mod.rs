@@ -19,6 +19,7 @@
 pub mod bridge;
 pub mod chromium;
 pub mod download;
+pub mod extension;
 pub mod install;
 pub mod page;
 pub mod policy;
