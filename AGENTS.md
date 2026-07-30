@@ -113,6 +113,30 @@ Tauri dev 二进制不在系统应用注册表里，`computer-use.request_access
   权限，screenshot/click/type/scroll 全部可用
 - 后续 UX 验证都以此为准；不再有"Mac dev binary 不能 live verify"借口
 
+**在 worktree 里实地验证：改指针，不要重装 wrapper。**
+wrapper 在**每次启动时**解析要跑哪个 checkout，顺序为
+`$CODEFACTORY_DEV_TARGET` → 指针文件 `~/.codefactory/dev-app-target` →
+安装时所在的 checkout。所以 worktree 只需要改一行指针，bundle 不动：
+
+- 验证前：`scripts/install-dev-app-wrapper.sh --target`（不带参数即当前目录）
+- 验证后：`scripts/install-dev-app-wrapper.sh --clear-target` 交还主 checkout
+- 随时确认当前指向：`scripts/install-dev-app-wrapper.sh --show`
+- `/tmp/CodeFactoryDev-<YYYYMMDD>.log` 每次启动都会写
+  `target checkout: <path> [via ...]` 和 commit；截图取证时一并附上这两行，
+  否则无法证明截的是本次改动的代码
+
+**禁止**在 worktree 里跑无参数安装：那会把 bundle 的兜底路径固化成一个
+close out 之后就消失的目录，等于把用户的 wrapper 弄坏。指针失效时 shim 会
+自动回落到安装时的 checkout 并在日志写 `warn:`，但兜底本身必须是长期存在的
+主 checkout。`--target` 对旧版 bundle 会直接报错（旧 shim 不读指针，写了也
+只会拿错 checkout 的证据），按提示从主 checkout 重装一次即可。
+
+**窗口落在副屏会截不到图。** 已实测 `computer-use` 对副屏窗口截图可能直接
+失败（SCContentFilter 返回 nil）。wrapper 默认在启动时把主窗口钉在主屏
+`60,60`（`CODEFACTORY_DEV_WINDOW_ORIGIN="x,y"` 改坐标，`off` 交还 Tauri）。
+若窗口仍出现在副屏或截图失败：先用 `computer-use.switch_display` 切到该屏，
+不行就把窗口拖回主屏再截；两者都不行时按下面的降级条款在 PR 写明。
+
 如果出现新的 harness 限制（不是这个），可以临时降级为：
 - 在 PR description 写明 **"agent live verification not feasible"** + 具体原因
 - 改写**针对真实失败模式的单元测试**（不是 happy path）
