@@ -86,11 +86,30 @@ change the already-published artifact and it wastes user-visible delivery time.
 
 ### Idempotent / resumable state machine
 
-`deliver()` walks steps up to the effective ceiling; each checks reality first:
+`deliver()` records the requested ceiling separately from the effective ceiling,
+then walks the safely achievable steps. Reaching a reduced effective ceiling is
+a recoverable `blocked` outcome, not `delivered`: the result names the missing
+capability, actual reached state, and one continuation action.
+
+Each step checks reality first:
 nothing-to-commit is a clean skip, an already-open PR is reused via
 `list_prs(head)` (never double-opened), CI-red/conflict/no-token are **blocked**
 terminals with a clear message — never a loop, never a double-apply. Re-invoking
-after a crash continues from the real git/PR state.
+after a crash continues from the real git/PR state. Before merge and release
+dispatch, delivery writes a repo-local `intent_merge`/`intent_release` receipt;
+a confirmed response upgrades it to `merged`/`release_triggered`. The receipt
+key and body are bound to schema version, credential-free canonical remote
+identity, remote name, base, head, and commit SHA. This prevents different
+branches or repositories that share a tip from overwriting each other's
+idempotency state. Same-context, same-tip retries reuse completed receipts and
+only rerun missing observation. Corrupt, unknown, unreadable, mismatched, or
+lingering intent receipts fail closed; an ambiguous external result is
+structurally non-retryable until the remote fact is inspected.
+
+The structured `DeliveryOutcome` truth fields are also carried as tool metadata
+through the desktop backend, stream event, frontend tool-call state, and the
+normalized `tool_calls.metadata` column. Retryability and reached state never
+depend on parsing the localized report body.
 
 ### Agent integration — killing the loop
 

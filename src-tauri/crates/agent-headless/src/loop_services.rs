@@ -188,6 +188,7 @@ where
             stdout,
             stderr,
             error,
+            metadata: None,
             next_working_directory,
             duration_ms: started.elapsed().as_millis() as u64,
         })

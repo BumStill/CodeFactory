@@ -8,6 +8,7 @@ export interface ToolCallState {
   args: string;
   result?: string;
   isError?: boolean;
+  metadata?: Record<string, unknown> | null;
   status: "waiting_permission" | "running" | "done" | "blocked" | "error" | "denied" | "cancelled";
 }
 
@@ -294,7 +295,13 @@ export function reduceChatStreamEvent(
           ...m,
           toolCalls: (m.toolCalls ?? []).map((tc) =>
             tc.id === event.tool_call_id
-              ? { ...tc, result: event.content, isError: event.is_error, status: nextStatus }
+              ? {
+                  ...tc,
+                  result: event.content,
+                  isError: event.is_error,
+                  status: nextStatus,
+                  metadata: event.metadata,
+                }
               : tc,
           ),
         })),

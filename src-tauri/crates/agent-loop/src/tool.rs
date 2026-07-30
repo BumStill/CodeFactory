@@ -57,6 +57,9 @@ pub struct ToolInvocationResult {
     pub stdout: String,
     pub stderr: String,
     pub error: Option<String>,
+    /// Machine-readable tool-specific outcome. Delivery uses this to carry the
+    /// truthful state ladder and retryability without parsing localized text.
+    pub metadata: Option<serde_json::Value>,
     /// Sidecar cd-tracking (the Harbor container reports where cwd ended up);
     /// the desktop backend leaves this `None`.
     pub next_working_directory: Option<String>,
@@ -153,6 +156,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
                 error: None,
+                metadata: None,
                 next_working_directory: None,
                 duration_ms: 0,
             })
