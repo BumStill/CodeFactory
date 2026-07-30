@@ -27,7 +27,7 @@ pub mod worktree;
 
 pub use dispatch::{
     decide_chat_contract, decide_chat_mode, is_contextual_approval, proposal_capability,
-    steer_capability_override,
+    steer_capability_override, TurnGrants,
 };
 
 #[cfg(test)]
@@ -105,7 +105,9 @@ fn wall_budget_applies(mode: AgentMode) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionResponse {
     Allow,
-    Deny,
+    DeniedByUser,
+    TimedOut,
+    ChannelClosed,
     Cancelled,
 }
 
@@ -145,7 +147,9 @@ async fn await_permission_response(
     tokio::select! {
         response = timeout(max_wait, receiver) => match response {
             Ok(Ok(true)) => PermissionResponse::Allow,
-            _ => PermissionResponse::Deny,
+            Ok(Ok(false)) => PermissionResponse::DeniedByUser,
+            Ok(Err(_)) => PermissionResponse::ChannelClosed,
+            Err(_) => PermissionResponse::TimedOut,
         },
         _ = wait_for_cancellation(cancel), if cancel.is_some() => PermissionResponse::Cancelled,
     }
@@ -492,6 +496,8 @@ pub struct AgentLoop {
     mode: AgentMode,
     /// Per-turn hard capability boundary; independent from full-access/trust.
     turn_capability: TurnCapability,
+    /// Narrow grants derived only from the current user message.
+    turn_grants: TurnGrants,
     /// Stable for one AgentLoop execution; combined with the provider-round
     /// index to make usage persistence idempotent without collapsing genuine
     /// multi-round tool work.
@@ -717,6 +723,7 @@ impl AgentLoop {
                 AgentMode::Interactive => TurnCapability::ReviewOnly,
                 AgentMode::Execute | AgentMode::Autonomous => TurnCapability::Implement,
             },
+            turn_grants: TurnGrants::default(),
             usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,
             cancel: None,
@@ -801,6 +808,7 @@ impl AgentLoop {
                 AgentMode::Interactive => TurnCapability::ReviewOnly,
                 AgentMode::Execute | AgentMode::Autonomous => TurnCapability::Implement,
             },
+            turn_grants: TurnGrants::default(),
             usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,
             cancel: None,
@@ -820,6 +828,11 @@ impl AgentLoop {
 
     pub fn with_turn_capability(mut self, capability: TurnCapability) -> Self {
         self.turn_capability = capability;
+        self
+    }
+
+    pub fn with_turn_grants(mut self, grants: TurnGrants) -> Self {
+        self.turn_grants = grants;
         self
     }
 
@@ -1300,6 +1313,7 @@ impl AgentLoop {
             events: self.events.clone(),
             pending_permissions: self.pending_permissions.clone(),
             cancel: self.cancel.clone(),
+            browser_read_granted: self.turn_grants.browser_read,
         }
     }
 
@@ -2459,12 +2473,98 @@ pub(super) fn permission_policy_for_mode(mode: &str) -> PermissionPolicy {
             full_access: true,
         },
         _ => PermissionPolicy {
-            allow: standard_tools,
+            allow: standard_tools
+                .into_iter()
+                .chain([
+                    "browser_session(open)".to_string(),
+                    "browser_session(snapshot)".to_string(),
+                    "browser_session(tabs)".to_string(),
+                    "browser_session(select_tab)".to_string(),
+                    "browser_session(close)".to_string(),
+                ])
+                .collect(),
             ask: vec!["bash".to_string(), "browser_session".to_string()],
             deny: vec![],
             full_access: false,
         },
     }
+}
+
+fn decide_permission_for_call(
+    policy: &PermissionPolicy,
+    tool_name: &str,
+    args: &serde_json::Value,
+    cmd: Option<&str>,
+    browser_read_granted: bool,
+) -> PermissionDecision {
+    if tool_name == "browser_session" {
+        let Some(action) = args.get("action").and_then(serde_json::Value::as_str) else {
+            return PermissionDecision::Ask;
+        };
+        match action {
+            // Cleanup must never wait for another approval.
+            "close" => return PermissionDecision::Allow,
+            // Acting in a browser can send, buy, publish, or delete. Trusted
+            // mode does not bypass this per-action confirmation.
+            "click" | "fill" | "press" => return PermissionDecision::Ask,
+            // This writes a project file; the structural capability gate also
+            // rejects it on ReviewOnly turns.
+            "screenshot" => return PermissionDecision::Ask,
+            "open" => {
+                let url = args.get("url").and_then(serde_json::Value::as_str);
+                let verdict = crate::browser::policy::classify(
+                    crate::browser::policy::BrowserAction::Read,
+                    url,
+                    &crate::browser::profile::ProfileScope::Ephemeral,
+                    &crate::browser::policy::GrantedHosts::new(),
+                );
+                if let crate::browser::policy::BrowserPermission::Deny { reason } = verdict {
+                    return PermissionDecision::Deny(reason);
+                }
+            }
+            // Existing Chrome contains the user's signed-in state. The current
+            // root message must explicitly ask for browser reading; safe mode
+            // still keeps its own confirmation.
+            "attach"
+                if browser_read_granted
+                    && (policy.full_access
+                        || policy
+                            .allow
+                            .iter()
+                            .any(|pattern| pattern == "browser_session(open)")) =>
+            {
+                return PermissionDecision::Allow;
+            }
+            "attach" | "snapshot" | "tabs" | "select_tab" => {}
+            _ => {
+                return PermissionDecision::Deny(format!(
+                    "unknown browser_session action '{action}'"
+                ))
+            }
+        }
+
+        let key = format!("browser_session({action})");
+        for pattern in &policy.deny {
+            if glob_match(pattern, &key) || glob_match(pattern, tool_name) {
+                return PermissionDecision::Deny(format!("Denied by policy: matches '{pattern}'"));
+            }
+        }
+        if policy.full_access {
+            return PermissionDecision::Allow;
+        }
+        for pattern in &policy.allow {
+            if glob_match(pattern, &key) || glob_match(pattern, tool_name) {
+                return PermissionDecision::Allow;
+            }
+        }
+        for pattern in &policy.ask {
+            if glob_match(pattern, &key) || glob_match(pattern, tool_name) {
+                return PermissionDecision::Ask;
+            }
+        }
+        return PermissionDecision::Ask;
+    }
+    decide_permission(policy, tool_name, cmd)
 }
 
 fn decide_permission(
@@ -2494,9 +2594,10 @@ fn decide_permission(
         }
     }
 
-    let key = match cmd {
-        Some(c) => format!("{}({})", tool_name, c),
-        None => tool_name.to_string(),
+    let key = match (tool_name, cmd) {
+        ("browser_session", _) => tool_name.to_string(),
+        (_, Some(c)) => format!("{}({})", tool_name, c),
+        (_, None) => tool_name.to_string(),
     };
 
     for pattern in &policy.deny {
@@ -2668,6 +2769,29 @@ mod tests {
         assert_eq!(
             await_permission_response(receiver, Some(&cancel), Duration::from_secs(1)).await,
             PermissionResponse::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_response_preserves_user_denial_timeout_and_closed_channel() {
+        let (deny_sender, deny_receiver) = tokio::sync::oneshot::channel();
+        deny_sender.send(false).unwrap();
+        assert_eq!(
+            await_permission_response(deny_receiver, None, Duration::from_secs(1)).await,
+            PermissionResponse::DeniedByUser
+        );
+
+        let (_timeout_sender, timeout_receiver) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            await_permission_response(timeout_receiver, None, Duration::from_millis(1)).await,
+            PermissionResponse::TimedOut
+        );
+
+        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        drop(closed_sender);
+        assert_eq!(
+            await_permission_response(closed_receiver, None, Duration::from_secs(1)).await,
+            PermissionResponse::ChannelClosed
         );
     }
 
@@ -3435,6 +3559,36 @@ mod tests {
             decide_permission(&standard, "bash", Some("pnpm test")),
             PermissionDecision::Ask
         );
+        assert_eq!(
+            decide_permission_for_call(
+                &standard,
+                "browser_session",
+                &serde_json::json!({"action":"open","url":"https://example.com"}),
+                None,
+                false,
+            ),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            decide_permission_for_call(
+                &standard,
+                "browser_session",
+                &serde_json::json!({"action":"attach"}),
+                None,
+                true,
+            ),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            decide_permission_for_call(
+                &standard,
+                "browser_session",
+                &serde_json::json!({"action":"attach"}),
+                None,
+                false,
+            ),
+            PermissionDecision::Ask
+        );
 
         let trusted = permission_policy_for_mode("trusted");
         assert_eq!(
@@ -3449,6 +3603,19 @@ mod tests {
             ),
             PermissionDecision::Ask
         );
+        for action in ["click", "fill", "press"] {
+            assert_eq!(
+                decide_permission_for_call(
+                    &trusted,
+                    "browser_session",
+                    &serde_json::json!({"action":action}),
+                    None,
+                    true,
+                ),
+                PermissionDecision::Ask,
+                "{action} must still require consent in trusted mode"
+            );
+        }
     }
 
     #[test]

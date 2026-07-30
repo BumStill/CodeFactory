@@ -28,6 +28,12 @@
 | CF-SCC-R22 | capability 变化后必须重新按新 capability 暴露工具；先前一次性过滤的 tool schema 不得造成整条 root turn 永久锁死 | scripted tool-schema regression |
 | CF-SCC-R23 | steer 不得清零 root turn 的累计 recovery 次数；结构门禁拒绝后的终态必须为 blocked，不得写 `completed/任务已完成`，用户也不得被要求重复授权 | state-machine unit + SQLite truth |
 | CF-SCC-R24 | ReviewOnly 只允许显式登记的只读工具；未知 MCP 即使名称以 `read_/get_/list_` 开头也必须 fail closed。Git branch/switch/checkout/fetch/pull/stash 均属于本地仓库状态变更 | backend counter + command classification |
+| CF-SCC-R25 | 浏览器权限必须按 action 和数据范围判定，不能再按 `browser_session` 工具名一刀切。Standard 下公开页面 `open/snapshot/close` 不重复询问；用户当前消息明确要求读取本机 Chrome 时，该 root turn 可连接现有 Chrome，Chrome 自身的远程调试确认仍是最终边界 | dispatch + permission unit + real app |
+| CF-SCC-R26 | `click/fill/press` 属于浏览器 Act，即使 Trusted 也必须逐次询问；`screenshot(path)` 会写工作区，必须分类为 Mutation，ReviewOnly 下不得执行 | permission + capability classifier |
+| CF-SCC-R27 | 权限结果必须区分 `denied_by_user / timed_out / channel_closed / cancelled / policy_denied`。只有用户明确点拒绝才可归因用户；等待时长必须进入工具证据，首个权限阻断不得被后续 fallback 的结构拒绝覆盖 | fake-clock unit + scripted loop + SQLite truth |
+| CF-SCC-R28 | 权限等待采用有界且可见的 60 秒窗口；前端显示到期时间，后台会话在侧边栏标记“等待批准”。超时后停止当前工具链并形成一次阻断总结，不得再提示模型“换一种方式”造成重复尝试 | reducer + component + real app |
+| CF-SCC-R29 | 普通 Chrome 连接使用官方 CDP attach，并复用用户现有登录态；关闭 CodeFactory 会话只能 detach，绝不关闭普通 Chrome。工具输出必须明确区分受管浏览器和用户 Chrome，页面内容始终标为不可信数据 | native tool unit + authenticated fixture + process proof |
+| CF-SCC-R30 | 当前能力或授权无法满足“读取真实现网页面”时，不得把本地源码、匿名 HTTP 或另一份浏览器冒充等价证据；Python/Node 等可执行 heredoc 继续 fail closed 为 Mutation | scripted trajectory + shell classifier regression |
 
 ## Primary User Paths
 
@@ -76,6 +82,7 @@
 - Viewport Harness：1366×768、800×600 下状态卡与输入区不重叠。
 - Observation Harness：真实 App 中 Full access 诊断、Execute 恢复和取消路径。
 - Payload Harness：状态卡不得泄漏完整命令、凭据、内部 prompt 或大段 tool result。
+- Browser Harness：公开页面、用户 Chrome 登录态、逐次 Act 授权、detach 与普通 Chrome 存活证明。
 - AI Collaboration Harness：独立架构/UX 审查、失败测试、最终验证结果。
 - Release Harness：PR+CI、安装包与发布 App 精确版本证据。
 

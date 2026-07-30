@@ -179,7 +179,10 @@ pub(crate) async fn record_tool_call_finished(
     error: Option<&str>,
     duration_ms: i64,
 ) -> Result<(), AppError> {
-    if !matches!(status, "done" | "error" | "denied" | "cancelled") {
+    if !matches!(
+        status,
+        "done" | "blocked" | "error" | "denied" | "cancelled"
+    ) {
         return Err(AppError::Other(format!(
             "unsupported normalized tool-call status: {status}"
         )));
@@ -215,7 +218,10 @@ pub(crate) async fn record_terminal_tool_outcome(
     error: Option<&str>,
     duration_ms: i64,
 ) -> Result<(), AppError> {
-    if !matches!(status, "done" | "error" | "denied" | "cancelled") {
+    if !matches!(
+        status,
+        "done" | "blocked" | "error" | "denied" | "cancelled"
+    ) {
         return Err(AppError::Other(format!(
             "unsupported normalized tool-call status: {status}"
         )));
@@ -574,6 +580,13 @@ mod tests {
                 Some("Tool call cancelled by hook."),
                 0,
             ),
+            (
+                "call-blocked",
+                "blocked",
+                Some("Chrome remote debugging must be enabled by the user."),
+                None,
+                23,
+            ),
         ] {
             record_tool_call_started(
                 &pool,
@@ -628,7 +641,7 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert!(rows.iter().all(|(role, _)| role == "tool"));
         let joined = rows
             .iter()
@@ -638,6 +651,7 @@ mod tests {
         assert!(joined.contains("call-done"));
         assert!(joined.contains("call-error"));
         assert!(joined.contains("call-denied"));
+        assert!(joined.contains("call-blocked"));
         assert!(joined.contains("visible"));
         assert!(joined.contains("recovered"));
         assert!(!joined.contains("dispatch failed"));
@@ -645,12 +659,12 @@ mod tests {
         assert!(!joined.contains("CF_EVO_ERROR_SECRET"));
 
         let terminal_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM tool_calls WHERE status IN ('done','error','denied')",
+            "SELECT COUNT(*) FROM tool_calls WHERE status IN ('done','blocked','error','denied')",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(terminal_count, 3);
+        assert_eq!(terminal_count, 4);
     }
 
     #[tokio::test]

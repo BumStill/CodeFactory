@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { useEffect, useState } from "react";
 import { Check, ShieldAlert, X, Unlock } from "lucide-react";
 import { createTwoFilesPatch } from "diff";
 import type { PendingPermission } from "../stores/chat";
@@ -79,13 +80,35 @@ export function PermissionDialog({
   onDeny,
   onAllowFullAccess,
 }: Props) {
+  const [remainingSeconds, setRemainingSeconds] = useState<number | null>(() =>
+    request.expiresAt == null
+      ? null
+      : Math.max(0, Math.ceil((request.expiresAt - Date.now()) / 1000)),
+  );
+  useEffect(() => {
+    if (request.expiresAt == null) {
+      setRemainingSeconds(null);
+      return;
+    }
+    const update = () =>
+      setRemainingSeconds(Math.max(0, Math.ceil((request.expiresAt! - Date.now()) / 1000)));
+    update();
+    const timer = window.setInterval(update, 250);
+    return () => window.clearInterval(timer);
+  }, [request.expiresAt]);
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="permission-dialog-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
+    >
       <div className="w-full max-w-lg rounded-lg border border-border bg-surface-2 shadow-2xl">
         <div className="flex items-center gap-2 border-b border-border px-4 py-3">
           <ShieldAlert size={16} className="text-amber-400" />
           <div className="min-w-0">
-            <h2 className="text-sm font-semibold text-gray-100">需要权限</h2>
+            <h2 id="permission-dialog-title" className="text-sm font-semibold text-gray-100">需要权限</h2>
             <p className="text-xs text-gray-500">
               工具 `{request.toolName}` 想要以项目访问权限运行。
             </p>
@@ -95,6 +118,11 @@ export function PermissionDialog({
         <div className="max-h-[45vh] overflow-auto px-4 py-3">
           <div className="mb-2 text-xs uppercase tracking-wide text-gray-600">参数</div>
           <ToolArgsPreview request={request} />
+          {remainingSeconds != null && (
+            <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+              请在 {remainingSeconds} 秒内处理；超时只会标记“授权已过期”，不会记成你拒绝。
+            </div>
+          )}
           {trusted && (
             <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
               当前会话已处于信任模式，普通工具会减少确认；高风险命令仍会拦截。
@@ -111,6 +139,7 @@ export function PermissionDialog({
             拒绝
           </button>
           <button
+            autoFocus
             onClick={onAllow}
             className="inline-flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover"
           >

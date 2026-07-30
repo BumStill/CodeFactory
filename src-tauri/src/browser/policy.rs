@@ -43,7 +43,7 @@ impl BrowserAction {
     pub fn from_tool_action(action: &str) -> Self {
         match action {
             "click" | "fill" | "press" => Self::Act,
-            "close" => Self::Lifecycle,
+            "attach" | "close" => Self::Lifecycle,
             _ => Self::Read,
         }
     }
@@ -54,8 +54,12 @@ impl BrowserAction {
 pub enum BrowserPermission {
     Allow,
     /// Prompt the user. `subject` is what the prompt should name.
-    Ask { subject: String },
-    Deny { reason: String },
+    Ask {
+        subject: String,
+    },
+    Deny {
+        reason: String,
+    },
 }
 
 /// Hosts already confirmed for this chat session, so repeat reads don't re-ask.
@@ -90,12 +94,6 @@ pub fn classify(
         }
     }
 
-    // A throwaway profile is signed in to nothing, so browsing it is no more
-    // sensitive than fetching a public page.
-    if !scope.is_persistent() {
-        return BrowserPermission::Allow;
-    }
-
     match action {
         BrowserAction::Lifecycle => BrowserPermission::Allow,
         BrowserAction::Act => BrowserPermission::Ask {
@@ -104,6 +102,9 @@ pub fn classify(
                 None => "act as your signed-in account on the open page".into(),
             },
         },
+        // A throwaway profile is signed in to nothing, so reading it is no more
+        // sensitive than fetching a public page. Acting still asks above.
+        BrowserAction::Read if !scope.is_persistent() => BrowserPermission::Allow,
         BrowserAction::Read => match url.and_then(host_of) {
             Some(host) if granted.contains(&host) => BrowserPermission::Allow,
             Some(host) => BrowserPermission::Ask {
@@ -127,8 +128,11 @@ pub fn host_of(url: &str) -> Option<String> {
 fn scheme_of(url: &str) -> Option<String> {
     let (scheme, _) = url.split_once("://")?;
     let scheme = scheme.trim().to_ascii_lowercase();
-    (!scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-'))
-        .then_some(scheme)
+    (!scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-'))
+    .then_some(scheme)
 }
 
 #[cfg(test)]
@@ -232,6 +236,16 @@ mod tests {
             &GrantedHosts::new(),
         );
         assert!(matches!(denied, BrowserPermission::Deny { .. }));
+
+        assert!(matches!(
+            classify(
+                BrowserAction::Act,
+                None,
+                &ProfileScope::Ephemeral,
+                &GrantedHosts::new(),
+            ),
+            BrowserPermission::Ask { .. }
+        ));
     }
 
     #[test]
@@ -246,10 +260,12 @@ mod tests {
         for action in ["open", "read", "find", "snapshot", "screenshot"] {
             assert_eq!(BrowserAction::from_tool_action(action), BrowserAction::Read);
         }
-        assert_eq!(
-            BrowserAction::from_tool_action("close"),
-            BrowserAction::Lifecycle
-        );
+        for action in ["attach", "close"] {
+            assert_eq!(
+                BrowserAction::from_tool_action(action),
+                BrowserAction::Lifecycle
+            );
+        }
     }
 
     #[test]
@@ -258,7 +274,10 @@ mod tests {
             host_of("https://User:pw@Mail.Example.com:8443/x?y#z").as_deref(),
             Some("mail.example.com")
         );
-        assert_eq!(host_of("https://example.com").as_deref(), Some("example.com"));
+        assert_eq!(
+            host_of("https://example.com").as_deref(),
+            Some("example.com")
+        );
         assert_eq!(host_of("not-a-url"), None);
     }
 }

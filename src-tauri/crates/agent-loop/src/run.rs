@@ -543,6 +543,7 @@ pub async fn run_agent_loop(
     let mut progress_tracker = codefactory_agent_core::ProgressTracker::new(progress_window as u32);
     let mut finalization_pending = false;
     let mut blocker_summary_pending = false;
+    let mut blocker_terminal_reason: Option<String> = None;
     let mut completion_summary_retry_used = false;
     let mut completion_recovery_attempts = 0_u32;
     let mut structural_denial_seen = false;
@@ -954,7 +955,7 @@ pub async fn run_agent_loop(
                         "blocked",
                         "任务已在明确边界停止",
                         None,
-                        Some("tool_blocked"),
+                        blocker_terminal_reason.as_deref().or(Some("tool_blocked")),
                     )
                     .await?;
                     let (done_in, done_out) = usage
@@ -1257,6 +1258,9 @@ pub async fn run_agent_loop(
                 } else {
                     None
                 };
+                let mut permission_denial_duration_ms = 0_u64;
+                let mut permission_denial_stops_chain = false;
+                let mut permission_denial_terminal_reason: Option<&'static str> = None;
                 let denial_content = if let Some(content) = capability_denial {
                     Some(content)
                 } else if let Some(denial) = inspection_denial.or_else(|| {
@@ -1279,7 +1283,13 @@ pub async fn run_agent_loop(
                 } else {
                     match permission.authorize(tc, &args, bash_cmd.as_deref()).await {
                         PermissionOutcome::Allow => None,
-                        PermissionOutcome::Deny(content) => Some(content),
+                        PermissionOutcome::Deny(denial) => {
+                            permission_denial_duration_ms = denial.duration_ms;
+                            permission_denial_stops_chain = denial.reason.stops_tool_chain();
+                            permission_denial_terminal_reason =
+                                Some(denial.reason.terminal_reason());
+                            Some(denial.content)
+                        }
                         PermissionOutcome::Cancelled => {
                             finish_cancelled_tool_batch(
                                 persistence.as_ref(),
@@ -1301,8 +1311,21 @@ pub async fn run_agent_loop(
                     if capability_denied {
                         structural_denial_seen = true;
                     }
+                    if permission_denial_stops_chain {
+                        blocked_tool_result = true;
+                        if blocker_terminal_reason.is_none() {
+                            blocker_terminal_reason =
+                                permission_denial_terminal_reason.map(str::to_owned);
+                        }
+                    }
                     persistence
-                        .record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
+                        .record_tool_call_outcome(
+                            tc,
+                            "denied",
+                            None,
+                            Some(&content),
+                            permission_denial_duration_ms,
+                        )
                         .await?;
                     events.emit(crate::types::StreamEvent::ToolResult {
                         tool_call_id: tc.id.clone(),
@@ -1318,6 +1341,39 @@ pub async fn run_agent_loop(
                         name: Some(tc.function.name.clone()),
                         reasoning_content: None,
                     });
+                    if permission_denial_stops_chain {
+                        let remaining_calls = &tool_calls[tool_index + 1..];
+                        let cancelled = persistence
+                            .persist_cancelled_tool_batch(remaining_calls)
+                            .await?;
+                        for (remaining_call, cancelled_content) in
+                            remaining_calls.iter().zip(cancelled)
+                        {
+                            let remaining_args =
+                                serde_json::from_str(&remaining_call.function.arguments)
+                                    .unwrap_or_default();
+                            events.emit(crate::types::StreamEvent::ToolCallStart {
+                                id: remaining_call.id.clone(),
+                                name: remaining_call.function.name.clone(),
+                                args: remaining_args,
+                            });
+                            events.emit(crate::types::StreamEvent::ToolResult {
+                                tool_call_id: remaining_call.id.clone(),
+                                content: cancelled_content.clone(),
+                                is_error: true,
+                                status: "cancelled".into(),
+                            });
+                            result_messages.push(crate::types::ChatMessage {
+                                role: "tool".into(),
+                                content: crate::types::MessageContent::Text(cancelled_content),
+                                tool_calls: None,
+                                tool_call_id: Some(remaining_call.id.clone()),
+                                name: Some(remaining_call.function.name.clone()),
+                                reasoning_content: None,
+                            });
+                        }
+                        break;
+                    }
                     continue;
                 }
 
@@ -1494,13 +1550,13 @@ pub async fn run_agent_loop(
                     "blocked",
                     "正在整理阻断结果",
                     None,
-                    Some("tool_blocked"),
+                    blocker_terminal_reason.as_deref().or(Some("tool_blocked")),
                 )
                 .await?;
                 messages.push(crate::types::ChatMessage {
                     role: "user".into(),
                     content: crate::types::MessageContent::Text(
-                        "工具返回了结构化 blocked。不要重试该工具；请只用已有事实生成一次简洁阻断总结，说明停在哪一步、已完成什么和下一步。".into(),
+                        "工具链已在明确边界停止。不要重试、绕过授权或把其他来源冒充等价证据；请只用已有事实生成一次简洁阻断总结，说明停在哪一步、已完成什么和下一步。".into(),
                     ),
                     tool_calls: None,
                     tool_call_id: None,
@@ -1862,11 +1918,15 @@ fn run_outcome_for_terminal(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
     use crate::events::CollectingEventSink;
     use crate::journal::{NullBudget, PersistResult};
-    use crate::services::{AllowAllPermissions, NoOpFactChecker, NoOpHooks};
+    use crate::services::{
+        AllowAllPermissions, NoOpFactChecker, NoOpHooks, PermissionDenial, PermissionDenialReason,
+        PermissionGateway,
+    };
     use crate::tool::{ToolBackend, ToolCtx, ToolInvocationResult};
     use crate::transport::{ModelResponse, ModelTransport, RoundOptions};
     use crate::types::{
@@ -2047,6 +2107,28 @@ mod tests {
                 error: None,
                 next_working_directory: None,
                 duration_ms: 1,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct TimedOutPermission {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl PermissionGateway for TimedOutPermission {
+        async fn authorize(
+            &self,
+            _tool_call: &ToolCall,
+            _args: &serde_json::Value,
+            _bash_command: Option<&str>,
+        ) -> PermissionOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            PermissionOutcome::Deny(PermissionDenial {
+                content: "permission expired without a user decision".into(),
+                reason: PermissionDenialReason::TimedOut,
+                duration_ms: 60_000,
             })
         }
     }
@@ -2348,9 +2430,7 @@ mod tests {
         let mut svc = services(transport, persistence, events.clone());
         svc.steer = steer;
 
-        run_agent_loop(inputs(), cfg, svc)
-            .await
-            .expect("loop runs");
+        run_agent_loop(inputs(), cfg, svc).await.expect("loop runs");
 
         assert!(events.events().iter().any(|event| matches!(
             event,
@@ -2400,6 +2480,70 @@ mod tests {
         assert!(!events.events().iter().any(|event| matches!(
             event,
             StreamEvent::TurnActivityUpdated { status, .. } if status == "completed"
+        )));
+    }
+
+    #[tokio::test]
+    async fn permission_timeout_stops_the_tool_chain_and_preserves_its_terminal_reason() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "读取页面",
+                vec![
+                    call("t1", "scripted", serde_json::json!({})),
+                    call(
+                        "t2",
+                        "bash",
+                        serde_json::json!({"command":"curl https://example.com"}),
+                    ),
+                ],
+                0,
+            ),
+            response("授权已过期，页面未读取。", vec![], 1),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let tools = Arc::new(CountingTools::default());
+        let permission = Arc::new(TimedOutPermission::default());
+        let mut svc = services(transport, persistence, events.clone());
+        svc.tools = tools.clone();
+        svc.permission = permission.clone();
+
+        run_agent_loop(inputs(), config(), svc)
+            .await
+            .expect("loop runs");
+
+        assert!(
+            tools.executed().is_empty(),
+            "timed-out tool must not execute"
+        );
+        assert_eq!(
+            permission.calls.load(Ordering::SeqCst),
+            1,
+            "remaining tools in the provider batch must be cancelled without another authorization attempt"
+        );
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult {
+                tool_call_id,
+                status,
+                ..
+            } if tool_call_id == "t2" && status == "cancelled"
+        )));
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated {
+                status,
+                terminal_reason: Some(reason),
+                ..
+            } if status == "blocked" && reason == "permission_timed_out"
+        )));
+        assert!(!events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated {
+                status,
+                terminal_reason: Some(reason),
+                ..
+            } if status == "blocked" && reason == "capability_denied"
         )));
     }
 

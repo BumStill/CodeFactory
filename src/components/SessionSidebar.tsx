@@ -28,6 +28,7 @@ import {
   Pencil,
   Trash2,
   MoreHorizontal,
+  ShieldQuestion,
 } from "lucide-react";
 import { useChatStore } from "../stores/chat";
 import { formatRelativeTime } from "../lib/time";
@@ -253,6 +254,9 @@ function SessionRow({
   // Per-session streaming indicator: with concurrent sessions, any row may be
   // mid-stream even when it's not the foreground one.
   const streaming = useChatStore((s) => s.runtime?.[session.id]?.streaming ?? false);
+  const waitingPermission = useChatStore(
+    (s) => s.runtime?.[session.id]?.pendingPermission != null,
+  );
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [confirming, setConfirming] = useState(false);
@@ -328,7 +332,13 @@ function SessionRow({
               {session.title || "未命名会话"}
             </span>
           )}
-          {streaming && (
+          {waitingPermission ? (
+            <ShieldQuestion
+              size={12}
+              className="shrink-0 text-amber-400"
+              aria-label="等待批准"
+            />
+          ) : streaming && (
             <Loader2 size={11} className="shrink-0 animate-spin text-accent" aria-label="运行中" />
           )}
           {!editing && !confirming && (
