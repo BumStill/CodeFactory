@@ -373,8 +373,12 @@ mod live {
         eprintln!("installed {} at {}", install.version, install.binary.display());
         assert!(install.binary.is_file());
 
-        // The real proof is that the binary executes.
+        // The real proof is that the binary executes. `.no_window()` so this
+        // matches the rule the rest of the codebase is held to — a probe that
+        // flashes a console window on Windows is a bug wherever it lives.
+        use crate::util::no_window::NoWindow;
         let output = std::process::Command::new(&install.binary)
+            .no_window()
             .arg("--version")
             .output()
             .expect("run chromium");
