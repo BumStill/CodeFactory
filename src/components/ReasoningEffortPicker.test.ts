@@ -43,6 +43,39 @@ describe("reasoningPickerVisible", () => {
     expect(reasoningPickerVisible(openai)).toBe(false);
   });
 
+  it("shows for a direct DeepSeek endpoint (deepseek.com)", () => {
+    const deepseek = settingsWith("deepseek", {
+      deepseek: {
+        base_url: "https://api.deepseek.com",
+        api_style: "openai",
+        custom_models: [{ id: "deepseek-v4-pro" }],
+      },
+    });
+    expect(reasoningPickerVisible(deepseek)).toBe(true);
+  });
+
+  it("shows for a DeepSeek model on OpenRouter", () => {
+    const openrouter = settingsWith("openrouter", {
+      openrouter: {
+        base_url: "https://openrouter.ai/api/v1",
+        api_style: "openai",
+        custom_models: [{ id: "deepseek/deepseek-v4-pro" }],
+      },
+    });
+    expect(reasoningPickerVisible(openrouter)).toBe(true);
+  });
+
+  it("stays hidden for non-DeepSeek OpenAI-compatible endpoints", () => {
+    const lmstudio = settingsWith("lmstudio", {
+      lmstudio: {
+        base_url: "http://localhost:1234/v1",
+        api_style: "openai",
+        custom_models: [{ id: "qwen2.5-coder" }],
+      },
+    });
+    expect(reasoningPickerVisible(lmstudio)).toBe(false);
+  });
+
   it("uses the active model catalog instead of a global hard-coded ceiling", () => {
     const chatgpt = settingsWith("chatgpt", {
       chatgpt: {
@@ -87,6 +120,34 @@ describe("reasoningPickerVisible", () => {
       "medium",
       "high",
       "xhigh",
+    ]);
+  });
+
+  it("offers DeepSeek models the API's three real levels (low/high/max)", () => {
+    const deepseek = settingsWith("deepseek", {
+      deepseek: {
+        base_url: "https://api.deepseek.com",
+        api_style: "openai",
+        custom_models: [{ id: "deepseek-v4-pro" }],
+      },
+    });
+    expect(reasoningEffortsForModel(deepseek, "deepseek-v4-pro")).toEqual([
+      "low",
+      "high",
+      "max",
+    ]);
+    // OpenRouter slug form
+    const openrouter = settingsWith("openrouter", {
+      openrouter: {
+        base_url: "https://openrouter.ai/api/v1",
+        api_style: "openai",
+        custom_models: [{ id: "deepseek/deepseek-v4-pro" }],
+      },
+    });
+    expect(reasoningEffortsForModel(openrouter, "deepseek/deepseek-v4-pro")).toEqual([
+      "low",
+      "high",
+      "max",
     ]);
   });
 });

@@ -453,6 +453,67 @@ pub fn is_contextual_approval(user_msg: &str) -> bool {
     is_explicit_continuation_request(user_msg) || is_approval(user_msg)
 }
 
+/// Explicit revocation of a previously granted delivery authorization. A
+/// session that once said "提交上线" keeps `Deliver` capability on later
+/// turns (see [`with_persisted_delivery_authorization`]); these phrasings
+/// turn that back off so the user is not stuck with standing delivery
+/// permission they no longer want.
+pub fn is_delivery_revocation(user_msg: &str) -> bool {
+    let text = user_msg.to_ascii_lowercase();
+    [
+        "取消交付",
+        "取消发布",
+        "先不发布",
+        "先别发布",
+        "不要发布",
+        "不要提交",
+        "别提交",
+        "别发布",
+        "不要合并",
+        "别合并",
+        "停止交付",
+        "暂停交付",
+        "撤回发布",
+        "不用上线",
+        "先不上线",
+        "don't publish",
+        "do not publish",
+        "don't release",
+        "do not release",
+        "don't deploy",
+        "do not deploy",
+        "don't submit",
+        "cancel the release",
+        "cancel delivery",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue))
+}
+
+/// Apply a session-persisted delivery authorization to the per-turn contract.
+///
+/// `decide_chat_contract` derives capability from the CURRENT message alone,
+/// so a user who said "提交上线" on an earlier turn finds the next turn back
+/// at `Implement` and gets asked to re-confirm delivery again — field report.
+/// Once a session has granted delivery, later non-planning turns keep
+/// `Deliver` (so fixing follow-up issues then shipping works without a repeat
+/// confirmation). Explicit planning requests stay `ReviewOnly`, and
+/// [`is_delivery_revocation`] clears the grant.
+pub fn with_persisted_delivery_authorization(
+    contract: ChatContract,
+    delivery_authorized: bool,
+) -> ChatContract {
+    if delivery_authorized && contract.capability != TurnCapability::ReviewOnly {
+        ChatContract {
+            mode: contract.mode,
+            capability: TurnCapability::Deliver,
+            grants: contract.grants,
+        }
+    } else {
+        contract
+    }
+}
+
 /// A mid-run user steer can change the hard capability at the next safe round
 /// boundary. This is separate from normal permission approval: it changes the
 /// user's objective, and therefore must reach the structural gate itself.
@@ -799,6 +860,40 @@ mod tests {
             decide_chat_contract(Some("这是只读审视方案。"), "好的").capability,
             TurnCapability::ReviewOnly
         );
+    }
+
+    #[test]
+    fn persisted_delivery_authorization_keeps_deliver_on_followup_turns() {
+        // A follow-up "fix this too" turn alone would be Implement…
+        let followup = decide_chat_contract(None, "顺便把这两个问题也修复了");
+        assert_eq!(followup.capability, TurnCapability::Implement);
+        // …but once the session granted delivery, it inherits Deliver.
+        let inherited = with_persisted_delivery_authorization(followup, true);
+        assert_eq!(inherited.capability, TurnCapability::Deliver);
+        assert_eq!(inherited.mode, followup.mode);
+        // No standing grant → the original contract is untouched.
+        let untouched = with_persisted_delivery_authorization(followup, false);
+        assert_eq!(untouched.capability, TurnCapability::Implement);
+    }
+
+    #[test]
+    fn persisted_delivery_authorization_never_overrides_explicit_planning() {
+        let planning = decide_chat_contract(None, "先系统分析，不要修改代码");
+        assert_eq!(planning.capability, TurnCapability::ReviewOnly);
+        // Even with a standing grant, an explicit planning request stays
+        // review-only — the user's current intent wins.
+        let kept = with_persisted_delivery_authorization(planning, true);
+        assert_eq!(kept.capability, TurnCapability::ReviewOnly);
+    }
+
+    #[test]
+    fn delivery_revocation_phrasings_are_recognized() {
+        assert!(is_delivery_revocation("取消发布，先等等"));
+        assert!(is_delivery_revocation("先别提交"));
+        assert!(is_delivery_revocation("don't publish yet"));
+        assert!(is_delivery_revocation("取消交付"));
+        assert!(!is_delivery_revocation("修复后提交上线"));
+        assert!(!is_delivery_revocation("继续修复"));
     }
 
     #[test]

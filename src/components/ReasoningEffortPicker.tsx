@@ -10,6 +10,9 @@ import { useChatStore } from "../stores/chat";
 import type { Settings, ReasoningEffort } from "../lib/tauri";
 
 const LEGACY_EFFORTS: ReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
+// DeepSeek's chat/completions API accepts exactly these three levels
+// (medium/xhigh are compatibility-mapped server-side).
+const DEEPSEEK_EFFORTS: ReasoningEffort[] = ["low", "high", "max"];
 const LABELS: Record<ReasoningEffort, string> = {
   minimal: "最简",
   low: "低",
@@ -20,12 +23,25 @@ const LABELS: Record<ReasoningEffort, string> = {
   ultra: "极致",
 };
 
-/** Whether the reasoning control is relevant for the current settings — only
- *  the ChatGPT/Codex endpoint honours reasoning.effort. Exported for testing. */
+function isDeepSeekEndpoint(settings: Settings | null): boolean {
+  const ep = settings?.endpoints?.[settings.default_endpoint];
+  if (!ep) return false;
+  const base = (ep.base_url ?? "").toLowerCase();
+  const models = ep.custom_models ?? [];
+  return (
+    base.includes("deepseek.com") ||
+    models.some((m) => m.id.toLowerCase().startsWith("deepseek"))
+  );
+}
+
+/** Whether the reasoning control is relevant for the current settings — the
+ *  ChatGPT/Codex endpoint honours reasoning.effort, and DeepSeek models
+ *  (deepseek.com direct or deepseek/… via OpenRouter) accept reasoning_effort
+ *  low|high|max. Exported for testing. */
 export function reasoningPickerVisible(settings: Settings | null): boolean {
   // Defensive: settings (or endpoints) may be partial while loading.
   const ep = settings?.endpoints?.[settings.default_endpoint];
-  return ep?.api_style === "chatgpt";
+  return ep?.api_style === "chatgpt" || isDeepSeekEndpoint(settings);
 }
 
 export function reasoningEffortsForModel(
@@ -34,9 +50,11 @@ export function reasoningEffortsForModel(
 ): ReasoningEffort[] {
   const endpoint = settings?.endpoints?.[settings.default_endpoint];
   const model = endpoint?.custom_models?.find((candidate) => candidate.id === modelId);
-  return model?.supported_reasoning_efforts?.length
-    ? model.supported_reasoning_efforts
-    : LEGACY_EFFORTS;
+  if (model?.supported_reasoning_efforts?.length) {
+    return model.supported_reasoning_efforts;
+  }
+  if (modelId.toLowerCase().startsWith("deepseek")) return DEEPSEEK_EFFORTS;
+  return LEGACY_EFFORTS;
 }
 
 function effectiveEffort(

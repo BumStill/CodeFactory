@@ -599,6 +599,81 @@ pub fn resolve_repo(cwd: &Path, default_branch_hint: Option<&str>) -> Result<Rep
     })
 }
 
+/// Result of looking for a sibling worktree whose feature branch is ready to
+/// deliver when the current checkout sits on the default branch.
+enum WorktreeDiscovery {
+    /// No sibling worktree carries a branch with commits ahead of the default.
+    None,
+    /// Exactly one worktree branch is ahead — that is the delivery target.
+    Single(RepoContext),
+    /// Several worktree branches are ahead; ambiguous, list them for the user.
+    Multiple(Vec<String>),
+}
+
+/// When the current checkout is on the default branch (can't open a PR from
+/// it), discover sibling worktrees whose branch has commits ahead of
+/// `origin/<default>`. The common worktree-default workflow leaves exactly one
+/// such branch; delivery should target it instead of refusing outright.
+fn discover_worktree_target(repo: &RepoContext) -> WorktreeDiscovery {
+    let Ok(porcelain) = git(
+        &repo.root,
+        &["worktree", "list", "--porcelain"],
+    ) else {
+        return WorktreeDiscovery::None;
+    };
+    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
+    for stanza in porcelain.split("\n\n") {
+        let mut dir: Option<&str> = None;
+        let mut branch: Option<&str> = None;
+        for line in stanza.lines() {
+            if let Some(d) = line.strip_prefix("worktree ") {
+                dir = Some(d);
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+                branch = Some(b);
+            }
+        }
+        let (Some(dir), Some(branch)) = (dir, branch) else { continue };
+        let dir = PathBuf::from(dir);
+        if dir == repo.root {
+            continue; // the checkout we are running from
+        }
+        if branch == repo.default_branch {
+            continue;
+        }
+        // Commits on this branch not reachable from the remote default branch
+        // mean there is work here that has not been merged yet.
+        let ahead = git(
+            &repo.root,
+            &[
+                "rev-list",
+                "--count",
+                &format!("{}/{}", repo.remote, repo.default_branch),
+                branch,
+            ],
+        )
+        .unwrap_or_default();
+        if ahead.trim() == "0" {
+            continue;
+        }
+        candidates.push((dir, branch.to_string()));
+    }
+    match candidates.len() {
+        0 => WorktreeDiscovery::None,
+        1 => {
+            let (root, branch) = candidates.into_iter().next().unwrap();
+            let remote_url = git(&root, &["remote", "get-url", &repo.remote]).ok();
+            WorktreeDiscovery::Single(RepoContext {
+                root,
+                branch,
+                default_branch: repo.default_branch.clone(),
+                remote: repo.remote.clone(),
+                remote_url,
+            })
+        }
+        n => WorktreeDiscovery::Multiple(candidates.into_iter().take(n).map(|(_, b)| b).collect()),
+    }
+}
+
 /// Normalize a repo-relative path for denylist matching.
 fn norm(p: &str) -> String {
     p.replace('\\', "/")
@@ -1054,19 +1129,49 @@ pub async fn deliver<R: DeliveryRemote>(
     }
 
     // ── Resolve repo ────────────────────────────────────────────────────────
-    let repo = match resolve_repo(cwd, default_branch_hint) {
+    let mut repo = match resolve_repo(cwd, default_branch_hint) {
         Ok(r) => r,
         Err(e) => return outcome.blocked_at(StepResult::blocked("repo", e)),
     };
     outcome.branch = Some(repo.branch.clone());
     if repo.branch == repo.default_branch {
-        return outcome.blocked_at(StepResult::blocked(
-            "repo",
-            format!(
-                "当前在默认分支 {} 上,不能从默认分支向自身开 PR;请先切到功能分支。",
-                repo.default_branch
-            ),
-        ));
+        // On the default branch we cannot open a PR from it to itself, but the
+        // worktree-default workflow leaves the feature branch in a sibling
+        // worktree while the main checkout sits on main. Discover that branch
+        // and deliver it instead of refusing outright.
+        match discover_worktree_target(&repo) {
+            WorktreeDiscovery::Single(target) => {
+                let from = repo.branch.clone();
+                repo = target;
+                outcome.branch = Some(repo.branch.clone());
+                outcome.steps.push(StepResult::ok(
+                    "repo",
+                    format!(
+                        "主 checkout 在默认分支 {from} 上；检测到 worktree 分支 {} 有未合并提交，改为以该分支为交付目标",
+                        repo.branch
+                    ),
+                ));
+            }
+            WorktreeDiscovery::Multiple(candidates) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "repo",
+                    format!(
+                        "当前在默认分支 {} 上,不能从默认分支向自身开 PR;且检测到多个 worktree 分支有待交付提交({}),请先切到目标功能分支。",
+                        repo.default_branch,
+                        candidates.join(", ")
+                    ),
+                ));
+            }
+            WorktreeDiscovery::None => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "repo",
+                    format!(
+                        "当前在默认分支 {} 上,不能从默认分支向自身开 PR;请先切到功能分支(未发现待交付的 worktree 分支)。",
+                        repo.default_branch
+                    ),
+                ));
+            }
+        }
     }
 
     // A capability gap DESCENDS the ceiling; it does not cancel the rungs below
@@ -1863,7 +1968,11 @@ fn finish(mut outcome: DeliveryOutcome, branch: &str) -> DeliveryOutcome {
 async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32) -> CiStatus {
     let deadline = timeout_secs.max(1);
     let mut waited = 0u32;
-    let step = 10u32;
+    // Exponential backoff: 10s → 20s → 40s → 60s (capped). GitHub check-runs
+    // polling is the biggest API cost of a delivery run; a fixed 10s cadence
+    // burns ~30 requests for a 5-minute CI. Backoff keeps the first polls
+    // snappy while slashing total calls on longer runs.
+    let mut interval = 10u32;
     loop {
         match remote.ci_status(sha).await {
             Ok(CiStatus::Pending) => {}
@@ -1873,11 +1982,10 @@ async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32
         if waited >= deadline {
             return CiStatus::Pending;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(
-            step.min(deadline - waited) as u64
-        ))
-        .await;
-        waited += step;
+        let sleep_secs = interval.min(deadline - waited);
+        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs as u64)).await;
+        waited += sleep_secs;
+        interval = (interval * 2).min(60);
     }
 }
 
@@ -2242,6 +2350,12 @@ fn gh_auth_status_for_host(bin: &str, hostname: &str) -> bool {
 /// user. This is the same credential file `gh auth status --hostname` checks;
 /// reading it directly works even when the `gh` binary is not in the GUI app's
 /// PATH (common on macOS with Homebrew).
+///
+/// Parsing is deliberately LOOSE about host-file structure: modern gh writes
+/// `users:`-nested entries (`users: <name>: oauth_token:`), older versions use
+/// flat `oauth_token:` at host level, and the indentation differs across gh
+/// releases. The only things we need are a `user:` key and a non-empty
+/// `oauth_token:` key under the requested host block — anything else is noise.
 fn gh_hosts_file_indicates_authenticated_for_host(hostname: &str) -> bool {
     let home = match dirs::home_dir() {
         Some(h) => h,
@@ -2252,6 +2366,14 @@ fn gh_hosts_file_indicates_authenticated_for_host(hostname: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
+    gh_hosts_content_has_auth_for_host(&content, hostname)
+}
+
+/// Testable core of the hosts.yml probe above. `gh auth status` exits non-zero
+/// both when no token exists AND when GitHub is rate-limiting the validation
+/// request, so we cannot rely on its exit code alone — the credential file is
+/// the source of truth for "is gh authenticated".
+pub fn gh_hosts_content_has_auth_for_host(content: &str, hostname: &str) -> bool {
     let header = format!("{}:", hostname.trim().to_ascii_lowercase());
     let mut in_host_block = false;
     let mut has_user = false;
@@ -2264,26 +2386,32 @@ fn gh_hosts_file_indicates_authenticated_for_host(hostname: &str) -> bool {
             has_token = false;
             continue;
         }
-        if in_host_block {
-            if t.starts_with("user:") && t.strip_prefix("user:").unwrap_or("").trim().len() > 0 {
-                has_user = true;
-            }
-            if t.starts_with("oauth_token:")
-                && !t
-                    .strip_prefix("oauth_token:")
-                    .unwrap_or("")
-                    .trim()
-                    .is_empty()
-            {
-                has_token = true;
-            }
-            if has_user && has_token {
-                return true;
-            }
-            // Any non-indented top-level key ends the selected host block.
-            if !t.starts_with(' ') && t.ends_with(':') {
-                return false;
-            }
+        if !in_host_block {
+            continue;
+        }
+        if t.starts_with("user:") && t.strip_prefix("user:").unwrap_or("").trim().len() > 0 {
+            has_user = true;
+        }
+        if t.starts_with("oauth_token:")
+            && !t
+                .strip_prefix("oauth_token:")
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+        {
+            has_token = true;
+        }
+        if has_user && has_token {
+            return true;
+        }
+        // A new top-level host header ends the selected block; anything else
+        // (nested `users:`, `git_protocol:`, …) is ignored.
+        if !t.starts_with(' ')
+            && t.ends_with(':')
+            && t.to_ascii_lowercase() != header
+            && !line.starts_with(' ')
+        {
+            in_host_block = false;
         }
     }
     false
@@ -5124,5 +5252,204 @@ Release-Urgency: hold"
             )
             .unwrap();
         }
+    }
+
+    // ── Worktree discovery: deliver from main by finding the sibling ─────────
+
+    /// Repo with `main` pushed to a bare origin, plus a sibling worktree whose
+    /// branch `feat/wt` has one commit ahead. Returns (main root, worktree dir).
+    fn repo_with_worktree_feature(tag: &str) -> (PathBuf, PathBuf) {
+        let root = make_repo(tag);
+        let origin = root.parent().unwrap().join("origin.git");
+        Command::new("git")
+            .no_window()
+            .args(["init", "--bare", "-q", origin.to_str().unwrap()])
+            .status()
+            .unwrap();
+        git(&root, &["remote", "add", "origin", origin.to_str().unwrap()]).unwrap();
+        git(&root, &["push", "-q", "origin", "main"]).unwrap();
+
+        let wt = root.parent().unwrap().join("wt-feat");
+        git(&root, &["worktree", "add", "-q", "-b", "feat/wt", wt.to_str().unwrap(), "main"]).unwrap();
+        std::fs::write(wt.join("feature.rs"), "pub fn f() {}\n").unwrap();
+        git(&wt, &["add", "-A"]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "feat(wt): work"]).unwrap();
+        (root, wt)
+    }
+
+    #[test]
+    fn default_branch_refuses_when_no_worktree_candidate() {
+        let root = make_repo("wt-none");
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: stub_calls(),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let out = rt.block_on(deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            1,
+            &DeliverOpts {
+                title: None,
+                body: None,
+                release_urgency: None,
+                requested_ceiling: None,
+                extra_excludes: vec![],
+            },
+            Some(&remote),
+            Some("main"),
+        ));
+        assert_eq!(out.reached_state, "local");
+        assert!(
+            out.summary.contains("默认分支"),
+            "summary should explain the default-branch refusal, got: {}",
+            out.summary
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn worktree_feature_branch_is_discovered_and_delivered_from_main() {
+        let (root, wt) = repo_with_worktree_feature("wt-discover");
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: stub_calls(),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let out = rt.block_on(deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            1,
+            &DeliverOpts {
+                title: None,
+                body: None,
+                release_urgency: None,
+                requested_ceiling: None,
+                extra_excludes: vec![],
+            },
+            Some(&remote),
+            Some("main"),
+        ));
+        // Delivery must NOT refuse on default branch: it found the worktree
+        // branch and opened the PR from it.
+        assert_eq!(out.branch.as_deref(), Some("feat/wt"));
+        assert_eq!(out.pr_number, Some(7));
+        assert!(
+            out.steps.iter().any(|s| s.step == "repo" && s.status == "ok"),
+            "worktree discovery should be recorded as a repo step"
+        );
+        assert_eq!(remote.calls.open_pr.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn multiple_worktree_candidates_are_reported_as_ambiguous() {
+        let (root, wt1) = repo_with_worktree_feature("wt-multi");
+        // A second sibling worktree with its own ahead branch.
+        let wt2 = root.parent().unwrap().join("wt-feat2");
+        git(&root, &["worktree", "add", "-q", "-b", "feat/wt2", wt2.to_str().unwrap(), "main"]).unwrap();
+        std::fs::write(wt2.join("feature2.rs"), "pub fn g() {}\n").unwrap();
+        git(&wt2, &["add", "-A"]).unwrap();
+        git(&wt2, &["commit", "-q", "-m", "feat(wt2): work"]).unwrap();
+
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: stub_calls(),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let out = rt.block_on(deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            1,
+            &DeliverOpts {
+                title: None,
+                body: None,
+                release_urgency: None,
+                requested_ceiling: None,
+                extra_excludes: vec![],
+            },
+            Some(&remote),
+            Some("main"),
+        ));
+        assert_eq!(out.reached_state, "local");
+        assert!(
+            out.summary.contains("多个 worktree 分支"),
+            "summary should name both candidates, got: {}",
+            out.summary
+        );
+        assert!(out.summary.contains("feat/wt"), "candidate 1 named");
+        assert!(out.summary.contains("feat/wt2"), "candidate 2 named");
+        // No PR was opened for an ambiguous choice.
+        assert_eq!(remote.calls.open_pr.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    // ── gh hosts.yml parsing: auth presence must not be misreported ─────────
+
+    #[test]
+    fn gh_hosts_content_detects_modern_nested_users_format() {
+        // Modern gh writes users-nested entries; the old parser bailed at the
+        // `users:` line and reported "not authenticated" even with a token.
+        let content = "\
+github.com:
+    users:
+        BumStill:
+            oauth_token: gho_abc123
+    user: BumStill
+    git_protocol: https
+";
+        assert!(gh_hosts_content_has_auth_for_host(content, "github.com"));
+    }
+
+    #[test]
+    fn gh_hosts_content_detects_flat_legacy_format() {
+        let content = "\
+github.com:
+    oauth_token: gho_abc123
+    user: BumStill
+";
+        assert!(gh_hosts_content_has_auth_for_host(content, "github.com"));
+    }
+
+    #[test]
+    fn gh_hosts_content_ignores_other_hosts_and_missing_tokens() {
+        // Different host block: not authenticated for github.com.
+        let other = "\
+gitlab.com:
+    user: someone
+    oauth_token: glpat_x
+";
+        assert!(!gh_hosts_content_has_auth_for_host(other, "github.com"));
+        // Host present but token empty / missing.
+        let empty_token = "\
+github.com:
+    user: BumStill
+    oauth_token:
+";
+        assert!(!gh_hosts_content_has_auth_for_host(empty_token, "github.com"));
+        let no_token = "github.com:\n    user: BumStill\n";
+        assert!(!gh_hosts_content_has_auth_for_host(no_token, "github.com"));
+    }
+
+    #[test]
+    fn gh_hosts_content_case_insensitive_host_match() {
+        let content = "\
+GITHUB.COM:
+    oauth_token: gho_abc123
+    user: BumStill
+";
+        assert!(gh_hosts_content_has_auth_for_host(content, "github.com"));
     }
 }

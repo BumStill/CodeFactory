@@ -86,6 +86,11 @@ pub struct AppState {
     pub pending_permissions: PendingPermissionMap,
     pub chat_cancels: ChatCancelMap,
     pub interjections: commands::interjections::InterjectionQueue,
+    /// Per-session delivery authorization: once the user explicitly asks a
+    /// session to deliver ("提交上线"), later turns in that session inherit
+    /// `Deliver` capability until the session ends or the user revokes it —
+    /// so follow-up fixes then shipping do not need a repeat confirmation.
+    pub delivery_authorizations: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 /// Handle the release-only Evolution smoke mode before Tauri initializes.
@@ -478,6 +483,7 @@ pub fn run() {
                 pending_permissions: Arc::new(Mutex::new(HashMap::new())),
                 chat_cancels: Arc::new(Mutex::new(HashMap::new())),
                 interjections: Arc::new(Mutex::new(HashMap::new())),
+                delivery_authorizations: Arc::new(Mutex::new(HashMap::new())),
             });
             // Manage the Arc so all commands share the same McpManager instance.
             app.manage(mcp_manager);
