@@ -18,8 +18,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../../lib/tauri", async (orig) => ({
   ...((await orig()) as object),
   invoke: mocks.invoke,
+  onChromiumProgress: mocks.listen,
 }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
 
 // Reuses the settings shape the other SettingsPage tests use: the page early
 // returns a loading state until settings resolve, so a null fixture renders
@@ -111,8 +111,8 @@ beforeEach(() => {
   mocks.writeText.mockReset();
   emit = null;
 
-  mocks.listen.mockImplementation(async (_name: string, handler: (event: unknown) => void) => {
-    emit = (payload) => handler({ payload });
+  mocks.listen.mockImplementation(async (handler: (progress: unknown) => void) => {
+    emit = (payload) => handler(payload);
     return () => {};
   });
   Object.assign(navigator, { clipboard: { writeText: mocks.writeText } });

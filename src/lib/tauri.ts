@@ -18,6 +18,35 @@ export function onSessionUpdated(
   return listen<Session>(`session_updated:${sessionId}`, (e) => handler(e.payload));
 }
 
+/// Progress while the app-managed Chromium is downloaded.
+export interface ChromiumProgress {
+  stage: "resolving" | "downloading" | "extracting" | "done";
+  received_bytes?: number;
+  total_bytes?: number | null;
+  version?: string;
+}
+
+/// Subscribe to Chromium download progress.
+///
+/// Wrapped here rather than importing `listen` in the component: a component
+/// that reaches for `@tauri-apps/api/event` directly blows up in any test that
+/// renders it without stubbing that module, because jsdom has no Tauri runtime.
+/// Every listener in this app goes through this file for that reason.
+export function onChromiumProgress(
+  handler: (progress: ChromiumProgress) => void,
+): Promise<UnlistenFn> {
+  // Outside a Tauri window there is no event bus to subscribe to, and the API
+  // throws asynchronously — which surfaces as an unhandled rejection that fails
+  // the whole test run while every test still reports as passing. Nothing can
+  // emit this event outside the app, so a no-op is the honest answer.
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+    return Promise.resolve(() => {});
+  }
+  return listen<ChromiumProgress>("browser:chromium-progress", (event) =>
+    handler(event.payload),
+  );
+}
+
 // ── Types mirroring Rust StreamEvent ────────────────────────────────────────
 
 export type StreamEvent =

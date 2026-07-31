@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import {
   invoke,
+  onChromiumProgress,
   codexLogout,
   codexAccount,
   codexLoginStart,
@@ -17,7 +18,6 @@ import {
   listBrowserSessions,
   closeBrowserSession,
 } from "../../lib/tauri";
-import { listen } from "@tauri-apps/api/event";
 import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
@@ -1819,10 +1819,7 @@ function ChromiumFallbackPanel() {
 
   useEffect(() => {
     void load();
-    const unlisten = listen<{ stage: string; received_bytes?: number; total_bytes?: number | null }>(
-      "browser:chromium-progress",
-      (event) => {
-        const payload = event.payload;
+    const unlisten = onChromiumProgress((payload) => {
         if (payload.stage === "downloading" && payload.received_bytes) {
           const mb = Math.round(payload.received_bytes / 1_000_000);
           const total = payload.total_bytes
@@ -1835,8 +1832,7 @@ function ChromiumFallbackPanel() {
           setProgress(null);
           void load();
         }
-      },
-    );
+    });
     return () => {
       void unlisten.then((off) => off());
     };
