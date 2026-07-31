@@ -487,6 +487,10 @@ export function WorkspacePage({
                   onToggleAnonymous={setDraftAnonymous}
                 />
               )}
+              <ContextUsageBar
+                sessionId={activeSession?.id}
+                onOpenUsage={onOpenUsage ? () => onOpenUsage() : undefined}
+              />
               <MessageInput
                 key={activeSession?.id ?? activeDraft?.id ?? sessionId}
                 initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
@@ -499,10 +503,6 @@ export function WorkspacePage({
                 pendingInsert={pendingInsert}
                 onInsertConsumed={() => setPendingInsert(undefined)}
                 cwd={activeCwd}
-              />
-              <ContextUsageBar
-                sessionId={activeSession?.id}
-                onOpenUsage={onOpenUsage ? () => onOpenUsage() : undefined}
               />
             </div>
           </div>

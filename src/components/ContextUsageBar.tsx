@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Combined live readout for the chat footer: token totals on the left,
-// context-window usage on the right, all in one slim row. Previously these
-// were two separate rows with emoji-prefixed labels; the user asked for a
-// tighter, professional look — single row, no colored icons.
+// Combined live readout for the chat composer header: token totals on the
+// left, context-window usage on the right, all in one slim row sitting
+// directly above the message input. Previously these were two separate rows
+// with emoji-prefixed labels; the user asked for a tighter, professional
+// look — single row, no colored icons, placed above the input box so it
+// stops stealing vertical space from the conversation area.
 
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -164,7 +166,10 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
   };
 
   return (
-    <div className="flex min-h-8 shrink-0 select-none items-center gap-3 px-4 py-1 text-xs text-gray-500">
+    <div
+      data-testid="context-usage-bar"
+      className="flex min-h-8 shrink-0 select-none items-center gap-3 border-b border-border/60 px-4 py-1 text-xs text-gray-500"
+    >
       {/* Token totals — left side, no emoji */}
       {hasTokens && (
         <div className="flex items-center gap-1 tabular-nums">
@@ -182,7 +187,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
         </div>
       )}
 
-      {/* Compression toast — middle, transient */}
+      {/* Compression toast — transient, follows the tokens */}
       {showToast && toast && (
         <span
           className="rounded-md bg-status-warning-soft px-1.5 py-0.5 text-[11px] text-status-warning"
