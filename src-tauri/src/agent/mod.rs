@@ -2668,6 +2668,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             error: None,
+            metadata: None,
             next_working_directory: None,
             duration_ms: 0,
         }

@@ -95,7 +95,7 @@ export function DraftScopeBar({
         匿名
       </button>
 
-      <span className="truncate text-[10px] text-gray-600">
+      <span className="truncate text-[11px] text-gray-600">
         {anonymous
           ? "聊完不留记录"
           : cwd
@@ -109,7 +109,7 @@ export function DraftScopeBar({
           aria-label="项目选择"
           className="absolute bottom-full left-1 z-50 mb-1 w-64 overflow-hidden rounded-lg border border-border bg-surface-2 py-1 shadow-xl"
         >
-          <p className="px-3 py-1 text-[9px] font-medium tracking-wide text-gray-600">在哪里干活</p>
+          <p className="px-3 py-1 text-[11px] font-medium tracking-wide text-gray-600">在哪里干活</p>
           <button
             type="button"
             onClick={() => {
@@ -124,7 +124,7 @@ export function DraftScopeBar({
           </button>
           {options.length > 0 && (
             <>
-              <p className="mt-1 border-t border-border px-3 pb-0.5 pt-1.5 text-[9px] font-medium tracking-wide text-gray-600">
+              <p className="mt-1 border-t border-border px-3 pb-0.5 pt-1.5 text-[11px] font-medium tracking-wide text-gray-600">
                 最近项目
               </p>
               {options.map((project) => (

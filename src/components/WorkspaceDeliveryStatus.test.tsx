@@ -53,7 +53,10 @@ describe("WorkspaceDeliveryStatus", () => {
     expect(status).toHaveTextContent("PR #175");
     expect(status).toHaveTextContent("CI 通过");
     expect(status).toHaveTextContent("已合并");
-    expect(status).toHaveTextContent("v1.63.0 已创建");
+    expect(status).toHaveTextContent("v1.63.0");
+    expect(status).toHaveTextContent("未验证上线");
+    expect(status).toHaveAttribute("data-status-tone", "progress");
+    expect(status).toHaveAttribute("aria-expanded", "false");
     expect(mocks.invoke).toHaveBeenCalledWith("workspace_delivery_status", {
       cwd: "/repo",
       branch: "feat/workspace-ui",
@@ -62,10 +65,22 @@ describe("WorkspaceDeliveryStatus", () => {
 
     await userEvent.click(status);
     const drawer = screen.getByRole("dialog", { name: "交付详情" });
+    const close = screen.getByRole("button", { name: "关闭交付详情" });
+    await waitFor(() => expect(close).toHaveFocus());
+    expect(status).toHaveAttribute("aria-expanded", "true");
     expect(drawer).toHaveTextContent("feat/workspace-ui → main");
     expect(drawer).toHaveTextContent("release artifact 可见");
     expect(drawer).toHaveTextContent("真实上线还需要 deliver_changes 的部署观察或 live verifier 通过");
+    expect(drawer).toHaveTextContent("线上验证");
+    expect(drawer).toHaveTextContent("未验证上线");
     expect(drawer).toHaveTextContent("6");
+
+    await userEvent.tab({ shift: true });
+    expect(screen.getByRole("link", { name: "打开 PR #175" })).toHaveFocus();
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "交付详情" })).not.toBeInTheDocument();
+    await waitFor(() => expect(status).toHaveFocus());
+    expect(status).toHaveAttribute("aria-expanded", "false");
   });
 
   it("does not misreport an unavailable remote as no PR", async () => {

@@ -322,8 +322,17 @@ pub fn completion_recovery_attempts_after_steer(attempts: u32) -> u32 {
 /// round as soon as its evidence ledger is complete. Interactive/Execute may
 /// still have later planned mutations, so they finalize when the model
 /// actually attempts a tool-free answer.
+///
+/// Both unattended arms qualify: `BlockOnIncomplete` (desktop Autonomous) and
+/// `Benchmark` (the eval sidecar, which has no human in the loop at all). #260
+/// narrowed this to `BlockOnIncomplete` while rewording the rule as "unattended
+/// execution" — that dropped the sidecar's tools-disabled finalization round
+/// even though the sidecar is exactly the surface the rule describes.
 pub fn completion_ready_applies(policy: FinalizationPolicy) -> bool {
-    matches!(policy, FinalizationPolicy::BlockOnIncomplete)
+    matches!(
+        policy,
+        FinalizationPolicy::BlockOnIncomplete | FinalizationPolicy::Benchmark
+    )
 }
 
 pub fn openai_tool_controls(
@@ -1214,6 +1223,9 @@ mod tests {
         assert!(completion_ready_applies(
             FinalizationPolicy::BlockOnIncomplete
         ));
+        // The eval sidecar is the most unattended surface there is; leaving it
+        // out is what broke the headless finalization round after #260.
+        assert!(completion_ready_applies(FinalizationPolicy::Benchmark));
     }
 }
 

@@ -65,6 +65,11 @@ describe("chat tool call stream events", () => {
         content: "Written 5 bytes",
         is_error: false,
         status: "done",
+        metadata: {
+          requested_ceiling: "through_release",
+          reached_state: "merged",
+          recoverable: true,
+        },
       },
       "assistant-1",
     );
@@ -73,6 +78,11 @@ describe("chat tool call stream events", () => {
     expect(toolCall).toBeTruthy();
     expect(toolCall?.status).toBe("done");
     expect(toolCall?.result).toBe("Written 5 bytes");
+    expect(toolCall?.metadata).toEqual({
+      requested_ceiling: "through_release",
+      reached_state: "merged",
+      recoverable: true,
+    });
     expect(done.pendingPermission).toBeNull();
   });
 

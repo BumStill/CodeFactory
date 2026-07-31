@@ -157,12 +157,152 @@ pub async fn merge_pr(
     repo: &str,
     number: u64,
     method: &str,
+    commit_title: Option<&str>,
+    commit_body: Option<&str>,
 ) -> Result<(), String> {
     let path = format!("/repos/{}/pulls/{}/merge", repo, number);
-    client
-        .put(&path, json!({ "merge_method": method }))
-        .await
-        .map(|_| ())
+    let payload = merge_payload(method, commit_title, commit_body);
+    let merged = client.put(&path, payload).await?;
+
+    if method != "squash" {
+        return Ok(());
+    }
+    let Some(expected_message) = commit_body else {
+        return Ok(());
+    };
+    let sha = str_val(&merged, "sha");
+    if sha.is_empty() {
+        return Err("squash merge succeeded but GitHub returned no merge commit SHA".into());
+    }
+    let commit = client.get(&format!("/repos/{repo}/commits/{sha}")).await?;
+    let message = commit
+        .get("commit")
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let missing = missing_release_metadata(expected_message, message);
+    if !missing.is_empty() {
+        return Err(format!(
+            "squash merge commit {sha} lost release metadata: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn merge_payload(method: &str, commit_title: Option<&str>, commit_body: Option<&str>) -> Value {
+    let mut payload = json!({ "merge_method": method });
+    if method == "squash" {
+        if let Some(title) = commit_title {
+            payload["commit_title"] = Value::String(title.to_string());
+        }
+        if let Some(body) = commit_body {
+            payload["commit_message"] = Value::String(body.to_string());
+        }
+    }
+    payload
+}
+
+fn release_urgency_trailers(message: &str) -> Vec<String> {
+    let lines: Vec<&str> = message.trim_end().lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|line| line.trim().is_empty())
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    lines[start..]
+        .iter()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("Release-Urgency")
+                .then(|| value.trim().to_ascii_lowercase())
+        })
+        .collect()
+}
+
+fn breaking_change_trailers(message: &str) -> Vec<String> {
+    let lines: Vec<&str> = message.trim_end().lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|line| line.trim().is_empty())
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    lines[start..]
+        .iter()
+        .filter_map(|line| {
+            let line = line.trim();
+            (line.starts_with("BREAKING CHANGE:") || line.starts_with("BREAKING-CHANGE:"))
+                .then(|| line.to_string())
+        })
+        .collect()
+}
+
+fn missing_release_metadata(expected_message: &str, actual_message: &str) -> Vec<String> {
+    let expected_urgencies = release_urgency_trailers(expected_message);
+    let actual_urgencies = release_urgency_trailers(actual_message);
+    let expected_breaking_changes = breaking_change_trailers(expected_message);
+    let actual_breaking_changes = breaking_change_trailers(actual_message);
+
+    let mut missing: Vec<String> = expected_urgencies
+        .iter()
+        .filter(|value| !actual_urgencies.contains(value))
+        .map(|value| format!("Release-Urgency: {value}"))
+        .collect();
+    missing.extend(
+        expected_breaking_changes
+            .iter()
+            .filter(|value| !actual_breaking_changes.contains(value))
+            .cloned(),
+    );
+    missing
+}
+
+#[cfg(test)]
+mod release_policy_tests {
+    use super::*;
+
+    #[test]
+    fn squash_payload_carries_the_final_commit_message() {
+        let payload = merge_payload(
+            "squash",
+            Some("fix: guarded"),
+            Some("Details\n\nBREAKING CHANGE: migration required\nRelease-Urgency: hold"),
+        );
+        assert_eq!(payload["merge_method"], "squash");
+        assert_eq!(payload["commit_title"], "fix: guarded");
+        assert_eq!(
+            payload["commit_message"],
+            "Details\n\nBREAKING CHANGE: migration required\nRelease-Urgency: hold"
+        );
+        assert_eq!(
+            release_urgency_trailers(payload["commit_message"].as_str().unwrap()),
+            vec!["hold"]
+        );
+        assert_eq!(
+            breaking_change_trailers(payload["commit_message"].as_str().unwrap()),
+            vec!["BREAKING CHANGE: migration required"]
+        );
+        assert!(missing_release_metadata(
+            payload["commit_message"].as_str().unwrap(),
+            payload["commit_message"].as_str().unwrap(),
+        )
+        .is_empty());
+        assert_eq!(
+            missing_release_metadata(
+                payload["commit_message"].as_str().unwrap(),
+                "Details\n\nRelease-Urgency: hold",
+            ),
+            vec!["BREAKING CHANGE: migration required"]
+        );
+    }
+
+    #[test]
+    fn non_squash_payload_does_not_rewrite_commit_messages() {
+        let payload = merge_payload("merge", Some("fix: guarded"), Some("Release-Urgency: hold"));
+        assert!(payload.get("commit_title").is_none());
+        assert!(payload.get("commit_message").is_none());
+    }
 }
 
 /// CI conclusion for a commit, from the GitHub Actions check-runs API.

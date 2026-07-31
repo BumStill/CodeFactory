@@ -343,8 +343,8 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
 
   return (
     <div
-      className={`border-t border-border bg-surface-1 px-4 py-3 transition-colors ${
-        dragOver ? "bg-accent/5" : ""
+      className={`px-3 pb-2 pt-1 transition-colors ${
+        dragOver ? "rounded-xl bg-status-progress-soft" : ""
       }`}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
@@ -384,14 +384,14 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
                   thumbnailClassName="block h-20 w-28 rounded-lg bg-surface-2 object-cover transition-opacity hover:opacity-90"
                   title={a.path}
                 />
-                <figcaption className="mt-1 flex max-w-28 items-center gap-1 text-[10px] text-gray-400">
+                <figcaption className="mt-1 flex max-w-28 items-center gap-1 text-[11px] text-gray-400">
                   <span className="truncate">{a.name}</span>
                   <span className="shrink-0 text-gray-600">{(a.sizeBytes / 1024).toFixed(0)}KB</span>
                 </figcaption>
                 <button
                   type="button"
                   onClick={() => removeAttachment(a.id)}
-                  className="absolute right-1 top-1 rounded-full bg-surface-0/80 p-0.5 text-gray-400 opacity-90 transition-colors hover:bg-red-500/20 hover:text-red-300"
+                  className="absolute right-1 top-1 rounded-full bg-surface-0/80 p-0.5 text-gray-400 opacity-90 transition-colors hover:bg-status-danger-soft hover:text-status-danger"
                   title="移除"
                   aria-label={`移除 ${a.name}`}
                 >
@@ -401,18 +401,18 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
             ) : (
               <span
                 key={a.id}
-                className="inline-flex items-center gap-1.5 rounded-full border border-border bg-surface-3 px-2 py-0.5 text-[11px] text-gray-300"
+                className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-border bg-surface-3 px-2.5 text-[13px] text-gray-300"
                 title={a.path}
               >
                 <Paperclip size={10} className="text-accent" />
                 <span className="max-w-[160px] truncate">{a.name}</span>
-                <span className="text-[10px] text-gray-600">
+                <span className="text-[11px] text-gray-600">
                   {(a.sizeBytes / 1024).toFixed(0)}KB
                 </span>
                 <button
                   type="button"
                   onClick={() => removeAttachment(a.id)}
-                  className="text-gray-500 hover:text-red-400"
+                  className="text-gray-500 hover:text-status-danger"
                   title="移除"
                   aria-label={`移除 ${a.name}`}
                 >
@@ -422,16 +422,16 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
             )
           ))}
           {uploading && (
-            <span className="inline-flex items-center gap-1 text-[11px] text-gray-500">
-              <Loader2 size={10} className="animate-spin" /> 保存中…
+            <span className="inline-flex items-center gap-1 text-[13px] text-gray-500">
+              <Loader2 size={10} className="animate-spin motion-reduce:animate-none" /> 保存中…
             </span>
           )}
           {attachError && (
-            <span className="text-[11px] text-red-700 dark:text-red-300">{attachError}</span>
+            <span className="text-[13px] text-status-danger">{attachError}</span>
           )}
         </div>
       )}
-      <div className="flex items-end gap-2 rounded-xl border border-border bg-surface-2 px-3 py-2 focus-within:border-accent/50 transition-colors">
+      <div className="flex items-end gap-2 rounded-2xl border border-border/80 bg-surface-2 px-3 py-2.5 shadow-sm transition-colors focus-within:border-accent/60 focus-within:shadow-md">
         <input
           ref={fileInputRef}
           type="file"
@@ -444,7 +444,8 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
           type="button"
           onClick={() => fileInputRef.current?.click()}
           disabled={!cwd || uploading}
-          className="shrink-0 rounded-lg p-1.5 transition-colors enabled:hover:bg-surface-4 text-gray-500 disabled:opacity-30"
+          aria-label="附加文件"
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-gray-500 transition-colors enabled:hover:bg-surface-4 disabled:opacity-30"
           title={cwd ? "附加文件（图片 / pptx / docx / pdf / xlsx）" : "打开项目后可附加文件"}
         >
           <Paperclip size={16} />
@@ -472,53 +473,62 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
             dragOver
               ? "松开以附加文件"
               : guidanceActive
-              ? "执行中…直接输入即可引导当前执行"
+              ? "引导当前执行…"
               : disabled
-              ? "发送消息，或用 /cwd <path> 切换目录"
-              : "发送消息 · 粘贴/拖拽/回形针附加文件（图片 · pptx · docx · pdf · xlsx）"
+              ? "选择项目，或输入 /cwd <path>"
+              : "描述任务或继续对话…"
           }
-          className="flex-1 resize-none bg-transparent text-sm text-gray-200 placeholder-gray-600 outline-none min-h-[24px] max-h-[200px] leading-6 disabled:opacity-40"
+          className="min-h-[24px] max-h-[200px] flex-1 resize-none bg-transparent text-[15px] leading-6 text-gray-200 outline-none placeholder:text-gray-600 disabled:opacity-40"
         />
         {/* Two buttons during streaming: queue-send (default, primary)
             and cancel-stream (secondary, square icon). Outside streaming
             it's just the regular send. */}
         {streaming && submitReady && (
           <button
-            onClick={() => void submit()}
+            type="button"
+            onClick={() => void submit({ forceQueue: true })}
             disabled={!submitReady}
-            className="shrink-0 rounded-lg p-1.5 transition-colors enabled:hover:bg-surface-4 text-accent"
-            title="排队（流式结束后自动发送）"
+            aria-label="排到当前执行之后"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-status-progress-soft text-status-progress transition-colors enabled:hover:brightness-95"
+            title="排到当前执行之后"
           >
             <Send size={16} />
           </button>
         )}
         <button
+          type="button"
           onClick={streaming ? onCancel : () => void submit()}
           disabled={!streaming && !submitReady}
-          className="shrink-0 rounded-lg p-1.5 transition-colors disabled:opacity-30
-            enabled:hover:bg-surface-4 text-accent disabled:text-gray-600"
+          aria-label={streaming ? "停止后续生成" : guidanceActive ? "引导当前执行" : "发送"}
+          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors disabled:opacity-30 ${
+            streaming
+              ? "bg-status-danger-soft text-status-danger hover:brightness-95"
+              : submitReady
+                ? "bg-accent text-white shadow-sm hover:bg-accent-hover"
+                : "text-gray-600"
+          }`}
           title={streaming ? "停止后续生成" : "发送(Enter)"}
         >
           {streaming ? (
             <Square size={16} />
           ) : guidanceState.kind === "pending" ? (
-            <Loader2 size={16} className="animate-spin" />
+            <Loader2 size={16} className="animate-spin motion-reduce:animate-none" />
           ) : (
             <Send size={16} />
           )}
         </button>
       </div>
-      <div className="mt-1 flex min-h-4 items-center gap-2 text-xs text-gray-700 select-none">
+      <div className="mt-1 flex min-h-4 items-center gap-2 text-[11px] text-gray-600 select-none">
         {streaming && (
           <span>停止后续生成不会撤销已经完成的修改、提交或推送</span>
         )}
         {guidanceState.kind === "success" && (
-          <span aria-live="polite" className="flex items-center gap-1 text-green-700 dark:text-green-400">
+          <span aria-live="polite" className="flex items-center gap-1 text-status-success">
             <Check size={11} /> 已送出
           </span>
         )}
         {guidanceState.kind === "error" && (
-          <span role="alert" className="truncate text-red-700 dark:text-red-300">
+          <span role="alert" className="truncate text-status-danger">
             引导发送失败：{guidanceState.message}
           </span>
         )}

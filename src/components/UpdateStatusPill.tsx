@@ -20,7 +20,7 @@ export function UpdateStatusPill() {
     return (
       <button
         onClick={() => void install()}
-        className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent/15 border border-accent/40 text-[11px] text-accent hover:bg-accent/25 transition-colors animate-pulse"
+        className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent/15 border border-accent/40 text-[11px] text-accent hover:bg-accent/25 transition-colors animate-pulse motion-reduce:animate-none"
         title={`点击下载并安装 v${phase.update.version}`}
       >
         <Download size={11} />
@@ -33,7 +33,7 @@ export function UpdateStatusPill() {
     const pct = phase.total ? Math.round((phase.received / phase.total) * 100) : 0;
     return (
       <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent/10 text-[11px] text-accent">
-        <RefreshCw size={11} className="animate-spin" />
+        <RefreshCw size={11} className="animate-spin motion-reduce:animate-none" />
         正在下载 {pct}%
       </span>
     );
@@ -56,7 +56,7 @@ export function UpdateStatusPill() {
   return (
     <button
       onClick={() => void checkNow()}
-      className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
+      className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] transition-colors ${
         errored
           ? "text-rose-400 hover:bg-rose-500/10"
           : "text-gray-600 hover:text-gray-300 hover:bg-surface-3"
@@ -72,7 +72,7 @@ export function UpdateStatusPill() {
       }
     >
       {errored && <AlertCircle size={10} />}
-      {phase.kind === "checking" && <RefreshCw size={10} className="animate-spin" />}
+      {phase.kind === "checking" && <RefreshCw size={10} className="animate-spin motion-reduce:animate-none" />}
       {versionText}
     </button>
   );

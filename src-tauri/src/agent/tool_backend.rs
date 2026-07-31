@@ -107,6 +107,7 @@ impl ToolBackend for DesktopToolBackend {
             stdout: String::new(),
             stderr: String::new(),
             error: None,
+            metadata: output.metadata,
             next_working_directory: None,
             duration_ms: 0,
         })

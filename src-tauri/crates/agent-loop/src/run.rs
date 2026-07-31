@@ -387,6 +387,7 @@ pub async fn finish_cancelled_tool_batch(
             content: content.clone(),
             is_error: true,
             status: "cancelled".into(),
+            metadata: None,
         });
     }
     events.emit(crate::types::StreamEvent::Done {
@@ -893,6 +894,7 @@ pub async fn run_agent_loop(
                         content: content.into(),
                         is_error: true,
                         status: "denied".into(),
+                        metadata: None,
                     });
                     cancelled_results.push(crate::types::ChatMessage {
                         role: "tool".into(),
@@ -1228,6 +1230,7 @@ pub async fn run_agent_loop(
                         content: content.clone(),
                         is_error: false,
                         status: "done".into(),
+                        metadata: None,
                     });
                     result_messages.push(crate::types::ChatMessage {
                         role: "tool".into(),
@@ -1333,6 +1336,7 @@ pub async fn run_agent_loop(
                         content: content.clone(),
                         is_error: true,
                         status: "denied".into(),
+                        metadata: None,
                     });
                     result_messages.push(crate::types::ChatMessage {
                         role: "tool".into(),
@@ -1363,6 +1367,7 @@ pub async fn run_agent_loop(
                                 content: cancelled_content.clone(),
                                 is_error: true,
                                 status: "cancelled".into(),
+                                metadata: None,
                             });
                             result_messages.push(crate::types::ChatMessage {
                                 role: "tool".into(),
@@ -1390,6 +1395,7 @@ pub async fn run_agent_loop(
                         content: content.clone(),
                         is_error: true,
                         status: "denied".into(),
+                        metadata: None,
                     });
                     result_messages.push(crate::types::ChatMessage {
                         role: "tool".into(),
@@ -1457,6 +1463,9 @@ pub async fn run_agent_loop(
                         duration_ms,
                     )
                     .await?;
+                if let Some(metadata) = output.metadata.as_ref() {
+                    persistence.record_tool_call_metadata(tc, metadata).await?;
+                }
 
                 // b6: the backend may report where the shell ended up (the
                 // sidecar's Harbor container tracks `cd`). Absolute paths only —
@@ -1505,6 +1514,7 @@ pub async fn run_agent_loop(
                         crate::tool::ToolExecutionStatus::Error => "error",
                     }
                     .into(),
+                    metadata: output.metadata.clone(),
                 });
 
                 result_messages.push(crate::types::ChatMessage {
@@ -1611,7 +1621,15 @@ pub async fn run_agent_loop(
                     name: None,
                     reasoning_content: None,
                 });
-            } else if !matches!(turn_capability, TurnCapability::ReviewOnly) && !evidence.completed
+            // `required_tool_response` is this round's own tool_choice: when it
+            // is set, the batch we just finished IS the forced recovery. Making
+            // that batch re-arm the flag would lock the turn into back-to-back
+            // `required` rounds — the model could never speak again until the
+            // evidence ledger closed. One forced tool, then a normal `auto`
+            // round, whether the recovery tool succeeded, failed, or was denied.
+            } else if !matches!(turn_capability, TurnCapability::ReviewOnly)
+                && !evidence.completed
+                && !required_tool_response
             {
                 require_tool_next = true;
                 messages.push(crate::types::ChatMessage {
@@ -2119,6 +2137,7 @@ mod tests {
                 },
                 stderr: String::new(),
                 error: None,
+                metadata: None,
                 next_working_directory: None,
                 duration_ms: 1,
             })
@@ -2215,6 +2234,7 @@ mod tests {
                     String::new()
                 },
                 error: failed.then(|| "test result: FAILED".into()),
+                metadata: None,
                 next_working_directory: None,
                 duration_ms: 1,
             })

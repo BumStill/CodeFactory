@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { ChevronDown, Clock3, GitBranch, Loader2 } from "lucide-react";
+import { AlertTriangle, ChevronDown, Clock3, GitBranch, Loader2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import type {
   ExternalJobState,
@@ -64,15 +64,23 @@ export function TurnProgress({
     progress.current?.kind === "external_job" && progress.current.externalJobId
       ? externalJobs.find((job) => job.id === progress.current?.externalJobId)
       : null;
+  const waiting = Boolean(plan.waitingReason);
 
   return (
     <section
       data-testid="turn-progress"
+      data-status-tone={waiting ? "warning" : "progress"}
       aria-label="任务执行路线"
-      className="w-[min(560px,calc(100vw-2rem))] rounded-xl border border-border/60 bg-surface-1/95 shadow-lg backdrop-blur"
+      className={`w-[min(560px,calc(100vw-2rem))] rounded-xl border bg-surface-1/95 shadow-lg backdrop-blur ${
+        waiting ? "border-status-warning/35" : "border-status-progress/25"
+      }`}
     >
       <div className="flex items-start gap-2 px-3 py-2">
-        <Loader2 size={14} aria-hidden="true" className="shrink-0 animate-spin text-accent motion-reduce:animate-none" />
+        {waiting ? (
+          <AlertTriangle size={14} aria-hidden="true" className="mt-0.5 shrink-0 text-status-warning" />
+        ) : (
+          <Loader2 size={14} aria-hidden="true" className="shrink-0 animate-spin text-status-progress motion-reduce:animate-none" />
+        )}
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[13px]">
             <span className="shrink-0 font-medium text-gray-200">
@@ -120,7 +128,9 @@ export function TurnProgress({
             className="mt-1.5 h-1 overflow-hidden rounded-full bg-surface-3"
           >
             <div
-              className="h-full rounded-full bg-accent transition-[width] duration-300 motion-reduce:transition-none"
+              className={`h-full rounded-full transition-[width] duration-300 motion-reduce:transition-none ${
+                waiting ? "bg-status-warning" : "bg-status-progress"
+              }`}
               style={{ width: `${progress.percent}%` }}
             />
           </div>
@@ -149,9 +159,9 @@ export function TurnProgress({
                   aria-hidden="true"
                   className={`h-1.5 w-1.5 shrink-0 rounded-full ${
                     step.status === "completed"
-                      ? "bg-green-500"
+                      ? "bg-status-success"
                       : step.status === "in_progress"
-                        ? "bg-accent"
+                        ? "bg-status-progress"
                         : "bg-gray-600"
                   }`}
                 />
@@ -176,7 +186,7 @@ export function TurnProgress({
             )}
           </div>
           {plan.waitingReason && (
-            <p role="status" className="rounded border-l-2 border-amber-500/60 bg-amber-500/5 px-2 py-1 text-amber-700 dark:text-amber-200">
+            <p role="status" className="rounded-md border-l-2 border-status-warning bg-status-warning-soft px-2 py-1 text-status-warning">
               等待 · {plan.waitingReason}
             </p>
           )}

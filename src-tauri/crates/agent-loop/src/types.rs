@@ -262,6 +262,8 @@ pub enum StreamEvent {
         content: String,
         is_error: bool,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
     },
     PermissionRequest {
         tool_call_id: String,

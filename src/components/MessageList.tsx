@@ -6,7 +6,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
-import { Check, Copy, ChevronDown, ChevronUp } from "lucide-react";
+import { AlertTriangle, Check, Copy, ChevronDown, ChevronUp } from "lucide-react";
 import { ToolCallCard } from "./ToolCallCard";
 import { ImagePreview } from "./ImagePreview";
 import { WelcomeScreen } from "./WelcomeScreen";
@@ -97,15 +97,16 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   return (
     <div className="my-2 rounded-md overflow-hidden border border-border bg-[#0d1117]">
       <div className="flex items-center justify-between px-3 py-1 bg-surface-3 border-b border-border">
-        <span className="text-[10px] uppercase tracking-wide text-gray-500 font-sans">
+        <span className="text-[11px] uppercase tracking-wide text-gray-500 font-sans">
           {lang === "text" ? "code" : lang}
         </span>
         <button
           onClick={handleCopy}
-          className="flex items-center gap-1 text-[10px] text-gray-500 hover:text-gray-200 transition-colors font-sans"
-          title="Copy"
+          className="flex min-h-7 items-center gap-1 rounded px-1.5 text-[11px] text-gray-500 transition-colors hover:bg-surface-4 hover:text-gray-200 font-sans"
+          title="复制代码"
+          aria-label={copied ? "已复制代码" : "复制代码"}
         >
-          {copied ? <><Check size={11} className="text-green-400" /> Copied</> : <><Copy size={11} /> Copy</>}
+          {copied ? <><Check size={11} className="text-status-success" /> 已复制</> : <><Copy size={11} /> 复制</>}
         </button>
       </div>
       {html ? (
@@ -206,7 +207,7 @@ const markdownComponents: Components = {
       return <CodeBlock lang={match![1]} code={code} />;
     }
     return (
-      <code className="bg-surface-3 px-1 py-0.5 rounded text-[12px] font-mono text-amber-700 dark:text-amber-200" {...props}>
+      <code className="rounded bg-accent/10 px-1 py-0.5 font-mono text-[12px] text-gray-300 ring-1 ring-inset ring-accent/10" {...props}>
         {children}
       </code>
     );
@@ -263,9 +264,9 @@ const markdownComponents: Components = {
 function TypingDots() {
   return (
     <span className="inline-flex items-center gap-1 ml-1 align-middle">
-      <span className="w-1 h-1 rounded-full bg-accent animate-typing-dot" style={{ animationDelay: "0ms" }} />
-      <span className="w-1 h-1 rounded-full bg-accent animate-typing-dot" style={{ animationDelay: "150ms" }} />
-      <span className="w-1 h-1 rounded-full bg-accent animate-typing-dot" style={{ animationDelay: "300ms" }} />
+      <span className="h-1 w-1 animate-typing-dot rounded-full bg-status-progress motion-reduce:animate-none" style={{ animationDelay: "0ms" }} />
+      <span className="h-1 w-1 animate-typing-dot rounded-full bg-status-progress motion-reduce:animate-none" style={{ animationDelay: "150ms" }} />
+      <span className="h-1 w-1 animate-typing-dot rounded-full bg-status-progress motion-reduce:animate-none" style={{ animationDelay: "300ms" }} />
     </span>
   );
 }
@@ -385,6 +386,10 @@ export function MessageList({
         ref={scrollerRef}
         className="absolute inset-0 overflow-y-auto px-4 py-4"
       >
+        <div
+          data-testid="conversation-reading-column"
+          className="mx-auto w-full max-w-[880px] pb-2"
+        >
         {activeProgressMessage && (
           <div className="sticky top-0 z-20 mb-3 flex justify-center">
             <ActiveTurnProgress
@@ -412,7 +417,7 @@ export function MessageList({
         {historyTruncated && (
           <div
             role="status"
-            className="mx-auto max-w-xl rounded-md border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-center text-[11px] text-amber-800 dark:text-amber-200/80"
+            className="mx-auto max-w-xl rounded-md border border-status-warning/25 bg-status-warning-soft/55 px-3 py-2 text-center text-[11px] text-status-warning"
           >
             为保持超长会话可用，部分超大历史内容仅显示预览或分段加载；完整原始记录仍保存在本机。
           </div>
@@ -448,6 +453,7 @@ export function MessageList({
           </div>
           );
         })}
+        </div>
       </div>
 
       {!pinned && (
@@ -455,17 +461,17 @@ export function MessageList({
           onClick={jumpToBottom}
           className={
             hasNewContent
-              ? "absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-accent/60 bg-accent/15 text-accent text-[11px] font-medium shadow-lg hover:bg-accent/25 transition-colors animate-pulse"
+              ? "absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-accent/60 bg-accent/15 text-accent text-[11px] font-medium shadow-lg hover:bg-accent/25 transition-colors animate-pulse motion-reduce:animate-none"
               : "absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1 px-2.5 py-1 rounded-full border border-border bg-surface-2 text-[11px] text-gray-300 shadow-lg hover:bg-surface-3 transition-colors"
           }
           title={
             hasNewContent
-              ? "New content arrived — click to jump to the latest and resume auto-scroll"
-              : "Jump to the latest message and resume auto-scroll"
+              ? "有新内容，点击回到最新并恢复自动跟随"
+              : "回到最新消息并恢复自动跟随"
           }
         >
           <ChevronDown size={12} />
-          {hasNewContent ? "New content" : "Jump to latest"}
+          {hasNewContent ? "有新内容" : "回到最新"}
         </button>
       )}
     </div>
@@ -482,9 +488,9 @@ function SuccessfulToolGroup({ tools }: { tools: NonNullable<UIMessage["toolCall
         onClick={() => setOpen((value) => !value)}
         className="inline-flex min-h-7 max-w-full items-center gap-1.5 rounded-md px-1.5 text-left text-[13px] text-gray-600 transition-colors hover:bg-surface-3/55 hover:text-gray-400"
       >
-        <Check size={12} className="text-green-600/70" />
+        <Check size={12} className="text-status-success/70" />
         <span>已完成 {tools.length} 个操作</span>
-        <ChevronDown size={12} className={`ml-auto transition-transform ${open ? "rotate-180" : ""}`} />
+        <ChevronDown size={12} className={`ml-auto transition-transform motion-reduce:transition-none ${open ? "rotate-180" : ""}`} />
       </button>
       {open && <div className="ml-2 border-l border-border/40 pl-2">{tools.map((tool) => <ToolCallCard key={tool.id} tc={tool} />)}</div>}
     </div>
@@ -512,7 +518,7 @@ function ActiveTurnProgress({
         data-testid="turn-activity-progress"
         className="flex max-w-[min(34rem,calc(100vw-2rem))] items-center gap-2 rounded-full border border-border bg-surface-2/95 px-3 py-1.5 text-[11px] text-gray-300 shadow-lg backdrop-blur"
       >
-        <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-accent" />
+        <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-status-progress motion-reduce:animate-none" />
         <span className="truncate">{activity?.label || "正在处理任务"}</span>
         <span className="shrink-0 text-gray-600">
           {formatDuration(Math.max(0, nowMs - startedAt))}
@@ -554,6 +560,11 @@ const MessageRow = memo(function MessageRow({
   // other row `active` is false, so this is inert.
   const nowMs = useNowTick(isStreamingTail);
   const [showAllSteps, setShowAllSteps] = useState(false);
+  const turnBoundaryFailure = Boolean(
+    msg.failureEvidence ||
+    msg.runtimeError ||
+    msg.turnActivity?.terminalReason,
+  );
 
   // A persisted turn failure (provider error that killed the turn). Red
   // notice with the raw error so it survives reloads — the 2026-07-21
@@ -562,33 +573,57 @@ const MessageRow = memo(function MessageRow({
     const persistedError = msg.content.replace(/^回合中断[::]\s*/, "");
     if (isModelRouteExhaustedError(persistedError)) {
       return (
-        <div className="space-y-1.5 text-[13px] leading-5">
-          <p className="max-w-[72ch] text-gray-300">
+        <section
+          data-testid="failure-resolution-card"
+          data-status-tone="warning"
+          aria-label="需要处理"
+          className="max-w-[72ch] space-y-2 rounded-xl border border-status-warning/25 bg-status-warning-soft/55 px-3 py-2.5 text-[13px] leading-5"
+        >
+          <div className="flex items-center gap-2">
+            <AlertTriangle
+              size={15}
+              aria-hidden="true"
+              className="shrink-0 text-status-warning"
+            />
+            <span className="font-semibold text-gray-200">需要处理</span>
+          </div>
+          <p className="text-gray-300">
             {MODEL_ROUTE_EXHAUSTED_GUIDANCE}
           </p>
-          <details className="w-fit max-w-full text-[13px] leading-5 text-gray-500">
-            <summary className="cursor-pointer select-none hover:text-gray-400">
+          <details className="border-t border-status-warning/20 pt-2 text-gray-500">
+            <summary className="w-fit cursor-pointer select-none transition-colors hover:text-gray-300">
               查看失败详情
             </summary>
-            <div className="ml-4 mt-1 max-w-[72ch] whitespace-pre-wrap break-words text-gray-600">
+            <div className="mt-1 whitespace-pre-wrap break-words text-gray-500">
               {persistedError}
             </div>
           </details>
-        </div>
+        </section>
       );
     }
     return (
-      <div className="flex justify-center">
-        <div className="max-w-[85%] rounded border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-[11px] leading-snug text-red-800 dark:text-red-200 break-words">
-          回合中断:{persistedError}
+      <section
+        data-testid="failure-resolution-card"
+        data-status-tone="danger"
+        aria-label="回合中断"
+        className="max-w-[72ch] space-y-1.5 rounded-xl border border-status-danger/25 bg-status-danger-soft/55 px-3 py-2.5 text-[13px] leading-5"
+      >
+        <div className="flex items-center gap-2 font-semibold text-gray-200">
+          <AlertTriangle
+            size={15}
+            aria-hidden="true"
+            className="shrink-0 text-status-danger"
+          />
+          回合中断
         </div>
-      </div>
+        <p className="break-words text-gray-300">{persistedError}</p>
+      </section>
     );
   }
 
   if (msg.completionState === "auth_expired") {
     return (
-      <div className="max-w-[72ch] space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+      <div className="max-w-[72ch] space-y-2 rounded-lg border border-status-warning/30 bg-status-warning-soft/55 p-3">
         <p className="text-sm font-medium text-gray-200">ChatGPT 授权已过期</p>
         <p className="text-xs leading-5 text-gray-500">
           重新验证后可以回到这个会话继续；当前失败回合不会自动重放。
@@ -602,7 +637,7 @@ const MessageRow = memo(function MessageRow({
   if (msg.completionState === "gate_warning") {
     return (
       <div className="flex justify-center">
-        <div className="max-w-[85%] rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-[11px] leading-snug text-amber-800 dark:text-amber-200 break-words whitespace-pre-wrap">
+        <div className="max-w-[85%] rounded border border-status-warning/30 bg-status-warning-soft/55 px-2.5 py-1 text-[11px] leading-snug text-status-warning break-words whitespace-pre-wrap">
           {msg.content}
         </div>
       </div>
@@ -624,7 +659,7 @@ const MessageRow = memo(function MessageRow({
     }
     return (
       <div className="flex justify-center">
-        <div className="max-w-[85%] rounded border border-sky-500/30 bg-sky-500/10 px-2.5 py-1 text-[11px] leading-snug text-sky-800 dark:text-sky-200 break-words">
+        <div className="max-w-[85%] rounded border border-status-info/30 bg-status-info-soft/55 px-2.5 py-1 text-[11px] leading-snug text-status-info break-words">
           {msg.content}
         </div>
       </div>
@@ -659,7 +694,7 @@ const MessageRow = memo(function MessageRow({
             this, and saying so is cheaper than letting the user wonder why
             nothing changed. */}
         {msg.steerPending && (
-          <span className="mt-0.5 mr-1 text-[10px] text-gray-500">等待当前步骤结束…</span>
+          <span className="mt-0.5 mr-1 text-[11px] text-gray-500">等待当前步骤结束…</span>
         )}
       </div>
     );
@@ -733,9 +768,30 @@ const MessageRow = memo(function MessageRow({
     : null;
 
   return (
-    <div className="group text-sm text-gray-200 space-y-1.5">
+    <div
+      data-testid={msg.failureEvidence ? "failure-resolution-card" : undefined}
+      data-status-tone={msg.failureEvidence ? "warning" : undefined}
+      aria-label={msg.failureEvidence ? "需要处理" : undefined}
+      className={`group space-y-1.5 text-sm text-gray-200 ${
+        msg.failureEvidence
+          ? "max-w-[72ch] rounded-xl border border-status-warning/25 bg-status-warning-soft/55 px-3 py-2.5"
+          : ""
+      }`}
+    >
+      {msg.failureEvidence && (
+        <div className="flex items-center gap-2">
+          <AlertTriangle
+            size={15}
+            aria-hidden="true"
+            className="shrink-0 text-status-warning"
+          />
+          <span className="text-[13px] font-semibold text-gray-200">
+            需要处理
+          </span>
+        </div>
+      )}
       {msg.runtimeError?.code === "AUTH_EXPIRED" && (
-        <div className="max-w-[72ch] space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+        <div className="max-w-[72ch] space-y-2 rounded-lg border border-status-warning/30 bg-status-warning-soft/55 p-3">
           <p className="text-sm font-medium text-gray-200">ChatGPT 授权已过期</p>
           <p className="text-xs leading-5 text-gray-500">
             重新验证后可以回到这个会话继续；当前失败回合不会自动重放。
@@ -760,7 +816,7 @@ const MessageRow = memo(function MessageRow({
               <ChevronDown
                 size={13}
                 aria-hidden="true"
-                className={`transition-transform ${showAllSteps ? "" : "-rotate-90"}`}
+                className={`transition-transform motion-reduce:transition-none ${showAllSteps ? "" : "-rotate-90"}`}
               />
               {showAllSteps ? "收起较早的执行过程" : "展开较早的执行过程"}
             </button>
@@ -835,34 +891,34 @@ const MessageRow = memo(function MessageRow({
             aria-live={isModelRouteSwitchNotice(action.detail) ? "polite" : undefined}
             className={
               action.kind === "warning"
-                ? "w-fit max-w-full rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] leading-snug text-amber-800 dark:text-amber-200 break-words"
+                ? "w-fit max-w-full rounded border border-status-warning/30 bg-status-warning-soft/55 px-2 py-1 text-[11px] leading-snug text-status-warning break-words"
                 : isModelRouteSwitchNotice(action.detail)
                   ? "text-[13px] leading-5 text-gray-500 break-words"
-                : "w-fit max-w-full rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1 text-[11px] leading-snug text-sky-800 dark:text-sky-200 break-words"
+                : "w-fit max-w-full rounded border border-status-info/30 bg-status-info-soft/55 px-2 py-1 text-[11px] leading-snug text-status-info break-words"
             }
           >
             {action.detail}
           </div>
         ))}
-      {!timeline && msg.content && (
+      {!timeline && msg.content ? (
         <div className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
           <MarkdownContent content={msg.content} />
           {isStreamingTail && <TypingDots />}
         </div>
-      )}
+      ) : null}
       {msg.failureEvidence && (
-        <details className="w-fit max-w-full text-[13px] leading-5 text-gray-500">
-          <summary className="cursor-pointer select-none hover:text-gray-400">
+        <details className="mt-2 max-w-full border-t border-status-warning/20 pt-2 text-[13px] leading-5 text-gray-500">
+          <summary className="w-fit cursor-pointer select-none transition-colors hover:text-gray-300">
             查看失败详情
           </summary>
-          <div className="ml-4 mt-1 max-w-[72ch] whitespace-pre-wrap break-words text-gray-600">
+          <div className="mt-1 max-w-[72ch] whitespace-pre-wrap break-words text-gray-500">
             {msg.failureEvidence}
           </div>
         </details>
       )}
       {showThinkingHint && (
-        <div className="text-xs text-gray-500 inline-flex items-center">
-          Thinking <TypingDots />
+        <div role="status" className="inline-flex items-center text-[13px] text-gray-500">
+          正在处理 <TypingDots />
         </div>
       )}
       {durationLabel && (
@@ -877,6 +933,7 @@ const MessageRow = memo(function MessageRow({
           <TurnResultSnapshot
             plan={msg.plan}
             evidence={evidence}
+            turnBoundaryFailure={turnBoundaryFailure}
             durationMs={msg.durationMs ?? null}
             processExpanded={showAllSteps}
             onToggleProcess={

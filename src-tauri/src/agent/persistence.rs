@@ -349,6 +349,24 @@ impl Persistence for SqlitePersistence {
         .map_err(perr)
     }
 
+    async fn record_tool_call_metadata(
+        &self,
+        tool_call: &ToolCall,
+        metadata: &serde_json::Value,
+    ) -> PersistResult<()> {
+        if self.anonymous {
+            return Ok(());
+        }
+        crate::trajectory::record_tool_call_metadata(
+            &self.db,
+            &self.session_id,
+            &tool_call.id,
+            metadata,
+        )
+        .await
+        .map_err(perr)
+    }
+
     async fn persist_cancelled_tool_batch(
         &self,
         remaining: &[ToolCall],

@@ -7,10 +7,10 @@
 
 use serde_json::{json, Value};
 
-use super::{ExecCtx, ToolOutput};
 #[cfg(test)]
 use super::ToolExecutionStatus;
-use crate::agent::delivery::{self, DeliverOpts};
+use super::{ExecCtx, ToolOutput};
+use crate::agent::delivery::{self, DeliverOpts, ReleaseUrgency};
 use crate::config::settings::DeliveryCeiling;
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
@@ -33,6 +33,11 @@ pub fn definition() -> ToolDefinition {
                 "properties": {
                     "title": { "type": "string", "description": "Optional PR/commit title. Defaults to a message derived from the branch + changed files." },
                     "body":  { "type": "string", "description": "Optional PR body." },
+                    "release_urgency": {
+                        "type": "string",
+                        "enum": ["immediate", "hold"],
+                        "description": "Optional release-cadence signal. `immediate` is preserved in the final commit and requests the express lane; `hold` is preserved and blocks release until the whole batch is explicitly reviewed."
+                    },
                     "ceiling": {
                         "type": "string",
                         "enum": ["off", "pr_only", "through_ci_green", "through_merge", "through_release"],
@@ -51,6 +56,10 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 
     let title = args.get("title").and_then(Value::as_str).map(String::from);
     let body = args.get("body").and_then(Value::as_str).map(String::from);
+    let release_urgency = match release_urgency_from_args(&args) {
+        Ok(value) => value,
+        Err(message) => return Ok(ToolOutput::err(message)),
+    };
     let requested_ceiling = args
         .get("ceiling")
         .and_then(Value::as_str)
@@ -59,6 +68,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let opts = DeliverOpts {
         title,
         body,
+        release_urgency,
         requested_ceiling,
         extra_excludes: settings.delivery_exclude_globs.clone(),
     };
@@ -85,11 +95,26 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 
 fn tool_output_for_outcome(outcome: &delivery::DeliveryOutcome) -> ToolOutput {
     let report = render_report(outcome);
-    if outcome.final_state == "blocked" {
+    let output = if outcome.final_state == "blocked" {
         ToolOutput::blocked(report)
     } else {
         ToolOutput::ok(report)
-    }
+    };
+    output.with_metadata(json!({
+        "status": outcome.final_state,
+        "stage": outcome.stage,
+        "code": outcome.code,
+        "recoverable": outcome.recoverable,
+        "next_action": outcome.next_action,
+        "requested_ceiling": outcome.requested_ceiling,
+        "effective_ceiling": outcome.effective_ceiling,
+        "reached_state": outcome.reached_state,
+        "capability_gap": outcome.capability_gap,
+        "branch": outcome.branch,
+        "commit_sha": outcome.commit_sha,
+        "pr_number": outcome.pr_number,
+        "pr_url": outcome.pr_url,
+    }))
 }
 
 async fn persist_delivery_ref(
@@ -138,6 +163,10 @@ fn render_report(outcome: &delivery::DeliveryOutcome) -> String {
     if let Some(branch) = &outcome.branch {
         out.push_str(&format!("分支: {branch}\n"));
     }
+    out.push_str(&format!(
+        "请求边界: {} · 实际边界: {} · 已到达: {}\n",
+        outcome.requested_ceiling, outcome.effective_ceiling, outcome.reached_state
+    ));
     for s in &outcome.steps {
         let mark = match s.status.as_str() {
             "ok" => "✅",
@@ -153,9 +182,9 @@ fn render_report(outcome: &delivery::DeliveryOutcome) -> String {
     out.push_str(&format!("\n{}", outcome.summary));
     if outcome.final_state == "blocked" {
         out.push_str(
-            "\n\n注意:本次交付已在上述步骤被阻断,你在本轮没有完成后续的 PR/合并/发布。\
+            "\n\n注意:本次交付没有达到请求边界；只能报告上面明确列出的已完成步骤。\
 即使之后查询发现仓库出现了新的合并或发布,那也是其他执行器(并行 agent 或自动化流水线)\
-完成的,不得归因为你本次的交付动作;如实报告阻断原因和已完成到哪一步即可。",
+完成的,不得归因为你本次的交付动作;如实报告缺失能力、实际到达层级和恢复动作即可。",
         );
     }
     out
@@ -170,6 +199,29 @@ fn parse_ceiling(s: &str) -> Option<DeliveryCeiling> {
         "through_release" => Some(DeliveryCeiling::ThroughRelease),
         _ => None,
     }
+}
+
+fn parse_release_urgency(s: &str) -> Option<ReleaseUrgency> {
+    match s {
+        "immediate" => Some(ReleaseUrgency::Immediate),
+        "hold" => Some(ReleaseUrgency::Hold),
+        _ => None,
+    }
+}
+
+fn release_urgency_from_args(args: &Value) -> std::result::Result<Option<ReleaseUrgency>, String> {
+    let Some(raw) = args.get("release_urgency") else {
+        return Ok(None);
+    };
+    let Some(value) = raw.as_str() else {
+        return Err("deliver_changes.release_urgency 必须是 immediate 或 hold".into());
+    };
+    parse_release_urgency(value).map(Some).ok_or_else(|| {
+        format!(
+            "无效的 deliver_changes.release_urgency: {value}; 只允许 immediate 或 hold，\
+未执行任何交付动作。"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -204,6 +256,10 @@ mod tests {
             recoverable: final_state == "blocked",
             next_action: None,
             reached_state: "local".into(),
+            requested_ceiling: "through_release".into(),
+            effective_ceiling: "through_release".into(),
+            capability_gap: None,
+            release_receipt: None,
             summary: "summary".into(),
         }
     }
@@ -225,10 +281,32 @@ mod tests {
     }
 
     #[test]
+    fn release_urgency_parser_accepts_only_the_governed_values() {
+        assert_eq!(
+            parse_release_urgency("immediate"),
+            Some(ReleaseUrgency::Immediate)
+        );
+        assert_eq!(parse_release_urgency("hold"), Some(ReleaseUrgency::Hold));
+        assert_eq!(parse_release_urgency("soon"), None);
+        assert!(
+            release_urgency_from_args(&json!({"release_urgency": "soon"}))
+                .unwrap_err()
+                .contains("未执行任何交付动作")
+        );
+        assert!(release_urgency_from_args(&json!({"release_urgency": 1})).is_err());
+        assert_eq!(release_urgency_from_args(&json!({})).unwrap(), None);
+    }
+
+    #[test]
     fn business_blocker_maps_to_blocked_tool_status() {
         let output = tool_output_for_outcome(&outcome("blocked"));
         assert_eq!(output.status, ToolExecutionStatus::Blocked);
         assert!(!output.is_error, "blocked is not a tool crash");
+        let metadata = output.metadata.expect("delivery metadata");
+        assert_eq!(metadata["recoverable"], true);
+        assert_eq!(metadata["requested_ceiling"], "through_release");
+        assert_eq!(metadata["effective_ceiling"], "through_release");
+        assert_eq!(metadata["reached_state"], "local");
     }
     #[tokio::test]
     async fn session_delivery_reference_is_durable_and_replaced_by_latest_pr() {

@@ -209,14 +209,14 @@ describe("session-native task delegation", () => {
     expect(within(header).queryByRole("group", { name: "主题" })).not.toBeInTheDocument();
   });
 
-  it("keeps pending-only delegated work out of the header because it is not user-actionable", async () => {
+  it("surfaces pending delegated work without placing the task tree in the conversation", async () => {
     fakeTasksState.tasks = { s1: [task()] };
     renderWorkspace();
 
     const conversation = screen.getByRole("main", { name: "会话窗口" });
     expect(within(conversation).queryByText("会话执行详情")).not.toBeInTheDocument();
     expect(within(conversation).queryByText("实现登录页")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "打开任务活动" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "打开任务活动" })).toHaveTextContent("待执行 1");
   });
 
   it("opens task activity for running delegated execution and keeps it out of the conversation", async () => {
@@ -230,10 +230,54 @@ describe("session-native task delegation", () => {
 
     const activity = screen.getByRole("button", { name: "打开任务活动" });
     expect(activity).toHaveTextContent("正在执行 1");
+    expect(activity).toHaveAttribute("aria-expanded", "false");
     await userEvent.click(activity);
     const drawer = screen.getByRole("dialog", { name: "任务活动" });
+    await waitFor(() => expect(screen.getByRole("button", { name: "关闭任务活动" })).toHaveFocus());
+    expect(activity).toHaveAttribute("aria-expanded", "true");
     expect(within(drawer).getByText("实现登录页")).toBeInTheDocument();
     expect(screen.queryByText("会话执行详情")).not.toBeInTheDocument();
+
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "任务活动" })).not.toBeInTheDocument();
+    await waitFor(() => expect(activity).toHaveFocus());
+    expect(activity).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("turns the session rail into a dismissible overlay at narrow or 200% zoom widths", async () => {
+    const originalMatchMedia = window.matchMedia;
+    const media = {
+      matches: true,
+      media: "(max-width: 720px)",
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    };
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: vi.fn(() => media),
+    });
+
+    const rendered = renderWorkspace();
+    expect(screen.queryByRole("complementary", { name: "会话列表" })).not.toBeInTheDocument();
+    const toggle = screen.getByRole("button", { name: "展开会话侧栏" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    await userEvent.click(toggle);
+    expect(screen.getByRole("complementary", { name: "会话列表" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "关闭会话侧栏" })).toBeInTheDocument();
+    expect(screen.getByRole("main", { name: "会话窗口" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "关闭会话侧栏" }));
+    expect(screen.queryByRole("complementary", { name: "会话列表" })).not.toBeInTheDocument();
+    rendered.unmount();
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: originalMatchMedia,
+    });
   });
 
   it("keeps legacy spec provenance visible without reopening a spec product surface", async () => {
@@ -248,13 +292,14 @@ describe("session-native task delegation", () => {
     expect(screen.queryByTitle(/规范工作台/)).not.toBeInTheDocument();
   });
 
-  it("does not surface pending-only tasks as a manual action", async () => {
+  it("shows pending-only tasks as informational activity without inventing a manual start action", async () => {
     fakeTasksState.tasks = { s1: [task()] };
     renderWorkspace();
 
-    expect(screen.queryByRole("button", { name: "打开任务活动" })).not.toBeInTheDocument();
-    expect(screen.queryByText("执行已暂停，还有 1 项等待执行。" )).not.toBeInTheDocument();
-    expect(screen.queryByText("任务已委派，由后台调度器自动执行；若长时间未开始请检查模型配置或重试委派。")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
+    expect(screen.getByText("执行已暂停，还有 1 项等待执行。" )).toBeInTheDocument();
+    expect(screen.getByText("任务已委派，由后台调度器自动执行；若长时间未开始请检查模型配置或重试委派。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /开始|继续执行/ })).not.toBeInTheDocument();
   });
 
   it("does not offer a generic continue action while a failure blocks pending work", async () => {
@@ -341,7 +386,10 @@ describe("session-native task delegation", () => {
 
     expect(screen.getByRole("button", { name: "打开任务活动" })).toHaveTextContent("模型配置待修复");
     await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
-    expect(screen.getByText("模型/Provider")).toBeInTheDocument();
+    expect(screen.getByText("模型/Provider").closest("[data-status-tone]")).toHaveAttribute(
+      "data-status-tone",
+      "danger",
+    );
 
     await userEvent.click(screen.getByRole("button", { name: "打开模型设置" }));
     expect(onOpenSettings).toHaveBeenCalledWith("endpoints");
@@ -362,7 +410,10 @@ describe("session-native task delegation", () => {
   it("labels a repairable active failure as a failed step, not a generic needs-attention count", () => {
     fakeTasksState.tasks = { s1: [task({ status: "failed", failure_attribution: { repairable: true } })] };
     renderWorkspace();
-    expect(screen.getByRole("button", { name: "打开任务活动" })).toHaveTextContent("1 个步骤失败");
+    expect(screen.getByRole("button", { name: "打开任务活动" }))
+      .toHaveTextContent("1 个步骤失败");
+    expect(screen.getByRole("button", { name: "打开任务活动" }))
+      .toHaveClass("text-status-warning");
   });
 
   it("takes an unknown blocker back to chat with the task evidence prefilled", async () => {
