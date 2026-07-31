@@ -57,37 +57,155 @@ pub struct ChromiumDriver {
     sessions: Arc<Mutex<HashMap<String, LiveSession>>>,
 }
 
+/// An explicitly configured binary, when it actually exists.
+///
+/// Separate from the env lookup so it can be tested without mutating process
+/// state that other tests in the same binary would see.
+fn override_executable(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let path = PathBuf::from(raw?);
+    // A stale or misspelled override must not shadow a working install: fall
+    // through to detection rather than failing with "no such file".
+    path.is_file().then_some(path)
+}
+
+/// Whether to launch without a window. Off unless explicitly asked for.
+fn headless_requested() -> bool {
+    matches!(
+        std::env::var("CODEFACTORY_BROWSER_HEADLESS").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// A Chrome the machine already has.
+///
+/// Chromium-family only. These all speak the DevTools protocol the driver is
+/// built on; Firefox and Safari do not, so listing them here would produce a
+/// launch that fails later instead of an honest "not found" now.
+fn system_chrome() -> Option<PathBuf> {
+    if let Some(path) = override_executable(std::env::var_os("CODEFACTORY_CHROME")) {
+        return Some(path);
+    }
+    system_chrome_candidates().into_iter().find(|path| path.is_file())
+}
+
+#[cfg(target_os = "macos")]
+fn system_chrome_candidates() -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from("/Applications")];
+    if let Some(home) = dirs::home_dir() {
+        // A per-user install is just as valid, and common on managed Macs where
+        // /Applications is not writable.
+        roots.push(home.join("Applications"));
+    }
+    let apps = [
+        ("Google Chrome.app", "Google Chrome"),
+        ("Chromium.app", "Chromium"),
+        ("Microsoft Edge.app", "Microsoft Edge"),
+    ];
+    roots
+        .iter()
+        .flat_map(|root| {
+            apps.iter()
+                .map(move |(bundle, binary)| root.join(bundle).join("Contents/MacOS").join(binary))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn system_chrome_candidates() -> Vec<PathBuf> {
+    // Chrome installs per-machine or per-user, and a 32-bit install on a 64-bit
+    // box lands in a third place — so all three roots have to be checked.
+    let roots = ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"];
+    let relative = [
+        r"Google\Chrome\Application\chrome.exe",
+        r"Chromium\Application\chrome.exe",
+        r"Microsoft\Edge\Application\msedge.exe",
+    ];
+    roots
+        .iter()
+        .filter_map(|key| std::env::var_os(key))
+        .flat_map(|root| {
+            relative
+                .iter()
+                .map(move |tail| PathBuf::from(&root).join(tail))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn system_chrome_candidates() -> Vec<PathBuf> {
+    let names = [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "microsoft-edge",
+    ];
+    // PATH first so a user's own build wins over a distro package, then the
+    // usual install roots for the case where PATH is not inherited.
+    let mut roots: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    roots.extend([PathBuf::from("/usr/bin"), PathBuf::from("/usr/local/bin"), PathBuf::from("/snap/bin")]);
+    roots
+        .iter()
+        .flat_map(|root| names.iter().map(move |name| root.join(name)))
+        .collect()
+}
+
 impl ChromiumDriver {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Resolve the downloaded browser, or explain what to do about it.
+    /// Resolve a browser to drive, or explain what to do about it.
+    ///
+    /// Order matters and is a product decision: the managed download wins when
+    /// it is there, because the user opted into it deliberately and its version
+    /// is known. But nobody should be forced through a 150 MB download to use
+    /// browser control when Chrome is already sitting on the machine, so a
+    /// system install is the fallback rather than a dead end. Either way the
+    /// launch below pins an isolated `--user-data-dir`, so driving the user's
+    /// own Chrome binary still never touches their signed-in profile — reading
+    /// pages they are already signed into is what the extension path is for.
     fn executable() -> Result<PathBuf> {
-        let platform = install::Platform::current().ok_or_else(|| {
-            AppError::Other(
-                "Browser control isn't available on this platform — no Chromium build is \
-                 published for it."
-                    .into(),
-            )
-        })?;
-        let root = install::install_root()
-            .ok_or_else(|| AppError::Other("Could not resolve the home directory".into()))?;
-        match install::detect(&root, platform) {
-            InstallState::Ready(found) => Ok(found.binary),
-            // Actionable rather than a bare failure: the caller turns this into
-            // the download prompt instead of showing the user a dead end.
-            InstallState::Missing { previous: None } => Err(AppError::Other(
-                "Chromium isn't installed yet. Enable browser control in Settings to download \
-                 it (about 150 MB, one time)."
-                    .into(),
-            )),
-            InstallState::Missing { previous: Some(_) } => Err(AppError::Other(
-                "The downloaded Chromium is incomplete. Re-run the download from Settings to \
-                 repair it."
-                    .into(),
-            )),
+        let platform = install::Platform::current();
+        let state = platform.and_then(|platform| {
+            let root = install::install_root()?;
+            Some(install::detect(&root, platform))
+        });
+        if let Some(InstallState::Ready(found)) = state {
+            return Ok(found.binary);
         }
+        if let Some(binary) = system_chrome() {
+            return Ok(binary);
+        }
+
+        // A half-written managed install with no Chrome to fall back on: repair
+        // is the one useful instruction, so don't bury it under the generic one.
+        if matches!(state, Some(InstallState::Missing { previous: Some(_) })) {
+            return Err(AppError::Other(
+                "The downloaded Chromium is incomplete, and no installed Chrome was found to \
+                 use instead. Re-run the download from Settings to repair it."
+                    .into(),
+            ));
+        }
+
+        // Actionable rather than a bare failure: the caller turns this into the
+        // download prompt instead of showing the user a dead end.
+        if platform.is_none() {
+            return Err(AppError::Other(
+                "Browser control needs Chrome. No Chromium build is published for this \
+                 platform, and no installed Chrome, Chromium or Edge was found."
+                    .into(),
+            ));
+        }
+        Err(AppError::Other(
+            "Browser control needs Chrome. Install Chrome (or Chromium/Edge) and it will be \
+             used automatically, or download the managed browser from Settings (about 150 MB, \
+             one time)."
+                .into(),
+        ))
     }
 
     /// Run `f` against the session's page, or say the session is unknown.
@@ -211,13 +329,20 @@ impl BrowserDriver for ChromiumDriver {
             }
         };
 
-        let config = BrowserConfig::builder()
+        let builder = BrowserConfig::builder()
             .chrome_executable(&executable)
-            .user_data_dir(&user_data_dir)
-            // Headed: the user has to be able to complete a sign-in, including
-            // any 2FA, in this window. A headless browser cannot be signed in
-            // to anything by a person.
-            .with_head()
+            .user_data_dir(&user_data_dir);
+        // Headed by default: the user has to be able to complete a sign-in,
+        // including any 2FA, in this window. A headless browser cannot be
+        // signed in to anything by a person. The override exists for automated
+        // environments with no desktop session (CI smokes), where there is no
+        // person to sign in either way.
+        let builder = if headless_requested() {
+            builder
+        } else {
+            builder.with_head()
+        };
+        let config = builder
             .build()
             .map_err(|error| AppError::Other(format!("Invalid browser configuration: {error}")))?;
 
@@ -396,6 +521,64 @@ fn release_profile(dir: &Option<PathBuf>, session_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_override_only_counts_when_the_binary_is_really_there() {
+        let real = std::env::current_exe().expect("test binary exists");
+        assert_eq!(
+            override_executable(Some(real.clone().into_os_string())),
+            Some(real)
+        );
+
+        // A stale override must fall through to detection instead of becoming a
+        // launch that fails with "no such file" later.
+        assert_eq!(
+            override_executable(Some("/nope/not-a-chrome".into())),
+            None,
+            "a path that does not exist must not shadow a working install"
+        );
+        assert_eq!(override_executable(None), None);
+
+        // A directory is not a binary — `exists()` would wrongly accept it.
+        let dir = std::env::temp_dir();
+        assert_eq!(override_executable(Some(dir.into_os_string())), None);
+    }
+
+    #[test]
+    fn the_candidate_list_names_only_browsers_that_speak_devtools() {
+        let candidates = system_chrome_candidates();
+        assert!(
+            !candidates.is_empty(),
+            "every supported platform must look somewhere"
+        );
+
+        // Firefox and Safari cannot be driven by this driver at all, so finding
+        // one would produce a launch that fails instead of an honest "not
+        // found" — they must never be candidates.
+        for path in &candidates {
+            let name = path.to_string_lossy().to_lowercase();
+            assert!(
+                !name.contains("firefox") && !name.contains("safari"),
+                "non-DevTools browser in the candidate list: {}",
+                path.display()
+            );
+            assert!(
+                name.contains("chrome") || name.contains("chromium") || name.contains("edge"),
+                "unexpected candidate: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn headless_is_off_unless_explicitly_asked_for() {
+        // The default has to stay headed: a user completing a 2FA sign-in in an
+        // invisible window is the one failure they cannot diagnose.
+        assert!(
+            !headless_requested(),
+            "tests run without the override, so this must be false"
+        );
+    }
 
     #[test]
     fn only_refs_minted_by_our_own_snapshot_are_accepted() {
