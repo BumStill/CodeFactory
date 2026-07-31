@@ -193,7 +193,9 @@ fn guess_context_from_name(model_id: &str) -> Option<u32> {
     // DeepSeek family
     if id.starts_with("deepseek") {
         if id.contains("v4") {
-            return Some(131_072);
+            // DeepSeek v4 ships a 1M context window (matching the model
+            // family's public spec); older chat/reasoner models stay at 64K.
+            return Some(1_000_000);
         }
         if id.contains("v3") || id.contains("chat") || id.contains("reasoner") {
             return Some(65_536);
@@ -416,7 +418,7 @@ mod tests {
     fn known_families_unchanged() {
         assert_eq!(guess("claude-3-5-sonnet"), Some(200_000));
         assert_eq!(guess("gemini-2.5-pro"), Some(2_000_000));
-        assert_eq!(guess("deepseek-v4-pro"), Some(131_072));
+        assert_eq!(guess("deepseek-v4-pro"), Some(1_000_000));
         assert_eq!(guess("gpt-4o"), Some(128_000));
         assert_eq!(guess("gpt-3.5-turbo"), Some(16_385));
         assert_eq!(guess("totally-unknown-model"), None);
