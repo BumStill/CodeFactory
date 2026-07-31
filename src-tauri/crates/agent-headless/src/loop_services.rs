@@ -28,7 +28,8 @@ use codefactory_agent_core::{
 use codefactory_agent_loop::events::EventSink;
 use codefactory_agent_loop::journal::Budget;
 use codefactory_agent_loop::services::{
-    CompactionOutcome, ContextCompactor, PermissionGateway, PermissionOutcome,
+    CompactionOutcome, ContextCompactor, PermissionDenial, PermissionDenialReason,
+    PermissionGateway, PermissionOutcome,
 };
 use codefactory_agent_loop::tool::{ToolBackend, ToolCtx, ToolError, ToolInvocationResult};
 use codefactory_agent_loop::types::{ChatMessage, MessageContent, StreamEvent, ToolCall};
@@ -187,6 +188,7 @@ where
             stdout,
             stderr,
             error,
+            metadata: None,
             next_working_directory,
             duration_ms: started.elapsed().as_millis() as u64,
         })
@@ -291,9 +293,11 @@ impl PermissionGateway for SidecarPermissions {
             .unwrap_or_default();
         match self.policy.evaluate_command(command) {
             PolicyDecision::Allow => PermissionOutcome::Allow,
-            PolicyDecision::Deny { rule, reason } => {
-                PermissionOutcome::Deny(self.format_budget_denial(&rule, &reason))
-            }
+            PolicyDecision::Deny { rule, reason } => PermissionOutcome::Deny(PermissionDenial {
+                content: self.format_budget_denial(&rule, &reason),
+                reason: PermissionDenialReason::PolicyDenied,
+                duration_ms: 0,
+            }),
         }
     }
 

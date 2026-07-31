@@ -948,7 +948,7 @@ export function SettingsPage({
             <div className="space-y-1">
               <label className="text-xs text-gray-500">自动交付上限</label>
               <p className="text-[11px] leading-5 text-gray-600">
-                代码改动测试通过后,AI 自动把工作推进到哪一步为止。默认一路合并、发布上线；如果你想人工接管,可以把边界降到 PR 或 CI。合并/发布受远端分支保护与凭据权限约束；CodeFactory 会优先使用
+                代码改动测试通过后，AI 自动把工作推进到哪一步为止。默认一路合并并创建正式发布；如果你想人工接管，可以把边界降到 PR 或 CI。正式发布只代表 release artifact 已创建，不代表部署或线上验证通过。合并/发布受远端分支保护与凭据权限约束；CodeFactory 会优先使用
                 「远程仓库」令牌，也会自动复用已登录的 GitHub CLI。
               </p>
               <select
@@ -966,7 +966,7 @@ export function SettingsPage({
                 <option value="pr_only">提交 + 推送 + 开 PR</option>
                 <option value="through_ci_green">…并等 CI 通过</option>
                 <option value="through_merge">…并合并</option>
-                <option value="through_release">…并发布上线(默认)</option>
+                <option value="through_release">…并创建正式发布(默认)</option>
               </select>
             </div>
 
@@ -1116,7 +1116,7 @@ function BrowserSessionsTab() {
             受管浏览器会话
           </h2>
           <p className="mt-1 text-xs leading-5 text-gray-400">
-            这里只显示 CodeFactory 创建的自动化浏览器。结束会话不会关闭你的普通 Chrome 窗口。
+            这里显示 CodeFactory 创建的自动化浏览器和已连接的用户 Chrome。结束受管会话会关闭自动化浏览器；断开连接只会停止控制，不会关闭你的普通 Chrome 窗口。
           </p>
         </div>
         <button
@@ -1128,6 +1128,18 @@ function BrowserSessionsTab() {
           <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           刷新
         </button>
+      </div>
+
+      <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 px-4 py-3 text-xs leading-5 text-gray-400">
+        <div className="font-medium text-gray-200">读取普通 Chrome 登录态前的一次性设置</div>
+        <div className="mt-1">
+          在普通 Chrome 打开{" "}
+          <code className="select-all rounded bg-surface-2 px-1 py-0.5 text-blue-700 dark:text-blue-300">
+            chrome://inspect/#remote-debugging
+          </code>
+          ，开启 “Allow remote debugging for this browser instance”。这是 Chrome 自己的安全边界；
+          CodeFactory 不会代替你静默开启，也不会在失败后改用本地源码冒充现网页面。
+        </div>
       </div>
 
       {error && (
@@ -1159,6 +1171,9 @@ function BrowserSessionsTab() {
               <div className="truncate text-xs font-medium text-gray-200">
                 {session.task_id ? `任务 ${session.task_id}` : `会话 ${session.owner_session_id ?? "未知"}`}
               </div>
+              <div className="mt-1 text-[10px] text-gray-500">
+                {session.kind === "attached_chrome" ? "用户 Chrome（复用现有登录）" : "CodeFactory 受管浏览器"}
+              </div>
               <div className="mt-1 truncate font-mono text-[10px] text-gray-500">
                 {session.session_id}
               </div>
@@ -1173,7 +1188,11 @@ function BrowserSessionsTab() {
               disabled={closing === session.session_id}
               className="rounded border border-red-500/30 px-2.5 py-1.5 text-xs text-red-700 hover:bg-red-500/10 disabled:opacity-50 dark:text-red-300"
             >
-              {closing === session.session_id ? "正在结束…" : "结束会话"}
+              {closing === session.session_id
+                ? "正在结束…"
+                : session.kind === "attached_chrome"
+                  ? "断开连接"
+                  : "结束会话"}
             </button>
           </div>
         ))}

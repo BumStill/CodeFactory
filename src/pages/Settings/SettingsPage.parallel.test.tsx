@@ -203,6 +203,9 @@ describe("SettingsPage parallel-task controls", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("任务 task-123")).toBeInTheDocument();
     expect(screen.getByText(/不会关闭你的普通 Chrome/)).toBeInTheDocument();
+    expect(
+      screen.getByText("chrome://inspect/#remote-debugging"),
+    ).toBeInTheDocument();
 
     fireEvent.click(
       screen.getByRole("button", {
@@ -226,8 +229,9 @@ describe("SettingsPage parallel-task controls", () => {
     expect(screen.getByRole("spinbutton")).toHaveValue(3);
     expect(screen.getByDisplayValue("共享目录(默认)")).toBeInTheDocument();
     // Delivery ceiling: a legacy settings.json (no delivery_ceiling) hydrates to
-    // release delivery by default, so approved work reaches the visible shipped result.
-    expect(screen.getByDisplayValue("…并发布上线(默认)")).toBeInTheDocument();
+    // A formal release artifact is not the same thing as a live-verifier pass.
+    expect(screen.getByDisplayValue("…并创建正式发布(默认)")).toBeInTheDocument();
+    expect(screen.queryByText(/默认一路合并、发布上线/)).not.toBeInTheDocument();
   });
 
   it("does not expose the unsupported Ultra orchestration label as a global effort", async () => {
@@ -241,7 +245,7 @@ describe("SettingsPage parallel-task controls", () => {
   it("saves the selected delivery ceiling", async () => {
     await openGeneralTab();
 
-    fireEvent.change(screen.getByDisplayValue("…并发布上线(默认)"), {
+    fireEvent.change(screen.getByDisplayValue("…并创建正式发布(默认)"), {
       target: { value: "pr_only" },
     });
     fireEvent.click(screen.getByRole("button", { name: "保存" }));

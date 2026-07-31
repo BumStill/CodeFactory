@@ -46,7 +46,7 @@ export function GitHistoryPanel({ onClose }: Props) {
           className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors"
           title="刷新"
         >
-          <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+          <RefreshCw size={12} className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
         </button>
         <button
           onClick={onClose}
@@ -59,7 +59,7 @@ export function GitHistoryPanel({ onClose }: Props) {
 
       <div className="flex-1 overflow-y-auto">
         {commits.length === 0 && !loading && (
-          <div className="text-[11px] text-gray-700 text-center pt-8">无提交</div>
+          <div className="pt-8 text-center text-[11px] text-gray-600">无提交</div>
         )}
         {loading && commits.length === 0 && (
           <div className="text-[11px] text-gray-600 text-center pt-8">加载中…</div>
@@ -79,12 +79,12 @@ export function GitHistoryPanel({ onClose }: Props) {
                 )}
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 text-[11px]">
-                    <span className="font-mono text-amber-400 shrink-0">{c.short_hash}</span>
+                    <span className="shrink-0 font-mono text-accent">{c.short_hash}</span>
                     <span className="text-gray-200 truncate flex-1">{c.message}</span>
                   </div>
-                  <div className="flex items-center gap-2 text-[10px] text-gray-600 mt-0.5">
+                  <div className="flex items-center gap-2 text-[11px] text-gray-600 mt-0.5">
                     <span className="truncate">{c.author}</span>
-                    <span className="text-gray-700">·</span>
+                    <span className="text-gray-600">·</span>
                     <span>{formatRelative(c.timestamp)}</span>
                   </div>
                 </div>
@@ -94,7 +94,7 @@ export function GitHistoryPanel({ onClose }: Props) {
                   <pre className="text-[11px] text-gray-400 whitespace-pre-wrap break-words font-mono bg-surface-2 rounded p-2 border border-border">
                     {c.message_body || c.message}
                   </pre>
-                  <div className="text-[10px] text-gray-700 mt-1.5">
+                  <div className="mt-1.5 text-[11px] text-gray-600">
                     <span className="font-mono">{c.hash}</span>
                     <span className="mx-1">·</span>
                     <span>{c.email}</span>

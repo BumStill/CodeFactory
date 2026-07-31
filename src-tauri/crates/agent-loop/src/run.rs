@@ -387,6 +387,7 @@ pub async fn finish_cancelled_tool_batch(
             content: content.clone(),
             is_error: true,
             status: "cancelled".into(),
+            metadata: None,
         });
     }
     events.emit(crate::types::StreamEvent::Done {
@@ -543,6 +544,7 @@ pub async fn run_agent_loop(
     let mut progress_tracker = codefactory_agent_core::ProgressTracker::new(progress_window as u32);
     let mut finalization_pending = false;
     let mut blocker_summary_pending = false;
+    let mut blocker_terminal_reason: Option<String> = None;
     let mut completion_summary_retry_used = false;
     let mut completion_recovery_attempts = 0_u32;
     let mut structural_denial_seen = false;
@@ -892,6 +894,7 @@ pub async fn run_agent_loop(
                         content: content.into(),
                         is_error: true,
                         status: "denied".into(),
+                        metadata: None,
                     });
                     cancelled_results.push(crate::types::ChatMessage {
                         role: "tool".into(),
@@ -954,7 +957,7 @@ pub async fn run_agent_loop(
                         "blocked",
                         "任务已在明确边界停止",
                         None,
-                        Some("tool_blocked"),
+                        blocker_terminal_reason.as_deref().or(Some("tool_blocked")),
                     )
                     .await?;
                     let (done_in, done_out) = usage
@@ -1227,6 +1230,7 @@ pub async fn run_agent_loop(
                         content: content.clone(),
                         is_error: false,
                         status: "done".into(),
+                        metadata: None,
                     });
                     result_messages.push(crate::types::ChatMessage {
                         role: "tool".into(),
@@ -1246,6 +1250,7 @@ pub async fn run_agent_loop(
                     &tc.function.name,
                     &classified_command,
                     &classified_kind,
+                    &args,
                 );
                 let capability_denied = capability_denial.is_some();
                 let inspection_denial = if inspection_budget {
@@ -1257,6 +1262,9 @@ pub async fn run_agent_loop(
                 } else {
                     None
                 };
+                let mut permission_denial_duration_ms = 0_u64;
+                let mut permission_denial_stops_chain = false;
+                let mut permission_denial_terminal_reason: Option<&'static str> = None;
                 let denial_content = if let Some(content) = capability_denial {
                     Some(content)
                 } else if let Some(denial) = inspection_denial.or_else(|| {
@@ -1279,7 +1287,13 @@ pub async fn run_agent_loop(
                 } else {
                     match permission.authorize(tc, &args, bash_cmd.as_deref()).await {
                         PermissionOutcome::Allow => None,
-                        PermissionOutcome::Deny(content) => Some(content),
+                        PermissionOutcome::Deny(denial) => {
+                            permission_denial_duration_ms = denial.duration_ms;
+                            permission_denial_stops_chain = denial.reason.stops_tool_chain();
+                            permission_denial_terminal_reason =
+                                Some(denial.reason.terminal_reason());
+                            Some(denial.content)
+                        }
                         PermissionOutcome::Cancelled => {
                             finish_cancelled_tool_batch(
                                 persistence.as_ref(),
@@ -1301,14 +1315,28 @@ pub async fn run_agent_loop(
                     if capability_denied {
                         structural_denial_seen = true;
                     }
+                    if permission_denial_stops_chain {
+                        blocked_tool_result = true;
+                        if blocker_terminal_reason.is_none() {
+                            blocker_terminal_reason =
+                                permission_denial_terminal_reason.map(str::to_owned);
+                        }
+                    }
                     persistence
-                        .record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
+                        .record_tool_call_outcome(
+                            tc,
+                            "denied",
+                            None,
+                            Some(&content),
+                            permission_denial_duration_ms,
+                        )
                         .await?;
                     events.emit(crate::types::StreamEvent::ToolResult {
                         tool_call_id: tc.id.clone(),
                         content: content.clone(),
                         is_error: true,
                         status: "denied".into(),
+                        metadata: None,
                     });
                     result_messages.push(crate::types::ChatMessage {
                         role: "tool".into(),
@@ -1318,6 +1346,40 @@ pub async fn run_agent_loop(
                         name: Some(tc.function.name.clone()),
                         reasoning_content: None,
                     });
+                    if permission_denial_stops_chain {
+                        let remaining_calls = &tool_calls[tool_index + 1..];
+                        let cancelled = persistence
+                            .persist_cancelled_tool_batch(remaining_calls)
+                            .await?;
+                        for (remaining_call, cancelled_content) in
+                            remaining_calls.iter().zip(cancelled)
+                        {
+                            let remaining_args =
+                                serde_json::from_str(&remaining_call.function.arguments)
+                                    .unwrap_or_default();
+                            events.emit(crate::types::StreamEvent::ToolCallStart {
+                                id: remaining_call.id.clone(),
+                                name: remaining_call.function.name.clone(),
+                                args: remaining_args,
+                            });
+                            events.emit(crate::types::StreamEvent::ToolResult {
+                                tool_call_id: remaining_call.id.clone(),
+                                content: cancelled_content.clone(),
+                                is_error: true,
+                                status: "cancelled".into(),
+                                metadata: None,
+                            });
+                            result_messages.push(crate::types::ChatMessage {
+                                role: "tool".into(),
+                                content: crate::types::MessageContent::Text(cancelled_content),
+                                tool_calls: None,
+                                tool_call_id: Some(remaining_call.id.clone()),
+                                name: Some(remaining_call.function.name.clone()),
+                                reasoning_content: None,
+                            });
+                        }
+                        break;
+                    }
                     continue;
                 }
 
@@ -1333,6 +1395,7 @@ pub async fn run_agent_loop(
                         content: content.clone(),
                         is_error: true,
                         status: "denied".into(),
+                        metadata: None,
                     });
                     result_messages.push(crate::types::ChatMessage {
                         role: "tool".into(),
@@ -1400,6 +1463,9 @@ pub async fn run_agent_loop(
                         duration_ms,
                     )
                     .await?;
+                if let Some(metadata) = output.metadata.as_ref() {
+                    persistence.record_tool_call_metadata(tc, metadata).await?;
+                }
 
                 // b6: the backend may report where the shell ended up (the
                 // sidecar's Harbor container tracks `cd`). Absolute paths only —
@@ -1448,6 +1514,7 @@ pub async fn run_agent_loop(
                         crate::tool::ToolExecutionStatus::Error => "error",
                     }
                     .into(),
+                    metadata: output.metadata.clone(),
                 });
 
                 result_messages.push(crate::types::ChatMessage {
@@ -1494,13 +1561,13 @@ pub async fn run_agent_loop(
                     "blocked",
                     "正在整理阻断结果",
                     None,
-                    Some("tool_blocked"),
+                    blocker_terminal_reason.as_deref().or(Some("tool_blocked")),
                 )
                 .await?;
                 messages.push(crate::types::ChatMessage {
                     role: "user".into(),
                     content: crate::types::MessageContent::Text(
-                        "工具返回了结构化 blocked。不要重试该工具；请只用已有事实生成一次简洁阻断总结，说明停在哪一步、已完成什么和下一步。".into(),
+                        "工具链已在明确边界停止。不要重试、绕过授权或把其他来源冒充等价证据；请只用已有事实生成一次简洁阻断总结，说明停在哪一步、已完成什么和下一步。".into(),
                     ),
                     tool_calls: None,
                     tool_call_id: None,
@@ -1554,7 +1621,15 @@ pub async fn run_agent_loop(
                     name: None,
                     reasoning_content: None,
                 });
-            } else if !matches!(turn_capability, TurnCapability::ReviewOnly) && !evidence.completed
+            // `required_tool_response` is this round's own tool_choice: when it
+            // is set, the batch we just finished IS the forced recovery. Making
+            // that batch re-arm the flag would lock the turn into back-to-back
+            // `required` rounds — the model could never speak again until the
+            // evidence ledger closed. One forced tool, then a normal `auto`
+            // round, whether the recovery tool succeeded, failed, or was denied.
+            } else if !matches!(turn_capability, TurnCapability::ReviewOnly)
+                && !evidence.completed
+                && !required_tool_response
             {
                 require_tool_next = true;
                 messages.push(crate::types::ChatMessage {
@@ -1862,11 +1937,15 @@ fn run_outcome_for_terminal(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
     use crate::events::CollectingEventSink;
     use crate::journal::{NullBudget, PersistResult};
-    use crate::services::{AllowAllPermissions, NoOpFactChecker, NoOpHooks};
+    use crate::services::{
+        AllowAllPermissions, NoOpFactChecker, NoOpHooks, PermissionDenial, PermissionDenialReason,
+        PermissionGateway,
+    };
     use crate::tool::{ToolBackend, ToolCtx, ToolInvocationResult};
     use crate::transport::{ModelResponse, ModelTransport, RoundOptions};
     use crate::types::{
@@ -1879,6 +1958,7 @@ mod tests {
         responses: Mutex<VecDeque<Result<ModelResponse, TransportError>>>,
         calls: Mutex<Vec<usize>>,
         requests: Mutex<Vec<Vec<ChatMessage>>>,
+        advertised_tools: Mutex<Vec<Vec<ToolDefinition>>>,
     }
 
     impl ScriptedTransport {
@@ -1887,11 +1967,19 @@ mod tests {
                 responses: Mutex::new(responses.into_iter().map(Ok).collect()),
                 calls: Mutex::new(Vec::new()),
                 requests: Mutex::new(Vec::new()),
+                advertised_tools: Mutex::new(Vec::new()),
             }
         }
 
         fn advertised_tool_counts(&self) -> Vec<usize> {
             self.calls.lock().expect("calls").clone()
+        }
+
+        /// The exact tool schemas handed to the provider each round — the only
+        /// way to prove which tools the model could actually see, and what their
+        /// descriptions told it.
+        fn advertised_tools(&self) -> Vec<Vec<ToolDefinition>> {
+            self.advertised_tools.lock().expect("tools").clone()
         }
 
         /// The exact message list handed to the provider each round — the only
@@ -1910,6 +1998,10 @@ mod tests {
             _opts: &RoundOptions,
         ) -> Result<ModelResponse, TransportError> {
             self.calls.lock().expect("calls").push(tools.len());
+            self.advertised_tools
+                .lock()
+                .expect("tools")
+                .push(tools.to_vec());
             self.requests
                 .lock()
                 .expect("requests")
@@ -2045,8 +2137,31 @@ mod tests {
                 },
                 stderr: String::new(),
                 error: None,
+                metadata: None,
                 next_working_directory: None,
                 duration_ms: 1,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct TimedOutPermission {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl PermissionGateway for TimedOutPermission {
+        async fn authorize(
+            &self,
+            _tool_call: &ToolCall,
+            _args: &serde_json::Value,
+            _bash_command: Option<&str>,
+        ) -> PermissionOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            PermissionOutcome::Deny(PermissionDenial {
+                content: "permission expired without a user decision".into(),
+                reason: PermissionDenialReason::TimedOut,
+                duration_ms: 60_000,
             })
         }
     }
@@ -2119,6 +2234,7 @@ mod tests {
                     String::new()
                 },
                 error: failed.then(|| "test result: FAILED".into()),
+                metadata: None,
                 next_working_directory: None,
                 duration_ms: 1,
             })
@@ -2348,9 +2464,7 @@ mod tests {
         let mut svc = services(transport, persistence, events.clone());
         svc.steer = steer;
 
-        run_agent_loop(inputs(), cfg, svc)
-            .await
-            .expect("loop runs");
+        run_agent_loop(inputs(), cfg, svc).await.expect("loop runs");
 
         assert!(events.events().iter().any(|event| matches!(
             event,
@@ -2400,6 +2514,177 @@ mod tests {
         assert!(!events.events().iter().any(|event| matches!(
             event,
             StreamEvent::TurnActivityUpdated { status, .. } if status == "completed"
+        )));
+    }
+
+    /// End-to-end through the real loop, not just the pure rule.
+    ///
+    /// `policy::capability_denial` unit tests prove the DECISION; they cannot
+    /// prove the WIRING — that the loop passes the tool args to the gate, that
+    /// the allowed write actually reaches the tool backend, and that the write
+    /// tools are advertised to the model in the first place. The 2026-07-30
+    /// field report was exactly a wiring problem: the rule "review turns don't
+    /// mutate" was working as written, and that was the bug.
+    #[tokio::test]
+    async fn a_review_turn_writes_its_planning_document_and_still_refuses_code() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "把这份方案落盘",
+                vec![
+                    call(
+                        "t1",
+                        "write_file",
+                        serde_json::json!({
+                            "path": "docs/plans/embedded-browser-pane.md",
+                            "content": "# 内置浏览器 pane\n",
+                        }),
+                    ),
+                    call(
+                        "t2",
+                        "write_file",
+                        serde_json::json!({
+                            "path": "src/browser/pane.rs",
+                            "content": "pub fn open() {}",
+                        }),
+                    ),
+                ],
+                0,
+            ),
+            response(
+                "方案已写入 docs/plans/embedded-browser-pane.md；代码改动等你确认后再做。",
+                vec![],
+                1,
+            ),
+        ]));
+        let events = Arc::new(CollectingEventSink::new());
+        let tools = Arc::new(CountingTools::default());
+        let mut cfg = config();
+        cfg.turn_capability = TurnCapability::ReviewOnly;
+        let mut loop_inputs = inputs();
+        loop_inputs.tool_defs = vec![
+            write_tool_definition("write_file"),
+            write_tool_definition("edit_file"),
+            tool_definition(),
+        ];
+        let mut svc = services(
+            transport.clone(),
+            Arc::new(RecordingPersistence::default()),
+            events.clone(),
+        );
+        svc.tools = tools.clone();
+
+        run_agent_loop(loop_inputs, cfg, svc)
+            .await
+            .expect("loop runs");
+
+        // The planning document really executed …
+        assert_eq!(
+            tools.executed(),
+            vec!["write_file docs/plans/embedded-browser-pane.md".to_string()],
+            "the planning document must reach the tool backend, and the code write must not"
+        );
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult { tool_call_id, status, .. }
+                if tool_call_id == "t1" && status == "done"
+        )));
+        // … and the code write in the SAME batch was still refused.
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult { tool_call_id, status, .. }
+                if tool_call_id == "t2" && status == "denied"
+        )));
+
+        // The model must SEE the write tools, carrying their document-only
+        // bound; otherwise it falls back to a shell heredoc the gate blocks.
+        let first_round = transport
+            .advertised_tools()
+            .into_iter()
+            .next()
+            .expect("at least one round");
+        let write = first_round
+            .iter()
+            .find(|definition| definition.function.name == "write_file")
+            .expect("write_file is advertised on a review turn");
+        assert!(
+            write.function.description.contains("docs/"),
+            "advertised description must state the document-only bound: {}",
+            write.function.description
+        );
+    }
+
+    fn write_tool_definition(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: name.into(),
+                description: "Create or overwrite a file with the given content.".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_timeout_stops_the_tool_chain_and_preserves_its_terminal_reason() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "读取页面",
+                vec![
+                    call("t1", "scripted", serde_json::json!({})),
+                    call(
+                        "t2",
+                        "bash",
+                        serde_json::json!({"command":"curl https://example.com"}),
+                    ),
+                ],
+                0,
+            ),
+            response("授权已过期，页面未读取。", vec![], 1),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let tools = Arc::new(CountingTools::default());
+        let permission = Arc::new(TimedOutPermission::default());
+        let mut svc = services(transport, persistence, events.clone());
+        svc.tools = tools.clone();
+        svc.permission = permission.clone();
+
+        run_agent_loop(inputs(), config(), svc)
+            .await
+            .expect("loop runs");
+
+        assert!(
+            tools.executed().is_empty(),
+            "timed-out tool must not execute"
+        );
+        assert_eq!(
+            permission.calls.load(Ordering::SeqCst),
+            1,
+            "remaining tools in the provider batch must be cancelled without another authorization attempt"
+        );
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult {
+                tool_call_id,
+                status,
+                ..
+            } if tool_call_id == "t2" && status == "cancelled"
+        )));
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated {
+                status,
+                terminal_reason: Some(reason),
+                ..
+            } if status == "blocked" && reason == "permission_timed_out"
+        )));
+        assert!(!events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated {
+                status,
+                terminal_reason: Some(reason),
+                ..
+            } if status == "blocked" && reason == "capability_denied"
         )));
     }
 

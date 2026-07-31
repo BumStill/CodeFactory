@@ -41,6 +41,8 @@ pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
     pub status: ToolExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 impl ToolOutput {
@@ -49,6 +51,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             status: ToolExecutionStatus::Done,
+            metadata: None,
         }
     }
     pub fn blocked(content: impl Into<String>) -> Self {
@@ -56,6 +59,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             status: ToolExecutionStatus::Blocked,
+            metadata: None,
         }
     }
     pub fn err(content: impl Into<String>) -> Self {
@@ -63,7 +67,13 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             status: ToolExecutionStatus::Error,
+            metadata: None,
         }
+    }
+
+    pub fn with_metadata(mut self, metadata: Value) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 }
 

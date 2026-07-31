@@ -42,31 +42,31 @@ function styleForTool(name: string): ToolStyle {
   switch (name) {
     case "read_file":
     case "read":
-      return { icon: FileText, iconClass: "text-blue-400" };
+      return { icon: FileText, iconClass: "text-status-info" };
     case "write_file":
     case "write":
-      return { icon: Save, iconClass: "text-green-400" };
+      return { icon: Save, iconClass: "text-accent" };
     case "edit_file":
     case "edit":
-      return { icon: Edit3, iconClass: "text-amber-400" };
+      return { icon: Edit3, iconClass: "text-accent" };
     case "bash":
     case "exec":
-      return { icon: TerminalSquare, iconClass: "text-purple-400" };
+      return { icon: TerminalSquare, iconClass: "text-accent" };
     case "grep":
-      return { icon: Search, iconClass: "text-cyan-400" };
+      return { icon: Search, iconClass: "text-status-info" };
     case "glob":
     case "list_files":
-      return { icon: FolderTree, iconClass: "text-cyan-400" };
+      return { icon: FolderTree, iconClass: "text-status-info" };
     case "fetch":
     case "web_fetch":
     case "web_search":
-      return { icon: Globe, iconClass: "text-pink-400" };
+      return { icon: Globe, iconClass: "text-status-info" };
     case "spawn_subagent":
     case "task":
-      return { icon: Bot, iconClass: "text-fuchsia-400" };
+      return { icon: Bot, iconClass: "text-accent" };
     case "kb_search":
     case "kb_get_chunk":
-      return { icon: BookOpen, iconClass: "text-emerald-400" };
+      return { icon: BookOpen, iconClass: "text-status-info" };
     default:
       return { icon: Wrench, iconClass: "text-accent" };
   }
@@ -277,15 +277,15 @@ function KnowledgeSourcesList({ sources }: { sources: KnowledgeSource[] }) {
         {sources.map((source, i) => (
           <div key={`${source.chunk_id ?? source.document_id ?? source.path ?? "source"}-${i}`} className="rounded border border-border bg-surface-1 px-2.5 py-2">
             <div className="flex items-center gap-2 min-w-0">
-              <BookOpen size={12} className="text-emerald-400 shrink-0" />
+              <BookOpen size={12} className="text-status-info shrink-0" />
               <span className="text-xs text-gray-200 font-medium truncate" title={source.path}>
                 {sourceDisplayName(source)}
               </span>
               {source.kind && (
-                <span className="text-[10px] uppercase text-gray-600 shrink-0">{source.kind}</span>
+                <span className="text-[11px] uppercase text-gray-600 shrink-0">{source.kind}</span>
               )}
             </div>
-            <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-gray-500 font-mono">
+            <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-gray-500 font-mono">
               {sourceLocator(source) && <span>{sourceLocator(source)}</span>}
               {source.chunk_id && <span>{source.chunk_id}</span>}
               {source.score != null && <span>score {source.score}</span>}
@@ -299,7 +299,7 @@ function KnowledgeSourcesList({ sources }: { sources: KnowledgeSource[] }) {
               </div>
             )}
             {source.path && (
-              <div className="mt-1 text-[10px] text-gray-600 font-mono truncate" title={source.path}>
+              <div className="mt-1 text-[11px] text-gray-600 font-mono truncate" title={source.path}>
                 {source.path}
               </div>
             )}
@@ -330,27 +330,27 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
 
   const statusIcon =
     tc.status === "waiting_permission" ? (
-      <ShieldQuestion size={12} className="text-amber-400 shrink-0" />
+      <ShieldQuestion size={12} className="text-status-warning shrink-0" />
     ) : tc.status === "done" && !tc.isError ? (
-      <CheckCircle size={12} className="text-green-500 shrink-0" />
+      <CheckCircle size={12} className="text-status-success shrink-0" />
     ) : tc.status === "cancelled" ? (
       <Ban size={12} className="text-gray-500 shrink-0" aria-label="已取消" />
     ) : tc.status === "blocked" ? (
-      <AlertCircle size={12} className="text-amber-400 shrink-0" aria-label="已阻断" />
+      <AlertCircle size={12} className="text-status-warning shrink-0" aria-label="已阻断" />
     ) : tc.status === "error" || tc.status === "denied" || tc.isError ? (
-      <AlertCircle size={12} className="text-red-400 shrink-0" />
+      <AlertCircle size={12} className="text-status-danger shrink-0" />
     ) : (
-      <span className="w-3 h-3 rounded-full border border-accent animate-pulse shrink-0" />
+      <span className="w-3 h-3 rounded-full border border-accent animate-pulse motion-reduce:animate-none shrink-0" />
     );
 
   const needsAttention = tc.status !== "done" || Boolean(tc.isError);
   const shellClass = needsAttention
     ? tc.status === "error" || tc.status === "denied" || tc.isError
-      ? "rounded-r-sm border-l border-red-500/50 bg-transparent"
+      ? "rounded-r-sm border-l border-status-danger/50 bg-transparent"
       : tc.status === "blocked"
-        ? "rounded-r-md border-l-2 border-amber-500/50 bg-amber-500/[0.035]"
+        ? "rounded-r-md border-l-2 border-status-warning/50 bg-status-warning-soft/55"
       : tc.status === "waiting_permission"
-        ? "rounded-r-md border-l-2 border-amber-500/40 bg-amber-500/[0.025]"
+        ? "rounded-r-md border-l-2 border-status-warning/40 bg-status-warning-soft/45"
         : "rounded-r-md border-l-2 border-accent/35 bg-accent/[0.025]"
     : "rounded-md";
 
@@ -382,12 +382,12 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
           first line of the error on the collapsed card. Full output stays
           behind the expand toggle. */}
       {!open && (tc.isError || tc.status === "error") && tc.result && (
-        <div className="ml-7 max-w-[56ch] truncate px-1.5 pb-1 text-[13px] font-mono leading-5 text-red-700 dark:text-red-300">
+        <div className="ml-7 max-w-[56ch] truncate px-1.5 pb-1 text-[13px] font-mono leading-5 text-status-danger">
           {firstNonEmptyLine(tc.result)}
         </div>
       )}
       {!open && tc.status === "blocked" && tc.result && (
-        <div className="ml-7 max-w-[56ch] truncate px-1.5 pb-1 text-[13px] leading-5 text-amber-700 dark:text-amber-300">
+        <div className="ml-7 max-w-[56ch] truncate px-1.5 pb-1 text-[13px] leading-5 text-status-warning">
           {firstNonEmptyLine(tc.result)}
         </div>
       )}
@@ -418,7 +418,7 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
           )}
           {tc.result != null && (
             <div>
-              <div className={`mb-1 ${tc.isError ? "text-red-400" : "text-gray-500"}`}>
+              <div className={`mb-1 ${tc.isError ? "text-status-danger" : "text-gray-500"}`}>
                 {tc.isError ? "error" : "output"}
               </div>
               {knowledgeSources.length > 0 && !tc.isError ? (
@@ -426,7 +426,7 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
               ) : hasDiff ? (
                 <DiffViewer output={tc.result} parsed={parsedDiff ?? undefined} />
               ) : (
-                <pre className={`whitespace-pre-wrap break-all ${tc.isError ? "text-red-700 dark:text-red-300" : "text-gray-300"}`}>
+                <pre className={`whitespace-pre-wrap break-all ${tc.isError ? "text-status-danger" : "text-gray-300"}`}>
                   {tc.result.slice(0, 2000)}
                   {tc.result.length > 2000 && "\n[truncated]"}
                 </pre>

@@ -8,6 +8,7 @@ export interface ToolCallState {
   args: string;
   result?: string;
   isError?: boolean;
+  metadata?: Record<string, unknown> | null;
   status: "waiting_permission" | "running" | "done" | "blocked" | "error" | "denied" | "cancelled";
 }
 
@@ -27,6 +28,7 @@ export interface PendingPermission {
   toolCallId: string;
   toolName: string;
   args: unknown;
+  expiresAt?: number;
 }
 
 export interface UIMessage {
@@ -103,6 +105,19 @@ export function isModelRouteExhaustedError(message: string): boolean {
   return message.startsWith(MODEL_ROUTE_EXHAUSTED_PREFIX);
 }
 
+function credentialFailureGuidance(message: string): string | null {
+  const details = message.slice(MODEL_ROUTE_EXHAUSTED_PREFIX.length);
+  const route = details.split("（", 1)[0]?.trim();
+  if (!route) return null;
+  if (details.includes("AUTH_MISSING")) {
+    return `${route} 当前不可用：尚未配置凭据。请打开模型设置配置该端点的 API Key 后重试。`;
+  }
+  if (details.includes("CREDENTIAL_ACCESS_REQUIRED")) {
+    return `${route} 当前不可用：无法读取已配置凭据。请打开模型设置重新保存该端点的 API Key 后重试。`;
+  }
+  return null;
+}
+
 export function presentChatInvocationError(error: unknown): Pick<
   UIMessage,
   "content" | "failureEvidence"
@@ -110,7 +125,7 @@ export function presentChatInvocationError(error: unknown): Pick<
   const message = String(error).replace(/^Error:\s*/i, "");
   if (isModelRouteExhaustedError(message)) {
     return {
-      content: MODEL_ROUTE_EXHAUSTED_GUIDANCE,
+      content: credentialFailureGuidance(message) ?? MODEL_ROUTE_EXHAUSTED_GUIDANCE,
       failureEvidence: message,
     };
   }
@@ -257,6 +272,7 @@ export function reduceChatStreamEvent(
           toolCallId: event.tool_call_id,
           toolName: event.tool_name,
           args: event.args,
+          expiresAt: event.expires_at,
         },
         messages: upsertToolCall(state.messages, msgId, {
           id: event.tool_call_id,
@@ -279,7 +295,13 @@ export function reduceChatStreamEvent(
           ...m,
           toolCalls: (m.toolCalls ?? []).map((tc) =>
             tc.id === event.tool_call_id
-              ? { ...tc, result: event.content, isError: event.is_error, status: nextStatus }
+              ? {
+                  ...tc,
+                  result: event.content,
+                  isError: event.is_error,
+                  status: nextStatus,
+                  metadata: event.metadata,
+                }
               : tc,
           ),
         })),
@@ -308,10 +330,11 @@ export function reduceChatStreamEvent(
         pendingPermission: null,
         messages: updateMessageById(state.messages, msgId, (m) => {
           if (modelRoutesExhausted) {
+            const presentation = presentChatInvocationError(event.message);
             return {
               ...m,
-              content: MODEL_ROUTE_EXHAUSTED_GUIDANCE,
-              failureEvidence: event.message,
+              content: presentation.content,
+              failureEvidence: presentation.failureEvidence,
               durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
             };
           }

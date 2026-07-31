@@ -227,6 +227,7 @@ impl DesktopModelTransport {
         reasoning_effort: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         let finalization_response = tool_defs.is_empty();
+        let reasoning_effort = normalize_chatgpt_reasoning_effort(reasoning_effort);
 
         let (mut access_token, mut account_id) = crate::codex_auth::valid_access_token().await?;
         // The ChatGPT backend URL is fixed — use the canonical constant rather
@@ -743,6 +744,14 @@ impl DesktopModelTransport {
     }
 }
 
+fn normalize_chatgpt_reasoning_effort(value: &str) -> &str {
+    match value {
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => value,
+        "ultra" => "max",
+        _ => "medium",
+    }
+}
+
 /// The agent-loop `ModelTransport` seam (keystone slice 4.5b). Wraps the
 /// inherent `call_openai_transport` (which the loop still calls directly until
 /// slice 4.6 switches it onto `complete`): maps the internal 4-tuple to
@@ -1113,6 +1122,13 @@ mod tests {
             name: None,
             reasoning_content: None,
         }
+    }
+
+    #[test]
+    fn chatgpt_request_never_sends_an_empty_reasoning_effort() {
+        assert_eq!(normalize_chatgpt_reasoning_effort(""), "medium");
+        assert_eq!(normalize_chatgpt_reasoning_effort("ultra"), "max");
+        assert_eq!(normalize_chatgpt_reasoning_effort("high"), "high");
     }
     fn tool_cm(id: &str, content: &str) -> ChatMessage {
         ChatMessage {

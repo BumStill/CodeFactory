@@ -8,7 +8,8 @@
 // jsdom — no real Tauri backend, so the chat store is mocked.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 const mocks = vi.hoisted(() => ({
   loadSessions: vi.fn(),
@@ -51,6 +52,17 @@ import { SessionSidebar } from "./SessionSidebar";
 
 const noop = () => {};
 
+function expectNoNestedInteractive(root: HTMLElement) {
+  const interactive = root.querySelectorAll<HTMLElement>("button, [role='button']");
+  for (const control of interactive) {
+    expect(
+      control.querySelector(
+        "button, [role='button'], input, select, textarea, a[href], [tabindex]:not([tabindex='-1'])",
+      ),
+    ).toBeNull();
+  }
+}
+
 describe("SessionSidebar", () => {
   beforeEach(() => {
     Object.values(mocks).forEach((m) => m.mockReset());
@@ -71,6 +83,38 @@ describe("SessionSidebar", () => {
     expect(screen.queryByText("独立任务")).not.toBeInTheDocument();
   });
 
+  it("filters conversations by title or project path", () => {
+    render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+    );
+
+    const search = screen.getByRole("searchbox", { name: "搜索会话" });
+    fireEvent.change(search, { target: { value: "ledger" } });
+    expect(screen.getByText("记账 app")).toBeInTheDocument();
+    expect(screen.queryByText("改图脚本")).not.toBeInTheDocument();
+
+    fireEvent.change(search, { target: { value: "旧会话" } });
+    expect(screen.getByText("CodeFactory 旧会话")).toBeInTheDocument();
+    expect(screen.queryByText("记账 app")).not.toBeInTheDocument();
+  });
+
+  it("marks a background session that is waiting for permission", () => {
+    fakeChatState.runtime = {
+      q1: {
+        streaming: true,
+        pendingPermission: { toolCallId: "tc-1", toolName: "bash", args: {} },
+      },
+    };
+    try {
+      render(
+        <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+      );
+      expect(screen.getByLabelText("等待批准")).toBeInTheDocument();
+    } finally {
+      fakeChatState.runtime = {};
+    }
+  });
+
   it("leaves a folder used once as an ordinary row, not a group", () => {
     const onOpen = vi.fn();
     render(
@@ -81,7 +125,7 @@ describe("SessionSidebar", () => {
     // row (the folder is only a subtitle), with nothing to expand and no
     // per-folder action yet. Clicking it opens that conversation directly.
     expect(screen.queryByLabelText("在 ledger 里新建会话")).not.toBeInTheDocument();
-    const row = screen.getByText("记账 app").closest('[role="button"]');
+    const row = screen.getByRole("button", { name: "打开会话 记账 app" });
     expect(row).not.toHaveAttribute("aria-expanded");
 
     fireEvent.click(screen.getByText("记账 app"));
@@ -160,10 +204,86 @@ describe("SessionSidebar", () => {
       <SessionSidebar currentSessionId="q1" onOpenSession={noop} onNewConversation={noop} />,
     );
 
-    expect(screen.getByText("改图脚本").closest('[role="button"]')).toHaveAttribute(
+    expect(screen.getByRole("button", { name: "打开会话 改图脚本" })).toHaveAttribute(
       "aria-current",
       "page",
     );
+  });
+
+  it("keeps project and session actions as sibling native controls", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <SessionSidebar currentSessionId="q1" onOpenSession={noop} onNewConversation={noop} />,
+    );
+
+    const projectToggle = screen.getByRole("button", { name: "展开项目 CodeFactory" });
+    const projectNew = screen.getByRole("button", { name: "在 CodeFactory 里新建会话" });
+    expect(projectToggle.parentElement).toBe(projectNew.parentElement);
+    expect(projectToggle).not.toContainElement(projectNew);
+    expectNoNestedInteractive(container);
+
+    await user.click(projectToggle);
+    const sessionOpen = screen.getByRole("button", { name: "打开会话 CodeFactory 主线" });
+    const sessionRow = sessionOpen.closest<HTMLElement>("[data-session-row]");
+    expect(sessionRow).not.toBeNull();
+    const sessionMenu = within(sessionRow!).getByRole("button", { name: "更多操作" });
+    expect(sessionOpen).not.toContainElement(sessionMenu);
+    expect(sessionOpen.closest("[data-session-row]")).toBe(
+      sessionMenu.closest("[data-session-row]"),
+    );
+
+    await user.click(sessionMenu);
+    await user.click(within(sessionRow!).getByRole("button", { name: "删除" }));
+    expect(within(sessionRow!).getByRole("button", { name: "确认删除" })).toBeInTheDocument();
+    expectNoNestedInteractive(container);
+  });
+
+  it("supports native keyboard activation for project, session, rename, and delete controls", async () => {
+    const user = userEvent.setup();
+    const onOpen = vi.fn();
+    render(
+      <SessionSidebar currentSessionId="q1" onOpenSession={onOpen} onNewConversation={noop} />,
+    );
+
+    const projectToggle = screen.getByRole("button", { name: "展开项目 CodeFactory" });
+    projectToggle.focus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByText("CodeFactory 主线")).toBeInTheDocument();
+    expect(onOpen).not.toHaveBeenCalled();
+
+    const collapseProject = screen.getByRole("button", { name: "收起项目 CodeFactory" });
+    collapseProject.focus();
+    await user.keyboard(" ");
+    expect(screen.queryByText("CodeFactory 主线")).not.toBeInTheDocument();
+
+    const sessionOpen = screen.getByRole("button", { name: "打开会话 改图脚本" });
+    sessionOpen.focus();
+    await user.keyboard("{Enter}");
+    expect(onOpen).toHaveBeenCalledWith("q1");
+
+    const sessionRow = sessionOpen.closest<HTMLElement>("[data-session-row]")!;
+    const menu = within(sessionRow).getByRole("button", { name: "更多操作" });
+    menu.focus();
+    await user.keyboard("{Enter}");
+    const rename = within(sessionRow).getByRole("button", { name: "重命名" });
+    rename.focus();
+    await user.keyboard("{Enter}");
+
+    const input = within(sessionRow).getByRole("textbox", { name: "重命名会话" });
+    await user.clear(input);
+    await user.type(input, "新的会话标题{Enter}");
+    expect(mocks.renameSession).toHaveBeenCalledWith("q1", "新的会话标题");
+
+    const reopenedMenu = within(sessionRow).getByRole("button", { name: "更多操作" });
+    reopenedMenu.focus();
+    await user.keyboard("{Enter}");
+    const remove = within(sessionRow).getByRole("button", { name: "删除" });
+    remove.focus();
+    await user.keyboard("{Enter}");
+    const confirm = within(sessionRow).getByRole("button", { name: "确认删除" });
+    confirm.focus();
+    await user.keyboard("{Enter}");
+    expect(mocks.deleteSession).toHaveBeenCalledWith("q1");
   });
 
   it("starts a blank conversation from + 新建 with no project attached", () => {

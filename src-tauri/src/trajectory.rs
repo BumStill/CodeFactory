@@ -179,7 +179,10 @@ pub(crate) async fn record_tool_call_finished(
     error: Option<&str>,
     duration_ms: i64,
 ) -> Result<(), AppError> {
-    if !matches!(status, "done" | "error" | "denied" | "cancelled") {
+    if !matches!(
+        status,
+        "done" | "blocked" | "error" | "denied" | "cancelled"
+    ) {
         return Err(AppError::Other(format!(
             "unsupported normalized tool-call status: {status}"
         )));
@@ -215,7 +218,10 @@ pub(crate) async fn record_terminal_tool_outcome(
     error: Option<&str>,
     duration_ms: i64,
 ) -> Result<(), AppError> {
-    if !matches!(status, "done" | "error" | "denied" | "cancelled") {
+    if !matches!(
+        status,
+        "done" | "blocked" | "error" | "denied" | "cancelled"
+    ) {
         return Err(AppError::Other(format!(
             "unsupported normalized tool-call status: {status}"
         )));
@@ -269,6 +275,54 @@ pub(crate) async fn record_terminal_tool_outcome(
     Ok(())
 }
 
+pub(crate) async fn record_tool_call_metadata(
+    pool: &SqlitePool,
+    session_id: &str,
+    provider_tool_call_id: &str,
+    metadata: &Value,
+) -> Result<(), AppError> {
+    let id = trace_record_id(session_id, provider_tool_call_id);
+    let redacted = redact_json(metadata);
+    let serialized = serde_json::to_string(&redacted)
+        .map_err(|error| AppError::Other(format!("serialize tool metadata: {error}")))?;
+    let metadata = if serialized.chars().count() <= MAX_RESULT_CHARS {
+        serialized
+    } else {
+        let bounded = redact_json_with_limit(metadata, 256);
+        let mut compact = serde_json::Map::new();
+        if let Value::Object(fields) = bounded {
+            for key in [
+                "status",
+                "stage",
+                "code",
+                "recoverable",
+                "next_action",
+                "requested_ceiling",
+                "effective_ceiling",
+                "reached_state",
+                "capability_gap",
+            ] {
+                if let Some(value) = fields.get(key) {
+                    compact.insert(key.into(), value.clone());
+                }
+            }
+        }
+        compact.insert("truncated".into(), Value::Bool(true));
+        Value::Object(compact).to_string()
+    };
+    let updated = sqlx::query("UPDATE tool_calls SET metadata = ? WHERE id = ?")
+        .bind(metadata)
+        .bind(&id)
+        .execute(pool)
+        .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::Other(format!(
+            "normalized tool call missing for metadata: {id}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +343,7 @@ mod tests {
                 tool_name TEXT NOT NULL,
                 arguments TEXT NOT NULL DEFAULT '{}',
                 result TEXT,
+                metadata TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 error TEXT,
                 duration_ms INTEGER,
@@ -314,6 +369,66 @@ mod tests {
         assert!(!redacted.contains("hunter2"));
         assert!(redacted.contains("visible"));
         assert!(redacted.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn structured_tool_metadata_is_persisted_separately_from_result_text() {
+        let pool = test_pool().await;
+        record_tool_call_started(
+            &pool,
+            "session-1",
+            "message-1",
+            "call-delivery",
+            "deliver_changes",
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        let metadata = json!({
+            "requested_ceiling": "through_release",
+            "effective_ceiling": "through_merge",
+            "reached_state": "merged",
+            "recoverable": true
+        });
+        record_tool_call_metadata(&pool, "session-1", "call-delivery", &metadata)
+            .await
+            .unwrap();
+        let stored: String = sqlx::query_scalar(
+            "SELECT metadata FROM tool_calls WHERE id = 'session-1:call-delivery'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let stored: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(stored, metadata);
+
+        let oversized = json!({
+            "status": "blocked",
+            "stage": "receipt",
+            "code": "delivery_external_state_uncertain",
+            "recoverable": false,
+            "next_action": "x".repeat(MAX_RESULT_CHARS * 2),
+            "requested_ceiling": "through_release",
+            "effective_ceiling": "through_release",
+            "reached_state": "merged",
+            "provider_noise": "y".repeat(MAX_RESULT_CHARS * 2)
+        });
+        record_tool_call_metadata(&pool, "session-1", "call-delivery", &oversized)
+            .await
+            .unwrap();
+        let stored: String = sqlx::query_scalar(
+            "SELECT metadata FROM tool_calls WHERE id = 'session-1:call-delivery'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let stored: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(stored["recoverable"], false);
+        assert_eq!(stored["requested_ceiling"], "through_release");
+        assert_eq!(stored["effective_ceiling"], "through_release");
+        assert_eq!(stored["reached_state"], "merged");
+        assert_eq!(stored["truncated"], true);
+        assert!(stored.get("provider_noise").is_none());
     }
 
     #[test]
@@ -574,6 +689,13 @@ mod tests {
                 Some("Tool call cancelled by hook."),
                 0,
             ),
+            (
+                "call-blocked",
+                "blocked",
+                Some("Chrome remote debugging must be enabled by the user."),
+                None,
+                23,
+            ),
         ] {
             record_tool_call_started(
                 &pool,
@@ -628,7 +750,7 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert!(rows.iter().all(|(role, _)| role == "tool"));
         let joined = rows
             .iter()
@@ -638,6 +760,7 @@ mod tests {
         assert!(joined.contains("call-done"));
         assert!(joined.contains("call-error"));
         assert!(joined.contains("call-denied"));
+        assert!(joined.contains("call-blocked"));
         assert!(joined.contains("visible"));
         assert!(joined.contains("recovered"));
         assert!(!joined.contains("dispatch failed"));
@@ -645,12 +768,12 @@ mod tests {
         assert!(!joined.contains("CF_EVO_ERROR_SECRET"));
 
         let terminal_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM tool_calls WHERE status IN ('done','error','denied')",
+            "SELECT COUNT(*) FROM tool_calls WHERE status IN ('done','blocked','error','denied')",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(terminal_count, 3);
+        assert_eq!(terminal_count, 4);
     }
 
     #[tokio::test]

@@ -59,8 +59,15 @@ export type StreamEvent =
       content: string;
       is_error: boolean;
       status: "done" | "blocked" | "error" | "denied" | "cancelled";
+      metadata?: Record<string, unknown> | null;
     }
-  | { type: "permission_request"; tool_call_id: string; tool_name: string; args: unknown }
+  | {
+      type: "permission_request";
+      tool_call_id: string;
+      tool_name: string;
+      args: unknown;
+      expires_at?: number;
+    }
   | { type: "done"; input_tokens: number; output_tokens: number }
   | {
       type: "context_usage";
@@ -273,6 +280,7 @@ export interface BrowserSession {
   session_id: string;
   task_id?: string | null;
   owner_session_id?: string | null;
+  kind?: "managed" | "attached_chrome";
   updated_at_unix_secs: number;
   expired: boolean;
 }

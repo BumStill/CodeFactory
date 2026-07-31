@@ -658,6 +658,7 @@ pub async fn send_message(
                 contract.mode,
             )
             .with_turn_capability(contract.capability)
+            .with_turn_grants(contract.grants)
             .with_failover_plan(route_plan)
             .with_cancel(cancel_flag)
             .with_steer(interjections);
@@ -911,6 +912,7 @@ pub async fn send_message_anonymous(
             )
             .anonymous()
             .with_turn_capability(contract.capability)
+            .with_turn_grants(contract.grants)
             .with_failover_plan(route_plan)
             .with_cancel(cancel_flag)
             .with_steer(interjections);

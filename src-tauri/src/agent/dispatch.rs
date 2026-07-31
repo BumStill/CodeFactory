@@ -33,6 +33,13 @@ use super::{AgentMode, TurnCapability};
 pub struct ChatContract {
     pub mode: AgentMode,
     pub capability: TurnCapability,
+    pub grants: TurnGrants,
+}
+
+/// Narrow user-authored grants that do not widen the turn's code capability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnGrants {
+    pub browser_read: bool,
 }
 
 /// Negation cues — substring-matched (CJK). If any appears we refuse to read
@@ -465,23 +472,90 @@ pub fn steer_capability_override(user_msg: &str) -> Option<TurnCapability> {
     None
 }
 
+fn grants_browser_read(user_msg: &str) -> bool {
+    let text = user_msg.to_ascii_lowercase();
+    if [
+        "不要打开浏览器",
+        "别打开浏览器",
+        "不要读浏览器",
+        "别读浏览器",
+        "不用打开浏览器",
+        "无需打开浏览器",
+        "do not open the browser",
+        "don't open the browser",
+        "dont open the browser",
+        "do not read the browser",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue))
+    {
+        return false;
+    }
+
+    let existing_browser_target = [
+        "本机 chrome",
+        "本机chrome",
+        "我的 chrome",
+        "我的chrome",
+        "chrome 里",
+        "chrome里",
+        "本机浏览器",
+        "我的浏览器",
+        "浏览器里",
+        "浏览器登录态",
+        "existing chrome",
+        "my chrome",
+        "local chrome",
+        "current browser",
+        "signed-in browser",
+        "logged-in browser",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue));
+    let read_action = [
+        "读一下",
+        "读取",
+        "看看",
+        "查看",
+        "打开",
+        "访问",
+        "走查",
+        "检查页面",
+        "read",
+        "inspect",
+        "browse",
+        "open",
+        "visit",
+        "check the page",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue));
+    existing_browser_target && read_action
+}
+
 pub fn decide_chat_contract(prev_assistant: Option<&str>, user_msg: &str) -> ChatContract {
+    let grants = TurnGrants {
+        browser_read: grants_browser_read(user_msg),
+    };
     if is_explicit_planning_request(user_msg) {
         return ChatContract {
             mode: AgentMode::Interactive,
             capability: TurnCapability::ReviewOnly,
+            grants,
         };
     }
     if is_delivery_request(user_msg) {
         return ChatContract {
             mode: AgentMode::Execute,
             capability: TurnCapability::Deliver,
+            grants,
         };
     }
     if is_direct_execution_request(user_msg) {
         return ChatContract {
             mode: AgentMode::Execute,
             capability: TurnCapability::Implement,
+            grants,
         };
     }
     if is_explicit_continuation_request(user_msg) {
@@ -490,6 +564,7 @@ pub fn decide_chat_contract(prev_assistant: Option<&str>, user_msg: &str) -> Cha
             capability: prev_assistant
                 .and_then(proposal_capability)
                 .unwrap_or(TurnCapability::Implement),
+            grants,
         };
     }
     let approved_proposal = prev_assistant
@@ -502,11 +577,13 @@ pub fn decide_chat_contract(prev_assistant: Option<&str>, user_msg: &str) -> Cha
             capability: approved_proposal
                 .or_else(|| prev_assistant.and_then(proposal_capability))
                 .unwrap_or(TurnCapability::Implement),
+            grants,
         };
     }
     ChatContract {
         mode: AgentMode::Interactive,
         capability: TurnCapability::ReviewOnly,
+        grants,
     }
 }
 
@@ -521,6 +598,33 @@ pub fn decide_chat_mode(prev_assistant: Option<&str>, user_msg: &str) -> AgentMo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_read_grant_comes_only_from_the_current_user_message() {
+        let contract = decide_chat_contract(
+            Some("我可以读取 Chrome，是否开始？"),
+            "你去读一下我本机 Chrome 里的产品现网看看",
+        );
+        assert_eq!(contract.capability, TurnCapability::ReviewOnly);
+        assert!(contract.grants.browser_read);
+
+        assert!(
+            !decide_chat_contract(Some("我可以读取 Chrome，是否开始？"), "只分析现有截图")
+                .grants
+                .browser_read
+        );
+        assert!(
+            !decide_chat_contract(None, "不要打开浏览器，只分析截图")
+                .grants
+                .browser_read
+        );
+        assert!(
+            !decide_chat_contract(None, "打开这个公开网页看看")
+                .grants
+                .browser_read,
+            "a public-page request must not authorize attaching signed-in Chrome"
+        );
+    }
 
     #[test]
     fn pending_proposal_detects_trailing_question_both_scripts() {
@@ -728,11 +832,7 @@ mod tests {
             );
         }
         assert_eq!(
-            decide_chat_contract(
-                Some("我会修复、开 PR、合并并发布。"),
-                "可以，继续",
-            )
-            .capability,
+            decide_chat_contract(Some("我会修复、开 PR、合并并发布。"), "可以，继续",).capability,
             TurnCapability::Deliver,
         );
     }

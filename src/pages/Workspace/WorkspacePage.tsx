@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   BookOpen,
@@ -97,7 +97,29 @@ export function WorkspacePage({
       return false;
     }
   });
+  const [narrowViewport, setNarrowViewport] = useState(() =>
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(max-width: 720px)").matches,
+  );
+  const [narrowSidebarOpen, setNarrowSidebarOpen] = useState(false);
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia("(max-width: 720px)");
+    const syncViewport = () => setNarrowViewport(media.matches);
+    syncViewport();
+    media.addEventListener("change", syncViewport);
+    return () => media.removeEventListener("change", syncViewport);
+  }, []);
+  useEffect(() => {
+    if (narrowViewport) setNarrowSidebarOpen(false);
+  }, [narrowViewport, sessionId]);
+  const sidebarVisible = narrowViewport ? narrowSidebarOpen : !sidebarCollapsed;
   const toggleSidebar = () => {
+    if (narrowViewport) {
+      setNarrowSidebarOpen((open) => !open);
+      return;
+    }
     setSidebarCollapsed((collapsed) => {
       const next = !collapsed;
       try {
@@ -159,13 +181,14 @@ export function WorkspacePage({
   const blockedTasks = failedTasks.filter((task) => task.failure_attribution?.repairable === false);
   const taskBlockedCount = blockedTasks.length;
   const taskProviderBlockedCount = blockedTasks.filter((task) => task.failure_attribution?.kind === "model-provider").length;
-  const taskActivityVisible = taskRunningCount + taskFailedCount > 0;
+  const taskActivityVisible = taskPendingCount + taskRunningCount + taskFailedCount > 0;
   const [taskActivityOpen, setTaskActivityOpen] = useState(Boolean(initialTaskLogId));
   const taskActivityButtonRef = useRef<HTMLButtonElement>(null);
-  const closeTaskActivity = () => {
+  const taskActivityDialogRef = useRef<HTMLElement>(null);
+  const closeTaskActivity = useCallback(() => {
     setTaskActivityOpen(false);
     requestAnimationFrame(() => taskActivityButtonRef.current?.focus());
-  };
+  }, []);
   const loadProjectTasks = useTasksStore((state) => state.loadTasks);
   const subscribeProjectTasks = useTasksStore((state) => state.subscribe);
   const isProjectSession = Boolean(
@@ -207,30 +230,57 @@ export function WorkspacePage({
 
   useEffect(() => {
     if (!taskActivityOpen) return;
+    const dialog = taskActivityDialogRef.current;
+    requestAnimationFrame(() => {
+      dialog?.querySelector<HTMLElement>("[data-dialog-initial-focus]")?.focus();
+    });
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeTaskActivity();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeTaskActivity();
+        return;
+      }
+      if (event.key !== "Tab" || !dialog) return;
+      const focusable = Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hasAttribute("hidden"));
+      if (focusable.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [taskActivityOpen]);
+  }, [closeTaskActivity, taskActivityOpen]);
 
   return (
     <div className="h-full flex flex-col bg-surface-0">
 
       {/* ── Header ────────────────────────────────────────────────────────── */}
-      <header aria-label="会话工具栏" className="flex items-center gap-3 px-3 py-1.5 border-b border-border bg-surface-1 shrink-0">
+      <header aria-label="会话工具栏" className="flex min-h-12 shrink-0 flex-wrap items-center gap-2 border-b border-border/80 bg-surface-1/95 px-3 py-1.5">
         <button
           onClick={toggleSidebar}
-          className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
-          title={sidebarCollapsed ? "展开会话侧栏" : "收起会话侧栏"}
-          aria-label={sidebarCollapsed ? "展开会话侧栏" : "收起会话侧栏"}
-          aria-expanded={!sidebarCollapsed}
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300"
+          title={sidebarVisible ? "收起会话侧栏" : "展开会话侧栏"}
+          aria-label={sidebarVisible ? "收起会话侧栏" : "展开会话侧栏"}
+          aria-expanded={sidebarVisible}
           aria-controls="workspace-session-sidebar"
         >
-          {sidebarCollapsed ? <PanelLeftOpen size={14} /> : <PanelLeftClose size={14} />}
+          {sidebarVisible ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
         </button>
         <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium text-gray-200 truncate flex items-center gap-2">
+          <div className="flex truncate text-[13px] font-semibold text-gray-200 items-center gap-2">
             {titleEditing && activeSession ? (
               <input
                 autoFocus
@@ -241,7 +291,7 @@ export function WorkspacePage({
                   if (e.key === "Escape") setTitleEditing(false);
                 }}
                 onBlur={commitTitle}
-                className="min-w-0 flex-1 rounded border border-accent/50 bg-surface-3 px-1.5 py-0.5 text-sm text-gray-100 outline-none"
+                className="min-w-0 flex-1 rounded-md border border-accent/50 bg-surface-2 px-1.5 py-0.5 text-[13px] text-gray-100 outline-none"
               />
             ) : (
               <span
@@ -259,14 +309,14 @@ export function WorkspacePage({
             )}
             {activeDraft ? (
               <span
-                className="text-[9px] px-1.5 py-0.5 rounded bg-accent/15 text-accent font-normal"
+                className="rounded-md bg-status-progress-soft px-1.5 py-0.5 text-[11px] font-normal text-status-progress"
                 title="尚未创建记录；发送首条消息后生成"
               >
                 草稿
               </span>
             ) : activeSession?.kind === "quick" ? (
               <span
-                className="text-[9px] px-1.5 py-0.5 rounded bg-surface-3 text-gray-400 font-normal"
+                className="rounded-md bg-surface-3 px-1.5 py-0.5 text-[11px] font-normal text-gray-400"
                 title="没有绑定项目的独立任务"
               >
                 独立任务
@@ -274,7 +324,7 @@ export function WorkspacePage({
             ) : null}
             {isAnonymous && (
               <span
-                className="inline-flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400 font-normal"
+                className="inline-flex items-center gap-1 rounded-md bg-status-warning-soft px-1.5 py-0.5 text-[11px] font-normal text-status-warning"
                 title="匿名会话：不落库、不计费、不进记忆/画像。离开即丢弃。"
               >
                 <EyeOff size={9} />
@@ -282,7 +332,7 @@ export function WorkspacePage({
               </span>
             )}
           </div>
-          <div className="text-[10px] text-gray-600 font-mono truncate">
+          <div className="hidden truncate font-mono text-[11px] text-gray-600 lg:block">
             {isAnonymous
               ? "无痕会话 · 不落库 · 不计费 · 不学习"
               : activeDraft
@@ -296,7 +346,7 @@ export function WorkspacePage({
               exitAnonymous();
               onNewConversation(null);
             }}
-            className="flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-600 transition-colors hover:bg-amber-500/20 dark:text-amber-400"
+            className="flex min-h-8 items-center gap-1 rounded-lg border border-status-warning/30 bg-status-warning-soft px-2 text-[13px] text-status-warning transition-colors hover:brightness-95"
             title="退出匿名会话并丢弃其历史"
           >
             <EyeOff size={12} />
@@ -329,11 +379,15 @@ export function WorkspacePage({
             type="button"
             onClick={() => setTaskActivityOpen(true)}
             aria-label="打开任务活动"
-            className={`inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11px] transition-colors ${
-              taskFailedCount > 0
-                ? "bg-red-500/10 text-red-700 hover:bg-red-500/15 dark:text-red-300"
+            aria-expanded={taskActivityOpen}
+            aria-controls="workspace-task-activity-dialog"
+            className={`inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-[13px] transition-colors ${
+              taskBlockedCount > 0
+                ? "bg-status-danger-soft text-status-danger hover:brightness-95"
+                : taskFailedCount > 0
+                  ? "bg-status-warning-soft text-status-warning hover:brightness-95"
                 : taskRunningCount > 0
-                  ? "bg-accent/10 text-accent hover:bg-accent/15"
+                  ? "bg-status-progress-soft text-status-progress hover:brightness-95"
                   : "text-gray-500 hover:bg-surface-3 hover:text-gray-300"
             }`}
             title="查看后台任务、验收结果和恢复操作"
@@ -354,7 +408,7 @@ export function WorkspacePage({
         )}
         <button
           onClick={() => onOpenSettings()}
-          className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300"
           title="设置"
           aria-label="设置"
         >
@@ -363,21 +417,43 @@ export function WorkspacePage({
       </header>
 
       {/* ── Body: 3 columns ──────────────────────────────────────────────── */}
-      <div className="flex-1 flex min-h-0">
+      <div className="relative flex min-h-0 flex-1">
 
         {/* ─── Left: collapsible session rail; the header control always restores it. ─── */}
-        {!sidebarCollapsed && (
-          <aside id="workspace-session-sidebar" aria-label="会话列表" className="w-64 shrink-0 border-r border-border bg-surface-1 flex flex-col min-h-0">
+        {narrowViewport && sidebarVisible && (
+          <button
+            type="button"
+            aria-label="关闭会话侧栏"
+            onClick={() => setNarrowSidebarOpen(false)}
+            className="absolute inset-0 z-30 bg-black/30"
+          />
+        )}
+        {sidebarVisible && (
+          <aside
+            id="workspace-session-sidebar"
+            aria-label="会话列表"
+            className={`flex min-h-0 flex-col border-r border-border/80 bg-surface-1 ${
+              narrowViewport
+                ? "absolute inset-y-0 left-0 z-40 w-[min(272px,88vw)] shadow-2xl"
+                : "w-[272px] shrink-0"
+            }`}
+          >
             <SessionSidebar
               currentSessionId={sessionId}
-              onOpenSession={onOpenSession}
-              onNewConversation={onNewConversation}
+              onOpenSession={(id) => {
+                if (narrowViewport) setNarrowSidebarOpen(false);
+                onOpenSession(id);
+              }}
+              onNewConversation={(cwd) => {
+                if (narrowViewport) setNarrowSidebarOpen(false);
+                onNewConversation(cwd);
+              }}
             />
           </aside>
         )}
 
         {/* ─── Center: conversation remains the primary surface. ─────────── */}
-        <main aria-label="会话窗口" className="flex-1 flex flex-col min-w-0">
+        <main aria-label="会话窗口" className="flex min-w-0 flex-1 flex-col bg-surface-2">
           <MessageList
             messages={messages}
             streaming={streaming}
@@ -394,35 +470,42 @@ export function WorkspacePage({
             timingProfile={turnTimingProfile}
             externalJobs={externalJobs}
           />
-          <ContextUsageBar sessionId={activeSession?.id} />
-          {queue.length > 0 && (
-            <QueueBadge queue={queue} onRemove={removeFromQueue} />
-          )}
-          {/* A draft's two remaining choices — where it works, and whether it
-              leaves a trace — live right above the composer, because they stop
-              being editable the moment the first message is sent. */}
-          {activeDraft && (
-            <DraftScopeBar
-              cwd={activeDraft.cwd}
-              anonymous={activeDraft.anonymous}
-              projects={draftProjects}
-              onPickProject={setDraftProject}
-              onToggleAnonymous={setDraftAnonymous}
-            />
-          )}
-          <MessageInput
-            key={activeSession?.id ?? activeDraft?.id ?? sessionId}
-            initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
-            onSend={(t) => void sendOrQueue(t)}
-            onGuide={guideNextStep}
-            onCancel={() => cancelStream()}
-            streaming={streaming}
-            guidanceActive={steerActive}
-            disabled={!activeSession && !activeDraft}
-            pendingInsert={pendingInsert}
-            onInsertConsumed={() => setPendingInsert(undefined)}
-            cwd={activeCwd}
-          />
+          <div data-testid="workspace-composer-shell" className="shrink-0 bg-surface-1 px-3 pb-3 pt-2">
+            <div className="mx-auto w-full max-w-[920px] overflow-hidden rounded-2xl border border-border/80 bg-surface-2 shadow-lg">
+              {queue.length > 0 && (
+                <QueueBadge queue={queue} onRemove={removeFromQueue} />
+              )}
+              {/* A draft's two remaining choices — where it works, and whether it
+                  leaves a trace — live inside the composer surface because they
+                  stop being editable the moment the first message is sent. */}
+              {activeDraft && (
+                <DraftScopeBar
+                  cwd={activeDraft.cwd}
+                  anonymous={activeDraft.anonymous}
+                  projects={draftProjects}
+                  onPickProject={setDraftProject}
+                  onToggleAnonymous={setDraftAnonymous}
+                />
+              )}
+              <MessageInput
+                key={activeSession?.id ?? activeDraft?.id ?? sessionId}
+                initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
+                onSend={(t) => void sendOrQueue(t)}
+                onGuide={guideNextStep}
+                onCancel={() => cancelStream()}
+                streaming={streaming}
+                guidanceActive={steerActive}
+                disabled={!activeSession && !activeDraft}
+                pendingInsert={pendingInsert}
+                onInsertConsumed={() => setPendingInsert(undefined)}
+                cwd={activeCwd}
+              />
+              <ContextUsageBar
+                sessionId={activeSession?.id}
+                onOpenUsage={onOpenUsage ? () => onOpenUsage() : undefined}
+              />
+            </div>
+          </div>
         </main>
 
       </div>
@@ -436,6 +519,8 @@ export function WorkspacePage({
           }}
         >
           <section
+            id="workspace-task-activity-dialog"
+            ref={taskActivityDialogRef}
             role="dialog"
             aria-label="任务活动"
             aria-modal="true"
@@ -551,23 +636,23 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onRequestRe
       <div className="flex h-12 shrink-0 items-center justify-between border-b border-border px-4">
         <div className="min-w-0">
           <h2 className="text-sm font-medium text-gray-200">任务活动</h2>
-          <p className="text-[10px] text-gray-600">后台步骤、验收结果与恢复操作</p>
+          <p className="text-[11px] text-gray-600">后台步骤、验收结果与恢复操作</p>
         </div>
-        <button autoFocus type="button" onClick={onClose} aria-label="关闭任务活动" className="rounded p-1 text-gray-500 hover:bg-surface-3 hover:text-gray-200">
+        <button data-dialog-initial-focus type="button" onClick={onClose} aria-label="关闭任务活动" className="flex h-8 w-8 items-center justify-center rounded-lg text-gray-500 hover:bg-surface-3 hover:text-gray-200">
           <X size={15} />
         </button>
       </div>
-      <div className="flex shrink-0 flex-col gap-2 border-b border-border px-4 py-2">
-        <div className="flex flex-wrap items-center gap-2 text-[10px] text-gray-600">
+      <div className="flex shrink-0 flex-col gap-2 border-b border-border px-4 py-3">
+        <div className="flex flex-wrap items-center gap-2 text-[12px] text-gray-600">
           <span>已完成 {completedCount}</span><span>待执行 {pendingCount}</span>
-          {runningCount > 0 && <span className="text-accent">执行中 {runningCount}</span>}
-          {repairableFailedCount > 0 && <span className="text-amber-700 dark:text-amber-300">可重试 {repairableFailedCount}</span>}
-          {providerBlockedTasks.length > 0 && <span className="text-red-700 dark:text-red-300">模型配置 {providerBlockedTasks.length}</span>}
-          {permissionBlockedTasks.length > 0 && <span className="text-red-700 dark:text-red-300">权限配置 {permissionBlockedTasks.length}</span>}
-          {conversationBlockedTasks.length > 0 && <span className="text-red-700 dark:text-red-300">需要你 {conversationBlockedTasks.length}</span>}
+          {runningCount > 0 && <span className="text-status-progress">执行中 {runningCount}</span>}
+          {repairableFailedCount > 0 && <span className="text-status-warning">可重试 {repairableFailedCount}</span>}
+          {providerBlockedTasks.length > 0 && <span className="text-status-danger">模型配置 {providerBlockedTasks.length}</span>}
+          {permissionBlockedTasks.length > 0 && <span className="text-status-danger">权限配置 {permissionBlockedTasks.length}</span>}
+          {conversationBlockedTasks.length > 0 && <span className="text-status-danger">需要你 {conversationBlockedTasks.length}</span>}
         </div>
         {!isRunning && pendingCount > 0 && (
-          <p className={`text-[10px] ${failedTasks.length > 0 ? "text-amber-700 dark:text-amber-300" : "text-gray-500"}`}>
+          <p className={`text-[12px] leading-5 ${failedTasks.length > 0 ? "text-status-warning" : "text-gray-500"}`}>
             {failedTasks.length > 0
               ? `先处理失败项，再继续剩余 ${pendingCount} 项。`
               : `执行已暂停，还有 ${pendingCount} 项等待执行。`}
@@ -575,29 +660,29 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onRequestRe
         )}
         <div className="flex flex-wrap items-center gap-1">
           {isRunning ? (
-            <button onClick={() => void handleCancel()} className="flex items-center gap-1 rounded bg-red-500/10 px-2 py-1 text-[10px] text-red-700 hover:bg-red-500/20 dark:text-red-300"><Square size={9} />停止</button>
+            <button onClick={() => void handleCancel()} className="flex min-h-8 items-center gap-1.5 rounded-lg bg-status-danger-soft px-2.5 text-[13px] text-status-danger hover:brightness-95"><Square size={11} />停止</button>
           ) : pendingCount > 0 && failedTasks.length === 0 ? (
-            <span className="text-[10px] text-gray-500">任务已委派，由后台调度器自动执行；若长时间未开始请检查模型配置或重试委派。</span>
+            <span className="text-[12px] leading-5 text-gray-500">任务已委派，由后台调度器自动执行；若长时间未开始请检查模型配置或重试委派。</span>
           ) : null}
           {!isRunning && repairableFailedCount > 0 && (
-            <button onClick={() => void handleRepairFailed()} disabled={repairBusy} className="flex items-center gap-1 rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-700 disabled:opacity-40 dark:text-amber-300" title="重试可自动修复的失败步骤">
-              {repairBusy ? <Loader2 size={9} className="animate-spin" /> : <RefreshCw size={9} />}重试失败步骤
+            <button onClick={() => void handleRepairFailed()} disabled={repairBusy} className="flex min-h-8 items-center gap-1.5 rounded-lg bg-status-warning-soft px-2.5 text-[13px] text-status-warning disabled:opacity-40" title="重试可自动修复的失败步骤">
+              {repairBusy ? <Loader2 size={11} className="animate-spin motion-reduce:animate-none" /> : <RefreshCw size={11} />}重试失败步骤
             </button>
           )}
           {!isRunning && providerBlockedTasks.length > 0 && (
-            <><button onClick={() => onOpenSettings("endpoints")} className="rounded bg-accent/10 px-2 py-1 text-[10px] text-accent hover:bg-accent/20">打开模型设置</button>
-            <button aria-label={`已修复，重试 ${providerBlockedTasks.length} 项`} title={`重试：${providerBlockedTasks.map((task) => task.title).join("、")}`} onClick={() => void handleRetryBlocked(providerBlockedTasks)} disabled={blockedRetryBusy} className="flex items-center gap-1 rounded bg-emerald-500/10 px-2 py-1 text-[10px] text-emerald-700 disabled:opacity-40 dark:text-emerald-300"><RefreshCw size={9} />已修复，重试 {providerBlockedTasks.length} 项</button></>
+            <><button onClick={() => onOpenSettings("endpoints")} className="min-h-8 rounded-lg bg-status-progress-soft px-2.5 text-[13px] text-status-progress hover:brightness-95">打开模型设置</button>
+            <button aria-label={`已修复，重试 ${providerBlockedTasks.length} 项`} title={`重试：${providerBlockedTasks.map((task) => task.title).join("、")}`} onClick={() => void handleRetryBlocked(providerBlockedTasks)} disabled={blockedRetryBusy} className="flex min-h-8 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-[13px] text-gray-300 disabled:opacity-40"><RefreshCw size={11} />已修复，重试 {providerBlockedTasks.length} 项</button></>
           )}
           {!isRunning && permissionBlockedTasks.length > 0 && (
-            <><button onClick={() => onOpenSettings("endpoints")} className="rounded bg-accent/10 px-2 py-1 text-[10px] text-accent hover:bg-accent/20">调整会话权限</button>
-            <button onClick={() => void handleRetryBlocked(permissionBlockedTasks)} disabled={blockedRetryBusy} className="rounded bg-emerald-500/10 px-2 py-1 text-[10px] text-emerald-700 disabled:opacity-40 dark:text-emerald-300">已授权，重试 {permissionBlockedTasks.length} 项</button></>
+            <><button onClick={() => onOpenSettings("endpoints")} className="min-h-8 rounded-lg bg-status-progress-soft px-2.5 text-[13px] text-status-progress hover:brightness-95">调整会话权限</button>
+            <button onClick={() => void handleRetryBlocked(permissionBlockedTasks)} disabled={blockedRetryBusy} className="min-h-8 rounded-lg border border-border bg-surface-2 px-2.5 text-[13px] text-gray-300 disabled:opacity-40">已授权，重试 {permissionBlockedTasks.length} 项</button></>
           )}
           {!isRunning && conversationBlockedTasks.length > 0 && (
-            <button onClick={() => onRequestRepair(conversationBlockedTasks[0])} className="rounded bg-accent/10 px-2 py-1 text-[10px] text-accent hover:bg-accent/20">回到对话处理</button>
+            <button onClick={() => onRequestRepair(conversationBlockedTasks[0])} className="min-h-8 rounded-lg bg-status-progress-soft px-2.5 text-[13px] text-status-progress hover:brightness-95">回到对话处理</button>
           )}
         </div>
       </div>
-      {startError && <div className="border-b border-red-500/20 bg-red-500/10 px-4 py-2 text-[10px] text-red-700 dark:text-red-300">{startError}</div>}
+      {startError && <div className="border-b border-status-danger/20 bg-status-danger-soft px-4 py-2 text-[12px] text-status-danger">{startError}</div>}
       <div className="flex-1 overflow-y-auto p-3"><ul className="space-y-1">{buildTaskTree(sessionTasks).map(({ task, depth }) => <TaskRow key={task.id} task={task} depth={depth} highlighted={task.id === highlightedTaskId} />)}</ul></div>
     </div>
   );
@@ -632,27 +717,27 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
     <li
       id={`task-log-${task.id}`}
       aria-current={highlighted ? "true" : undefined}
-      className={`rounded transition-colors ${highlighted ? "bg-accent/10 ring-1 ring-accent/40" : "hover:bg-surface-3"}`}
+      className={`rounded-lg transition-colors ${highlighted ? "bg-status-progress-soft ring-1 ring-status-progress/30" : "hover:bg-surface-3"}`}
       style={{ paddingLeft: `${0.375 + depth * 0.875}rem` }}
     >
       <div className="group flex items-start gap-2 px-1.5 py-1">
         <Icon
-          size={11}
+          size={13}
           className={`mt-1 shrink-0 ${statusColor(task.status)} ${
-            task.status === "running" ? "animate-spin" : ""
+            task.status === "running" ? "animate-spin motion-reduce:animate-none" : ""
           }`}
         />
         <div className="min-w-0 flex-1">
           <div className="flex items-start gap-1.5">
-            <span className="block flex-1 text-[11px] text-gray-300 leading-snug line-clamp-2">
+            <span className="block flex-1 text-[13px] leading-5 text-gray-300 line-clamp-2">
               {task.title}
             </span>
             {summary && (
               <button
                 onClick={() => setVerifOpen((v) => !v)}
                 title={`验收验证：${summary.passed}/${summary.total} 通过（点击展开逐条）`}
-                className={`mt-0.5 inline-flex shrink-0 items-center gap-0.5 rounded px-1 text-[9px] transition-colors hover:bg-surface-2 ${
-                  summary.allPassed ? "text-green-500" : "text-red-500"
+                className={`mt-0.5 inline-flex min-h-7 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] transition-colors hover:bg-surface-2 ${
+                  summary.allPassed ? "text-status-success" : "text-status-danger"
                 }`}
               >
                 {summary.allPassed ? <CheckCircle2 size={10} /> : <XCircle size={10} />}
@@ -662,7 +747,7 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
           </div>
           {task.spec_title && (
             <div
-              className="mt-0.5 flex items-center gap-1 text-[9px] text-accent/80"
+              className="mt-0.5 flex items-center gap-1 text-[11px] text-status-progress"
               title={`来自规范《${task.spec_title}》`}
             >
               <BookOpen size={9} className="shrink-0" />
@@ -671,21 +756,28 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
           )}
           {task.failure_attribution && (
             <div
-              className="mt-0.5 flex items-start gap-1 rounded bg-amber-500/10 px-1 py-0.5 text-[9px] text-amber-700 dark:text-amber-300"
+              data-status-tone={
+                task.failure_attribution.repairable === false ? "danger" : "warning"
+              }
+              className={`mt-1 flex items-start gap-1.5 rounded-md px-2 py-1 text-[11px] leading-4 ${
+                task.failure_attribution.repairable === false
+                  ? "bg-status-danger-soft text-status-danger"
+                  : "bg-status-warning-soft text-status-warning"
+              }`}
               title={`${task.failure_attribution.summary}\n下一步：${task.failure_attribution.next_action}`}
             >
               <AlertTriangle size={9} className="mt-0.5 shrink-0" />
               <span className="shrink-0 font-medium">{task.failure_attribution.label}</span>
-              <span className="min-w-0 truncate text-amber-800/80 dark:text-amber-200/80">
+              <span className="min-w-0 truncate opacity-80">
                 {task.failure_attribution.next_action}
               </span>
             </div>
           )}
           {task.attempts && task.attempts.length > 0 && (
-            <div className="mt-0.5 text-[9px] text-gray-600">
+            <div className="mt-0.5 text-[11px] text-gray-600">
               {task.attempts.length} 次执行记录
               {task.attempts[task.attempts.length - 1]?.status === "failed" && (
-                <span className="ml-1 text-amber-500">最近一次失败</span>
+                <span className="ml-1 text-status-warning">最近一次失败</span>
               )}
             </div>
           )}
@@ -711,18 +803,28 @@ function VerifCheckRow({ result }: { result: VerificationResult }) {
     <div className="rounded bg-surface-2">
       <div
         className={`flex items-center gap-1.5 px-1.5 py-0.5 ${hasOutput ? "cursor-pointer" : ""}`}
+        role={hasOutput ? "button" : undefined}
+        tabIndex={hasOutput ? 0 : undefined}
+        aria-expanded={hasOutput ? showOutput : undefined}
+        aria-label={hasOutput ? `${result.check}，查看验收输出` : undefined}
         onClick={() => hasOutput && setShowOutput((v) => !v)}
+        onKeyDown={(event) => {
+          if (hasOutput && (event.key === "Enter" || event.key === " ")) {
+            event.preventDefault();
+            setShowOutput((value) => !value);
+          }
+        }}
       >
         {result.passed ? (
-          <CheckCircle2 size={10} className="shrink-0 text-green-500" />
+          <CheckCircle2 size={10} className="shrink-0 text-status-success" />
         ) : (
-          <XCircle size={10} className="shrink-0 text-red-500" />
+          <XCircle size={10} className="shrink-0 text-status-danger" />
         )}
-        <span className="flex-1 truncate text-[10px] text-gray-400">{result.check}</span>
-        <span className="text-[9px] text-gray-600">{result.duration_ms}ms</span>
+        <span className="flex-1 truncate text-[12px] text-gray-400">{result.check}</span>
+        <span className="text-[11px] text-gray-600">{result.duration_ms}ms</span>
       </div>
       {showOutput && hasOutput && (
-        <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap px-1.5 pb-1 font-mono text-[9px] text-gray-500">
+        <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap px-1.5 pb-1 font-mono text-[11px] text-gray-500">
           {result.output}
         </pre>
       )}
@@ -741,9 +843,9 @@ function statusIcon(status: string) {
 
 function statusColor(status: string): string {
   switch (status) {
-    case "completed":  return "text-green-500";
-    case "running":    return "text-accent";
-    case "failed":     return "text-red-500";
+    case "completed":  return "text-status-success";
+    case "running":    return "text-status-progress";
+    case "failed":     return "text-status-danger";
     default:           return "text-gray-600";
   }
 }

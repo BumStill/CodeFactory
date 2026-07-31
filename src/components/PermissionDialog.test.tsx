@@ -16,6 +16,21 @@ function baseRequest(overrides: Partial<PendingPermission>): PendingPermission {
 const noop = { onAllow: vi.fn(), onDeny: vi.fn(), onAllowFullAccess: vi.fn() };
 
 describe("PermissionDialog tool-args preview", () => {
+  it("is an accessible modal and explains that expiry is not a user denial", () => {
+    render(
+      <PermissionDialog
+        request={baseRequest({
+          expiresAt: Date.now() + 60_000,
+        })}
+        trusted={false}
+        {...noop}
+      />,
+    );
+
+    expect(screen.getByRole("dialog", { name: "需要权限" })).toBeInTheDocument();
+    expect(screen.getByText(/超时.*不会记成你拒绝/)).toBeInTheDocument();
+  });
+
   it("renders a real diff for edit_file instead of raw JSON", () => {
     render(
       <PermissionDialog

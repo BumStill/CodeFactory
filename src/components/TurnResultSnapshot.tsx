@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { CheckCircle2, ChevronDown, FileCode2, ListTree, RefreshCw, TestTube2 } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  ChevronDown,
+  CircleDashed,
+  FileCode2,
+  ListTree,
+  RefreshCw,
+  TestTube2,
+} from "lucide-react";
 import { useState } from "react";
 import type { TurnPlan } from "../lib/chatPlan";
 import { planProgress } from "../lib/chatPlan";
@@ -84,6 +93,8 @@ export function summarizeTurnEvidence(toolCalls: ToolCallState[]): TurnEvidenceS
 interface Props {
   plan: TurnPlan;
   evidence: TurnEvidenceSummary;
+  /** A provider/runtime/turn boundary failed even when no tool call did. */
+  turnBoundaryFailure?: boolean;
   durationMs: number | null;
   processExpanded: boolean;
   onToggleProcess?: () => void;
@@ -92,6 +103,7 @@ interface Props {
 export function TurnResultSnapshot({
   plan,
   evidence,
+  turnBoundaryFailure = false,
   durationMs,
   processExpanded,
   onToggleProcess,
@@ -100,68 +112,111 @@ export function TurnResultSnapshot({
   const [summaryOpen, setSummaryOpen] = useState(false);
   const progress = planProgress(plan);
   const complete = progress.total > 0 && progress.completed === progress.total;
+  const effectiveFailureCount =
+    evidence.failureCount + (turnBoundaryFailure && evidence.failureCount === 0 ? 1 : 0);
+  const needsAttention = effectiveFailureCount > 0 || Boolean(plan.waitingReason);
+  const status = complete && !needsAttention
+    ? {
+        tone: "success",
+        label: "已完成",
+        icon: CheckCircle2,
+        iconClass: "text-status-success",
+        borderClass: "border-l-status-success",
+      }
+    : needsAttention
+      ? {
+          tone: "warning",
+          label: "需要处理",
+          icon: AlertTriangle,
+          iconClass: "text-status-warning",
+          borderClass: "border-l-status-warning",
+        }
+      : {
+          tone: "neutral",
+          label: "未完成",
+          icon: CircleDashed,
+          iconClass: "text-gray-500",
+          borderClass: "border-l-border",
+        };
+  const StatusIcon = status.icon;
+  const attentionDetail = plan.waitingReason
+    ?? (turnBoundaryFailure
+      ? "回合存在失败或中断证据"
+      : effectiveFailureCount > 0
+        ? `${effectiveFailureCount} 项操作失败或未完成`
+        : null);
   const summary = `完成 ${progress.completed}/${progress.total} 个计划步骤；修改 ${evidence.changedFileCount} 个文件；执行 ${evidence.verificationCount} 项验证；${
-    evidence.failureCount === 0 ? "没有失败证据。" : `有 ${evidence.failureCount} 项失败证据。`
+    effectiveFailureCount === 0 ? "没有失败证据。" : `有 ${effectiveFailureCount} 项失败证据。`
   }`;
 
   return (
     <section
       data-testid="turn-result-snapshot"
+      data-status-tone={status.tone}
       aria-label="任务结果"
-      className="mt-3 max-w-[72ch] rounded-xl border border-border/60 bg-surface-1/50"
+      className={`mt-3 max-w-[72ch] overflow-hidden rounded-xl border border-border/70 border-l-2 bg-surface-2/70 ${status.borderClass}`}
     >
-      <div className="flex flex-wrap items-center gap-2 px-3 py-2">
-        <CheckCircle2 size={14} aria-hidden="true" className={complete ? "text-green-500" : "text-amber-500"} />
-        <span className="text-[13px] font-medium text-gray-200">任务结果</span>
+      <div className="flex flex-wrap items-center gap-2 px-3 py-2.5">
+        <StatusIcon size={15} aria-hidden="true" className={status.iconClass} />
+        <span className="text-[13px] font-semibold text-gray-200">{status.label}</span>
+        <span className="rounded-md bg-surface-3 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-gray-400">
+          {progress.completed}/{progress.total}
+        </span>
         <span className="text-[11px] text-gray-500">
-          {progress.completed}/{progress.total} 个步骤 · {evidence.operationCount} 项操作
+          {evidence.operationCount} 项操作
           {durationMs != null ? ` · ${formatDuration(durationMs)}` : ""}
         </span>
         <div className="ml-auto flex flex-wrap items-center gap-1">
           <button
             type="button"
-            aria-label="结果视图"
+            aria-label="查看证据"
             aria-expanded={resultOpen}
             onClick={() => setResultOpen((value) => !value)}
-            className="inline-flex min-h-7 items-center gap-1 rounded px-2 text-[11px] text-gray-400 hover:bg-surface-3 hover:text-gray-200"
+            className="inline-flex min-h-8 items-center gap-1 rounded-lg px-2 text-[13px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200"
           >
-            结果视图
+            查看证据
             <ChevronDown size={12} aria-hidden="true" className={resultOpen ? "rotate-180" : ""} />
           </button>
           {onToggleProcess && (
             <button
               type="button"
-              aria-label="完整过程"
+              aria-label="执行过程"
               aria-pressed={processExpanded}
               onClick={onToggleProcess}
-              className="inline-flex min-h-7 items-center gap-1 rounded px-2 text-[11px] text-gray-400 hover:bg-surface-3 hover:text-gray-200"
+              className="inline-flex min-h-8 items-center gap-1 rounded-lg px-2 text-[13px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200"
             >
               <ListTree size={12} aria-hidden="true" />
-              完整过程
+              执行过程
             </button>
           )}
           <button
             type="button"
-            aria-label="证据化重新总结"
+            aria-label="结果摘要"
             aria-expanded={summaryOpen}
             onClick={() => setSummaryOpen((value) => !value)}
-            className="inline-flex min-h-7 items-center gap-1 rounded px-2 text-[11px] text-gray-400 hover:bg-surface-3 hover:text-gray-200"
+            className="inline-flex min-h-8 items-center gap-1 rounded-lg px-2 text-[13px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200"
           >
             <RefreshCw size={12} aria-hidden="true" />
-            证据化重新总结
+            结果摘要
           </button>
         </div>
       </div>
 
+      {attentionDetail && (
+        <p role="status" className="border-t border-border/50 bg-status-warning-soft px-3 py-2 text-[13px] leading-5 text-status-warning">
+          当前边界 · {attentionDetail}
+        </p>
+      )}
+
       {resultOpen && (
-        <div className="grid gap-3 border-t border-border/50 px-3 py-2 text-[12px] sm:grid-cols-2">
+        <div className="grid gap-3 border-t border-border/50 px-3 py-2.5 text-[13px] sm:grid-cols-2">
           <div>
             <p className="mb-1 flex items-center gap-1 text-gray-400">
               <FileCode2 size={12} aria-hidden="true" />
               修改文件
             </p>
             {evidence.changedFiles.length > 0 ? (
-              <ul className="space-y-0.5 font-mono text-[11px] text-gray-300">
+              <ul className="space-y-0.5 font-mono text-[12px] text-gray-300">
                 {evidence.changedFiles.map((path) => <li key={path} className="truncate">{path}</li>)}
               </ul>
             ) : <p className="text-gray-600">没有文件修改证据</p>}
@@ -172,7 +227,7 @@ export function TurnResultSnapshot({
               验证
             </p>
             {evidence.verificationCommands.length > 0 ? (
-              <ul className="space-y-0.5 font-mono text-[11px] text-gray-300">
+              <ul className="space-y-0.5 font-mono text-[12px] text-gray-300">
                 {evidence.verificationCommands.map((command) => <li key={command} className="truncate">{command}</li>)}
               </ul>
             ) : <p className="text-gray-600">没有验证命令证据</p>}
@@ -191,7 +246,7 @@ export function TurnResultSnapshot({
             <p
               className={
                 evidence.failureCount > 0
-                  ? "mt-1 text-red-700 dark:text-red-300"
+                  ? "mt-1 text-status-danger"
                   : "mt-1 text-gray-600"
               }
             >
@@ -207,7 +262,7 @@ export function TurnResultSnapshot({
       )}
 
       {summaryOpen && (
-        <p role="status" className="border-t border-border/50 px-3 py-2 text-[12px] leading-5 text-gray-300">
+        <p role="status" className="border-t border-border/50 px-3 py-2 text-[13px] leading-5 text-gray-300">
           {summary}
         </p>
       )}

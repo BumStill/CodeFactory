@@ -73,11 +73,11 @@ function IssueDetail({ issue, onBack }: IssueDetailProps) {
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
         <h2 className="text-sm font-semibold text-gray-200">{issue.title}</h2>
 
-        <div className="flex flex-wrap gap-1.5 text-[10px]">
+        <div className="flex flex-wrap gap-1.5 text-[11px]">
           <span
             className={`px-1.5 py-0.5 rounded ${
               issue.state === "open"
-                ? "bg-green-900 text-green-200"
+                ? "bg-status-progress-soft text-status-progress"
                 : "bg-gray-700 text-gray-400"
             }`}
           >
@@ -86,7 +86,7 @@ function IssueDetail({ issue, onBack }: IssueDetailProps) {
           {issue.labels.map((l) => (
             <span
               key={l}
-              className="px-1.5 py-0.5 rounded bg-blue-900 text-blue-200 flex items-center gap-0.5"
+              className="px-1.5 py-0.5 rounded bg-status-info-soft text-status-info flex items-center gap-0.5"
             >
               <Tag size={8} />
               {l}
@@ -94,7 +94,7 @@ function IssueDetail({ issue, onBack }: IssueDetailProps) {
           ))}
         </div>
 
-        <div className="text-[10px] text-gray-600">
+        <div className="text-[11px] text-gray-600">
           作者 <span className="text-gray-400">{issue.author}</span> ·{" "}
           {new Date(issue.created_at).toLocaleDateString()}
         </div>
@@ -150,7 +150,7 @@ function NewIssueForm({ remoteId, repo, onCreated, onCancel }: NewIssueFormProps
 
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
         <div>
-          <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">标题</label>
+          <label className="block text-[11px] text-gray-600 uppercase tracking-wider mb-1">标题</label>
           <input
             autoFocus
             type="text"
@@ -161,7 +161,7 @@ function NewIssueForm({ remoteId, repo, onCreated, onCancel }: NewIssueFormProps
           />
         </div>
         <div>
-          <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">描述</label>
+          <label className="block text-[11px] text-gray-600 uppercase tracking-wider mb-1">描述</label>
           <textarea
             value={body}
             onChange={(e) => setBody(e.target.value)}
@@ -170,7 +170,7 @@ function NewIssueForm({ remoteId, repo, onCreated, onCancel }: NewIssueFormProps
             className="w-full bg-surface-3 border border-border rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50 resize-none"
           />
         </div>
-        {error && <p className="text-xs text-red-400">{error}</p>}
+        {error && <p className="text-xs text-status-danger">{error}</p>}
       </div>
 
       <div className="flex gap-2 p-3 border-t border-border shrink-0">
@@ -238,7 +238,7 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
 
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
         <div>
-          <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">标题</label>
+          <label className="block text-[11px] text-gray-600 uppercase tracking-wider mb-1">标题</label>
           <input
             autoFocus
             type="text"
@@ -250,7 +250,7 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
         </div>
         <div className="flex gap-2">
           <div className="flex-1">
-            <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">源分支</label>
+            <label className="block text-[11px] text-gray-600 uppercase tracking-wider mb-1">源分支</label>
             <input
               type="text"
               value={head}
@@ -259,7 +259,7 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
             />
           </div>
           <div className="flex-1">
-            <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">目标分支</label>
+            <label className="block text-[11px] text-gray-600 uppercase tracking-wider mb-1">目标分支</label>
             <input
               type="text"
               value={base}
@@ -269,7 +269,7 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
           </div>
         </div>
         <div>
-          <label className="block text-[10px] text-gray-600 uppercase tracking-wider mb-1">描述</label>
+          <label className="block text-[11px] text-gray-600 uppercase tracking-wider mb-1">描述</label>
           <textarea
             value={body}
             onChange={(e) => setBody(e.target.value)}
@@ -287,7 +287,7 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
           />
           草稿拉取请求
         </label>
-        {error && <p className="text-xs text-red-400">{error}</p>}
+        {error && <p className="text-xs text-status-danger">{error}</p>}
       </div>
 
       <div className="flex gap-2 p-3 border-t border-border shrink-0">
@@ -410,7 +410,7 @@ function IssuesTab({ remotes }: IssuesTabProps) {
             className="p-1.5 rounded bg-surface-3 text-gray-400 hover:text-gray-200 disabled:opacity-50 transition-colors"
             title="刷新"
           >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+            <RefreshCw size={12} className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
           </button>
           <button
             onClick={() => setNewIssueOpen(true)}
@@ -426,7 +426,7 @@ function IssuesTab({ remotes }: IssuesTabProps) {
       {/* Issue list */}
       <div className="flex-1 overflow-y-auto">
         {error && (
-          <div className="px-3 py-2 text-xs text-red-400 border-b border-border">{error}</div>
+          <div className="px-3 py-2 text-xs text-status-danger border-b border-border">{error}</div>
         )}
         {!loading && issues.length === 0 && (
           <div className="px-3 py-3 text-xs text-gray-600">
@@ -442,23 +442,23 @@ function IssuesTab({ remotes }: IssuesTabProps) {
             <div className="flex items-start gap-2">
               <CircleDot
                 size={12}
-                className={`mt-0.5 shrink-0 ${issue.state === "open" ? "text-green-400" : "text-gray-600"}`}
+                className={`mt-0.5 shrink-0 ${issue.state === "open" ? "text-status-progress" : "text-gray-600"}`}
               />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] text-gray-600 font-mono shrink-0">#{issue.number}</span>
+                  <span className="text-[11px] text-gray-600 font-mono shrink-0">#{issue.number}</span>
                   <span className="text-xs text-gray-300 truncate">{issue.title}</span>
                 </div>
                 {issue.labels.length > 0 && (
                   <div className="flex flex-wrap gap-1 mt-0.5">
                     {issue.labels.slice(0, 3).map((l) => (
-                      <span key={l} className="text-[9px] px-1 py-0 rounded bg-surface-3 text-gray-500">
+                      <span key={l} className="text-[11px] px-1 py-0 rounded bg-surface-3 text-gray-500">
                         {l}
                       </span>
                     ))}
                   </div>
                 )}
-                <div className="text-[9px] text-gray-700 mt-0.5">
+                <div className="mt-0.5 text-[11px] text-gray-600">
                   {issue.author} · {new Date(issue.created_at).toLocaleDateString()}
                 </div>
               </div>
@@ -516,8 +516,8 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
 
   const prStateColor = (state: string) => {
     switch (state) {
-      case "open": return "text-green-400";
-      case "merged": return "text-purple-400";
+      case "open": return "text-status-progress";
+      case "merged": return "text-status-success";
       default: return "text-gray-600";
     }
   };
@@ -560,7 +560,7 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
             className="p-1.5 rounded bg-surface-3 text-gray-400 hover:text-gray-200 disabled:opacity-50 transition-colors"
             title="刷新"
           >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+            <RefreshCw size={12} className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
           </button>
           <button
             onClick={() => setNewPROpen(true)}
@@ -576,7 +576,7 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
       {/* PR list */}
       <div className="flex-1 overflow-y-auto">
         {error && (
-          <div className="px-3 py-2 text-xs text-red-400 border-b border-border">{error}</div>
+          <div className="px-3 py-2 text-xs text-status-danger border-b border-border">{error}</div>
         )}
         {!loading && prs.length === 0 && (
           <div className="px-3 py-3 text-xs text-gray-600">
@@ -593,20 +593,20 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
               <GitPullRequest size={12} className={`mt-0.5 shrink-0 ${prStateColor(pr.state)}`} />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] text-gray-600 font-mono shrink-0">#{pr.number}</span>
+                  <span className="text-[11px] text-gray-600 font-mono shrink-0">#{pr.number}</span>
                   <span className="text-xs text-gray-300 truncate">{pr.title}</span>
                   {pr.draft && (
-                    <span className="text-[9px] px-1 rounded bg-surface-3 text-gray-500 shrink-0">草稿</span>
+                    <span className="text-[11px] px-1 rounded bg-surface-3 text-gray-500 shrink-0">草稿</span>
                   )}
                 </div>
-                <div className="text-[9px] text-gray-700 mt-0.5 font-mono">
+                <div className="mt-0.5 font-mono text-[11px] text-gray-600">
                   {pr.head_branch} → {pr.base_branch}
                 </div>
                 <div className="flex items-center gap-1 mt-0.5">
-                  <span className="text-[9px] text-gray-700">
+                  <span className="text-[11px] text-gray-600">
                     {new Date(pr.created_at).toLocaleDateString()}
                   </span>
-                  <ExternalLink size={8} className="text-gray-700 opacity-0 group-hover:opacity-100 transition-opacity" />
+                  <ExternalLink size={8} className="text-gray-600 opacity-0 transition-opacity group-hover:opacity-100" />
                 </div>
               </div>
             </div>
@@ -670,9 +670,9 @@ export function RemoteGitPanel({ currentBranch, onClose }: RemoteGitPanelProps) 
       {/* No remotes configured */}
       {remotes.length === 0 ? (
         <div className="flex-1 flex items-center justify-center flex-col gap-2 p-6 text-center">
-          <GitPullRequest size={32} className="text-gray-700" />
+          <GitPullRequest size={32} className="text-gray-600" />
           <p className="text-xs text-gray-600">未配置远程仓库。</p>
-          <p className="text-[10px] text-gray-700">在设置中添加 GitHub 或 GitLab 远程仓库。</p>
+          <p className="text-[11px] text-gray-600">在设置中添加 GitHub 或 GitLab 远程仓库。</p>
         </div>
       ) : (
         <div className="flex-1 min-h-0">

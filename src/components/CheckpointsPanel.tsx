@@ -141,7 +141,7 @@ export function CheckpointsPanel({ sessionId }: Props) {
               ) : (
                 <>
                   <section>
-                    <div className="mb-2 flex items-center gap-2 px-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">
+                    <div className="mb-2 flex items-center gap-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-gray-500">
                       可恢复变更
                       <span className="ml-auto tabular-nums text-gray-600">{changed.length}</span>
                     </div>
@@ -175,7 +175,7 @@ export function CheckpointsPanel({ sessionId }: Props) {
                       <button
                         onClick={() => setShowUnchanged((value) => !value)}
                         aria-label={`${showUnchanged ? "收起" : "查看"} ${unchanged.length} 个无差异检查点`}
-                        className="flex w-full items-center gap-2 rounded px-1 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 hover:text-gray-300"
+                        className="flex w-full items-center gap-2 rounded px-1 py-1 text-[11px] font-semibold uppercase tracking-wider text-gray-600 hover:text-gray-300"
                       >
                         无文件差异
                         <span className="ml-auto tabular-nums">{unchanged.length}</span>
@@ -241,29 +241,29 @@ function CheckpointRow({
 
   return (
     <li className="group flex items-center gap-2 rounded border border-transparent px-2 py-2 text-[11px] hover:border-border hover:bg-surface-2">
-      <span className="w-12 shrink-0 truncate font-mono text-gray-700" title={checkpoint.git_sha}>
+      <span className="w-12 shrink-0 truncate font-mono text-gray-600" title={checkpoint.git_sha}>
         {checkpoint.git_sha.slice(0, 7)}
       </span>
       <div className="min-w-0 flex-1">
-        <div className={checkpoint.reverted ? "truncate text-gray-700 line-through" : "truncate text-gray-300"} title={checkpoint.label}>
+        <div className={checkpoint.reverted ? "truncate text-gray-600 line-through" : "truncate text-gray-300"} title={checkpoint.label}>
           {label}
         </div>
-        <div className="mt-0.5 text-[9px] text-gray-700">
+        <div className="mt-0.5 text-[11px] text-gray-600">
           {fileCount > 0 ? `${fileCount} 个文件变化` : "无文件差异"}
         </div>
       </div>
-      <span className="shrink-0 text-[10px] text-gray-700" title={when.toLocaleString()}>
+      <span className="shrink-0 text-[11px] text-gray-600" title={when.toLocaleString()}>
         {when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
       </span>
       {checkpoint.reverted ? (
-        <span className="inline-flex shrink-0 items-center gap-0.5 text-[10px] text-emerald-500">
+        <span className="inline-flex shrink-0 items-center gap-0.5 text-[11px] text-status-success">
           <Check size={10} /> 已恢复
         </span>
       ) : (
         <button
           onClick={() => onRequestRevert(checkpoint)}
           aria-label={`恢复检查点 ${checkpoint.label}`}
-          className="inline-flex shrink-0 items-center gap-0.5 rounded px-1.5 py-1 text-[10px] text-gray-500 opacity-0 transition-opacity hover:bg-amber-500/10 hover:text-amber-400 group-hover:opacity-100 focus:opacity-100"
+          className="inline-flex shrink-0 items-center gap-0.5 rounded px-1.5 py-1 text-[11px] text-gray-500 transition-colors hover:bg-status-warning-soft hover:text-status-warning"
         >
           <RotateCcw size={10} /> 恢复
         </button>
@@ -330,7 +330,7 @@ function RevertConfirmModal({
 
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
           {error ? (
-            <div className="flex items-start gap-2 rounded border border-rose-500/40 bg-rose-500/10 p-2 text-xs text-rose-800 dark:text-rose-300">
+            <div className="flex items-start gap-2 rounded border border-status-danger/40 bg-status-danger-soft p-2 text-xs text-status-danger">
               <AlertCircle size={12} className="mt-0.5 shrink-0" />
               <span className="flex-1 break-words">{error}</span>
             </div>
@@ -348,7 +348,7 @@ function RevertConfirmModal({
                   <li key={file.path} className="flex items-center gap-2 font-mono text-[11px]">
                     <StatusIcon status={file.status} />
                     <span className="min-w-0 flex-1 truncate text-gray-300" title={file.path}>{file.path}</span>
-                    <span className="text-[10px] uppercase tracking-wide text-gray-600">{statusLabel(file.status)}</span>
+                    <span className="text-[11px] uppercase tracking-wide text-gray-600">{statusLabel(file.status)}</span>
                   </li>
                 ))}
               </ul>
@@ -364,7 +364,7 @@ function RevertConfirmModal({
             onClick={() => void restore()}
             disabled={busy || fileChanges === null || fileChanges.length === 0}
             aria-label="确认恢复"
-            className="inline-flex items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/20 px-3 py-1.5 text-xs text-amber-800 transition-colors hover:bg-amber-500/30 disabled:cursor-not-allowed disabled:opacity-40 dark:text-amber-300"
+            className="inline-flex items-center gap-1.5 rounded border border-status-warning/40 bg-status-warning-soft px-3 py-1.5 text-xs text-status-warning transition-colors hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <RotateCcw size={11} />
             {busy ? "正在恢复…" : "恢复"}
@@ -377,9 +377,9 @@ function RevertConfirmModal({
 
 function StatusIcon({ status }: { status: CheckpointFileChange["status"] }) {
   switch (status) {
-    case "added": return <FilePlus size={11} className="shrink-0 text-emerald-400" />;
-    case "deleted": return <FileMinus size={11} className="shrink-0 text-rose-400" />;
-    case "modified": return <FileEdit size={11} className="shrink-0 text-amber-400" />;
+    case "added": return <FilePlus size={11} className="shrink-0 text-status-info" />;
+    case "deleted": return <FileMinus size={11} className="shrink-0 text-gray-500" />;
+    case "modified": return <FileEdit size={11} className="shrink-0 text-accent" />;
     default: return <FileText size={11} className="shrink-0 text-gray-500" />;
   }
 }

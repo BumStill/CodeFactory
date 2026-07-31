@@ -322,8 +322,17 @@ pub fn completion_recovery_attempts_after_steer(attempts: u32) -> u32 {
 /// round as soon as its evidence ledger is complete. Interactive/Execute may
 /// still have later planned mutations, so they finalize when the model
 /// actually attempts a tool-free answer.
+///
+/// Both unattended arms qualify: `BlockOnIncomplete` (desktop Autonomous) and
+/// `Benchmark` (the eval sidecar, which has no human in the loop at all). #260
+/// narrowed this to `BlockOnIncomplete` while rewording the rule as "unattended
+/// execution" — that dropped the sidecar's tools-disabled finalization round
+/// even though the sidecar is exactly the surface the rule describes.
 pub fn completion_ready_applies(policy: FinalizationPolicy) -> bool {
-    matches!(policy, FinalizationPolicy::BlockOnIncomplete)
+    matches!(
+        policy,
+        FinalizationPolicy::BlockOnIncomplete | FinalizationPolicy::Benchmark
+    )
 }
 
 pub fn openai_tool_controls(
@@ -361,10 +370,22 @@ pub fn active_tool_definitions_for_capability(
     }
     tool_defs
         .iter()
-        .filter(|definition| {
-            tool_visible_for_capability(capability, &definition.function.name)
-        })
+        .filter(|definition| tool_visible_for_capability(capability, &definition.function.name))
         .cloned()
+        .map(|mut definition| {
+            if matches!(capability, TurnCapability::ReviewOnly)
+                && matches!(
+                    definition.function.name.as_str(),
+                    "write_file" | "edit_file"
+                )
+            {
+                definition
+                    .function
+                    .description
+                    .push_str(REVIEW_WRITE_SCOPE_NOTE);
+            }
+            definition
+        })
         .collect()
 }
 
@@ -406,7 +427,10 @@ pub fn completion_command_and_kind(
     } else if tool_name == "browser_session" {
         match args.get("action").and_then(serde_json::Value::as_str) {
             Some("click" | "fill" | "press") => ToolKind::Mutation,
-            Some("open" | "snapshot" | "screenshot" | "close") => ToolKind::RuntimeProbe,
+            Some("screenshot") => ToolKind::Mutation,
+            Some("open" | "attach" | "snapshot" | "tabs" | "select_tab" | "close") => {
+                ToolKind::RuntimeProbe
+            }
             _ => ToolKind::Mutation,
         }
     } else if tool_name.starts_with("write_")
@@ -454,6 +478,103 @@ fn is_delivery_command(command: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// Directories whose text documents are planning artifacts rather than product
+/// code. A WHITELIST on purpose: an unrecognized location fails closed, the same
+/// way `is_review_safe_named_tool` fails closed on an unknown tool name.
+const PLANNING_DOCUMENT_ROOTS: &[&str] = &[
+    "docs/",
+    "doc/",
+    "design/",
+    "designs/",
+    "spec/",
+    "specs/",
+    "plan/",
+    "plans/",
+    "planning/",
+    "rfc/",
+    "rfcs/",
+    "adr/",
+    "adrs/",
+    "notes/",
+];
+
+/// Prose extensions only. A `.rs`/`.json`/`.sh` under `docs/` is still product
+/// material — build scripts and fixtures live in documentation trees too.
+const PLANNING_DOCUMENT_EXTENSIONS: &[&str] = &[".md", ".markdown", ".txt"];
+
+/// Files that steer an agent or front the repository. Editing these CHANGES
+/// BEHAVIOUR — the one thing a review turn must not do — so they are excluded
+/// even when they sit inside a documentation directory.
+const BEHAVIOUR_BEARING_DOCUMENTS: &[&str] = &[
+    "agents.md",
+    "claude.md",
+    "codex.md",
+    "gemini.md",
+    "readme.md",
+    "contributing.md",
+    ".cursorrules",
+    "copilot-instructions.md",
+];
+
+/// Is this path a planning/design document — the legitimate output of a
+/// review turn?
+///
+/// Tolerant about how the model spells the path (absolute or workspace-relative,
+/// `/` or `\`, any case) and strict about what it may reach: a prose extension,
+/// inside a documentation directory, that is not an agent-instruction file, with
+/// no `..` traversal.
+pub fn is_planning_document_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    if normalized.is_empty() || normalized.split('/').any(|segment| segment == "..") {
+        return false;
+    }
+    if !PLANNING_DOCUMENT_EXTENSIONS
+        .iter()
+        .any(|extension| normalized.ends_with(extension))
+    {
+        return false;
+    }
+    let file_name = normalized.rsplit('/').next().unwrap_or_default();
+    if BEHAVIOUR_BEARING_DOCUMENTS.contains(&file_name) {
+        return false;
+    }
+    // Segment-anchored so `mydocs/a.md` and `src/docsystem/a.md` do not pass.
+    PLANNING_DOCUMENT_ROOTS
+        .iter()
+        .any(|root| normalized.starts_with(root) || normalized.contains(&format!("/{root}")))
+}
+
+/// A write whose reach is fully pinned by one `path` argument, aimed at a
+/// planning document. This is the ONLY mutation a review turn may perform.
+///
+/// Deliberately restricted to the two path-bounded write tools: a shell command
+/// naming `docs/plan.md` can still touch anything else in the same line, so
+/// `bash` mutations stay denied and the model is pushed onto `write_file`.
+fn is_planning_document_write(tool_name: &str, args: &serde_json::Value) -> bool {
+    if !matches!(tool_name, "write_file" | "edit_file") {
+        return false;
+    }
+    args.get("path")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_planning_document_path)
+}
+
+/// A structural denial has to carry the allowed route, not just the refusal.
+/// Without it the model retries the same write through a heredoc, then a patch,
+/// then hands the blocker to the user (2026-07-30 field report).
+fn review_only_denial(tool_name: &str) -> String {
+    format!(
+        "本回合是只读审视，已阻止 `{tool_name}`；继续完成当前只读目标，不要要求用户重复确认。\
+需要把方案落盘时，用 `write_file` 或 `edit_file` 写 `docs/` 下的 Markdown 文档\
+（例如 `docs/plans/<slug>.md`），不要用 shell、heredoc 或 patch 写文件。\
+代码、配置、测试以及 AGENTS.md / CLAUDE.md / README.md 要等用户明确要求执行后再改。"
+    )
+}
+
+/// Appended to the write tools' schema on a review turn, so the model learns the
+/// bound from the tool description instead of from a denial after the fact.
+const REVIEW_WRITE_SCOPE_NOTE: &str = " On this review-only turn the path MUST be a planning or design document inside a documentation directory (for example `docs/plans/<slug>.md`), with a `.md`, `.markdown`, or `.txt` extension. Writes to code, config, tests, or agent-instruction files such as AGENTS.md, CLAUDE.md and README.md are rejected until the user asks for implementation.";
+
 fn is_review_safe_named_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -469,6 +590,12 @@ fn is_review_safe_named_tool(tool_name: &str) -> bool {
             | "skill_fetch"
             | "bash"
             | "browser_session"
+            // Offered so a planning turn can persist its own document. The
+            // per-call path check in `capability_denial` is what keeps them
+            // narrow; without them here the tool is invisible and the model
+            // resorts to a shell heredoc that the gate then blocks anyway.
+            | "write_file"
+            | "edit_file"
     )
 }
 
@@ -481,19 +608,29 @@ pub fn tool_visible_for_capability(capability: TurnCapability, tool_name: &str) 
 }
 
 /// Structural intent gate, evaluated before the permission gateway.
+///
+/// `args` is the raw tool payload: the review arm needs the target `path` to
+/// tell a planning document apart from a product change (see
+/// [`is_planning_document_path`]). Deriving it from `command` would be a string
+/// round-trip through `completion_command_and_kind`, and would break for any
+/// backend that formats its command line differently.
 pub fn capability_denial(
     capability: TurnCapability,
     tool_name: &str,
     command: &str,
     kind: &ToolKind,
+    args: &serde_json::Value,
 ) -> Option<String> {
     match capability {
         TurnCapability::ReviewOnly => {
+            // A planning document IS the deliverable of a review turn. Blocking
+            // it forced the whole plan into the chat instead of onto disk.
+            if is_planning_document_write(tool_name, args) {
+                return None;
+            }
             let mutating = matches!(kind, ToolKind::Mutation | ToolKind::BackgroundServiceStart);
             if mutating || !is_review_safe_named_tool(tool_name) {
-                Some(format!(
-                    "本回合是只读审视，已阻止 `{tool_name}`；继续完成当前只读目标，不要要求用户重复确认。"
-                ))
+                Some(review_only_denial(tool_name))
             } else {
                 None
             }
@@ -575,13 +712,22 @@ mod tests {
         assert!(d.reason.contains("post-change inspection is exhausted"));
     }
 
+    fn no_args() -> serde_json::Value {
+        serde_json::json!({})
+    }
+
+    fn write_to(path: &str) -> serde_json::Value {
+        serde_json::json!({"path": path, "content": "# plan\n"})
+    }
+
     #[test]
     fn turn_capability_is_a_hard_gate_before_permission() {
         assert!(capability_denial(
             TurnCapability::ReviewOnly,
             "edit_file",
-            "edit_file",
+            "edit_file src/lib.rs",
             &ToolKind::Mutation,
+            &write_to("src/lib.rs"),
         )
         .is_some());
         assert!(capability_denial(
@@ -589,6 +735,7 @@ mod tests {
             "bash",
             "git status --short",
             &ToolKind::ReadOnly,
+            &no_args(),
         )
         .is_none());
         assert!(capability_denial(
@@ -596,6 +743,7 @@ mod tests {
             "deliver_changes",
             "deliver_changes",
             &ToolKind::Mutation,
+            &no_args(),
         )
         .is_some());
         assert!(capability_denial(
@@ -603,6 +751,7 @@ mod tests {
             "bash",
             "git push origin feat/x",
             &ToolKind::Mutation,
+            &no_args(),
         )
         .is_some());
         assert!(capability_denial(
@@ -610,6 +759,7 @@ mod tests {
             "deliver_changes",
             "deliver_changes",
             &ToolKind::Mutation,
+            &no_args(),
         )
         .is_none());
     }
@@ -621,6 +771,7 @@ mod tests {
             "bash",
             "touch sentinel",
             &ToolKind::Mutation,
+            &no_args(),
         )
         .expect("mutation must be denied");
         assert!(!denial.contains("请由用户明确要求"));
@@ -639,8 +790,220 @@ mod tests {
                 name,
                 name,
                 &ToolKind::ReadOnly,
+                &no_args(),
             )
             .is_some());
+        }
+    }
+
+    // ── Planning documents are the deliverable of a review turn ─────────────
+    //
+    // The motivating field report (2026-07-30): the user asked for a design
+    // ("不要改代码，先给方案"), the turn correctly became ReviewOnly, and then
+    // every attempt to persist that design — `python3 - <<PY … write_text`,
+    // `apply_patch` adding `docs/specs/feature-specs/*.md` — was structurally
+    // denied. ReviewOnly conflated "do not change the product" with "do not
+    // write anything at all", so a planning turn could not produce its own
+    // artifact and dumped the whole plan into the chat instead.
+
+    #[test]
+    fn review_only_allows_the_planning_document_it_exists_to_produce() {
+        for path in [
+            "docs/specs/feature-specs/on-demand-embedded-browser-pane.md",
+            "docs/design/session-execution-governance-ux-design.md",
+            "docs/plans/intent-recognition-planning.md",
+            "docs/long-tasks/keystone-headless-runner.md",
+            "design/notes.txt",
+            "specs/rfc-0001.markdown",
+        ] {
+            assert!(
+                capability_denial(
+                    TurnCapability::ReviewOnly,
+                    "write_file",
+                    &format!("write_file {path}"),
+                    &ToolKind::Mutation,
+                    &write_to(path),
+                )
+                .is_none(),
+                "{path} is the planning artifact of a review turn, not a product change"
+            );
+        }
+        // edit_file on an existing planning document is the same class.
+        assert!(capability_denial(
+            TurnCapability::ReviewOnly,
+            "edit_file",
+            "edit_file docs/specs/feature-specs/mvp-agent-client.md",
+            &ToolKind::Mutation,
+            &serde_json::json!({
+                "path": "docs/specs/feature-specs/mvp-agent-client.md",
+                "old_string": "a",
+                "new_string": "b",
+            }),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn review_only_still_refuses_code_config_and_agent_instruction_writes() {
+        for path in [
+            // Product code and config are never a planning artifact …
+            "src/main.rs",
+            "src/agent/dispatch.rs",
+            "package.json",
+            "src-tauri/Cargo.toml",
+            "docs/scripts/build.sh",
+            "docs/config.json",
+            "migrations/003_add_column.sql",
+            // … nor is a test, even a Markdown-adjacent one …
+            "tests/plan.spec.ts",
+            // … nor are the files that steer the agent itself. Editing those
+            // changes behaviour, which is exactly what a review turn must not do.
+            "AGENTS.md",
+            "CLAUDE.md",
+            "README.md",
+            "docs/AGENTS.md",
+            ".cursorrules",
+            // … and traversal out of the workspace fails closed.
+            "docs/../../../etc/notes.md",
+        ] {
+            assert!(
+                capability_denial(
+                    TurnCapability::ReviewOnly,
+                    "write_file",
+                    &format!("write_file {path}"),
+                    &ToolKind::Mutation,
+                    &write_to(path),
+                )
+                .is_some(),
+                "{path} must stay blocked until the user asks for implementation"
+            );
+        }
+    }
+
+    #[test]
+    fn review_only_keeps_shell_writes_blocked_because_a_command_has_no_path_bound() {
+        // The screenshot's exact escape hatches. A shell command can touch
+        // anything, so it cannot be admitted by path — the model must be pushed
+        // onto `write_file` instead.
+        for command in [
+            "python3 - <<'PY'\nPath('docs/plans/x.md').write_text('…')\nPY",
+            "apply_patch <<'PATCH'\n*** Add File: docs/plans/x.md\nPATCH",
+            "echo '# plan' > docs/plans/x.md",
+            "cat > docs/plans/x.md",
+        ] {
+            assert!(
+                capability_denial(
+                    TurnCapability::ReviewOnly,
+                    "bash",
+                    command,
+                    &ToolKind::Mutation,
+                    &serde_json::json!({"command": command}),
+                )
+                .is_some(),
+                "{command:?} is an unbounded mutation even though it names a docs path"
+            );
+        }
+    }
+
+    #[test]
+    fn review_denial_names_the_route_instead_of_only_saying_no() {
+        // A gate that only blocks makes the model retry the same write three
+        // ways and then hand the blocker to the user. It must point at the
+        // allowed route in the same breath.
+        let denial = capability_denial(
+            TurnCapability::ReviewOnly,
+            "bash",
+            "python3 - <<'PY'\nPath('docs/x.md').write_text('…')\nPY",
+            &ToolKind::Mutation,
+            &serde_json::json!({"command": "python3 -"}),
+        )
+        .expect("shell mutation must be denied");
+        assert!(denial.contains("write_file"), "names the allowed tool");
+        assert!(denial.contains("docs/"), "names the allowed location");
+        assert!(denial.contains("不要要求用户重复确认"));
+        assert!(!denial.contains("请由用户明确要求"));
+    }
+
+    #[test]
+    fn planning_document_detection_is_a_whitelist_and_fails_closed() {
+        assert!(is_planning_document_path("docs/plans/a.md"));
+        assert!(is_planning_document_path("DOCS/PLANS/A.MD"));
+        assert!(is_planning_document_path(r"docs\plans\a.md"));
+        assert!(is_planning_document_path(
+            "/Users/leo/Projects/CodeFactory/docs/specs/a.md"
+        ));
+        // Right extension, wrong place — a whitelist, not "any Markdown".
+        assert!(!is_planning_document_path("notes.md"));
+        assert!(!is_planning_document_path("src/plan.md"));
+        // Right place, wrong extension.
+        assert!(!is_planning_document_path("docs/plans/a.rs"));
+        assert!(!is_planning_document_path("docs/plans/a"));
+        // Substring near-misses must not open the gate.
+        assert!(!is_planning_document_path("src/docsystem/a.md"));
+        assert!(!is_planning_document_path("mydocs/a.md"));
+        assert!(!is_planning_document_path(""));
+    }
+
+    #[test]
+    fn review_turns_expose_the_write_tools_scoped_to_documents() {
+        for name in ["write_file", "edit_file"] {
+            assert!(
+                tool_visible_for_capability(TurnCapability::ReviewOnly, name),
+                "{name} must be offered, or the model falls back to a shell heredoc"
+            );
+        }
+        assert!(!tool_visible_for_capability(
+            TurnCapability::ReviewOnly,
+            "deliver_changes"
+        ));
+
+        let defs = vec![
+            definition("write_file", "Create or overwrite a file."),
+            definition("read_file", "Read a file."),
+        ];
+        let review =
+            active_tool_definitions_for_capability(&defs, false, TurnCapability::ReviewOnly);
+        let write = review
+            .iter()
+            .find(|d| d.function.name == "write_file")
+            .expect("write_file stays available on a review turn");
+        assert!(
+            write.function.description.contains("docs/"),
+            "the document-only bound belongs in the schema the model reads, \
+             not only in the denial it gets afterwards: {}",
+            write.function.description
+        );
+        // Unrelated tools and other capabilities keep their exact description.
+        assert_eq!(
+            review
+                .iter()
+                .find(|d| d.function.name == "read_file")
+                .unwrap()
+                .function
+                .description,
+            "Read a file."
+        );
+        let implement =
+            active_tool_definitions_for_capability(&defs, false, TurnCapability::Implement);
+        assert_eq!(
+            implement
+                .iter()
+                .find(|d| d.function.name == "write_file")
+                .unwrap()
+                .function
+                .description,
+            "Create or overwrite a file."
+        );
+    }
+
+    fn definition(name: &str, description: &str) -> ToolDefinition {
+        ToolDefinition {
+            r#type: "function".into(),
+            function: crate::types::FunctionDefinition {
+                name: name.into(),
+                description: description.into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
         }
     }
 
@@ -659,6 +1022,31 @@ mod tests {
         ] {
             let (_, kind) = completion_command_and_kind(name, &serde_json::json!({}));
             assert_eq!(kind, ToolKind::Mutation, "{name}");
+        }
+    }
+
+    #[test]
+    fn browser_screenshot_is_a_workspace_mutation_but_observation_stays_read_only() {
+        let (_, screenshot) = completion_command_and_kind(
+            "browser_session",
+            &serde_json::json!({"action":"screenshot","path":"proof/page.png"}),
+        );
+        assert_eq!(screenshot, ToolKind::Mutation);
+        assert!(capability_denial(
+            TurnCapability::ReviewOnly,
+            "browser_session",
+            "browser_session screenshot",
+            &screenshot,
+            &serde_json::json!({"action": "screenshot", "path": "proof/page.png"}),
+        )
+        .is_some());
+
+        for action in ["open", "attach", "snapshot", "tabs", "select_tab", "close"] {
+            let (_, kind) = completion_command_and_kind(
+                "browser_session",
+                &serde_json::json!({"action":action}),
+            );
+            assert_eq!(kind, ToolKind::RuntimeProbe, "{action}");
         }
     }
 
@@ -835,6 +1223,9 @@ mod tests {
         assert!(completion_ready_applies(
             FinalizationPolicy::BlockOnIncomplete
         ));
+        // The eval sidecar is the most unattended surface there is; leaving it
+        // out is what broke the headless finalization round after #260.
+        assert!(completion_ready_applies(FinalizationPolicy::Benchmark));
     }
 }
 

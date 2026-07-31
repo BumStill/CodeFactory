@@ -27,7 +27,7 @@ pub mod worktree;
 
 pub use dispatch::{
     decide_chat_contract, decide_chat_mode, is_contextual_approval, proposal_capability,
-    steer_capability_override,
+    steer_capability_override, TurnGrants,
 };
 
 #[cfg(test)]
@@ -105,7 +105,9 @@ fn wall_budget_applies(mode: AgentMode) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionResponse {
     Allow,
-    Deny,
+    DeniedByUser,
+    TimedOut,
+    ChannelClosed,
     Cancelled,
 }
 
@@ -145,7 +147,9 @@ async fn await_permission_response(
     tokio::select! {
         response = timeout(max_wait, receiver) => match response {
             Ok(Ok(true)) => PermissionResponse::Allow,
-            _ => PermissionResponse::Deny,
+            Ok(Ok(false)) => PermissionResponse::DeniedByUser,
+            Ok(Err(_)) => PermissionResponse::ChannelClosed,
+            Err(_) => PermissionResponse::TimedOut,
         },
         _ = wait_for_cancellation(cancel), if cancel.is_some() => PermissionResponse::Cancelled,
     }
@@ -492,6 +496,8 @@ pub struct AgentLoop {
     mode: AgentMode,
     /// Per-turn hard capability boundary; independent from full-access/trust.
     turn_capability: TurnCapability,
+    /// Narrow grants derived only from the current user message.
+    turn_grants: TurnGrants,
     /// Stable for one AgentLoop execution; combined with the provider-round
     /// index to make usage persistence idempotent without collapsing genuine
     /// multi-round tool work.
@@ -717,6 +723,7 @@ impl AgentLoop {
                 AgentMode::Interactive => TurnCapability::ReviewOnly,
                 AgentMode::Execute | AgentMode::Autonomous => TurnCapability::Implement,
             },
+            turn_grants: TurnGrants::default(),
             usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,
             cancel: None,
@@ -801,6 +808,7 @@ impl AgentLoop {
                 AgentMode::Interactive => TurnCapability::ReviewOnly,
                 AgentMode::Execute | AgentMode::Autonomous => TurnCapability::Implement,
             },
+            turn_grants: TurnGrants::default(),
             usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,
             cancel: None,
@@ -820,6 +828,11 @@ impl AgentLoop {
 
     pub fn with_turn_capability(mut self, capability: TurnCapability) -> Self {
         self.turn_capability = capability;
+        self
+    }
+
+    pub fn with_turn_grants(mut self, grants: TurnGrants) -> Self {
+        self.turn_grants = grants;
         self
     }
 
@@ -1300,6 +1313,7 @@ impl AgentLoop {
             events: self.events.clone(),
             pending_permissions: self.pending_permissions.clone(),
             cancel: self.cancel.clone(),
+            browser_read_granted: self.turn_grants.browser_read,
         }
     }
 
@@ -2371,7 +2385,12 @@ fn user_visible_time_context() -> String {
 fn base_system_prompt(mode: AgentMode, cwd: &Path) -> String {
     format!(
         "{}\n\n{}\n\n{}\n\n{SELF_RECOVERY_CONTRACT}\n# Repository-Owned Intent\n\
-         Long-lived requirements, specifications, architecture decisions, and acceptance criteria belong to ordinary versioned files in the repository, not to Agent memory or an app-owned specification database. Before non-trivial planning or implementation, inspect `AGENTS.md`, the README, and relevant existing files such as `docs/specs` or `docs/design`; follow the repository's own convention rather than creating `.codefactory/specs`; plans and delegated task state belong to the current conversation; do not direct the user to a separate specification or planning screen. When a durable decision changes, edit the repository document through normal file tools so it appears in the diff and travels with Git.\n\n# Product Self-Repair Context\n\
+         Long-lived requirements, specifications, architecture decisions, and acceptance criteria belong to ordinary versioned files in the repository, not to Agent memory or an app-owned specification database. Before non-trivial planning or implementation, inspect `AGENTS.md`, the README, and relevant existing files such as `docs/specs` or `docs/design`; follow the repository's own convention rather than creating `.codefactory/specs`; delegated task state belongs to the current conversation; do not direct the user to a separate specification or planning screen. When a durable decision changes, edit the repository document through normal file tools so it appears in the diff and travels with Git.\n\n# A Long Plan Is A Document, Not A Chat Wall\n\
+         When a plan, design, or proposal runs past roughly one screen — several phases, multiple files, alternatives weighed, or acceptance criteria — do NOT flatten it into the reply. Persist it and keep the conversation short:\n\
+         1. Write the full plan to a versioned document with `write_file` (or `edit_file` to revise one that exists). Follow the repository's own convention — `docs/specs/`, `docs/design/`, `docs/long-tasks/` when present — and fall back to `docs/plans/<slug>.md` only when the repository has no convention yet.\n\
+         2. In the chat leave only: the problem in one sentence, three to six decision bullets, the document path, and any genuinely open question. Nothing else. The document is the artifact; the reply is the summary of it.\n\
+         3. Revising a plan means editing that document, not re-pasting a longer version into the conversation.\n\
+         This holds on analysis and review turns too. Writing the planning document IS the deliverable of a turn that must not touch code, and it is explicitly permitted there — a turn restricted from changing the product is not restricted from recording the decision. Use `write_file`/`edit_file` on the document; never write files through a shell heredoc, `apply_patch`, or an inline script.\n\n# Product Self-Repair Context\n\
          When the user reports behavior of the running product and the selected repository is that product's codebase, treat it as a product bug you can fix here. Inspect and fix it in this repository; do not stop at explaining the issue or asking the user to switch contexts.\n\n# Working Directory\n\
          The project root and default tool working directory is:\n{}\n\
          Use this exact path or paths relative to it. Do not assume `/workspace` or another container path.",
@@ -2459,12 +2478,98 @@ pub(super) fn permission_policy_for_mode(mode: &str) -> PermissionPolicy {
             full_access: true,
         },
         _ => PermissionPolicy {
-            allow: standard_tools,
+            allow: standard_tools
+                .into_iter()
+                .chain([
+                    "browser_session(open)".to_string(),
+                    "browser_session(snapshot)".to_string(),
+                    "browser_session(tabs)".to_string(),
+                    "browser_session(select_tab)".to_string(),
+                    "browser_session(close)".to_string(),
+                ])
+                .collect(),
             ask: vec!["bash".to_string(), "browser_session".to_string()],
             deny: vec![],
             full_access: false,
         },
     }
+}
+
+fn decide_permission_for_call(
+    policy: &PermissionPolicy,
+    tool_name: &str,
+    args: &serde_json::Value,
+    cmd: Option<&str>,
+    browser_read_granted: bool,
+) -> PermissionDecision {
+    if tool_name == "browser_session" {
+        let Some(action) = args.get("action").and_then(serde_json::Value::as_str) else {
+            return PermissionDecision::Ask;
+        };
+        match action {
+            // Cleanup must never wait for another approval.
+            "close" => return PermissionDecision::Allow,
+            // Acting in a browser can send, buy, publish, or delete. Trusted
+            // mode does not bypass this per-action confirmation.
+            "click" | "fill" | "press" => return PermissionDecision::Ask,
+            // This writes a project file; the structural capability gate also
+            // rejects it on ReviewOnly turns.
+            "screenshot" => return PermissionDecision::Ask,
+            "open" => {
+                let url = args.get("url").and_then(serde_json::Value::as_str);
+                let verdict = crate::browser::policy::classify(
+                    crate::browser::policy::BrowserAction::Read,
+                    url,
+                    &crate::browser::profile::ProfileScope::Ephemeral,
+                    &crate::browser::policy::GrantedHosts::new(),
+                );
+                if let crate::browser::policy::BrowserPermission::Deny { reason } = verdict {
+                    return PermissionDecision::Deny(reason);
+                }
+            }
+            // Existing Chrome contains the user's signed-in state. The current
+            // root message must explicitly ask for browser reading; safe mode
+            // still keeps its own confirmation.
+            "attach"
+                if browser_read_granted
+                    && (policy.full_access
+                        || policy
+                            .allow
+                            .iter()
+                            .any(|pattern| pattern == "browser_session(open)")) =>
+            {
+                return PermissionDecision::Allow;
+            }
+            "attach" | "snapshot" | "tabs" | "select_tab" => {}
+            _ => {
+                return PermissionDecision::Deny(format!(
+                    "unknown browser_session action '{action}'"
+                ))
+            }
+        }
+
+        let key = format!("browser_session({action})");
+        for pattern in &policy.deny {
+            if glob_match(pattern, &key) || glob_match(pattern, tool_name) {
+                return PermissionDecision::Deny(format!("Denied by policy: matches '{pattern}'"));
+            }
+        }
+        if policy.full_access {
+            return PermissionDecision::Allow;
+        }
+        for pattern in &policy.allow {
+            if glob_match(pattern, &key) || glob_match(pattern, tool_name) {
+                return PermissionDecision::Allow;
+            }
+        }
+        for pattern in &policy.ask {
+            if glob_match(pattern, &key) || glob_match(pattern, tool_name) {
+                return PermissionDecision::Ask;
+            }
+        }
+        return PermissionDecision::Ask;
+    }
+    decide_permission(policy, tool_name, cmd)
 }
 
 fn decide_permission(
@@ -2494,42 +2599,10 @@ fn decide_permission(
         }
     }
 
-    // Browsing a signed-in profile acts as the user across every account in it,
-    // so — like bash's shell policy — the browser rules run ahead of the generic
-    // allow/ask/deny lists and ahead of full_access. A blanket "allow
-    // everything" must not silently grant acting as the user on a live site.
-    if tool_name == "browser_session" {
-        if let Some(cmd) = cmd {
-            match crate::browser::policy::classify_cmd(cmd) {
-                crate::browser::policy::BrowserPermission::Deny { reason } => {
-                    return PermissionDecision::Deny(reason);
-                }
-                crate::browser::policy::BrowserPermission::Ask { .. } => {
-                    // Still consult the allow list first, so "always allow
-                    // reading github.com" keeps working; only fall back to Ask.
-                    let key = format!("{tool_name}({cmd})");
-                    for pattern in &policy.deny {
-                        if glob_match(pattern, &key) || glob_match(pattern, tool_name) {
-                            return PermissionDecision::Deny(format!(
-                                "Denied by policy: matches '{pattern}'"
-                            ));
-                        }
-                    }
-                    for pattern in &policy.allow {
-                        if glob_match(pattern, &key) {
-                            return PermissionDecision::Allow;
-                        }
-                    }
-                    return PermissionDecision::Ask;
-                }
-                crate::browser::policy::BrowserPermission::Allow => {}
-            }
-        }
-    }
-
-    let key = match cmd {
-        Some(c) => format!("{}({})", tool_name, c),
-        None => tool_name.to_string(),
+    let key = match (tool_name, cmd) {
+        ("browser_session", _) => tool_name.to_string(),
+        (_, Some(c)) => format!("{}({})", tool_name, c),
+        (_, None) => tool_name.to_string(),
     };
 
     for pattern in &policy.deny {
@@ -2595,6 +2668,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             error: None,
+            metadata: None,
             next_working_directory: None,
             duration_ms: 0,
         }
@@ -2701,6 +2775,29 @@ mod tests {
         assert_eq!(
             await_permission_response(receiver, Some(&cancel), Duration::from_secs(1)).await,
             PermissionResponse::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_response_preserves_user_denial_timeout_and_closed_channel() {
+        let (deny_sender, deny_receiver) = tokio::sync::oneshot::channel();
+        deny_sender.send(false).unwrap();
+        assert_eq!(
+            await_permission_response(deny_receiver, None, Duration::from_secs(1)).await,
+            PermissionResponse::DeniedByUser
+        );
+
+        let (_timeout_sender, timeout_receiver) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            await_permission_response(timeout_receiver, None, Duration::from_millis(1)).await,
+            PermissionResponse::TimedOut
+        );
+
+        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        drop(closed_sender);
+        assert_eq!(
+            await_permission_response(closed_receiver, None, Duration::from_secs(1)).await,
+            PermissionResponse::ChannelClosed
         );
     }
 
@@ -3329,7 +3426,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_intent_belongs_to_git_while_plans_belong_to_the_session() {
+    fn repository_intent_belongs_to_git_while_task_state_belongs_to_the_session() {
         for mode in [
             AgentMode::Interactive,
             AgentMode::Execute,
@@ -3340,10 +3437,42 @@ mod tests {
             assert!(prompt.contains("AGENTS.md"));
             assert!(prompt.contains("docs/specs"));
             assert!(prompt.contains("docs/design"));
-            assert!(prompt
-                .contains("plans and delegated task state belong to the current conversation"));
+            assert!(
+                prompt.contains("delegated task state belongs to the current conversation"),
+                "live task state stays in the session"
+            );
+            assert!(
+                !prompt
+                    .contains("plans and delegated task state belong to the current conversation"),
+                "a long plan is no longer session-only — it is persisted as a repository document"
+            );
             assert!(prompt
                 .contains("do not direct the user to a separate specification or planning screen"));
+        }
+    }
+
+    /// 2026-07-30 field report: a design discussion produced a full spec inside
+    /// the chat because nothing told the agent to persist it, and the review-only
+    /// gate blocked it from doing so anyway (see
+    /// `docs/specs/feature-specs/planning-turn-document-authoring.md`).
+    #[test]
+    fn a_long_plan_is_persisted_as_a_document_instead_of_flattened_into_chat() {
+        for mode in [
+            AgentMode::Interactive,
+            AgentMode::Execute,
+            AgentMode::Autonomous,
+        ] {
+            let prompt = base_system_prompt(mode, Path::new("/projects/CodeFactory"));
+            assert!(prompt.contains("# A Long Plan Is A Document, Not A Chat Wall"));
+            // The threshold, the destination, and what the chat keeps instead.
+            assert!(prompt.contains("do NOT flatten it into the reply"));
+            assert!(prompt.contains("docs/plans/<slug>.md"));
+            assert!(prompt.contains("the document path"));
+            // Review turns must be told the document write is allowed there,
+            // otherwise the model self-censors and dumps the plan into the chat.
+            assert!(prompt.contains("deliverable of a turn that must not touch code"));
+            // And it must not reach for the escape hatches the gate blocks.
+            assert!(prompt.contains("never write files through a shell heredoc"));
         }
     }
 
@@ -3468,6 +3597,36 @@ mod tests {
             decide_permission(&standard, "bash", Some("pnpm test")),
             PermissionDecision::Ask
         );
+        assert_eq!(
+            decide_permission_for_call(
+                &standard,
+                "browser_session",
+                &serde_json::json!({"action":"open","url":"https://example.com"}),
+                None,
+                false,
+            ),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            decide_permission_for_call(
+                &standard,
+                "browser_session",
+                &serde_json::json!({"action":"attach"}),
+                None,
+                true,
+            ),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            decide_permission_for_call(
+                &standard,
+                "browser_session",
+                &serde_json::json!({"action":"attach"}),
+                None,
+                false,
+            ),
+            PermissionDecision::Ask
+        );
 
         let trusted = permission_policy_for_mode("trusted");
         assert_eq!(
@@ -3482,6 +3641,19 @@ mod tests {
             ),
             PermissionDecision::Ask
         );
+        for action in ["click", "fill", "press"] {
+            assert_eq!(
+                decide_permission_for_call(
+                    &trusted,
+                    "browser_session",
+                    &serde_json::json!({"action":action}),
+                    None,
+                    true,
+                ),
+                PermissionDecision::Ask,
+                "{action} must still require consent in trusted mode"
+            );
+        }
     }
 
     #[test]
