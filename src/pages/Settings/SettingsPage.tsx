@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import {
   invoke,
+  onChromiumProgress,
   codexLogout,
   codexAccount,
   codexLoginStart,
@@ -1106,6 +1107,9 @@ function BrowserSessionsTab() {
 
   return (
     <section className="max-w-3xl space-y-4" aria-labelledby="browser-sessions-title">
+      <BrowserBridgePanel />
+      <ChromiumFallbackPanel />
+
       <div className="flex items-start justify-between gap-4">
         <div>
           <h2 id="browser-sessions-title" className="text-base font-semibold text-gray-100">
@@ -1684,6 +1688,209 @@ function AppearanceTab() {
         </p>
       </div>
 
+    </div>
+  );
+}
+
+// ── BrowserBridgePanel — pairing the extension with the user's own browser ───
+//
+// The extension cannot read a file on disk, so the port and token have to cross
+// by hand exactly once. Showing them here — rather than asking the user to dig
+// through a config file — is the whole point of this panel.
+function BrowserBridgePanel() {
+  const [pairing, setPairing] = useState<
+    { port: number; token: string; connected: boolean } | null
+  >(null);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState<"port" | "token" | null>(null);
+
+  const load = async () => {
+    try {
+      setPairing(await invoke("browser_bridge_pairing"));
+      setError(null);
+    } catch (loadError) {
+      setError(String(loadError));
+    }
+  };
+
+  useEffect(() => {
+    void load();
+    // Connection state changes when the user finishes pairing in Chrome, and
+    // there is no event for that — a slow poll is honest and cheap.
+    const timer = setInterval(() => void load(), 5000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const copy = async (what: "port" | "token", value: string) => {
+    await navigator.clipboard.writeText(value);
+    setCopied(what);
+    setTimeout(() => setCopied(null), 1500);
+  };
+
+  return (
+    <div className="space-y-2.5 rounded-lg border border-border bg-surface-1 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-sm text-gray-200">读取你自己浏览器里已打开的页面</p>
+          <p className="mt-0.5 text-xs leading-5 text-gray-500">
+            装上 CodeFactory 扩展后,agent 就能读你已经登录的站点——不用在别的浏览器里重新登录一次。
+          </p>
+        </div>
+        <span
+          className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] ${
+            pairing?.connected
+              ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400"
+              : "bg-surface-3 text-gray-500"
+          }`}
+        >
+          {pairing?.connected ? "已连接" : "未连接"}
+        </span>
+      </div>
+
+      {error && (
+        <p className="text-xs leading-5 text-rose-500">{error}</p>
+      )}
+
+      {pairing && (
+        <>
+          <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded-md border border-border/70 bg-surface-2 p-2.5 text-xs">
+            <span className="text-gray-500">端口</span>
+            <span className="font-mono text-gray-200">{pairing.port}</span>
+            <button
+              type="button"
+              onClick={() => void copy("port", String(pairing.port))}
+              className="rounded border border-border px-2 py-0.5 text-[11px] text-gray-400 hover:text-gray-200"
+            >
+              {copied === "port" ? "已复制" : "复制"}
+            </button>
+
+            <span className="text-gray-500">配对码</span>
+            <span className="truncate font-mono text-gray-200">{pairing.token}</span>
+            <button
+              type="button"
+              onClick={() => void copy("token", pairing.token)}
+              className="rounded border border-border px-2 py-0.5 text-[11px] text-gray-400 hover:text-gray-200"
+            >
+              {copied === "token" ? "已复制" : "复制"}
+            </button>
+          </div>
+
+          <ol className="ml-4 list-decimal space-y-1 text-xs leading-5 text-gray-500">
+            <li>
+              在项目里运行 <span className="font-mono text-gray-400">pnpm ext:build</span>
+            </li>
+            <li>
+              Chrome 打开 <span className="font-mono text-gray-400">chrome://extensions</span>,
+              开启右上角「开发者模式」
+            </li>
+            <li>
+              点「加载已解压的扩展程序」,选 <span className="font-mono text-gray-400">extension/dist</span>
+            </li>
+            <li>点扩展图标,把上面的端口和配对码填进去</li>
+          </ol>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── ChromiumFallbackPanel — the browser CodeFactory manages itself ───────────
+//
+// The fallback for when the extension is not installed: it needs nothing set up
+// in the user's browser, at the cost of signing in once inside it. The download
+// is ~150 MB, so it is opt-in and shows progress rather than blocking.
+function ChromiumFallbackPanel() {
+  const [status, setStatus] = useState<{
+    supported: boolean;
+    installed?: boolean;
+    version?: string;
+    needs_repair?: boolean;
+  } | null>(null);
+  const [progress, setProgress] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = async () => {
+    try {
+      setStatus(await invoke("browser_chromium_status"));
+    } catch (loadError) {
+      setError(String(loadError));
+    }
+  };
+
+  useEffect(() => {
+    void load();
+    const unlisten = onChromiumProgress((payload) => {
+        if (payload.stage === "downloading" && payload.received_bytes) {
+          const mb = Math.round(payload.received_bytes / 1_000_000);
+          const total = payload.total_bytes
+            ? ` / ${Math.round(payload.total_bytes / 1_000_000)} MB`
+            : "";
+          setProgress(`正在下载 ${mb} MB${total}`);
+        } else if (payload.stage === "extracting") {
+          setProgress("正在解压…");
+        } else if (payload.stage === "done") {
+          setProgress(null);
+          void load();
+        }
+    });
+    return () => {
+      void unlisten.then((off) => off());
+    };
+  }, []);
+
+  const download = async () => {
+    setError(null);
+    setProgress("正在准备…");
+    try {
+      await invoke("browser_download_chromium");
+    } catch (downloadError) {
+      setError(String(downloadError));
+      setProgress(null);
+    }
+  };
+
+  if (status && !status.supported) {
+    return (
+      <div className="rounded-lg border border-border bg-surface-1 p-3 text-xs text-gray-500">
+        这个平台没有可用的 Chromium 构建,只能使用扩展方式。
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2 rounded-lg border border-border bg-surface-1 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-sm text-gray-200">备用:CodeFactory 自带的浏览器</p>
+          <p className="mt-0.5 text-xs leading-5 text-gray-500">
+            没装扩展时用这个。不需要动你的浏览器,代价是要在它里面登录一次。约 150 MB,只下一次。
+          </p>
+        </div>
+        {status?.installed ? (
+          <span className="shrink-0 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[11px] text-emerald-700 dark:text-emerald-400">
+            已就绪
+          </span>
+        ) : null}
+      </div>
+
+      {status?.installed ? (
+        <p className="text-xs text-gray-600">版本 {status.version}</p>
+      ) : progress ? (
+        <p className="flex items-center gap-1.5 text-xs text-gray-400">
+          <RefreshCw size={11} className="animate-spin" />
+          {progress}
+        </p>
+      ) : (
+        <button
+          type="button"
+          onClick={() => void download()}
+          className="rounded bg-accent px-2.5 py-1 text-xs text-white hover:bg-accent-hover"
+        >
+          {status?.needs_repair ? "重新下载(修复)" : "下载浏览器"}
+        </button>
+      )}
+
+      {error && <p className="text-xs leading-5 text-rose-500">{error}</p>}
     </div>
   );
 }

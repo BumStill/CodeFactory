@@ -97,6 +97,8 @@ vi.mock("../../stores/updater", () => ({
   useUpdaterStore: <T,>(selector: (state: typeof updaterState) => T) => selector(updaterState),
 }));
 vi.mock("../../lib/tauri", () => ({
+  // The Browser tab subscribes to Chromium download progress.
+  onChromiumProgress: () => Promise.resolve(() => {}),
   invoke: mocks.invoke,
   codexLogin: mocks.codexLogin,
   codexLogout: mocks.codexLogout,

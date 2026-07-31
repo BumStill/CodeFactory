@@ -117,6 +117,10 @@ vi.mock("../../lib/tauri", () => ({
   applyCodexModels: mocks.applyCodexModels,
   listBrowserSessions: mocks.listBrowserSessions,
   closeBrowserSession: mocks.closeBrowserSession,
+  // The Browser tab now also subscribes to Chromium download progress. This
+  // test does not exercise the download, so a no-op unsubscriber is enough —
+  // but it must exist, or the real Tauri listener runs and jsdom has no runtime.
+  onChromiumProgress: () => Promise.resolve(() => {}),
 }));
 
 async function openGeneralTab() {

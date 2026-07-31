@@ -150,6 +150,12 @@ jobs:
       # removes its lease instead of leaving a headless browser daemon behind.
       - name: Browser session lifecycle smoke
         shell: pwsh
+        env:
+          # The runner has Chrome preinstalled but nobody at the keyboard, so
+          # the headed default would open a window no one can use. This is the
+          # only place the override is set; the app itself stays headed, since
+          # a user completing a 2FA sign-in needs to see it.
+          CODEFACTORY_BROWSER_HEADLESS: "1"
         run: |
           $receipt = Join-Path $env:RUNNER_TEMP "browser-session-smoke.json"
           cargo run --manifest-path src-tauri/Cargo.toml -- --browser-session-smoke $receipt

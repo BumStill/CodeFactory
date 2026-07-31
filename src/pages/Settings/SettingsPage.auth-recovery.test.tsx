@@ -88,6 +88,8 @@ vi.mock("../../stores/updater", () => ({
 }));
 
 vi.mock("../../lib/tauri", () => ({
+  // The Browser tab subscribes to Chromium download progress.
+  onChromiumProgress: () => Promise.resolve(() => {}),
   invoke: mocks.invoke,
   codexAccount: mocks.codexAccount,
   codexLogin: mocks.codexLogin,

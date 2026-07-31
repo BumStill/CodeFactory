@@ -188,3 +188,18 @@ describe("page script — snapshot and refs", () => {
     expect(names).toEqual(["Visible"]);
   });
 });
+
+describe("progress listener outside Tauri", () => {
+  it("resolves to a no-op instead of throwing into an unhandled rejection", async () => {
+    // This exact failure shipped twice: every test file reported passing while
+    // vitest exited non-zero, because subscribing without a Tauri runtime
+    // rejects asynchronously. A component that renders in jsdom must be able to
+    // call this safely.
+    const { onChromiumProgress } = await import("./tauri");
+    expect("__TAURI_INTERNALS__" in window).toBe(false);
+
+    const unlisten = await onChromiumProgress(() => {});
+    expect(typeof unlisten).toBe("function");
+    expect(() => unlisten()).not.toThrow();
+  });
+});

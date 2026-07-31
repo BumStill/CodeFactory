@@ -2540,7 +2540,9 @@ fn decide_permission_for_call(
             {
                 return PermissionDecision::Allow;
             }
-            "attach" | "snapshot" | "tabs" | "select_tab" => {}
+            // Reading is the point of the feature; these carry no side effect
+            // beyond what the user already sees in their own browser.
+            "attach" | "snapshot" | "tabs" | "select_tab" | "read" | "find" => {}
             _ => {
                 return PermissionDecision::Deny(format!(
                     "unknown browser_session action '{action}'"

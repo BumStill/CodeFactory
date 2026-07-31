@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <title>CodeFactory Browser Bridge</title>
+    <style>
+      body {
+        font: 13px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        margin: 0;
+        padding: 16px;
+        width: 320px;
+        color: #1f2328;
+      }
+      h1 { font-size: 14px; margin: 0 0 4px; }
+      p { margin: 0 0 12px; color: #59636e; }
+      label { display: block; font-size: 12px; margin-bottom: 4px; color: #59636e; }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 6px 8px;
+        border: 1px solid #d1d9e0;
+        border-radius: 6px;
+        font: inherit;
+        margin-bottom: 10px;
+      }
+      button {
+        width: 100%;
+        padding: 7px;
+        border: 0;
+        border-radius: 6px;
+        background: #1f6feb;
+        color: #fff;
+        font: inherit;
+        cursor: pointer;
+      }
+      #status {
+        margin-top: 12px;
+        padding: 8px 10px;
+        border-radius: 6px;
+        background: #f6f8fa;
+        font-size: 12px;
+      }
+      @media (prefers-color-scheme: dark) {
+        body { background: #0d1117; color: #e6edf3; }
+        p, label { color: #9198a1; }
+        input { background: #0d1117; border-color: #3d444d; color: #e6edf3; }
+        #status { background: #151b23; }
+      }
+    </style>
+  </head>
+  <body>
+    <h1>连接 CodeFactory</h1>
+    <p>在 CodeFactory 的「设置 → 浏览器」里复制端口和配对码,粘贴到下面。</p>
+
+    <label for="port">端口</label>
+    <input id="port" inputmode="numeric" placeholder="例如 51789" />
+
+    <label for="token">配对码</label>
+    <input id="token" placeholder="32 位字符" />
+
+    <button id="save">保存并连接</button>
+
+    <div id="status">正在检查连接状态…</div>
+
+    <script src="options.js"></script>
+  </body>
+</html>

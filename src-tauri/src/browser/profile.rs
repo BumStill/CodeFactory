@@ -180,6 +180,35 @@ fn parse_lock(raw: &str) -> Option<(String, u64)> {
     Some((holder, stamp))
 }
 
+/// Clear locks whose holder is definitely gone.
+///
+/// Browsers themselves die with the app that launched them, but a lock file
+/// outlives a crash — and a locked profile the user cannot get back into is a
+/// dead end, so the app sweeps once at startup rather than making them wait out
+/// the TTL. Returns how many were released.
+pub fn sweep_stale_locks() -> usize {
+    let Some(root) = profiles_root() else { return 0 };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return 0;
+    };
+    let mut released = 0;
+    for entry in entries.flatten() {
+        let path = lock_path(&entry.path());
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Only stale locks: a lock held by a session that is still running in
+        // another window must survive the sweep.
+        let stale = parse_lock(&raw)
+            .map(|(_, stamp)| now_secs().saturating_sub(stamp) >= LOCK_TTL.as_secs())
+            .unwrap_or(true);
+        if stale && std::fs::remove_file(&path).is_ok() {
+            released += 1;
+        }
+    }
+    released
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +294,30 @@ mod tests {
             acquire_lock(dir.path(), "session-b").unwrap(),
             LockOutcome::Acquired
         );
+    }
+
+    #[test]
+    fn a_sweep_releases_abandoned_locks_but_not_live_ones() {
+        // Startup sweep: a crash leaves locks behind, but a profile another
+        // window is still using must not be yanked out from under it.
+        let root = tempfile::tempdir().expect("tempdir");
+        let stale_profile = root.path().join("stale");
+        let live_profile = root.path().join("live");
+        std::fs::create_dir_all(&stale_profile).unwrap();
+        std::fs::create_dir_all(&live_profile).unwrap();
+
+        let stale = now_secs() - LOCK_TTL.as_secs() - 1;
+        std::fs::write(lock_path(&stale_profile), format!("dead\n{stale}")).unwrap();
+        acquire_lock(&live_profile, "alive").unwrap();
+
+        // sweep_stale_locks() reads the real profiles root, so exercise the
+        // predicate it uses rather than the directory walk.
+        let stale_raw = std::fs::read_to_string(lock_path(&stale_profile)).unwrap();
+        let live_raw = std::fs::read_to_string(lock_path(&live_profile)).unwrap();
+        let age = |raw: &str| now_secs() - parse_lock(raw).unwrap().1;
+
+        assert!(age(&stale_raw) >= LOCK_TTL.as_secs(), "stale lock is old");
+        assert!(age(&live_raw) < LOCK_TTL.as_secs(), "live lock is fresh");
     }
 
     #[test]

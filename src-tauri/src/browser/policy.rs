@@ -268,6 +268,8 @@ mod tests {
         }
     }
 
+
+
     #[test]
     fn host_extraction_ignores_port_credentials_and_case() {
         assert_eq!(

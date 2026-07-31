@@ -16,6 +16,10 @@
 //! Everything security-relevant lives in [`policy`] and [`profile`] rather than
 //! in a driver, so a second backend cannot accidentally ship with weaker rules.
 
+pub mod bridge;
+pub mod chromium;
+pub mod download;
+pub mod extension;
 pub mod install;
 pub mod page;
 pub mod policy;
