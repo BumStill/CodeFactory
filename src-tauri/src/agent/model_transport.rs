@@ -198,7 +198,7 @@ impl DesktopModelTransport {
                     .await
             }
             _ => {
-                self.call_openai_model(messages, tool_defs, require_tool)
+                self.call_openai_model(messages, tool_defs, require_tool, reasoning_effort)
                     .await
             }
         };
@@ -213,7 +213,9 @@ impl DesktopModelTransport {
                 self.call_chatgpt_model(messages, tool_defs, false, reasoning_effort)
                     .await
             }
-            _ => self.call_openai_model(messages, tool_defs, false).await,
+            _ => self
+                .call_openai_model(messages, tool_defs, false, reasoning_effort)
+                .await,
         }
     }
 
@@ -524,6 +526,7 @@ impl DesktopModelTransport {
         messages: &[ChatMessage],
         tool_defs: &[ToolDefinition],
         require_tool: bool,
+        reasoning_effort: &str,
     ) -> Result<(String, Vec<ToolCall>, Option<Usage>, Option<String>)> {
         let finalization_response = tool_defs.is_empty();
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -556,6 +559,22 @@ impl DesktopModelTransport {
         // reported as "1.15 worked, recent builds don't". We adapt REACTIVELY
         // below, only when the server itself rejects `max_tokens`.
         let mut body = serde_json::to_value(&req)?;
+
+        // DeepSeek reasoning models (deepseek.com direct or deepseek/… via
+        // OpenRouter) enable thinking and tune its strength through
+        // `reasoning_effort` (low|high|max). Attach only for DeepSeek routes —
+        // other OpenAI-compatible providers keep their exact payload.
+        if let Some(patch) =
+            deepseek_reasoning_body_patch(&self.base_url, &self.model_id, reasoning_effort)
+        {
+            if let Some(obj) = body.as_object_mut() {
+                if let Some(extra) = patch.as_object() {
+                    for (k, v) in extra {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
 
         let mut response = crate::http_util::send_with_retry_and_notify(
             "OpenAI-compatible chat stream request",
@@ -750,6 +769,47 @@ fn normalize_chatgpt_reasoning_effort(value: &str) -> &str {
         "ultra" => "max",
         _ => "medium",
     }
+}
+
+/// DeepSeek's `reasoning_effort` accepts `low` | `high` | `max` (default
+/// `high`); `medium`/`xhigh` are compatibility-mapped by the API itself. Map
+/// CodeFactory's extended palette onto DeepSeek's three real levels — the
+/// picker shows low/high/max for DeepSeek, but a persisted session override
+/// may still carry any of our levels.
+fn normalize_deepseek_reasoning_effort(value: &str) -> &str {
+    match value {
+        "minimal" | "low" => "low",
+        "medium" | "high" => "high",
+        "xhigh" | "max" | "ultra" => "max",
+        other => other,
+    }
+}
+
+/// True when this route speaks the DeepSeek API dialect — either a
+/// deepseek.com endpoint or a deepseek-prefixed model id (incl. OpenRouter
+/// `deepseek/…` slugs).
+fn is_deepseek_route(base_url: &str, model_id: &str) -> bool {
+    let base = base_url.to_ascii_lowercase();
+    let model = model_id.to_ascii_lowercase();
+    base.contains("deepseek.com") || model.starts_with("deepseek")
+}
+
+/// The extra body fields to attach for a DeepSeek reasoning model. DeepSeek
+/// enables thinking via `thinking: {type: enabled}` and tunes it with
+/// `reasoning_effort`. Returns `None` for non-DeepSeek routes so other
+/// OpenAI-compatible providers (LMStudio, Ollama, …) keep their exact payload.
+fn deepseek_reasoning_body_patch(
+    base_url: &str,
+    model_id: &str,
+    reasoning_effort: &str,
+) -> Option<serde_json::Value> {
+    if !is_deepseek_route(base_url, model_id) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "thinking": { "type": "enabled" },
+        "reasoning_effort": normalize_deepseek_reasoning_effort(reasoning_effort),
+    }))
 }
 
 /// The agent-loop `ModelTransport` seam (keystone slice 4.5b). Wraps the
@@ -1129,6 +1189,53 @@ mod tests {
         assert_eq!(normalize_chatgpt_reasoning_effort(""), "medium");
         assert_eq!(normalize_chatgpt_reasoning_effort("ultra"), "max");
         assert_eq!(normalize_chatgpt_reasoning_effort("high"), "high");
+    }
+
+    #[test]
+    fn deepseek_effort_maps_our_palette_onto_low_high_max() {
+        assert_eq!(normalize_deepseek_reasoning_effort("minimal"), "low");
+        assert_eq!(normalize_deepseek_reasoning_effort("low"), "low");
+        assert_eq!(normalize_deepseek_reasoning_effort("medium"), "high");
+        assert_eq!(normalize_deepseek_reasoning_effort("high"), "high");
+        assert_eq!(normalize_deepseek_reasoning_effort("xhigh"), "max");
+        assert_eq!(normalize_deepseek_reasoning_effort("max"), "max");
+        assert_eq!(normalize_deepseek_reasoning_effort("ultra"), "max");
+    }
+
+    #[test]
+    fn deepseek_route_detection_covers_direct_and_openrouter_slugs() {
+        assert!(is_deepseek_route("https://api.deepseek.com", "deepseek-v4-pro"));
+        assert!(is_deepseek_route("https://openrouter.ai/api/v1", "deepseek/deepseek-v4-pro"));
+        // Non-DeepSeek OpenAI-compatible providers must NOT get the patch.
+        assert!(!is_deepseek_route("http://localhost:1234/v1", "qwen2.5-coder"));
+        assert!(!is_deepseek_route("https://api.openai.com/v1", "gpt-5.6"));
+    }
+
+    #[test]
+    fn deepseek_body_patch_enables_thinking_with_mapped_effort() {
+        let patch = deepseek_reasoning_body_patch(
+            "https://api.deepseek.com",
+            "deepseek-v4-pro",
+            "medium",
+        )
+        .expect("deepseek route gets a patch");
+        assert_eq!(patch["thinking"]["type"], "enabled");
+        assert_eq!(patch["reasoning_effort"], "high");
+
+        let max_patch = deepseek_reasoning_body_patch(
+            "https://openrouter.ai/api/v1",
+            "deepseek/deepseek-v4-pro",
+            "xhigh",
+        )
+        .expect("openrouter deepseek slug gets a patch");
+        assert_eq!(max_patch["reasoning_effort"], "max");
+
+        assert!(deepseek_reasoning_body_patch(
+            "http://localhost:1234/v1",
+            "qwen2.5-coder",
+            "high"
+        )
+        .is_none());
     }
     fn tool_cm(id: &str, content: &str) -> ChatMessage {
         ChatMessage {
