@@ -26,8 +26,9 @@ pub mod verification;
 pub mod worktree;
 
 pub use dispatch::{
-    decide_chat_contract, decide_chat_mode, is_contextual_approval, proposal_capability,
-    steer_capability_override, TurnGrants,
+    decide_chat_contract, decide_chat_mode, is_contextual_approval, is_delivery_revocation,
+    proposal_capability, steer_capability_override, with_persisted_delivery_authorization,
+    TurnGrants,
 };
 
 #[cfg(test)]

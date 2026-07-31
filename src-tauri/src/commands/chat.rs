@@ -609,7 +609,23 @@ pub async fn send_message(
     // Full access is a permission policy only. It may reduce approval prompts
     // after a tool is selected, but it must never turn a diagnostic question
     // into an execute-contract turn.
-    let contract = crate::agent::decide_chat_contract(prev_assistant.as_deref(), &content);
+    let mut contract = crate::agent::decide_chat_contract(prev_assistant.as_deref(), &content);
+    // Session-persisted delivery authorization: once this session asked to
+    // deliver, later non-planning turns keep Deliver capability so follow-up
+    // work can ship without a repeat confirmation. A new explicit delivery
+    // request (re)grants it; a revocation clears it.
+    let delivery_map = state.delivery_authorizations.clone();
+    {
+        let mut auth = delivery_map.lock().await;
+        let authorized = auth.get(&session_id).copied().unwrap_or(false);
+        if crate::agent::is_delivery_revocation(&content) {
+            auth.insert(session_id.clone(), false);
+        } else if contract.capability == crate::agent::TurnCapability::Deliver {
+            auth.insert(session_id.clone(), true);
+        } else if authorized {
+            contract = crate::agent::with_persisted_delivery_authorization(contract, true);
+        }
+    }
     let mode = select_chat_mode(
         settings.permissions.full_access,
         prev_assistant.as_deref(),
@@ -852,7 +868,22 @@ pub async fn send_message_anonymous(
                     || crate::agent::proposal_capability(&turn.content).is_some())
         })
         .map(|turn| turn.content.as_str());
-    let contract = crate::agent::decide_chat_contract(prev_assistant, &content);
+    let mut contract = crate::agent::decide_chat_contract(prev_assistant, &content);
+    // Session-persisted delivery authorization (same semantics as send_message):
+    // once this session asked to deliver, later non-planning turns inherit
+    // Deliver capability; explicit delivery re-grants, revocation clears.
+    let delivery_map = state.delivery_authorizations.clone();
+    {
+        let mut auth = delivery_map.lock().await;
+        let authorized = auth.get(&session_id).copied().unwrap_or(false);
+        if crate::agent::is_delivery_revocation(&content) {
+            auth.insert(session_id.clone(), false);
+        } else if contract.capability == crate::agent::TurnCapability::Deliver {
+            auth.insert(session_id.clone(), true);
+        } else if authorized {
+            contract = crate::agent::with_persisted_delivery_authorization(contract, true);
+        }
+    }
 
     // Build in-memory history: prior turns from the frontend + this new message.
     let mut full_history: Vec<crate::storage::Message> = history

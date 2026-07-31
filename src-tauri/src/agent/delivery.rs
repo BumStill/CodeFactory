@@ -1968,7 +1968,11 @@ fn finish(mut outcome: DeliveryOutcome, branch: &str) -> DeliveryOutcome {
 async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32) -> CiStatus {
     let deadline = timeout_secs.max(1);
     let mut waited = 0u32;
-    let step = 10u32;
+    // Exponential backoff: 10s → 20s → 40s → 60s (capped). GitHub check-runs
+    // polling is the biggest API cost of a delivery run; a fixed 10s cadence
+    // burns ~30 requests for a 5-minute CI. Backoff keeps the first polls
+    // snappy while slashing total calls on longer runs.
+    let mut interval = 10u32;
     loop {
         match remote.ci_status(sha).await {
             Ok(CiStatus::Pending) => {}
@@ -1978,11 +1982,10 @@ async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32
         if waited >= deadline {
             return CiStatus::Pending;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(
-            step.min(deadline - waited) as u64
-        ))
-        .await;
-        waited += step;
+        let sleep_secs = interval.min(deadline - waited);
+        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs as u64)).await;
+        waited += sleep_secs;
+        interval = (interval * 2).min(60);
     }
 }
 
@@ -2347,6 +2350,12 @@ fn gh_auth_status_for_host(bin: &str, hostname: &str) -> bool {
 /// user. This is the same credential file `gh auth status --hostname` checks;
 /// reading it directly works even when the `gh` binary is not in the GUI app's
 /// PATH (common on macOS with Homebrew).
+///
+/// Parsing is deliberately LOOSE about host-file structure: modern gh writes
+/// `users:`-nested entries (`users: <name>: oauth_token:`), older versions use
+/// flat `oauth_token:` at host level, and the indentation differs across gh
+/// releases. The only things we need are a `user:` key and a non-empty
+/// `oauth_token:` key under the requested host block — anything else is noise.
 fn gh_hosts_file_indicates_authenticated_for_host(hostname: &str) -> bool {
     let home = match dirs::home_dir() {
         Some(h) => h,
@@ -2357,6 +2366,14 @@ fn gh_hosts_file_indicates_authenticated_for_host(hostname: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
+    gh_hosts_content_has_auth_for_host(&content, hostname)
+}
+
+/// Testable core of the hosts.yml probe above. `gh auth status` exits non-zero
+/// both when no token exists AND when GitHub is rate-limiting the validation
+/// request, so we cannot rely on its exit code alone — the credential file is
+/// the source of truth for "is gh authenticated".
+pub fn gh_hosts_content_has_auth_for_host(content: &str, hostname: &str) -> bool {
     let header = format!("{}:", hostname.trim().to_ascii_lowercase());
     let mut in_host_block = false;
     let mut has_user = false;
@@ -2369,26 +2386,32 @@ fn gh_hosts_file_indicates_authenticated_for_host(hostname: &str) -> bool {
             has_token = false;
             continue;
         }
-        if in_host_block {
-            if t.starts_with("user:") && t.strip_prefix("user:").unwrap_or("").trim().len() > 0 {
-                has_user = true;
-            }
-            if t.starts_with("oauth_token:")
-                && !t
-                    .strip_prefix("oauth_token:")
-                    .unwrap_or("")
-                    .trim()
-                    .is_empty()
-            {
-                has_token = true;
-            }
-            if has_user && has_token {
-                return true;
-            }
-            // Any non-indented top-level key ends the selected host block.
-            if !t.starts_with(' ') && t.ends_with(':') {
-                return false;
-            }
+        if !in_host_block {
+            continue;
+        }
+        if t.starts_with("user:") && t.strip_prefix("user:").unwrap_or("").trim().len() > 0 {
+            has_user = true;
+        }
+        if t.starts_with("oauth_token:")
+            && !t
+                .strip_prefix("oauth_token:")
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+        {
+            has_token = true;
+        }
+        if has_user && has_token {
+            return true;
+        }
+        // A new top-level host header ends the selected block; anything else
+        // (nested `users:`, `git_protocol:`, …) is ignored.
+        if !t.starts_with(' ')
+            && t.ends_with(':')
+            && t.to_ascii_lowercase() != header
+            && !line.starts_with(' ')
+        {
+            in_host_block = false;
         }
     }
     false
@@ -5371,5 +5394,62 @@ Release-Urgency: hold"
         // No PR was opened for an ambiguous choice.
         assert_eq!(remote.calls.open_pr.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    // ── gh hosts.yml parsing: auth presence must not be misreported ─────────
+
+    #[test]
+    fn gh_hosts_content_detects_modern_nested_users_format() {
+        // Modern gh writes users-nested entries; the old parser bailed at the
+        // `users:` line and reported "not authenticated" even with a token.
+        let content = "\
+github.com:
+    users:
+        BumStill:
+            oauth_token: gho_abc123
+    user: BumStill
+    git_protocol: https
+";
+        assert!(gh_hosts_content_has_auth_for_host(content, "github.com"));
+    }
+
+    #[test]
+    fn gh_hosts_content_detects_flat_legacy_format() {
+        let content = "\
+github.com:
+    oauth_token: gho_abc123
+    user: BumStill
+";
+        assert!(gh_hosts_content_has_auth_for_host(content, "github.com"));
+    }
+
+    #[test]
+    fn gh_hosts_content_ignores_other_hosts_and_missing_tokens() {
+        // Different host block: not authenticated for github.com.
+        let other = "\
+gitlab.com:
+    user: someone
+    oauth_token: glpat_x
+";
+        assert!(!gh_hosts_content_has_auth_for_host(other, "github.com"));
+        // Host present but token empty / missing.
+        let empty_token = "\
+github.com:
+    user: BumStill
+    oauth_token:
+";
+        assert!(!gh_hosts_content_has_auth_for_host(empty_token, "github.com"));
+        let no_token = "github.com:\n    user: BumStill\n";
+        assert!(!gh_hosts_content_has_auth_for_host(no_token, "github.com"));
+    }
+
+    #[test]
+    fn gh_hosts_content_case_insensitive_host_match() {
+        let content = "\
+GITHUB.COM:
+    oauth_token: gho_abc123
+    user: BumStill
+";
+        assert!(gh_hosts_content_has_auth_for_host(content, "github.com"));
     }
 }
