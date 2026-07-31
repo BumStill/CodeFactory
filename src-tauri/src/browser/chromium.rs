@@ -338,7 +338,18 @@ impl BrowserDriver for ChromiumDriver {
         // environments with no desktop session (CI smokes), where there is no
         // person to sign in either way.
         let builder = if headless_requested() {
-            builder
+            // Automated environments only. A CI account has no desktop session,
+            // no GPU and a sandbox that Chrome cannot enter, and each of those
+            // makes it exit before it ever prints its DevTools endpoint — which
+            // surfaces as an empty stderr and a websocket timeout. None of this
+            // is applied to the headed path a real user gets.
+            builder.args(vec![
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ])
         } else {
             builder.with_head()
         };
@@ -349,13 +360,23 @@ impl BrowserDriver for ChromiumDriver {
         let launched = tokio::time::timeout(LAUNCH_TIMEOUT, Browser::launch(config)).await;
         let (mut browser, mut handler) = match launched {
             Ok(Ok(pair)) => pair,
+            // Both failures name the binary. Which Chrome we resolved is the
+            // first thing anyone needs to know when a launch fails, and it is
+            // the one fact the underlying error never carries — its stderr is
+            // routinely empty when the process dies during startup.
             Ok(Err(error)) => {
                 release_profile(&profile_dir, session_id);
-                return Err(AppError::Other(format!("Could not start Chromium: {error}")));
+                return Err(AppError::Other(format!(
+                    "Could not start the browser at {}: {error}",
+                    executable.display()
+                )));
             }
             Err(_) => {
                 release_profile(&profile_dir, session_id);
-                return Err(AppError::Other("Chromium did not start in time".into()));
+                return Err(AppError::Other(format!(
+                    "The browser at {} did not start in time",
+                    executable.display()
+                )));
             }
         };
 
