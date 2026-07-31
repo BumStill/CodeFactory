@@ -48,6 +48,7 @@
 - 只有用户明确批准紧急热修时才允许 `CODEFACTORY_SKIP_SYNC_GATE=1 git commit ...`，最终说明必须标记 `hotfix bypass` 并补回 PR+CI。
 
 ## Worktree 生命周期与 Cargo 缓存
+- **Worktree 默认开发**：非平凡任务（任何会进 PR 的代码/配置/文档改动、发布/交付链、并行开发）强制在独立 worktree 中完成；主 checkout 只做验收与发版，禁止长期停留 WIP/半提交/未合并分支。完整分级与生命周期见 `docs/principles/worktree-default-development.md`。开始用 `pnpm worktree:start <branch-name>`，PR 合并后 `pnpm worktrees:closeout -- --path <worktree 绝对路径> --apply` 自动清理。
 - 创建或 checkout 新 worktree 后，版本化 `post-checkout` hook 会把缺失的 `src-tauri/target` 链接到共同缓存；已有本地 target 一律不自动替换。
 - PR 通过 GitHub squash 合并后，执行者必须从其他 checkout 运行 `pnpm worktrees:closeout -- --path <自己的绝对路径> --apply`，由 GitHub 已合并 PR 判定后删除目录和本地分支；不得用 `merge-base` 否定 squash 合并。
 - 长会话优先使用 `pnpm cargo:shared -- <cargo arguments>`；裸 Cargo 在新 worktree 中也必须落到共同 target，不得形成新的独占 `src-tauri/target`。
