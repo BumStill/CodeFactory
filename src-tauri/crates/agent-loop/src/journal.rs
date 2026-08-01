@@ -76,8 +76,8 @@ pub struct TurnActivityUpdate {
     pub terminal_reason: Option<String>,
 }
 
-/// Write-only persistence. Every method no-ops (returning the "not written"
-/// value) when the run is anonymous, inside the impl.
+/// Persistence boundary. Mutating methods no-op (returning the "not written"
+/// value) when the run is anonymous; the root-turn count read also returns 0.
 #[async_trait::async_trait]
 pub trait Persistence: Send + Sync {
     async fn update_turn_activity(&self, _update: &TurnActivityUpdate) -> PersistResult<i64> {
@@ -106,15 +106,21 @@ pub trait Persistence: Send + Sync {
     /// content is never redacted.
     async fn persist_gate_message(&self, content: &str, state: &str) -> PersistResult<()>;
 
-    /// Dedup-by-marker wrapper around `persist_gate_message`; the anonymous
-    /// short-circuit sits BEFORE the dedup read so anonymous runs stay
-    /// read-free too.
+    /// Dedup-by-marker wrapper around `persist_gate_message`. Returns whether
+    /// this call wrote the notice. The marker stays outside user-facing text;
+    /// anonymous runs short-circuit before either reads or writes.
     async fn persist_gate_message_once(
         &self,
         marker: &str,
         content: &str,
         state: &str,
-    ) -> PersistResult<()>;
+    ) -> PersistResult<bool>;
+
+    /// Count normalized tool calls already persisted for one root turn. This
+    /// lets a restarted/resumed loop preserve root-turn amplification limits.
+    async fn root_turn_tool_call_count(&self, _root_turn_id: &str) -> PersistResult<usize> {
+        Ok(0)
+    }
 
     /// Collapse the most recent assistant draft to a rejected gate candidate
     /// (`completion_state='rejected_candidate'`). No-ops on `None` id or
@@ -218,8 +224,8 @@ impl Persistence for NullPersistence {
         _marker: &str,
         _content: &str,
         _state: &str,
-    ) -> PersistResult<()> {
-        Ok(())
+    ) -> PersistResult<bool> {
+        Ok(false)
     }
     async fn mark_rejected_candidate(&self, _id: Option<&str>) -> PersistResult<()> {
         Ok(())

@@ -235,6 +235,26 @@ describe("MessageList completion-review isolation", () => {
     expect(container.querySelector(".justify-end")).toBeNull();
   });
 
+  it("rehydrates a persisted tool-amplification notice with warning semantics", () => {
+    const { container } = render(
+      <MessageList
+        messages={[
+          msg({
+            id: "amplification-warning",
+            role: "system",
+            content: "本回合工具调用较多，系统已要求复用已有证据并收敛剩余步骤。",
+            completionState: "turn_notice",
+          }),
+        ]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+    const warning = screen.getByText(/工具调用较多/);
+    expect(warning.className).toContain("text-status-warning");
+    expect(container.querySelector(".justify-end")).toBeNull();
+  });
+
   it("renders a verification-incomplete warning as an amber notice, with the reply left visible", () => {
     // 2026-07-21 field report: exhausting gate recovery used to FOLD the
     // reply and kill the turn with an untranslated internal error. Now the

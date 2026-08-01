@@ -97,6 +97,41 @@ describe("MessageList structured progress and result", () => {
     expect(screen.getByTestId("turn-activity-progress")).toHaveTextContent(
       "正在补充缺失验证",
     );
+    expect(screen.getByTestId("turn-activity-progress")).toHaveTextContent(
+      "验证证据不足",
+    );
+    expect(screen.getByTestId("turn-activity-progress")).toHaveAttribute(
+      "data-status-tone",
+      "warning",
+    );
+  });
+
+  it("keeps a long-tool waiting reason visible even when a structured plan exists", () => {
+    const running = messages(false);
+    running[1] = {
+      ...running[1],
+      plan: { ...plan, waitingReason: null },
+      turnActivity: {
+        rootTurnId: "user",
+        revision: 8,
+        phase: "working",
+        status: "active",
+        kind: "tool",
+        label: "命令仍在运行（约 1 分钟）",
+        waitingReason: "命令已连续运行约 1 分钟",
+        updatedAt: Date.now(),
+        terminalReason: null,
+      },
+    };
+
+    render(<MessageList messages={running} streaming cwd={null} />);
+
+    expect(screen.getByTestId("turn-progress")).toHaveTextContent(
+      "命令已连续运行约 1 分钟",
+    );
+    expect(screen.getByTestId("turn-progress")).not.toHaveTextContent(
+      "SECRET_COMMAND",
+    );
   });
 
   it("forms a local result snapshot immediately after the terminal state", () => {

@@ -34,6 +34,10 @@
 | CF-SCC-R28 | 权限等待采用有界且可见的 60 秒窗口；前端显示到期时间，后台会话在侧边栏标记“等待批准”。超时后停止当前工具链并形成一次阻断总结，不得再提示模型“换一种方式”造成重复尝试 | reducer + component + real app |
 | CF-SCC-R29 | 普通 Chrome 连接使用官方 CDP attach，并复用用户现有登录态；关闭 CodeFactory 会话只能 detach，绝不关闭普通 Chrome。工具输出必须明确区分受管浏览器和用户 Chrome，页面内容始终标为不可信数据 | native tool unit + authenticated fixture + process proof |
 | CF-SCC-R30 | 当前能力或授权无法满足“读取真实现网页面”时，不得把本地源码、匿名 HTTP 或另一份浏览器冒充等价证据；Python/Node 等可执行 heredoc 继续 fail closed 为 Mutation | scripted trajectory + shell classifier regression |
+| CF-SCC-R31 | 单个工具实际执行超过 30 秒时必须周期更新同一条 turn activity；60 秒后用户在折叠前直接看到脱敏工具类别与长等待原因。心跳不得创建聊天消息、不得包含参数/路径/输出，工具终态后不得继续更新 | fake-clock loop + reducer/component + real app |
+| CF-SCC-R32 | 时间口径必须分离：assistant duration 为 root turn 墙钟时间，permission outcome duration 为授权等待，tool outcome duration 只覆盖 backend 实际执行。产品不得用其中一个冒充另一个 | loop sequence + SQLite truth |
+| CF-SCC-R33 | 同一 root turn 首次达到 40 次工具调用时只持久化并展示 1 次放大风险提醒，并在下一模型轮注入 1 次收敛提示；计数本身不得强行取消、阻断、完成或扩大 capability | scripted 41-call loop + persistence/event assertions |
+| CF-SCC-R34 | 长等待心跳与放大提醒必须在 anonymous/headless/desktop surface 保持既有隐私和兼容语义；旧数据库无需 schema 迁移，reload 只恢复最后活动快照和去重后的 notice | compatibility + hydration + privacy negative assertions |
 
 ## Primary User Paths
 
@@ -46,6 +50,8 @@
 用户明确要求实施，或点击结构化「继续执行」后进入 Execute。仅实施请求得到 `implement`，包含提交、PR、合并、发布或上线的明确请求得到 `deliver`。模型尝试结束但验证证据不足时，正文中的候选草稿和内部 recovery prompt 保持隐藏；同一位置显示一句紧凑状态，说明正在补充哪一项证据。每个 root turn 只允许一次定向恢复；仍不足时形成唯一的 `verification_incomplete` 结果，不能继续生成候选—拒绝—重试循环。
 
 运行中发送的新消息属于 steer revision，不是普通模型上下文附注。框架先根据用户原文更新结构 capability，再进入下一次模型调用；升级后重新开放对应工具，降级后下一次 mutation 必须在 permission 之前被拒绝。任何 steer 都不能补充 recovery 配额。
+
+单个工具长时间运行时，框架在 backend 执行区间内刷新脱敏活动心跳；权限等待仍使用独立的 60 秒授权窗口和独立时长。root turn 达到工具放大阈值后，系统只提醒一次并要求下一轮收敛，不以数量替代对真实进展、mutation 与 evidence 的判断。
 
 ## 状态转换矩阵
 

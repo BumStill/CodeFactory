@@ -512,14 +512,29 @@ function ActiveTurnProgress({
 }) {
   const nowMs = useNowTick(true);
   if (!plan) {
+    const waitingReason = activity?.waitingReason;
     return (
       <div
         role="status"
         data-testid="turn-activity-progress"
-        className="flex max-w-[min(34rem,calc(100vw-2rem))] items-center gap-2 rounded-full border border-border bg-surface-2/95 px-3 py-1.5 text-[11px] text-gray-300 shadow-lg backdrop-blur"
+        data-status-tone={waitingReason ? "warning" : "progress"}
+        className={`flex max-w-[min(34rem,calc(100vw-2rem))] items-center gap-2 rounded-full border bg-surface-2/95 px-3 py-1.5 text-[11px] shadow-lg backdrop-blur ${
+          waitingReason
+            ? "border-status-warning/35 text-status-warning"
+            : "border-border text-gray-300"
+        }`}
       >
-        <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-status-progress motion-reduce:animate-none" />
+        {waitingReason ? (
+          <AlertTriangle size={12} aria-hidden="true" className="shrink-0" />
+        ) : (
+          <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-status-progress motion-reduce:animate-none" />
+        )}
         <span className="truncate">{activity?.label || "正在处理任务"}</span>
+        {waitingReason && (
+          <span className="max-w-[18rem] truncate text-status-warning/80">
+            · {waitingReason}
+          </span>
+        )}
         <span className="shrink-0 text-gray-600">
           {formatDuration(Math.max(0, nowMs - startedAt))}
         </span>
@@ -533,6 +548,8 @@ function ActiveTurnProgress({
       externalJobs={externalJobs}
       elapsedMs={Math.max(0, nowMs - startedAt)}
       nowMs={nowMs}
+      activityLabel={activity?.kind === "tool_wait" ? activity.label : null}
+      activityWaitingReason={activity?.waitingReason}
     />
   );
 }
@@ -543,6 +560,10 @@ function isQuietSuccess(tool: NonNullable<UIMessage["toolCalls"]>[number] | unde
 
 function isModelRouteSwitchNotice(detail: string): boolean {
   return detail.includes("已自动切换到") && detail.includes("任务继续执行");
+}
+
+function isToolAmplificationNotice(detail: string): boolean {
+  return detail.includes("本回合工具调用较多") && detail.includes("收敛剩余步骤");
 }
 
 const MessageRow = memo(function MessageRow({
@@ -654,6 +675,15 @@ const MessageRow = memo(function MessageRow({
           className="text-[13px] leading-5 text-gray-500 break-words"
         >
           {msg.content}
+        </div>
+      );
+    }
+    if (isToolAmplificationNotice(msg.content)) {
+      return (
+        <div className="flex justify-center">
+          <div className="max-w-[85%] rounded border border-status-warning/30 bg-status-warning-soft/55 px-2.5 py-1 text-[11px] leading-snug text-status-warning break-words whitespace-pre-wrap">
+            {msg.content}
+          </div>
         </div>
       );
     }
