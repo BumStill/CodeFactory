@@ -17,6 +17,8 @@ interface Props {
   externalJobs: ExternalJobState[];
   elapsedMs: number;
   nowMs?: number;
+  activityLabel?: string | null;
+  activityWaitingReason?: string | null;
 }
 
 function estimateLabel(lowMs: number, highMs: number): string {
@@ -50,6 +52,8 @@ export function TurnProgress({
   externalJobs,
   elapsedMs,
   nowMs = Date.now(),
+  activityLabel = null,
+  activityWaitingReason = null,
 }: Props) {
   const [expanded, setExpanded] = useState(false);
   const progress = useMemo(() => planProgress(plan), [plan]);
@@ -64,7 +68,8 @@ export function TurnProgress({
     progress.current?.kind === "external_job" && progress.current.externalJobId
       ? externalJobs.find((job) => job.id === progress.current?.externalJobId)
       : null;
-  const waiting = Boolean(plan.waitingReason);
+  const effectiveWaitingReason = activityWaitingReason || plan.waitingReason;
+  const waiting = Boolean(effectiveWaitingReason);
 
   return (
     <section
@@ -105,6 +110,15 @@ export function TurnProgress({
               {progress.next ? `下一步 · ${progress.next.title}` : "下一步 · 待计划更新"}
             </span>
           </div>
+          {(activityLabel || effectiveWaitingReason) && (
+            <p
+              role="status"
+              className={`mt-1 truncate text-[11px] ${effectiveWaitingReason ? "text-status-warning" : "text-gray-500"}`}
+            >
+              {activityLabel ?? effectiveWaitingReason}
+              {activityLabel && effectiveWaitingReason ? ` · ${effectiveWaitingReason}` : ""}
+            </p>
+          )}
           {(estimate || linkedExternalJob) && (
             <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-gray-500">
               {estimate && minimumSampleCount != null && (
@@ -185,11 +199,6 @@ export function TurnProgress({
               </span>
             )}
           </div>
-          {plan.waitingReason && (
-            <p role="status" className="rounded-md border-l-2 border-status-warning bg-status-warning-soft px-2 py-1 text-status-warning">
-              等待 · {plan.waitingReason}
-            </p>
-          )}
           {plan.changeReason && (
             <p className="flex items-start gap-1.5 text-gray-400">
               <GitBranch size={12} aria-hidden="true" className="mt-0.5 shrink-0" />

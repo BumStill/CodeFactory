@@ -28,6 +28,25 @@ Tool schema 每轮按当前 capability 过滤；执行前再以真实 tool name�
 
 证据账本先于最终候选决策。第一次缺失时生成一个只包含 blockers 的 targeted recovery；第二次仍不足直接形成 `verification_incomplete`。相同 workspace/command 的成功验证继续复用，mutation 后失效。
 
+### Tool wait heartbeat
+
+`agent-loop` 在工具权限与 pre-hook 通过后开始计算工具实际执行时间。固定间隔 timeout 始终重复 poll 同一个 pinned 工具 future；timer 只更新 `chat_turn_state` 和 `TurnActivityUpdated`，不创建 message/tool outcome。心跳与工具终态活动快照都属于 best-effort 诊断：单次活动写库失败只记录 warning，不能 drop 正在执行的工具 future，也不能覆盖已持久化的真实工具 outcome。工具完成或报错后 timer 随作用域结束，不产生孤儿心跳；普通可恢复工具错误保持 turn active，只有明确 `Blocked` 或 backend fatal 才写 terminal。
+
+心跳只使用框架维护的脱敏分类标签（读取、修改、命令、交付、子任务、浏览器、通用工具），禁止拼接 tool arguments、cwd、附件路径或 stdout。`duration_ms` 继续表示 backend 实际执行时间，不包含权限等待；整回合墙钟时间仍由 assistant message 的 `createdAt/durationMs` 表示。
+
+生产参数为 30 秒心跳、60 秒长等待提示。测试通过 `RunConfig` 注入毫秒级间隔，避免真实等待。
+
+### Root-turn amplification signal
+
+共享 loop 对收到的工具调用做 root-turn 累计计数。首次达到 40 次时：
+
+- 从 normalized `tool_calls` 恢复该 root turn 已有计数，并以 `chat_turn_state.root_turn_id` 标识下一条真实根消息；同 root turn 的 steer 用户消息不截断计数，避免 App 重启或 segment 续跑后归零；
+- 在 `gate_events` 原子写入不出现在用户正文中的去重 marker，并持久化一条 `turn_notice`；
+- 发出一个用户可见但不含原始参数的 warning；
+- 在当前 tool batch 结束后按 Review/Implement/Deliver 能力向下一模型轮次注入一次收敛提示；已具备完成证据、结构拒绝或明确阻断时不再注入。
+
+计数不会重置 capability、completion recovery 或 evidence ledger，也不会直接取消、阻断或标记完成。阈值后继续执行的真实 mutation 仍受原有 capability/permission gate 管理。
+
 ### P1 persistence
 
 - `chat_task_segments`：root turn 内的有界上下文和 handoff。
@@ -46,6 +65,7 @@ user message
   -> optional user steer capability revision
   -> re-filter advertised tools
   -> AgentLoop execution gate
+  -> tool execution heartbeat / root-turn amplification signal
   -> tool outcome status
   -> evidence ledger / progress snapshot
   -> one final result

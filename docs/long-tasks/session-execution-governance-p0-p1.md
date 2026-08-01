@@ -1,6 +1,6 @@
 # 会话执行治理 P0–P1
 
-状态：v1.73.0 已发布；continuation 状态机 P0 回归修复中
+状态：v1.76.0 已发布；长等待与工具放大 P1 已完成本地实现和 Dev App 验证，待 PR/CI
 范围：turn capability、delivery preflight/outcome、completion convergence、task segment、进度快照、sub-agent attempt
 
 ## 现场基线
@@ -21,6 +21,19 @@
 - [x] P1 实现与 reload/viewport verification。
 - [x] 真实 CodeFactoryDev 主路径。
 - [ ] PR、CI、merge、release artifact 与正式 App 验收。
+
+## 2026-08-01 P1：长等待与工具放大
+
+- [x] 正式版 24 小时轨迹确认：23 个 root 用户回合、373 次工具调用，工具/回合 16.22；9 次工具执行超过 60 秒，最长约 560 秒。
+- [x] 根因确认：backend tool future 等待期间没有 activity heartbeat；现有 ProgressTracker 只治理连续只读调用，不治理 root-turn 总放大。
+- [x] 业务、架构、UX 增量设计与 CF-SCC-R31..R34。
+- [x] Failure-first：长工具心跳、隐私、终态停止、40 次一次性提醒/收敛。
+- [x] 共享 loop 与前端进度卡实现。
+- [x] 独立 QA 后补：跨 restart/resume/steer 计数与 notice 去重、活动快照写库失败不取消或覆盖工具 outcome、普通工具错误不误写 segment blocked、能力定制收敛提示、reload warning 语义一致。
+- [x] focused/full tests、CodeFactoryDev 成功与边界路径。
+- [ ] PR、CI、merge 与发布节奏判断。
+
+验证结果：`agent-loop` 65/65、SQLite persistence 12/12、前端 92 文件 474/474、`pnpm build`、Rust workspace check、治理基线通过。真实 CodeFactoryDev 绑定当前 worktree 与 DeepSeek v4 Flash：70 秒、100 秒和 65 秒命令均成功；30 秒时同一活动卡显示“命令仍在运行”，100 秒路径捕获到约 1 分钟文案，工具终态后不残留 running 状态。实地发现无结构化 plan 时未展示独立等待原因，补充 failure-first component 回归后修复；热更新后的 warning tone 有单测与 build 证据，但未在短暂 60–65 秒窗口内重新截到实地图。独立 QA 发现的续跑/steer 去重、活动快照失败和假 blocked 均先复现失败再修复，未触碰正式版数据库。
 
 ## v1.73.0 continuation 回归
 

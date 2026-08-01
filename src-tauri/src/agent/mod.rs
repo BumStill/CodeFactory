@@ -1151,6 +1151,9 @@ impl AgentLoop {
             // them (b12).
             inspection_budget: false,
             replay_rejected_draft: false,
+            tool_heartbeat_interval: Some(std::time::Duration::from_secs(30)),
+            long_tool_wait_threshold: std::time::Duration::from_secs(60),
+            tool_amplification_threshold: Some(40),
             session_id: self.session_id.clone(),
             endpoint_name: self.endpoint_name.clone(),
             model_id: self.model_id.clone(),

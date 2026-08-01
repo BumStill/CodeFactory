@@ -158,7 +158,7 @@ impl Persistence for SqlitePersistence {
         .execute(&self.db)
         .await
         .map_err(perr)?;
-        if terminal {
+        if terminal || update.status == "active" {
             sqlx::query(
                 "UPDATE chat_task_segments SET status=?, updated_at=?
                  WHERE id=(SELECT task_segment_id FROM chat_turn_state WHERE root_turn_id=?)",
@@ -264,28 +264,112 @@ impl Persistence for SqlitePersistence {
         marker: &str,
         content: &str,
         state: &str,
-    ) -> PersistResult<()> {
+    ) -> PersistResult<bool> {
         if self.anonymous {
-            return Ok(());
+            return Ok(false);
         }
-        let sql = if is_gate_control_state(state) {
-            "SELECT COUNT(*) FROM gate_events WHERE session_id = ? AND kind = ? \
-             AND content LIKE ?"
-        } else {
-            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND completion_state = ? \
-             AND content LIKE ?"
-        };
-        let existing: (i64,) = sqlx::query_as(sql)
+        let marker_id = format!("notice-marker:{}:{marker}", self.session_id);
+        let mut tx = self.db.begin().await.map_err(perr)?;
+        let inserted = if is_gate_control_state(state) {
+            sqlx::query(
+                "INSERT OR IGNORE INTO gate_events \
+                 (id, session_id, kind, content, message_id, created_at) \
+                 VALUES (?,?,?,?,NULL,?)",
+            )
+            .bind(&marker_id)
             .bind(&self.session_id)
             .bind(state)
-            .bind(format!("%{marker}%"))
-            .fetch_one(&self.db)
+            .bind(content)
+            .bind(Utc::now().timestamp_millis())
+            .execute(&mut *tx)
+            .await
+            .map_err(perr)?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "INSERT OR IGNORE INTO gate_events \
+                 (id, session_id, kind, content, message_id, created_at) \
+                 VALUES (?,?,'notice_marker',?,NULL,?)",
+            )
+            .bind(&marker_id)
+            .bind(&self.session_id)
+            .bind(marker)
+            .bind(Utc::now().timestamp_millis())
+            .execute(&mut *tx)
+            .await
+            .map_err(perr)?
+            .rows_affected()
+        };
+        if inserted == 0 {
+            tx.rollback().await.map_err(perr)?;
+            return Ok(false);
+        }
+        if !is_gate_control_state(state) {
+            let role = if state == "turn_notice" {
+                "system"
+            } else {
+                "user"
+            };
+            sqlx::query(
+                "INSERT INTO messages \
+                 (id, session_id, role, content, completion_state, created_at) \
+                 VALUES (?,?,?,?,?,?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&self.session_id)
+            .bind(role)
+            .bind(content)
+            .bind(state)
+            .bind(Utc::now().timestamp_millis())
+            .execute(&mut *tx)
             .await
             .map_err(perr)?;
-        if existing.0 > 0 {
-            return Ok(());
         }
-        self.persist_gate_message(content, state).await
+        tx.commit().await.map_err(perr)?;
+        Ok(true)
+    }
+
+    async fn root_turn_tool_call_count(&self, root_turn_id: &str) -> PersistResult<usize> {
+        if self.anonymous {
+            return Ok(0);
+        }
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM tool_calls tc
+             JOIN messages assistant ON assistant.id = tc.message_id
+             WHERE assistant.session_id = ?
+               AND assistant.rowid > COALESCE(
+                 (SELECT rowid FROM messages WHERE id = ? AND session_id = ?),
+                 9223372036854775807
+               )
+               AND assistant.rowid < COALESCE(
+                 (
+                   SELECT MIN(next_user.rowid)
+                   FROM messages next_user
+                   WHERE next_user.session_id = ?
+                     AND next_user.role = 'user'
+                     AND (next_user.completion_state IS NULL OR next_user.completion_state = '')
+                     AND EXISTS (
+                       SELECT 1 FROM chat_turn_state registered_root
+                       WHERE registered_root.root_turn_id = next_user.id
+                     )
+                     AND next_user.rowid > (
+                       SELECT rowid FROM messages WHERE id = ? AND session_id = ?
+                     )
+                 ),
+                 9223372036854775807
+               )",
+        )
+        .bind(&self.session_id)
+        .bind(root_turn_id)
+        .bind(&self.session_id)
+        .bind(&self.session_id)
+        .bind(root_turn_id)
+        .bind(&self.session_id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(perr)?;
+        Ok(count.max(0) as usize)
     }
 
     /// Record that the gate rejected this assistant turn as a premature final
@@ -437,11 +521,39 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
+            "CREATE TABLE tool_calls (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, \
+             tool_name TEXT NOT NULL, arguments TEXT NOT NULL DEFAULT '{}', result TEXT, \
+             metadata TEXT, status TEXT NOT NULL DEFAULT 'pending', error TEXT, \
+             duration_ms INTEGER, created_at INTEGER NOT NULL)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
             "CREATE TABLE model_route_attempts (
                 id TEXT PRIMARY KEY, root_turn_id TEXT, session_id TEXT,
                 endpoint TEXT, model TEXT, policy TEXT, status TEXT,
                 failure_code TEXT, output_started INTEGER,
                 side_effect_started INTEGER, created_at TEXT, completed_at TEXT
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_task_segments (
+                id TEXT PRIMARY KEY, status TEXT NOT NULL, updated_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+                root_turn_id TEXT PRIMARY KEY, task_segment_id TEXT, revision INTEGER NOT NULL,
+                phase TEXT NOT NULL, status TEXT NOT NULL, recent_activity_kind TEXT,
+                recent_activity_label TEXT, waiting_reason TEXT, updated_at INTEGER NOT NULL,
+                completed_at INTEGER, terminal_reason TEXT
             )",
         )
         .execute(&db)
@@ -582,12 +694,156 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
-        let control: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM gate_events")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+        let control: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM gate_events WHERE kind != 'notice_marker'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
         assert_eq!(notices.0, 1, "turn notices dedup within messages");
         assert_eq!(control.0, 1, "gate prompts dedup within gate_events");
+    }
+
+    #[tokio::test]
+    async fn opaque_notice_marker_dedups_without_leaking_into_the_notice_body() {
+        let db = pool().await;
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: false,
+        };
+        for _ in 0..2 {
+            p.persist_gate_message_once(
+                "tool_amplification:root-1:40",
+                "本回合工具调用较多",
+                "turn_notice",
+            )
+            .await
+            .unwrap();
+        }
+
+        let bodies: Vec<String> =
+            sqlx::query_scalar("SELECT content FROM messages WHERE session_id='s1' ORDER BY rowid")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(bodies, ["本回合工具调用较多"]);
+        assert!(!bodies[0].contains("root-1"));
+    }
+
+    #[tokio::test]
+    async fn root_turn_tool_count_crosses_steers_and_stops_at_the_next_registered_root() {
+        let db = pool().await;
+        for (id, role, state, created_at) in [
+            ("root-1", "user", None, 1_i64),
+            ("assistant-1", "assistant", None, 2),
+            ("steer-1", "user", None, 3),
+            ("assistant-2", "assistant", None, 4),
+            ("notice", "system", Some("turn_notice"), 5),
+            ("root-2", "user", None, 6),
+            ("assistant-3", "assistant", None, 7),
+        ] {
+            sqlx::query(
+                "INSERT INTO messages \
+                 (id, session_id, role, content, completion_state, created_at) \
+                 VALUES (?,'s1',?,'content',?,?)",
+            )
+            .bind(id)
+            .bind(role)
+            .bind(state)
+            .bind(created_at)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        for (id, message_id, created_at) in [
+            ("tool-1", "assistant-1", 2_i64),
+            ("tool-2", "assistant-2", 4),
+            ("tool-3", "assistant-3", 7),
+        ] {
+            sqlx::query(
+                "INSERT INTO tool_calls \
+                 (id, message_id, tool_name, arguments, status, created_at) \
+                 VALUES (?,?,'bash','{}','done',?)",
+            )
+            .bind(id)
+            .bind(message_id)
+            .bind(created_at)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        for root_turn_id in ["root-1", "root-2"] {
+            sqlx::query(
+                "INSERT INTO chat_turn_state \
+                 (root_turn_id, revision, phase, status, updated_at) \
+                 VALUES (?,1,'working','active',1)",
+            )
+            .bind(root_turn_id)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let p = SqlitePersistence {
+            db,
+            session_id: "s1".into(),
+            anonymous: false,
+        };
+
+        assert_eq!(p.root_turn_tool_call_count("root-1").await.unwrap(), 2);
+        assert_eq!(p.root_turn_tool_call_count("root-2").await.unwrap(), 1);
+        assert_eq!(p.root_turn_tool_call_count("missing").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn recoverable_tool_failure_reopens_a_stale_blocked_segment() {
+        let db = pool().await;
+        sqlx::query(
+            "INSERT INTO chat_task_segments (id, status, updated_at) \
+             VALUES ('segment-1','blocked',1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state \
+             (root_turn_id, task_segment_id, revision, phase, status, updated_at, completed_at, terminal_reason) \
+             VALUES ('root-1','segment-1',1,'working','blocked',1,1,'tool_error')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: false,
+        };
+
+        p.update_turn_activity(&TurnActivityUpdate {
+            root_turn_id: "root-1".into(),
+            phase: "working".into(),
+            status: "active".into(),
+            recent_activity_kind: "tool_failed".into(),
+            recent_activity_label: "长时工具执行失败，正在尝试恢复".into(),
+            waiting_reason: None,
+            terminal_reason: None,
+        })
+        .await
+        .unwrap();
+
+        let turn: (String, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT status, completed_at, terminal_reason FROM chat_turn_state \
+             WHERE root_turn_id='root-1'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let segment: String =
+            sqlx::query_scalar("SELECT status FROM chat_task_segments WHERE id='segment-1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(turn, ("active".into(), None, None));
+        assert_eq!(segment, "active");
     }
 
     #[tokio::test]

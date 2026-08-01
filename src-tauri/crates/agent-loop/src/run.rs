@@ -270,6 +270,14 @@ pub struct RunConfig {
     /// (keystone slice 4.8c b12). The sidecar does; the desktop does not — its
     /// UI already collapses the rejected candidate.
     pub replay_rejected_draft: bool,
+    /// Periodic coalesced activity refresh while one backend tool future is
+    /// still pending. `None` disables heartbeats for non-interactive surfaces.
+    pub tool_heartbeat_interval: Option<std::time::Duration>,
+    /// When a pending tool becomes a user-visible long wait.
+    pub long_tool_wait_threshold: std::time::Duration,
+    /// One-shot root-turn convergence signal after this many received tool
+    /// calls. `None` disables the signal.
+    pub tool_amplification_threshold: Option<usize>,
     // Usage-attribution identity + working dir (all constant for the run).
     pub session_id: String,
     pub endpoint_name: String,
@@ -362,6 +370,29 @@ async fn publish_turn_activity(
         terminal_reason: update.terminal_reason,
     });
     Ok(())
+}
+
+fn sanitized_tool_activity(name: &str) -> (&'static str, &'static str, &'static str) {
+    match name {
+        "read_file" | "glob" | "grep" | "kb_search" | "kb_get_chunk" => {
+            ("working", "正在检查相关信息", "信息检查")
+        }
+        "write_file" | "edit_file" => ("working", "正在修改工作区", "工作区修改"),
+        "bash" => ("working", "正在执行命令", "命令"),
+        "deliver_changes" => ("delivering", "正在执行交付", "交付任务"),
+        "delegate_tasks" | "dispatch_parallel_tasks" => ("working", "正在执行子任务", "子任务"),
+        "browser_session" => ("working", "正在检查浏览器页面", "浏览器检查"),
+        _ => ("working", "正在执行工具", "工具"),
+    }
+}
+
+fn approximate_wait_label(elapsed: std::time::Duration) -> String {
+    if elapsed < std::time::Duration::from_secs(60) {
+        format!("{} 秒", elapsed.as_secs().max(1))
+    } else {
+        let minutes = elapsed.as_secs() / 60;
+        format!("{minutes} 分钟")
+    }
 }
 
 /// Finish a tool batch that was cancelled mid-flight: persist each remaining
@@ -477,6 +508,9 @@ pub async fn run_agent_loop(
         overload_backoff,
         inspection_budget,
         replay_rejected_draft,
+        tool_heartbeat_interval,
+        long_tool_wait_threshold,
+        tool_amplification_threshold,
         session_id,
         endpoint_name,
         model_id,
@@ -552,6 +586,12 @@ pub async fn run_agent_loop(
     let mut require_tool_next = false;
     let mut model_round_index = 0_usize;
     let mut stalled_chat_segments = 0_u32;
+    let mut root_tool_call_count = match root_turn_id.as_deref() {
+        Some(root_turn_id) => persistence.root_turn_tool_call_count(root_turn_id).await?,
+        None => 0,
+    };
+    let mut amplification_signal_emitted = false;
+    let mut amplification_prompt_pending = false;
     // Run-level totals + the last model reply, carried into `RunOutcome`
     // (keystone slice 4.8c). The desktop discards them; the sidecar builds its
     // terminal `finished` payload from them.
@@ -1134,6 +1174,30 @@ pub async fn run_agent_loop(
             let completion_evidence_before_tool_batch = completion_gate.evidence();
 
             for (tool_index, tc) in tool_calls.iter().enumerate() {
+                root_tool_call_count = root_tool_call_count.saturating_add(1);
+                if !amplification_signal_emitted
+                    && tool_amplification_threshold
+                        .filter(|threshold| *threshold > 0)
+                        .is_some_and(|threshold| root_tool_call_count >= threshold)
+                {
+                    let threshold = tool_amplification_threshold.unwrap_or(root_tool_call_count);
+                    let notice = "本回合工具调用较多，系统已要求复用已有证据并收敛剩余步骤。";
+                    let marker = format!(
+                        "tool_amplification:{}:{threshold}",
+                        root_turn_id.as_deref().unwrap_or("anonymous")
+                    );
+                    let newly_persisted = persistence
+                        .persist_gate_message_once(&marker, notice, "turn_notice")
+                        .await?;
+                    amplification_signal_emitted = true;
+                    if anonymous || newly_persisted {
+                        amplification_prompt_pending = true;
+                        events.emit(crate::types::StreamEvent::CompletionGateAction {
+                            kind: "warning".into(),
+                            detail: notice.into(),
+                        });
+                    }
+                }
                 if let Some(remaining) =
                     cancelled_tool_suffix(cancel.as_ref(), &tool_calls, tool_index)
                 {
@@ -1175,26 +1239,13 @@ pub async fn run_agent_loop(
                     name: tc.function.name.clone(),
                     args: args.clone(),
                 });
-                let activity_label = match tc.function.name.as_str() {
-                    "read_file" | "glob" | "grep" | "kb_search" | "kb_get_chunk" => {
-                        "正在检查相关信息"
-                    }
-                    "write_file" | "edit_file" => "正在修改工作区",
-                    "bash" => "正在执行命令",
-                    "deliver_changes" => "正在执行交付",
-                    "delegate_tasks" | "dispatch_parallel_tasks" => "正在执行子任务",
-                    "browser_session" => "正在检查浏览器页面",
-                    _ => "正在执行工具",
-                };
+                let (activity_phase, activity_label, activity_subject) =
+                    sanitized_tool_activity(&tc.function.name);
                 publish_turn_activity(
                     persistence.as_ref(),
                     events.as_ref(),
                     root_turn_id.as_deref(),
-                    if tc.function.name == "deliver_changes" {
-                        "delivering"
-                    } else {
-                        "working"
-                    },
+                    activity_phase,
                     "active",
                     "tool",
                     activity_label,
@@ -1426,7 +1477,48 @@ pub async fn run_agent_loop(
                 };
 
                 let tool_start = std::time::Instant::now();
-                let exec_result = tool_backend.execute(tc, &args, &tool_ctx).await;
+                let mut execution = Box::pin(tool_backend.execute(tc, &args, &tool_ctx));
+                let mut heartbeat_emitted = false;
+                let exec_result = if let Some(interval) =
+                    tool_heartbeat_interval.filter(|interval| !interval.is_zero())
+                {
+                    loop {
+                        match tokio::time::timeout(interval, execution.as_mut()).await {
+                            Ok(result) => break result,
+                            Err(_) => {
+                                heartbeat_emitted = true;
+                                let elapsed = tool_start.elapsed();
+                                let elapsed_label = approximate_wait_label(elapsed);
+                                let heartbeat_label =
+                                    format!("{activity_subject}仍在运行（约 {elapsed_label}）");
+                                let waiting_reason =
+                                    (elapsed >= long_tool_wait_threshold).then(|| {
+                                        format!("{activity_subject}已连续运行约 {elapsed_label}")
+                                    });
+                                if let Err(error) = publish_turn_activity(
+                                    persistence.as_ref(),
+                                    events.as_ref(),
+                                    root_turn_id.as_deref(),
+                                    activity_phase,
+                                    "active",
+                                    "tool_wait",
+                                    &heartbeat_label,
+                                    waiting_reason.as_deref(),
+                                    None,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "tool heartbeat activity update failed; tool execution continues"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    execution.await
+                };
                 let duration_ms = tool_start.elapsed().as_millis() as u64;
                 let output = match exec_result {
                     Ok(result) => result,
@@ -1441,6 +1533,26 @@ pub async fn run_agent_loop(
                                 duration_ms,
                             )
                             .await?;
+                        if heartbeat_emitted {
+                            if let Err(activity_error) = publish_turn_activity(
+                                persistence.as_ref(),
+                                events.as_ref(),
+                                root_turn_id.as_deref(),
+                                activity_phase,
+                                "blocked",
+                                "tool_finished",
+                                "长时工具已因错误停止",
+                                None,
+                                Some("tool_error"),
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    error = %activity_error,
+                                    "tool terminal activity update failed after fatal outcome persistence"
+                                );
+                            }
+                        }
                         return Err(LoopError::Tool(crate::tool::ToolError {
                             message: error_text,
                         }));
@@ -1516,6 +1628,41 @@ pub async fn run_agent_loop(
                     .into(),
                     metadata: output.metadata.clone(),
                 });
+                if heartbeat_emitted {
+                    let (status, label, terminal_reason) = match output.status {
+                        crate::tool::ToolExecutionStatus::Done => {
+                            ("active", "长时工具已完成，正在继续处理", None)
+                        }
+                        crate::tool::ToolExecutionStatus::Blocked => {
+                            ("blocked", "长时工具已在明确边界停止", Some("tool_blocked"))
+                        }
+                        crate::tool::ToolExecutionStatus::Error => {
+                            ("active", "长时工具执行失败，正在尝试恢复", None)
+                        }
+                    };
+                    if let Err(error) = publish_turn_activity(
+                        persistence.as_ref(),
+                        events.as_ref(),
+                        root_turn_id.as_deref(),
+                        activity_phase,
+                        status,
+                        if matches!(output.status, crate::tool::ToolExecutionStatus::Error) {
+                            "tool_failed"
+                        } else {
+                            "tool_finished"
+                        },
+                        label,
+                        None,
+                        terminal_reason,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "tool terminal activity update failed after outcome persistence"
+                        );
+                    }
+                }
 
                 result_messages.push(crate::types::ChatMessage {
                     role: "tool".into(),
@@ -1587,6 +1734,29 @@ pub async fn run_agent_loop(
                 });
             }
             let evidence = completion_gate.evidence();
+            if amplification_prompt_pending {
+                amplification_prompt_pending = false;
+                if !evidence.completed && !finalization_pending && !structural_denial_seen {
+                    let threshold = tool_amplification_threshold.unwrap_or(root_tool_call_count);
+                    let convergence_scope = match turn_capability {
+                        TurnCapability::ReviewOnly => "只保留尚未完成且能改变结论的最少只读检查",
+                        TurnCapability::Implement => {
+                            "只执行尚未完成且能改变结果的最少实施或验证步骤"
+                        }
+                        TurnCapability::Deliver => "只执行尚未完成且能改变交付结果的最少步骤",
+                    };
+                    messages.push(crate::types::ChatMessage {
+                        role: "user".into(),
+                        content: crate::types::MessageContent::Text(format!(
+                            "本回合已累计 {threshold} 次工具调用。请在下一轮主动收敛：复用已有证据，停止重复探测，{convergence_scope}；若存在外部阻断，请直接说明，不要轮询等待。"
+                        )),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                    });
+                }
+            }
             if crate::policy::completion_ready_applies(finalization)
                 && evidence.completed
                 && evidence.last_successful_verification_sequence != last_completion_nudge_sequence
@@ -2018,11 +2188,35 @@ mod tests {
     struct RecordingPersistence {
         messages: Mutex<Vec<(String, String, Option<String>)>>,
         notices: Mutex<Vec<(String, String)>>,
+        notice_markers: Mutex<BTreeSet<String>>,
         usage_ids: Mutex<Vec<String>>,
+        tool_call_count: AtomicUsize,
+        activity_fail_kind: Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
     impl Persistence for RecordingPersistence {
+        async fn update_turn_activity(
+            &self,
+            update: &crate::journal::TurnActivityUpdate,
+        ) -> PersistResult<i64> {
+            let should_fail = {
+                let mut kind = self.activity_fail_kind.lock().expect("activity fail kind");
+                if kind.as_deref() == Some(update.recent_activity_kind.as_str()) {
+                    kind.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_fail {
+                return Err(crate::journal::PersistError {
+                    message: "injected activity failure".into(),
+                });
+            }
+            Ok(1)
+        }
+
         async fn persist_message(
             &self,
             role: &str,
@@ -2054,11 +2248,25 @@ mod tests {
 
         async fn persist_gate_message_once(
             &self,
-            _marker: &str,
+            marker: &str,
             content: &str,
             state: &str,
-        ) -> PersistResult<()> {
-            self.persist_gate_message(content, state).await
+        ) -> PersistResult<bool> {
+            if !self
+                .notice_markers
+                .lock()
+                .expect("notice markers")
+                .insert(marker.into())
+            {
+                return Ok(false);
+            }
+            self.persist_gate_message(content, state)
+                .await
+                .map(|()| true)
+        }
+
+        async fn root_turn_tool_call_count(&self, _root_turn_id: &str) -> PersistResult<usize> {
+            Ok(self.tool_call_count.load(Ordering::SeqCst))
         }
 
         async fn mark_rejected_candidate(&self, _message_id: Option<&str>) -> PersistResult<()> {
@@ -2070,6 +2278,7 @@ mod tests {
             _message_id: &str,
             _tool_call: &ToolCall,
         ) -> PersistResult<()> {
+            self.tool_call_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -2140,6 +2349,74 @@ mod tests {
                 metadata: None,
                 next_working_directory: None,
                 duration_ms: 1,
+            })
+        }
+    }
+
+    struct SlowTools {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolBackend for SlowTools {
+        async fn list_schemas(&self) -> Vec<ToolDefinition> {
+            vec![tool_definition()]
+        }
+
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            _args: &serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolInvocationResult, ToolError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(ToolInvocationResult {
+                content: "long tool finished".into(),
+                is_error: false,
+                status: crate::tool::ToolExecutionStatus::Done,
+                command: call.function.name.clone(),
+                kind: ToolKind::Verification,
+                return_code: Some(0),
+                stdout: "ok".into(),
+                stderr: String::new(),
+                error: None,
+                metadata: None,
+                next_working_directory: None,
+                duration_ms: self.delay.as_millis() as u64,
+            })
+        }
+    }
+
+    struct SlowErrorTools {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolBackend for SlowErrorTools {
+        async fn list_schemas(&self) -> Vec<ToolDefinition> {
+            vec![tool_definition()]
+        }
+
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            _args: &serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolInvocationResult, ToolError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(ToolInvocationResult {
+                content: "command failed and can be repaired".into(),
+                is_error: true,
+                status: crate::tool::ToolExecutionStatus::Error,
+                command: call.function.name.clone(),
+                kind: ToolKind::Verification,
+                return_code: Some(1),
+                stdout: String::new(),
+                stderr: "failed".into(),
+                error: Some("failed".into()),
+                metadata: None,
+                next_working_directory: None,
+                duration_ms: self.delay.as_millis() as u64,
             })
         }
     }
@@ -2363,6 +2640,9 @@ mod tests {
             overload_backoff: false,
             inspection_budget: false,
             replay_rejected_draft: false,
+            tool_heartbeat_interval: None,
+            long_tool_wait_threshold: std::time::Duration::from_secs(60),
+            tool_amplification_threshold: None,
             session_id: "session".into(),
             endpoint_name: "test".into(),
             model_id: "model".into(),
@@ -2393,6 +2673,380 @@ mod tests {
             context_policy: Arc::new(FixedContext),
             fact_checker: Arc::new(NoOpFactChecker),
             steer: Arc::new(crate::services::NoSteering),
+        }
+    }
+
+    #[tokio::test]
+    async fn long_tool_emits_sanitized_coalesced_activity_until_its_terminal_result() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "执行长验证",
+                vec![call(
+                    "slow-1",
+                    "bash",
+                    serde_json::json!({"command": "SECRET_COMMAND --token hidden"}),
+                )],
+                0,
+            ),
+            response("验证完成", vec![], 1),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut cfg = config();
+        cfg.tool_heartbeat_interval = Some(std::time::Duration::from_millis(10));
+        cfg.long_tool_wait_threshold = std::time::Duration::from_millis(20);
+        let mut svc = services(transport, persistence.clone(), events.clone());
+        svc.tools = Arc::new(SlowTools {
+            delay: std::time::Duration::from_millis(45),
+        });
+
+        run_agent_loop(inputs(), cfg, svc).await.expect("loop runs");
+
+        let recorded = events.events();
+        let heartbeat_positions: Vec<_> = recorded
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                StreamEvent::TurnActivityUpdated {
+                    recent_activity_label,
+                    waiting_reason,
+                    ..
+                } if recent_activity_label.contains("仍在运行") => {
+                    Some((index, recent_activity_label.clone(), waiting_reason.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            heartbeat_positions.len() >= 2,
+            "expected periodic heartbeat: {recorded:?}"
+        );
+        assert!(heartbeat_positions
+            .iter()
+            .any(|(_, _, reason)| reason.as_deref().is_some_and(|text| text.contains("运行"))));
+        assert!(heartbeat_positions.iter().all(|(_, label, reason)| {
+            !label.contains("SECRET_COMMAND")
+                && !label.contains("hidden")
+                && reason
+                    .as_deref()
+                    .is_none_or(|text| !text.contains("SECRET_COMMAND") && !text.contains("hidden"))
+        }));
+        let result_position = recorded
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolResult { tool_call_id, .. } if tool_call_id == "slow-1"))
+            .expect("terminal tool result");
+        assert!(heartbeat_positions
+            .iter()
+            .all(|(position, _, _)| *position < result_position));
+        assert!(recorded
+            .iter()
+            .skip(result_position + 1)
+            .any(|event| matches!(
+                event,
+                StreamEvent::TurnActivityUpdated {
+                    recent_activity_kind,
+                    waiting_reason: None,
+                    ..
+                } if recent_activity_kind == "tool_finished"
+            )));
+        assert!(
+            persistence
+                .messages
+                .lock()
+                .expect("messages")
+                .iter()
+                .all(|(_, content, _)| !content.contains("仍在运行")),
+            "heartbeats must not create transcript messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_persistence_failure_does_not_cancel_the_inflight_tool() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "执行长验证",
+                vec![call(
+                    "slow-1",
+                    "bash",
+                    serde_json::json!({"command": "slow"}),
+                )],
+                0,
+            ),
+            response("验证完成", vec![], 1),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut cfg = config();
+        cfg.tool_heartbeat_interval = Some(std::time::Duration::from_millis(10));
+        *persistence
+            .activity_fail_kind
+            .lock()
+            .expect("activity fail kind") = Some("tool_wait".into());
+        let mut svc = services(transport, persistence, events.clone());
+        svc.tools = Arc::new(SlowTools {
+            delay: std::time::Duration::from_millis(25),
+        });
+
+        run_agent_loop(inputs(), cfg, svc)
+            .await
+            .expect("diagnostic heartbeat failure must not abort the tool");
+
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult { tool_call_id, status, .. }
+                if tool_call_id == "slow-1" && status == "done"
+        )));
+    }
+
+    #[tokio::test]
+    async fn terminal_activity_persistence_failure_does_not_fail_the_completed_tool_round() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "执行长验证",
+                vec![call(
+                    "slow-1",
+                    "bash",
+                    serde_json::json!({"command": "slow"}),
+                )],
+                0,
+            ),
+            response("验证完成", vec![], 1),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        *persistence
+            .activity_fail_kind
+            .lock()
+            .expect("activity fail kind") = Some("tool_finished".into());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut cfg = config();
+        cfg.tool_heartbeat_interval = Some(std::time::Duration::from_millis(10));
+        let mut svc = services(transport, persistence, events.clone());
+        svc.tools = Arc::new(SlowTools {
+            delay: std::time::Duration::from_millis(25),
+        });
+
+        run_agent_loop(inputs(), cfg, svc)
+            .await
+            .expect("terminal activity failure must not fail a completed tool round");
+
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult { tool_call_id, status, .. }
+                if tool_call_id == "slow-1" && status == "done"
+        )));
+        assert!(events
+            .events()
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn ordinary_long_tool_error_stays_recoverable_instead_of_blocking_the_turn() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "执行长验证",
+                vec![call(
+                    "slow-1",
+                    "bash",
+                    serde_json::json!({"command": "slow"}),
+                )],
+                0,
+            ),
+            response("已根据错误完成修复", vec![], 1),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut cfg = config();
+        cfg.tool_heartbeat_interval = Some(std::time::Duration::from_millis(10));
+        let mut svc = services(transport, persistence, events.clone());
+        svc.tools = Arc::new(SlowErrorTools {
+            delay: std::time::Duration::from_millis(25),
+        });
+
+        run_agent_loop(inputs(), cfg, svc).await.expect("loop runs");
+
+        let recorded = events.events();
+        assert!(recorded.iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated {
+                status,
+                recent_activity_kind,
+                terminal_reason: None,
+                ..
+            } if status == "active" && recent_activity_kind == "tool_failed"
+        )));
+        assert!(!recorded.iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated {
+                status,
+                terminal_reason: Some(reason),
+                ..
+            } if status == "blocked" && reason == "tool_error"
+        )));
+    }
+
+    #[tokio::test]
+    async fn fortieth_tool_call_emits_one_visible_signal_and_one_convergence_prompt() {
+        let tool_calls = (0..41)
+            .map(|index| {
+                call(
+                    &format!("tool-{index}"),
+                    "read_file",
+                    serde_json::json!({"path": format!("doc-{index}.md")}),
+                )
+            })
+            .collect();
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response("实施并验证", tool_calls, 0),
+            response("已完成", vec![], 1),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut cfg = config();
+        cfg.turn_capability = TurnCapability::ReviewOnly;
+        cfg.tool_amplification_threshold = Some(40);
+
+        run_agent_loop(
+            inputs(),
+            cfg,
+            services(transport.clone(), persistence.clone(), events.clone()),
+        )
+        .await
+        .expect("loop runs");
+
+        let warnings: Vec<_> = events
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                StreamEvent::CompletionGateAction { kind, detail } if kind == "warning" => {
+                    Some(detail)
+                }
+                _ => None,
+            })
+            .filter(|detail| detail.contains("工具调用较多"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "one visible signal per root turn");
+        assert_eq!(
+            persistence
+                .notices
+                .lock()
+                .expect("notices")
+                .iter()
+                .filter(|(_, content)| content.contains("工具调用较多"))
+                .count(),
+            1,
+            "one persisted signal per root turn"
+        );
+        let requests = transport.requests();
+        let convergence_prompts: Vec<_> = requests
+            .iter()
+            .flat_map(|request| request.iter())
+            .filter_map(|message| {
+                if message.role != "user" {
+                    return None;
+                }
+                match &message.content {
+                    MessageContent::Text(text) if text.contains("本回合已累计 40 次工具调用") => {
+                        Some(text)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(
+            convergence_prompts.len(),
+            1,
+            "one convergence prompt per root turn"
+        );
+        assert!(convergence_prompts[0].contains("最少只读检查"));
+        assert!(!convergence_prompts[0].contains("实施"));
+    }
+
+    #[tokio::test]
+    async fn resumed_root_turn_counts_prior_tool_calls_before_emitting_one_signal() {
+        let persistence = Arc::new(RecordingPersistence::default());
+        persistence.tool_call_count.store(30, Ordering::SeqCst);
+        let first_transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "继续检查",
+                (0..11)
+                    .map(|index| {
+                        call(
+                            &format!("resume-tool-{index}"),
+                            "bash",
+                            serde_json::json!({"command": format!("verify-{index}")}),
+                        )
+                    })
+                    .collect(),
+                0,
+            ),
+            response("完成", vec![], 1),
+        ]));
+        let mut cfg = config();
+        cfg.tool_amplification_threshold = Some(40);
+
+        run_agent_loop(
+            inputs(),
+            cfg.clone(),
+            services(
+                first_transport,
+                persistence.clone(),
+                Arc::new(CollectingEventSink::new()),
+            ),
+        )
+        .await
+        .expect("first resumed run");
+
+        let second_transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "再次续跑",
+                vec![call(
+                    "resume-tool-final",
+                    "bash",
+                    serde_json::json!({"command": "verify-final"}),
+                )],
+                0,
+            ),
+            response("完成", vec![], 1),
+        ]));
+        run_agent_loop(
+            inputs(),
+            cfg,
+            services(
+                second_transport,
+                persistence.clone(),
+                Arc::new(CollectingEventSink::new()),
+            ),
+        )
+        .await
+        .expect("second resumed run");
+
+        assert_eq!(
+            persistence
+                .notices
+                .lock()
+                .expect("notices")
+                .iter()
+                .filter(|(_, content)| content.contains("工具调用较多"))
+                .count(),
+            1,
+            "restart/resume must preserve one warning per root turn"
+        );
+    }
+
+    #[test]
+    fn approximate_wait_labels_do_not_round_up_an_entire_minute() {
+        for (seconds, expected) in [
+            (59, "59 秒"),
+            (60, "1 分钟"),
+            (61, "1 分钟"),
+            (119, "1 分钟"),
+            (120, "2 分钟"),
+        ] {
+            assert_eq!(
+                approximate_wait_label(std::time::Duration::from_secs(seconds)),
+                expected
+            );
         }
     }
 
@@ -3294,6 +3948,9 @@ mod tests {
             overload_backoff: false,
             inspection_budget: false,
             replay_rejected_draft: false,
+            tool_heartbeat_interval: Some(std::time::Duration::from_secs(30)),
+            long_tool_wait_threshold: std::time::Duration::from_secs(60),
+            tool_amplification_threshold: Some(40),
             session_id: session_id.clone(),
             endpoint_name: endpoint_name.clone(),
             model_id: model_id.clone(),
@@ -3317,6 +3974,9 @@ mod tests {
             overload_backoff: true,
             inspection_budget: true,
             replay_rejected_draft: true,
+            tool_heartbeat_interval: None,
+            long_tool_wait_threshold: std::time::Duration::from_secs(60),
+            tool_amplification_threshold: None,
             session_id,
             endpoint_name,
             model_id,
