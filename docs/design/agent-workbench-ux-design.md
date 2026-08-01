@@ -112,6 +112,8 @@ PR → CI → 合并 → 正式发布 → 线上验证
 ### 5.1 会话侧栏
 
 - 顶部提供搜索；第二批增加 Pin 和状态分组；
+- 展开时，“收起”使用简单左向 Chevron 并与“会话”标题同组，不把侧栏操作混入当前会话工具栏；
+- 收起后，当前会话工具栏仅显示带“会话”文字和消息图标的恢复入口，不能退化成含义不明的 panel 方框图标；
 - 行内显示标题、项目/分支上下文、最后活动时间和状态文字/图标；
 - 当前项使用 2px accent + subtle background；
 - 完整标题和路径通过 accessible label/tooltip 可读；
@@ -148,6 +150,8 @@ PR → CI → 合并 → 正式发布 → 线上验证
 - placeholder 简化为“描述任务或继续对话…”；
 - 支持格式只在附件按钮 tooltip/menu 展示；
 - 附件 chips 和错误在输入框上方；
+- 会话/今日用量与 context meter 作为 composer header 放在输入框上方，不在底部制造独立 footer 留白；
+- 曲别针、单行 textarea 和发送/停止按钮使用同一 32px 垂直盒；textarea 以 24px 行高 + 上下各 4px 内边距对齐图标视觉中心，多行时控制继续贴底；
 - send 在可发送时为清晰主动作，stop 使用 danger 语义；
 - queue、draft scope、context 都属于同一 raised surface；
 - context 正常区为 neutral/progress，70–85% warning，≥85% danger；显示 meter 的 accessible name/value。
@@ -196,6 +200,6 @@ PR → CI → 合并 → 正式发布 → 线上验证
 
 - `chat-continuity` 中“最终回复不切 dashboard”保留；P2 结果卡解释为紧凑 footer。
 - `workspace-navigation` 中“latest release 即已上线”作废；正式发布与 live verification 分离。
-- `token-usage` 的常驻独立底栏改为 composer 内低强调 footer/chip，数据语义不变。
+- `token-usage` 的常驻独立底栏改为 composer 输入框上方的低强调 header，数据语义不变。
 - `TasksColumn`、Git/交付 drawer 与按需 browser pane 后续统一受 pane arbiter 管理。
 - 外部机器人不计入 CodeFactory 视觉审计、布局避让或产品品牌。

@@ -198,7 +198,9 @@ describe("session-native task delegation", () => {
     renderWorkspace();
 
     const header = screen.getByRole("banner", { name: "会话工具栏" });
-    expect(within(header).getByRole("button", { name: "收起会话侧栏" })).toBeInTheDocument();
+    const sessionRail = screen.getByRole("complementary", { name: "会话列表" });
+    expect(within(header).queryByRole("button", { name: "收起会话侧栏" })).not.toBeInTheDocument();
+    expect(within(sessionRail).getByRole("button", { name: "收起会话侧栏" })).toBeInTheDocument();
     expect(within(header).queryByRole("button", { name: "新建空白会话" })).not.toBeInTheDocument();
     expect(within(header).getByRole("button", { name: "Git 状态" })).toBeInTheDocument();
     expect(within(header).queryByRole("button", { name: /检查点|恢复/ })).not.toBeInTheDocument();
@@ -267,11 +269,12 @@ describe("session-native task delegation", () => {
     expect(toggle).toHaveAttribute("aria-expanded", "false");
 
     await userEvent.click(toggle);
-    expect(screen.getByRole("complementary", { name: "会话列表" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "关闭会话侧栏" })).toBeInTheDocument();
+    const sessionRail = screen.getByRole("complementary", { name: "会话列表" });
+    expect(sessionRail).toBeInTheDocument();
+    expect(within(sessionRail).getByRole("button", { name: "关闭会话侧栏" })).toBeInTheDocument();
     expect(screen.getByRole("main", { name: "会话窗口" })).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "关闭会话侧栏" }));
+    await userEvent.click(within(sessionRail).getByRole("button", { name: "关闭会话侧栏" }));
     expect(screen.queryByRole("complementary", { name: "会话列表" })).not.toBeInTheDocument();
     rendered.unmount();
     Object.defineProperty(window, "matchMedia", {

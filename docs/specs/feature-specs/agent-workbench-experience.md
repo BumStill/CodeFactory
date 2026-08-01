@@ -10,9 +10,9 @@
 | CF-WB-R4 | normal/progress/success/warning/danger/info 使用统一语义 token；状态不能只靠颜色 | theme + status surfaces | unit + contrast + real app |
 | CF-WB-R5 | 结果 footer 明确区分已完成、未完成、需要处理；未完成不得使用成功图标/绿色完成语义 | TurnResultSnapshot | component |
 | CF-WB-R6 | 正常 context 使用中性/progress 色，70–85% warning，≥85% danger，并暴露 accessible meter | ContextUsageBar | pure function + component |
-| CF-WB-R7 | composer、queue、draft scope 与 context 收敛成一个 raised 操作表面；placeholder 不列文件格式 | Workspace + MessageInput | component + real app |
+| CF-WB-R7 | composer、queue、draft scope 与 context 收敛成一个 raised 操作表面；用量/context 位于输入框上方；曲别针、单行文本与发送按钮共享 32px 垂直基准；placeholder 不列文件格式 | Workspace + MessageInput | component geometry + real app |
 | CF-WB-R8 | queue chip 的展开方向、`aria-expanded`、逐条移除名称和键盘 focus 正确 | QueueBadge | component |
-| CF-WB-R9 | 会话侧栏支持按标题/项目路径搜索，完整标题可读，关键辅助文字不小于 11px | SessionSidebar | interaction component + real app |
+| CF-WB-R9 | 会话侧栏支持按标题/项目路径搜索，完整标题可读，关键辅助文字不小于 11px；收起入口归属于“会话”栏头且使用简单方向图标，隐藏后由顶栏带“会话”文字的入口恢复 | SessionSidebar | interaction component + real app |
 | CF-WB-R10 | 当前回合、后台作业、交付、队列保持独立真相源，但共享用户可理解的状态语义 | Workspace | integration + adversarial fixture |
 | CF-WB-R11 | 任务抽屉中的任务标题、恢复动作、失败归因和验收结果可读；不可修复阻塞与可恢复失败不同语义 | task activity | component + real app |
 | CF-WB-R12 | 交付链固定区分 PR、CI、合并、正式发布和线上验证；release 不能显示成 live | delivery + Settings + onboarding | component + copy audit |
