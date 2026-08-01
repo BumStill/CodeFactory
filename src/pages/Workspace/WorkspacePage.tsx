@@ -4,8 +4,7 @@ import {
   AlertTriangle,
   BookOpen,
   Settings as SettingsIcon,
-  PanelLeftClose,
-  PanelLeftOpen,
+  MessageSquare,
   RefreshCw,
   Circle,
   CheckCircle2,
@@ -269,16 +268,20 @@ export function WorkspacePage({
 
       {/* ── Header ────────────────────────────────────────────────────────── */}
       <header aria-label="会话工具栏" className="flex min-h-12 shrink-0 flex-wrap items-center gap-2 border-b border-border/80 bg-surface-1/95 px-3 py-1.5">
-        <button
-          onClick={toggleSidebar}
-          className="flex h-8 w-8 items-center justify-center rounded-lg text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300"
-          title={sidebarVisible ? "收起会话侧栏" : "展开会话侧栏"}
-          aria-label={sidebarVisible ? "收起会话侧栏" : "展开会话侧栏"}
-          aria-expanded={sidebarVisible}
-          aria-controls="workspace-session-sidebar"
-        >
-          {sidebarVisible ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
-        </button>
+        {!sidebarVisible && (
+          <button
+            type="button"
+            onClick={toggleSidebar}
+            className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2 text-[13px] font-medium text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
+            title="展开会话侧栏"
+            aria-label="展开会话侧栏"
+            aria-expanded={false}
+            aria-controls="workspace-session-sidebar"
+          >
+            <MessageSquare size={14} aria-hidden="true" />
+            <span>会话</span>
+          </button>
+        )}
         <div className="flex-1 min-w-0">
           <div className="flex truncate text-[13px] font-semibold text-gray-200 items-center gap-2">
             {titleEditing && activeSession ? (
@@ -419,12 +422,11 @@ export function WorkspacePage({
       {/* ── Body: 3 columns ──────────────────────────────────────────────── */}
       <div className="relative flex min-h-0 flex-1">
 
-        {/* ─── Left: collapsible session rail; the header control always restores it. ─── */}
+        {/* ─── Left: the rail owns collapse; the workspace header only restores it. ─── */}
         {narrowViewport && sidebarVisible && (
-          <button
-            type="button"
-            aria-label="关闭会话侧栏"
-            onClick={() => setNarrowSidebarOpen(false)}
+          <div
+            aria-hidden="true"
+            onMouseDown={() => setNarrowSidebarOpen(false)}
             className="absolute inset-0 z-30 bg-black/30"
           />
         )}
@@ -448,6 +450,8 @@ export function WorkspacePage({
                 if (narrowViewport) setNarrowSidebarOpen(false);
                 onNewConversation(cwd);
               }}
+              onCollapse={toggleSidebar}
+              collapseLabel={narrowViewport ? "关闭会话侧栏" : "收起会话侧栏"}
             />
           </aside>
         )}

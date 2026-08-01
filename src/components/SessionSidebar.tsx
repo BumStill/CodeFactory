@@ -30,6 +30,7 @@ import {
   MoreHorizontal,
   Search,
   ShieldQuestion,
+  ChevronLeft,
 } from "lucide-react";
 import { useChatStore } from "../stores/chat";
 import { formatRelativeTime } from "../lib/time";
@@ -43,12 +44,18 @@ interface SessionSidebarProps {
   onOpenSession: (id: string) => void;
   /** Start a blank conversation, optionally scoped to a project directory. */
   onNewConversation: (cwd?: string | null) => void;
+  /** Collapse or dismiss this session-owned rail from its own header. */
+  onCollapse?: () => void;
+  /** Narrow overlays use close language; wide rails use collapse language. */
+  collapseLabel?: "收起会话侧栏" | "关闭会话侧栏";
 }
 
 export function SessionSidebar({
   currentSessionId,
   onOpenSession,
   onNewConversation,
+  onCollapse,
+  collapseLabel = "收起会话侧栏",
 }: SessionSidebarProps) {
   const sessions = useChatStore((s) => s.sessions);
   const draftSession = useChatStore((s) => s.draftSession);
@@ -106,8 +113,22 @@ export function SessionSidebar({
       {/* ── Toolbar: one unambiguous "new blank conversation" action. ──── */}
       <div className="shrink-0 border-b border-border/80 px-2 pb-2">
         <div className="flex h-11 items-center justify-between px-1">
-          <span className="text-[13px] font-semibold text-gray-300">会话</span>
+          <div className="flex min-w-0 items-center gap-1">
+            <span className="text-[13px] font-semibold text-gray-300">会话</span>
+            {onCollapse && (
+              <button
+                type="button"
+                onClick={onCollapse}
+                aria-label={collapseLabel}
+                title={collapseLabel}
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
+              >
+                <ChevronLeft size={16} aria-hidden="true" />
+              </button>
+            )}
+          </div>
           <button
+            type="button"
             onClick={() => onNewConversation(null)}
             aria-label="新建会话"
             title="新建会话（空白，可在输入框上方选择项目）"

@@ -431,7 +431,10 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
           )}
         </div>
       )}
-      <div className="flex items-end gap-2 rounded-2xl border border-border/80 bg-surface-2 px-3 py-2.5 shadow-sm transition-colors focus-within:border-accent/60 focus-within:shadow-md">
+      <div
+        data-testid="message-input-control-row"
+        className="flex items-end gap-2 rounded-2xl border border-border/80 bg-surface-2 px-3 py-2.5 shadow-sm transition-colors focus-within:border-accent/60 focus-within:shadow-md"
+      >
         <input
           ref={fileInputRef}
           type="file"
@@ -478,7 +481,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
               ? "选择项目，或输入 /cwd <path>"
               : "描述任务或继续对话…"
           }
-          className="min-h-[24px] max-h-[200px] flex-1 resize-none bg-transparent text-[15px] leading-6 text-gray-200 outline-none placeholder:text-gray-600 disabled:opacity-40"
+          className="min-h-8 max-h-[200px] flex-1 resize-none bg-transparent py-1 text-[15px] leading-6 text-gray-200 outline-none placeholder:text-gray-600 disabled:opacity-40"
         />
         {/* Two buttons during streaming: queue-send (default, primary)
             and cancel-stream (secondary, square icon). Outside streaming

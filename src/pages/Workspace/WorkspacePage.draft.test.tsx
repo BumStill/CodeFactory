@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 const mocks = vi.hoisted(() => ({
   selectSession: vi.fn(),
@@ -89,12 +89,21 @@ describe("Workspace virtual draft", () => {
 
     expect(screen.queryByRole("button", { name: "新建空白会话" })).not.toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "新建会话" })).toHaveLength(1);
-    expect(screen.getByRole("complementary", { name: "会话列表" })).toBeInTheDocument();
+    const sessionRail = screen.getByRole("complementary", { name: "会话列表" });
+    const workspaceHeader = screen.getByRole("banner", { name: "会话工具栏" });
+    expect(sessionRail).toBeInTheDocument();
     expect(screen.getByRole("main", { name: "会话窗口" })).toBeInTheDocument();
+    const collapse = within(sessionRail).getByRole("button", { name: "收起会话侧栏" });
+    expect(collapse).toBeInTheDocument();
+    expect(collapse.querySelector(".lucide-chevron-left")).toBeInTheDocument();
+    expect(collapse.querySelector(".lucide-panel-left-close")).not.toBeInTheDocument();
+    expect(within(workspaceHeader).queryByRole("button", { name: "收起会话侧栏" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "收起会话侧栏" }));
+    fireEvent.click(within(sessionRail).getByRole("button", { name: "收起会话侧栏" }));
     expect(screen.queryByRole("complementary", { name: "会话列表" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "展开会话侧栏" })).toBeInTheDocument();
+    const restore = within(workspaceHeader).getByRole("button", { name: "展开会话侧栏" });
+    expect(restore).toHaveTextContent("会话");
+    expect(restore.querySelector(".lucide-message-square")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "展开会话侧栏" }));
     expect(screen.getByRole("complementary", { name: "会话列表" })).toBeInTheDocument();
