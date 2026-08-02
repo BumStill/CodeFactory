@@ -59,16 +59,8 @@ def validate_policy(policy: dict[str, Any]) -> list[str]:
     if exclude != []:
         errors.append("ruleset must not exclude any ref")
 
-    bypass = ruleset.get("bypass_actors")
-    expected_bypass = [
-        {
-            "actor_id": GITHUB_ACTIONS_APP_ID,
-            "actor_type": "Integration",
-            "bypass_mode": "always",
-        }
-    ]
-    if bypass != expected_bypass:
-        errors.append("only GitHub Actions Integration 15368 may bypass")
+    if ruleset.get("bypass_actors") != []:
+        errors.append("ruleset bypass actors must be empty")
 
     rules = ruleset.get("rules", [])
     if not isinstance(rules, list):

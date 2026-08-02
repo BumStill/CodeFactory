@@ -18,11 +18,12 @@ name: Auto Release
 # The trailer is a decision signal; it deliberately does not add a merge trigger.
 #
 # It then determines the version slot from ALL commits since the last tag,
-# bumps the three version files, pushes a vX.Y.Z tag, then dispatches
-# release.yml from main with that tag. Running Release on the default branch
-# lets consecutive versions share GitHub cache scope while every build still
-# checks out the immutable tag. Bump commits ("chore: bump version to …") are
-# excluded so they can never themselves cause a release.
+# bumps the version files on an automation branch, opens a PR, waits for the
+# same required checks as every other change, then tags the merged commit and
+# dispatches release.yml. Running Release on the default branch lets consecutive
+# versions share GitHub cache scope while every build still checks out the
+# immutable tag. Bump commits ("chore: bump version to …") are excluded so they
+# can never themselves cause a release.
 
 on:
   workflow_dispatch:
@@ -39,25 +40,69 @@ on:
     - cron: "0 1 * * *" # daily 01:00 UTC — batches the day's merges into one release
 
 permissions:
-  contents: write
+  contents: read
   actions: write
 
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
 jobs:
+  release-token-preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require release automation PAT
+        env:
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+        run: |
+          test -n "$RELEASE_PAT" || {
+            echo "::error::RELEASE_PAT is required for CI-triggering version PRs and tag pushes"
+            exit 1
+          }
+
   release:
+    needs: release-token-preflight
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
-          # The main ruleset grants bypass only to GitHub Actions Integration
-          # 15368. A maintainer PAT is intentionally not a bypass identity.
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # RELEASE_PAT may create/update the version PR and therefore trigger
+          # its required checks. It has no ruleset bypass and cannot push main.
+          token: ${{ secrets.RELEASE_PAT }}
 
       - name: Configure git
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Quiesce open version PR
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+        run: |
+          set -euo pipefail
+          BRANCH="automation/release-next"
+          PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" \
+            --state open --json number --jq '.[0].number // empty')
+          if [ -n "$PR" ]; then
+            if ! gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --disable-auto; then
+              echo "Existing version PR #$PR did not have an active auto-merge request, or cancellation returned an error; verifying live state"
+            fi
+            AUTO_MERGE=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" \
+              --json autoMergeRequest \
+              --jq 'if .autoMergeRequest == null then "null" else "enabled" end')
+            if [ "$AUTO_MERGE" != "null" ]; then
+              echo "::error::Version PR auto-merge is still enabled after cancellation"
+              exit 1
+            fi
+            echo "Paused existing version PR #$PR before replanning"
+          fi
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "::error::main advanced during release startup; rerun from the latest main"
+            exit 1
+          }
 
       - name: Verify main governance check is green
         env:
@@ -77,8 +122,119 @@ jobs:
           fi
           echo "governance-baseline for $HEAD_SHA: ${CONC:-not found, proceeding}"
 
+      - name: Reconcile interrupted version release
+        id: reconcile
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+          ACTIONS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "recovered=false" >> "$GITHUB_OUTPUT"
+          BRANCH="automation/release-next"
+          PR_DATA=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" \
+            --state merged --limit 20 --json number,mergedAt,mergeCommit \
+            --jq 'sort_by(.mergedAt) | last // {}')
+          PR=$(jq -r '.number // empty' <<< "$PR_DATA")
+          if [ -z "$PR" ]; then
+            echo "No previously merged guarded version PR to reconcile"
+            exit 0
+          fi
+
+          MERGE_SHA=$(jq -r '.mergeCommit.oid // empty' <<< "$PR_DATA")
+          test -n "$MERGE_SHA" || {
+            echo "::error::Merged version PR #$PR has no merge SHA"
+            exit 1
+          }
+          git fetch origin main --tags
+          git merge-base --is-ancestor "$MERGE_SHA" origin/main || {
+            echo "::error::Version PR merge $MERGE_SHA is not contained in origin/main"
+            exit 1
+          }
+          VERSION=$(git show "$MERGE_SHA:package.json" | jq -r '.version')
+          SUBJECT=$(git show -s --format=%s "$MERGE_SHA")
+          [[ "$SUBJECT" =~ ^chore:\ bump\ version\ to\ $VERSION(\ \(#[0-9]+\))?$ ]] || {
+            echo "::error::Latest $BRANCH merge is not a canonical version bump"
+            exit 1
+          }
+          FILES=$(git diff-tree --no-commit-id --name-only -r "$MERGE_SHA" | sort)
+          EXPECTED=$(printf '%s\n' package.json src-tauri/Cargo.lock \
+            src-tauri/Cargo.toml src-tauri/tauri.conf.json | sort)
+          test "$FILES" = "$EXPECTED" || {
+            echo "::error::Version PR merge changed files outside the four version manifests"
+            exit 1
+          }
+
+          CARGO_VERSION=$(git show "$MERGE_SHA:src-tauri/Cargo.toml" | \
+            sed -n '0,/^version = /s/^version = "\([^"]*\)"/\1/p')
+          TAURI_VERSION=$(git show "$MERGE_SHA:src-tauri/tauri.conf.json" | jq -r '.version')
+          LOCK_VERSION=$(git show "$MERGE_SHA:src-tauri/Cargo.lock" | \
+            sed -n '/^name = "codefactory"$/{n;s/^version = "\([^"]*\)"/\1/p;q;}')
+          test "$VERSION" = "$CARGO_VERSION" && \
+            test "$VERSION" = "$TAURI_VERSION" && \
+            test "$VERSION" = "$LOCK_VERSION" || {
+            echo "::error::Recovered version PR has inconsistent version manifests"
+            exit 1
+          }
+          TAG="v$VERSION"
+          TAG_CREATED=false
+          if git rev-parse --verify --quiet "refs/tags/$TAG"; then
+            test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$MERGE_SHA" || {
+              echo "::error::$TAG already points to a different commit"
+              exit 1
+            }
+          else
+            git tag "$TAG" "$MERGE_SHA"
+            n=0
+            until git push origin "$TAG"; do
+              n=$((n + 1))
+              if [ "$n" -ge 5 ]; then
+                echo "::error::recovery push of $TAG failed after $n attempts"
+                exit 1
+              fi
+              sleep $((n * 10))
+            done
+            TAG_CREATED=true
+            echo "Recovered missing tag $TAG at $MERGE_SHA"
+          fi
+
+          RELEASE_STATE=missing
+          if RELEASE_JSON=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+               --json isDraft 2>/dev/null); then
+            if [ "$(jq -r '.isDraft' <<< "$RELEASE_JSON")" = "false" ]; then
+              echo "Published release $TAG already exists; reconciliation complete"
+              exit 0
+            fi
+            RELEASE_STATE=draft
+          fi
+
+          RUNS=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow release.yml \
+            --limit 100 --json displayTitle,status,conclusion)
+          RUN=$(jq --arg title "Release $TAG" \
+            '[.[] | select(.displayTitle == $title)][0] // {}' <<< "$RUNS")
+          RUN_STATUS=$(jq -r '.status // "missing"' <<< "$RUN")
+          RUN_CONCLUSION=$(jq -r '.conclusion // ""' <<< "$RUN")
+          case "$RUN_STATUS" in
+            requested|waiting|pending|queued|in_progress)
+              echo "Release $TAG is already $RUN_STATUS; no duplicate dispatch"
+              echo "recovered=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          if [ "$RUN_CONCLUSION" = "success" ] && [ "$RELEASE_STATE" != "published" ]; then
+            echo "::error::Release $TAG run succeeded but no published release exists"
+            exit 1
+          fi
+
+          if [ "$TAG_CREATED" = true ] || [ "$RELEASE_STATE" != "published" ]; then
+            GH_TOKEN="$ACTIONS_TOKEN" gh workflow run release.yml \
+              --repo "$GITHUB_REPOSITORY" --ref main -f tag="$TAG"
+            echo "Recovered missing Release dispatch for $TAG"
+            echo "recovered=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Determine version slot from commits since last tag
         id: slot
+        if: steps.reconcile.outputs.recovered != 'true'
         run: |
           # Batch the whole window since the last tag — NOT just one commit.
           LAST=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
@@ -100,14 +256,14 @@ jobs:
           echo "Range: $RANGE"
 
       - name: Setup Node.js
-        if: steps.slot.outputs.skip != 'true'
+        if: steps.reconcile.outputs.recovered != 'true' && steps.slot.outputs.skip != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Resolve next version
         id: ver
-        if: steps.slot.outputs.skip != 'true'
+        if: steps.reconcile.outputs.recovered != 'true' && steps.slot.outputs.skip != 'true'
         run: |
           LAST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
           CURRENT="${LAST#v}"
@@ -123,7 +279,7 @@ jobs:
           echo "Last: $LAST  Slot: $SLOT  Next: v$NEW"
 
       - name: Bump version files
-        if: steps.slot.outputs.skip != 'true'
+        if: steps.reconcile.outputs.recovered != 'true' && steps.slot.outputs.skip != 'true'
         env:
           NEW: ${{ steps.ver.outputs.version }}
         run: |
@@ -157,36 +313,191 @@ jobs:
             echo "::error::Cargo.lock codefactory entry did not sync to $NEW"; exit 1;
           }
 
-      - name: Commit, tag, push
-        if: steps.slot.outputs.skip != 'true'
+      - name: Open guarded version bump PR
+        id: version_pr
+        if: steps.reconcile.outputs.recovered != 'true' && steps.slot.outputs.skip != 'true'
         env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
           NEW: ${{ steps.ver.outputs.version }}
           TAG: ${{ steps.ver.outputs.tag }}
         run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN" || {
+            echo "::error::RELEASE_PAT is required to create a CI-triggering version PR"
+            exit 1
+          }
+          BRANCH="automation/release-next"
           git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/Cargo.lock
           git commit -m "chore: bump version to $NEW"
-          git tag "$TAG"
-          # GitHub's git backend occasionally 500s on push (transient, observed
-          # in practice). Retry each push with linear backoff instead of
-          # failing the whole release and leaving the bump unpushed.
-          for ref in main "$TAG"; do
-            n=0
-            until git push origin "$ref"; do
-              n=$((n + 1))
-              if [ "$n" -ge 5 ]; then
-                echo "::error::push of $ref failed after $n attempts"
-                exit 1
-              fi
-              echo "push of $ref failed (attempt $n); retrying in $((n * 10))s"
-              sleep $((n * 10))
-            done
+          HEAD_SHA=$(git rev-parse HEAD)
+
+          REMOTE_SHA=$(git ls-remote --heads origin "refs/heads/$BRANCH" | awk '{print $1}')
+          LEASE="--force-with-lease=refs/heads/$BRANCH:$REMOTE_SHA"
+          n=0
+          until git push "$LEASE" origin "HEAD:refs/heads/$BRANCH"; do
+            ACTUAL_SHA=$(git ls-remote --heads origin "refs/heads/$BRANCH" | awk '{print $1}')
+            if [ "$ACTUAL_SHA" = "$HEAD_SHA" ]; then
+              echo "Push reached origin despite a transient client error"
+              break
+            fi
+            if [ "$ACTUAL_SHA" != "$REMOTE_SHA" ]; then
+              echo "::error::$BRANCH changed concurrently from ${REMOTE_SHA:-missing} to ${ACTUAL_SHA:-missing}"
+              exit 1
+            fi
+            n=$((n + 1))
+            if [ "$n" -ge 5 ]; then
+              echo "::error::push of $BRANCH failed after $n attempts"
+              exit 1
+            fi
+            echo "push of $BRANCH failed (attempt $n); retrying in $((n * 10))s"
+            sleep $((n * 10))
           done
 
-      - name: Dispatch release build from main
-        if: steps.slot.outputs.skip != 'true'
+          PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+                 --state open --json number --jq '.[0].number // empty')
+          if [ -z "$PR" ]; then
+            PR_URL=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+              --title "chore: bump version to $NEW" \
+              --body "Automated version bump for $TAG. This PR must pass the same required checks as every other main change.")
+            PR="${PR_URL##*/}"
+          else
+            gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" \
+              --title "chore: bump version to $NEW" \
+              --body "Automated version bump for $TAG. This PR must pass the same required checks as every other main change."
+          fi
+          echo "pr_number=$PR" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "Version PR #$PR opened for guarded checks at $HEAD_SHA"
+
+      - name: Wait for guarded version bump merge
+        id: version_merge
+        if: steps.reconcile.outputs.recovered != 'true' && steps.slot.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+          PR: ${{ steps.version_pr.outputs.pr_number }}
+          EXPECTED_HEAD: ${{ steps.version_pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 180); do
+            DATA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" \
+              --json state,mergeStateStatus,mergeCommit,headRefOid,statusCheckRollup)
+            ACTUAL_HEAD=$(jq -r '.headRefOid' <<< "$DATA")
+            if [ "$ACTUAL_HEAD" != "$EXPECTED_HEAD" ]; then
+              echo "::error::Version PR #$PR head changed from $EXPECTED_HEAD to $ACTUAL_HEAD"
+              exit 1
+            fi
+            STATE=$(jq -r '.state' <<< "$DATA")
+            if [ "$STATE" = "MERGED" ]; then
+              MERGE_SHA=$(jq -r '.mergeCommit.oid // empty' <<< "$DATA")
+              test -n "$MERGE_SHA" || {
+                echo "::error::Version PR merged without a merge SHA"
+                exit 1
+              }
+              echo "merge_sha=$MERGE_SHA" >> "$GITHUB_OUTPUT"
+              echo "Version PR #$PR merged at $MERGE_SHA"
+              exit 0
+            fi
+            if [ "$STATE" = "CLOSED" ]; then
+              echo "::error::Version PR #$PR closed without merging"
+              exit 1
+            fi
+
+            SUCCESSES=0
+            for CHECK in governance-baseline agent-bridge-linux check remote-real-app-gui; do
+              CONCLUSIONS=$(jq -r --arg check "$CHECK" \
+                '.statusCheckRollup[]? | select(.name == $check) | .conclusion' <<< "$DATA")
+              if grep -Eq '^(FAILURE|CANCELLED|TIMED_OUT|ACTION_REQUIRED)$' \
+                   <<< "$CONCLUSIONS"; then
+                echo "::error::Version PR #$PR required check $CHECK failed"
+                exit 1
+              fi
+              if grep -qx 'SUCCESS' <<< "$CONCLUSIONS"; then
+                SUCCESSES=$((SUCCESSES + 1))
+              fi
+            done
+
+            MERGE_STATE=$(jq -r '.mergeStateStatus' <<< "$DATA")
+            if [ "$MERGE_STATE" = "DIRTY" ]; then
+              echo "::error::Version PR #$PR has merge conflicts"
+              exit 1
+            fi
+            if [ "$MERGE_STATE" = "BEHIND" ]; then
+              echo "::error::Version PR #$PR is behind main; refusing to expand an already planned release batch. Rerun Auto Release to replan from latest main."
+              exit 1
+            fi
+            if [ "$SUCCESSES" -eq 4 ]; then
+              gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash \
+                --match-head-commit "$EXPECTED_HEAD"
+              echo "All required checks passed; submitted guarded merge for version PR #$PR"
+              sleep 5
+              continue
+            fi
+            echo "Version PR #$PR waiting ($attempt/180, state=$MERGE_STATE, required=$SUCCESSES/4)"
+            sleep 20
+          done
+          echo "::error::Version PR #$PR did not merge within 60 minutes"
+          exit 1
+
+      - name: Tag guarded merge and dispatch release build
+        if: steps.reconcile.outputs.recovered != 'true' && steps.slot.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.ver.outputs.tag }}
+          MERGE_SHA: ${{ steps.version_merge.outputs.merge_sha }}
         run: |
+          set -euo pipefail
+          git fetch origin main --tags
+          git merge-base --is-ancestor "$MERGE_SHA" origin/main || {
+            echo "::error::Version PR merge $MERGE_SHA is not contained in origin/main"
+            exit 1
+          }
+
+          EXPECTED_VERSION="${TAG#v}"
+          SUBJECT=$(git show -s --format=%s "$MERGE_SHA")
+          [[ "$SUBJECT" =~ ^chore:\ bump\ version\ to\ $EXPECTED_VERSION(\ \(#[0-9]+\))?$ ]] || {
+            echo "::error::Tag candidate is not the canonical version bump for $EXPECTED_VERSION"
+            exit 1
+          }
+          FILES=$(git diff-tree --no-commit-id --name-only -r "$MERGE_SHA" | sort)
+          EXPECTED_FILES=$(printf '%s\n' package.json src-tauri/Cargo.lock \
+            src-tauri/Cargo.toml src-tauri/tauri.conf.json | sort)
+          test "$FILES" = "$EXPECTED_FILES" || {
+            echo "::error::Tag candidate changed files outside the four version manifests"
+            exit 1
+          }
+
+          PACKAGE_VERSION=$(git show "$MERGE_SHA:package.json" | jq -r '.version')
+          CARGO_VERSION=$(git show "$MERGE_SHA:src-tauri/Cargo.toml" | \
+            sed -n '0,/^version = /s/^version = "\([^"]*\)"/\1/p')
+          TAURI_VERSION=$(git show "$MERGE_SHA:src-tauri/tauri.conf.json" | jq -r '.version')
+          LOCK_VERSION=$(git show "$MERGE_SHA:src-tauri/Cargo.lock" | \
+            sed -n '/^name = "codefactory"$/{n;s/^version = "\([^"]*\)"/\1/p;q;}')
+          test "$PACKAGE_VERSION" = "$EXPECTED_VERSION" && \
+            test "$CARGO_VERSION" = "$EXPECTED_VERSION" && \
+            test "$TAURI_VERSION" = "$EXPECTED_VERSION" && \
+            test "$LOCK_VERSION" = "$EXPECTED_VERSION" || {
+            echo "::error::Tag candidate version manifests do not match $EXPECTED_VERSION"
+            exit 1
+          }
+
+          if git rev-parse --verify --quiet "refs/tags/$TAG"; then
+            test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$MERGE_SHA" || {
+              echo "::error::$TAG already points to a different commit"
+              exit 1
+            }
+          else
+            git tag "$TAG" "$MERGE_SHA"
+          fi
+          n=0
+          until git push origin "$TAG"; do
+            n=$((n + 1))
+            if [ "$n" -ge 5 ]; then
+              echo "::error::push of $TAG failed after $n attempts"
+              exit 1
+            fi
+            echo "push of $TAG failed (attempt $n); retrying in $((n * 10))s"
+            sleep $((n * 10))
+          done
           gh workflow run release.yml --ref main -f tag="$TAG"
-          echo "Dispatched Release for $TAG from main"
+          echo "Dispatched Release for $TAG from guarded merge $MERGE_SHA"
