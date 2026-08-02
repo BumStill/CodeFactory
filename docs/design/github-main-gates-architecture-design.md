@@ -33,6 +33,8 @@ required checks 全部绑定 Integration `15368`，避免同名外部 status 冒
 - `apply`：先创建或更新 active ruleset，再开启 auto-merge，最后移除旧的 1-review 规则；中途失败时保持 fail-closed。
 - `verify`：重新读取 GitHub；ruleset、auto-merge、classic cleanup 任一不一致即退出非零。
 
+classic review 清理用 REST `DELETE` 执行，但状态验证读取 GraphQL 中 `refs/heads/main` 的 effective `branchProtectionRule` 实时 review 字段，避免漏掉 `*`、`m*` 等命中 main 的通配规则。GitHub 的专用 REST review GET 在成功返回 `204` 后仍可能长期返回删除前 payload，不能把该缓存响应作为 drift 依据。
+
 同步器拒绝以下策略：非默认分支目标、少于四项检查、非 strict check、任何 bypass actor、非 GitHub Actions 检查来源、允许非 squash、审批数不为 0。
 
 ## 发布兼容性

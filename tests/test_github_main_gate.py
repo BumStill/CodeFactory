@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import tools.governance.manage_main_branch_ruleset as main_gate
 from tools.governance.manage_main_branch_ruleset import (
     apply_policy,
     build_ruleset_payload,
@@ -256,6 +257,50 @@ class GitHubMainGateTests(unittest.TestCase):
                 allow_not_found=True,
             )
         )
+
+    @patch("tools.governance.manage_main_branch_ruleset.gh_graphql")
+    def test_classic_review_verification_uses_uncached_graphql_state(
+        self, graphql
+    ) -> None:
+        graphql.return_value = {
+            "data": {
+                "repository": {
+                    "ref": {
+                        "branchProtectionRule": {
+                            "pattern": "main",
+                            "requiresApprovingReviews": False,
+                            "requiredApprovingReviewCount": None,
+                        }
+                    }
+                }
+            }
+        }
+
+        self.assertFalse(
+            main_gate.classic_review_requirement_present("BumStill/CodeFactory")
+        )
+
+        graphql.return_value["data"]["repository"]["ref"][
+            "branchProtectionRule"
+        ] = {
+            "pattern": "m*",
+            "requiresApprovingReviews": True,
+            "requiredApprovingReviewCount": 1,
+        }
+        self.assertTrue(
+            main_gate.classic_review_requirement_present("BumStill/CodeFactory")
+        )
+
+        graphql.return_value["data"]["repository"]["ref"][
+            "branchProtectionRule"
+        ] = None
+        self.assertFalse(
+            main_gate.classic_review_requirement_present("BumStill/CodeFactory")
+        )
+
+        graphql.return_value = {"data": {"repository": {"ref": None}}}
+        with self.assertRaisesRegex(RuntimeError, "response is incomplete"):
+            main_gate.classic_review_requirement_present("BumStill/CodeFactory")
 
 
 if __name__ == "__main__":

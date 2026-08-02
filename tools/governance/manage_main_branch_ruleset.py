@@ -139,6 +139,60 @@ def gh_api(
     return json.loads(result.stdout)
 
 
+def gh_graphql(query: str, variables: dict[str, str]) -> dict[str, Any]:
+    command = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for key, value in sorted(variables.items()):
+        command.extend(["-F", f"{key}={value}"])
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"gh api graphql failed: {detail}")
+    return json.loads(result.stdout)
+
+
+def classic_review_requirement_present(repo: str) -> bool:
+    """Read effective classic review state without the stale REST subresource.
+
+    GitHub can keep returning the pre-delete review payload from the dedicated
+    REST endpoint even after a successful 204 cleanup. GraphQL reflects the
+    branch protection rule's current review fields and avoids false drift.
+    """
+    owner, name = repo.split("/", 1)
+    query = """
+      query($owner: String!, $name: String!) {
+        repository(owner: $owner, name: $name) {
+          ref(qualifiedName: "refs/heads/main") {
+            branchProtectionRule {
+              pattern
+              requiresApprovingReviews
+              requiredApprovingReviewCount
+            }
+          }
+        }
+      }
+    """
+    payload = gh_graphql(query, {"owner": owner, "name": name})
+    try:
+        repository = payload["data"]["repository"]
+        ref = repository["ref"]
+        if ref is None or "branchProtectionRule" not in ref:
+            raise KeyError("main ref or effective branch protection rule is missing")
+        rule = ref["branchProtectionRule"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("GraphQL branch protection response is incomplete") from exc
+    if rule is None:
+        return False
+    return (
+        rule.get("requiresApprovingReviews") is True
+        or (rule.get("requiredApprovingReviewCount") or 0) > 0
+    )
+
+
 def find_ruleset(repo: str, name: str) -> dict[str, Any] | None:
     summaries = gh_api(repo, "rulesets")
     match = next((item for item in summaries if item.get("name") == name), None)
@@ -169,17 +223,12 @@ def inspect_live(policy: dict[str, Any]) -> dict[str, Any]:
     desired = build_ruleset_payload(policy)
     repository = gh_api(repo, "")
     ruleset = find_ruleset(repo, desired["name"])
-    classic_review = gh_api(
-        repo,
-        "branches/main/protection/required_pull_request_reviews",
-        allow_not_found=True,
-    )
     return {
         "repository": repo,
         "allow_auto_merge": repository.get("allow_auto_merge"),
         "ruleset_id": ruleset.get("id") if ruleset else None,
         "ruleset_matches": contains(ruleset, desired) if ruleset else False,
-        "classic_review_requirement_present": classic_review is not None,
+        "classic_review_requirement_present": classic_review_requirement_present(repo),
     }
 
 
