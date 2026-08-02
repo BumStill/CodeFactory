@@ -31,7 +31,7 @@ class GitHubMainGateTests(unittest.TestCase):
     def _policy(self) -> dict[str, object]:
         return json.loads(POLICY_PATH.read_text(encoding="utf-8"))
 
-    def test_policy_is_safe_for_solo_maintainer_and_machine_release(self) -> None:
+    def test_policy_is_safe_for_solo_maintainer_and_has_no_bypass(self) -> None:
         policy = self._policy()
 
         self.assertEqual(validate_policy(policy), [])
@@ -43,16 +43,7 @@ class GitHubMainGateTests(unittest.TestCase):
         self.assertEqual(
             ruleset["conditions"]["ref_name"]["include"], ["~DEFAULT_BRANCH"]
         )
-        self.assertEqual(
-            ruleset["bypass_actors"],
-            [
-                {
-                    "actor_id": GITHUB_ACTIONS_APP_ID,
-                    "actor_type": "Integration",
-                    "bypass_mode": "always",
-                }
-            ],
-        )
+        self.assertEqual(ruleset["bypass_actors"], [])
 
         by_type = {rule["type"]: rule for rule in ruleset["rules"]}
         self.assertIn("deletion", by_type)
@@ -88,16 +79,70 @@ class GitHubMainGateTests(unittest.TestCase):
             REPO_ROOT / ".github/workflows/governance-baseline.yml"
         ).read_text(encoding="utf-8")
 
-        self.assertNotIn("secrets.RELEASE_PAT", auto_release)
-        self.assertIn("token: ${{ secrets.GITHUB_TOKEN }}", auto_release)
-        self.assertIn("contents: write", auto_release)
+        self.assertIn("token: ${{ secrets.RELEASE_PAT }}", auto_release)
+        self.assertIn("contents: read", auto_release)
         self.assertIn("actions: write", auto_release)
+        self.assertIn("group: auto-release", auto_release)
+        self.assertIn("cancel-in-progress: false", auto_release)
+        self.assertIn("release-token-preflight:", auto_release)
+        self.assertNotIn('git push origin "main"', auto_release)
+        self.assertNotIn("git push origin main", auto_release)
+        self.assertNotIn("refs/heads/main", auto_release)
+        self.assertIn("gh pr create", auto_release)
+        self.assertIn("gh pr merge", auto_release)
+        self.assertNotIn("--auto", auto_release)
+        self.assertIn("--match-head-commit", auto_release)
+        self.assertNotIn("gh pr update-branch", auto_release)
+        self.assertIn("automation/release-next", auto_release)
+        self.assertIn("Quiesce open version PR", auto_release)
+        self.assertIn("Reconcile interrupted version release", auto_release)
+        self.assertIn("--disable-auto", auto_release)
+        self.assertNotIn("--disable-auto || true", auto_release)
+        self.assertIn("autoMergeRequest", auto_release)
+        self.assertIn("Version PR auto-merge is still enabled", auto_release)
+        self.assertIn("EXPECTED_HEAD", auto_release)
+        for check in EXPECTED_CHECKS:
+            self.assertIn(check, auto_release)
+        self.assertIn("steps.reconcile.outputs.recovered != 'true'", auto_release)
+        self.assertIn("gh release view", auto_release)
+        self.assertIn("displayTitle", auto_release)
+        self.assertIn("Recovered missing tag", auto_release)
+        self.assertIn("Recovered missing Release dispatch", auto_release)
+        self.assertIn("requested|waiting|pending|queued|in_progress", auto_release)
+        self.assertLess(
+            auto_release.index("Quiesce open version PR"),
+            auto_release.index("Reconcile interrupted version release"),
+        )
+        self.assertLess(
+            auto_release.index("Reconcile interrupted version release"),
+            auto_release.index("Determine version slot from commits since last tag"),
+        )
+        self.assertIn("merge_sha=", auto_release)
+        self.assertIn('git tag "$TAG" "$MERGE_SHA"', auto_release)
+        wait_step = auto_release.split("Wait for guarded version bump merge", 1)[1]
+        self.assertLess(
+            wait_step.index("ACTUAL_HEAD="),
+            wait_step.index('if [ "$STATE" = "MERGED" ]'),
+        )
+        tag_step = auto_release.split("Tag guarded merge and dispatch release build", 1)[1]
+        self.assertIn('EXPECTED_VERSION="${TAG#v}"', tag_step)
+        self.assertIn("Tag candidate version manifests do not match", tag_step)
+        self.assertIn("Tag candidate changed files outside", tag_step)
+        self.assertLess(
+            auto_release.index("Wait for guarded version bump merge"),
+            auto_release.rindex('git tag "$TAG" "$MERGE_SHA"'),
+        )
         self.assertIn(
             'gh workflow run release.yml --ref main -f tag="$TAG"',
             auto_release,
         )
         self.assertIn("pull_request:\n    branches: [main]", governance)
         self.assertIn("push:\n    branches: [main]", governance)
+
+        release = (REPO_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("run-name: Release ${{ inputs.tag }}", release)
 
     def test_policy_cannot_exclude_default_branch_or_add_unknown_rules(self) -> None:
         excluded = copy.deepcopy(self._policy())
@@ -114,6 +159,19 @@ class GitHubMainGateTests(unittest.TestCase):
         self.assertIn(
             "rules must be exactly deletion, non_fast_forward, pull_request, required_status_checks",
             validate_policy(extra_rule),
+        )
+
+        bypass = copy.deepcopy(self._policy())
+        bypass["ruleset"]["bypass_actors"] = [
+            {
+                "actor_id": GITHUB_ACTIONS_APP_ID,
+                "actor_type": "Integration",
+                "bypass_mode": "always",
+            }
+        ]
+        self.assertIn(
+            "ruleset bypass actors must be empty",
+            validate_policy(bypass),
         )
 
     @patch("tools.governance.manage_main_branch_ruleset.inspect_live")

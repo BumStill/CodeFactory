@@ -24,4 +24,6 @@ python3 tools/governance/manage_main_branch_ruleset.py verify
 - `converged`：auto-merge 已启用、active ruleset 与仓库文件一致、旧 1-review 已移除；
 - `drift`：至少一项不一致，禁止把聊天约定或本地测试当成已经生效。
 
-真实 probe PR 的验收报告同时记录 PR 编号、head SHA、pending 时的 `OPEN + autoMergeRequest`、四项 check 结论和最终 merge SHA。若下一次真实 Auto Release 尚未发生，发布直推只能标为“配置兼容已验证，live bump 待下一次 releasable batch”，不能包装成已跑通。
+真实 probe PR 的验收报告同时记录 PR 编号、head SHA、pending 时的 `OPEN + autoMergeRequest`、四项 check 结论和最终 merge SHA。若下一次真实 Auto Release 尚未发生，版本 PR 路径只能标为“契约已验证，live bump 待下一次 releasable batch”，不能包装成已跑通。
+
+Auto Release 若报告版本 PR `BEHIND`，操作含义是“批次已过期，需要重新规划”，不是普通 CI 重试；直接重新运行 Auto Release，它会先关闭旧 auto-merge，再基于最新 main 重建同一个 `automation/release-next` PR。若上轮已合并但中断在 tag 或 dispatch，下一轮会显示 `Recovered missing tag` 或 `Recovered missing Release dispatch`，不会重新制造版本号。
