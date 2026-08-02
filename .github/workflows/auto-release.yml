@@ -50,9 +50,9 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          # RELEASE_PAT remains supported for repositories whose branch rules
-          # require it; GITHUB_TOKEN is enough for the explicit dispatch below.
-          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          # The main ruleset grants bypass only to GitHub Actions Integration
+          # 15368. A maintainer PAT is intentionally not a bypass identity.
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         run: |

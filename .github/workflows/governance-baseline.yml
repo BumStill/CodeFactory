@@ -2,7 +2,9 @@ name: governance-baseline
 
 on:
   pull_request:
+    branches: [main]
   push:
+    branches: [main]
 
 jobs:
   governance-baseline:

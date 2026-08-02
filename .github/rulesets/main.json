@@ -1,0 +1,75 @@
+{
+  "repository": "BumStill/CodeFactory",
+  "repository_settings": {
+    "allow_auto_merge": true
+  },
+  "cleanup": {
+    "remove_classic_review_requirement": true
+  },
+  "ruleset": {
+    "name": "main-pr-and-ci-gate",
+    "target": "branch",
+    "enforcement": "active",
+    "conditions": {
+      "ref_name": {
+        "include": [
+          "~DEFAULT_BRANCH"
+        ],
+        "exclude": []
+      }
+    },
+    "bypass_actors": [
+      {
+        "actor_id": 15368,
+        "actor_type": "Integration",
+        "bypass_mode": "always"
+      }
+    ],
+    "rules": [
+      {
+        "type": "deletion"
+      },
+      {
+        "type": "non_fast_forward"
+      },
+      {
+        "type": "pull_request",
+        "parameters": {
+          "allowed_merge_methods": [
+            "squash"
+          ],
+          "dismiss_stale_reviews_on_push": false,
+          "require_code_owner_review": false,
+          "require_last_push_approval": false,
+          "required_approving_review_count": 0,
+          "required_review_thread_resolution": true
+        }
+      },
+      {
+        "type": "required_status_checks",
+        "parameters": {
+          "do_not_enforce_on_create": false,
+          "required_status_checks": [
+            {
+              "context": "agent-bridge-linux",
+              "integration_id": 15368
+            },
+            {
+              "context": "check",
+              "integration_id": 15368
+            },
+            {
+              "context": "governance-baseline",
+              "integration_id": 15368
+            },
+            {
+              "context": "remote-real-app-gui",
+              "integration_id": 15368
+            }
+          ],
+          "strict_required_status_checks_policy": true
+        }
+      }
+    ]
+  }
+}
