@@ -14,7 +14,7 @@
 #   enforcer    artifact that makes/keeps the rule true (must exist)
 #   level       warn | error   (only for enforcement: check)
 
-version: "2026-06-05"
+version: "2026-08-02"
 
 rules:
   - id: release-cadence
@@ -35,6 +35,12 @@ rules:
     doc: docs/governance/agent-conformance.md
     enforcement: structural
     enforcer: .github/workflows/governance-baseline.yml
+
+  - id: main-pr-ci-gate
+    statement: "The default branch accepts human changes only through a PR with all required checks green."
+    doc: docs/design/github-main-gates-business-design.md
+    enforcement: structural
+    enforcer: .github/rulesets/main.json
 
   - id: ux-verify-before-merge
     statement: "User-facing behavior changes must be verified in the running app before they ship."

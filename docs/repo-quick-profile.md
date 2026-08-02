@@ -3,7 +3,7 @@
 ## Task Entry
 - Repository: `CodeFactory`
 - 产品类型：Windows AI 编程 Agent 桌面客户端。
-- 当前已验证公开版本：`v1.76.1`。一级「进化审查」、人工裁决和持久作业日志已存在；输入控件对齐与会话侧栏归属修正已经过本地真实 App、远程 GUI、公开 macOS DMG 和版本元数据验收。
+- 当前已验证公开版本：`v1.76.2`。一级「进化审查」、人工裁决和持久作业日志已存在；输入控件对齐与会话侧栏归属修正已经过本地真实 App、远程 GUI、公开 macOS DMG 和版本元数据验收。
 - 日常任务先加载本文件、任务说明和 quick gate 结果。
 - quick gate 标记 release、compatibility、observation、payload、viewport 或 governance-change 时，再加载 `docs/repo-governance-profile.md`。
 
@@ -40,6 +40,8 @@
 - 本机锁屏后不得要求用户解锁或绕过 macOS 安全。UI 变更用 `pnpm test:evolution:headless` 继续执行真实浏览器布局/键盘门禁；PR、合并、刻意发版和安装包验证使用 CLI 与 GitHub runner。headless 不能替代发布 DMG smoke，DMG smoke 也不能替代功能断言。
 
 ## 快速命令
+- GitHub 主分支门禁：`python3 tools/governance/manage_main_branch_ruleset.py validate|plan|apply|verify`
+  - 设计入口：`docs/design/github-main-gates-business-design.md`、`github-main-gates-architecture-design.md`、`github-main-gates-ux-design.md`
 - 跨 worktree 共享 Cargo 缓存：`pnpm cargo:shared -- <cargo arguments>`
   - **裸 `cargo build` / `cargo test` 不走共享缓存**，会在当前 worktree 另起一份数 GB 的 `target/`。长会话优先用上面这条。
 - 清理已完结的 worktree：`pnpm worktrees`（只报告）/ `pnpm worktrees:clean`（删已合并且干净的，并清 7 天未动的构建产物）
