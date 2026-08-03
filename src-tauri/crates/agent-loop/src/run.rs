@@ -583,6 +583,7 @@ pub async fn run_agent_loop(
     let mut blocker_terminal_reason: Option<String> = None;
     let mut completion_summary_retry_used = false;
     let mut completion_recovery_attempts = 0_u32;
+    let mut delivery_recovery_attempts = 0_u8;
     let mut structural_denial_seen = false;
     let mut fact_check_used = false;
     let mut require_tool_next = false;
@@ -1173,6 +1174,7 @@ pub async fn run_agent_loop(
             let mut result_messages = Vec::new();
             let mut progress_prompt = None;
             let mut blocked_tool_result = false;
+            let mut delivery_recovery_prompt = None;
             let completion_evidence_before_tool_batch = completion_gate.evidence();
 
             for (tool_index, tc) in tool_calls.iter().enumerate() {
@@ -1560,8 +1562,20 @@ pub async fn run_agent_loop(
                         }));
                     }
                 };
-                blocked_tool_result |=
-                    matches!(output.status, crate::tool::ToolExecutionStatus::Blocked);
+                if matches!(output.status, crate::tool::ToolExecutionStatus::Blocked) {
+                    if let Some(prompt) = output.metadata.as_ref().and_then(|metadata| {
+                        crate::policy::recoverable_delivery_prompt(
+                            &tc.function.name,
+                            metadata,
+                            delivery_recovery_attempts,
+                        )
+                    }) {
+                        delivery_recovery_attempts = delivery_recovery_attempts.saturating_add(1);
+                        delivery_recovery_prompt = Some(prompt);
+                    } else {
+                        blocked_tool_result = true;
+                    }
+                }
                 persistence
                     .record_tool_call_outcome(
                         tc,
@@ -1698,6 +1712,33 @@ pub async fn run_agent_loop(
                 reasoning_content: reasoning,
             });
             messages.extend(result_messages);
+            if !blocked_tool_result {
+                if let Some(prompt) = delivery_recovery_prompt {
+                    finalization_pending = false;
+                    blocker_summary_pending = false;
+                    publish_turn_activity(
+                        persistence.as_ref(),
+                        events.as_ref(),
+                        root_turn_id.as_deref(),
+                        "recovering",
+                        "active",
+                        "delivery_recovery",
+                        "正在自动修复交付失败并续跑",
+                        None,
+                        None,
+                    )
+                    .await?;
+                    messages.push(crate::types::ChatMessage {
+                        role: "user".into(),
+                        content: crate::types::MessageContent::Text(prompt),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                    });
+                    continue;
+                }
+            }
             if blocked_tool_result {
                 finalization_pending = true;
                 blocker_summary_pending = true;

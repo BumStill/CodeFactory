@@ -227,6 +227,13 @@ class ReadmeContractTests(unittest.TestCase):
         )
         self.assertIn("README contract", ci)
         self.assertIn("validate_readme_contract.py --ci", ci)
+        self.assertIn("pull-requests: read", ci)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", ci)
+        self.assertIn("types: [opened, synchronize, reopened, edited]", ci)
+        self.assertRegex(
+            ci,
+            r"- name: README contract\n\s+if: \$\{\{ !cancelled\(\) \}\}",
+        )
         self.assertIn("README-Update: reviewed", auto_release)
         self.assertEqual(auto_release.count('--body "$PR_BODY"'), 2)
 
@@ -239,6 +246,7 @@ class ReadmeContractTests(unittest.TestCase):
         )
         self.assertIn("README-Update: reviewed", template)
         self.assertIn("README-Update-Reason:", template)
+        self.assertNotIn("README-Update-Reason: <", template)
         self.assertIn('cron: "0 3 1 * *"', review)
         self.assertIn("gh issue create", review)
         self.assertNotIn("git push", review)

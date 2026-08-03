@@ -56,7 +56,7 @@ your own API key, or sign in with ChatGPT for the Codex-backed provider.
 | 🌐 **On-demand browser** | Task-scoped managed browser sessions open an embedded pane only when needed; pause for login or approval, then recover the session without leaving an idle browser daemon behind. |
 | 📦 **Docker sandbox** | Optional `sandbox_mode: Docker` runs every shell/tool command in a disposable container instead of your host shell. |
 | 🔔 **IM notifications** | Optional WeCom / Feishu / generic-JSON webhook pings you when a task finishes, fails, or needs permission — fire-and-forget, no secrets in the payload. |
-| 🚚 **Controlled delivery** | Turn a completed task into an auditable PR → CI → merge → release flow, with explicit blockers when a live verifier or deployment step is not configured. |
+| 🚚 **Controlled delivery** | Turn a completed task into an auditable PR → CI → merge → release flow. Recoverable CI/metadata/branch failures return to a bounded repair loop; genuine permission or policy blockers stay explicit. |
 | 🔁 **Auto-update** | Signed updates over GitHub Releases. New version arrives → in-app banner → one-click install + relaunch. Your data stays. |
 
 ## Install

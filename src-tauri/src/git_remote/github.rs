@@ -150,6 +150,21 @@ pub async fn create_pr(
     Ok(parse_pr(&v))
 }
 
+pub async fn update_pr_body(
+    client: &RemoteGitClient,
+    repo: &str,
+    number: u64,
+    body: &str,
+) -> Result<(), String> {
+    client
+        .patch(
+            &format!("/repos/{repo}/pulls/{number}"),
+            serde_json::json!({"body": body}),
+        )
+        .await
+        .map(|_| ())
+}
+
 /// Merge a PR. `method` is one of "squash" | "merge" | "rebase". A 405 from a
 /// protected branch / required review surfaces as the REST error verbatim.
 pub async fn merge_pr(
@@ -346,12 +361,11 @@ pub(crate) fn classify_ci_observation(
     value: &Value,
     required_checks: &[RequiredStatusCheck],
 ) -> CiObservation {
-    let mut runs = value
+    let raw_runs = value
         .get("check_runs")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    runs.sort_by_key(|run| str_val(run, "name"));
     let run_identity = |run: &Value| {
         (
             str_val(run, "name"),
@@ -360,6 +374,48 @@ pub(crate) fn classify_ci_observation(
                 .and_then(Value::as_u64),
         )
     };
+
+    // A PR-body edit or workflow rerun creates another check-run with the same
+    // required context on the same commit. Judging every historical run makes
+    // the old red result win forever. Keep only the newest run per
+    // (context, GitHub App) identity; the monotonically increasing check-run id
+    // is also part of the fingerprint so recovery waits for fresh evidence.
+    let mut latest_runs: Vec<Value> = Vec::new();
+    for run in raw_runs {
+        let identity = run_identity(&run);
+        if let Some(index) = latest_runs
+            .iter()
+            .position(|existing| run_identity(existing) == identity)
+        {
+            let current_id = latest_runs[index]
+                .get("id")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let candidate_id = run.get("id").and_then(Value::as_u64).unwrap_or(0);
+            if candidate_id >= current_id {
+                latest_runs[index] = run;
+            }
+        } else {
+            latest_runs.push(run);
+        }
+    }
+    let mut runs = if required_checks.is_empty() {
+        latest_runs
+    } else {
+        latest_runs
+            .into_iter()
+            .filter(|run| {
+                let (name, integration_id) = run_identity(run);
+                required_checks.iter().any(|required| {
+                    name == required.context
+                        && required
+                            .integration_id
+                            .map_or(true, |expected| integration_id == Some(expected))
+                })
+            })
+            .collect()
+    };
+    runs.sort_by_key(|run| str_val(run, "name"));
     let missing_required = required_checks
         .iter()
         .filter(|required| {
@@ -380,10 +436,11 @@ pub(crate) fn classify_ci_observation(
             .iter()
             .map(|run| {
                 format!(
-                    "{}:{}:{}",
+                    "{}:{}:{}:{}",
                     str_val(run, "name"),
                     str_val(run, "status"),
-                    str_val(run, "conclusion")
+                    str_val(run, "conclusion"),
+                    run.get("id").and_then(Value::as_u64).unwrap_or(0)
                 )
             })
             .collect::<Vec<_>>();
@@ -413,10 +470,17 @@ pub(crate) fn classify_ci_observation(
         match str_val(run, "conclusion").as_str() {
             "success" | "neutral" | "skipped" => {}
             other => {
+                let name = str_val(run, "name");
+                let url = str_val(run, "details_url");
+                let detail = if url.is_empty() {
+                    format!("failure:{name}:{other}")
+                } else {
+                    format!("failure:{name}:{other} [{url}]")
+                };
                 return CiObservation {
-                    status: format!("failure:{other}"),
+                    status: detail,
                     fingerprint,
-                }
+                };
             }
         }
     }

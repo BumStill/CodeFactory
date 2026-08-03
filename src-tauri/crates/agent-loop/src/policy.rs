@@ -659,6 +659,45 @@ pub fn capability_denial(
     }
 }
 
+/// Convert a machine-classified, recoverable delivery stop into another
+/// execution round. The ordinary blocked path intentionally finalizes, but a
+/// delivery result with an explicit `next_action` is a state-machine edge, not
+/// a terminal blocker. Two rounds are enough to repair metadata/BEHIND and to
+/// return one real CI failure to implementation without creating an infinite
+/// agent loop.
+pub fn recoverable_delivery_prompt(
+    tool_name: &str,
+    metadata: &serde_json::Value,
+    attempts: u8,
+) -> Option<String> {
+    const MAX_ATTEMPTS: u8 = 2;
+    if tool_name != "deliver_changes"
+        || attempts >= MAX_ATTEMPTS
+        || metadata
+            .get("recoverable")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return None;
+    }
+    let next_action = metadata
+        .get("next_action")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let code = metadata
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("delivery_recoverable");
+    Some(format!(
+        "受控交付返回可恢复状态 `{code}`。这是第 {}/{} 次有界恢复，不是终态，也不是权限问题。\
+立即执行下面的恢复动作；若修改了代码或正文，完成验证后再次调用 deliver_changes 续接同一 PR。\
+恢复过程必须保留 required checks，并继续使用受控交付；禁止 --admin、force push 和门禁绕过。\n恢复动作：{next_action}",
+        attempts + 1,
+        MAX_ATTEMPTS
+    ))
+}
+
 /// A completion-policy denial, kept STRUCTURED so each surface can word it its
 /// own way (keystone slice 4.8c b4) — the desktop's user-facing sentence and the
 /// eval sidecar's `policy denied command ({rule}): {reason}` are different
@@ -772,6 +811,44 @@ mod tests {
             &no_args(),
         )
         .is_none());
+    }
+
+    #[test]
+    fn recoverable_delivery_blocker_returns_to_execution_with_a_bound() {
+        let metadata = serde_json::json!({
+            "status": "blocked",
+            "code": "delivery_ci_failed",
+            "recoverable": true,
+            "next_action": "读取失败 check，修复后重新调用 deliver_changes",
+            "pr_url": "https://example.test/pull/7"
+        });
+
+        let first = recoverable_delivery_prompt("deliver_changes", &metadata, 0)
+            .expect("the first recovery must continue the delivery loop");
+        assert!(first.contains("读取失败 check"));
+        assert!(first.contains("deliver_changes"));
+        assert!(!first.contains("只生成阻断总结"));
+
+        let second = recoverable_delivery_prompt("deliver_changes", &metadata, 1)
+            .expect("one retry may still need a second bounded recovery");
+        assert!(second.contains("第 2/2 次"));
+
+        assert!(recoverable_delivery_prompt("deliver_changes", &metadata, 2).is_none());
+    }
+
+    #[test]
+    fn non_delivery_or_nonrecoverable_blockers_still_finalize() {
+        let blocked = serde_json::json!({
+            "recoverable": false,
+            "next_action": "ask a human"
+        });
+        assert!(recoverable_delivery_prompt("deliver_changes", &blocked, 0).is_none());
+
+        let unrelated = serde_json::json!({
+            "recoverable": true,
+            "next_action": "retry"
+        });
+        assert!(recoverable_delivery_prompt("browser_session", &unrelated, 0).is_none());
     }
 
     #[test]
