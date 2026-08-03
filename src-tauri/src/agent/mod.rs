@@ -589,6 +589,38 @@ async fn fetch_session_reasoning_effort(db: &SqlitePool, session_id: &str) -> Op
         .flatten()
 }
 
+/// Read the persisted per-session delivery authorization (0/1). `false` when
+/// unset or no such session. Unlike the old in-memory map this survives app
+/// restarts, so a user who granted delivery once is not re-asked after a
+/// relaunch.
+pub async fn fetch_session_delivery_authorized(db: &SqlitePool, session_id: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT delivery_authorized FROM sessions WHERE id = ?",
+    )
+    .bind(session_id)
+    .fetch_one(db)
+    .await
+    .ok()
+    .map(|v| v != 0)
+    .unwrap_or(false)
+}
+
+/// Persist the per-session delivery authorization. `true` on an explicit
+/// delivery request, `false` on revocation.
+pub async fn set_session_delivery_authorized(
+    db: &SqlitePool,
+    session_id: &str,
+    authorized: bool,
+) {
+    let _ = sqlx::query(
+        "UPDATE sessions SET delivery_authorized = ? WHERE id = ?",
+    )
+    .bind(if authorized { 1 } else { 0 })
+    .bind(session_id)
+    .execute(db)
+    .await;
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum UsageSurface {
     #[default]
@@ -2725,6 +2757,41 @@ mod tests {
             fetch_session_reasoning_effort(&db, "s1").await.as_deref(),
             Some("low")
         );
+    }
+
+    #[tokio::test]
+    async fn session_delivery_authorization_is_persisted_until_revoked() {
+        // Regression: the delivery grant lived in an in-memory map, so an app
+        // restart (upgrade/relaunch) silently dropped it and the user was asked
+        // to re-confirm "提交上线" again. The grant is now a sessions row that
+        // survives restarts; only an explicit revocation clears it.
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, delivery_authorized INTEGER NOT NULL DEFAULT 0)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO sessions (id) VALUES ('s1')")
+            .execute(&db)
+            .await
+            .unwrap();
+        // Default row → not authorized (fresh session).
+        assert!(!fetch_session_delivery_authorized(&db, "s1").await);
+        // User says "提交上线" → grant persists.
+        set_session_delivery_authorized(&db, "s1", true).await;
+        assert!(fetch_session_delivery_authorized(&db, "s1").await);
+        // The grant lives in the sessions row, not process memory: a fresh
+        // query through the same pool still sees it (an in-memory SQLite db is
+        // per-connection, so restart semantics are proven at the row level).
+        assert!(fetch_session_delivery_authorized(&db, "s1").await);
+        // Revocation clears the grant.
+        set_session_delivery_authorized(&db, "s1", false).await;
+        assert!(!fetch_session_delivery_authorized(&db, "s1").await);
     }
 
     #[test]
