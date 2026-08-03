@@ -52,27 +52,59 @@ jobs:
           workspaces: src-tauri
 
       - name: Install frontend deps
+        id: deps
         run: pnpm install --frozen-lockfile
 
+      # ── Every gate below reports its own verdict ────────────────────────────
+      #
+      # These steps used to run in a plain sequence, so the FIRST failure
+      # skipped all the rest and the job told you nothing about them. Run
+      # 30795455214 is the case that forced this change: a timing-sensitive
+      # Vitest case lost to a loaded Windows runner, and CI then skipped the
+      # entire Rust suite and both evidence uploads — on a PR whose only change
+      # was Rust. A red `check` has to mean "here is what broke", not "here is
+      # the first thing that broke".
+      #
+      # `!cancelled()` rather than `always()`: on failure we want the remaining
+      # gates, but when a human cancels the run we want it to actually stop
+      # instead of holding a (2x-billed) Windows runner for another ~6 minutes.
+      # A step that fails still fails the job — later successes do not mask it.
+      #
+      # Cost: a frontend-only failure now runs the Rust suite too, taking the
+      # job from ~5min to the ~10min of a full green run. That is the price of
+      # one run reporting the true state of both sides.
+      #
+      # The frontend gates are additionally conditioned on `deps` succeeding —
+      # without node_modules they would each fail for the same uninformative
+      # reason. The Rust gates need only the toolchain, so they stay
+      # independent of anything above them.
       - name: Type-check frontend
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pnpm exec tsc --noEmit
 
       # Frontend regression tests (Vitest + jsdom + React Testing Library).
       # Currently covers the stick-to-bottom scroll hook, which shipped
       # broken in v0.3.7 and v0.3.9 before tests existed.
       - name: Vitest
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pnpm test
 
       - name: Release workflow contract tests
+        if: ${{ !cancelled() }}
         run: python -m unittest tests.test_release_workflow
 
       - name: Evolution workbench headless viewport gate
+        id: evolution_gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pnpm test:evolution:headless
         env:
           CODEFACTORY_EVOLUTION_ARTIFACT_DIR: ${{ runner.temp }}/codefactory-evolution-headless
 
+      # Evidence is mandatory whenever the gate actually ran (pass or fail), but
+      # demanding it when the gate was skipped just manufactures a second red
+      # step — `if-no-files-found: error` did exactly that in run 30795455214.
       - name: Upload evolution viewport evidence
-        if: always()
+        if: ${{ !cancelled() && steps.evolution_gate.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: evolution-workbench-headless-${{ runner.os }}
@@ -80,12 +112,14 @@ jobs:
           if-no-files-found: error
 
       - name: Resume journal headless viewport gate
+        id: resume_gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pnpm test:resume:headless
         env:
           CODEFACTORY_RESUME_ARTIFACT_DIR: ${{ runner.temp }}/codefactory-resume-headless
 
       - name: Upload resume journal viewport evidence
-        if: always()
+        if: ${{ !cancelled() && steps.resume_gate.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: resume-journal-headless-${{ runner.os }}
@@ -93,6 +127,7 @@ jobs:
           if-no-files-found: error
 
       - name: Cargo check
+        if: ${{ !cancelled() }}
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
       # Run the Rust test suite. New regressions like the v0.3.7
@@ -100,12 +135,14 @@ jobs:
       # catch them before tagging a release instead of after a user
       # reports it.
       - name: Cargo test
+        if: ${{ !cancelled() }}
         run: cargo test --manifest-path src-tauri/Cargo.toml --quiet
 
       # The root `cargo test` covers only the `codefactory` package. The shared
       # tauri-free loop crate (keystone slice 4) is a separate workspace member,
       # so test it explicitly — future slices move real loop logic here.
       - name: Cargo test (agent-loop crate)
+        if: ${{ !cancelled() }}
         run: cargo test --manifest-path src-tauri/Cargo.toml -p codefactory-agent-loop --quiet
 
       # Same reason as agent-loop: the headless eval sidecar is its own workspace
@@ -113,9 +150,11 @@ jobs:
       # it. Without this step its tests are invisible to CI — which is exactly how
       # #260 shipped three red sidecar tests (tool_choice regressions) unnoticed.
       - name: Cargo test (agent-headless crate)
+        if: ${{ !cancelled() }}
         run: cargo test --manifest-path src-tauri/Cargo.toml -p codefactory-agent-headless --quiet
 
       - name: Evolution executable closed-loop smoke
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $receipt = Join-Path $env:RUNNER_TEMP "evolution-smoke.json"
@@ -134,6 +173,7 @@ jobs:
       # loader path #166 made fragile. Runs on the actual executable, not the
       # unit-test EXE, which is the safe place to exercise the headless seam.
       - name: Headless AgentLoop construction smoke
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $receipt = Join-Path $env:RUNNER_TEMP "headless-smoke.json"
@@ -149,6 +189,7 @@ jobs:
       # the real binary and prove the native manager detects that output and
       # removes its lease instead of leaving a headless browser daemon behind.
       - name: Browser session lifecycle smoke
+        if: ${{ !cancelled() }}
         shell: pwsh
         env:
           # The runner has Chrome preinstalled but nobody at the keyboard, so

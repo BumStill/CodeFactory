@@ -270,6 +270,93 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("harbor==0.15.0", job)
         self.assertIn("python -m unittest discover -s tests -p 'test_*.py'", job)
 
+    def _check_job_steps(self) -> dict[str, str]:
+        """Map every `- name:` step in ci.yml's `check` job to its own block.
+
+        PyYAML is not installed in the jobs that run this module, so the steps
+        are split on the `      - name:` indentation ci.yml uses rather than
+        parsed. Steps are keyed by name; the value is that step's text up to
+        the next step.
+        """
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("\n  check:\n", workflow)
+        job = workflow.split("\n  check:\n", 1)[1]
+
+        steps: dict[str, str] = {}
+        current: str | None = None
+        for line in job.splitlines():
+            if line.startswith("      - name: "):
+                current = line[len("      - name: ") :].strip()
+                steps[current] = ""
+            elif line.startswith("  ") and not line.startswith("    "):
+                break  # next top-level job
+            elif current is not None:
+                steps[current] += line + "\n"
+        return steps
+
+    def test_a_frontend_failure_does_not_hide_the_rust_suite(self) -> None:
+        """A red `check` must report every gate, not just the first to break.
+
+        Run 30795455214 lost a timing-sensitive Vitest case on a loaded Windows
+        runner and skipped the entire Rust suite — on a PR whose only change was
+        Rust. The Rust gates only need the toolchain, so nothing above them in
+        the step list may decide whether they run.
+        """
+        steps = self._check_job_steps()
+
+        rust_steps = [
+            "Cargo check",
+            "Cargo test",
+            "Cargo test (agent-loop crate)",
+            "Cargo test (agent-headless crate)",
+            "Evolution executable closed-loop smoke",
+            "Headless AgentLoop construction smoke",
+            "Browser session lifecycle smoke",
+        ]
+        for name in rust_steps:
+            self.assertIn(name, steps, f"`check` lost its {name!r} step")
+            block = steps[name]
+            self.assertIn(
+                "!cancelled()",
+                block,
+                f"{name!r} runs only when every earlier step passed, so one "
+                "unrelated frontend failure hides it",
+            )
+            # `always()` would keep a 2x-billed Windows runner busy after a
+            # human cancels the run.
+            self.assertNotIn("if: always()", block, f"{name!r} ignores cancellation")
+            # Gating a Rust step on the frontend is the exact coupling this
+            # test exists to prevent.
+            self.assertNotIn(
+                "steps.deps.outcome",
+                block,
+                f"{name!r} is gated on the frontend install",
+            )
+
+        self.assertIn("Vitest", steps)
+        self.assertIn("id: deps", steps["Install frontend deps"])
+
+    def test_viewport_evidence_is_required_only_when_its_gate_ran(self) -> None:
+        """Skipped gates must not manufacture a second failure.
+
+        Both uploads are `if-no-files-found: error` because the evidence is
+        mandatory. Combined with `if: always()` that turned one skipped gate
+        into an extra red step in run 30795455214.
+        """
+        steps = self._check_job_steps()
+
+        for upload, gate in (
+            ("Upload evolution viewport evidence", "evolution_gate"),
+            ("Upload resume journal viewport evidence", "resume_gate"),
+        ):
+            self.assertIn(upload, steps)
+            block = steps[upload]
+            self.assertIn("if-no-files-found: error", block)
+            self.assertIn(f"steps.{gate}.outcome != 'skipped'", block)
+            self.assertNotIn("if: always()", block)
+
 
 if __name__ == "__main__":
     unittest.main()
