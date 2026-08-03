@@ -168,7 +168,7 @@ jobs:
             sed -n '0,/^version = /s/^version = "\([^"]*\)"/\1/p')
           TAURI_VERSION=$(git show "$MERGE_SHA:src-tauri/tauri.conf.json" | jq -r '.version')
           LOCK_VERSION=$(git show "$MERGE_SHA:src-tauri/Cargo.lock" | \
-            sed -n '/^name = "codefactory"$/{n;s/^version = "\([^"]*\)"/\1/p;q;}')
+            awk '/^name = "codefactory"$/ { found=1; next } found && /^version = / { gsub(/^version = "|"$/, ""); print; found=0 }')
           test "$VERSION" = "$CARGO_VERSION" && \
             test "$VERSION" = "$TAURI_VERSION" && \
             test "$VERSION" = "$LOCK_VERSION" || {
@@ -472,7 +472,7 @@ jobs:
             sed -n '0,/^version = /s/^version = "\([^"]*\)"/\1/p')
           TAURI_VERSION=$(git show "$MERGE_SHA:src-tauri/tauri.conf.json" | jq -r '.version')
           LOCK_VERSION=$(git show "$MERGE_SHA:src-tauri/Cargo.lock" | \
-            sed -n '/^name = "codefactory"$/{n;s/^version = "\([^"]*\)"/\1/p;q;}')
+            awk '/^name = "codefactory"$/ { found=1; next } found && /^version = / { gsub(/^version = "|"$/, ""); print; found=0 }')
           test "$PACKAGE_VERSION" = "$EXPECTED_VERSION" && \
             test "$CARGO_VERSION" = "$EXPECTED_VERSION" && \
             test "$TAURI_VERSION" = "$EXPECTED_VERSION" && \
