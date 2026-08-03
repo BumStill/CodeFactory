@@ -443,6 +443,9 @@ export function SettingsPage({
     sandbox_image: string;
   } | null>(null);
   const [generalSaved, setGeneralSaved] = useState(false);
+  const [showImBindingDialog, setShowImBindingDialog] = useState(false);
+  const [showManualImWebhook, setShowManualImWebhook] = useState(false);
+  const [selectedImProvider, setSelectedImProvider] = useState<"wecom" | "feishu" | null>(null);
 
   // ── Load ───────────────────────────────────────────────────────────────────
 
@@ -975,38 +978,173 @@ export function SettingsPage({
               </select>
             </div>
 
-            <div className="space-y-1">
-              <label className="text-xs text-gray-500">IM 通知(手机上掌握进度)</label>
-              <p className="text-[11px] leading-5 text-gray-600">
-                配置群机器人 Webhook 后,任务完成/失败、会话回合中断、工具等待批准时会推送一条消息。
-                仅单向通知,不含任何令牌或代码内容;留空即关闭。
-              </p>
-              <div className="flex items-center gap-2">
-                <select
-                  value={generalDraft.im_webhook_format}
-                  onChange={(e) =>
-                    setGeneralDraft({
-                      ...generalDraft,
-                      im_webhook_format: e.target.value as NonNullable<Settings["im_webhook_format"]>,
-                    })
-                  }
-                  className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
-                >
-                  <option value="wecom">企业微信</option>
-                  <option value="feishu">飞书</option>
-                  <option value="generic">通用 JSON</option>
-                </select>
-                <input
-                  value={generalDraft.im_webhook_url}
-                  onChange={(e) =>
-                    setGeneralDraft({ ...generalDraft, im_webhook_url: e.target.value })
-                  }
-                  placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…"
-                  className="flex-1 rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
-                  aria-label="IM Webhook 地址"
-                />
+            <section className="space-y-3 rounded-xl border border-border bg-surface-1 p-3" aria-labelledby="settings-im-title">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h3 id="settings-im-title" className="text-sm font-semibold text-gray-100">手机通知</h3>
+                  <p className="mt-1 text-[11px] leading-5 text-gray-500">
+                    任务完成、失败或等待你批准时，推送到企业微信或飞书。
+                  </p>
+                </div>
+                <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] ${
+                  generalDraft.im_webhook_url.trim()
+                    ? "bg-green-500/10 text-green-700 dark:text-green-300"
+                    : "bg-surface-3 text-gray-500"
+                }`}>
+                  {generalDraft.im_webhook_url.trim() ? "已配置旧 Webhook" : "未绑定"}
+                </span>
               </div>
-            </div>
+
+              <div className="rounded-lg border border-border/70 bg-surface-2 px-3 py-2 text-[11px] leading-5 text-gray-500">
+                新的主路径不是让你手填 URL，而是选择 IM、完成授权/连接、自动发送诊断消息，成功后才保存绑定。
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowImBindingDialog(true)}
+                  className="rounded bg-accent px-3 py-1.5 text-xs font-medium text-white hover:bg-accent-hover"
+                >
+                  一键绑定 IM
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowManualImWebhook((value) => !value)}
+                  className="rounded border border-border bg-surface-2 px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-3"
+                >
+                  高级：手动 Webhook
+                </button>
+              </div>
+
+              {showManualImWebhook && (
+                <div className="space-y-2 rounded-lg border border-border/70 bg-surface-0 p-3">
+                  <p className="text-[11px] leading-5 text-gray-500">
+                    仅在无法一键绑定时使用。保存前请确认机器人已经在目标群内。
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={generalDraft.im_webhook_format}
+                      onChange={(e) =>
+                        setGeneralDraft({
+                          ...generalDraft,
+                          im_webhook_format: e.target.value as NonNullable<Settings["im_webhook_format"]>,
+                        })
+                      }
+                      className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                    >
+                      <option value="wecom">企业微信</option>
+                      <option value="feishu">飞书</option>
+                      <option value="generic">通用 JSON</option>
+                    </select>
+                    <input
+                      value={generalDraft.im_webhook_url}
+                      onChange={(e) =>
+                        setGeneralDraft({ ...generalDraft, im_webhook_url: e.target.value })
+                      }
+                      placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…"
+                      className="min-w-0 flex-1 rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                      aria-label="IM Webhook 地址"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {showImBindingDialog && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+                  <div
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="im-binding-dialog-title"
+                    className="w-full max-w-md rounded-xl border border-border bg-surface-1 p-4 shadow-xl"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <h3 id="im-binding-dialog-title" className="text-sm font-semibold text-gray-100">
+                          绑定 IM 通知
+                        </h3>
+                        <p className="mt-1 text-xs leading-5 text-gray-500">
+                          CodeFactory 会先发送一条诊断消息，成功后才保存绑定。
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowImBindingDialog(false)}
+                        className="rounded px-2 py-1 text-xs text-gray-500 hover:bg-surface-3 hover:text-gray-200"
+                      >
+                        关闭
+                      </button>
+                    </div>
+
+                    <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      {[
+                        { id: "wecom", name: "企业微信", description: "推荐用于公司群机器人" },
+                        { id: "feishu", name: "飞书", description: "推荐用于飞书项目群" },
+                      ].map((provider) => (
+                        <button
+                          key={provider.id}
+                          type="button"
+                          aria-label={provider.name}
+                          onClick={() => {
+                            const providerId = provider.id as "wecom" | "feishu";
+                            setSelectedImProvider(providerId);
+                            setGeneralDraft({
+                              ...generalDraft,
+                              im_webhook_format: providerId as NonNullable<Settings["im_webhook_format"]>,
+                            });
+                          }}
+                          className={`rounded-lg border p-3 text-left hover:border-accent/50 hover:bg-surface-3 ${
+                            selectedImProvider === provider.id
+                              ? "border-accent/60 bg-accent/10"
+                              : "border-border bg-surface-2"
+                          }`}
+                        >
+                          <span className="block text-sm font-medium text-gray-100">{provider.name}</span>
+                          <span className="mt-1 block text-[11px] leading-5 text-gray-500">
+                            {provider.description}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+
+                    {selectedImProvider && (
+                      <div className="mt-3 space-y-2 rounded-lg border border-border/70 bg-surface-2 px-3 py-2">
+                        <h4 className="text-xs font-semibold text-gray-200">
+                          {selectedImProvider === "wecom" ? "企业微信绑定步骤" : "飞书绑定步骤"}
+                        </h4>
+                        <ol className="space-y-1 text-[11px] leading-5 text-gray-500">
+                          <li>
+                            {selectedImProvider === "wecom"
+                              ? "1. 在企业微信群里添加群机器人。"
+                              : "1. 在飞书群里添加自定义机器人。"}
+                          </li>
+                          <li>2. 复制机器人 Webhook，粘贴到下方。</li>
+                          <li>3. CodeFactory 会发送诊断消息，成功后才保存。</li>
+                        </ol>
+                        <input
+                          value={generalDraft.im_webhook_url}
+                          onChange={(event) =>
+                            setGeneralDraft({ ...generalDraft, im_webhook_url: event.target.value })
+                          }
+                          placeholder={
+                            selectedImProvider === "wecom"
+                              ? "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…"
+                              : "https://open.feishu.cn/open-apis/bot/v2/hook/…"
+                          }
+                          className="w-full rounded border border-border bg-surface-0 px-2 py-1 text-xs text-gray-300"
+                          aria-label={
+                            selectedImProvider === "wecom" ? "企业微信 Webhook 地址" : "飞书 Webhook 地址"
+                          }
+                        />
+                      </div>
+                    )}
+
+                    <div className="mt-3 rounded-lg border border-border/70 bg-surface-2 px-3 py-2 text-[11px] leading-5 text-gray-500">
+                      下一步会打开对应 IM 的授权/机器人连接流程；如果当前环境不可用，再回退到高级 Webhook。
+                    </div>
+                  </div>
+                </div>
+              )}
+            </section>
 
             <div className="space-y-1">
               <label className="text-xs text-gray-500">命令沙箱</label>
