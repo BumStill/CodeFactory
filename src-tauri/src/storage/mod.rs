@@ -41,6 +41,12 @@ pub struct Session {
     /// None → fall back to the global Settings.reasoning_effort default.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Per-session delivery authorization granted by the user ("提交上线").
+    /// Persisted so a relaunch does not reset it; cleared by explicit
+    /// revocation ("取消交付"/"先别提交").
+    #[serde(default)]
+    #[sqlx(default)]
+    pub delivery_authorized: bool,
 }
 
 fn default_session_kind() -> String {
