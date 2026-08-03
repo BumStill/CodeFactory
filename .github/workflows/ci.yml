@@ -29,6 +29,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # README-Update: required compares the PR base SHA with HEAD.
+          # A shallow checkout does not contain the base object, so the
+          # contract check would fail before it can inspect the real diff.
+          fetch-depth: 0
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
