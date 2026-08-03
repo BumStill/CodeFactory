@@ -1,8 +1,8 @@
 ## README contract
 
-<!-- Choose exactly one decision line and replace the reason. -->
+<!-- Choose exactly one decision line. Refine the reason for user-visible changes. -->
 README-Update: reviewed
-README-Update-Reason: <explain why README changes or does not change>
+README-Update-Reason: README impact reviewed; update this reason if the change alters the evergreen product contract.
 
 ## Change summary
 

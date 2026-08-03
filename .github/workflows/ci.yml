@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
   agent-bridge-linux:
@@ -99,7 +104,9 @@ jobs:
         run: python -m unittest tests.test_release_workflow
 
       - name: README contract
+        if: ${{ !cancelled() }}
         env:
+          GH_TOKEN: ${{ github.token }}
           README_CONTRACT_EVENT_PATH: ${{ github.event_path }}
           README_CONTRACT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python tools/governance/validate_readme_contract.py --ci

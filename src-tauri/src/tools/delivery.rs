@@ -23,10 +23,12 @@ pub fn definition() -> ToolDefinition {
             description: "Deliver the current code changes through git: stage only the real \
                 changed source files (never local noise), commit, push, open (or reuse) a pull \
                 request, and — depending on the user's configured delivery ceiling — wait for CI, \
-                merge, and release. Call this ONCE after tests pass to carry code work to done; \
+                merge, and release. Call this after tests pass to carry code work to done; \
                 do NOT hand-run git in bash and do NOT stop at a green build to describe a missing \
-                PR. Idempotent: safe to call again to resume. Returns the steps taken, the PR URL, \
-                and a terminal state (delivered / blocked / noop)."
+                PR. It generates or repairs the PR README decision block. Idempotent: when a \
+                recoverable result supplies next_action, perform that action and call this again \
+                to resume the SAME PR; the agent loop bounds retries. Returns the steps taken, the \
+                PR URL, and a state (delivered / blocked / noop)."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -194,8 +196,16 @@ fn render_report(outcome: &delivery::DeliveryOutcome) -> String {
         out.push_str(
             "\n\n注意:本次交付没有达到请求边界；只能报告上面明确列出的已完成步骤。\
 即使之后查询发现仓库出现了新的合并或发布,那也是其他执行器(并行 agent 或自动化流水线)\
-完成的,不得归因为你本次的交付动作;如实报告缺失能力、实际到达层级和恢复动作即可。",
+完成的,不得归因为你本次的交付动作。",
         );
+        if outcome.recoverable {
+            out.push_str(
+                "\n\n这是可恢复的交付状态，不是最终总结边界。执行 metadata/正文中的 next_action，\
+然后重新调用 deliver_changes 续接同一 PR；不得使用 --admin、force push 或删 required check。",
+            );
+        } else {
+            out.push_str("如实报告缺失能力、实际到达层级和恢复动作即可。");
+        }
     }
     out
 }
