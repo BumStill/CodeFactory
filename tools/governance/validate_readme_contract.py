@@ -43,6 +43,7 @@ ANY_DECISION_RE = re.compile(r"^[ \t]*README-Update:[ \t]*(.+?)[ \t]*$", re.IGNO
 REASON_RE = re.compile(r"^[ \t]*README-Update-Reason:[ \t]*(.+?)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 PLACEHOLDER_RE = re.compile(r"^<[^>]+>$|\b(?:tbd|todo|fill[ -]?in|n/?a)\b", re.IGNORECASE)
 FENCED_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 
 
 def _git(repo_root: Path, *args: str) -> tuple[bool, str, str]:
@@ -52,6 +53,25 @@ def _git(repo_root: Path, *args: str) -> tuple[bool, str, str]:
         text=True,
     )
     return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+
+
+def _prose_only(text: str) -> str:
+    """Blank out code so a documented toolchain pin is not read as a release claim.
+
+    `## Build from source` is supposed to carry `rustup toolchain install
+    1.83.0`; scanning it for release versions failed CI and told the author to
+    move it to Release notes, which is wrong for a toolchain pin. The decision
+    parser already strips fenced blocks for the same reason — this applies the
+    same treatment to the version scan, plus inline spans (``Rust `1.83.0` ``).
+
+    Replaces with same-length blanks so byte offsets — and therefore reported
+    line numbers — stay correct.
+    """
+
+    def blank(match: re.Match[str]) -> str:
+        return "".join("\n" if ch == "\n" else " " for ch in match.group(0))
+
+    return INLINE_CODE_RE.sub(blank, FENCED_BLOCK_RE.sub(blank, text))
 
 
 def _line_number(text: str, offset: int) -> int:
@@ -110,7 +130,7 @@ def validate_static(repo_root: Path, readme_path: Path | None = None) -> list[st
         errors.append(
             "README.md: keep at least one releases/latest link for version-neutral downloads"
         )
-    versions = sorted(set(EXACT_VERSION_RE.findall(text)))
+    versions = sorted(set(EXACT_VERSION_RE.findall(_prose_only(text))))
     if versions:
         errors.append(
             "README.md: exact version(s) "
@@ -180,6 +200,36 @@ def validate_pr_contract(repo_root: Path, body: str, base_sha: str) -> list[str]
     return errors
 
 
+def _live_pr_body(number: Any) -> str | None:
+    """Fetch the PR's CURRENT body via gh, or None when unavailable.
+
+    The event payload is a snapshot taken when the run was triggered. Re-running
+    a failed check replays that snapshot, so a body fixed after the fact can
+    never pass — the only escape is a fresh commit. That turned a one-line
+    body omission into a hard stop on the release pipeline (2026-08-03, PR #301
+    for v1.77.0: body corrected, three consecutive re-runs still read the stale
+    payload). The contract should judge the PR as it stands now, which is also
+    what a reviewer sees.
+    """
+
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        return None
+    result = subprocess.run(
+        ["gh", "pr", "view", str(number), "--json", "body", "--jq", ".body"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(
+            "::warning::README contract could not read the live PR body "
+            f"({result.stderr.strip() or 'gh failed'}); falling back to the event payload"
+        )
+        return None
+    return result.stdout
+
+
 def _event_payload(path: str | None) -> dict[str, Any] | None:
     if not path:
         return None
@@ -206,7 +256,8 @@ def _run(args: argparse.Namespace) -> int:
         )
         pull_request = event.get("pull_request") if event else None
         if isinstance(pull_request, dict):
-            body = pull_request.get("body") or ""
+            live = _live_pr_body(pull_request.get("number"))
+            body = live if live is not None else (pull_request.get("body") or "")
             base = pull_request.get("base")
             event_base = base.get("sha") if isinstance(base, dict) else ""
             base_sha = (
