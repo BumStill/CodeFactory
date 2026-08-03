@@ -2926,6 +2926,27 @@ pub fn gh_remote_for(cwd: &Path) -> Option<GhCliRemote> {
     })
 }
 
+/// Does this [`DeliveryRemote::ci_status`] error mean "the remote has never
+/// seen this SHA"? GitHub answers the check-runs endpoint with
+/// `422 No commit found for SHA` for any commit it does not have — the normal
+/// state of a local commit between `git commit` and `git push`. That is an
+/// unmet environment precondition, not a defect, so a caller that only makes
+/// sense against a commit the remote already knows should skip, not fail.
+///
+/// Deliberately narrow: it keys on GitHub's own "no commit found" wording, so
+/// a parse regression (`check-runs non-JSON: …`), revoked credentials, or a
+/// missing repo all stay outside it and keep failing loudly. A classifier
+/// broad enough to swallow those would quietly turn its caller into a no-op.
+///
+/// Test-gated, like the docker daemon probe in `tools::bash::sandbox`: the
+/// real-runtime smoke is the only caller that needs the distinction. Delivery
+/// itself reaches `ci_status` only after its own push, where a missing SHA is
+/// a genuine failure and must not be softened.
+#[cfg(test)]
+fn ci_status_error_means_commit_absent_from_remote(err: &str) -> bool {
+    err.to_ascii_lowercase().contains("no commit found for sha")
+}
+
 impl GhCliRemote {
     fn gh(&self, args: &[String]) -> Result<String, String> {
         let out = dev_command("gh")
@@ -4444,7 +4465,14 @@ Release-Urgency: hold"
 
     /// Real-runtime smoke: with a logged-in gh on this machine, ci_status on
     /// the repo's own HEAD must parse into a valid CiStatus. Skips cleanly
-    /// when gh is absent or unauthenticated.
+    /// when gh is absent or unauthenticated, when this is not a GitHub
+    /// checkout, or when HEAD has not been pushed yet.
+    ///
+    /// That last guard is the one that bites. "gh is authenticated" and "the
+    /// remote has this commit" are different questions, and every developer
+    /// sits in the gap between them for as long as a commit is unpushed —
+    /// asking only the first turned that routine local state into a red
+    /// suite. The skip prints why, so it is never mistaken for coverage.
     #[tokio::test]
     async fn gh_cli_remote_reads_real_ci_status_when_gh_is_authenticated() {
         if !gh_cli_available() {
@@ -4459,7 +4487,47 @@ Release-Urgency: hold"
         let head = git(&cwd, &["rev-parse", "HEAD"]).unwrap();
         match remote.ci_status(&head).await {
             Ok(_) => {}
+            Err(e) if ci_status_error_means_commit_absent_from_remote(&e) => {
+                eprintln!(
+                    "skipping gh smoke: HEAD {head} is not on the remote yet — push it to \
+                     really run this test ({e})"
+                );
+            }
             Err(e) => panic!("gh ci_status must parse: {e}"),
+        }
+    }
+
+    /// The regression the smoke guard above depends on: separating "the remote
+    /// does not have this commit" from every failure that is a real defect.
+    /// Pinned deterministically because the smoke itself cannot cover it —
+    /// it only ever observes whichever state this machine happens to be in.
+    #[test]
+    fn unpushed_head_is_told_apart_from_a_real_ci_status_failure() {
+        // Verbatim gh output for the check-runs call on a local-only commit.
+        assert!(ci_status_error_means_commit_absent_from_remote(
+            "gh: No commit found for SHA: bf4ba167f4eb47d3ac24b21ee5f5be21b62b7032 (HTTP 422)"
+        ));
+
+        // Everything below is a real failure. If the classifier widened to
+        // swallow any of them the smoke would degrade into a permanent skip
+        // and stop catching the parse regressions it exists for.
+        for real_failure in [
+            // The ci_status parse regression the smoke is there to catch.
+            "check-runs non-JSON: expected value at line 1 column 1",
+            // Credentials revoked or scoped too narrowly.
+            "gh: Bad credentials (HTTP 401)",
+            "gh: Resource not accessible by personal access token (HTTP 403)",
+            // Repo gone, renamed, or private to this token — a broken
+            // checkout, not an unpushed commit.
+            "gh: Not Found (HTTP 404)",
+            // gh unusable at all.
+            "failed to spawn gh: No such file or directory (os error 2)",
+            "",
+        ] {
+            assert!(
+                !ci_status_error_means_commit_absent_from_remote(real_failure),
+                "must not be swallowed as an unpushed commit: {real_failure:?}"
+            );
         }
     }
 
