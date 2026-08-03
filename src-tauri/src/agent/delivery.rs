@@ -4427,6 +4427,11 @@ Release-Urgency: hold"
     /// Real-runtime smoke: with a logged-in gh on this machine, `ci_status` on a
     /// commit the remote actually has must parse into a valid `CiStatus`.
     ///
+    /// This is intentionally opt-in (`CODEFACTORY_RUN_GH_SMOKE=1`). The default
+    /// Rust suite runs often during delivery and CI; hitting GitHub's live API
+    /// there amplified PR polling into rate limits and failed otherwise-good
+    /// builds. Parser behavior is covered by deterministic unit tests; this smoke
+    /// is for explicit operator diagnostics only.
     /// It asks about `origin/<default>`, NOT local `HEAD`. Local HEAD is
     /// whatever you are working on, and GitHub answers `No commit found for SHA
     /// … (HTTP 422)` for anything unpushed — so the old form failed on every
@@ -4438,6 +4443,10 @@ Release-Urgency: hold"
     /// it at a remote-known commit keeps it running during ordinary work.
     #[tokio::test]
     async fn gh_cli_remote_reads_real_ci_status_when_gh_is_authenticated() {
+        if std::env::var("CODEFACTORY_RUN_GH_SMOKE").ok().as_deref() != Some("1") {
+            eprintln!("skipping gh smoke: set CODEFACTORY_RUN_GH_SMOKE=1 to hit GitHub's live API");
+            return;
+        }
         if !gh_cli_available() {
             eprintln!("skipping gh smoke: gh missing or unauthenticated");
             return;
