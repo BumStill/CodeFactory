@@ -355,15 +355,16 @@ jobs:
 
           PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
                  --state open --json number --jq '.[0].number // empty')
+          PR_BODY=$'Automated version bump for '"$TAG"$'. This PR must pass the same required checks as every other main change.\n\nREADME-Update: reviewed\nREADME-Update-Reason: Version manifest only; the evergreen README keeps version-neutral latest-release links.'
           if [ -z "$PR" ]; then
             PR_URL=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
               --title "chore: bump version to $NEW" \
-              --body "Automated version bump for $TAG. This PR must pass the same required checks as every other main change.")
+              --body "$PR_BODY")
             PR="${PR_URL##*/}"
           else
             gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" \
               --title "chore: bump version to $NEW" \
-              --body "Automated version bump for $TAG. This PR must pass the same required checks as every other main change."
+              --body "$PR_BODY"
           fi
           echo "pr_number=$PR" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"

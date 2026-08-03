@@ -29,6 +29,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # README-Update: required compares the PR base SHA with HEAD.
+          # A shallow checkout does not contain the base object, so the
+          # contract check would fail before it can inspect the real diff.
+          fetch-depth: 0
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -92,6 +97,12 @@ jobs:
       - name: Release workflow contract tests
         if: ${{ !cancelled() }}
         run: python -m unittest tests.test_release_workflow
+
+      - name: README contract
+        env:
+          README_CONTRACT_EVENT_PATH: ${{ github.event_path }}
+          README_CONTRACT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python tools/governance/validate_readme_contract.py --ci
 
       - name: Evolution workbench headless viewport gate
         id: evolution_gate
