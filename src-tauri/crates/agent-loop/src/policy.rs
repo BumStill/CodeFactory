@@ -564,10 +564,11 @@ fn is_planning_document_write(tool_name: &str, args: &serde_json::Value) -> bool
 /// then hands the blocker to the user (2026-07-30 field report).
 fn review_only_denial(tool_name: &str) -> String {
     format!(
-        "本回合是只读审视，已阻止 `{tool_name}`；继续完成当前只读目标，不要要求用户重复确认。\
+        "已跳过与当前显式只读意图冲突的 `{tool_name}` 变更动作；这不是账号权限、GitHub 权限或 high-risk 命令判定。\
+继续完成当前只读目标，不要要求用户重复确认；后续用户意图变化时重新逐动作判断。\
 需要把方案落盘时，用 `write_file` 或 `edit_file` 写 `docs/` 下的 Markdown 文档\
 （例如 `docs/plans/<slug>.md`），不要用 shell、heredoc 或 patch 写文件。\
-代码、配置、测试以及 AGENTS.md / CLAUDE.md / README.md 要等用户明确要求执行后再改。"
+代码、配置、测试以及 AGENTS.md / CLAUDE.md / README.md 在当前显式只读约束下不修改。"
     )
 }
 
@@ -638,14 +639,23 @@ pub fn capability_denial(
         TurnCapability::Implement => {
             if tool_name == "deliver_changes" || is_delivery_command(command) {
                 Some(
-                    "本回合只授权本地实施，已阻止提交、推送、PR、合并或发布；需要交付时请由用户明确要求。"
+                    "当前意图只授权本地实施，已跳过提交、推送、PR、合并或发布动作；需要交付时必须获得对应意图并调用受控交付工具。"
                         .into(),
                 )
             } else {
                 None
             }
         }
-        TurnCapability::Deliver => None,
+        TurnCapability::Deliver => {
+            if tool_name == "bash" && is_delivery_command(command) {
+                Some(
+                    "已跳过裸 shell 交付命令；提交、推送、PR、合并和发布必须调用 `deliver_changes`，由它记录 CI 门禁、head SHA 与恢复回执。这不是账号或命令权限分类问题；不要重试同一条 gh/git 命令。"
+                        .into(),
+                )
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -721,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_capability_is_a_hard_gate_before_permission() {
+    fn explicit_action_intent_is_enforced_before_tool_permission() {
         assert!(capability_denial(
             TurnCapability::ReviewOnly,
             "edit_file",
@@ -922,6 +932,23 @@ mod tests {
         assert!(denial.contains("docs/"), "names the allowed location");
         assert!(denial.contains("不要要求用户重复确认"));
         assert!(!denial.contains("请由用户明确要求"));
+        assert!(!denial.contains("本回合"));
+        assert!(denial.contains("不是账号权限"));
+    }
+
+    #[test]
+    fn deliver_intent_routes_raw_delivery_commands_to_the_governed_tool() {
+        let denial = capability_denial(
+            TurnCapability::Deliver,
+            "bash",
+            "gh pr merge 281 --squash --auto",
+            &ToolKind::Mutation,
+            &serde_json::json!({"command": "gh pr merge 281 --squash --auto"}),
+        )
+        .expect("raw delivery mutation must stay behind deliver_changes");
+        assert!(denial.contains("deliver_changes"));
+        assert!(!denial.contains("本回合"));
+        assert!(!denial.contains("高风险"));
     }
 
     #[test]

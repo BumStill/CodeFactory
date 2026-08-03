@@ -227,8 +227,10 @@ pub enum FinalizationPolicy {
     Benchmark,
 }
 
-/// Hard capability boundary for one user root turn. Permissions may require
-/// approval for an allowed action, but can never widen this contract.
+/// Current intent envelope used while evaluating each requested action.
+/// Surfaces re-evaluate it for every user message and steer; it is not a fixed
+/// lifetime lock for a root turn. Permissions may narrow an allowed action but
+/// cannot widen explicit user constraints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnCapability {
     ReviewOnly,
@@ -642,9 +644,9 @@ pub async fn run_agent_loop(
                     }
                     turn_capability = next_capability;
                     let label = match next_capability {
-                        TurnCapability::ReviewOnly => "已切换为只读审视",
-                        TurnCapability::Implement => "已按用户指令继续实施",
-                        TurnCapability::Deliver => "已按用户指令继续交付",
+                        TurnCapability::ReviewOnly => "已更新动作意图：仅执行分析与读取",
+                        TurnCapability::Implement => "已更新动作意图：允许本地实施",
+                        TurnCapability::Deliver => "已更新动作意图：允许受控交付",
                     };
                     publish_turn_activity(
                         persistence.as_ref(),
@@ -3078,7 +3080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_explicit_steer_upgrades_the_hard_gate_before_the_next_tool_batch() {
+    async fn an_explicit_steer_updates_action_intent_before_the_next_tool_batch() {
         let transport = Arc::new(ScriptedTransport::new(vec![
             response(
                 "先检查",
@@ -3139,7 +3141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_structural_capability_denial_cannot_end_as_task_completed() {
+    async fn an_action_intent_denial_cannot_end_as_task_completed() {
         let transport = Arc::new(ScriptedTransport::new(vec![
             response(
                 "尝试修改",

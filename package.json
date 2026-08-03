@@ -1,6 +1,6 @@
 {
   "name": "codefactory",
-  "version": "1.76.3",
+  "version": "1.76.5",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -27,6 +27,7 @@
     "test:startup-session:headless": "node scripts/verify-startup-session-headless.mjs",
     "test:sidebar-expansion:headless": "node scripts/verify-sidebar-expansion-headless.mjs",
     "test:image-preview:headless": "node scripts/verify-image-preview-headless.mjs",
+    "test:draft-project-picker:headless": "node scripts/verify-draft-project-picker-headless.mjs",
     "test:watch": "vitest",
     "test:scrollbar:headless": "node scripts/verify-scrollbar-auto-hide-headless.mjs",
     "ext:build": "node scripts/build-extension.mjs",

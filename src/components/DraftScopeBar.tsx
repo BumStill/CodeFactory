@@ -13,6 +13,7 @@
 // choosing which conversation to resume are different acts, and every surface
 // that blurred them is what made "选了项目" drop users into old history.
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Folder, FolderOpen, Check, ChevronDown, EyeOff, MessageSquare } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { folderName, type ProjectGroup } from "../lib/projects";
@@ -35,12 +36,49 @@ export function DraftScopeBar({
   onToggleAnonymous,
 }: DraftScopeBarProps) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPosition, setMenuPosition] = useState<{ left: number; top: number } | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  const updateMenuPosition = () => {
+    const rect = buttonRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const menuWidth = 256;
+    const menuHeight = 180;
+    const gutter = 8;
+    const maxLeft = Math.max(gutter, window.innerWidth - menuWidth - gutter);
+    const aboveTop = rect.top - menuHeight - 4;
+    setMenuPosition({
+      left: Math.min(Math.max(gutter, rect.left + 4), maxLeft),
+      top: Math.max(gutter, aboveTop),
+    });
+  };
+
+  const toggleMenu = () => {
+    setMenuOpen((open) => {
+      if (!open) updateMenuPosition();
+      return !open;
+    });
+  };
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    updateMenuPosition();
+    window.addEventListener("resize", updateMenuPosition);
+    window.addEventListener("scroll", updateMenuPosition, true);
+    return () => {
+      window.removeEventListener("resize", updateMenuPosition);
+      window.removeEventListener("scroll", updateMenuPosition, true);
+    };
+  }, [menuOpen]);
 
   useEffect(() => {
     if (!menuOpen) return;
     const onClick = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+      const target = e.target as Node;
+      if (rootRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      setMenuOpen(false);
     };
     document.addEventListener("mousedown", onClick);
     return () => document.removeEventListener("mousedown", onClick);
@@ -62,10 +100,11 @@ export function DraftScopeBar({
       : projects;
 
   return (
-    <div className="relative flex items-center gap-2 px-1 pb-1.5" ref={menuRef}>
+    <div className="relative flex items-center gap-2 px-1 pb-1.5" ref={rootRef}>
       <button
+        ref={buttonRef}
         type="button"
-        onClick={() => setMenuOpen((v) => !v)}
+        onClick={toggleMenu}
         aria-label="选择项目"
         aria-expanded={menuOpen}
         title={cwd ?? "不使用项目，只做一个独立任务"}
@@ -103,11 +142,13 @@ export function DraftScopeBar({
             : "没选项目，不会碰任何代码"}
       </span>
 
-      {menuOpen && (
+      {menuOpen && typeof document !== "undefined" && createPortal(
         <div
+          ref={menuRef}
           role="menu"
           aria-label="项目选择"
-          className="absolute bottom-full left-1 z-50 mb-1 w-64 overflow-hidden rounded-lg border border-border bg-surface-2 py-1 shadow-xl"
+          style={menuPosition ? { left: menuPosition.left, top: menuPosition.top } : undefined}
+          className="fixed z-[100] w-64 overflow-hidden rounded-lg border border-border bg-surface-2 py-1 shadow-2xl"
         >
           <p className="px-3 py-1 text-[11px] font-medium tracking-wide text-gray-600">在哪里干活</p>
           <button
@@ -153,7 +194,8 @@ export function DraftScopeBar({
             <FolderOpen size={11} className="shrink-0 text-gray-500" />
             <span className="flex-1">浏览目录…</span>
           </button>
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
