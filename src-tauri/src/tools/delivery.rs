@@ -42,6 +42,10 @@ pub fn definition() -> ToolDefinition {
                         "type": "string",
                         "enum": ["off", "pr_only", "through_ci_green", "through_merge", "through_release"],
                         "description": "Optional per-call ceiling. Clamped to at most the user's configured ceiling — a call can lower, never raise it."
+                    },
+                    "expect_branch": {
+                        "type": "string",
+                        "description": "Optional guard: the branch you believe you are delivering. This tool has no branch argument — it delivers whatever branch the working directory is on. When resuming a specific PR, pass its head branch here; if the working directory is somewhere else the call stops before touching anything instead of opening a second PR for unrelated work."
                     }
                 }
             }),
@@ -71,6 +75,12 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         release_urgency,
         requested_ceiling,
         extra_excludes: settings.delivery_exclude_globs.clone(),
+        expect_branch: args
+            .get("expect_branch")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from),
     };
 
     let remote = delivery::resolve_delivery_remote(&ctx.cwd, &settings);
