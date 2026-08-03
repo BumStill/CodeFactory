@@ -4431,7 +4431,9 @@ Release-Urgency: hold"
     /// Rust suite runs often during delivery and CI; hitting GitHub's live API
     /// there amplified PR polling into rate limits and failed otherwise-good
     /// builds. Parser behavior is covered by deterministic unit tests; this smoke
-    /// is for explicit operator diagnostics only.
+    /// is for explicit operator diagnostics only. That opt-in gate is part of
+    /// the delivery stability contract: routine CI must not consume GitHub API
+    /// quota just to prove local parser behavior.
     /// It asks about `origin/<default>`, NOT local `HEAD`. Local HEAD is
     /// whatever you are working on, and GitHub answers `No commit found for SHA
     /// … (HTTP 422)` for anything unpushed — so the old form failed on every
