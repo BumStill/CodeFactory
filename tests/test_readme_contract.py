@@ -5,6 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from unittest import mock
+
+from tools.governance import validate_readme_contract as contract
 from tools.governance.validate_readme_contract import validate_pr_contract, validate_static
 
 
@@ -44,6 +47,15 @@ Apache-2.0.
 
 [Latest releases](https://github.com/example/example/releases/latest)
 """
+
+
+def _write(text: str) -> Path:
+    temp = tempfile.NamedTemporaryFile(  # noqa: SIM115 - kept alive by the caller's assertion
+        "w", suffix="README.md", delete=False, encoding="utf-8"
+    )
+    temp.write(text)
+    temp.close()
+    return Path(temp.name)
 
 
 class ReadmeContractTests(unittest.TestCase):
@@ -135,6 +147,69 @@ class ReadmeContractTests(unittest.TestCase):
         (repo / "README.md").write_text(broken, encoding="utf-8")
         errors = validate_static(repo)
         self.assertTrue(any("missing local link" in error for error in errors))
+
+    # A toolchain pin is exactly what "Build from source" is supposed to
+    # document, and the gate already knows how to ignore code — it strips
+    # fenced blocks before reading the PR decision. Not applying the same
+    # treatment to the version scan turned normal build docs into a CI failure,
+    # with advice ("versions belong in Release notes") that is wrong for a
+    # toolchain pin. Verified against the real validator on 2026-08-03.
+    def test_versions_inside_code_are_documentation_not_release_claims(self) -> None:
+        fenced = BASE_README.replace(
+            "Build locally.",
+            "```bash\nrustup toolchain install 1.83.0\nnode --version   # v20.11.0\n```",
+        )
+        self.assertEqual(
+            [e for e in validate_static(REPO_ROOT, _write(fenced)) if "exact version" in e],
+            [],
+            "a fenced build command must not read as a release version claim",
+        )
+
+        inline = BASE_README.replace("Build locally.", "Requires Rust `1.83.0` or newer.")
+        self.assertEqual(
+            [e for e in validate_static(REPO_ROOT, _write(inline)) if "exact version" in e],
+            [],
+            "an inline-code toolchain pin must not read as a release version claim",
+        )
+
+    def test_prose_versions_are_still_rejected(self) -> None:
+        # The rule itself must survive: an unquoted version in prose is the
+        # stale-README problem this gate exists to prevent.
+        prose = BASE_README.replace("Stable features.", "Download CodeFactory 1.77.0 now.")
+        self.assertTrue(
+            any("exact version" in e for e in validate_static(REPO_ROOT, _write(prose))),
+            "a bare version in prose must still fail",
+        )
+        # …including one that merely sits next to code.
+        mixed = BASE_README.replace(
+            "Stable features.", "Version 1.77.0 ships with `cargo build`."
+        )
+        self.assertTrue(
+            any("exact version" in e for e in validate_static(REPO_ROOT, _write(mixed))),
+            "stripping code must not swallow the surrounding prose",
+        )
+
+    # The event payload is a snapshot from when the run was triggered, so a
+    # re-run replays the ORIGINAL body. On 2026-08-03 that pinned PR #301
+    # (the v1.77.0 version bump) in a permanent failure: the body was corrected
+    # immediately, but three re-runs all re-read the stale payload and the only
+    # escape was pushing a commit. A required check must judge the PR as it
+    # stands, which is also what a reviewer sees.
+    def test_live_pr_body_wins_over_the_stale_event_snapshot(self) -> None:
+        with mock.patch.object(contract, "subprocess") as sp:
+            sp.run.return_value = mock.Mock(returncode=0, stdout="README-Update: reviewed\n", stderr="")
+            self.assertEqual(contract._live_pr_body(301), "README-Update: reviewed\n")
+            sp.run.assert_called_once()
+            self.assertIn("301", sp.run.call_args[0][0])
+
+    def test_live_body_lookup_falls_back_instead_of_hard_failing(self) -> None:
+        # No gh, no network, or a PR the token cannot read must not turn the
+        # contract into an unconditional failure — fall back to the payload.
+        with mock.patch.object(contract, "subprocess") as sp:
+            sp.run.return_value = mock.Mock(returncode=1, stdout="", stderr="gh: not found")
+            self.assertIsNone(contract._live_pr_body(301))
+        self.assertIsNone(contract._live_pr_body(None))
+        self.assertIsNone(contract._live_pr_body("not-a-number"))
 
     def test_release_docs_point_to_governed_release_path(self) -> None:
         versioning = (REPO_ROOT / "VERSIONING.md").read_text(encoding="utf-8")
