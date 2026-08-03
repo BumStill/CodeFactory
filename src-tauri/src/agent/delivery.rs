@@ -179,6 +179,12 @@ pub struct DeliverOpts {
     /// A per-call ceiling; clamped to at most the user's configured ceiling.
     pub requested_ceiling: Option<DeliveryCeiling>,
     pub extra_excludes: Vec<String>,
+    /// The branch the caller BELIEVES it is delivering. `deliver_changes` has no
+    /// branch argument — it delivers whatever the working directory is on — so a
+    /// caller resuming a specific delivery states its target here and the tool
+    /// refuses when reality disagrees, instead of silently delivering something
+    /// else under the intended title.
+    pub expect_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +229,24 @@ pub enum MergeObservation {
 pub enum MergeRequestResult {
     Queued,
     Merged { merge_sha: String },
+}
+
+/// An existing open PR that carries the title we are about to open a NEW PR
+/// with, on a different head branch.
+///
+/// `deliver_changes` takes no branch or PR argument: it always delivers whatever
+/// branch the working directory happens to be on, and stamps the caller-supplied
+/// title (which comes from session context) onto it. When those two disagree the
+/// tool silently opens a second PR for unrelated work under the first one's name
+/// — 2026-07-30 field report: a turn meaning to resume PR #281
+/// (`feat/on-demand-embedded-browser-pane`) was sitting on
+/// `fix/auto-release-reconcile-sigpipe` and opened #290, leaving two open PRs
+/// with identical titles and unrelated contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictingPr {
+    pub number: u64,
+    pub url: String,
+    pub head: String,
 }
 
 /// Why a PR cannot be merged right now — the distinction between "time will fix
@@ -454,6 +478,19 @@ pub trait DeliveryRemote {
         std::future::ready(Ok(ObservationStatus::Unsupported(
             "deployment observer not configured".into(),
         )))
+    }
+
+    /// An open PR with the SAME title on a DIFFERENT head, when this head has no
+    /// open PR of its own — i.e. we are about to open a duplicate.
+    ///
+    /// Default `Ok(None)` keeps existing adapters source-compatible.
+    fn conflicting_open_pr(
+        &self,
+        _title: &str,
+        _head: &str,
+        _base: &str,
+    ) -> impl std::future::Future<Output = Result<Option<ConflictingPr>, String>> {
+        std::future::ready(Ok(None))
     }
 
     /// Why the PR is not mergeable yet. Defaulting to `Unknown` keeps existing
@@ -1271,6 +1308,21 @@ pub async fn deliver<R: DeliveryRemote>(
         }
     }
 
+    // The caller stated which delivery this is. Check it BEFORE any mutation:
+    // delivering the wrong branch is not something a later step can undo.
+    if let Some(expected) = opts.expect_branch.as_deref() {
+        if expected != repo.branch {
+            return outcome.blocked_at(StepResult::blocked(
+                "preflight",
+                format!(
+                    "调用方声明要交付分支 `{expected}`，但当前工作目录在 `{}` 上，未执行任何交付动作。\
+先切到 `{expected}`，或在确实要交付当前分支时去掉该声明。",
+                    repo.branch
+                ),
+            ));
+        }
+    }
+
     // A capability gap DESCENDS the ceiling; it does not cancel the rungs below
     // it. Everything after this point runs against `ceiling`, which is now the
     // achievable one.
@@ -1527,6 +1579,31 @@ pub async fn deliver<R: DeliveryRemote>(
         }
 
         // ── Open (or reuse) PR/MR ───────────────────────────────────────────
+        // Guard against a misdirected delivery: this tool has no branch
+        // argument, so a caller whose working directory drifted would otherwise
+        // open a SECOND PR for unrelated work under the intended PR's title.
+        match remote
+            .conflicting_open_pr(&pr_title, &repo.branch, &repo.default_branch)
+            .await
+        {
+            Ok(Some(conflict)) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "pr",
+                    format!(
+                        "当前分支是 `{}`，但标题 `{pr_title}` 已属于 PR #{}（分支 `{}`，{}）。\
+继续会为不相关的改动新开一个同名 PR。\
+若本意是续跑那个交付，请先切到 `{}` 再调用；若本分支确实是另一件工作，请给它自己的标题。",
+                        repo.branch, conflict.number, conflict.head, conflict.url, conflict.head
+                    ),
+                ));
+            }
+            Ok(None) => {}
+            // A guard that cannot run must not stop delivery.
+            Err(error) => outcome.steps.push(StepResult::ok(
+                "pr_guard",
+                format!("重名 PR 检查未能执行（{error}），继续交付"),
+            )),
+        }
         let had_pr_receipt = prior_receipt
             .as_ref()
             .is_some_and(|receipt| receipt.state == "pr_open");
@@ -2667,6 +2744,32 @@ fn gh_pr_create_args(title: &str, body: &str, head: &str, base: &str) -> Vec<Str
 /// requires branches to be up to date (`strict_required_status_checks_policy`),
 /// and GitHub will not update the head ref itself. Auto-merge on a `BEHIND` PR
 /// therefore waits forever.
+/// Pick the misdirected-delivery conflict out of the open PR list for `base`.
+///
+/// Returns `Some` only when BOTH hold:
+/// - this head has no open PR of its own (so we are about to CREATE one), and
+/// - another open PR already carries this exact title.
+///
+/// If the current head already has a PR we are resuming it, which is the normal
+/// idempotent path and never a conflict — even if some other PR shares the title.
+fn conflicting_open_pr_from_list(
+    prs: &[(u64, String, String, String)], // (number, url, title, head)
+    title: &str,
+    head: &str,
+) -> Option<ConflictingPr> {
+    if prs.iter().any(|(_, _, _, pr_head)| pr_head == head) {
+        return None;
+    }
+    let wanted = title.trim();
+    prs.iter()
+        .find(|(_, _, pr_title, _)| pr_title.trim() == wanted)
+        .map(|(number, url, _, pr_head)| ConflictingPr {
+            number: *number,
+            url: url.clone(),
+            head: pr_head.clone(),
+        })
+}
+
 /// Conventional-commit release weight: 3 breaking, 2 feat, 1 fix, 0 everything
 /// else. Mirrors the slot arithmetic in `.github/workflows/auto-release.yml`.
 fn conventional_slot(subject: &str) -> u8 {
@@ -3000,6 +3103,45 @@ impl DeliveryRemote for GhCliRemote {
             other => CiStatus::Failure(other.trim_start_matches("failure:").to_string()),
         };
         Ok(self.ci_stability.confirm(&observation.fingerprint, status))
+    }
+
+    async fn conflicting_open_pr(
+        &self,
+        title: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<Option<ConflictingPr>, String> {
+        let raw = self.gh(&[
+            "pr".into(),
+            "list".into(),
+            "--base".into(),
+            base.into(),
+            "--state".into(),
+            "open".into(),
+            "--json".into(),
+            "number,url,title,headRefName".into(),
+            "--limit".into(),
+            "100".into(),
+        ])?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("解析 gh pr list 输出失败: {e}"))?;
+        let rows: Vec<(u64, String, String, String)> = parsed
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|pr| {
+                        Some((
+                            pr["number"].as_u64()?,
+                            pr["url"].as_str()?.to_string(),
+                            pr["title"].as_str()?.to_string(),
+                            pr["headRefName"].as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(conflicting_open_pr_from_list(&rows, title, head))
     }
 
     async fn merge_readiness(&self, number: u64) -> Result<MergeReadiness, String> {
@@ -4692,6 +4834,7 @@ else:
                 release_urgency: None,
                 requested_ceiling: None,
                 extra_excludes: vec![],
+                expect_branch: None,
             },
             Some(&remote),
             Some("main"),
@@ -5862,6 +6005,144 @@ Release-Urgency: hold"
     // GitHub would never merge it: auto-merge does not update a stale head ref.
     // The advice was not merely unhelpful, it was wrong — an unbounded no-op wait.
 
+    // ── A delivery must be the delivery the caller meant ────────────────────
+    //
+    // `deliver_changes` takes no branch argument: it delivers whatever the
+    // working directory is on, stamped with a title from session context. On
+    // 2026-07-30 a turn meaning to resume PR #281
+    // (feat/on-demand-embedded-browser-pane) was sitting on
+    // fix/auto-release-reconcile-sigpipe and opened #290 — two open PRs, one
+    // title, unrelated contents.
+
+    fn pr_row(number: u64, title: &str, head: &str) -> (u64, String, String, String) {
+        (
+            number,
+            format!("https://example/pr/{number}"),
+            title.into(),
+            head.into(),
+        )
+    }
+
+    #[test]
+    fn opening_a_second_pr_under_another_prs_title_is_refused() {
+        let open = vec![pr_row(
+            281,
+            "feat: add on-demand embedded browser pane",
+            "feat/on-demand-embedded-browser-pane",
+        )];
+        // The exact #290 shape: different head, inherited title, no PR of our own.
+        let conflict = conflicting_open_pr_from_list(
+            &open,
+            "feat: add on-demand embedded browser pane",
+            "fix/auto-release-reconcile-sigpipe",
+        )
+        .expect("a same-title PR on another head is a misdirected delivery");
+        assert_eq!(conflict.number, 281);
+        assert_eq!(conflict.head, "feat/on-demand-embedded-browser-pane");
+    }
+
+    #[test]
+    fn resuming_our_own_pr_is_never_a_conflict() {
+        let open = vec![
+            pr_row(281, "feat: add pane", "feat/pane"),
+            pr_row(290, "feat: add pane", "fix/other"),
+        ];
+        // We already own an open PR for this head → this is the ordinary
+        // idempotent resume, even though another PR shares the title.
+        assert!(conflicting_open_pr_from_list(&open, "feat: add pane", "feat/pane").is_none());
+        // A genuinely new title on a fresh branch is fine too.
+        assert!(
+            conflicting_open_pr_from_list(&open, "fix: unrelated work", "fix/fresh").is_none()
+        );
+        // Whitespace must not defeat the match.
+        assert!(
+            conflicting_open_pr_from_list(&open, "  feat: add pane  ", "fix/fresh").is_some()
+        );
+        // No open PRs at all → nothing to conflict with.
+        assert!(conflicting_open_pr_from_list(&[], "feat: add pane", "feat/pane").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stated_target_branch_is_checked_before_anything_is_touched() {
+        let root = feature_branch_repo("wrongbranch");
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: Arc::new(StubCalls::default()),
+        };
+        let out = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts {
+                expect_branch: Some("feat/some-other-branch".into()),
+                ..DeliverOpts::default()
+            },
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "blocked");
+        assert!(
+            !out.steps
+                .iter()
+                .any(|s| s.step == "commit" || s.step == "push" || s.step == "pr"),
+            "delivering the wrong branch is not undoable — nothing may run: {:?}",
+            out.steps
+        );
+        // The working tree must be left exactly as found.
+        assert!(!git(&root, &["status", "--porcelain"])
+            .expect("status")
+            .trim()
+            .is_empty());
+        let blocked = out
+            .steps
+            .iter()
+            .find(|s| s.status == "blocked")
+            .expect("a blocked step");
+        assert!(
+            blocked.detail.contains("feat/some-other-branch"),
+            "must name the branch the caller expected: {}",
+            blocked.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn a_matching_target_branch_does_not_get_in_the_way() {
+        let root = feature_branch_repo("rightbranch");
+        let branch = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).expect("branch");
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: Arc::new(StubCalls::default()),
+        };
+        let out = deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts {
+                expect_branch: Some(branch),
+                ..DeliverOpts::default()
+            },
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+        assert!(
+            out.steps.iter().any(|s| s.step == "commit" && s.status == "ok"),
+            "a correct declaration must not block delivery: {:?}",
+            out.steps
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
     #[test]
     fn behind_is_a_deadlock_while_pending_checks_are_a_real_wait() {
         assert_eq!(merge_readiness_from_state("BEHIND"), MergeReadiness::Behind);
@@ -6073,6 +6354,7 @@ Release-Urgency: hold"
                 release_urgency: None,
                 requested_ceiling: None,
                 extra_excludes: vec![],
+                expect_branch: None,
             },
             Some(&remote),
             Some("main"),
@@ -6108,6 +6390,7 @@ Release-Urgency: hold"
                 release_urgency: None,
                 requested_ceiling: None,
                 extra_excludes: vec![],
+                expect_branch: None,
             },
             Some(&remote),
             Some("main"),
@@ -6153,6 +6436,7 @@ Release-Urgency: hold"
                 release_urgency: None,
                 requested_ceiling: None,
                 extra_excludes: vec![],
+                expect_branch: None,
             },
             Some(&remote),
             Some("main"),
