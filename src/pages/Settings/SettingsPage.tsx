@@ -983,7 +983,7 @@ export function SettingsPage({
                 </div>
                 <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] ${
                   generalDraft.im_webhook_url.trim()
-                    ? "bg-green-500/10 text-green-300"
+                    ? "bg-green-500/10 text-green-700 dark:text-green-300"
                     : "bg-surface-3 text-gray-500"
                 }`}>
                   {generalDraft.im_webhook_url.trim() ? "已配置旧 Webhook" : "未绑定"}
