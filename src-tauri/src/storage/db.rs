@@ -1175,6 +1175,9 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ensure_column(pool, "sessions", "kind", "TEXT NOT NULL DEFAULT 'project'").await?;
     // Per-session reasoning effort override (NULL → use the global default).
     ensure_column(pool, "sessions", "reasoning_effort", "TEXT").await?;
+    // Per-session delivery authorization (0/1). Survives app restarts so a
+    // user who said "提交上线" is not asked to re-confirm after relaunching.
+    ensure_column(pool, "sessions", "delivery_authorized", "INTEGER NOT NULL DEFAULT 0").await?;
     // Per-session permission preset. Existing sessions get standard so old
     // global allow/ask/deny details no longer leak into the primary UX.
     ensure_column(

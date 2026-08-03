@@ -610,18 +610,18 @@ pub async fn send_message(
     // after a tool is selected, but it must never turn a diagnostic question
     // into an execute-contract turn.
     let mut contract = crate::agent::decide_chat_contract(prev_assistant.as_deref(), &content);
-    // Session-persisted delivery authorization: once this session asked to
-    // deliver, later non-planning turns keep Deliver capability so follow-up
-    // work can ship without a repeat confirmation. A new explicit delivery
-    // request (re)grants it; a revocation clears it.
-    let delivery_map = state.delivery_authorizations.clone();
+    // Session-persisted delivery authorization (DB-backed so it survives app
+    // restarts): once this session asked to deliver, later non-planning turns
+    // keep Deliver capability so follow-up work can ship without a repeat
+    // confirmation. A new explicit delivery request (re)grants it; a
+    // revocation clears it.
     {
-        let mut auth = delivery_map.lock().await;
-        let authorized = auth.get(&session_id).copied().unwrap_or(false);
+        let db = state.db.read().await.clone();
+        let authorized = crate::agent::fetch_session_delivery_authorized(&db, &session_id).await;
         if crate::agent::is_delivery_revocation(&content) {
-            auth.insert(session_id.clone(), false);
+            crate::agent::set_session_delivery_authorized(&db, &session_id, false).await;
         } else if contract.capability == crate::agent::TurnCapability::Deliver {
-            auth.insert(session_id.clone(), true);
+            crate::agent::set_session_delivery_authorized(&db, &session_id, true).await;
         } else if authorized {
             contract = crate::agent::with_persisted_delivery_authorization(contract, true);
         }
@@ -869,17 +869,17 @@ pub async fn send_message_anonymous(
         })
         .map(|turn| turn.content.as_str());
     let mut contract = crate::agent::decide_chat_contract(prev_assistant, &content);
-    // Session-persisted delivery authorization (same semantics as send_message):
-    // once this session asked to deliver, later non-planning turns inherit
-    // Deliver capability; explicit delivery re-grants, revocation clears.
-    let delivery_map = state.delivery_authorizations.clone();
+    // Session-persisted delivery authorization (DB-backed, same semantics as
+    // send_message): once this session asked to deliver, later non-planning
+    // turns inherit Deliver capability; explicit delivery re-grants,
+    // revocation clears.
     {
-        let mut auth = delivery_map.lock().await;
-        let authorized = auth.get(&session_id).copied().unwrap_or(false);
+        let db = state.db.read().await.clone();
+        let authorized = crate::agent::fetch_session_delivery_authorized(&db, &session_id).await;
         if crate::agent::is_delivery_revocation(&content) {
-            auth.insert(session_id.clone(), false);
+            crate::agent::set_session_delivery_authorized(&db, &session_id, false).await;
         } else if contract.capability == crate::agent::TurnCapability::Deliver {
-            auth.insert(session_id.clone(), true);
+            crate::agent::set_session_delivery_authorized(&db, &session_id, true).await;
         } else if authorized {
             contract = crate::agent::with_persisted_delivery_authorization(contract, true);
         }
