@@ -109,10 +109,16 @@ pub mod sandbox {
     /// Bounded: a wedged or still-booting daemon can leave `info` hanging, and
     /// a probe that never returns is worse than one that says "not reachable".
     ///
-    /// Test-gated for now: only the real-runtime smoke needs it. The live path
-    /// deliberately keeps the cheaper presence check so it doesn't pay for an
-    /// extra `docker info` round trip on every sandboxed command.
-    #[cfg(test)]
+    /// Never a pre-flight check. Asking this before every sandboxed command
+    /// would bill each one an extra `docker info` round trip — measured at a
+    /// ~20ms median against a healthy local colima, on top of a ~148ms
+    /// `docker run`, and slower against Docker Desktop — to learn what the
+    /// command itself is about to prove anyway. The live path calls it only
+    /// *after* a command already failed in a way that looks like a connection
+    /// error; see `looks_like_daemon_unreachable`.
+    ///
+    /// Blocking by design, so the synchronous test guards can call it directly;
+    /// async callers must hand it to `spawn_blocking`.
     pub fn daemon_available(program: &str) -> bool {
         let Ok(mut child) = std::process::Command::new(program)
             .no_window()
@@ -139,8 +145,47 @@ pub mod sandbox {
         }
     }
 
-    #[cfg(test)]
     const DAEMON_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Docker CLI wordings for "the client could not reach a daemon". Both live
+    /// spellings are covered: `Cannot connect to the Docker daemon at unix://…`
+    /// (CLI <= 26 and Docker Desktop) and `failed to connect to the docker API
+    /// at unix://…` (CLI >= 27); `dial unix` catches the `error during connect:
+    /// …` shapes that wrap the same Go dial failure.
+    ///
+    /// Deliberately absent: `permission denied while trying to connect to the
+    /// Docker daemon socket`. That daemon is running — the fix is group
+    /// membership, not starting Docker — and the CLI's own English text says so
+    /// more usefully than our notice would.
+    const DAEMON_UNREACHABLE_MARKERS: [&str; 4] = [
+        "cannot connect to the docker daemon",
+        "failed to connect to the docker api",
+        "error during connect",
+        "dial unix",
+    ];
+
+    /// Does this failed `docker run` *look* like the daemon was unreachable?
+    ///
+    /// The CLI reports an unreachable daemon as an ordinary non-zero exit, so
+    /// it is indistinguishable from a failed user command until the text is
+    /// read. Reading it is free, which is the whole point: a healthy daemon
+    /// never pays for this diagnosis.
+    ///
+    /// A prefilter, not a verdict — a command is perfectly capable of *printing*
+    /// these words (`grep` over a CI log, say), so callers must confirm with
+    /// `daemon_available` before replacing the output.
+    pub fn looks_like_daemon_unreachable(stdout: &[u8], stderr: &[u8]) -> bool {
+        // A real connection failure means the container never started, so it
+        // cannot have produced stdout. Anything that did ran fine and failed
+        // for its own reasons.
+        if !stdout.is_empty() {
+            return false;
+        }
+        let stderr = String::from_utf8_lossy(stderr).to_lowercase();
+        DAEMON_UNREACHABLE_MARKERS
+            .iter()
+            .any(|marker| stderr.contains(marker))
+    }
 }
 
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
@@ -189,6 +234,7 @@ async fn execute_inner(
         .map(|s| s.sandbox_mode)
         .unwrap_or_default();
     let mut launched_program = String::new();
+    let sandboxed = matches!(sandbox_mode, crate::config::settings::SandboxMode::Docker);
     let cmd = match sandbox_mode {
         crate::config::settings::SandboxMode::Docker => {
             if cfg!(windows) {
@@ -246,6 +292,29 @@ async fn execute_inner(
             )))
         }
         Ok(output) => {
+            // The guard before launch only knows whether the docker CLI is
+            // installed; a stopped Docker Desktop or Colima sails past it and
+            // fails here instead, handing the user the CLI's English socket
+            // dump. Recover the actionable notice after the fact rather than
+            // pre-flighting `docker info` on every command: the healthy daemon
+            // — the overwhelmingly common case — pays nothing for this, and
+            // only a failure that already looks like a connection error is
+            // worth one probe to confirm.
+            if sandboxed
+                && !output.status.success()
+                && sandbox::looks_like_daemon_unreachable(&output.stdout, &output.stderr)
+            {
+                let daemon_reachable =
+                    tokio::task::spawn_blocking(|| sandbox::daemon_available("docker"))
+                        .await
+                        // The probe itself broke; keep the raw output rather
+                        // than assert a cause we never confirmed.
+                        .unwrap_or(true);
+                if !daemon_reachable {
+                    return Ok(ToolOutput::err(sandbox::MISSING_DOCKER_ERROR));
+                }
+            }
+
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&output.stdout));
             combined.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -373,6 +442,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// The other half of the recovery, proved against a live daemon: a command
+    /// that fails while *printing* the daemon error must keep its own output.
+    ///
+    /// This is what the `daemon_available` confirmation buys. The text
+    /// prefilter alone says "unreachable" here — same wording, same empty
+    /// stdout, same non-zero exit as the real thing — and mislabelling it would
+    /// throw away the output the user asked for and blame their Docker install
+    /// for a failure that had nothing to do with it.
+    ///
+    /// Runs only where a container can really start; skips elsewhere.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_daemon_keeps_command_output_that_looks_like_a_connection_error() {
+        if !super::sandbox::runtime_available("docker")
+            || !super::sandbox::daemon_available("docker")
+        {
+            eprintln!("skipping live-daemon false-positive test: no reachable docker daemon");
+            return;
+        }
+
+        let home = std::env::var("HOME").expect("HOME set on unix");
+        let cwd = std::path::PathBuf::from(home)
+            .join(".cache")
+            .join(format!("cf-sandbox-falsepos-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+
+        let mut settings = crate::config::settings::Settings::default();
+        settings.sandbox_mode = crate::config::settings::SandboxMode::Docker;
+        let mut ctx = crate::tools::ExecCtx::new(cwd.clone(), None);
+        ctx.settings = Some(settings);
+
+        // Verbatim docker wording, on stderr, no stdout, non-zero exit: every
+        // signal the prefilter keys on, produced by a container that ran fine.
+        let echoed = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock";
+        let out = super::execute(
+            serde_json::json!({ "command": format!("echo '{echoed}' >&2; exit 7") }),
+            &ctx,
+        )
+        .await
+        .expect("tool returns output");
+        let _ = std::fs::remove_dir_all(&cwd);
+
+        assert!(out.is_error, "exit 7 is still a failure");
+        assert_ne!(
+            out.content,
+            super::sandbox::MISSING_DOCKER_ERROR,
+            "a reachable daemon must never be reported as missing"
+        );
+        assert!(
+            out.content.contains("Cannot connect to the Docker daemon"),
+            "the command's own output must survive: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("exit_code=7"),
+            "the real exit code must survive: {}",
+            out.content
+        );
+    }
+
     /// The regression the smoke guard above depends on: "the CLI is installed"
     /// and "the daemon is reachable" are different questions, and a guard that
     /// asks the first one panics on every machine where Docker Desktop or
@@ -393,6 +522,161 @@ mod tests {
         assert!(!super::sandbox::daemon_available(
             "definitely-not-a-real-binary-xyz"
         ));
+    }
+
+    /// Both docker CLI generations must be recognized. The first string is the
+    /// verbatim stderr of `docker run` against a stopped Colima on CLI 29.6.1;
+    /// the second is the wording CLI <= 26 and Docker Desktop still emit.
+    #[test]
+    fn daemon_unreachable_is_recognized_across_docker_cli_wordings() {
+        let modern = b"failed to connect to the docker API at unix:///var/run/docker.sock; \
+check if the path is correct and if the daemon is running: dial unix \
+/var/run/docker.sock: connect: no such file or directory\n";
+        let classic = b"Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
+Is the docker daemon running?\n";
+        let wrapped = b"error during connect: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/\
+containers/create\": dial unix /var/run/docker.sock: connect: connection refused\n";
+
+        for stderr in [modern.as_slice(), classic.as_slice(), wrapped.as_slice()] {
+            assert!(
+                super::sandbox::looks_like_daemon_unreachable(b"", stderr),
+                "unrecognized daemon failure: {}",
+                String::from_utf8_lossy(stderr)
+            );
+        }
+    }
+
+    /// Why the live path confirms with a probe instead of trusting the text: a
+    /// sandboxed command can legitimately *print* these words — grepping a CI
+    /// log, replaying a captured build failure — and misreading that as "your
+    /// Docker isn't running" would throw away the output the user asked for and
+    /// blame the wrong thing entirely.
+    #[test]
+    fn a_command_that_merely_prints_the_daemon_error_is_not_mistaken_for_one() {
+        let echoed = b"Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n";
+        // Produced stdout, so the container plainly ran: not a connect failure.
+        assert!(!super::sandbox::looks_like_daemon_unreachable(
+            echoed,
+            b"grep: matched 1 line\n"
+        ));
+        // On stderr with no stdout the text alone is genuinely ambiguous, so
+        // the prefilter forwards it — and `daemon_available` settles it.
+        assert!(super::sandbox::looks_like_daemon_unreachable(b"", echoed));
+    }
+
+    #[test]
+    fn ordinary_command_failures_are_left_alone() {
+        assert!(!super::sandbox::looks_like_daemon_unreachable(
+            b"",
+            b"error[E0308]: mismatched types\n --> src/main.rs:4:9\n"
+        ));
+        assert!(!super::sandbox::looks_like_daemon_unreachable(
+            b"",
+            b"bash: line 1: cargo: command not found\n"
+        ));
+        // Socket permission trouble is a different fix (group membership), so
+        // it must keep the CLI's own wording rather than "please start Docker".
+        assert!(!super::sandbox::looks_like_daemon_unreachable(
+            b"",
+            b"permission denied while trying to connect to the Docker daemon socket at \
+unix:///var/run/docker.sock\n"
+        ));
+        assert!(!super::sandbox::looks_like_daemon_unreachable(b"", b""));
+    }
+
+    /// The user-visible gap: the pre-flight guard only asks whether the docker
+    /// CLI is installed, so on the very common "Docker Desktop/Colima installed
+    /// but never started" box a sandboxed command sails past it, `docker run`
+    /// fails on the socket, and the user is handed the CLI's raw English dump
+    /// instead of the actionable notice this repo already wrote for exactly
+    /// this situation.
+    ///
+    /// Runs only where the bug actually bites — CLI present, daemon down —
+    /// and skips elsewhere rather than pretending to cover it. Stop the daemon
+    /// (`colima stop`, or quit Docker Desktop) to really exercise this.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopped_daemon_reports_the_actionable_notice_not_a_raw_socket_error() {
+        if !super::sandbox::runtime_available("docker") {
+            eprintln!("skipping stopped-daemon test: docker CLI not on PATH");
+            return;
+        }
+        if super::sandbox::daemon_available("docker") {
+            eprintln!(
+                "skipping stopped-daemon test: the docker daemon is reachable — stop it \
+                 (`colima stop`, or quit Docker Desktop) to really run this test"
+            );
+            return;
+        }
+
+        let cwd = std::env::temp_dir().join(format!("cf-sandbox-daemon-down-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+
+        let mut settings = crate::config::settings::Settings::default();
+        settings.sandbox_mode = crate::config::settings::SandboxMode::Docker;
+        let mut ctx = crate::tools::ExecCtx::new(cwd.clone(), None);
+        ctx.settings = Some(settings);
+
+        let out = super::execute(serde_json::json!({ "command": "echo hi" }), &ctx)
+            .await
+            .expect("tool returns output");
+        let _ = std::fs::remove_dir_all(&cwd);
+
+        assert!(out.is_error, "a stopped daemon must not read as success");
+        assert_eq!(
+            out.content,
+            super::sandbox::MISSING_DOCKER_ERROR,
+            "stopped daemon must surface the actionable notice, not the raw docker error"
+        );
+    }
+
+    /// The same recovery, but entered the way the running app enters it: the
+    /// `"sandbox_mode": "docker"` string the Settings page persists, read back
+    /// through `Settings` deserialization, carried in `ExecCtx` exactly as
+    /// `agent::tool_backend` builds it, and dispatched by name through
+    /// `tools::dispatch`. Covers the plumbing the direct-`execute` test above
+    /// stubs — everything from the persisted toggle down, short of the window.
+    ///
+    /// (`ToolBackend` itself stays out of reach here: it owns a Tauri
+    /// `AppHandle`, and constructing that inside the test EXE is what triggered
+    /// the Windows `STATUS_ENTRYPOINT_NOT_FOUND` loader abort in hotfix #166.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persisted_docker_sandbox_setting_reaches_the_tool_and_reports_the_notice() {
+        if !super::sandbox::runtime_available("docker") {
+            eprintln!("skipping persisted-setting test: docker CLI not on PATH");
+            return;
+        }
+        if super::sandbox::daemon_available("docker") {
+            eprintln!("skipping persisted-setting test: the docker daemon is reachable");
+            return;
+        }
+
+        // Round-trip through JSON so the persisted spelling is what is tested,
+        // not a hand-built enum a rename could silently desync from.
+        let mut persisted = serde_json::to_value(crate::config::settings::Settings::default())
+            .expect("settings serialize");
+        persisted["sandbox_mode"] = serde_json::json!("docker");
+        let settings: crate::config::settings::Settings =
+            serde_json::from_value(persisted).expect("settings round-trip");
+        assert_eq!(
+            settings.sandbox_mode,
+            crate::config::settings::SandboxMode::Docker,
+            "the Settings page writes \"docker\"; the tool must read it as Docker"
+        );
+
+        let cwd = std::env::temp_dir().join(format!("cf-sandbox-dispatch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        let mut ctx = crate::tools::ExecCtx::new(cwd.clone(), None);
+        ctx.settings = Some(settings);
+
+        let out = crate::tools::dispatch("bash", serde_json::json!({ "command": "echo hi" }), &ctx)
+            .await
+            .expect("dispatch returns output");
+        let _ = std::fs::remove_dir_all(&cwd);
+
+        assert!(out.is_error);
+        assert_eq!(out.content, super::sandbox::MISSING_DOCKER_ERROR);
     }
 
     #[test]
