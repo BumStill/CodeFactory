@@ -289,4 +289,55 @@ describe("SettingsPage parallel-task controls", () => {
     });
     expect(mocks.save.mock.calls[0][0].max_parallel_tasks).toBe(8);
   });
+
+  it("presents IM notifications as a one-click binding flow instead of a raw webhook form", async () => {
+    await openGeneralTab();
+
+    expect(screen.getByRole("heading", { name: "手机通知" })).toBeInTheDocument();
+    expect(screen.getByText("任务完成、失败或等待你批准时，推送到企业微信或飞书。"))
+      .toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "一键绑定 IM" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "高级：手动 Webhook" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("IM Webhook 地址")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "一键绑定 IM" }));
+
+    expect(screen.getByRole("dialog", { name: "绑定 IM 通知" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "企业微信" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "飞书" })).toBeInTheDocument();
+    expect(screen.getByText("CodeFactory 会先发送一条诊断消息，成功后才保存绑定。"))
+      .toBeInTheDocument();
+  });
+
+  it("keeps manual IM webhooks as an advanced fallback, not the primary path", async () => {
+    await openGeneralTab();
+
+    fireEvent.click(screen.getByRole("button", { name: "高级：手动 Webhook" }));
+
+    expect(screen.getByLabelText("IM Webhook 地址")).toBeInTheDocument();
+    expect(screen.getByText("仅在无法一键绑定时使用。保存前请确认机器人已经在目标群内。"))
+      .toBeInTheDocument();
+  });
+
+  it("shows provider-specific next steps after selecting an IM provider", async () => {
+    await openGeneralTab();
+
+    fireEvent.click(screen.getByRole("button", { name: "一键绑定 IM" }));
+    fireEvent.click(screen.getByRole("button", { name: "企业微信" }));
+
+    expect(screen.getByText("企业微信绑定步骤")).toBeInTheDocument();
+    expect(screen.getByText("1. 在企业微信群里添加群机器人。"))
+      .toBeInTheDocument();
+    expect(screen.getByText("2. 复制机器人 Webhook，粘贴到下方。"))
+      .toBeInTheDocument();
+    expect(screen.getByText("3. CodeFactory 会发送诊断消息，成功后才保存。"))
+      .toBeInTheDocument();
+    expect(screen.getByLabelText("企业微信 Webhook 地址")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "飞书" }));
+
+    expect(screen.getByText("飞书绑定步骤")).toBeInTheDocument();
+    expect(screen.getByLabelText("飞书 Webhook 地址")).toBeInTheDocument();
+  });
+
 });

@@ -1945,6 +1945,16 @@ fn delivery_fact_check_applies(mode: AgentMode, instruction: &str) -> bool {
     !matches!(mode, AgentMode::Interactive) && instruction_requests_delivery(instruction)
 }
 
+fn falsely_calls_gh_merge_high_risk(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    (lower.contains("gh pr merge") || lower.contains("直接合并命令"))
+        && (lower.contains("high-risk")
+            || lower.contains("high risk")
+            || text.contains("高风险")
+            || text.contains("账号没权限")
+            || text.contains("账号无权限"))
+}
+
 fn delivery_fact_check_correction(
     text: &str,
     completion_instruction: &str,
@@ -1971,6 +1981,15 @@ fn delivery_fact_check_correction(
 /// ordinary execution turns pay nothing. Delivery corrections additionally
 /// require a user instruction that explicitly asks for delivery.
 fn fact_check_reply(text: &str, completion_instruction: &str, mode: AgentMode) -> Option<String> {
+    if falsely_calls_gh_merge_high_risk(text) {
+        return Some(
+            "事实纠偏:`gh pr merge` 是外部 mutation，但不在 shell high-risk 命令名单。\
+如果它被跳过，必须按真实工具结果区分动作意图门禁、受控交付路由和 GitHub ruleset；\
+不要归因账号权限或高风险，也不要建议 `--admin`。已有交付意图时调用 `deliver_changes`，\
+没有交付意图时只解释事实。"
+                .to_string(),
+        );
+    }
     if matches!(mode, AgentMode::Interactive) {
         return None;
     }
@@ -4351,6 +4370,19 @@ mod tests {
                 "{delivery_instruction}"
             );
         }
+    }
+
+    #[test]
+    fn fact_check_rejects_the_exact_false_high_risk_merge_explanation() {
+        let correction = fact_check_reply(
+            "本地执行层把 `gh pr merge --auto` 这类直接合并命令当成高风险操作拦截了。",
+            "你为啥没权限，没人限制你啊",
+            AgentMode::Interactive,
+        )
+        .expect("the field-report explanation is factually false");
+        assert!(correction.contains("不在 shell high-risk"));
+        assert!(correction.contains("deliver_changes"));
+        assert!(correction.contains("不要建议 `--admin`"));
     }
 
     #[test]
