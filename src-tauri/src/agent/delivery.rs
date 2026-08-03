@@ -225,6 +225,30 @@ pub enum MergeRequestResult {
     Merged { merge_sha: String },
 }
 
+/// Why a PR cannot be merged right now — the distinction between "time will fix
+/// this" and "nothing will ever fix this on its own".
+///
+/// Registering auto-merge on a `Behind` PR under a strict required-status-checks
+/// policy is a DEADLOCK, not a wait: GitHub does not update a stale head ref, so
+/// the PR never becomes mergeable and auto-merge never fires. Reporting that as
+/// "waiting for remote gates" sends the caller into an unbounded no-op wait
+/// (2026-07-30 field report: an 11m36s turn ended `blocked` telling the user to
+/// wait for something that could not happen).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeReadiness {
+    /// Mergeable now.
+    Ready,
+    /// Head is behind base. Auto-resolvable by updating the branch — no human
+    /// needed — but it will NOT resolve by waiting.
+    Behind,
+    /// Required checks are still running. Waiting is the correct action.
+    WaitingOnChecks,
+    /// Conflicts, missing review, or a failed required check: a human must act.
+    NeedsAction(String),
+    /// The adapter cannot tell (no support, or GitHub is still computing).
+    Unknown,
+}
+
 /// CI conclusion for a commit.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CiStatus {
@@ -430,6 +454,25 @@ pub trait DeliveryRemote {
         std::future::ready(Ok(ObservationStatus::Unsupported(
             "deployment observer not configured".into(),
         )))
+    }
+
+    /// Why the PR is not mergeable yet. Defaulting to `Unknown` keeps existing
+    /// adapters source-compatible; an adapter that cannot answer simply keeps
+    /// today's behaviour.
+    fn merge_readiness(
+        &self,
+        _number: u64,
+    ) -> impl std::future::Future<Output = Result<MergeReadiness, String>> {
+        std::future::ready(Ok(MergeReadiness::Unknown))
+    }
+
+    /// Merge the base branch into the PR head so a `Behind` PR becomes
+    /// mergeable. Default is "unsupported" so adapters opt in.
+    fn update_pr_branch(
+        &self,
+        _number: u64,
+    ) -> impl std::future::Future<Output = Result<(), String>> {
+        std::future::ready(Err("adapter cannot update a PR branch".to_string()))
     }
 
     /// Run a provider-specific real-service assertion. Repositories should
@@ -1425,6 +1468,13 @@ pub async fn deliver<R: DeliveryRemote>(
                 .unwrap_or(&repo.branch)
                 .to_string()
         });
+    // The title may have come from session context rather than from this
+    // branch. Never let it claim a bigger release than the commits justify.
+    let commit_slot = branch_commit_slot(&repo.root, &repo.default_branch, &repo.branch);
+    if let (corrected, Some(note)) = reconcile_pr_title(&pr_title, commit_slot) {
+        outcome.steps.push(StepResult::ok("pr_title", note));
+        pr_title = corrected;
+    }
     let mut pr_body = prior_receipt
         .as_ref()
         .and_then(|receipt| receipt.pr_body.clone())
@@ -1661,10 +1711,43 @@ pub async fn deliver<R: DeliveryRemote>(
                     format!("GitHub 已登记 auto-merge，但 merge_queued 回执写入失败: {error}"),
                 ));
             }
-            return outcome.blocked_at(StepResult::blocked(
-                "merge",
-                "GitHub 已登记受规则保护的 auto-merge；PR 仍在等待远端门禁，后续续接会先核对远端状态",
-            ));
+            // Auto-merge is registered — but registered is not the same as
+            // progressing. Ask WHY it could not merge before telling the caller
+            // to wait: under a strict required-status-checks policy a `BEHIND`
+            // PR never becomes mergeable on its own, so "wait for the remote
+            // gates" would be an unbounded no-op wait.
+            let readiness = remote
+                .merge_readiness(pr_number)
+                .await
+                .unwrap_or(MergeReadiness::Unknown);
+            let detail = match &readiness {
+                MergeReadiness::Behind => match remote.update_pr_branch(pr_number).await {
+                    Ok(()) => format!(
+                        "PR #{pr_number} 落后于 {base}，auto-merge 不会自行更新分支（永远不会触发）。\
+已把 {base} 合入 PR 分支；CI 重新通过后 auto-merge 会接管。\
+再次调用 deliver_changes 可核对远端事实并续跑。",
+                        base = repo.default_branch
+                    ),
+                    Err(error) => format!(
+                        "PR #{pr_number} 落后于 {base}，auto-merge 不会自行更新分支，因此仅靠等待永远不会合并。\
+自动更新分支失败: {error}。\
+需要先把 {base} 合入 PR 分支（`gh pr update-branch {pr_number}`）并等 CI 重新通过。",
+                        base = repo.default_branch
+                    ),
+                },
+                MergeReadiness::NeedsAction(reason) => format!(
+                    "PR #{pr_number} 已登记 auto-merge，但仅靠等待不会合并: {reason}。"
+                ),
+                MergeReadiness::WaitingOnChecks | MergeReadiness::Ready => format!(
+                    "GitHub 已登记受规则保护的 auto-merge；PR #{pr_number} 正在等待必需检查完成，\
+通过后会自动合并。再次调用 deliver_changes 会先核对远端事实并续跑。"
+                ),
+                MergeReadiness::Unknown => {
+                    "GitHub 已登记受规则保护的 auto-merge；PR 仍在等待远端门禁，后续续接会先核对远端状态"
+                        .to_string()
+                }
+            };
+            return outcome.blocked_at(StepResult::blocked("merge", detail));
         }
         outcome.steps.push(StepResult::ok(
             "merge",
@@ -2578,6 +2661,99 @@ fn gh_pr_create_args(title: &str, body: &str, head: &str, base: &str) -> Vec<Str
     ]
 }
 
+/// Map GitHub's `mergeStateStatus` onto the wait-vs-deadlock distinction.
+///
+/// `BEHIND` is the load-bearing case: it only appears when the repository
+/// requires branches to be up to date (`strict_required_status_checks_policy`),
+/// and GitHub will not update the head ref itself. Auto-merge on a `BEHIND` PR
+/// therefore waits forever.
+/// Conventional-commit release weight: 3 breaking, 2 feat, 1 fix, 0 everything
+/// else. Mirrors the slot arithmetic in `.github/workflows/auto-release.yml`.
+fn conventional_slot(subject: &str) -> u8 {
+    let s = subject.trim();
+    if s.contains("BREAKING CHANGE") || s.contains("BREAKING-CHANGE") {
+        return 3;
+    }
+    let Some((kind, _)) = s.split_once(':') else {
+        return 0;
+    };
+    let kind = kind.trim();
+    let breaking = kind.ends_with('!');
+    let base = kind.trim_end_matches('!');
+    // Strip an optional scope: `feat(chat)` → `feat`.
+    let base = base.split_once('(').map_or(base, |(head, _)| head).trim();
+    match (base, breaking) {
+        ("feat", true) | ("fix", true) => 3,
+        ("feat", false) => 2,
+        ("fix", false) => 1,
+        _ => 0,
+    }
+}
+
+fn slot_prefix(slot: u8) -> &'static str {
+    match slot {
+        3 => "feat!",
+        2 => "feat",
+        1 => "fix",
+        _ => "chore",
+    }
+}
+
+/// Stop a PR title from inflating the release slot above what its commits
+/// justify.
+///
+/// The title matters far beyond cosmetics: this repository squash-merges, the
+/// squash subject IS the PR title, and `auto-release.yml` computes the version
+/// slot from those subjects. A branch whose only commit is `ci: …` carried a
+/// title of `feat: …` (2026-07-30 field report, PR #290) would have fabricated a
+/// **minor** release for a feature that does not exist.
+///
+/// Only the inflating direction is corrected. A title that understates (commits
+/// are `feat`, title says `fix`) delays value but never invents a release, so it
+/// is left alone rather than fighting a deliberate choice.
+fn reconcile_pr_title(title: &str, commit_slot: u8) -> (String, Option<String>) {
+    let title_slot = conventional_slot(title);
+    if title_slot <= commit_slot {
+        return (title.to_string(), None);
+    }
+    let body = title
+        .split_once(':')
+        .map_or(title.trim(), |(_, rest)| rest.trim());
+    let corrected = format!("{}: {body}", slot_prefix(commit_slot));
+    let note = format!(
+        "PR 标题原为 `{title}`，但分支提交最高只到 `{}`。本仓库 squash 合并且发版 slot 按标题前缀计算，\
+按原标题合入会凭空触发更高版本，已修正为 `{corrected}`。",
+        slot_prefix(commit_slot)
+    );
+    (corrected, Some(note))
+}
+
+/// Highest conventional slot among the commits this branch adds over `base`.
+fn branch_commit_slot(root: &Path, base: &str, branch: &str) -> u8 {
+    git(
+        root,
+        &["log", "--format=%s", &format!("{base}..{branch}")],
+    )
+    .map(|log| log.lines().map(conventional_slot).max().unwrap_or(0))
+    .unwrap_or(0)
+}
+
+fn merge_readiness_from_state(state: &str) -> MergeReadiness {
+    match state.trim().to_ascii_uppercase().as_str() {
+        "CLEAN" | "HAS_HOOKS" => MergeReadiness::Ready,
+        "BEHIND" => MergeReadiness::Behind,
+        // Non-required checks pending; required ones decide. Waiting is right.
+        "UNSTABLE" | "BLOCKED" => MergeReadiness::WaitingOnChecks,
+        "DIRTY" => MergeReadiness::NeedsAction(
+            "PR 与目标分支存在冲突，需要人工解决后才能合并".into(),
+        ),
+        "DRAFT" => {
+            MergeReadiness::NeedsAction("PR 仍是 draft，需要标记为 ready 才能合并".into())
+        }
+        _ => MergeReadiness::Unknown,
+    }
+}
+
 fn gh_pr_merge_args(
     number: u64,
     method: MergeMethod,
@@ -2824,6 +3000,24 @@ impl DeliveryRemote for GhCliRemote {
             other => CiStatus::Failure(other.trim_start_matches("failure:").to_string()),
         };
         Ok(self.ci_stability.confirm(&observation.fingerprint, status))
+    }
+
+    async fn merge_readiness(&self, number: u64) -> Result<MergeReadiness, String> {
+        let raw = self.gh(&[
+            "pr".into(),
+            "view".into(),
+            number.to_string(),
+            "--json".into(),
+            "mergeStateStatus".into(),
+            "--jq".into(),
+            ".mergeStateStatus".into(),
+        ])?;
+        Ok(merge_readiness_from_state(raw.trim()))
+    }
+
+    async fn update_pr_branch(&self, number: u64) -> Result<(), String> {
+        self.gh(&["pr".into(), "update-branch".into(), number.to_string()])
+            .map(|_| ())
     }
 
     async fn merge_pr(
@@ -5657,6 +5851,100 @@ Release-Urgency: hold"
         assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
         assert_eq!(calls.release.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    // ── Waiting vs deadlock, and titles that inflate the release ────────────
+    //
+    // 2026-07-30 field report. `deliver_changes` ran 11m36s, registered
+    // auto-merge on PR #290, reported `blocked` with "等待 GitHub 远端门禁完成
+    // 并自动合并", and stopped. The repository's ruleset has
+    // `strict_required_status_checks_policy = true` and the PR was `BEHIND`, so
+    // GitHub would never merge it: auto-merge does not update a stale head ref.
+    // The advice was not merely unhelpful, it was wrong — an unbounded no-op wait.
+
+    #[test]
+    fn behind_is_a_deadlock_while_pending_checks_are_a_real_wait() {
+        assert_eq!(merge_readiness_from_state("BEHIND"), MergeReadiness::Behind);
+        assert_eq!(merge_readiness_from_state("CLEAN"), MergeReadiness::Ready);
+        assert_eq!(
+            merge_readiness_from_state("HAS_HOOKS"),
+            MergeReadiness::Ready
+        );
+        assert_eq!(
+            merge_readiness_from_state("UNSTABLE"),
+            MergeReadiness::WaitingOnChecks
+        );
+        assert!(matches!(
+            merge_readiness_from_state("DIRTY"),
+            MergeReadiness::NeedsAction(_)
+        ));
+        assert!(matches!(
+            merge_readiness_from_state("DRAFT"),
+            MergeReadiness::NeedsAction(_)
+        ));
+        // GitHub is still computing — not a conclusion.
+        assert_eq!(
+            merge_readiness_from_state("UNKNOWN"),
+            MergeReadiness::Unknown
+        );
+        assert_eq!(merge_readiness_from_state(""), MergeReadiness::Unknown);
+        // Case/whitespace tolerant: the value is read off a CLI.
+        assert_eq!(
+            merge_readiness_from_state(" behind \n"),
+            MergeReadiness::Behind
+        );
+    }
+
+    #[test]
+    fn a_pr_title_may_never_claim_a_bigger_release_than_its_commits() {
+        // The exact #290 shape: one `ci:` commit, a `feat:` title inherited from
+        // session context. Squash-merging that fabricates a minor release.
+        let (title, note) = reconcile_pr_title(
+            "feat: add on-demand embedded browser pane",
+            conventional_slot("ci: avoid auto-release reconcile sigpipe"),
+        );
+        assert_eq!(title, "chore: add on-demand embedded browser pane");
+        let note = note.expect("an inflating title must be reported, not silently kept");
+        assert!(note.contains("slot"), "the note must say why: {note}");
+
+        // feat title over a fix-only branch drops to fix.
+        let (title, note) = reconcile_pr_title("feat: tidy up", conventional_slot("fix: crash"));
+        assert_eq!(title, "fix: tidy up");
+        assert!(note.is_some());
+
+        // Matching or understating titles are left exactly alone.
+        for (title, commit) in [
+            ("fix: crash on empty input", "fix: crash on empty input"),
+            ("feat: new pane", "feat: new pane"),
+            ("fix: modest wording", "feat: big feature"),
+            ("chore: notes", "chore: notes"),
+        ] {
+            let (out, note) = reconcile_pr_title(title, conventional_slot(commit));
+            assert_eq!(out, title, "must not rewrite {title:?}");
+            assert!(note.is_none(), "no note expected for {title:?}");
+        }
+    }
+
+    #[test]
+    fn conventional_slot_matches_the_release_workflow_arithmetic() {
+        assert_eq!(conventional_slot("feat!: drop v1 API"), 3);
+        assert_eq!(conventional_slot("fix!: change default"), 3);
+        assert_eq!(conventional_slot("refactor: x\n\nBREAKING CHANGE: y"), 3);
+        assert_eq!(conventional_slot("feat: add pane"), 2);
+        assert_eq!(conventional_slot("feat(chat): add pane"), 2);
+        assert_eq!(conventional_slot("fix: crash"), 1);
+        assert_eq!(conventional_slot("fix(agent): crash"), 1);
+        for none in [
+            "ci: avoid sigpipe",
+            "chore: bump version to 1.74.0",
+            "docs: update readme",
+            "refactor: split module",
+            "test: add case",
+            "no colon here",
+            "",
+        ] {
+            assert_eq!(conventional_slot(none), 0, "{none:?}");
+        }
     }
 
     #[tokio::test]
