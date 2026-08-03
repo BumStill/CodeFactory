@@ -4442,9 +4442,18 @@ Release-Urgency: hold"
         assert!(github_message.contains("GitHub 通道"));
     }
 
-    /// Real-runtime smoke: with a logged-in gh on this machine, ci_status on
-    /// the repo's own HEAD must parse into a valid CiStatus. Skips cleanly
-    /// when gh is absent or unauthenticated.
+    /// Real-runtime smoke: with a logged-in gh on this machine, `ci_status` on a
+    /// commit the remote actually has must parse into a valid `CiStatus`.
+    ///
+    /// It asks about `origin/<default>`, NOT local `HEAD`. Local HEAD is
+    /// whatever you are working on, and GitHub answers `No commit found for SHA
+    /// … (HTTP 422)` for anything unpushed — so the old form failed on every
+    /// in-progress commit (hit twice in one session on 2026-08-03) and told you
+    /// nothing about the parser.
+    ///
+    /// Skipping on unpushed HEAD would have been worse than the bug: the test
+    /// would then sit out exactly when someone is changing this code. Pointing
+    /// it at a remote-known commit keeps it running during ordinary work.
     #[tokio::test]
     async fn gh_cli_remote_reads_real_ci_status_when_gh_is_authenticated() {
         if !gh_cli_available() {
@@ -4456,10 +4465,19 @@ Release-Urgency: hold"
             eprintln!("skipping gh smoke: not a github repo checkout");
             return;
         };
-        let head = git(&cwd, &["rev-parse", "HEAD"]).unwrap();
-        match remote.ci_status(&head).await {
+        let default_branch =
+            remote_default_branch(&cwd, "origin").unwrap_or_else(|| "main".to_string());
+        // A commit the remote is guaranteed to know. Only skip when this
+        // checkout has no such ref at all (fresh clone with no fetch).
+        let Ok(sha) = git(&cwd, &["rev-parse", &format!("origin/{default_branch}")]) else {
+            eprintln!(
+                "skipping gh smoke: no local ref for origin/{default_branch}; run `git fetch origin`"
+            );
+            return;
+        };
+        match remote.ci_status(sha.trim()).await {
             Ok(_) => {}
-            Err(e) => panic!("gh ci_status must parse: {e}"),
+            Err(e) => panic!("gh ci_status must parse for remote-known {sha}: {e}"),
         }
     }
 
