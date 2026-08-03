@@ -4459,6 +4459,10 @@ Release-Urgency: hold"
         };
         match remote.ci_status(sha.trim()).await {
             Ok(_) => {}
+            Err(e) if e.to_ascii_lowercase().contains("rate limit") => {
+                eprintln!("skipping gh smoke: GitHub API rate limited this external smoke: {e}");
+                return;
+            }
             Err(e) => panic!("gh ci_status must parse for remote-known {sha}: {e}"),
         }
     }
