@@ -88,6 +88,13 @@ impl StepResult {
             detail: detail.into(),
         }
     }
+    fn waiting(step: &str, detail: impl Into<String>) -> Self {
+        Self {
+            step: step.into(),
+            status: "waiting".into(),
+            detail: detail.into(),
+        }
+    }
 }
 
 /// The result of a delivery run.
@@ -1788,43 +1795,18 @@ pub async fn deliver<R: DeliveryRemote>(
                     format!("GitHub 已登记 auto-merge，但 merge_queued 回执写入失败: {error}"),
                 ));
             }
-            // Auto-merge is registered — but registered is not the same as
-            // progressing. Ask WHY it could not merge before telling the caller
-            // to wait: under a strict required-status-checks policy a `BEHIND`
-            // PR never becomes mergeable on its own, so "wait for the remote
-            // gates" would be an unbounded no-op wait.
-            let readiness = remote
-                .merge_readiness(pr_number)
-                .await
-                .unwrap_or(MergeReadiness::Unknown);
-            let detail = match &readiness {
-                MergeReadiness::Behind => match remote.update_pr_branch(pr_number).await {
-                    Ok(()) => format!(
-                        "PR #{pr_number} 落后于 {base}，auto-merge 不会自行更新分支（永远不会触发）。\
-已把 {base} 合入 PR 分支；CI 重新通过后 auto-merge 会接管。\
-再次调用 deliver_changes 可核对远端事实并续跑。",
-                        base = repo.default_branch
-                    ),
-                    Err(error) => format!(
-                        "PR #{pr_number} 落后于 {base}，auto-merge 不会自行更新分支，因此仅靠等待永远不会合并。\
-自动更新分支失败: {error}。\
-需要先把 {base} 合入 PR 分支（`gh pr update-branch {pr_number}`）并等 CI 重新通过。",
-                        base = repo.default_branch
-                    ),
-                },
-                MergeReadiness::NeedsAction(reason) => format!(
-                    "PR #{pr_number} 已登记 auto-merge，但仅靠等待不会合并: {reason}。"
-                ),
-                MergeReadiness::WaitingOnChecks | MergeReadiness::Ready => format!(
-                    "GitHub 已登记受规则保护的 auto-merge；PR #{pr_number} 正在等待必需检查完成，\
-通过后会自动合并。再次调用 deliver_changes 会先核对远端事实并续跑。"
-                ),
-                MergeReadiness::Unknown => {
-                    "GitHub 已登记受规则保护的 auto-merge；PR 仍在等待远端门禁，后续续接会先核对远端状态"
-                        .to_string()
-                }
-            };
-            return outcome.blocked_at(StepResult::blocked("merge", detail));
+            outcome.steps.push(StepResult::waiting(
+                "merge",
+                "GitHub 已登记受规则保护的 auto-merge；PR 仍在等待远端门禁，后续续接会先核对远端状态",
+            ));
+            outcome.final_state = "blocked".into();
+            outcome.stage = "merge".into();
+            outcome.code = "delivery_merge_queued".into();
+            outcome.recoverable = true;
+            outcome.next_action = Some("等待远端门禁完成后重新调用 deliver_changes 续接合并和发布。".into());
+            outcome.reached_state = "merge_queued".into();
+            outcome.summary = "GitHub 已登记 auto-merge，正在等待远端门禁；不是权限不足。".into();
+            return outcome;
         }
         outcome.steps.push(StepResult::ok(
             "merge",
@@ -4936,6 +4918,7 @@ else:
         ci: CiStatus,
         existing_pr: Option<(u64, String)>,
         merge_ok: bool,
+        merge_queues: bool,
         /// Varies per test: the whole point of the ladder fix is that a missing
         /// high-rung capability must not cancel the rungs below it.
         caps: DeliveryCapabilities,
@@ -5011,7 +4994,9 @@ else:
         ) -> Result<MergeRequestResult, String> {
             self.calls.merge.fetch_add(1, Ordering::SeqCst);
             *self.calls.merge_commit_message.lock().unwrap() = commit_message.cloned();
-            if self.merge_ok {
+            if self.merge_queues {
+                Ok(MergeRequestResult::Queued)
+            } else if self.merge_ok {
                 self.calls.merged.store(true, Ordering::SeqCst);
                 Ok(MergeRequestResult::Merged {
                     merge_sha: "merge-sha".into(),
@@ -5066,6 +5051,7 @@ else:
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: stub_calls(),
@@ -5103,6 +5089,7 @@ else:
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: calls.clone(),
@@ -5165,6 +5152,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: calls.clone(),
@@ -5299,6 +5287,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 review: false,
@@ -5350,6 +5339,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: calls.clone(),
@@ -5388,6 +5378,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Failure("build red".into()),
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: stub_calls(),
@@ -5415,11 +5406,47 @@ Release-Urgency: hold"
     }
 
     #[tokio::test]
+    async fn queued_auto_merge_is_a_waiting_state_not_a_permission_failure() {
+        let root = feature_branch_repo("merge-queued");
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: false,
+            merge_queues: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let out = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+        assert_eq!(out.final_state, "blocked", "{:?}", out.steps);
+        assert_eq!(out.reached_state, "merge_queued");
+        assert_eq!(out.code, "delivery_merge_queued");
+        assert!(out.recoverable);
+        assert!(out
+            .steps
+            .iter()
+            .any(|s| s.step == "merge" && s.status == "waiting"));
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
     async fn through_merge_merges_on_green() {
         let root = feature_branch_repo("merge");
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: stub_calls(),
@@ -5497,6 +5524,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 live: false,
@@ -5566,6 +5594,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: calls.clone(),
@@ -5604,6 +5633,7 @@ Release-Urgency: hold"
         let first_remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 live: false,
@@ -5626,6 +5656,7 @@ Release-Urgency: hold"
         let resume_remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 release: false,
@@ -5757,6 +5788,7 @@ Release-Urgency: hold"
             let remote = StubRemote {
                 ci: CiStatus::Success,
                 existing_pr: None,
+                merge_queues: false,
                 merge_ok: true,
                 caps: every_capability(),
                 calls: calls.clone(),
@@ -5807,6 +5839,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: calls.clone(),
@@ -5834,6 +5867,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 release: false,
@@ -5893,6 +5927,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 ci: false,
@@ -5942,6 +5977,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 merge: false,
@@ -5980,6 +6016,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 ci: false,
@@ -6086,6 +6123,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: Arc::new(StubCalls::default()),
@@ -6136,6 +6174,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: Arc::new(StubCalls::default()),
@@ -6356,6 +6395,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: stub_calls(),
@@ -6392,6 +6432,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: stub_calls(),
@@ -6438,6 +6479,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: stub_calls(),
