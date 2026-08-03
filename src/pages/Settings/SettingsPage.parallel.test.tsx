@@ -202,10 +202,14 @@ describe("SettingsPage parallel-task controls", () => {
 
     render(<SettingsPage onBack={() => {}} initialTab="browser" />);
 
+    // Wait on the fetched row, not on the heading. The heading renders
+    // synchronously, so awaiting it settles listBrowserSessions() only as a
+    // side effect of waitFor's act() flush — the assertions below would be
+    // racing that flush rather than the fetch they actually depend on.
+    expect(await screen.findByText("任务 task-123")).toBeInTheDocument();
     expect(
-      await screen.findByRole("heading", { name: "受管浏览器会话" }),
+      screen.getByRole("heading", { name: "受管浏览器会话" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("任务 task-123")).toBeInTheDocument();
     expect(screen.getByText(/不会关闭你的普通 Chrome/)).toBeInTheDocument();
     expect(
       screen.getByText("chrome://inspect/#remote-debugging"),
@@ -217,14 +221,18 @@ describe("SettingsPage parallel-task controls", () => {
       }),
     );
 
-    await waitFor(() => {
-      expect(mocks.closeBrowserSession).toHaveBeenCalledWith(
-        "codefactory-task-123",
-      );
-    });
+    // One settle for the whole close round trip instead of two sequential
+    // polls. The empty state is gated on `!loading && sessions.length === 0`,
+    // so it can only appear after closeBrowserSession() resolved AND the
+    // refetch came back empty — waiting for the mock call first added a second
+    // polling cycle (a real cost on a contended runner) and proved nothing the
+    // empty state does not already prove.
     expect(
       await screen.findByText("当前没有活动的 CodeFactory 自动化浏览器。"),
     ).toBeInTheDocument();
+    expect(mocks.closeBrowserSession).toHaveBeenCalledWith(
+      "codefactory-task-123",
+    );
   });
 
   it("hydrates defaults for settings saved before the fields existed", async () => {
