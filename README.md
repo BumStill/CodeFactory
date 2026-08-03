@@ -14,6 +14,12 @@
 
 </div>
 
+<!-- README-CONTRACT: evergreen
+Release-specific versions and change details belong in GitHub Release notes.
+Update this file in the same PR when a public product, install, privacy, or
+platform promise changes; keep download links version-neutral.
+-->
+
 ---
 
 CodeFactory is a Tauri desktop app that turns ideas into shipped code. It talks
@@ -47,8 +53,10 @@ your own API key, or sign in with ChatGPT for the Codex-backed provider.
 | 🤖 **Subagents** | Conversation-native task delegation → parallel subagent dispatch, shared brief, verification engine, evidence pack auto-collection. Long-lived specs stay in the repository and travel with Git. |
 | 🪝 **Hooks & Skills** | Run scripts on tool events (commit-on-edit, lint-on-write). Create, edit, import, or let the agent search for skill packs (system prompts + slash commands) right from the chat box — pull in Superpowers / OpenSpec-style skills with a preview-then-enable step. |
 | 🌐 **MCP client** | Connect Model Context Protocol servers for arbitrary tool extension. |
+| 🌐 **On-demand browser** | Task-scoped managed browser sessions open an embedded pane only when needed; pause for login or approval, then recover the session without leaving an idle browser daemon behind. |
 | 📦 **Docker sandbox** | Optional `sandbox_mode: Docker` runs every shell/tool command in a disposable container instead of your host shell. |
 | 🔔 **IM notifications** | Optional WeCom / Feishu / generic-JSON webhook pings you when a task finishes, fails, or needs permission — fire-and-forget, no secrets in the payload. |
+| 🚚 **Controlled delivery** | Turn a completed task into an auditable PR → CI → merge → release flow, with explicit blockers when a live verifier or deployment step is not configured. |
 | 🔁 **Auto-update** | Signed updates over GitHub Releases. New version arrives → in-app banner → one-click install + relaunch. Your data stays. |
 
 ## Install
@@ -132,13 +140,15 @@ pnpm tauri dev
 Requires Rust stable + Node 20 + pnpm 10. The first build is ~3 min as it
 compiles the Tauri toolchain; subsequent builds are seconds.
 
-To produce an installer:
+To produce installers:
 
 ```pwsh
 pnpm tauri build
 ```
 
-Output lands in `src-tauri/target/release/bundle/nsis/`.
+On Windows the NSIS installer lands in
+`src-tauri/target/release/bundle/nsis/`; on Apple Silicon macOS the DMG lands
+in `src-tauri/target/release/bundle/dmg/`.
 
 For a deeper walkthrough of the codebase layout, test commands, and
 where runtime data lives, see [DEVELOPMENT.md](DEVELOPMENT.md).

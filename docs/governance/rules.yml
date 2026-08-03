@@ -14,7 +14,7 @@
 #   enforcer    artifact that makes/keeps the rule true (must exist)
 #   level       warn | error   (only for enforcement: check)
 
-version: "2026-08-02"
+version: "2026-08-03"
 
 rules:
   - id: release-cadence
@@ -22,6 +22,12 @@ rules:
     doc: docs/principles/release-cadence.md
     enforcement: structural
     enforcer: .github/workflows/auto-release.yml
+
+  - id: readme-update-contract
+    statement: "README is an evergreen product contract: every PR declares its impact, required updates land with the change, and releases do not rewrite it."
+    doc: docs/principles/readme-update-cadence.md
+    enforcement: structural
+    enforcer: tools/governance/validate_readme_contract.py
 
   - id: design-doc-for-major
     statement: "Every major change lands a design doc in the tree (docs/specs|design|principles)."

@@ -1,0 +1,55 @@
+name: README review
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 1 * *" # monthly, first day at 03:00 UTC
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate README contract
+        run: python tools/governance/validate_readme_contract.py
+
+      - name: Open monthly review issue when needed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MONTH=$(date -u +%Y-%m)
+          TITLE="[README review] $MONTH"
+          EXISTING=$(gh issue list --state open --search "\"$TITLE\" in:title" \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "README review issue #$EXISTING already open for $MONTH"
+            exit 0
+          fi
+
+          BODY=$(mktemp)
+          trap 'rm -f "$BODY"' EXIT
+          cat > "$BODY" <<'EOF'
+          ## Monthly README review
+
+          Compare the published app and current repository against the evergreen README contract.
+
+          - [ ] Features still describe shipped user-visible capabilities.
+          - [ ] Install and Quick start match the Windows and Apple Silicon macOS artifacts.
+          - [ ] Data & privacy and security claims are still accurate.
+          - [ ] `releases/latest` links work and no exact release version is hard-coded.
+          - [ ] Roadmap items reflect the current product direction.
+          - [ ] If a change is needed, open a PR with `README-Update: required`.
+          - [ ] If no change is needed, leave the verification conclusion in this issue.
+          EOF
+          gh issue create --title "$TITLE" --body-file "$BODY"
