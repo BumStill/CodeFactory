@@ -553,7 +553,7 @@ export function WorkspacePage({
             timingProfile={turnTimingProfile}
             externalJobs={externalJobs}
           />
-          <div data-testid="workspace-composer-shell" className="shrink-0 bg-surface-1 px-3 pb-3 pt-2">
+          <div data-testid="workspace-composer-shell" className="shrink-0 bg-surface-2 px-3 pb-3 pt-2">
             <div className="mx-auto w-full max-w-[920px] overflow-hidden rounded-2xl border border-border/80 bg-surface-2 shadow-lg">
               {queue.length > 0 && (
                 <QueueBadge queue={queue} onRemove={removeFromQueue} />
