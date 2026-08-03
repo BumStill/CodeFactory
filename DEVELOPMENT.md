@@ -65,17 +65,17 @@ CI runs both on every push to `main`. See `.github/workflows/ci.yml`.
 
 ## Releasing
 
-See [VERSIONING.md](VERSIONING.md). TL;DR:
+See [VERSIONING.md](VERSIONING.md). The only supported release entry point is
+the governed [`auto-release.yml`](.github/workflows/auto-release.yml)
+`workflow_dispatch` or its daily schedule. An authorized
+`deliver_changes -> through_release` request may dispatch the same path.
 
-```pwsh
-.\scripts\bump-version.ps1 [patch|minor|major]
-```
-
-This bumps the three version files, commits, tags `vX.Y.Z`, and pushes.
-The release workflow builds the Windows installer, signs it with the
-Tauri updater key (stored in GitHub Secrets — `TAURI_SIGNING_PRIVATE_KEY`
-and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`), and publishes the GitHub
-Release.
+The workflow opens a version-bump PR, waits for the normal required checks and
+guarded merge, then dispatches [`release.yml`](.github/workflows/release.yml)
+to build the Windows installer and Apple Silicon macOS DMG, publish the GitHub
+Release, and verify its public artifacts. Do not run
+the legacy `scripts/bump-version.ps1` command to commit, tag, or push from a
+developer checkout; that legacy helper is not the release path.
 
 ## Where things live
 

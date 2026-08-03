@@ -66,6 +66,12 @@ jobs:
       - name: Release workflow contract tests
         run: python -m unittest tests.test_release_workflow
 
+      - name: README contract
+        env:
+          README_CONTRACT_EVENT_PATH: ${{ github.event_path }}
+          README_CONTRACT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python tools/governance/validate_readme_contract.py --ci
+
       - name: Evolution workbench headless viewport gate
         run: pnpm test:evolution:headless
         env:
