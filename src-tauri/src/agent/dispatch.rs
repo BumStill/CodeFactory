@@ -40,6 +40,9 @@ pub struct ChatContract {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TurnGrants {
     pub browser_read: bool,
+    /// The current message explicitly constrains mutations. This is separate
+    /// from a default question/diagnostic classification.
+    pub explicit_read_only: bool,
 }
 
 /// Negation cues — substring-matched (CJK). If any appears we refuse to read
@@ -141,6 +144,9 @@ const PLAN_ONLY_CJK: &[&str] = &[
     "只评估",
     "不要改",
     "别改",
+    "不要修改",
+    "别修改",
+    "先别修改",
     "不要执行",
     "别执行",
     "不要动代码",
@@ -495,17 +501,21 @@ pub fn is_delivery_revocation(user_msg: &str) -> bool {
 /// `decide_chat_contract` derives capability from the CURRENT message alone,
 /// so a user who said "提交上线" on an earlier turn finds the next turn back
 /// at `Implement` and gets asked to re-confirm delivery again — field report.
-/// Once a session has granted delivery, later non-planning turns keep
-/// `Deliver` (so fixing follow-up issues then shipping works without a repeat
-/// confirmation). Explicit planning requests stay `ReviewOnly`, and
-/// [`is_delivery_revocation`] clears the grant.
+/// Once a session has granted delivery, later messages retain that grant so
+/// fixing follow-up issues then shipping works without a repeat confirmation.
+/// A current explicit read-only constraint pauses mutation for the requested
+/// action, and [`is_delivery_revocation`] clears the durable grant.
 pub fn with_persisted_delivery_authorization(
     contract: ChatContract,
     delivery_authorized: bool,
 ) -> ChatContract {
-    if delivery_authorized && contract.capability != TurnCapability::ReviewOnly {
+    // A default question/diagnostic classification is not a revocation of an
+    // already-authorized delivery task. Only an explicit current constraint
+    // ("只分析 / 不要修改") can pause mutations. This is an action-intent
+    // decision, not a root-turn lock.
+    if delivery_authorized && !contract.grants.explicit_read_only {
         ChatContract {
-            mode: contract.mode,
+            mode: AgentMode::Execute,
             capability: TurnCapability::Deliver,
             grants: contract.grants,
         }
@@ -514,9 +524,9 @@ pub fn with_persisted_delivery_authorization(
     }
 }
 
-/// A mid-run user steer can change the hard capability at the next safe round
-/// boundary. This is separate from normal permission approval: it changes the
-/// user's objective, and therefore must reach the structural gate itself.
+/// A mid-run user steer can change the current action intent at the next safe
+/// round boundary. This is separate from normal permission approval: it
+/// changes the user's objective and therefore must reach policy evaluation.
 pub fn steer_capability_override(user_msg: &str) -> Option<TurnCapability> {
     if is_explicit_planning_request(user_msg) {
         return Some(TurnCapability::ReviewOnly);
@@ -595,10 +605,12 @@ fn grants_browser_read(user_msg: &str) -> bool {
 }
 
 pub fn decide_chat_contract(prev_assistant: Option<&str>, user_msg: &str) -> ChatContract {
+    let explicit_read_only = is_explicit_planning_request(user_msg);
     let grants = TurnGrants {
         browser_read: grants_browser_read(user_msg),
+        explicit_read_only,
     };
-    if is_explicit_planning_request(user_msg) {
+    if explicit_read_only {
         return ChatContract {
             mode: AgentMode::Interactive,
             capability: TurnCapability::ReviewOnly,
@@ -884,6 +896,16 @@ mod tests {
         // review-only — the user's current intent wins.
         let kept = with_persisted_delivery_authorization(planning, true);
         assert_eq!(kept.capability, TurnCapability::ReviewOnly);
+    }
+
+    #[test]
+    fn ordinary_diagnostic_does_not_revoke_an_active_delivery_intent() {
+        let diagnostic = decide_chat_contract(None, "你为啥没权限，没人限制你啊");
+        assert_eq!(diagnostic.capability, TurnCapability::ReviewOnly);
+
+        let continued = with_persisted_delivery_authorization(diagnostic, true);
+        assert_eq!(continued.capability, TurnCapability::Deliver);
+        assert_eq!(continued.mode, AgentMode::Execute);
     }
 
     #[test]

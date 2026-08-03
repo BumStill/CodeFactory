@@ -157,9 +157,11 @@ and a per-subtask PR would be wrong.
 - **`git push` credentials**: plain push relies on the machine's git credential
   helper. A token-URL host-matched push fallback (never logged/persisted) is a
   follow-up for machines without a helper.
-- **Branch protection**: `ThroughMerge` on a protected `main` with required
-  reviews correctly surfaces `merge_blocked` (405). Settings copy sets that
-  expectation.
+- **GitHub rulesets and merge queue**: delivery reads the effective required
+  checks for the PR base branch, waits until every required context is present
+  and terminal, then submits auto-merge bound to the observed head SHA. A
+  ruleset rejection remains a real blocker; it is never re-labelled as a local
+  high-risk-command denial and is never bypassed with `--admin`.
 - **`ThroughRelease`** dispatches `auto-release.yml` via `workflow_dispatch`,
   which needs a token with `workflow` scope; a repo-only token surfaces a clear
   blocker.

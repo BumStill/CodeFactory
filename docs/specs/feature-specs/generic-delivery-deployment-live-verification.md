@@ -23,6 +23,10 @@ Owner：agent delivery
 - **REQ-DEL-011 Delivery state vocabulary**：状态至少区分 `local`、`committed`、`pushed`、`pr_open`、`ci_green`、`merged`、`release_triggered`、`artifact_published`、`deployment_pending`、`deployment_succeeded`、`live_verified`、`blocked`。只有 `live_verified` 可使用“已上线”。
 - **REQ-DEL-012 Achievable delivery ladder**：在 remote/review 通道可用的前提下，缺 CI observer 时最高执行到 `pr_open`，缺 merge adapter 时最高执行到 `ci_green`，缺 release adapter 时最高执行到 `merged`；缺 live verifier 不取消 release 动作，只把最终结论限制为 `release_triggered/not_live`。每次降级必须记录缺失能力、requested/effective ceiling、实际到达层级和明确恢复动作。
 - **REQ-DEL-013 Idempotent continuation receipts**：merge/release 前先写 repo-local `intent_merge`/`intent_release` 写前回执，外部动作确认后再升级为 `merged`/`release_triggered`；回执 key 与内容必须同时绑定 schema version、无凭据的 canonical remote identity、remote name、base、head 和 commit SHA，不能让同 SHA 的不同交付上下文互相覆盖。损坏、版本/状态未知、读取失败或上下文不一致时全部 fail closed。相同上下文与 tip 的续跑必须复用完成回执，不得再次 merge 或再次 dispatch release；遗留 intent 或完成回执升级失败表示外部结果不确定，必须结构化标为不可自动重试并要求先核对远端事实。已有 `release_triggered` 回执时，即使本轮 release adapter 暂时不可用，也必须继续 observation，不能倒退成“只到 merged”。
+- **REQ-DEL-014 Stable CI observation**：PR 创建后第一次 `none` 或 `success` 只能视为候选终态；CI adapter 必须等待 check-suite 注册稳定窗口并再次观察同一 head。required checks 未完整注册、仍在运行或 head 漂移时不得到达 `ci_green`。
+- **REQ-DEL-015 Guarded auto-merge**：GitHub 合并必须使用规则集允许的 auto-merge 并绑定预期 head SHA；不得自动使用 admin bypass。CLI/API 返回成功不等于已合并，必须以远端 PR state 与 merge commit 为准。
+- **REQ-DEL-016 Reconciled intent recovery**：发现 `intent_merge` 时必须先查询远端 PR 状态。远端已合并则升级回执并继续；仍开放且 head 未变时允许幂等续接；关闭未合并、head 漂移或 adapter 无法核实时 fail closed。不得把无法恢复的 intent 描述成“稍后再次调用即可恢复”。
+- **REQ-DEL-017 Per-action intent policy**：不得把用户消息固化为整个根回合的 `ReviewOnly / Implement / Deliver` 互斥锁。每个工具动作必须组合 durable task grant、当前显式限制和动作类型重新判断；普通追问、纠错或失败原因问题不得撤销既有授权，只有明确的只读/停止/撤销表达可以约束对应动作。相同动作拒绝一次执行链只展示一次，且结构意图、工具权限和远端权限必须使用不同错误码与用户文案。
 
 ## Repository-owned configuration
 

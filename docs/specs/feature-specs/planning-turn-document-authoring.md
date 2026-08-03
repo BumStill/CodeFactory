@@ -1,4 +1,4 @@
-# 规划回合的文档产出权与长方案落盘
+# 规划意图下的文档产出权与长方案落盘
 
 > Req ID: `CF-PLAN-DOC`
 >
@@ -10,26 +10,28 @@
 
 2026-07-30 现场报告：用户在会话里提出一个产品设计（内置浏览器 pane 的展开策略），
 并要求「这种长的方案，应该生成一个文件来存储，而不是每次都展示在会话窗口里」。
-Agent 判定这是规划意图，回合能力落到 `TurnCapability::ReviewOnly`——这一步是正确的。
-但随后它三次尝试落盘同一份规格，全部被结构性门禁拦下：
+Agent 识别出用户当前明确要求不修改产品，并以内部兼容类型
+`TurnCapability::ReviewOnly` 表示这项动作约束。但随后它三次尝试落盘同一份规格，
+全部被结构性门禁拦下，而且错误文案把动作约束描述成整回合固定模式：
 
 | 尝试 | 结果 |
 | --- | --- |
-| `python3 - <<'PY' … spec.write_text(…)` | `本回合是只读审视，已阻止 bash` |
+| `python3 - <<'PY' … spec.write_text(…)` | 旧文案错误声称“本回合是只读审视”并阻止 `bash` |
 | `apply_patch <<'PATCH' *** Add File: docs/specs/feature-specs/…md` | 同上 |
 | 放弃落盘，把完整方案平铺进会话 | 用户看到的正是他刚要求避免的形态 |
 
 两个缺陷叠加：
 
-1. **能力粒度错误。** `ReviewOnly` 把「不要改产品」等同于「什么都不许落盘」。
-   而规划回合的交付物本身就是文档；禁止写文档等于禁止交付。
-   `is_review_safe_named_tool` 里没有 `write_file`/`edit_file`，模型在只读回合
+1. **能力粒度错误。** `ReviewOnly` 把「当前不要改产品」等同于「什么都不许落盘」。
+   而规划意图的交付物本身就是文档；禁止写文档等于禁止交付。
+   `is_review_safe_named_tool` 里没有 `write_file`/`edit_file`，模型在该约束下
    连写工具都看不到，只能用 shell heredoc 硬撞，撞上的又是同一道 Mutation 门禁。
 2. **门禁只挡不指路。** 拒绝消息只说「已阻止」，没有给出允许的路径。模型因此换
    三种写法重试同一个动作，最后把阻塞甩给用户处理。
 
-`ReviewOnly` 同时是 `decide_chat_contract` 的**默认兜底**（意图不明确时的落点），
-所以这个缺陷影响的是产品里最常见的一类回合，不是边缘场景。
+`ReviewOnly` 仍是 `decide_chat_contract` 的内部默认兜底类型，但不是对整回合的永久
+定性；后续消息、用户 steer 和每个动作都会重新评估，已有持续交付授权也不会被
+普通追问覆盖。
 
 ## Requirements Traceability
 
@@ -37,7 +39,7 @@ Agent 判定这是规划意图，回合能力落到 `TurnCapability::ReviewOnly`
 | --- | --- | --- | --- | --- | --- |
 | CF-PLAN-DOC-R1 | 不改代码也要能写文档 | `ReviewOnly` 回合允许写入规划文档；`write_file`/`edit_file` 在该回合可见 | agent-loop policy | Rust 单元测试 | agent |
 | CF-PLAN-DOC-R2 | 举一反三，不只放开一个文件 | 放行由路径白名单判定（文档目录 + prose 扩展名），不是单点特例 | agent-loop policy | 表驱动 Rust 测试 | agent |
-| CF-PLAN-DOC-R3 | 只读回合仍不得改产品 | 代码、配置、测试、迁移与 agent 指令文件（`AGENTS.md`/`CLAUDE.md`/`README.md`）在只读回合仍被拒 | agent-loop policy | 表驱动 Rust 测试 | governance |
+| CF-PLAN-DOC-R3 | 明确只分析时仍不得改产品 | 代码、配置、测试、迁移与 agent 指令文件（`AGENTS.md`/`CLAUDE.md`/`README.md`）在当前动作约束下仍被拒 | agent-loop policy | 表驱动 Rust 测试 | governance |
 | CF-PLAN-DOC-R4 | 不要三次撞墙后甩锅 | 结构性拒绝消息必须写明允许的工具与路径 | agent-loop policy | Rust 单元测试 | agent |
 | CF-PLAN-DOC-R5 | 长方案落盘而不是平铺会话 | 系统提示要求超过一屏的方案写成仓库文档，会话只留摘要、路径与待决问题 | agent prompt | Rust prompt 断言 | agent |
 | CF-PLAN-DOC-R6 | 不用 shell 写文件 | 提示与门禁一致地把落盘动作收敛到 `write_file`/`edit_file` | agent prompt + policy | Rust 单元测试 | agent |
@@ -60,19 +62,20 @@ Agent 判定这是规划意图，回合能力落到 `TurnCapability::ReviewOnly`
 - 文档目录内的非 prose 文件（`docs/config.json`、`docs/scripts/build.sh`）：
   文档树里同样存放构建脚本与 fixture。
 - `AGENTS.md`、`CLAUDE.md`、`README.md`、`CONTRIBUTING.md`、`.cursorrules`、
-  `copilot-instructions.md`：改这些文件**改变行为**，正是只读回合要防的事，
+  `copilot-instructions.md`：改这些文件**改变行为**，正是当前显式约束要防的事，
   即使它们位于文档目录之内。
 - 含 `..` 的路径。
 
 ## Primary User Path
 
 1. 用户在会话里提出设计、评估或「先给方案，不要改代码」类请求。
-2. `decide_chat_contract` 判定为规划意图（或意图不明确落到默认），回合能力为 `ReviewOnly`。
+2. `decide_chat_contract` 判定当前动作约束，并用内部类型 `ReviewOnly` 表达；它不把
+   后续整回合永久锁定。
 3. 方案超过一屏时，Agent 用 `write_file` 把完整方案写入仓库文档（优先遵循仓库既有约定
    `docs/specs/`、`docs/design/`、`docs/long-tasks/`；无约定时用 `docs/plans/<slug>.md`）。
 4. 会话里只留：一句问题陈述、3–6 条决策要点、文档路径、待决问题。
-5. 用户若尝试让 Agent 在该回合改代码，门禁拒绝并说明需要明确的执行要求。
-6. 用户表达执行意图后，回合能力升为 `Implement`，Agent 按已落盘的文档实施。
+5. 当前消息仍明确要求不要改代码时，门禁拒绝对应动作并说明原因。
+6. 用户表达执行意图后，下一动作重新评估为 `Implement`，Agent 按已落盘的文档实施。
 
 ## Applicable Harnesses
 
@@ -87,13 +90,13 @@ Agent 判定这是规划意图，回合能力落到 `TurnCapability::ReviewOnly`
 
 | 场景 | 期望结果 | 证据 |
 | --- | --- | --- |
-| 只读回合写 `docs/specs/feature-specs/*.md` | 允许 | `review_only_allows_the_planning_document_it_exists_to_produce` |
-| 只读回合写 `src/main.rs`、`package.json`、`migrations/*.sql` | 拒绝 | `review_only_still_refuses_code_config_and_agent_instruction_writes` |
-| 只读回合写 `AGENTS.md`/`CLAUDE.md`/`README.md`（含 `docs/` 内） | 拒绝 | 同上 |
-| 只读回合用 heredoc / `apply_patch` / `echo >` 写 `docs/` | 拒绝 | `review_only_keeps_shell_writes_blocked_because_a_command_has_no_path_bound` |
+| 明确只分析时写 `docs/specs/feature-specs/*.md` | 允许 | `review_only_allows_the_planning_document_it_exists_to_produce` |
+| 明确只分析时写 `src/main.rs`、`package.json`、`migrations/*.sql` | 拒绝 | `review_only_still_refuses_code_config_and_agent_instruction_writes` |
+| 明确只分析时写 `AGENTS.md`/`CLAUDE.md`/`README.md`（含 `docs/` 内） | 拒绝 | 同上 |
+| 明确只分析时用 heredoc / `apply_patch` / `echo >` 写 `docs/` | 拒绝 | `review_only_keeps_shell_writes_blocked_because_a_command_has_no_path_bound` |
 | 路径白名单近似匹配 `mydocs/a.md`、`src/docsystem/a.md` | 拒绝 | `planning_document_detection_is_a_whitelist_and_fails_closed` |
 | 拒绝消息内容 | 含 `write_file` 与 `docs/` | `review_denial_names_the_route_instead_of_only_saying_no` |
-| 只读回合的工具清单 | `write_file`/`edit_file` 可见且描述含路径约束 | `review_turns_expose_the_write_tools_scoped_to_documents` |
+| 明确只分析时的工具清单 | `write_file`/`edit_file` 可见且描述含路径约束 | `review_turns_expose_the_write_tools_scoped_to_documents` |
 | 三种 mode 的系统提示 | 含长方案落盘契约 | `a_long_plan_is_persisted_as_a_document_instead_of_flattened_into_chat` |
 
 ## 兼容与迁移

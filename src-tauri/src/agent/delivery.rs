@@ -33,6 +33,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -209,6 +210,21 @@ pub struct DeliveryPr {
     pub body: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeObservation {
+    OpenSameHead { auto_merge: bool },
+    Merged { merge_sha: String },
+    ClosedUnmerged,
+    HeadChanged { actual_head: String },
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeRequestResult {
+    Queued,
+    Merged { merge_sha: String },
+}
+
 /// CI conclusion for a commit.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CiStatus {
@@ -217,6 +233,31 @@ pub enum CiStatus {
     Pending,
     /// No CI is configured for this commit — treated as "not blocking".
     None,
+}
+
+/// GitHub creates check suites asynchronously after a PR opens. A single
+/// terminal-looking snapshot can therefore be empty or contain only an early
+/// subset of required checks. Require the exact terminal fingerprint twice;
+/// any changed set restarts stabilization.
+#[derive(Default)]
+struct CiObservationStability {
+    candidate: Mutex<Option<String>>,
+}
+
+impl CiObservationStability {
+    fn confirm(&self, fingerprint: &str, status: CiStatus) -> CiStatus {
+        if matches!(status, CiStatus::Pending | CiStatus::Failure(_)) {
+            *self.candidate.lock().expect("ci stability mutex poisoned") = None;
+            return status;
+        }
+        let mut candidate = self.candidate.lock().expect("ci stability mutex poisoned");
+        if candidate.as_deref() == Some(fingerprint) {
+            status
+        } else {
+            *candidate = Some(fingerprint.to_string());
+            CiStatus::Pending
+        }
+    }
 }
 
 /// A deployment/live observer must distinguish an actual successful assertion
@@ -367,7 +408,15 @@ pub trait DeliveryRemote {
         number: u64,
         method: MergeMethod,
         commit_message: Option<&MergeCommitMessage>,
-    ) -> impl std::future::Future<Output = Result<(), String>>;
+        expected_head: &str,
+    ) -> impl std::future::Future<Output = Result<MergeRequestResult, String>>;
+    fn observe_merge(
+        &self,
+        _number: u64,
+        _expected_head: &str,
+    ) -> impl std::future::Future<Output = Result<MergeObservation, String>> {
+        std::future::ready(Ok(MergeObservation::Unsupported))
+    }
     fn trigger_release(&self) -> impl std::future::Future<Output = Result<String, String>>;
 
     /// Observe the external CD platform (Zeabur, Vercel, Argo CD, etc.).
@@ -510,7 +559,12 @@ fn read_delivery_receipt(repo: &RepoContext, sha: &str) -> Result<Option<Deliver
     }
     if !matches!(
         receipt.state.as_str(),
-        "pr_open" | "intent_merge" | "merged" | "intent_release" | "release_triggered"
+        "pr_open"
+            | "intent_merge"
+            | "merge_queued"
+            | "merged"
+            | "intent_release"
+            | "release_triggered"
     ) {
         return Err(format!(
             "本地交付回执状态 {} 无法识别，拒绝重复外部动作",
@@ -1262,8 +1316,78 @@ pub async fn deliver<R: DeliveryRemote>(
             return outcome.blocked_at(StepResult::blocked("receipt", error));
         }
     };
-    if let Some(receipt) = prior_receipt.as_ref() {
-        if matches!(receipt.state.as_str(), "intent_merge" | "intent_release") {
+    if let Some(receipt) = prior_receipt.clone() {
+        if matches!(receipt.state.as_str(), "intent_merge" | "merge_queued") {
+            match remote.observe_merge(receipt.pr_number, &sha).await {
+                Ok(MergeObservation::Merged { merge_sha }) => {
+                    let mut reconciled = receipt.clone();
+                    reconciled.state = "merged".into();
+                    if let Err(error) = write_delivery_receipt(&repo, &sha, &reconciled) {
+                        return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                            "receipt",
+                            format!(
+                                "远端确认 PR/MR #{} 已合并为 {merge_sha}，但本地回执升级失败: {error}",
+                                receipt.pr_number
+                            ),
+                        ));
+                    }
+                    outcome.steps.push(StepResult::ok(
+                        "reconcile",
+                        format!(
+                            "已核对远端: PR/MR #{} 已合并为 {merge_sha}",
+                            receipt.pr_number
+                        ),
+                    ));
+                    prior_receipt = Some(reconciled);
+                }
+                Ok(MergeObservation::OpenSameHead { auto_merge }) => {
+                    let mut retryable = receipt.clone();
+                    retryable.state = "pr_open".into();
+                    if let Err(error) = write_delivery_receipt(&repo, &sha, &retryable) {
+                        return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                            "receipt",
+                            format!("远端确认 PR 仍开放，但无法把写前回执恢复为可续接状态: {error}"),
+                        ));
+                    }
+                    outcome.steps.push(StepResult::ok(
+                        "reconcile",
+                        if auto_merge {
+                            format!("PR/MR #{} 仍开放且 auto-merge 已登记；继续核对门禁", receipt.pr_number)
+                        } else {
+                            format!("PR/MR #{} 仍开放且 head 未变化；安全续接受控合并", receipt.pr_number)
+                        },
+                    ));
+                    prior_receipt = Some(retryable);
+                }
+                Ok(MergeObservation::HeadChanged { actual_head }) => {
+                    return outcome.blocked_at(StepResult::blocked(
+                        "reconcile",
+                        format!(
+                            "PR/MR #{} head 已变化: 回执绑定 {sha}，远端为 {actual_head}；旧授权不能用于新 head",
+                            receipt.pr_number
+                        ),
+                    ));
+                }
+                Ok(MergeObservation::ClosedUnmerged) => {
+                    return outcome.blocked_at(StepResult::blocked(
+                        "reconcile",
+                        format!("PR/MR #{} 已关闭但未合并；未重试外部动作", receipt.pr_number),
+                    ));
+                }
+                Ok(MergeObservation::Unsupported) => {
+                    return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                        "reconcile",
+                        format!("当前 provider 无法核对 PR/MR #{} 的 merge 状态", receipt.pr_number),
+                    ));
+                }
+                Err(error) => {
+                    return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                        "reconcile",
+                        format!("核对 PR/MR #{} 的远端 merge 状态失败: {error}", receipt.pr_number),
+                    ));
+                }
+            }
+        } else if receipt.state == "intent_release" {
             return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                 "receipt",
                 format!(
@@ -1511,17 +1635,35 @@ pub async fn deliver<R: DeliveryRemote>(
                 format!("合并前无法写入本地意图回执，未执行合并: {error}"),
             ));
         }
-        if let Err(e) = remote
+        let merge_result = match remote
             .merge_pr(
                 pr_number,
                 merge_method,
                 release_policy.merge_commit_message.as_ref(),
+                &sha,
             )
             .await
         {
-            return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+            Ok(result) => result,
+            Err(e) => {
+                return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                    "merge",
+                    format!("合并请求返回失败: {e}(服务端可能已接收；已保留 intent_merge 回执，下一次将先核对远端事实)。"),
+                ));
+            }
+        };
+        if matches!(merge_result, MergeRequestResult::Queued) {
+            let mut queued = intent.clone();
+            queued.state = "merge_queued".into();
+            if let Err(error) = write_delivery_receipt(&repo, &sha, &queued) {
+                return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                    "receipt",
+                    format!("GitHub 已登记 auto-merge，但 merge_queued 回执写入失败: {error}"),
+                ));
+            }
+            return outcome.blocked_at(StepResult::blocked(
                 "merge",
-                format!("合并请求返回失败: {e}(服务端可能已接收；已保留 intent_merge 回执)。"),
+                "GitHub 已登记受规则保护的 auto-merge；PR 仍在等待远端门禁，后续续接会先核对远端状态",
             ));
         }
         outcome.steps.push(StepResult::ok(
@@ -2232,13 +2374,15 @@ impl DeliveryRemote for HookRemote {
         number: u64,
         method: MergeMethod,
         commit_message: Option<&MergeCommitMessage>,
-    ) -> Result<(), String> {
+        expected_head: &str,
+    ) -> Result<MergeRequestResult, String> {
         let value = self.run_json(json!({
             "action": "merge_pr",
             "number": number,
             "method": method.as_str(),
             "commit_title": commit_message.map(|message| message.title.as_str()),
             "commit_body": commit_message.map(|message| message.body.as_str()),
+            "expected_head": expected_head,
         }))?;
         let _response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
             format!(
@@ -2246,7 +2390,9 @@ impl DeliveryRemote for HookRemote {
                 self.id
             )
         })?;
-        Ok(())
+        Ok(MergeRequestResult::Merged {
+            merge_sha: String::new(),
+        })
     }
 
     async fn trigger_release(&self) -> Result<String, String> {
@@ -2436,6 +2582,7 @@ fn gh_pr_merge_args(
     number: u64,
     method: MergeMethod,
     commit_message: Option<&MergeCommitMessage>,
+    expected_head: &str,
 ) -> Vec<String> {
     let flag = match method {
         MergeMethod::Squash => "--squash",
@@ -2453,6 +2600,11 @@ fn gh_pr_merge_args(
             ]);
         }
     }
+    args.extend([
+        "--auto".into(),
+        "--match-head-commit".into(),
+        expected_head.into(),
+    ]);
     args
 }
 
@@ -2474,6 +2626,7 @@ pub struct GhCliRemote {
     repo: String,
     default_branch: String,
     release_workflow: String,
+    ci_stability: CiObservationStability,
 }
 
 /// Build a [`GhCliRemote`] for `cwd` when it is a GitHub checkout. Does not
@@ -2490,6 +2643,7 @@ pub fn gh_remote_for(cwd: &Path) -> Option<GhCliRemote> {
         repo,
         default_branch,
         release_workflow: "auto-release.yml".to_string(),
+        ci_stability: CiObservationStability::default(),
     })
 }
 
@@ -2505,6 +2659,65 @@ impl GhCliRemote {
         } else {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
+    }
+
+    fn merge_observation(
+        &self,
+        number: u64,
+        expected_head: &str,
+    ) -> Result<MergeObservation, String> {
+        let raw = self.gh(&[
+            "pr".into(),
+            "view".into(),
+            number.to_string(),
+            "--json".into(),
+            "state,headRefOid,mergeCommit,autoMergeRequest".into(),
+        ])?;
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|error| format!("gh pr view merge state returned non-JSON: {error}"))?;
+        parse_github_merge_observation(&value, expected_head)
+    }
+}
+
+fn parse_github_merge_observation(
+    value: &serde_json::Value,
+    expected_head: &str,
+) -> Result<MergeObservation, String> {
+    let actual_head = value
+        .get("headRefOid")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if !actual_head.is_empty() && actual_head != expected_head {
+        return Ok(MergeObservation::HeadChanged { actual_head });
+    }
+    match value
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "MERGED" => {
+            let merge_sha = value
+                .get("mergeCommit")
+                .and_then(|merge| merge.get("oid"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if merge_sha.is_empty() {
+                Err("GitHub reports MERGED but returned no merge commit SHA".into())
+            } else {
+                Ok(MergeObservation::Merged { merge_sha })
+            }
+        }
+        "OPEN" => Ok(MergeObservation::OpenSameHead {
+            auto_merge: value
+                .get("autoMergeRequest")
+                .is_some_and(|request| !request.is_null()),
+        }),
+        "CLOSED" => Ok(MergeObservation::ClosedUnmerged),
+        other => Err(format!("unknown GitHub PR state '{other}'")),
     }
 }
 
@@ -2591,26 +2804,26 @@ impl DeliveryRemote for GhCliRemote {
         ])?;
         let v: serde_json::Value =
             serde_json::from_str(&raw).map_err(|e| format!("check-runs non-JSON: {e}"))?;
-        let runs = v["check_runs"].as_array().cloned().unwrap_or_default();
-        if runs.is_empty() {
-            return Ok(CiStatus::None);
-        }
-        let mut pending = false;
-        for run in &runs {
-            let status = run["status"].as_str().unwrap_or("");
-            let conclusion = run["conclusion"].as_str().unwrap_or("");
-            if status != "completed" {
-                pending = true;
-            } else if !matches!(conclusion, "success" | "skipped" | "neutral") {
-                let name = run["name"].as_str().unwrap_or("check");
-                return Ok(CiStatus::Failure(format!("{name}: {conclusion}")));
-            }
-        }
-        Ok(if pending {
-            CiStatus::Pending
-        } else {
-            CiStatus::Success
-        })
+        let rules = self
+            .gh(&[
+                "api".into(),
+                format!(
+                    "repos/{}/rules/branches/{}",
+                    self.repo, self.default_branch
+                ),
+            ])
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let required = crate::git_remote::github::parse_required_status_checks(&rules);
+        let observation = crate::git_remote::github::classify_ci_observation(&v, &required);
+        let status = match observation.status.as_str() {
+            "success" => CiStatus::Success,
+            "pending" => CiStatus::Pending,
+            "none" => CiStatus::None,
+            other => CiStatus::Failure(other.trim_start_matches("failure:").to_string()),
+        };
+        Ok(self.ci_stability.confirm(&observation.fingerprint, status))
     }
 
     async fn merge_pr(
@@ -2618,26 +2831,44 @@ impl DeliveryRemote for GhCliRemote {
         number: u64,
         method: MergeMethod,
         commit_message: Option<&MergeCommitMessage>,
-    ) -> Result<(), String> {
-        self.gh(&gh_pr_merge_args(number, method, commit_message))?;
+        expected_head: &str,
+    ) -> Result<MergeRequestResult, String> {
+        if let MergeObservation::Merged { merge_sha } =
+            self.merge_observation(number, expected_head)?
+        {
+            return Ok(MergeRequestResult::Merged { merge_sha });
+        }
+        self.gh(&gh_pr_merge_args(
+            number,
+            method,
+            commit_message,
+            expected_head,
+        ))?;
+        let observation = self.merge_observation(number, expected_head)?;
+        let merge_sha = match observation {
+            MergeObservation::Merged { merge_sha } => merge_sha,
+            MergeObservation::OpenSameHead { auto_merge: true } => {
+                return Ok(MergeRequestResult::Queued)
+            }
+            MergeObservation::OpenSameHead { auto_merge: false } => {
+                return Err("GitHub accepted gh pr merge but neither merged nor registered auto-merge".into())
+            }
+            MergeObservation::HeadChanged { actual_head } => {
+                return Err(format!(
+                    "PR head changed during merge: expected {expected_head}, actual {actual_head}"
+                ))
+            }
+            MergeObservation::ClosedUnmerged => return Err("PR closed without merge".into()),
+            MergeObservation::Unsupported => {
+                return Err("GitHub merge observation unexpectedly unsupported".into())
+            }
+        };
         if method != MergeMethod::Squash {
-            return Ok(());
+            return Ok(MergeRequestResult::Merged { merge_sha });
         }
         let Some(expected_message) = commit_message.map(|message| message.body.as_str()) else {
-            return Ok(());
+            return Ok(MergeRequestResult::Merged { merge_sha });
         };
-        let merge_sha = self.gh(&[
-            "pr".into(),
-            "view".into(),
-            number.to_string(),
-            "--json".into(),
-            "mergeCommit".into(),
-            "--jq".into(),
-            ".mergeCommit.oid".into(),
-        ])?;
-        if merge_sha.trim().is_empty() {
-            return Err("squash merge succeeded but GitHub returned no merge commit SHA".into());
-        }
         let merged_message = self.gh(&[
             "api".into(),
             format!("repos/{}/commits/{merge_sha}", self.repo),
@@ -2651,7 +2882,15 @@ impl DeliveryRemote for GhCliRemote {
                 missing.join(", ")
             ));
         }
-        Ok(())
+        Ok(MergeRequestResult::Merged { merge_sha })
+    }
+
+    async fn observe_merge(
+        &self,
+        number: u64,
+        expected_head: &str,
+    ) -> Result<MergeObservation, String> {
+        self.merge_observation(number, expected_head)
     }
 
     async fn trigger_release(&self) -> Result<String, String> {
@@ -2709,12 +2948,33 @@ impl DeliveryRemote for EitherRemote {
         number: u64,
         method: MergeMethod,
         commit_message: Option<&MergeCommitMessage>,
-    ) -> Result<(), String> {
+        expected_head: &str,
+    ) -> Result<MergeRequestResult, String> {
         match self {
-            EitherRemote::Hook(r) => r.merge_pr(number, method, commit_message).await,
-            EitherRemote::Gh(r) => r.merge_pr(number, method, commit_message).await,
-            EitherRemote::Github(r) => r.merge_pr(number, method, commit_message).await,
-            EitherRemote::Gitlab(r) => r.merge_pr(number, method, commit_message).await,
+            EitherRemote::Hook(r) => r
+                .merge_pr(number, method, commit_message, expected_head)
+                .await,
+            EitherRemote::Gh(r) => r
+                .merge_pr(number, method, commit_message, expected_head)
+                .await,
+            EitherRemote::Github(r) => r
+                .merge_pr(number, method, commit_message, expected_head)
+                .await,
+            EitherRemote::Gitlab(r) => r
+                .merge_pr(number, method, commit_message, expected_head)
+                .await,
+        }
+    }
+    async fn observe_merge(
+        &self,
+        number: u64,
+        expected_head: &str,
+    ) -> Result<MergeObservation, String> {
+        match self {
+            EitherRemote::Hook(r) => r.observe_merge(number, expected_head).await,
+            EitherRemote::Gh(r) => r.observe_merge(number, expected_head).await,
+            EitherRemote::Github(r) => r.observe_merge(number, expected_head).await,
+            EitherRemote::Gitlab(r) => r.observe_merge(number, expected_head).await,
         }
     }
     async fn trigger_release(&self) -> Result<String, String> {
@@ -2804,6 +3064,7 @@ pub struct GithubRemote {
     repo: String,
     default_branch: String,
     release_workflow: String,
+    ci_stability: CiObservationStability,
 }
 
 /// Extract `owner/name` from a GitHub remote URL (https or ssh).
@@ -3034,6 +3295,7 @@ pub fn github_remote_for(
         repo: owner_repo,
         default_branch,
         release_workflow: "auto-release.yml".to_string(),
+        ci_stability: CiObservationStability::default(),
     })
 }
 
@@ -3122,8 +3384,13 @@ impl DeliveryRemote for GitlabRemote {
         number: u64,
         method: MergeMethod,
         _commit_message: Option<&MergeCommitMessage>,
-    ) -> Result<(), String> {
-        crate::git_remote::gitlab::merge_pr(&self.client, &self.repo, number, method.as_str()).await
+        _expected_head: &str,
+    ) -> Result<MergeRequestResult, String> {
+        crate::git_remote::gitlab::merge_pr(&self.client, &self.repo, number, method.as_str())
+            .await?;
+        Ok(MergeRequestResult::Merged {
+            merge_sha: String::new(),
+        })
     }
 
     async fn trigger_release(&self) -> Result<String, String> {
@@ -3180,13 +3447,20 @@ impl DeliveryRemote for GithubRemote {
     }
 
     async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
-        let s = crate::git_remote::github::ci_status(&self.client, &self.repo, sha).await?;
-        Ok(match s.as_str() {
+        let observation = crate::git_remote::github::ci_observation(
+            &self.client,
+            &self.repo,
+            sha,
+            &self.default_branch,
+        )
+        .await?;
+        let status = match observation.status.as_str() {
             "success" => CiStatus::Success,
             "pending" => CiStatus::Pending,
             "none" => CiStatus::None,
             other => CiStatus::Failure(other.trim_start_matches("failure:").to_string()),
-        })
+        };
+        Ok(self.ci_stability.confirm(&observation.fingerprint, status))
     }
 
     async fn merge_pr(
@@ -3194,16 +3468,63 @@ impl DeliveryRemote for GithubRemote {
         number: u64,
         method: MergeMethod,
         commit_message: Option<&MergeCommitMessage>,
-    ) -> Result<(), String> {
-        crate::git_remote::github::merge_pr(
+        expected_head: &str,
+    ) -> Result<MergeRequestResult, String> {
+        let merge_sha = crate::git_remote::github::merge_pr(
             &self.client,
             &self.repo,
             number,
             method.as_str(),
             commit_message.map(|message| message.title.as_str()),
             commit_message.map(|message| message.body.as_str()),
+            expected_head,
         )
-        .await
+        .await?;
+        Ok(MergeRequestResult::Merged { merge_sha })
+    }
+
+    async fn observe_merge(
+        &self,
+        number: u64,
+        expected_head: &str,
+    ) -> Result<MergeObservation, String> {
+        let value = self
+            .client
+            .get(&format!("/repos/{}/pulls/{number}", self.repo))
+            .await?;
+        let actual_head = value
+            .get("head")
+            .and_then(|head| head.get("sha"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if !actual_head.is_empty() && actual_head != expected_head {
+            return Ok(MergeObservation::HeadChanged { actual_head });
+        }
+        if value
+            .get("merged")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let merge_sha = value
+                .get("merge_commit_sha")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if merge_sha.is_empty() {
+                return Err("GitHub reports merged but returned no merge commit SHA".into());
+            }
+            return Ok(MergeObservation::Merged { merge_sha });
+        }
+        match value
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+        {
+            "open" => Ok(MergeObservation::OpenSameHead { auto_merge: false }),
+            "closed" => Ok(MergeObservation::ClosedUnmerged),
+            other => Err(format!("unknown GitHub PR state '{other}'")),
+        }
     }
 
     async fn trigger_release(&self) -> Result<String, String> {
@@ -3509,7 +3830,12 @@ mod tests {
             title: "fix: preserve release policy".into(),
             body: "Release-Urgency: hold".into(),
         };
-        let merge = gh_pr_merge_args(42, MergeMethod::Squash, Some(&merge_message));
+        let merge = gh_pr_merge_args(
+            42,
+            MergeMethod::Squash,
+            Some(&merge_message),
+            "abc123",
+        );
         assert_eq!(
             merge,
             vec![
@@ -3521,12 +3847,110 @@ mod tests {
                 "fix: preserve release policy",
                 "--body",
                 "Release-Urgency: hold",
+                "--auto",
+                "--match-head-commit",
+                "abc123",
             ]
         );
+        assert!(!merge.iter().any(|arg| arg == "--admin"));
         let release = gh_workflow_run_args("auto-release.yml", "main");
         assert_eq!(
             release,
             vec!["workflow", "run", "auto-release.yml", "--ref", "main"]
+        );
+    }
+
+    #[test]
+    fn github_ci_terminal_observation_must_be_stable_before_green() {
+        let stability = CiObservationStability::default();
+        assert_eq!(stability.confirm("none", CiStatus::None), CiStatus::Pending);
+        assert_eq!(stability.confirm("none", CiStatus::None), CiStatus::None);
+        assert_eq!(
+            stability.confirm("governance:success", CiStatus::Success),
+            CiStatus::Pending
+        );
+        assert_eq!(
+            stability.confirm(
+                "agent:success|check:success|governance:success|gui:success",
+                CiStatus::Success,
+            ),
+            CiStatus::Pending
+        );
+        assert_eq!(
+            stability.confirm(
+                "agent:success|check:success|governance:success|gui:success",
+                CiStatus::Success,
+            ),
+            CiStatus::Success
+        );
+    }
+
+    #[test]
+    fn github_ci_stays_pending_until_every_effective_required_check_is_present() {
+        let rules = serde_json::json!([{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": "agent-bridge-linux", "integration_id": 15368},
+                {"context": "check", "integration_id": 15368},
+                {"context": "governance-baseline", "integration_id": 15368},
+                {"context": "remote-real-app-gui", "integration_id": 15368}
+            ]}
+        }]);
+        let required = crate::git_remote::github::parse_required_status_checks(&rules);
+        let partial = serde_json::json!({"check_runs": [{
+            "name": "governance-baseline",
+            "status": "completed",
+            "conclusion": "success",
+            "app": {"id": 15368}
+        }]});
+        let observation =
+            crate::git_remote::github::classify_ci_observation(&partial, &required);
+        assert_eq!(observation.status, "pending");
+        assert!(observation.fingerprint.contains("check:absent"));
+
+        let complete = serde_json::json!({"check_runs": required.iter().map(|check| {
+            serde_json::json!({
+                "name": check.context,
+                "status": "completed",
+                "conclusion": "success",
+                "app": {"id": check.integration_id}
+            })
+        }).collect::<Vec<_>>()});
+        assert_eq!(
+            crate::git_remote::github::classify_ci_observation(&complete, &required).status,
+            "success"
+        );
+    }
+
+    #[test]
+    fn github_merge_observation_binds_state_to_the_expected_head() {
+        let queued = serde_json::json!({
+            "state": "OPEN",
+            "headRefOid": "abc123",
+            "mergeCommit": null,
+            "autoMergeRequest": {"enabledAt": "2026-08-03T00:00:00Z"}
+        });
+        assert_eq!(
+            parse_github_merge_observation(&queued, "abc123").unwrap(),
+            MergeObservation::OpenSameHead { auto_merge: true }
+        );
+        assert_eq!(
+            parse_github_merge_observation(&queued, "different").unwrap(),
+            MergeObservation::HeadChanged {
+                actual_head: "abc123".into()
+            }
+        );
+        let merged = serde_json::json!({
+            "state": "MERGED",
+            "headRefOid": "abc123",
+            "mergeCommit": {"oid": "merge456"},
+            "autoMergeRequest": null
+        });
+        assert_eq!(
+            parse_github_merge_observation(&merged, "abc123").unwrap(),
+            MergeObservation::Merged {
+                merge_sha: "merge456".into()
+            }
         );
     }
 
@@ -3978,7 +4402,7 @@ else:
         assert_eq!(pr.body, "body");
         assert_eq!(remote.ci_status("abc123").await.unwrap(), CiStatus::Success);
         remote
-            .merge_pr(42, MergeMethod::Squash, None)
+            .merge_pr(42, MergeMethod::Squash, None, "abc123")
             .await
             .unwrap();
         assert_eq!(
@@ -4228,14 +4652,30 @@ else:
             _n: u64,
             _m: MergeMethod,
             commit_message: Option<&MergeCommitMessage>,
-        ) -> Result<(), String> {
+            _expected_head: &str,
+        ) -> Result<MergeRequestResult, String> {
             self.calls.merge.fetch_add(1, Ordering::SeqCst);
             *self.calls.merge_commit_message.lock().unwrap() = commit_message.cloned();
             if self.merge_ok {
                 self.calls.merged.store(true, Ordering::SeqCst);
-                Ok(())
+                Ok(MergeRequestResult::Merged {
+                    merge_sha: "merge-sha".into(),
+                })
             } else {
                 Err("protected branch".into())
+            }
+        }
+        async fn observe_merge(
+            &self,
+            _number: u64,
+            _expected_head: &str,
+        ) -> Result<MergeObservation, String> {
+            if self.calls.merged.load(Ordering::SeqCst) {
+                Ok(MergeObservation::Merged {
+                    merge_sha: "merge-sha".into(),
+                })
+            } else {
+                Ok(MergeObservation::OpenSameHead { auto_merge: false })
             }
         }
         async fn trigger_release(&self) -> Result<String, String> {
@@ -4937,16 +5377,15 @@ Release-Urgency: hold"
     }
 
     #[tokio::test]
-    async fn write_ahead_intent_blocks_automatic_external_retry() {
-        for state in ["intent_merge", "intent_release"] {
-            let root = feature_branch_repo(state);
+    async fn merge_intent_reconciles_open_same_head_and_resumes_safely() {
+            let root = feature_branch_repo("intent-merge-reconcile");
             git(&root, &["add", "feature.rs"]).unwrap();
             git(&root, &["commit", "-q", "-m", "feature"]).unwrap();
             let repo = resolve_repo(&root, Some("main")).unwrap();
             let sha = git(&root, &["rev-parse", "HEAD"]).unwrap();
             let receipt = DeliveryReceipt {
                 version: 1,
-                state: state.into(),
+                state: "intent_merge".into(),
                 remote: repo.remote.clone(),
                 remote_identity: receipt_remote_identity(&repo),
                 base_branch: repo.default_branch.clone(),
@@ -4969,7 +5408,7 @@ Release-Urgency: hold"
             };
             let out = deliver(
                 &root,
-                DeliveryCeiling::ThroughRelease,
+                DeliveryCeiling::ThroughMerge,
                 MergeMethod::Squash,
                 5,
                 &DeliverOpts::default(),
@@ -4977,13 +5416,60 @@ Release-Urgency: hold"
                 Some("main"),
             )
             .await;
-            assert_eq!(out.final_state, "blocked");
-            assert!(!out.recoverable);
-            assert_eq!(out.code, "delivery_external_state_uncertain");
-            assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
+            assert_eq!(out.final_state, "delivered", "{:?}", out.steps);
+            assert_eq!(out.reached_state, "merged");
+            assert_eq!(calls.merge.load(Ordering::SeqCst), 1);
             assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+            assert!(out.steps.iter().any(|step| {
+                step.step == "reconcile" && step.detail.contains("安全续接")
+            }));
             let _ = std::fs::remove_dir_all(root.parent().unwrap());
-        }
+    }
+
+    #[tokio::test]
+    async fn release_intent_stays_fail_closed_until_release_observation_exists() {
+        let root = feature_branch_repo("intent-release-closed");
+        git(&root, &["add", "feature.rs"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "feature"]).unwrap();
+        let repo = resolve_repo(&root, Some("main")).unwrap();
+        let sha = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let receipt = DeliveryReceipt {
+            version: 1,
+            state: "intent_release".into(),
+            remote: repo.remote.clone(),
+            remote_identity: receipt_remote_identity(&repo),
+            base_branch: repo.default_branch.clone(),
+            head_branch: repo.branch.clone(),
+            commit_sha: sha.clone(),
+            pr_number: 7,
+            pr_url: "https://example/pr/7".into(),
+            pr_title: None,
+            pr_body: None,
+            release_detail: None,
+        };
+        write_delivery_receipt(&repo, &sha, &receipt).unwrap();
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let out = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+        assert_eq!(out.final_state, "blocked");
+        assert_eq!(out.code, "delivery_external_state_uncertain");
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
     #[tokio::test]
