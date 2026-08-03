@@ -86,7 +86,9 @@ pub mod sandbox {
         }
     }
 
-    /// Cheap liveness probe for the container runtime binary.
+    /// Cheap liveness probe for the container runtime binary. Answers "is the
+    /// CLI installed", NOT "can this machine actually run a container" — see
+    /// `daemon_available` for that.
     pub fn runtime_available(program: &str) -> bool {
         std::process::Command::new(program)
             .no_window()
@@ -97,6 +99,48 @@ pub mod sandbox {
             .map(|status| status.success())
             .unwrap_or(false)
     }
+
+    /// Reachability probe for the container runtime *daemon*: `docker info`
+    /// succeeds only when the client can actually talk to a running daemon.
+    /// `--version` answers a different question and stays green on the very
+    /// common developer setup where Docker Desktop or Colima is installed but
+    /// stopped, so anything about to really run a container must ask this.
+    ///
+    /// Bounded: a wedged or still-booting daemon can leave `info` hanging, and
+    /// a probe that never returns is worse than one that says "not reachable".
+    ///
+    /// Test-gated for now: only the real-runtime smoke needs it. The live path
+    /// deliberately keeps the cheaper presence check so it doesn't pay for an
+    /// extra `docker info` round trip on every sandboxed command.
+    #[cfg(test)]
+    pub fn daemon_available(program: &str) -> bool {
+        let Ok(mut child) = std::process::Command::new(program)
+            .no_window()
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+
+        let deadline = std::time::Instant::now() + DAEMON_PROBE_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(_) => return false,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    const DAEMON_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 }
 
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
@@ -267,17 +311,29 @@ mod tests {
         assert_eq!(settings.sandbox_image, "ubuntu:24.04");
     }
 
-    /// Real-runtime smoke: only meaningful on a machine with docker; CI
-    /// runners without it skip. Runs a trivial command through the ACTUAL
-    /// docker wrapper and checks the output and that host paths don't leak
-    /// beyond the mounted project dir. Unix-only: Windows CI runners DO
-    /// ship docker, but sandbox mode itself reports unsupported there and
-    /// $HOME does not exist.
+    /// Real-runtime smoke: only meaningful on a machine that can actually run
+    /// a container; everywhere else it skips. Runs a trivial command through
+    /// the ACTUAL docker wrapper and checks the output and that host paths
+    /// don't leak beyond the mounted project dir. Unix-only: Windows CI
+    /// runners DO ship docker, but sandbox mode itself reports unsupported
+    /// there and $HOME does not exist.
+    ///
+    /// The guard checks daemon *reachability*, not just that the CLI is
+    /// installed: on a dev box with Docker Desktop or Colima installed but
+    /// stopped, a presence-only guard let this smoke through and it panicked
+    /// on the connection error instead of skipping.
     #[cfg(unix)]
     #[tokio::test]
     async fn docker_sandbox_executes_a_real_command_when_docker_is_present() {
         if !super::sandbox::runtime_available("docker") {
-            eprintln!("skipping docker sandbox smoke: docker not available");
+            eprintln!("skipping docker sandbox smoke: docker CLI not on PATH");
+            return;
+        }
+        if !super::sandbox::daemon_available("docker") {
+            eprintln!(
+                "skipping docker sandbox smoke: docker CLI is installed but the daemon is not \
+                 reachable — start it (Docker Desktop, or `colima start`) to really run this test"
+            );
             return;
         }
         // Under $HOME so the path sits inside Docker Desktop's default
@@ -315,6 +371,28 @@ mod tests {
             out.content
         );
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The regression the smoke guard above depends on: "the CLI is installed"
+    /// and "the daemon is reachable" are different questions, and a guard that
+    /// asks the first one panics on every machine where Docker Desktop or
+    /// Colima is installed but not started. `rustc` is a deterministic stand-in
+    /// for exactly that shape — it answers `--version` but has no `info`
+    /// subcommand — and is always present wherever this suite runs.
+    #[test]
+    fn daemon_probe_rejects_a_cli_that_answers_version_but_cannot_be_reached() {
+        assert!(
+            super::sandbox::runtime_available("rustc"),
+            "rustc must be present wherever cargo test runs"
+        );
+        assert!(
+            !super::sandbox::daemon_available("rustc"),
+            "presence of the binary must not be read as a reachable daemon"
+        );
+        // A missing binary is "not reachable", never a panic.
+        assert!(!super::sandbox::daemon_available(
+            "definitely-not-a-real-binary-xyz"
+        ));
     }
 
     #[test]
