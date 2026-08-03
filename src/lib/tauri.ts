@@ -312,6 +312,10 @@ export interface BrowserSession {
   kind?: "managed" | "attached_chrome";
   updated_at_unix_secs: number;
   expired: boolean;
+  status?: string | null;
+  pane_url?: string | null;
+  current_host?: string | null;
+  page_title?: string | null;
 }
 
 export function listBrowserSessions(): Promise<BrowserSession[]> {

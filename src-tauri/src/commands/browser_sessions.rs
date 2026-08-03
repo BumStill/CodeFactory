@@ -1,6 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::errors::AppError;
 use crate::tools::browser_session::{self, BrowserSessionView};
+use tauri::{Manager, WebviewUrl};
+
+#[derive(Debug, serde::Deserialize)]
+pub struct EmbeddedBrowserBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+fn embedded_label(session_id: &str) -> String {
+    let safe: String = session_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("embedded-browser-{safe}")
+}
+
+fn parse_https_url(url: &str) -> Result<url::Url, AppError> {
+    let parsed = url::Url::parse(url).map_err(|e| AppError::Other(format!("Invalid browser URL: {e}")))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed),
+        scheme => Err(AppError::Other(format!(
+            "Embedded browser only supports HTTP(S) URLs, got {scheme}"
+        ))),
+    }
+}
 
 #[tauri::command]
 pub async fn list_browser_sessions() -> Result<Vec<BrowserSessionView>, AppError> {
@@ -62,4 +89,75 @@ pub async fn browser_download_chromium(app: tauri::AppHandle) -> Result<serde_js
     .await
     .map_err(|error| AppError::Other(error.to_string()))?;
     Ok(serde_json::json!({"version": install.version}))
+}
+
+#[tauri::command]
+pub async fn embedded_browser_mount(
+    app: tauri::AppHandle,
+    session_id: String,
+    url: String,
+    bounds: EmbeddedBrowserBounds,
+) -> Result<(), AppError> {
+    let url = parse_https_url(&url)?;
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| AppError::Other("Main window is not available".into()))?;
+    let label = embedded_label(&session_id);
+    if let Some(webview) = window.webviews().into_iter().find(|w| w.label() == label) {
+        webview
+            .set_position(tauri::LogicalPosition::new(bounds.x, bounds.y))
+            .map_err(|e| AppError::Other(format!("Failed to move embedded browser: {e}")))?;
+        webview
+            .set_size(tauri::LogicalSize::new(bounds.width, bounds.height))
+            .map_err(|e| AppError::Other(format!("Failed to resize embedded browser: {e}")))?;
+        return Ok(());
+    }
+
+    let builder = tauri::webview::WebviewBuilder::new(label, WebviewUrl::External(url))
+        .on_navigation(|url| matches!(url.scheme(), "http" | "https"));
+    window
+        .add_child(
+            builder,
+            tauri::LogicalPosition::new(bounds.x, bounds.y),
+            tauri::LogicalSize::new(bounds.width, bounds.height),
+        )
+        .map_err(|e| AppError::Other(format!("Failed to mount embedded browser: {e}")))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn embedded_browser_resize(
+    app: tauri::AppHandle,
+    session_id: String,
+    bounds: EmbeddedBrowserBounds,
+) -> Result<(), AppError> {
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| AppError::Other("Main window is not available".into()))?;
+    let label = embedded_label(&session_id);
+    let webview = window
+        .webviews()
+        .into_iter()
+        .find(|w| w.label() == label)
+        .ok_or_else(|| AppError::Other("Embedded browser is not mounted".into()))?;
+    webview
+        .set_position(tauri::LogicalPosition::new(bounds.x, bounds.y))
+        .map_err(|e| AppError::Other(format!("Failed to move embedded browser: {e}")))?;
+    webview
+        .set_size(tauri::LogicalSize::new(bounds.width, bounds.height))
+        .map_err(|e| AppError::Other(format!("Failed to resize embedded browser: {e}")))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn embedded_browser_unmount(app: tauri::AppHandle, session_id: String) -> Result<(), AppError> {
+    if let Some(window) = app.get_window("main") {
+        let label = embedded_label(&session_id);
+        if let Some(webview) = window.webviews().into_iter().find(|w| w.label() == label) {
+            webview
+                .close()
+                .map_err(|e| AppError::Other(format!("Failed to close embedded browser: {e}")))?;
+        }
+    }
+    Ok(())
 }
