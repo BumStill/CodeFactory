@@ -159,21 +159,23 @@ pub async fn merge_pr(
     method: &str,
     commit_title: Option<&str>,
     commit_body: Option<&str>,
-) -> Result<(), String> {
+    expected_head: &str,
+) -> Result<String, String> {
     let path = format!("/repos/{}/pulls/{}/merge", repo, number);
-    let payload = merge_payload(method, commit_title, commit_body);
+    let mut payload = merge_payload(method, commit_title, commit_body);
+    payload["sha"] = Value::String(expected_head.to_string());
     let merged = client.put(&path, payload).await?;
 
-    if method != "squash" {
-        return Ok(());
-    }
-    let Some(expected_message) = commit_body else {
-        return Ok(());
-    };
     let sha = str_val(&merged, "sha");
     if sha.is_empty() {
-        return Err("squash merge succeeded but GitHub returned no merge commit SHA".into());
+        return Err("merge succeeded but GitHub returned no merge commit SHA".into());
     }
+    if method != "squash" {
+        return Ok(sha);
+    }
+    let Some(expected_message) = commit_body else {
+        return Ok(sha);
+    };
     let commit = client.get(&format!("/repos/{repo}/commits/{sha}")).await?;
     let message = commit
         .get("commit")
@@ -187,7 +189,7 @@ pub async fn merge_pr(
             missing.join(", ")
         ));
     }
-    Ok(())
+    Ok(sha)
 }
 
 fn merge_payload(method: &str, commit_title: Option<&str>, commit_body: Option<&str>) -> Value {
@@ -305,39 +307,148 @@ mod release_policy_tests {
     }
 }
 
-/// CI conclusion for a commit, from the GitHub Actions check-runs API.
-///   - any queued/in_progress            → "pending"
-///   - any failure/cancelled/timed_out   → "failure"
-///   - all success/neutral/skipped       → "success"
-///   - zero check runs                    → "none" (no CI configured)
-pub async fn ci_status(client: &RemoteGitClient, repo: &str, sha: &str) -> Result<String, String> {
-    let path = format!("/repos/{}/commits/{}/check-runs", repo, sha);
-    let v = client.get(&path).await?;
-    let runs = v
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiObservation {
+    pub status: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredStatusCheck {
+    pub context: String,
+    pub integration_id: Option<u64>,
+}
+
+pub(crate) fn parse_required_status_checks(value: &Value) -> Vec<RequiredStatusCheck> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|rule| rule.get("type").and_then(Value::as_str) == Some("required_status_checks"))
+        .flat_map(|rule| {
+            rule.get("parameters")
+                .and_then(|parameters| parameters.get("required_status_checks"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|check| {
+            let context = check.get("context").and_then(Value::as_str)?.to_string();
+            Some(RequiredStatusCheck {
+                context,
+                integration_id: check.get("integration_id").and_then(Value::as_u64),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn classify_ci_observation(
+    value: &Value,
+    required_checks: &[RequiredStatusCheck],
+) -> CiObservation {
+    let mut runs = value
         .get("check_runs")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if runs.is_empty() {
-        return Ok("none".into());
+    runs.sort_by_key(|run| str_val(run, "name"));
+    let run_identity = |run: &Value| {
+        (
+            str_val(run, "name"),
+            run.get("app")
+                .and_then(|app| app.get("id"))
+                .and_then(Value::as_u64),
+        )
+    };
+    let missing_required = required_checks
+        .iter()
+        .filter(|required| {
+            !runs.iter().any(|run| {
+                let (name, integration_id) = run_identity(run);
+                name == required.context
+                    && required
+                        .integration_id
+                        .map_or(true, |expected| integration_id == Some(expected))
+            })
+        })
+        .map(|required| format!("{}:absent", required.context))
+        .collect::<Vec<_>>();
+    let fingerprint = if runs.is_empty() && missing_required.is_empty() {
+        "none".to_string()
+    } else {
+        let mut parts = runs
+            .iter()
+            .map(|run| {
+                format!(
+                    "{}:{}:{}",
+                    str_val(run, "name"),
+                    str_val(run, "status"),
+                    str_val(run, "conclusion")
+                )
+            })
+            .collect::<Vec<_>>();
+        parts.extend(missing_required.iter().cloned());
+        parts.sort();
+        parts.join("|")
+    };
+    if runs.is_empty() && required_checks.is_empty() {
+        return CiObservation {
+            status: "none".into(),
+            fingerprint,
+        };
+    }
+    if !missing_required.is_empty() {
+        return CiObservation {
+            status: "pending".into(),
+            fingerprint,
+        };
     }
     let mut any_pending = false;
     for run in &runs {
-        let status = str_val(run, "status"); // queued | in_progress | completed
+        let status = str_val(run, "status");
         if status != "completed" {
             any_pending = true;
             continue;
         }
         match str_val(run, "conclusion").as_str() {
             "success" | "neutral" | "skipped" => {}
-            other => return Ok(format!("failure:{other}")),
+            other => {
+                return CiObservation {
+                    status: format!("failure:{other}"),
+                    fingerprint,
+                }
+            }
         }
     }
-    Ok(if any_pending {
-        "pending".into()
-    } else {
-        "success".into()
-    })
+    CiObservation {
+        status: if any_pending { "pending" } else { "success" }.into(),
+        fingerprint,
+    }
+}
+
+/// CI conclusion for a commit, from the GitHub Actions check-runs API.
+///   - any queued/in_progress            → "pending"
+///   - any failure/cancelled/timed_out   → "failure"
+///   - all success/neutral/skipped       → "success"
+///   - zero check runs                    → "none" (no CI configured)
+pub async fn ci_status(client: &RemoteGitClient, repo: &str, sha: &str) -> Result<String, String> {
+    Ok(ci_observation(client, repo, sha, "main").await?.status)
+}
+
+pub async fn ci_observation(
+    client: &RemoteGitClient,
+    repo: &str,
+    sha: &str,
+    base_branch: &str,
+) -> Result<CiObservation, String> {
+    let path = format!("/repos/{}/commits/{}/check-runs", repo, sha);
+    let value = client.get(&path).await?;
+    let rules = client
+        .get(&format!("/repos/{repo}/rules/branches/{base_branch}"))
+        .await
+        .unwrap_or(Value::Null);
+    let required = parse_required_status_checks(&rules);
+    Ok(classify_ci_observation(&value, &required))
 }
 
 pub async fn list_repos(client: &RemoteGitClient) -> Result<Vec<RemoteRepo>, String> {
