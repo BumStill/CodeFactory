@@ -537,6 +537,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "walkdir",
  "zip 4.6.1",

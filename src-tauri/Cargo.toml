@@ -18,7 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri        = { version = "2", features = ["protocol-asset"] }
+tauri        = { version = "2", features = ["protocol-asset", "unstable"] }
 tauri-plugin-shell   = "2"
 tauri-plugin-dialog  = "2"
 tauri-plugin-updater = "2"
@@ -59,6 +59,7 @@ anyhow   = "1"
 thiserror = "2"
 tempfile  = "3"
 uuid     = { version = "1", features = ["v4"] }
+url      = "2"
 chrono   = { version = "0.4", features = ["serde"] }
 iana-time-zone = "0.1"
 base64   = "0.22"

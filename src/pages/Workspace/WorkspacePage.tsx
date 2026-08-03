@@ -14,6 +14,8 @@ import {
   EyeOff,
   ListTodo,
   X,
+  Globe2,
+  ExternalLink,
 } from "lucide-react";
 import { MessageList } from "../../components/MessageList";
 import { MessageInput } from "../../components/MessageInput";
@@ -35,9 +37,33 @@ import { invoke } from "../../lib/tauri";
 import { useChatStore, activeRuntime } from "../../stores/chat";
 import { QueueBadge } from "../../components/QueueBadge";
 import { useTasksStore } from "../../stores/tasks";
-import type { TaskRun, VerificationResult } from "../../lib/tauri";
+import type { BrowserSession, TaskRun, VerificationResult } from "../../lib/tauri";
 import type { ExternalJobState, TurnTimingProfile } from "../../lib/chatPlan";
 import { parseVerification, verificationSummary } from "../../lib/verification";
+
+type WorkspaceBrowserSession = BrowserSession & {
+  status?: string | null;
+  pane_url?: string | null;
+  current_host?: string | null;
+  page_title?: string | null;
+};
+
+const BROWSER_PANE_DEFAULT_WIDTH = 38;
+
+function sessionHost(session: WorkspaceBrowserSession): string {
+  if (session.current_host) return session.current_host;
+  const url = session.pane_url;
+  if (!url) return "受管浏览器";
+  try {
+    return new URL(url).host || "受管浏览器";
+  } catch {
+    return "受管浏览器";
+  }
+}
+
+function sessionTitle(session: WorkspaceBrowserSession): string {
+  return session.page_title || sessionHost(session);
+}
 
 interface WorkspacePageProps {
   sessionId: string;
@@ -188,11 +214,60 @@ export function WorkspacePage({
     setTaskActivityOpen(false);
     requestAnimationFrame(() => taskActivityButtonRef.current?.focus());
   }, []);
+  const [browserSessions, setBrowserSessions] = useState<WorkspaceBrowserSession[]>([]);
+  const [browserLoadError, setBrowserLoadError] = useState<string | null>(null);
+  const [browserPaneCollapsed, setBrowserPaneCollapsed] = useState(false);
+  const browserPaneWidth = BROWSER_PANE_DEFAULT_WIDTH;
   const loadProjectTasks = useTasksStore((state) => state.loadTasks);
   const subscribeProjectTasks = useTasksStore((state) => state.subscribe);
   const isProjectSession = Boolean(
     activeSession && activeSession.kind !== "quick" && activeSession.kind !== "anonymous",
   );
+  const activeBrowserSessions = useMemo(
+    () =>
+      (Array.isArray(browserSessions) ? browserSessions : []).filter(
+        (session) =>
+          !session.expired &&
+          session.owner_session_id === sessionId &&
+          session.status !== "closed",
+      ),
+    [browserSessions, sessionId],
+  );
+  const browserPaneOpen = activeBrowserSessions.length > 0 && !browserPaneCollapsed;
+
+  useEffect(() => {
+    setBrowserPaneCollapsed(false);
+  }, [sessionId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshBrowserSessions = async () => {
+      try {
+        const sessions = await invoke<WorkspaceBrowserSession[]>("list_browser_sessions");
+        if (!cancelled) {
+          setBrowserSessions(Array.isArray(sessions) ? sessions : []);
+          setBrowserLoadError(null);
+        }
+      } catch (error) {
+        if (!cancelled) setBrowserLoadError(String(error));
+      }
+    };
+    void refreshBrowserSessions();
+    const timer = window.setInterval(() => {
+      void refreshBrowserSessions();
+    }, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [sessionId]);
+
+  const closeBrowserPaneSession = async (browserSessionId: string) => {
+    await invoke("close_browser_session", { sessionId: browserSessionId });
+    setBrowserSessions((sessions) =>
+      sessions.filter((session) => session.session_id !== browserSessionId),
+    );
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -457,7 +532,11 @@ export function WorkspacePage({
         )}
 
         {/* ─── Center: conversation remains the primary surface. ─────────── */}
-        <main aria-label="会话窗口" className="flex min-w-0 flex-1 flex-col bg-surface-2">
+        <main
+          aria-label="会话窗口"
+          data-browser-pane={browserPaneOpen ? "open" : "closed"}
+          className="flex min-w-0 flex-1 flex-col bg-surface-2"
+        >
           <MessageList
             messages={messages}
             streaming={streaming}
@@ -511,6 +590,16 @@ export function WorkspacePage({
             </div>
           </div>
         </main>
+
+        {browserPaneOpen && (
+          <EmbeddedBrowserPane
+            sessions={activeBrowserSessions}
+            widthPercent={browserPaneWidth}
+            loadError={browserLoadError}
+            onCollapse={() => setBrowserPaneCollapsed(true)}
+            onCloseSession={(browserSessionId) => void closeBrowserPaneSession(browserSessionId)}
+          />
+        )}
 
       </div>
 
@@ -573,6 +662,116 @@ export function WorkspacePage({
         />
       )}
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EmbeddedBrowserPane
+// ─────────────────────────────────────────────────────────────────────────────
+
+function EmbeddedBrowserPane({ sessions, widthPercent, loadError, onCollapse, onCloseSession }: {
+  sessions: WorkspaceBrowserSession[];
+  widthPercent: number;
+  loadError: string | null;
+  onCollapse: () => void;
+  onCloseSession: (sessionId: string) => void;
+}) {
+  const active = sessions[0];
+  if (!active) return null;
+  const host = sessionHost(active);
+  const title = sessionTitle(active);
+  const safeUrl = active.pane_url && /^https?:\/\//i.test(active.pane_url) ? active.pane_url : null;
+  const viewportRef = useRef<HTMLDivElement>(null);
+
+  const syncNativeWebView = useCallback(() => {
+    if (!safeUrl || !viewportRef.current) return;
+    const rect = viewportRef.current.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    void invoke("embedded_browser_mount", {
+      sessionId: active.session_id,
+      url: safeUrl,
+      bounds: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+    });
+  }, [active.session_id, safeUrl]);
+
+  useEffect(() => {
+    syncNativeWebView();
+    if (!safeUrl) return;
+    const onResize = () => syncNativeWebView();
+    window.addEventListener("resize", onResize);
+    const timer = window.setInterval(syncNativeWebView, 1000);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.clearInterval(timer);
+      void invoke("embedded_browser_unmount", { sessionId: active.session_id });
+    };
+  }, [active.session_id, safeUrl, syncNativeWebView]);
+
+  return (
+    <aside
+      aria-label="内置浏览器"
+      data-browser-width={String(widthPercent)}
+      className="hidden min-h-0 shrink-0 flex-col border-l border-border bg-surface-1 xl:flex"
+      style={{ width: `${widthPercent}%`, minWidth: 420, maxWidth: "50%" }}
+    >
+      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+        <Globe2 size={14} className="shrink-0 text-accent" aria-hidden="true" />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-xs font-medium text-gray-200">{host}</div>
+          <div className="truncate text-[11px] text-gray-500">{title}</div>
+        </div>
+        {sessions.length > 1 && (
+          <span className="rounded-full bg-accent/10 px-1.5 py-0.5 text-[11px] text-accent">
+            {sessions.length}
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={onCollapse}
+          className="rounded px-1.5 py-1 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
+          title="临时折叠浏览器"
+        >
+          折叠
+        </button>
+        <button
+          type="button"
+          onClick={() => onCloseSession(active.session_id)}
+          className="rounded bg-red-500/10 px-1.5 py-1 text-[11px] text-red-700 transition-colors hover:bg-red-500/20 dark:text-red-300"
+          aria-label="结束浏览器"
+          title="结束当前会话的受管浏览器"
+        >
+          结束
+        </button>
+      </div>
+      {loadError && (
+        <div className="border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-[11px] text-red-700 dark:text-red-300">
+          浏览器状态读取失败：{loadError}
+        </div>
+      )}
+      <div className="flex min-h-0 flex-1 flex-col bg-surface-0">
+        {safeUrl ? (
+          <div
+            ref={viewportRef}
+            role="application"
+            aria-label={`网页视图：${title}`}
+            className="relative min-h-0 flex-1 overflow-hidden bg-white"
+            data-codefactory-browser-session={active.session_id}
+          >
+            <div className="absolute inset-0 flex items-center justify-center bg-white text-xs text-gray-600">
+              正在内置浏览器中打开 {host}
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-1 items-center justify-center p-6 text-center text-xs text-gray-500">
+            <div>
+              <ExternalLink size={18} className="mx-auto mb-2 text-gray-600" aria-hidden="true" />
+              <p className="font-medium text-gray-300">受管浏览器已连接</p>
+              <p className="mt-1">等待页面地址；Agent 可继续读取和操作该会话。</p>
+            </div>
+          </div>
+        )}
+      </div>
+    </aside>
   );
 }
 

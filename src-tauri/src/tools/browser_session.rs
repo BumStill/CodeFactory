@@ -85,7 +85,19 @@ struct Lease {
     /// Which tab of the user's browser this session works with, if chosen.
     #[serde(default)]
     selected_tab: Option<i64>,
+    #[serde(default)]
+    pane_url: Option<String>,
+    #[serde(default)]
+    current_host: Option<String>,
+    #[serde(default)]
+    page_title: Option<String>,
+    #[serde(default = "default_session_status")]
+    status: String,
     updated_at_unix_secs: u64,
+}
+
+fn default_session_status() -> String {
+    "active".into()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,6 +108,10 @@ pub struct BrowserSessionView {
     pub kind: String,
     pub updated_at_unix_secs: u64,
     pub expired: bool,
+    pub status: String,
+    pub pane_url: Option<String>,
+    pub current_host: Option<String>,
+    pub page_title: Option<String>,
 }
 
 pub fn definition() -> ToolDefinition {
@@ -185,6 +201,10 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             owner_pid: std::process::id(),
             kind: session_kind,
             selected_tab: None,
+            pane_url: args.url.clone(),
+            current_host: args.url.as_deref().and_then(host_of),
+            page_title: None,
+            status: "active".into(),
             updated_at_unix_secs: now_secs(),
         });
     }
@@ -204,6 +224,14 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                 };
                 Ok(ToolOutput::ok(format!("{label}\n{output}")))
             } else {
+                let existing_lease = read_leases()
+                    .into_iter()
+                    .find(|lease| lease.session_id == session_id);
+                let pane_url = if args.action == "open" {
+                    args.url.clone()
+                } else {
+                    existing_lease.as_ref().and_then(|lease| lease.pane_url.clone())
+                };
                 write_lease(&Lease {
                     session_id: session_id.clone(),
                     task_id: ctx.task_id.clone(),
@@ -211,6 +239,10 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                     owner_pid: std::process::id(),
                     kind: session_kind,
                     selected_tab: selected_tab(&session_id),
+                    current_host: pane_url.as_deref().and_then(host_of),
+                    pane_url,
+                    page_title: existing_lease.and_then(|lease| lease.page_title),
+                    status: "active".into(),
                     updated_at_unix_secs: now_secs(),
                 });
                 let heading = match args.action.as_str() {
@@ -308,6 +340,10 @@ fn remember_selected_tab(session_id: &str, tab_id: i64, ctx: &ExecCtx, kind: Bro
         owner_pid: std::process::id(),
         kind,
         selected_tab: Some(tab_id),
+        pane_url: None,
+        current_host: None,
+        page_title: None,
+        status: "active".into(),
         updated_at_unix_secs: now_secs(),
     });
 }
@@ -526,6 +562,27 @@ async fn session_kind(ctx: &ExecCtx) -> SessionKind {
     }
 }
 
+fn npx_program() -> &'static str {
+    if cfg!(windows) {
+        "npx.cmd"
+    } else {
+        "npx"
+    }
+}
+
+fn output_reports_error(output: &str) -> bool {
+    let normalized = output.to_ascii_lowercase();
+    normalized.contains("### error") || normalized.contains("\nerror:")
+}
+
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = authority.split(':').next()?.trim().to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
 fn new_session_id(ctx: &ExecCtx) -> String {
     let owner = ctx
         .task_id
@@ -619,6 +676,10 @@ pub fn list_managed_sessions() -> Vec<BrowserSessionView> {
                 BrowserSessionKind::AttachedChrome => "attached_chrome".into(),
             },
             updated_at_unix_secs: lease.updated_at_unix_secs,
+            status: lease.status,
+            pane_url: lease.pane_url,
+            current_host: lease.current_host,
+            page_title: lease.page_title,
         })
         .collect();
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_unix_secs));
@@ -796,6 +857,10 @@ mod tests {
             owner_pid: std::process::id(),
             kind: BrowserSessionKind::Managed,
             selected_tab: None,
+            pane_url: Some("https://example.com/path".into()),
+            current_host: Some("example.com".into()),
+            page_title: None,
+            status: "active".into(),
             updated_at_unix_secs: 1_000,
         };
         assert!(!is_expired(&lease, 1_000 + LEASE_TTL.as_secs()));
@@ -825,6 +890,10 @@ mod tests {
             owner_pid: std::process::id(),
             kind: BrowserSessionKind::Managed,
             selected_tab: None,
+            pane_url: Some("https://example.com/task".into()),
+            current_host: Some("example.com".into()),
+            page_title: None,
+            status: "active".into(),
             updated_at_unix_secs: now_secs(),
         };
         let mut ctx = ExecCtx::new(std::env::temp_dir(), None);
