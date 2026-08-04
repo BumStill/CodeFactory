@@ -161,91 +161,138 @@ pub fn run_browser_session_smoke_cli() -> bool {
             std::process::exit(1);
         });
     let output_path = std::path::PathBuf::from(output);
-    let result = runtime.block_on(async {
-        let cwd = output_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf();
-        let owner_session_id = format!("browser-smoke-{}", uuid::Uuid::new_v4());
-        let ctx = tools::ExecCtx {
-            cwd,
-            app: None,
-            db: None,
-            session_id: Some(owner_session_id.clone()),
-            root_turn_id: None,
-            task_id: None,
-            knowledge_library_ids: None,
-            settings: None,
-        };
 
-        let opened = tools::browser_session::execute(
-            serde_json::json!({"action":"open","url":"https://example.com"}),
-            &ctx,
-        )
-        .await?;
-        if opened.is_error {
-            return Err(errors::AppError::Other(opened.content));
-        }
-        let session_id = opened
-            .content
-            .lines()
-            .find_map(|line| line.strip_prefix("Managed browser session: "))
-            .ok_or_else(|| errors::AppError::Other("smoke did not receive a session id".into()))?
-            .to_string();
+    // Both arms carry a receipt, because every exit from here has to leave one
+    // behind. Writing one only on the happy path is what left a red CI step
+    // saying nothing but "exited 1" — the reason went to stderr and the
+    // evidence file never existed.
+    let result: std::result::Result<serde_json::Value, serde_json::Value> =
+        runtime.block_on(async {
+            let cwd = output_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            let owner_session_id = format!("browser-smoke-{}", uuid::Uuid::new_v4());
+            let ctx = tools::ExecCtx {
+                cwd,
+                app: None,
+                db: None,
+                session_id: Some(owner_session_id.clone()),
+                root_turn_id: None,
+                task_id: None,
+                knowledge_library_ids: None,
+                settings: None,
+            };
 
-        let snapshot = tools::browser_session::execute(
-            serde_json::json!({"action":"snapshot","session_id":session_id}),
-            &ctx,
-        )
-        .await?;
-        let failed_action = tools::browser_session::execute(
-            serde_json::json!({
-                "action":"click",
-                "session_id":session_id,
-                "target":"e999999"
-            }),
-            &ctx,
-        )
-        .await?;
-        let lease_gone = !tools::browser_session::list_managed_sessions()
-            .iter()
-            .any(|session| session.session_id == session_id);
-        let receipt = serde_json::json!({
-            "status": if !snapshot.is_error && failed_action.is_error && lease_gone {
-                "passed"
-            } else {
-                "failed"
-            },
-            "native_tool": "browser_session",
-            "opened_session": session_id,
-            "snapshot_ok": !snapshot.is_error,
-            "failure_detected": failed_action.is_error,
-            "lease_reclaimed_after_failure": lease_gone,
-        });
-        std::fs::write(
-            &output_path,
-            serde_json::to_vec_pretty(&receipt).unwrap_or_default(),
-        )?;
-        tools::browser_session::close_for_session(&owner_session_id).await;
-        if receipt["status"] == "passed" {
-            Ok(receipt)
-        } else {
-            Err(errors::AppError::Other(receipt.to_string()))
-        }
-    });
+            // Whatever happens after a browser exists must not leave one
+            // running: that is the leak this whole smoke is here to catch.
+            macro_rules! give_up {
+                ($stage:expr, $error:expr, $attempts:expr) => {{
+                    tools::browser_session::close_for_session(&owner_session_id).await;
+                    return Err(browser::smoke::failure_receipt($stage, $error, $attempts));
+                }};
+            }
 
-    match result {
-        Ok(receipt) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&receipt).unwrap_or_default()
+            // Retried, and only here: a runner too busy to start Chrome inside
+            // the launch budget is the environment failing, not this project.
+            // Everything below the loop is asserted exactly once.
+            let mut attempts = 0_u32;
+            let opened = loop {
+                attempts += 1;
+                let opened = match tools::browser_session::execute(
+                    serde_json::json!({"action":"open","url":"https://example.com"}),
+                    &ctx,
+                )
+                .await
+                {
+                    Ok(opened) => opened,
+                    Err(error) => give_up!("open", &error.to_string(), attempts),
+                };
+                if !opened.is_error {
+                    break opened;
+                }
+                if !browser::smoke::should_retry_open(&opened.content, attempts) {
+                    give_up!("open", &opened.content, attempts);
+                }
+                eprintln!(
+                    "Browser-session smoke: attempt {attempts} of {} could not start a browser, \
+                     retrying — {}",
+                    browser::smoke::MAX_LAUNCH_ATTEMPTS,
+                    opened.content
+                );
+                tokio::time::sleep(browser::smoke::retry_backoff(attempts)).await;
+            };
+
+            let Some(session_id) = opened
+                .content
+                .lines()
+                .find_map(|line| line.strip_prefix("Managed browser session: "))
+                .map(str::to_owned)
+            else {
+                give_up!("session_id", "open did not report a session id", attempts);
+            };
+
+            let snapshot = match tools::browser_session::execute(
+                serde_json::json!({"action":"snapshot","session_id":session_id}),
+                &ctx,
+            )
+            .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => give_up!("snapshot", &error.to_string(), attempts),
+            };
+            let failed_action = match tools::browser_session::execute(
+                serde_json::json!({
+                    "action":"click",
+                    "session_id":session_id,
+                    "target":"e999999"
+                }),
+                &ctx,
+            )
+            .await
+            {
+                Ok(failed_action) => failed_action,
+                Err(error) => give_up!("injected_failure", &error.to_string(), attempts),
+            };
+            // Read before the owner-wide cleanup below, or reclamation by the
+            // manager and reclamation by our own teardown are indistinguishable.
+            let lease_gone = !tools::browser_session::list_managed_sessions()
+                .iter()
+                .any(|session| session.session_id == session_id);
+
+            let receipt = browser::smoke::receipt(
+                &session_id,
+                !snapshot.is_error,
+                failed_action.is_error,
+                lease_gone,
+                attempts,
             );
-            true
-        }
-        Err(error) => {
-            eprintln!("Browser-session smoke failed: {error}");
-            std::process::exit(1);
-        }
+            tools::browser_session::close_for_session(&owner_session_id).await;
+            if receipt["status"] == "passed" {
+                Ok(receipt)
+            } else {
+                Err(receipt)
+            }
+        });
+
+    let (receipt, passed) = match &result {
+        Ok(receipt) => (receipt, true),
+        Err(receipt) => (receipt, false),
+    };
+    let rendered = serde_json::to_string_pretty(receipt).unwrap_or_default();
+    if let Err(error) = std::fs::write(&output_path, rendered.as_bytes()) {
+        eprintln!(
+            "Browser-session smoke could not write {}: {error}",
+            output_path.display()
+        );
+        std::process::exit(1);
+    }
+    if passed {
+        println!("{rendered}");
+        true
+    } else {
+        eprintln!("Browser-session smoke failed: {rendered}");
+        std::process::exit(1);
     }
 }
 
