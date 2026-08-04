@@ -197,14 +197,50 @@ jobs:
             echo "Recovered missing tag $TAG at $MERGE_SHA"
           fi
 
-          RELEASE_STATE=missing
-          if RELEASE_JSON=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-               --json isDraft 2>/dev/null); then
-            if [ "$(jq -r '.isDraft' <<< "$RELEASE_JSON")" = "false" ]; then
-              echo "Published release $TAG already exists; reconciliation complete"
-              exit 0
+          # `gh release view` exits non-zero for TWO different situations: the
+          # release genuinely does not exist (404), and "we could not ask"
+          # (rate limit, network, revoked token). Collapsing both into "missing"
+          # made a transient 403 read as a broken release: on 2026-08-04 this
+          # step aborted with "Release v1.77.3 run succeeded but no published
+          # release exists" while v1.77.3 was published, non-draft, with six
+          # assets — the query had simply been rate-limited. Never let "I could
+          # not check" masquerade as a fact about the world.
+          read_release_state() {   # published | draft | missing | unknown
+            local out status
+            out=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft 2>&1)
+            status=$?
+            if [ "$status" -eq 0 ]; then
+              if [ "$(jq -r '.isDraft' <<< "$out")" = "false" ]; then
+                echo published
+              else
+                echo draft
+              fi
+              return 0
             fi
-            RELEASE_STATE=draft
+            if grep -qiE 'release not found|HTTP 404' <<< "$out"; then
+              echo missing
+              return 0
+            fi
+            echo "::warning::could not read release state for $TAG: $out" >&2
+            echo unknown
+          }
+
+          RELEASE_STATE=unknown
+          for attempt in 1 2 3; do
+            RELEASE_STATE=$(read_release_state)
+            [ "$RELEASE_STATE" != unknown ] && break
+            sleep $((attempt * 20))
+          done
+          if [ "$RELEASE_STATE" = unknown ]; then
+            # Report the real situation. Dispatching a duplicate release on a
+            # guess would be worse than stopping, and claiming the release is
+            # absent would be a lie.
+            echo "::error::could not determine the release state of $TAG (API unavailable, likely transient). Re-run this workflow; nothing was changed."
+            exit 1
+          fi
+          if [ "$RELEASE_STATE" = published ]; then
+            echo "Published release $TAG already exists; reconciliation complete"
+            exit 0
           fi
 
           RUNS=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow release.yml \

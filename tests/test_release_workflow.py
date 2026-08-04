@@ -184,6 +184,35 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(reviewed_plan["slot"], "major")
         self.assertFalse(reviewed_plan["skip"])
 
+    # 2026-08-04: the reconcile step aborted with "Release v1.77.3 run
+    # succeeded but no published release exists" while v1.77.3 was published,
+    # non-draft, with six assets. `gh release view` had been rate-limited, and
+    # the script treated every non-zero exit as "the release is absent" —
+    # stderr was even discarded with 2>/dev/null. A guard must never turn "I
+    # could not check" into a claim about the world.
+    def test_reconcile_separates_a_missing_release_from_an_unreadable_one(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/auto-release.yml").read_text(encoding="utf-8")
+
+        self.assertIn("read_release_state()", workflow)
+        # 404 is the only signal that actually means "not there".
+        self.assertRegex(workflow, r"release not found\|HTTP 404")
+        # Anything else is unknown, retried, and then reported as unknown.
+        self.assertIn("echo unknown", workflow)
+        self.assertIn("could not determine the release state", workflow)
+        # The old shape must not come back.
+        self.assertNotIn(
+            "--json isDraft 2>/dev/null",
+            workflow,
+            "swallowing stderr is what hid the rate-limit error",
+        )
+        # An unknown state must stop, never silently dispatch a duplicate.
+        unknown_block = workflow.split('if [ "$RELEASE_STATE" = unknown ]; then', 1)[1]
+        self.assertLess(
+            unknown_block.index("exit 1"),
+            unknown_block.index("gh workflow run release.yml"),
+            "unknown must exit before any duplicate release dispatch",
+        )
+
     def test_auto_release_dispatches_tag_from_main_for_shared_cache_scope(self) -> None:
         release = (REPO_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
