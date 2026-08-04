@@ -207,6 +207,7 @@ jobs:
       # the real binary and prove the native manager detects that output and
       # removes its lease instead of leaving a headless browser daemon behind.
       - name: Browser session lifecycle smoke
+        id: browser_smoke
         if: ${{ !cancelled() }}
         shell: pwsh
         env:
@@ -220,7 +221,31 @@ jobs:
           cargo run --manifest-path src-tauri/Cargo.toml -- --browser-session-smoke $receipt
           if ($LASTEXITCODE -ne 0) { throw "Browser session smoke exited $LASTEXITCODE" }
           $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          # These four are the leak defence and stay exactly as loud as they
+          # were. The smoke retries a browser that would not *start* — an
+          # unusable runner — and nothing else; a session that opened and then
+          # misbehaved fails here on its first observation.
           if ($smoke.status -ne "passed") { throw "Browser session smoke did not pass" }
           if (-not $smoke.snapshot_ok) { throw "Browser session smoke did not capture a snapshot" }
           if (-not $smoke.failure_detected) { throw "CLI logical failure was not detected" }
           if (-not $smoke.lease_reclaimed_after_failure) { throw "Browser lease survived failure" }
+          # A retry that rescued the run must not be silent, or the runner
+          # problem it papered over becomes invisible instead of merely green.
+          if ($smoke.launch_attempts -gt 1) {
+            Write-Output "::warning::Browser smoke needed $($smoke.launch_attempts) launch attempts on this runner"
+          }
+
+      # The receipt is the only durable record of *why* this step ended the way
+      # it did. Uploading it is what turns the next intermittent failure into
+      # evidence rather than another investigation from an exit code alone.
+      # `warn` rather than `error`: the smoke now writes a receipt on every path
+      # it reaches, so a missing file means the binary never ran at all — which
+      # the step above has already reported. A second red step would only add
+      # noise, exactly as it did in run 30795455214.
+      - name: Upload browser session smoke receipt
+        if: ${{ !cancelled() && steps.browser_smoke.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-session-smoke-${{ runner.os }}
+          path: ${{ runner.temp }}/browser-session-smoke.json
+          if-no-files-found: warn

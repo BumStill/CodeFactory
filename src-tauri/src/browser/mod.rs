@@ -24,6 +24,7 @@ pub mod install;
 pub mod page;
 pub mod policy;
 pub mod profile;
+pub mod smoke;
 
 use async_trait::async_trait;
 
