@@ -2,7 +2,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   X,
-  Play,
   Square,
   RefreshCw,
   Plus,
@@ -35,7 +34,6 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
     resumeReports,
     loadTasks,
     createTaskTree,
-    start,
     cancel,
     subscribe,
     subscribeEvidence,
@@ -115,14 +113,6 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
     }
   };
 
-  const handleStart = async () => {
-    try {
-      await start(sessionId);
-    } catch (e) {
-      // error already in store
-    }
-  };
-
   return (
     <div className="fixed right-0 top-0 bottom-0 z-40 w-[640px] max-w-[80vw] bg-surface-1 border-l border-border shadow-2xl flex flex-col">
       {/* Header */}
@@ -163,13 +153,9 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
           </span>
         )}
         {hasActive && !isRunning && (
-          <button
-            onClick={handleStart}
-            className="flex items-center gap-1 px-2 py-1 text-[11px] rounded bg-accent hover:bg-accent-hover text-white transition-colors"
-          >
-            <Play size={11} />
-            开始
-          </button>
+          <span className="text-[11px] text-gray-500">
+            已委派，由后台调度器自动执行
+          </span>
         )}
         {isRunning && (
           <button
