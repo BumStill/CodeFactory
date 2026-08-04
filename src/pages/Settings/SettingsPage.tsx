@@ -655,7 +655,7 @@ export function SettingsPage({
         >
           {tabGroups.map((group) => (
             <div key={group.label} className="mb-4">
-              <div className="px-4 pb-1.5 text-[10px] font-medium uppercase tracking-wider text-gray-600">
+              <div className="px-4 pb-1.5 text-[11px] font-semibold text-gray-500">
                 {group.label}
               </div>
               <div className="flex flex-col gap-0.5">
@@ -669,10 +669,10 @@ export function SettingsPage({
                     id={`settings-tab-${t.id}`}
                     onClick={() => setTab(t.id)}
                     title={t.description}
-                    className={`border-l-2 px-4 py-1.5 text-left text-xs transition-colors ${
+                    className={`border-l-2 px-4 py-1.5 text-left text-[13px] transition-colors ${
                       tab === t.id
                         ? "border-accent bg-surface-2 text-gray-100"
-                        : "border-transparent text-gray-500 hover:bg-surface-2 hover:text-gray-300"
+                        : "border-transparent text-gray-400 hover:bg-surface-2 hover:text-gray-200"
                     }`}
                   >
                     {t.label}
