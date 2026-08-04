@@ -81,9 +81,41 @@ impl Platform {
     }
 }
 
-/// Where downloaded browsers live: `~/.codefactory/browser/chromium`.
+/// Directory segment used for browser cache storage.
+const BROWSER_CACHE_SEGMENTS: &[&str] = &["browser", "chromium"];
+
+/// Where downloaded browsers live.
+///
+/// On Windows installed apps may run from `Program Files` and user profiles may
+/// be redirected or locked down; the fallback browser must therefore live under
+/// the per-user LocalAppData tree (`%LOCALAPPDATA%\CodeFactory\browser\chromium`)
+/// instead of the app install directory or process working directory.
+/// Non-Windows keeps the historical `~/.codefactory/browser/chromium` location.
 pub fn install_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".codefactory").join("browser").join("chromium"))
+    install_root_from_dirs(dirs::data_local_dir(), dirs::home_dir())
+}
+
+fn install_root_from_dirs(local_data_dir: Option<PathBuf>, home_dir: Option<PathBuf>) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        local_data_dir
+            .map(|dir| append_segments(dir.join("CodeFactory"), BROWSER_CACHE_SEGMENTS))
+            .or_else(|| {
+                home_dir.map(|home| append_segments(home.join(".codefactory"), BROWSER_CACHE_SEGMENTS))
+            })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = local_data_dir;
+        home_dir.map(|home| append_segments(home.join(".codefactory"), BROWSER_CACHE_SEGMENTS))
+    }
+}
+
+fn append_segments(mut root: PathBuf, segments: &[&str]) -> PathBuf {
+    for segment in segments {
+        root.push(segment);
+    }
+    root
 }
 
 /// Directory for one version, so an upgrade doesn't clobber a working install.
@@ -292,6 +324,47 @@ mod tests {
                 "marker {bad:?} must be rejected"
             );
         }
+    }
+
+
+    #[test]
+    fn install_root_policy_uses_windows_local_app_data_when_available() {
+        let local = PathBuf::from(r"C:\Users\Ada\AppData\Local");
+        let home = PathBuf::from(r"C:\Users\Ada");
+        let root = install_root_from_dirs(Some(local), Some(home)).expect("install root");
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            root,
+            PathBuf::from(r"C:\Users\Ada\AppData\Local")
+                .join("CodeFactory")
+                .join("browser")
+                .join("chromium")
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            root,
+            PathBuf::from(r"C:\Users\Ada")
+                .join(".codefactory")
+                .join("browser")
+                .join("chromium")
+        );
+    }
+
+    #[test]
+    fn install_root_policy_never_depends_on_the_current_working_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let local = cwd.join("Program Files").join("CodeFactory");
+        let home = PathBuf::from(r"C:\Users\Ada");
+        let root = install_root_from_dirs(Some(local.clone()), Some(home.clone())).expect("install root");
+
+        #[cfg(target_os = "windows")]
+        {
+            assert!(root.starts_with(&local));
+            assert!(root.ends_with(Path::new("CodeFactory").join("browser").join("chromium")));
+        }
+        #[cfg(not(target_os = "windows"))]
+        assert!(root.starts_with(&home));
     }
 
     #[test]
