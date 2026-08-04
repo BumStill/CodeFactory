@@ -102,9 +102,30 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
-/// Root for all persistent profiles: `~/.codefactory/browser/profiles`.
+/// Root for all persistent profiles.
+///
+/// Windows installed apps should keep browser user-data under the per-user
+/// LocalAppData tree. A persistent Chromium profile writes locks, SQLite DBs,
+/// caches and crash recovery files while the browser is running; placing it
+/// under an install directory such as `Program Files` turns first launch into a
+/// permission failure. Non-Windows keeps the historical
+/// `~/.codefactory/browser/profiles` location.
 pub fn profiles_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".codefactory").join("browser").join("profiles"))
+    profiles_root_from_dirs(dirs::data_local_dir(), dirs::home_dir())
+}
+
+fn profiles_root_from_dirs(local_data_dir: Option<PathBuf>, home_dir: Option<PathBuf>) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        local_data_dir
+            .map(|dir| dir.join("CodeFactory").join("browser").join("profiles"))
+            .or_else(|| home_dir.map(|home| home.join(".codefactory").join("browser").join("profiles")))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = local_data_dir;
+        home_dir.map(|home| home.join(".codefactory").join("browser").join("profiles"))
+    }
 }
 
 /// Directory backing a persistent profile. `None` for ephemeral scopes (the
@@ -212,6 +233,47 @@ pub fn sweep_stale_locks() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn profile_root_policy_uses_windows_local_app_data_when_available() {
+        let local = PathBuf::from(r"C:\Users\Ada\AppData\Local");
+        let home = PathBuf::from(r"C:\Users\Ada");
+        let root = profiles_root_from_dirs(Some(local), Some(home)).expect("profiles root");
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            root,
+            PathBuf::from(r"C:\Users\Ada\AppData\Local")
+                .join("CodeFactory")
+                .join("browser")
+                .join("profiles")
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            root,
+            PathBuf::from(r"C:\Users\Ada")
+                .join(".codefactory")
+                .join("browser")
+                .join("profiles")
+        );
+    }
+
+    #[test]
+    fn profile_root_policy_does_not_depend_on_the_current_working_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let local = cwd.join("Program Files").join("CodeFactory");
+        let home = PathBuf::from(r"C:\Users\Ada");
+        let root = profiles_root_from_dirs(Some(local.clone()), Some(home.clone())).expect("profiles root");
+
+        #[cfg(target_os = "windows")]
+        {
+            assert!(root.starts_with(&local));
+            assert!(root.ends_with(Path::new("CodeFactory").join("browser").join("profiles")));
+        }
+        #[cfg(not(target_os = "windows"))]
+        assert!(root.starts_with(&home));
+    }
 
     #[test]
     fn anonymous_sessions_never_get_a_persistent_profile() {
