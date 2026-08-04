@@ -12,7 +12,6 @@ import {
   XCircle,
   Square,
   EyeOff,
-  ListTodo,
   X,
   Globe2,
   ExternalLink,
@@ -207,6 +206,27 @@ export function WorkspacePage({
   const taskBlockedCount = blockedTasks.length;
   const taskProviderBlockedCount = blockedTasks.filter((task) => task.failure_attribution?.kind === "model-provider").length;
   const taskActivityVisible = taskPendingCount + taskRunningCount + taskFailedCount > 0;
+  const taskActivitySummary = useMemo(() => {
+    if (taskBlockedCount > 0) {
+      const title = taskProviderBlockedCount === taskBlockedCount
+        ? "模型配置需要处理"
+        : "后台任务需要你处理";
+      const label = taskProviderBlockedCount === taskBlockedCount
+        ? `${taskBlockedCount} 个后台任务需要修复模型配置`
+        : `${taskBlockedCount} 个后台任务需要你处理`;
+      return { count: taskBlockedCount, label, title, tone: "danger" as const, kind: "blocked" as const };
+    }
+    if (taskFailedCount > 0) {
+      return { count: taskFailedCount, label: `${taskFailedCount} 个后台任务失败，可重试`, title: `${taskFailedCount} 个后台任务失败，可重试`, tone: "warning" as const, kind: "failed" as const };
+    }
+    if (taskRunningCount > 0) {
+      return { count: taskRunningCount, label: `${taskRunningCount} 个后台任务正在运行`, title: `${taskRunningCount} 个后台任务正在运行`, tone: "progress" as const, kind: "running" as const };
+    }
+    if (taskPendingCount > 0) {
+      return { count: taskPendingCount, label: `${taskPendingCount} 个后台任务等待调度`, title: `${taskPendingCount} 个后台任务等待调度`, tone: "neutral" as const, kind: "pending" as const };
+    }
+    return null;
+  }, [taskBlockedCount, taskFailedCount, taskPendingCount, taskProviderBlockedCount, taskRunningCount]);
   const [taskActivityOpen, setTaskActivityOpen] = useState(Boolean(initialTaskLogId));
   const taskActivityButtonRef = useRef<HTMLButtonElement>(null);
   const taskActivityDialogRef = useRef<HTMLElement>(null);
@@ -451,37 +471,35 @@ export function WorkspacePage({
             />
           )}
         </div>
-        {isProjectSession && taskActivityVisible && (
+        {isProjectSession && taskActivityVisible && taskActivitySummary && (
           <button
             ref={taskActivityButtonRef}
             type="button"
             onClick={() => setTaskActivityOpen(true)}
-            aria-label="打开任务活动"
+            aria-label={`打开任务活动：${taskActivitySummary.label}`}
             aria-expanded={taskActivityOpen}
             aria-controls="workspace-task-activity-dialog"
-            className={`inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-[13px] transition-colors ${
-              taskBlockedCount > 0
+            className={`inline-flex h-8 min-w-8 items-center justify-center gap-1 rounded-lg px-2 text-[13px] font-medium transition-colors ${
+              taskActivitySummary.tone === "danger"
                 ? "bg-status-danger-soft text-status-danger hover:brightness-95"
-                : taskFailedCount > 0
+                : taskActivitySummary.tone === "warning"
                   ? "bg-status-warning-soft text-status-warning hover:brightness-95"
-                : taskRunningCount > 0
+                : taskActivitySummary.tone === "progress"
                   ? "bg-status-progress-soft text-status-progress hover:brightness-95"
                   : "text-gray-500 hover:bg-surface-3 hover:text-gray-300"
             }`}
-            title="查看后台任务、验收结果和恢复操作"
+            title={taskActivitySummary.title}
           >
-            <ListTodo size={12} />
-            <span>
-              {taskBlockedCount > 0
-                ? (taskProviderBlockedCount === taskBlockedCount ? "模型配置待修复" : "需要你处理")
-                : taskFailedCount > 0
-                  ? `${taskFailedCount} 个步骤失败`
-                  : taskRunningCount > 0
-                    ? `正在执行 ${taskRunningCount}`
-                    : taskPendingCount > 0
-                      ? `待执行 ${taskPendingCount}`
-                      : `任务 ${projectTaskCount}`}
-            </span>
+            {taskActivitySummary.kind === "running" ? (
+              <Loader2 size={12} className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
+            ) : taskActivitySummary.kind === "pending" ? (
+              <Circle size={11} aria-hidden="true" />
+            ) : taskActivitySummary.kind === "failed" ? (
+              <AlertTriangle size={12} aria-hidden="true" />
+            ) : (
+              <XCircle size={12} aria-hidden="true" />
+            )}
+            <span>{taskActivitySummary.count}</span>
           </button>
         )}
         <button
@@ -847,7 +865,7 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onRequestRe
       </div>
       <div className="flex shrink-0 flex-col gap-2 border-b border-border px-4 py-3">
         <div className="flex flex-wrap items-center gap-2 text-[12px] text-gray-600">
-          <span>已完成 {completedCount}</span><span>待执行 {pendingCount}</span>
+          <span>已完成 {completedCount}</span><span>等待调度 {pendingCount}</span>
           {runningCount > 0 && <span className="text-status-progress">执行中 {runningCount}</span>}
           {repairableFailedCount > 0 && <span className="text-status-warning">可重试 {repairableFailedCount}</span>}
           {providerBlockedTasks.length > 0 && <span className="text-status-danger">模型配置 {providerBlockedTasks.length}</span>}
@@ -858,7 +876,7 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onRequestRe
           <p className={`text-[12px] leading-5 ${failedTasks.length > 0 ? "text-status-warning" : "text-gray-500"}`}>
             {failedTasks.length > 0
               ? `先处理失败项，再继续剩余 ${pendingCount} 项。`
-              : `执行已暂停，还有 ${pendingCount} 项等待执行。`}
+              : `已委派，还有 ${pendingCount} 项等待后台调度。`}
           </p>
         )}
         <div className="flex flex-wrap items-center gap-1">

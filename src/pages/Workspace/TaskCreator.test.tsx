@@ -218,7 +218,10 @@ describe("session-native task delegation", () => {
     const conversation = screen.getByRole("main", { name: "会话窗口" });
     expect(within(conversation).queryByText("会话执行详情")).not.toBeInTheDocument();
     expect(within(conversation).queryByText("实现登录页")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "打开任务活动" })).toHaveTextContent("待执行 1");
+    const activity = screen.getByRole("button", { name: "打开任务活动：1 个后台任务等待调度" });
+    expect(activity).toHaveTextContent("1");
+    expect(activity).not.toHaveTextContent("待执行");
+    expect(activity).toHaveAttribute("title", "1 个后台任务等待调度");
   });
 
   it("opens task activity for running delegated execution and keeps it out of the conversation", async () => {
@@ -230,8 +233,10 @@ describe("session-native task delegation", () => {
     expect(within(conversation).queryByText("会话执行详情")).not.toBeInTheDocument();
     expect(within(conversation).queryByText("实现登录页")).not.toBeInTheDocument();
 
-    const activity = screen.getByRole("button", { name: "打开任务活动" });
-    expect(activity).toHaveTextContent("正在执行 1");
+    const activity = screen.getByRole("button", { name: "打开任务活动：1 个后台任务正在运行" });
+    expect(activity).toHaveTextContent("1");
+    expect(activity).not.toHaveTextContent("正在执行");
+    expect(activity.querySelector(".animate-spin")).toBeInTheDocument();
     expect(activity).toHaveAttribute("aria-expanded", "false");
     await userEvent.click(activity);
     const drawer = screen.getByRole("dialog", { name: "任务活动" });
@@ -290,7 +295,7 @@ describe("session-native task delegation", () => {
     fakeTasksState.running = { s1: true };
     renderWorkspace();
 
-    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
+    await userEvent.click(screen.getByRole("button", { name: /打开任务活动/ }));
     expect(screen.getByText("规范《Token 成本仪表盘》")).toBeInTheDocument();
     expect(screen.queryByTitle(/规范工作台/)).not.toBeInTheDocument();
   });
@@ -299,8 +304,8 @@ describe("session-native task delegation", () => {
     fakeTasksState.tasks = { s1: [task()] };
     renderWorkspace();
 
-    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
-    expect(screen.getByText("执行已暂停，还有 1 项等待执行。" )).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /打开任务活动/ }));
+    expect(screen.getByText("已委派，还有 1 项等待后台调度。" )).toBeInTheDocument();
     expect(screen.getByText("任务已委派，由后台调度器自动执行；若长时间未开始请检查模型配置或重试委派。")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /开始|继续执行/ })).not.toBeInTheDocument();
   });
@@ -326,7 +331,7 @@ describe("session-native task delegation", () => {
     };
     renderWorkspace();
 
-    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
+    await userEvent.click(screen.getByRole("button", { name: /打开任务活动/ }));
     expect(screen.queryByRole("button", { name: /继续执行/ })).not.toBeInTheDocument();
     expect(screen.getByText("先处理失败项，再继续剩余 1 项。" )).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "打开模型设置" })).toBeEnabled();
@@ -337,7 +342,7 @@ describe("session-native task delegation", () => {
     fakeTasksState.running = { s1: true };
     renderWorkspace();
 
-    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
+    await userEvent.click(screen.getByRole("button", { name: /打开任务活动/ }));
     await userEvent.click(screen.getByRole("button", { name: "停止" }));
     expect(mocks.cancel).toHaveBeenCalledWith("s1");
   });
@@ -361,7 +366,7 @@ describe("session-native task delegation", () => {
     };
     renderWorkspace();
 
-    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
+    await userEvent.click(screen.getByRole("button", { name: /打开任务活动/ }));
     await userEvent.click(screen.getByRole("button", { name: "重试失败步骤" }));
     await waitFor(() => expect(mocks.retryFailedTasks).toHaveBeenCalledWith("s1"));
     expect(mocks.start).toHaveBeenCalledWith("s1");
@@ -387,8 +392,11 @@ describe("session-native task delegation", () => {
     const onOpenSettings = vi.fn();
     renderWorkspace(onOpenSettings);
 
-    expect(screen.getByRole("button", { name: "打开任务活动" })).toHaveTextContent("模型配置待修复");
-    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
+    const activity = screen.getByRole("button", { name: "打开任务活动：1 个后台任务需要修复模型配置" });
+    expect(activity).toHaveTextContent("1");
+    expect(activity).not.toHaveTextContent("模型配置待修复");
+    expect(activity).toHaveAttribute("title", "模型配置需要处理");
+    await userEvent.click(screen.getByRole("button", { name: /打开任务活动/ }));
     expect(screen.getByText("模型/Provider").closest("[data-status-tone]")).toHaveAttribute(
       "data-status-tone",
       "danger",
@@ -407,16 +415,16 @@ describe("session-native task delegation", () => {
       s1: [task({ id: "cancelled", status: "cancelled" }), task({ id: "done", status: "completed" })],
     };
     renderWorkspace();
-    expect(screen.queryByRole("button", { name: "打开任务活动" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /打开任务活动/ })).not.toBeInTheDocument();
   });
 
   it("labels a repairable active failure as a failed step, not a generic needs-attention count", () => {
     fakeTasksState.tasks = { s1: [task({ status: "failed", failure_attribution: { repairable: true } })] };
     renderWorkspace();
-    expect(screen.getByRole("button", { name: "打开任务活动" }))
-      .toHaveTextContent("1 个步骤失败");
-    expect(screen.getByRole("button", { name: "打开任务活动" }))
-      .toHaveClass("text-status-warning");
+    const activity = screen.getByRole("button", { name: "打开任务活动：1 个后台任务失败，可重试" });
+    expect(activity).toHaveTextContent("1");
+    expect(activity).not.toHaveTextContent("1 个步骤失败");
+    expect(activity).toHaveClass("text-status-warning");
   });
 
   it("takes an unknown blocker back to chat with the task evidence prefilled", async () => {
@@ -435,7 +443,7 @@ describe("session-native task delegation", () => {
       })],
     };
     renderWorkspace();
-    await userEvent.click(screen.getByRole("button", { name: "打开任务活动" }));
+    await userEvent.click(screen.getByRole("button", { name: /打开任务活动/ }));
     await userEvent.click(screen.getByRole("button", { name: "回到对话处理" }));
     expect(screen.queryByRole("dialog", { name: "任务活动" })).not.toBeInTheDocument();
     expect(screen.getByTestId("pending-repair-prompt")).toHaveTextContent("实现登录页");
