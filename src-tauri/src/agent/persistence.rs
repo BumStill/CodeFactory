@@ -99,6 +99,33 @@ pub(super) struct SqlitePersistence {
 }
 
 impl SqlitePersistence {
+    /// Move the session's "last activity" marker forward.
+    ///
+    /// The sidebar shows and orders by `sessions.updated_at`
+    /// (`SessionSidebar.tsx`, `ORDER BY updated_at DESC`,
+    /// `groupSessionsByProject`), so that column has to mean "when did anything
+    /// real last happen here". Nothing advanced it when messages arrived — only
+    /// changing the model or setting the title did, and the title is generated
+    /// once at the start — so it froze near creation time and a long
+    /// conversation sank below sessions nobody had touched in days.
+    ///
+    /// Deliberately best-effort: a session list that is one row stale is a far
+    /// smaller problem than losing the message that was just written, so a
+    /// failure here logs and moves on rather than failing the persist.
+    async fn touch_session(&self, at_ms: i64) {
+        if let Err(error) = sqlx::query("UPDATE sessions SET updated_at = ? WHERE id = ?")
+            .bind(at_ms)
+            .bind(&self.session_id)
+            .execute(&self.db)
+            .await
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                "could not advance session activity time: {error}"
+            );
+        }
+    }
+
     /// Append one gate control event to the side table. Content is stored raw:
     /// these rows exist to answer "why did the loop keep going", so redacting
     /// them would defeat the only reason to keep them.
@@ -225,6 +252,7 @@ impl Persistence for SqlitePersistence {
         .execute(&self.db)
         .await
         .map_err(perr)?;
+        self.touch_session(now).await;
         Ok(Some(msg_id))
     }
 
@@ -509,6 +537,12 @@ mod tests {
              content TEXT, endpoint_id TEXT, model_id TEXT, input_tokens INTEGER,
              output_tokens INTEGER, tool_calls TEXT, \
              reasoning_content TEXT, usage_request_id TEXT, completion_state TEXT, created_at INTEGER)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at INTEGER, updated_at INTEGER)",
         )
         .execute(&db)
         .await
@@ -966,5 +1000,66 @@ mod tests {
         let serialized = serde_json::to_string(&rows).unwrap();
         assert!(!serialized.contains("secret"));
         assert!(!serialized.contains("api_key"));
+    }
+
+    /// The session list answers "where was I working", so its timestamp and its
+    /// order must follow the last real message.
+    ///
+    /// Display and sorting already read `updated_at`
+    /// (`SessionSidebar.tsx`, `ORDER BY updated_at DESC`,
+    /// `groupSessionsByProject`), but nothing advanced it when messages
+    /// arrived — only changing the model or setting the title did, and the
+    /// title is generated once at the start. So it froze at roughly creation
+    /// time and a two-hour conversation still showed its opening minute while
+    /// sinking below idle sessions.
+    #[tokio::test]
+    async fn persisting_a_message_advances_the_session_activity_time() {
+        let db = pool().await;
+        sqlx::query("INSERT INTO sessions (id, created_at, updated_at) VALUES ('s1', 100, 100)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: false,
+        };
+
+        p.persist_message("user", "hello", None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let updated: i64 = sqlx::query_scalar("SELECT updated_at FROM sessions WHERE id='s1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert!(
+            updated > 100,
+            "a real message must move the session to the top of the list, got {updated}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_session_still_leaves_no_trace() {
+        let db = pool().await;
+        sqlx::query("INSERT INTO sessions (id, created_at, updated_at) VALUES ('s1', 100, 100)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: true,
+        };
+
+        p.persist_message("user", "hello", None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let updated: i64 = sqlx::query_scalar("SELECT updated_at FROM sessions WHERE id='s1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(updated, 100, "anonymous sessions leave no trace by definition");
     }
 }

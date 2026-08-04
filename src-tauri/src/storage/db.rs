@@ -1332,10 +1332,51 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         tracing::warn!("task orphan recovery at boot failed (non-fatal): {e}");
     }
 
+    // Existing rows all carry a frozen activity time; pull them up to their
+    // newest message so the sidebar's order is right on first launch after the
+    // upgrade. Best-effort: a stale session list must never block startup.
+    match backfill_session_activity_time(pool).await {
+        Ok(0) => {}
+        Ok(rows) => tracing::info!("backfilled session activity time for {rows} session(s)"),
+        Err(e) => tracing::warn!("session activity backfill failed (non-fatal): {e}"),
+    }
+
     crate::knowledge::ensure_schema(pool).await?;
     crate::benchmark::ensure_schema(pool).await?;
 
     Ok(())
+}
+
+/// Pull each session's activity time up to its newest message.
+///
+/// Until this shipped, nothing advanced `sessions.updated_at` when messages
+/// were written — only changing the model or naming the session did, and the
+/// name is generated once at the start. Every existing row therefore carries a
+/// timestamp frozen near creation, which the sidebar shows as the session's
+/// time and sorts by. Without this backfill the fix would be invisible on
+/// existing data: old busy sessions would keep sorting below idle ones forever.
+///
+/// **Only ever moves forward.** A rename can legitimately set `updated_at`
+/// later than the last message, and dragging that backwards would be a second
+/// bug. Moving forward only also makes this idempotent: after the first pass
+/// the WHERE clause matches nothing, so it stays a cheap no-op on every boot
+/// instead of needing a one-shot migration slot.
+pub(crate) async fn backfill_session_activity_time(
+    pool: &SqlitePool,
+) -> crate::errors::Result<u64> {
+    let result = sqlx::query(
+        "UPDATE sessions
+         SET updated_at = (
+             SELECT MAX(m.created_at) FROM messages m WHERE m.session_id = sessions.id
+         )
+         WHERE EXISTS (SELECT 1 FROM messages m WHERE m.session_id = sessions.id)
+           AND updated_at < (
+             SELECT MAX(m.created_at) FROM messages m WHERE m.session_id = sessions.id
+           )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 async fn ensure_column(
@@ -2054,5 +2095,71 @@ mod tests {
             .unwrap();
             assert_eq!(exists, 1, "missing additive table {table}");
         }
+    }
+
+    /// The backfill is what makes the fix visible on existing data — and it
+    /// must never drag a timestamp backwards, because a rename can legitimately
+    /// set `updated_at` past the last message.
+    #[tokio::test]
+    async fn backfill_moves_stale_sessions_forward_only() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, updated_at INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, created_at INTEGER)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // frozen: the bug's signature — busy session stuck at creation time.
+        sqlx::query("INSERT INTO sessions VALUES ('frozen', 100)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages VALUES ('m1','frozen',100),('m2','frozen',900)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // renamed later than its last message — must NOT be pulled back.
+        sqlx::query("INSERT INTO sessions VALUES ('renamed', 5000)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages VALUES ('m3','renamed',900)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // empty session — nothing to derive from.
+        sqlx::query("INSERT INTO sessions VALUES ('empty', 42)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows = backfill_session_activity_time(&pool).await.unwrap();
+        assert_eq!(rows, 1, "only the frozen session needed moving");
+
+        let at = |id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT updated_at FROM sessions WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(at("frozen").await, 900, "pulled up to its newest message");
+        assert_eq!(at("renamed").await, 5000, "a later rename must not be undone");
+        assert_eq!(at("empty").await, 42, "no messages, nothing to derive");
+
+        // Idempotent: a second pass is a no-op, so it can run on every boot.
+        assert_eq!(backfill_session_activity_time(&pool).await.unwrap(), 0);
     }
 }
