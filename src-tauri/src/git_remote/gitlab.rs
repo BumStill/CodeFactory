@@ -160,6 +160,22 @@ pub async fn create_pr(
     Ok(parse_mr(&v))
 }
 
+pub async fn update_pr_body(
+    client: &RemoteGitClient,
+    project: &str,
+    number: u64,
+    body: &str,
+) -> Result<(), String> {
+    let encoded = encode_repo(project);
+    client
+        .put(
+            &format!("/projects/{encoded}/merge_requests/{number}"),
+            serde_json::json!({"description": body}),
+        )
+        .await
+        .map(|_| ())
+}
+
 /// Merge a GitLab merge request. GitLab uses project-local `iid` as the MR
 /// number in URLs. The `method` argument is accepted for interface parity with
 /// GitHub; GitLab's merge endpoint does not expose squash/merge/rebase as the

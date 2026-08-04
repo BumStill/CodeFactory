@@ -88,6 +88,13 @@ impl StepResult {
             detail: detail.into(),
         }
     }
+    fn waiting(step: &str, detail: impl Into<String>) -> Self {
+        Self {
+            step: step.into(),
+            status: "waiting".into(),
+            detail: detail.into(),
+        }
+    }
 }
 
 /// The result of a delivery run.
@@ -143,6 +150,15 @@ impl DeliveryOutcome {
         self.next_action = Some(format!(
             "{msg} 外部动作结果不确定，禁止自动重试；请先核对远端事实，再人工续接。"
         ));
+        self
+    }
+
+    fn human_action_required(mut self, step: StepResult) -> Self {
+        let msg = step.detail.clone();
+        self = self.blocked_at(step);
+        self.code = "delivery_human_action_required".into();
+        self.recoverable = false;
+        self.next_action = Some(msg);
         self
     }
 }
@@ -293,8 +309,12 @@ struct CiObservationStability {
 }
 
 impl CiObservationStability {
+    fn reset(&self) {
+        *self.candidate.lock().expect("ci stability mutex poisoned") = None;
+    }
+
     fn confirm(&self, fingerprint: &str, status: CiStatus) -> CiStatus {
-        if matches!(status, CiStatus::Pending | CiStatus::Failure(_)) {
+        if matches!(status, CiStatus::Pending) {
             *self.candidate.lock().expect("ci stability mutex poisoned") = None;
             return status;
         }
@@ -450,7 +470,21 @@ pub trait DeliveryRemote {
         head: &str,
         base: &str,
     ) -> impl std::future::Future<Output = Result<DeliveryPr, String>>;
+    /// Converge governance metadata on an existing PR without replacing its
+    /// identity. Called only when the desired body differs from the live body.
+    fn update_pr_body(
+        &self,
+        _number: u64,
+        _body: &str,
+    ) -> impl std::future::Future<Output = Result<(), String>> {
+        std::future::ready(Err("adapter cannot update an existing PR body".into()))
+    }
     fn ci_status(&self, sha: &str) -> impl std::future::Future<Output = Result<CiStatus, String>>;
+    /// Re-run retryable CI infrastructure failures. `false` means the adapter
+    /// has no safe rerun actuator; ordinary test failures never call this.
+    fn rerun_ci(&self, _sha: &str) -> impl std::future::Future<Output = Result<bool, String>> {
+        std::future::ready(Ok(false))
+    }
     fn merge_pr(
         &self,
         number: u64,
@@ -508,7 +542,7 @@ pub trait DeliveryRemote {
     fn update_pr_branch(
         &self,
         _number: u64,
-    ) -> impl std::future::Future<Output = Result<(), String>> {
+    ) -> impl std::future::Future<Output = Result<String, String>> {
         std::future::ready(Err("adapter cannot update a PR branch".to_string()))
     }
 
@@ -676,6 +710,128 @@ fn write_delivery_receipt(
     Ok(raw)
 }
 
+fn sync_updated_pr_head(repo: &RepoContext, expected_head: &str) -> Result<String, String> {
+    git(&repo.root, &["fetch", &repo.remote, &repo.branch])?;
+    let remote_ref = format!("{}/{}", repo.remote, repo.branch);
+    let fetched = git(&repo.root, &["rev-parse", &remote_ref])?;
+    if fetched != expected_head {
+        return Err(format!(
+            "更新后的 PR head 尚未收敛: provider 返回 {expected_head}，{remote_ref} 为 {fetched}"
+        ));
+    }
+    git(&repo.root, &["merge", "--ff-only", &remote_ref])?;
+    let local = git(&repo.root, &["rev-parse", "HEAD"])?;
+    if local != expected_head {
+        return Err(format!(
+            "本地分支未绑定更新后的 PR head: 预期 {expected_head}，实际 {local}"
+        ));
+    }
+    Ok(local)
+}
+
+async fn resume_queued_merge<R: DeliveryRemote>(
+    mut outcome: DeliveryOutcome,
+    repo: &RepoContext,
+    remote: &R,
+    receipt: &DeliveryReceipt,
+) -> DeliveryOutcome {
+    let pr_number = receipt.pr_number;
+    let mut queued = receipt.clone();
+    queued.state = "merge_queued".into();
+    if let Err(error) = write_delivery_receipt(repo, &receipt.commit_sha, &queued) {
+        return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+            "receipt",
+            format!("GitHub 已登记 auto-merge，但 merge_queued 回执写入失败: {error}"),
+        ));
+    }
+    outcome.pr_number = Some(pr_number);
+    outcome.pr_url = Some(receipt.pr_url.clone());
+
+    match remote.merge_readiness(pr_number).await {
+        Ok(MergeReadiness::Behind) => {
+            let new_head = match remote.update_pr_branch(pr_number).await {
+                Ok(head) => head,
+                Err(error) => {
+                    return outcome.blocked_at(StepResult::blocked(
+                        "branch_update",
+                        format!(
+                            "PR #{pr_number} 落后于 {}，自动更新失败: {error}；\
+修复更新条件后重新调用 deliver_changes，不能仅等待 auto-merge。",
+                            repo.default_branch
+                        ),
+                    ))
+                }
+            };
+            let local_head = match sync_updated_pr_head(repo, &new_head) {
+                Ok(head) => head,
+                Err(error) => {
+                    return outcome.blocked_at(StepResult::blocked(
+                        "branch_sync",
+                        format!(
+                            "PR #{pr_number} 已更新到 {new_head}，但本地分支同步失败: {error}。\
+先把本地 {} 快进到远端同名分支，再调用 deliver_changes；不要 force push 旧 head。",
+                            repo.branch
+                        ),
+                    ))
+                }
+            };
+            let mut rebound = queued;
+            rebound.state = "pr_open".into();
+            rebound.commit_sha = local_head.clone();
+            if let Err(error) = write_delivery_receipt(repo, &local_head, &rebound) {
+                return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                    "receipt",
+                    format!(
+                        "PR #{pr_number} 已更新并同步到 {local_head}，但新 head 回执写入失败: {error}"
+                    ),
+                ));
+            }
+            outcome.commit_sha = Some(local_head.clone());
+            outcome.steps.push(StepResult::ok(
+                "branch_update",
+                format!(
+                    "PR #{pr_number} 落后于 {}，已更新并把本地分支重绑到 {local_head}",
+                    repo.default_branch
+                ),
+            ));
+            outcome.final_state = "blocked".into();
+            outcome.stage = "branch_update".into();
+            outcome.code = "delivery_branch_updated".into();
+            outcome.recoverable = true;
+            outcome.next_action = Some(
+                "新 head 的 required checks 会重新运行；现在重新调用 deliver_changes 续接同一 PR。"
+                    .into(),
+            );
+            outcome.reached_state = "pr_open".into();
+            outcome.summary = format!(
+                "PR #{pr_number} 的 BEHIND 死锁已自动解除，交付已重绑到新 head {local_head}。"
+            );
+            outcome
+        }
+        Ok(MergeReadiness::NeedsAction(reason)) => outcome.human_action_required(
+            StepResult::blocked("merge", format!("PR #{pr_number} 无法自动恢复: {reason}")),
+        ),
+        Ok(MergeReadiness::Ready)
+        | Ok(MergeReadiness::WaitingOnChecks)
+        | Ok(MergeReadiness::Unknown)
+        | Err(_) => {
+            outcome.steps.push(StepResult::waiting(
+                "merge",
+                "GitHub 已登记受规则保护的 auto-merge；PR 正在等待远端门禁，后续续接只核对远端状态，不重复发起合并",
+            ));
+            outcome.final_state = "blocked".into();
+            outcome.stage = "merge".into();
+            outcome.code = "delivery_merge_queued".into();
+            outcome.recoverable = true;
+            outcome.next_action =
+                Some("等待远端门禁产生新状态后重新调用 deliver_changes 续接合并和发布。".into());
+            outcome.reached_state = "merge_queued".into();
+            outcome.summary = "GitHub 已登记 auto-merge，正在等待远端门禁；不是权限不足。".into();
+            outcome
+        }
+    }
+}
+
 /// Repo context resolved once at the start of delivery.
 #[derive(Debug, Clone)]
 pub struct RepoContext {
@@ -749,10 +905,7 @@ enum WorktreeDiscovery {
 /// `origin/<default>`. The common worktree-default workflow leaves exactly one
 /// such branch; delivery should target it instead of refusing outright.
 fn discover_worktree_target(repo: &RepoContext) -> WorktreeDiscovery {
-    let Ok(porcelain) = git(
-        &repo.root,
-        &["worktree", "list", "--porcelain"],
-    ) else {
+    let Ok(porcelain) = git(&repo.root, &["worktree", "list", "--porcelain"]) else {
         return WorktreeDiscovery::None;
     };
     let mut candidates: Vec<(PathBuf, String)> = Vec::new();
@@ -766,7 +919,9 @@ fn discover_worktree_target(repo: &RepoContext) -> WorktreeDiscovery {
                 branch = Some(b);
             }
         }
-        let (Some(dir), Some(branch)) = (dir, branch) else { continue };
+        let (Some(dir), Some(branch)) = (dir, branch) else {
+            continue;
+        };
         let dir = PathBuf::from(dir);
         if dir == repo.root {
             continue; // the checkout we are running from
@@ -1071,6 +1226,158 @@ struct PreparedReleasePolicy {
     guard: Option<String>,
     merge_commit_message: Option<MergeCommitMessage>,
     durable_body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadmeBodyReconciliation {
+    body: String,
+    changed: bool,
+}
+
+fn readme_changed_on_branch(root: &Path, remote: &str, base: &str) -> Result<bool, String> {
+    let range = format!("{remote}/{base}...HEAD");
+    let changed = git(root, &["diff", "--name-only", &range])?;
+    Ok(changed.lines().any(|path| path.trim() == "README.md"))
+}
+
+fn readme_reason_is_placeholder(reason: &str) -> bool {
+    let trimmed = reason.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    trimmed.is_empty()
+        || (trimmed.starts_with('<') && trimmed.ends_with('>'))
+        || ["tbd", "todo", "fill in", "fill-in", "n/a"]
+            .iter()
+            .any(|placeholder| lowered.contains(placeholder))
+}
+
+fn readme_contract_lines(body: &str) -> (Vec<String>, Vec<String>) {
+    let mut decisions = Vec::new();
+    let mut reasons = Vec::new();
+    let mut fenced = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let lowered = trimmed.to_ascii_lowercase();
+        if lowered.starts_with("readme-update-reason:") {
+            reasons.push(
+                trimmed
+                    .split_once(':')
+                    .map(|(_, value)| value.trim().to_string())
+                    .unwrap_or_default(),
+            );
+        } else if lowered.starts_with("readme-update:") {
+            decisions.push(
+                trimmed
+                    .split_once(':')
+                    .map(|(_, value)| value.trim().to_ascii_lowercase())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    (decisions, reasons)
+}
+
+fn reconcile_readme_contract_body(
+    root: &Path,
+    remote: &str,
+    base: &str,
+    body: &str,
+) -> Result<ReadmeBodyReconciliation, String> {
+    let readme_changed = readme_changed_on_branch(root, remote, base)?;
+    let (decisions, reasons) = readme_contract_lines(body);
+    let valid_decision =
+        decisions.len() == 1 && matches!(decisions[0].as_str(), "required" | "reviewed");
+    let valid_reason = reasons.len() == 1 && !readme_reason_is_placeholder(&reasons[0]);
+    if valid_decision && valid_reason {
+        if decisions[0] == "required" && !readme_changed {
+            return Err(
+                "PR 已声明 README-Update: required，但当前分支没有 README.md 变更；请补齐 README 后续跑交付"
+                    .into(),
+            );
+        }
+        return Ok(ReadmeBodyReconciliation {
+            body: body.to_string(),
+            changed: false,
+        });
+    }
+
+    let decision = if readme_changed {
+        "required"
+    } else {
+        "reviewed"
+    };
+    let reason = if readme_changed {
+        "README.md is updated in this PR to keep the evergreen product contract aligned with the implementation."
+    } else {
+        "README impact reviewed during controlled delivery; this PR does not change the evergreen README contract."
+    };
+
+    let mut fenced = false;
+    let mut cleaned = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            cleaned.push(line.to_string());
+            continue;
+        }
+        if !fenced {
+            let lowered = trimmed.to_ascii_lowercase();
+            if lowered.starts_with("readme-update:") || lowered.starts_with("readme-update-reason:")
+            {
+                continue;
+            }
+        }
+        cleaned.push(line.to_string());
+    }
+
+    let decision_line = format!("README-Update: {decision}");
+    let reason_line = format!("README-Update-Reason: {reason}");
+    if let Some(heading) = cleaned
+        .iter()
+        .position(|line| line.trim().eq_ignore_ascii_case("## README contract"))
+    {
+        cleaned.insert(heading + 1, reason_line);
+        cleaned.insert(heading + 1, decision_line);
+    } else {
+        while cleaned.last().is_some_and(|line| line.trim().is_empty()) {
+            cleaned.pop();
+        }
+        let footer_start = cleaned.iter().position(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("Release-Urgency:")
+                || trimmed.starts_with("BREAKING CHANGE:")
+                || trimmed.starts_with("BREAKING-CHANGE:")
+        });
+        let footer = footer_start.map(|index| cleaned.split_off(index));
+        while cleaned.last().is_some_and(|line| line.trim().is_empty()) {
+            cleaned.pop();
+        }
+        if !cleaned.is_empty() {
+            cleaned.push(String::new());
+        }
+        cleaned.extend([
+            "## README contract".to_string(),
+            String::new(),
+            decision_line,
+            reason_line,
+        ]);
+        if let Some(footer) = footer {
+            cleaned.push(String::new());
+            cleaned.extend(footer);
+        }
+    }
+
+    Ok(ReadmeBodyReconciliation {
+        body: format!("{}\n", cleaned.join("\n")),
+        changed: true,
+    })
 }
 
 fn prepare_release_policy(
@@ -1436,21 +1743,32 @@ pub async fn deliver<R: DeliveryRemote>(
                     prior_receipt = Some(reconciled);
                 }
                 Ok(MergeObservation::OpenSameHead { auto_merge }) => {
+                    if auto_merge {
+                        outcome.steps.push(StepResult::ok(
+                            "reconcile",
+                            format!(
+                                "PR/MR #{} 仍开放且 auto-merge 已登记；只核对门禁，不重复发起合并",
+                                receipt.pr_number
+                            ),
+                        ));
+                        return resume_queued_merge(outcome, &repo, remote, &receipt).await;
+                    }
                     let mut retryable = receipt.clone();
                     retryable.state = "pr_open".into();
                     if let Err(error) = write_delivery_receipt(&repo, &sha, &retryable) {
                         return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                             "receipt",
-                            format!("远端确认 PR 仍开放，但无法把写前回执恢复为可续接状态: {error}"),
+                            format!(
+                                "远端确认 PR 仍开放，但无法把写前回执恢复为可续接状态: {error}"
+                            ),
                         ));
                     }
                     outcome.steps.push(StepResult::ok(
                         "reconcile",
-                        if auto_merge {
-                            format!("PR/MR #{} 仍开放且 auto-merge 已登记；继续核对门禁", receipt.pr_number)
-                        } else {
-                            format!("PR/MR #{} 仍开放且 head 未变化；安全续接受控合并", receipt.pr_number)
-                        },
+                        format!(
+                            "PR/MR #{} 仍开放且 head 未变化；安全续接受控合并",
+                            receipt.pr_number
+                        ),
                     ));
                     prior_receipt = Some(retryable);
                 }
@@ -1466,19 +1784,28 @@ pub async fn deliver<R: DeliveryRemote>(
                 Ok(MergeObservation::ClosedUnmerged) => {
                     return outcome.blocked_at(StepResult::blocked(
                         "reconcile",
-                        format!("PR/MR #{} 已关闭但未合并；未重试外部动作", receipt.pr_number),
+                        format!(
+                            "PR/MR #{} 已关闭但未合并；未重试外部动作",
+                            receipt.pr_number
+                        ),
                     ));
                 }
                 Ok(MergeObservation::Unsupported) => {
                     return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                         "reconcile",
-                        format!("当前 provider 无法核对 PR/MR #{} 的 merge 状态", receipt.pr_number),
+                        format!(
+                            "当前 provider 无法核对 PR/MR #{} 的 merge 状态",
+                            receipt.pr_number
+                        ),
                     ));
                 }
                 Err(error) => {
                     return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                         "reconcile",
-                        format!("核对 PR/MR #{} 的远端 merge 状态失败: {error}", receipt.pr_number),
+                        format!(
+                            "核对 PR/MR #{} 的远端 merge 状态失败: {error}",
+                            receipt.pr_number
+                        ),
                     ));
                 }
             }
@@ -1527,13 +1854,27 @@ pub async fn deliver<R: DeliveryRemote>(
         outcome.steps.push(StepResult::ok("pr_title", note));
         pr_title = corrected;
     }
-    let mut pr_body = prior_receipt
+    let requested_pr_body = prior_receipt
         .as_ref()
         .and_then(|receipt| receipt.pr_body.clone())
         .or_else(|| opts.body.clone())
         .unwrap_or_else(|| {
             "由 CodeFactory 自动交付。\n\n🤖 Generated with CodeFactory".to_string()
         });
+    let mut pr_body = match reconcile_readme_contract_body(
+        &repo.root,
+        &repo.remote,
+        &repo.default_branch,
+        &requested_pr_body,
+    ) {
+        Ok(reconciled) => reconciled.body,
+        Err(error) => {
+            return outcome.blocked_at(StepResult::blocked(
+                "policy",
+                format!("README 交付契约未满足: {error}"),
+            ))
+        }
+    };
     let mut release_policy = match prepare_release_policy(
         &repo.root,
         &repo.remote,
@@ -1622,7 +1963,36 @@ pub async fn deliver<R: DeliveryRemote>(
         let pr_number = remote_pr.number;
         let pr_url = remote_pr.url;
         pr_title = remote_pr.title;
-        pr_body = remote_pr.body;
+        let reconciled_body = match reconcile_readme_contract_body(
+            &repo.root,
+            &repo.remote,
+            &repo.default_branch,
+            &remote_pr.body,
+        ) {
+            Ok(reconciled) => reconciled,
+            Err(error) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "policy",
+                    format!("远端 PR README 契约未满足: {error}"),
+                ))
+            }
+        };
+        if reconciled_body.changed {
+            if let Err(error) = remote
+                .update_pr_body(pr_number, &reconciled_body.body)
+                .await
+            {
+                return outcome.blocked_at(StepResult::blocked(
+                    "pr",
+                    format!("PR #{pr_number} 正文缺少有效 README 审计字段，自动补齐失败: {error}"),
+                ));
+            }
+            outcome.steps.push(StepResult::ok(
+                "pr_body",
+                format!("已保留原正文并补齐 PR #{pr_number} 的 README 决策和理由"),
+            ));
+        }
+        pr_body = reconciled_body.body;
         release_policy = match prepare_release_policy(
             &repo.root,
             &repo.remote,
@@ -1681,12 +2051,22 @@ pub async fn deliver<R: DeliveryRemote>(
         }
 
         // ── Wait for CI ─────────────────────────────────────────────────────
-        match wait_for_ci(remote, &sha, ci_timeout_secs).await {
+        let ci_wait = wait_for_ci(remote, &sha, ci_timeout_secs).await;
+        for detail in ci_wait.recoveries {
+            outcome.steps.push(StepResult::ok("ci_recovery", detail));
+        }
+        match ci_wait.status {
             CiStatus::Success | CiStatus::None => {
                 outcome.steps.push(StepResult::ok("ci", "CI 通过"))
             }
             CiStatus::Failure(d) => {
-                return outcome.blocked_at(StepResult::blocked("ci", format!("CI 未通过: {d}")))
+                return outcome.blocked_at(StepResult::blocked(
+                    "ci",
+                    format!(
+                        "CI 未通过: {d}。读取该 check 的失败日志，修复对应代码、测试或配置，\
+提交并 push 新 head 后重新调用 deliver_changes 续接；不要重复运行未修改的同一失败。"
+                    ),
+                ))
             }
             CiStatus::Pending => {
                 return outcome.blocked_at(StepResult::blocked(
@@ -1725,7 +2105,36 @@ pub async fn deliver<R: DeliveryRemote>(
             }
         };
         pr_title = refreshed_pr.title;
-        pr_body = refreshed_pr.body;
+        let reconciled_body = match reconcile_readme_contract_body(
+            &repo.root,
+            &repo.remote,
+            &repo.default_branch,
+            &refreshed_pr.body,
+        ) {
+            Ok(reconciled) => reconciled,
+            Err(error) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "policy",
+                    format!("合并前远端 PR README 契约未满足: {error}"),
+                ))
+            }
+        };
+        if reconciled_body.changed {
+            if let Err(error) = remote
+                .update_pr_body(pr_number, &reconciled_body.body)
+                .await
+            {
+                return outcome.blocked_at(StepResult::blocked(
+                    "pr",
+                    format!("合并前补齐 PR #{pr_number} README 审计字段失败: {error}"),
+                ));
+            }
+            outcome.steps.push(StepResult::ok(
+                "pr_body",
+                format!("合并前重新收敛 PR #{pr_number} 的 README 审计字段"),
+            ));
+        }
+        pr_body = reconciled_body.body;
         release_policy = match prepare_release_policy(
             &repo.root,
             &repo.remote,
@@ -1782,49 +2191,7 @@ pub async fn deliver<R: DeliveryRemote>(
         if matches!(merge_result, MergeRequestResult::Queued) {
             let mut queued = intent.clone();
             queued.state = "merge_queued".into();
-            if let Err(error) = write_delivery_receipt(&repo, &sha, &queued) {
-                return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
-                    "receipt",
-                    format!("GitHub 已登记 auto-merge，但 merge_queued 回执写入失败: {error}"),
-                ));
-            }
-            // Auto-merge is registered — but registered is not the same as
-            // progressing. Ask WHY it could not merge before telling the caller
-            // to wait: under a strict required-status-checks policy a `BEHIND`
-            // PR never becomes mergeable on its own, so "wait for the remote
-            // gates" would be an unbounded no-op wait.
-            let readiness = remote
-                .merge_readiness(pr_number)
-                .await
-                .unwrap_or(MergeReadiness::Unknown);
-            let detail = match &readiness {
-                MergeReadiness::Behind => match remote.update_pr_branch(pr_number).await {
-                    Ok(()) => format!(
-                        "PR #{pr_number} 落后于 {base}，auto-merge 不会自行更新分支（永远不会触发）。\
-已把 {base} 合入 PR 分支；CI 重新通过后 auto-merge 会接管。\
-再次调用 deliver_changes 可核对远端事实并续跑。",
-                        base = repo.default_branch
-                    ),
-                    Err(error) => format!(
-                        "PR #{pr_number} 落后于 {base}，auto-merge 不会自行更新分支，因此仅靠等待永远不会合并。\
-自动更新分支失败: {error}。\
-需要先把 {base} 合入 PR 分支（`gh pr update-branch {pr_number}`）并等 CI 重新通过。",
-                        base = repo.default_branch
-                    ),
-                },
-                MergeReadiness::NeedsAction(reason) => format!(
-                    "PR #{pr_number} 已登记 auto-merge，但仅靠等待不会合并: {reason}。"
-                ),
-                MergeReadiness::WaitingOnChecks | MergeReadiness::Ready => format!(
-                    "GitHub 已登记受规则保护的 auto-merge；PR #{pr_number} 正在等待必需检查完成，\
-通过后会自动合并。再次调用 deliver_changes 会先核对远端事实并续跑。"
-                ),
-                MergeReadiness::Unknown => {
-                    "GitHub 已登记受规则保护的 auto-merge；PR 仍在等待远端门禁，后续续接会先核对远端状态"
-                        .to_string()
-                }
-            };
-            return outcome.blocked_at(StepResult::blocked("merge", detail));
+            return resume_queued_merge(outcome, &repo, remote, &queued).await;
         }
         outcome.steps.push(StepResult::ok(
             "merge",
@@ -2267,9 +2634,25 @@ fn finish(mut outcome: DeliveryOutcome, branch: &str) -> DeliveryOutcome {
     outcome
 }
 
-async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32) -> CiStatus {
+struct CiWaitOutcome {
+    status: CiStatus,
+    recoveries: Vec<String>,
+}
+
+fn ci_failure_is_retryable(detail: &str) -> bool {
+    let without_url = detail.split(" [").next().unwrap_or(detail);
+    let conclusion = without_url.rsplit(':').next().unwrap_or(without_url);
+    matches!(
+        conclusion,
+        "cancelled" | "timed_out" | "stale" | "startup_failure"
+    )
+}
+
+async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32) -> CiWaitOutcome {
     let deadline = timeout_secs.max(1);
     let mut waited = 0u32;
+    let mut reruns = 0u8;
+    let mut recoveries = Vec::new();
     // Exponential backoff: 10s → 20s → 40s → 60s (capped). GitHub check-runs
     // polling is the biggest API cost of a delivery run; a fixed 10s cadence
     // burns ~30 requests for a 5-minute CI. Backoff keeps the first polls
@@ -2278,11 +2661,53 @@ async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32
     loop {
         match remote.ci_status(sha).await {
             Ok(CiStatus::Pending) => {}
-            Ok(other) => return other,
-            Err(e) => return CiStatus::Failure(e),
+            Ok(CiStatus::Failure(detail)) if ci_failure_is_retryable(&detail) && reruns < 1 => {
+                match remote.rerun_ci(sha).await {
+                    Ok(true) => {
+                        reruns += 1;
+                        waited = 0;
+                        interval = 10;
+                        recoveries.push(format!(
+                            "检测到可重试的 CI 基础设施结论 `{detail}`，已触发一次有界 rerun"
+                        ));
+                        continue;
+                    }
+                    Ok(false) => {
+                        return CiWaitOutcome {
+                            status: CiStatus::Failure(format!(
+                                "{detail}; 当前 provider 没有 CI rerun 能力"
+                            )),
+                            recoveries,
+                        }
+                    }
+                    Err(error) => {
+                        return CiWaitOutcome {
+                            status: CiStatus::Failure(format!(
+                                "{detail}; 自动 rerun 失败: {error}"
+                            )),
+                            recoveries,
+                        }
+                    }
+                }
+            }
+            Ok(other) => {
+                return CiWaitOutcome {
+                    status: other,
+                    recoveries,
+                }
+            }
+            Err(e) => {
+                return CiWaitOutcome {
+                    status: CiStatus::Failure(e),
+                    recoveries,
+                }
+            }
         }
         if waited >= deadline {
-            return CiStatus::Pending;
+            return CiWaitOutcome {
+                status: CiStatus::Pending,
+                recoveries,
+            };
         }
         let sleep_secs = interval.min(deadline - waited);
         tokio::time::sleep(std::time::Duration::from_secs(sleep_secs as u64)).await;
@@ -2512,6 +2937,21 @@ impl DeliveryRemote for HookRemote {
         })
     }
 
+    async fn update_pr_body(&self, number: u64, body: &str) -> Result<(), String> {
+        let value = self.run_json(json!({
+            "action": "update_pr_body",
+            "number": number,
+            "body": body,
+        }))?;
+        let _response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
+            format!(
+                "delivery provider hook '{}' update PR response invalid: {e}",
+                self.id
+            )
+        })?;
+        Ok(())
+    }
+
     async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
         let value = self.run_json(json!({ "action": "ci_status", "sha": sha }))?;
         let response: HookStatusResponse = serde_json::from_value(value).map_err(|e| {
@@ -2527,6 +2967,17 @@ impl DeliveryRemote for HookRemote {
             "failure" => CiStatus::Failure(response.detail.unwrap_or_else(|| "failure".into())),
             other => CiStatus::Failure(format!("unknown hook ci status: {other}")),
         })
+    }
+
+    async fn rerun_ci(&self, sha: &str) -> Result<bool, String> {
+        let value = self.run_json(json!({ "action": "rerun_ci", "sha": sha }))?;
+        let response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
+            format!(
+                "delivery provider hook '{}' rerun CI response invalid: {e}",
+                self.id
+            )
+        })?;
+        Ok(response.ok.unwrap_or(true))
     }
 
     async fn merge_pr(
@@ -2738,6 +3189,16 @@ fn gh_pr_create_args(title: &str, body: &str, head: &str, base: &str) -> Vec<Str
     ]
 }
 
+fn gh_pr_edit_body_args(number: u64, body: &str) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "edit".into(),
+        number.to_string(),
+        "--body".into(),
+        body.into(),
+    ]
+}
+
 /// Map GitHub's `mergeStateStatus` onto the wait-vs-deadlock distinction.
 ///
 /// `BEHIND` is the load-bearing case: it only appears when the repository
@@ -2833,12 +3294,9 @@ fn reconcile_pr_title(title: &str, commit_slot: u8) -> (String, Option<String>) 
 
 /// Highest conventional slot among the commits this branch adds over `base`.
 fn branch_commit_slot(root: &Path, base: &str, branch: &str) -> u8 {
-    git(
-        root,
-        &["log", "--format=%s", &format!("{base}..{branch}")],
-    )
-    .map(|log| log.lines().map(conventional_slot).max().unwrap_or(0))
-    .unwrap_or(0)
+    git(root, &["log", "--format=%s", &format!("{base}..{branch}")])
+        .map(|log| log.lines().map(conventional_slot).max().unwrap_or(0))
+        .unwrap_or(0)
 }
 
 fn merge_readiness_from_state(state: &str) -> MergeReadiness {
@@ -2847,14 +3305,41 @@ fn merge_readiness_from_state(state: &str) -> MergeReadiness {
         "BEHIND" => MergeReadiness::Behind,
         // Non-required checks pending; required ones decide. Waiting is right.
         "UNSTABLE" | "BLOCKED" => MergeReadiness::WaitingOnChecks,
-        "DIRTY" => MergeReadiness::NeedsAction(
-            "PR 与目标分支存在冲突，需要人工解决后才能合并".into(),
-        ),
-        "DRAFT" => {
-            MergeReadiness::NeedsAction("PR 仍是 draft，需要标记为 ready 才能合并".into())
+        "DIRTY" => {
+            MergeReadiness::NeedsAction("PR 与目标分支存在冲突，需要人工解决后才能合并".into())
         }
+        "DRAFT" => MergeReadiness::NeedsAction("PR 仍是 draft，需要标记为 ready 才能合并".into()),
         _ => MergeReadiness::Unknown,
     }
+}
+
+fn parse_github_merge_readiness(value: &serde_json::Value) -> MergeReadiness {
+    if value
+        .get("isDraft")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return MergeReadiness::NeedsAction("PR 仍是 draft，需要标记为 ready 才能合并".into());
+    }
+    match value
+        .get("reviewDecision")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+    {
+        "CHANGES_REQUESTED" => {
+            return MergeReadiness::NeedsAction("PR 存在未解决的 changes requested review".into())
+        }
+        "REVIEW_REQUIRED" => {
+            return MergeReadiness::NeedsAction("PR 仍缺少 required review".into())
+        }
+        _ => {}
+    }
+    merge_readiness_from_state(
+        value
+            .get("mergeStateStatus")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+    )
 }
 
 fn gh_pr_merge_args(
@@ -3076,6 +3561,10 @@ impl DeliveryRemote for GhCliRemote {
         }
     }
 
+    async fn update_pr_body(&self, number: u64, body: &str) -> Result<(), String> {
+        self.gh(&gh_pr_edit_body_args(number, body)).map(|_| ())
+    }
+
     async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
         let raw = self.gh(&[
             "api".into(),
@@ -3086,10 +3575,7 @@ impl DeliveryRemote for GhCliRemote {
         let rules = self
             .gh(&[
                 "api".into(),
-                format!(
-                    "repos/{}/rules/branches/{}",
-                    self.repo, self.default_branch
-                ),
+                format!("repos/{}/rules/branches/{}", self.repo, self.default_branch),
             ])
             .ok()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
@@ -3103,6 +3589,46 @@ impl DeliveryRemote for GhCliRemote {
             other => CiStatus::Failure(other.trim_start_matches("failure:").to_string()),
         };
         Ok(self.ci_stability.confirm(&observation.fingerprint, status))
+    }
+
+    async fn rerun_ci(&self, sha: &str) -> Result<bool, String> {
+        let raw = self.gh(&[
+            "run".into(),
+            "list".into(),
+            "--commit".into(),
+            sha.into(),
+            "--limit".into(),
+            "20".into(),
+            "--json".into(),
+            "databaseId,status,conclusion".into(),
+        ])?;
+        let runs: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|error| format!("gh run list returned non-JSON: {error}"))?;
+        let mut rerun = false;
+        for run in runs.as_array().into_iter().flatten() {
+            if run.get("status").and_then(serde_json::Value::as_str) != Some("completed") {
+                continue;
+            }
+            let conclusion = run
+                .get("conclusion")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if !matches!(
+                conclusion,
+                "failure" | "cancelled" | "timed_out" | "stale" | "startup_failure"
+            ) {
+                continue;
+            }
+            let Some(id) = run.get("databaseId").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            self.gh(&["run".into(), "rerun".into(), id.to_string()])?;
+            rerun = true;
+        }
+        if rerun {
+            self.ci_stability.reset();
+        }
+        Ok(rerun)
     }
 
     async fn conflicting_open_pr(
@@ -3150,16 +3676,29 @@ impl DeliveryRemote for GhCliRemote {
             "view".into(),
             number.to_string(),
             "--json".into(),
-            "mergeStateStatus".into(),
-            "--jq".into(),
-            ".mergeStateStatus".into(),
+            "mergeStateStatus,reviewDecision,isDraft".into(),
         ])?;
-        Ok(merge_readiness_from_state(raw.trim()))
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|error| format!("gh pr view readiness returned non-JSON: {error}"))?;
+        Ok(parse_github_merge_readiness(&value))
     }
 
-    async fn update_pr_branch(&self, number: u64) -> Result<(), String> {
-        self.gh(&["pr".into(), "update-branch".into(), number.to_string()])
-            .map(|_| ())
+    async fn update_pr_branch(&self, number: u64) -> Result<String, String> {
+        self.gh(&["pr".into(), "update-branch".into(), number.to_string()])?;
+        let head = self.gh(&[
+            "pr".into(),
+            "view".into(),
+            number.to_string(),
+            "--json".into(),
+            "headRefOid".into(),
+            "--jq".into(),
+            ".headRefOid".into(),
+        ])?;
+        if head.trim().is_empty() {
+            Err("GitHub updated the PR branch but returned no new head SHA".into())
+        } else {
+            Ok(head.trim().to_string())
+        }
     }
 
     async fn merge_pr(
@@ -3187,7 +3726,10 @@ impl DeliveryRemote for GhCliRemote {
                 return Ok(MergeRequestResult::Queued)
             }
             MergeObservation::OpenSameHead { auto_merge: false } => {
-                return Err("GitHub accepted gh pr merge but neither merged nor registered auto-merge".into())
+                return Err(
+                    "GitHub accepted gh pr merge but neither merged nor registered auto-merge"
+                        .into(),
+                )
             }
             MergeObservation::HeadChanged { actual_head } => {
                 return Err(format!(
@@ -3287,18 +3829,22 @@ impl DeliveryRemote for EitherRemote {
         expected_head: &str,
     ) -> Result<MergeRequestResult, String> {
         match self {
-            EitherRemote::Hook(r) => r
-                .merge_pr(number, method, commit_message, expected_head)
-                .await,
-            EitherRemote::Gh(r) => r
-                .merge_pr(number, method, commit_message, expected_head)
-                .await,
-            EitherRemote::Github(r) => r
-                .merge_pr(number, method, commit_message, expected_head)
-                .await,
-            EitherRemote::Gitlab(r) => r
-                .merge_pr(number, method, commit_message, expected_head)
-                .await,
+            EitherRemote::Hook(r) => {
+                r.merge_pr(number, method, commit_message, expected_head)
+                    .await
+            }
+            EitherRemote::Gh(r) => {
+                r.merge_pr(number, method, commit_message, expected_head)
+                    .await
+            }
+            EitherRemote::Github(r) => {
+                r.merge_pr(number, method, commit_message, expected_head)
+                    .await
+            }
+            EitherRemote::Gitlab(r) => {
+                r.merge_pr(number, method, commit_message, expected_head)
+                    .await
+            }
         }
     }
     async fn observe_merge(
@@ -3711,6 +4257,10 @@ impl DeliveryRemote for GitlabRemote {
         })
     }
 
+    async fn update_pr_body(&self, number: u64, body: &str) -> Result<(), String> {
+        crate::git_remote::gitlab::update_pr_body(&self.client, &self.repo, number, body).await
+    }
+
     async fn ci_status(&self, _sha: &str) -> Result<CiStatus, String> {
         Ok(CiStatus::None)
     }
@@ -3782,6 +4332,10 @@ impl DeliveryRemote for GithubRemote {
         })
     }
 
+    async fn update_pr_body(&self, number: u64, body: &str) -> Result<(), String> {
+        crate::git_remote::github::update_pr_body(&self.client, &self.repo, number, body).await
+    }
+
     async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
         let observation = crate::git_remote::github::ci_observation(
             &self.client,
@@ -3797,6 +4351,96 @@ impl DeliveryRemote for GithubRemote {
             other => CiStatus::Failure(other.trim_start_matches("failure:").to_string()),
         };
         Ok(self.ci_stability.confirm(&observation.fingerprint, status))
+    }
+
+    async fn rerun_ci(&self, sha: &str) -> Result<bool, String> {
+        let value = self
+            .client
+            .get(&format!(
+                "/repos/{}/actions/runs?head_sha={sha}&per_page=20",
+                self.repo
+            ))
+            .await?;
+        let mut rerun = false;
+        for run in value
+            .get("workflow_runs")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if run.get("status").and_then(serde_json::Value::as_str) != Some("completed") {
+                continue;
+            }
+            let conclusion = run
+                .get("conclusion")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if !matches!(
+                conclusion,
+                "failure" | "cancelled" | "timed_out" | "stale" | "startup_failure"
+            ) {
+                continue;
+            }
+            let Some(id) = run.get("id").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            self.client
+                .post(
+                    &format!("/repos/{}/actions/runs/{id}/rerun", self.repo),
+                    serde_json::json!({}),
+                )
+                .await?;
+            rerun = true;
+        }
+        if rerun {
+            self.ci_stability.reset();
+        }
+        Ok(rerun)
+    }
+
+    async fn merge_readiness(&self, number: u64) -> Result<MergeReadiness, String> {
+        let value = self
+            .client
+            .get(&format!("/repos/{}/pulls/{number}", self.repo))
+            .await?;
+        if value
+            .get("draft")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(MergeReadiness::NeedsAction(
+                "PR 仍是 draft，需要标记为 ready 才能合并".into(),
+            ));
+        }
+        Ok(merge_readiness_from_state(
+            value
+                .get("mergeable_state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        ))
+    }
+
+    async fn update_pr_branch(&self, number: u64) -> Result<String, String> {
+        self.client
+            .put(
+                &format!("/repos/{}/pulls/{number}/update-branch", self.repo),
+                serde_json::json!({}),
+            )
+            .await?;
+        let value = self
+            .client
+            .get(&format!("/repos/{}/pulls/{number}", self.repo))
+            .await?;
+        let head = value
+            .get("head")
+            .and_then(|head| head.get("sha"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if head.is_empty() {
+            Err("GitHub updated the PR branch but returned no new head SHA".into())
+        } else {
+            Ok(head.to_string())
+        }
     }
 
     async fn merge_pr(
@@ -3880,6 +4524,7 @@ impl DeliveryRemote for GithubRemote {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -4162,16 +4807,15 @@ mod tests {
                 "pr", "create", "--title", "t", "--body", "b", "--head", "feat/x", "--base", "main"
             ]
         );
+        assert_eq!(
+            gh_pr_edit_body_args(7, "updated body"),
+            vec!["pr", "edit", "7", "--body", "updated body"]
+        );
         let merge_message = MergeCommitMessage {
             title: "fix: preserve release policy".into(),
             body: "Release-Urgency: hold".into(),
         };
-        let merge = gh_pr_merge_args(
-            42,
-            MergeMethod::Squash,
-            Some(&merge_message),
-            "abc123",
-        );
+        let merge = gh_pr_merge_args(42, MergeMethod::Squash, Some(&merge_message), "abc123");
         assert_eq!(
             merge,
             vec![
@@ -4239,8 +4883,7 @@ mod tests {
             "conclusion": "success",
             "app": {"id": 15368}
         }]});
-        let observation =
-            crate::git_remote::github::classify_ci_observation(&partial, &required);
+        let observation = crate::git_remote::github::classify_ci_observation(&partial, &required);
         assert_eq!(observation.status, "pending");
         assert!(observation.fingerprint.contains("check:absent"));
 
@@ -4256,6 +4899,39 @@ mod tests {
             crate::git_remote::github::classify_ci_observation(&complete, &required).status,
             "success"
         );
+    }
+
+    #[test]
+    fn github_ci_failure_names_the_check_and_retryability() {
+        let required = vec![crate::git_remote::github::RequiredStatusCheck {
+            context: "check".into(),
+            integration_id: Some(15368),
+        }];
+        for (conclusion, retryable) in [
+            ("failure", false),
+            ("cancelled", true),
+            ("timed_out", true),
+            ("stale", true),
+            ("startup_failure", true),
+        ] {
+            let runs = serde_json::json!({"check_runs": [{
+                "name": "check",
+                "status": "completed",
+                "conclusion": conclusion,
+                "app": {"id": 15368},
+                "details_url": "https://github.example/actions/runs/7/job/8"
+            }]});
+            let observation = crate::git_remote::github::classify_ci_observation(&runs, &required);
+            assert!(
+                observation
+                    .status
+                    .starts_with(&format!("failure:check:{conclusion}")),
+                "{}",
+                observation.status
+            );
+            assert!(observation.status.contains("actions/runs/7/job/8"));
+            assert_eq!(ci_failure_is_retryable(&observation.status), retryable);
+        }
     }
 
     #[test]
@@ -4445,6 +5121,13 @@ Release-Urgency: hold"
     /// Real-runtime smoke: with a logged-in gh on this machine, `ci_status` on a
     /// commit the remote actually has must parse into a valid `CiStatus`.
     ///
+    /// This is intentionally opt-in (`CODEFACTORY_RUN_GH_SMOKE=1`). The default
+    /// Rust suite runs often during delivery and CI; hitting GitHub's live API
+    /// there amplified PR polling into rate limits and failed otherwise-good
+    /// builds. Parser behavior is covered by deterministic unit tests; this smoke
+    /// is for explicit operator diagnostics only. That opt-in gate is part of
+    /// the delivery stability contract: routine CI must not consume GitHub API
+    /// quota just to prove local parser behavior.
     /// It asks about `origin/<default>`, NOT local `HEAD`. Local HEAD is
     /// whatever you are working on, and GitHub answers `No commit found for SHA
     /// … (HTTP 422)` for anything unpushed — so the old form failed on every
@@ -4456,6 +5139,10 @@ Release-Urgency: hold"
     /// it at a remote-known commit keeps it running during ordinary work.
     #[tokio::test]
     async fn gh_cli_remote_reads_real_ci_status_when_gh_is_authenticated() {
+        if std::env::var("CODEFACTORY_RUN_GH_SMOKE").ok().as_deref() != Some("1") {
+            eprintln!("skipping gh smoke: set CODEFACTORY_RUN_GH_SMOKE=1 to hit GitHub's live API");
+            return;
+        }
         if !gh_cli_available() {
             eprintln!("skipping gh smoke: gh missing or unauthenticated");
             return;
@@ -4477,6 +5164,10 @@ Release-Urgency: hold"
         };
         match remote.ci_status(sha.trim()).await {
             Ok(_) => {}
+            Err(e) if e.to_ascii_lowercase().contains("rate limit") => {
+                eprintln!("skipping gh smoke: GitHub API rate limited this external smoke: {e}");
+                return;
+            }
             Err(e) => panic!("gh ci_status must parse for remote-known {sha}: {e}"),
         }
     }
@@ -4936,6 +5627,7 @@ else:
         ci: CiStatus,
         existing_pr: Option<(u64, String)>,
         merge_ok: bool,
+        merge_queues: bool,
         /// Varies per test: the whole point of the ladder fix is that a missing
         /// high-rung capability must not cancel the rungs below it.
         caps: DeliveryCapabilities,
@@ -4946,11 +5638,18 @@ else:
     struct StubCalls {
         merged: AtomicBool,
         open_pr: AtomicUsize,
+        update_pr_body: AtomicUsize,
         ci: AtomicUsize,
+        rerun_ci: AtomicUsize,
         merge: AtomicUsize,
+        update_branch: AtomicUsize,
         release: AtomicUsize,
         merge_commit_message: Mutex<Option<MergeCommitMessage>>,
         remote_pr_text: Mutex<Option<(String, String)>>,
+        last_pr_body: Mutex<Option<String>>,
+        last_ci_sha: Mutex<Option<String>>,
+        ci_sequence: Mutex<VecDeque<CiStatus>>,
+        merge_readiness: Mutex<Option<MergeReadiness>>,
     }
 
     fn stub_calls() -> Arc<StubCalls> {
@@ -4980,6 +5679,7 @@ else:
             _base: &str,
         ) -> Result<DeliveryPr, String> {
             self.calls.open_pr.fetch_add(1, Ordering::SeqCst);
+            *self.calls.last_pr_body.lock().unwrap() = Some(b.to_string());
             let (number, url) = self
                 .existing_pr
                 .clone()
@@ -4998,9 +5698,27 @@ else:
                 body,
             })
         }
-        async fn ci_status(&self, _sha: &str) -> Result<CiStatus, String> {
+        async fn update_pr_body(&self, _number: u64, body: &str) -> Result<(), String> {
+            self.calls.update_pr_body.fetch_add(1, Ordering::SeqCst);
+            let mut remote = self.calls.remote_pr_text.lock().unwrap();
+            let title = remote
+                .as_ref()
+                .map(|(title, _)| title.clone())
+                .unwrap_or_else(|| "fix: existing PR".into());
+            *remote = Some((title, body.to_string()));
+            Ok(())
+        }
+        async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
             self.calls.ci.fetch_add(1, Ordering::SeqCst);
+            *self.calls.last_ci_sha.lock().unwrap() = Some(sha.to_string());
+            if let Some(status) = self.calls.ci_sequence.lock().unwrap().pop_front() {
+                return Ok(status);
+            }
             Ok(self.ci.clone())
+        }
+        async fn rerun_ci(&self, _sha: &str) -> Result<bool, String> {
+            self.calls.rerun_ci.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
         }
         async fn merge_pr(
             &self,
@@ -5011,7 +5729,9 @@ else:
         ) -> Result<MergeRequestResult, String> {
             self.calls.merge.fetch_add(1, Ordering::SeqCst);
             *self.calls.merge_commit_message.lock().unwrap() = commit_message.cloned();
-            if self.merge_ok {
+            if self.merge_queues {
+                Ok(MergeRequestResult::Queued)
+            } else if self.merge_ok {
                 self.calls.merged.store(true, Ordering::SeqCst);
                 Ok(MergeRequestResult::Merged {
                     merge_sha: "merge-sha".into(),
@@ -5030,8 +5750,28 @@ else:
                     merge_sha: "merge-sha".into(),
                 })
             } else {
-                Ok(MergeObservation::OpenSameHead { auto_merge: false })
+                Ok(MergeObservation::OpenSameHead {
+                    auto_merge: self.merge_queues && self.calls.merge.load(Ordering::SeqCst) > 0,
+                })
             }
+        }
+        async fn merge_readiness(&self, _number: u64) -> Result<MergeReadiness, String> {
+            Ok(self
+                .calls
+                .merge_readiness
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(MergeReadiness::Unknown))
+        }
+        async fn update_pr_branch(&self, _number: u64) -> Result<String, String> {
+            self.calls.update_branch.fetch_add(1, Ordering::SeqCst);
+            self.calls
+                .last_ci_sha
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| "stub has not observed a head".into())
         }
         async fn trigger_release(&self) -> Result<String, String> {
             self.calls.release.fetch_add(1, Ordering::SeqCst);
@@ -5066,6 +5806,7 @@ else:
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: stub_calls(),
@@ -5093,7 +5834,148 @@ else:
         assert!(steps.contains(&"pr"));
         assert!(!steps.contains(&"ci"), "PrOnly must stop before CI");
         assert!(!steps.contains(&"merge"));
+        let body = remote
+            .calls
+            .last_pr_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("controlled delivery must send a PR body");
+        assert!(body.contains("README-Update: reviewed"));
+        assert!(body.contains("README-Update-Reason:"));
+        assert!(!body.contains("README-Update-Reason: <"));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn readme_diff_is_declared_required_in_generated_pr_body() {
+        let root = feature_branch_repo("pr-readme-required");
+        std::fs::write(root.join("README.md"), "# User-facing change\n").unwrap();
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let out = deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "delivered", "{:?}", out.steps);
+        let body = calls.last_pr_body.lock().unwrap().clone().unwrap();
+        assert!(body.contains("README-Update: required"), "{body}");
+        assert!(body.contains("README-Update-Reason:"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn existing_pr_body_is_converged_instead_of_left_to_fail_ci() {
+        let root = feature_branch_repo("pr-body-converge");
+        let calls = stub_calls();
+        *calls.remote_pr_text.lock().unwrap() = Some((
+            "fix: existing PR".into(),
+            "Existing context that must be preserved.".into(),
+        ));
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: Some((7, "https://example/pr/7".into())),
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let out = deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "delivered", "{:?}", out.steps);
+        assert_eq!(calls.update_pr_body.load(Ordering::SeqCst), 1);
+        let body = calls.remote_pr_text.lock().unwrap().clone().unwrap().1;
+        assert!(body.contains("Existing context that must be preserved."));
+        assert!(body.contains("README-Update: reviewed"));
+        assert!(body.contains("README-Update-Reason:"));
+    }
+
+    #[tokio::test]
+    async fn retryable_ci_infrastructure_failure_reruns_once_then_continues() {
+        let root = feature_branch_repo("ci-retryable");
+        let calls = stub_calls();
+        *calls.ci_sequence.lock().unwrap() = VecDeque::from([
+            CiStatus::Failure("check:timed_out".into()),
+            CiStatus::Success,
+        ]);
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let out = deliver(
+            &root,
+            DeliveryCeiling::ThroughCiGreen,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "delivered", "{:?}", out.steps);
+        assert_eq!(calls.rerun_ci.load(Ordering::SeqCst), 1);
+        assert!(out.steps.iter().any(|step| step.step == "ci_recovery"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_test_failure_is_actionable_but_not_blindly_rerun() {
+        let root = feature_branch_repo("ci-actionable");
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Failure("check:failure".into()),
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let out = deliver(
+            &root,
+            DeliveryCeiling::ThroughCiGreen,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "blocked");
+        assert!(out.recoverable);
+        assert_eq!(calls.rerun_ci.load(Ordering::SeqCst), 0);
+        assert!(out.next_action.as_deref().unwrap_or("").contains("check"));
+        assert!(out.next_action.as_deref().unwrap_or("").contains("修复"));
     }
 
     #[tokio::test]
@@ -5103,6 +5985,7 @@ else:
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: calls.clone(),
@@ -5165,6 +6048,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: calls.clone(),
@@ -5299,6 +6183,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 review: false,
@@ -5350,6 +6235,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: calls.clone(),
@@ -5388,6 +6274,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Failure("build red".into()),
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: stub_calls(),
@@ -5415,11 +6302,134 @@ Release-Urgency: hold"
     }
 
     #[tokio::test]
+    async fn queued_auto_merge_is_a_waiting_state_not_a_permission_failure() {
+        let root = feature_branch_repo("merge-queued");
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: false,
+            merge_queues: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let out = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+        assert_eq!(out.final_state, "blocked", "{:?}", out.steps);
+        assert_eq!(out.reached_state, "merge_queued");
+        assert_eq!(out.code, "delivery_merge_queued");
+        assert!(out.recoverable);
+        assert!(out
+            .steps
+            .iter()
+            .any(|s| s.step == "merge" && s.status == "waiting"));
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.update_branch.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn queued_auto_merge_resume_observes_without_reissuing_merge() {
+        let root = feature_branch_repo("merge-queued-resume");
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: false,
+            merge_queues: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let first = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+        assert_eq!(first.code, "delivery_merge_queued", "{:?}", first.steps);
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 1);
+
+        let resumed = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+        assert_eq!(resumed.code, "delivery_merge_queued", "{:?}", resumed.steps);
+        assert_eq!(
+            calls.merge.load(Ordering::SeqCst),
+            1,
+            "a durable merge_queued receipt must prevent duplicate merge requests"
+        );
+        assert!(resumed.steps.iter().any(|step| {
+            step.step == "reconcile" && step.detail.contains("不重复发起合并")
+        }));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn queued_auto_merge_updates_a_behind_branch_instead_of_waiting_forever() {
+        let root = feature_branch_repo("merge-queued-behind");
+        let calls = stub_calls();
+        *calls.merge_readiness.lock().unwrap() = Some(MergeReadiness::Behind);
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_ok: false,
+            merge_queues: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let out = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "blocked", "{:?}", out.steps);
+        assert_eq!(out.code, "delivery_branch_updated");
+        assert!(out.recoverable);
+        assert_eq!(calls.update_branch.load(Ordering::SeqCst), 1);
+        assert!(out
+            .next_action
+            .as_deref()
+            .unwrap_or("")
+            .contains("deliver_changes"));
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
     async fn through_merge_merges_on_green() {
         let root = feature_branch_repo("merge");
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: stub_calls(),
@@ -5497,6 +6507,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 live: false,
@@ -5566,6 +6577,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: calls.clone(),
@@ -5604,6 +6616,7 @@ Release-Urgency: hold"
         let first_remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 live: false,
@@ -5626,6 +6639,7 @@ Release-Urgency: hold"
         let resume_remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 release: false,
@@ -5733,52 +6747,54 @@ Release-Urgency: hold"
 
     #[tokio::test]
     async fn merge_intent_reconciles_open_same_head_and_resumes_safely() {
-            let root = feature_branch_repo("intent-merge-reconcile");
-            git(&root, &["add", "feature.rs"]).unwrap();
-            git(&root, &["commit", "-q", "-m", "feature"]).unwrap();
-            let repo = resolve_repo(&root, Some("main")).unwrap();
-            let sha = git(&root, &["rev-parse", "HEAD"]).unwrap();
-            let receipt = DeliveryReceipt {
-                version: 1,
-                state: "intent_merge".into(),
-                remote: repo.remote.clone(),
-                remote_identity: receipt_remote_identity(&repo),
-                base_branch: repo.default_branch.clone(),
-                head_branch: repo.branch.clone(),
-                commit_sha: sha.clone(),
-                pr_number: 7,
-                pr_url: "https://example/pr/7".into(),
-                pr_title: None,
-                pr_body: None,
-                release_detail: None,
-            };
-            write_delivery_receipt(&repo, &sha, &receipt).unwrap();
-            let calls = stub_calls();
-            let remote = StubRemote {
-                ci: CiStatus::Success,
-                existing_pr: None,
-                merge_ok: true,
-                caps: every_capability(),
-                calls: calls.clone(),
-            };
-            let out = deliver(
-                &root,
-                DeliveryCeiling::ThroughMerge,
-                MergeMethod::Squash,
-                5,
-                &DeliverOpts::default(),
-                Some(&remote),
-                Some("main"),
-            )
-            .await;
-            assert_eq!(out.final_state, "delivered", "{:?}", out.steps);
-            assert_eq!(out.reached_state, "merged");
-            assert_eq!(calls.merge.load(Ordering::SeqCst), 1);
-            assert_eq!(calls.release.load(Ordering::SeqCst), 0);
-            assert!(out.steps.iter().any(|step| {
-                step.step == "reconcile" && step.detail.contains("安全续接")
-            }));
-            let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        let root = feature_branch_repo("intent-merge-reconcile");
+        git(&root, &["add", "feature.rs"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "feature"]).unwrap();
+        let repo = resolve_repo(&root, Some("main")).unwrap();
+        let sha = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let receipt = DeliveryReceipt {
+            version: 1,
+            state: "intent_merge".into(),
+            remote: repo.remote.clone(),
+            remote_identity: receipt_remote_identity(&repo),
+            base_branch: repo.default_branch.clone(),
+            head_branch: repo.branch.clone(),
+            commit_sha: sha.clone(),
+            pr_number: 7,
+            pr_url: "https://example/pr/7".into(),
+            pr_title: None,
+            pr_body: None,
+            release_detail: None,
+        };
+        write_delivery_receipt(&repo, &sha, &receipt).unwrap();
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let out = deliver(
+            &root,
+            DeliveryCeiling::ThroughMerge,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+        assert_eq!(out.final_state, "delivered", "{:?}", out.steps);
+        assert_eq!(out.reached_state, "merged");
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        assert!(out
+            .steps
+            .iter()
+            .any(|step| { step.step == "reconcile" && step.detail.contains("安全续接") }));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
     #[tokio::test]
@@ -5807,6 +6823,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: calls.clone(),
@@ -5834,6 +6851,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 release: false,
@@ -5893,6 +6911,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 ci: false,
@@ -5942,6 +6961,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 merge: false,
@@ -5980,6 +7000,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: DeliveryCapabilities {
                 ci: false,
@@ -6069,13 +7090,9 @@ Release-Urgency: hold"
         // idempotent resume, even though another PR shares the title.
         assert!(conflicting_open_pr_from_list(&open, "feat: add pane", "feat/pane").is_none());
         // A genuinely new title on a fresh branch is fine too.
-        assert!(
-            conflicting_open_pr_from_list(&open, "fix: unrelated work", "fix/fresh").is_none()
-        );
+        assert!(conflicting_open_pr_from_list(&open, "fix: unrelated work", "fix/fresh").is_none());
         // Whitespace must not defeat the match.
-        assert!(
-            conflicting_open_pr_from_list(&open, "  feat: add pane  ", "fix/fresh").is_some()
-        );
+        assert!(conflicting_open_pr_from_list(&open, "  feat: add pane  ", "fix/fresh").is_some());
         // No open PRs at all → nothing to conflict with.
         assert!(conflicting_open_pr_from_list(&[], "feat: add pane", "feat/pane").is_none());
     }
@@ -6086,6 +7103,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: Arc::new(StubCalls::default()),
@@ -6136,6 +7154,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: Arc::new(StubCalls::default()),
@@ -6154,7 +7173,9 @@ Release-Urgency: hold"
         )
         .await;
         assert!(
-            out.steps.iter().any(|s| s.step == "commit" && s.status == "ok"),
+            out.steps
+                .iter()
+                .any(|s| s.step == "commit" && s.status == "ok"),
             "a correct declaration must not block delivery: {:?}",
             out.steps
         );
@@ -6339,11 +7360,27 @@ Release-Urgency: hold"
             .args(["init", "--bare", "-q", origin.to_str().unwrap()])
             .status()
             .unwrap();
-        git(&root, &["remote", "add", "origin", origin.to_str().unwrap()]).unwrap();
+        git(
+            &root,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .unwrap();
         git(&root, &["push", "-q", "origin", "main"]).unwrap();
 
         let wt = root.parent().unwrap().join("wt-feat");
-        git(&root, &["worktree", "add", "-q", "-b", "feat/wt", wt.to_str().unwrap(), "main"]).unwrap();
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/wt",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        )
+        .unwrap();
         std::fs::write(wt.join("feature.rs"), "pub fn f() {}\n").unwrap();
         git(&wt, &["add", "-A"]).unwrap();
         git(&wt, &["commit", "-q", "-m", "feat(wt): work"]).unwrap();
@@ -6356,6 +7393,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: stub_calls(),
@@ -6392,6 +7430,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: stub_calls(),
@@ -6418,7 +7457,9 @@ Release-Urgency: hold"
         assert_eq!(out.branch.as_deref(), Some("feat/wt"));
         assert_eq!(out.pr_number, Some(7));
         assert!(
-            out.steps.iter().any(|s| s.step == "repo" && s.status == "ok"),
+            out.steps
+                .iter()
+                .any(|s| s.step == "repo" && s.status == "ok"),
             "worktree discovery should be recorded as a repo step"
         );
         assert_eq!(remote.calls.open_pr.load(Ordering::SeqCst), 1);
@@ -6430,7 +7471,19 @@ Release-Urgency: hold"
         let (root, wt1) = repo_with_worktree_feature("wt-multi");
         // A second sibling worktree with its own ahead branch.
         let wt2 = root.parent().unwrap().join("wt-feat2");
-        git(&root, &["worktree", "add", "-q", "-b", "feat/wt2", wt2.to_str().unwrap(), "main"]).unwrap();
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/wt2",
+                wt2.to_str().unwrap(),
+                "main",
+            ],
+        )
+        .unwrap();
         std::fs::write(wt2.join("feature2.rs"), "pub fn g() {}\n").unwrap();
         git(&wt2, &["add", "-A"]).unwrap();
         git(&wt2, &["commit", "-q", "-m", "feat(wt2): work"]).unwrap();
@@ -6438,6 +7491,7 @@ Release-Urgency: hold"
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
+            merge_queues: false,
             merge_ok: true,
             caps: every_capability(),
             calls: stub_calls(),
@@ -6514,7 +7568,10 @@ github.com:
     user: BumStill
     oauth_token:
 ";
-        assert!(!gh_hosts_content_has_auth_for_host(empty_token, "github.com"));
+        assert!(!gh_hosts_content_has_auth_for_host(
+            empty_token,
+            "github.com"
+        ));
         let no_token = "github.com:\n    user: BumStill\n";
         assert!(!gh_hosts_content_has_auth_for_host(no_token, "github.com"));
     }

@@ -9,13 +9,17 @@
 | `tools/governance/validate_readme_contract.py` | 静态 README 检查、PR body 决策解析、required diff 检查 |
 | `.github/workflows/ci.yml` | 在已有 required `check` job 中运行 validator，避免新增规则集依赖 |
 | `.github/workflows/readme-review.yml` | 每月/手动执行静态检查并幂等创建 review issue，不改正文 |
+| `src-tauri/src/agent/delivery.rs` | 在开 PR/恢复 PR 时收敛 PR body，绑定最新 head 与最新 check run，并驱动失败恢复 |
 | `docs/principles/readme-update-cadence.md` | 跨 agent 的规范来源 |
 
 ## 数据流
 
 ```text
-PR body + event payload
+branch diff + PR body + event payload
           │
+          ▼                         ┌─ malformed body → same-PR PATCH → new check
+  deliver_changes convergence ─────┤
+          │                         └─ explicit required without diff → development loop
           ▼
   README contract validator ── static: marker/headings/links/version
           │                    └─ PR: decision/reason + required README diff
@@ -28,6 +32,8 @@ monthly schedule → static validator → one review issue → human PR (if need
 ## 合同
 
 - `README-Update` 和 `README-Update-Reason` 必须各出现一次；理由不能是占位符。
+- 有效的显式决策优先于自动缺省；自动收敛不得降级显式 `required`，不得编辑 README
+  正文。对 PR body 的 PATCH 后必须等待该 head 的最新 check run，旧失败不能覆盖新结果。
 - 静态层拒绝精确 `vX.Y.Z`/`X.Y.Z`，要求 `releases/latest`，并解析 README 内相对链接。
 - PR event 使用 `pull_request.base.sha...HEAD` 判断 `README.md` 是否真实变更；缺 base
   SHA 时 required 决策失败关闭。
@@ -39,7 +45,8 @@ monthly schedule → static validator → one review issue → human PR (if need
 - 复用现有 `check` required job，避免修改 GitHub ruleset；Linux agent-bridge 的
   unittest 还会覆盖 validator 的边界逻辑。
 - 不让 release workflow 回写 README，避免每个版本产生噪音和 merge 竞争。
-- 机器无法推断“用户可见”语义，所以把意图显式交给作者并要求理由；静态检查负责
+- 机器无法完全推断“用户可见”语义，所以显式判断仍由作者/执行 agent 负责；
+  `deliver_changes` 只负责机器字段的确定性收敛、同 PR 恢复和证据绑定，静态检查负责
   可机械证明的部分，月度 issue 负责语义复核。
 - issue 创建按月份查询 open issue 后再创建，重复调度不会产生重复提醒；权限只给
   `contents: read` 和 `issues: write`。

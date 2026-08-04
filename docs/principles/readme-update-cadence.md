@@ -30,10 +30,12 @@ README-Update-Reason: <why this decision is correct>
 
 ## 执行与节奏
 
-1. PR 模板提供默认 `reviewed` 字段，作者必须按实际影响改成 `required` 或保留
-   `reviewed` 并补充理由。
-2. CI 的 `README contract` 检查每个 push/PR：章节、维护标记、相对链接和版本中立性
-   必须通过；PR 声明 `required` 时，README diff 缺失直接失败。
+1. PR 模板提供有效的默认 `reviewed` 声明；`deliver_changes` 在开 PR 前和恢复已有 PR
+   时都会收敛机器字段：保留有效的显式判断，移除重复/占位字段，并按 README diff
+   生成确定性的缺省声明。它只修机器合同，不替作者改 README 正文或伪造语义理由。
+2. CI 的 `README contract` 检查每个 push/PR（包括 PR body `edited` 事件）：章节、维护
+   标记、相对链接和版本中立性必须通过；PR 声明 `required` 时，README diff 缺失直接
+   失败。该检查即使前序测试失败也运行，避免修完代码后才暴露第二个门禁。
 3. 自动版本 bump PR 显式声明 `reviewed`，因为版本文件变化不应触发 README 噪音。
 4. 发布流程只生成 Release notes，不自动重写 README；发布不会成为 README 的隐式
    触发器。
@@ -43,12 +45,15 @@ README-Update-Reason: <why this decision is correct>
 
 ## 责任与失败恢复
 
-- 功能 PR 作者：判断用户契约影响并在同一 PR 更新 README 或说明 `reviewed`。
+- 功能 PR 作者/执行 agent：判断用户契约影响并在同一 PR 更新 README 或显式说明
+  `reviewed`；机器生成的缺省声明只是防止流水线随机卡死，不能替代语义判断。
 - Product/Release owner：处理月度复核，维护公开能力和安装承诺的准确性。
 - CI/治理维护者：保持 validator、PR 模板和自动版本 PR 的字段一致。
 
-缺字段、重复字段、占位理由、README 缺章节/坏链接/硬编码版本时，先修 PR 再合并；
-不要通过删掉检查或让 bot 直接改 README 来“恢复”流水线。若发现发布后漏写，开一个
+缺字段、重复字段或占位理由由 `deliver_changes` 原地修复同一个 PR body 并重新观察
+CI；`required` 缺 README diff、README 缺章节/坏链接/硬编码版本时返回开发执行态，
+要求补正文、提交、推送后继续同一 PR。不得通过删检查、降级 `required`、强制合并或
+让 bot 猜写 README 正文来“恢复”流水线。若发布后发现遗漏，开一个
 `README-Update: required` 的补充 PR，并在月度 issue 记录原因。
 
 ## 验收指标
