@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, Check, DatabaseZap, Loader2, RefreshCw } from "lucide-react";
+import { Activity, Check, Loader2, RefreshCw } from "lucide-react";
 import { invoke } from "../lib/tauri";
 import { useSettingsStore } from "../stores/settings";
 import {
@@ -99,7 +99,7 @@ export function usageCostLabel(summary: UsageSummary): string {
 function Kpi({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <div className="rounded-lg border border-border bg-surface-1 p-3 min-w-0">
-      <div className="text-[10px] uppercase tracking-wider text-gray-500">{label}</div>
+      <div className="text-[10px] font-medium text-gray-500">{label}</div>
       <div className="mt-1 truncate font-mono text-base font-semibold text-gray-200" title={value}>{value}</div>
       {hint && <div className="mt-0.5 truncate text-[10px] text-gray-600" title={hint}>{hint}</div>}
     </div>
@@ -232,12 +232,6 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
   return (
     <section role="region" aria-label="用量与预算" className="mx-auto w-full max-w-6xl space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="flex items-center gap-2 text-sm font-semibold text-gray-200">
-            <DatabaseZap size={15} className="text-accent" />用量与预算
-          </h2>
-          <p className="mt-1 text-xs text-gray-500">逐次模型请求计量，可下钻到会话和端到端作业日志。</p>
-        </div>
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex rounded border border-border p-0.5 text-[10px]" aria-label="摘要范围">
             {([1, 7, 30] as const).map((days) => (
@@ -416,7 +410,7 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
           {detail && (
             <div className="grid gap-4 lg:grid-cols-2">
               <div>
-                <div className="mb-2 text-[10px] uppercase tracking-wider text-gray-600">执行入口</div>
+                <div className="mb-2 text-[10px] font-medium text-gray-600">执行入口</div>
                 <div className="space-y-1">
                   {detail.breakdowns.length === 0 && <p className="text-xs text-gray-500">当天没有已计量请求</p>}
                   {detail.breakdowns.map((item) => (
@@ -428,7 +422,7 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
                 </div>
               </div>
               <div>
-                <div className="mb-2 text-[10px] uppercase tracking-wider text-gray-600">高消耗会话</div>
+                <div className="mb-2 text-[10px] font-medium text-gray-600">高消耗会话</div>
                 <div className="space-y-1">
                   {detail.top_sessions.length === 0 && <p className="text-xs text-gray-500">无会话记录</p>}
                   {detail.top_sessions.map((session) => (
