@@ -38,6 +38,17 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
         return deny("direct Playwright CLI is not allowed; use the native browser_session tool so CodeFactory can own and clean up the browser process");
     }
 
+    if is_actorless_pr_wait(&normalized) {
+        return deny(
+            "this loop waits for a pull request to merge, but nothing here makes that happen — \
+             a wait needs an actor that can change the state. Deliver it instead: `deliver_changes` \
+             with ceiling=through_merge both waits for CI and performs the merge, so \"waited but \
+             nobody merged\" cannot occur. If this PR is not yours to drive, query it once and \
+             report the state — do not loop. (Waiting on a CI run is fine: GitHub advances that \
+             on its own.)",
+        );
+    }
+
     if is_unbounded_github_polling(&normalized) {
         return deny(
             "continuous GitHub polling is not allowed: `--watch` refreshes every 10s until CI ends, \
@@ -92,6 +103,28 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
     ShellCommandPolicy::Allow {
         risk: ShellRisk::Low,
     }
+}
+
+/// Is this a loop waiting for a pull request to be merged?
+///
+/// Cadence was only half the defect. On 2026-08-05 a fully cadence-compliant
+/// `sleep 180` loop waited 30 minutes on a PR whose CI was long green and whose
+/// state was CLEAN — nothing was ever going to merge it, because auto-merge had
+/// not been armed. Earlier the same day another wait burned 57 minutes with
+/// auto-merge armed but the branch BEHIND, which auto-merge cannot resolve.
+///
+/// The shape to catch: **observing a state that needs an actor, without one**.
+/// A CI run is explicitly NOT this — GitHub advances a run by itself, so waiting
+/// on `gh run view` terminates on its own and stays allowed.
+fn is_actorless_pr_wait(command: &str) -> bool {
+    let loops = command.contains("until ") || command.contains("while ");
+    if !loops || !command.contains("gh pr ") {
+        return false;
+    }
+    // "Has it merged yet?" — the question that needs someone to act.
+    ["state", "merged", "mergedat", "mergestatestatus"]
+        .iter()
+        .any(|needle| command.contains(needle))
 }
 
 /// Does this command poll GitHub faster than roughly once a minute, without
@@ -296,10 +329,10 @@ mod tests {
                 "{command:?} polls faster than once a minute and must be denied"
             );
         }
-        // A patient loop is the sanctioned escape hatch — deny the cadence, not
-        // the intent, or the model just finds another bypass.
+        // A patient loop over a CI RUN is fine: GitHub itself advances that
+        // state, so waiting is guaranteed to terminate.
         assert!(matches!(
-            classify_command("until gh pr view 291 --json state; do sleep 180; done"),
+            classify_command("until gh run view 123 --json status; do sleep 180; done"),
             ShellCommandPolicy::Allow { .. }
         ));
     }
@@ -351,5 +384,70 @@ mod tests {
         assert!(touches_github_api("gh pr view 1"));
         assert!(touches_github_api("curl https://api.github.com/rate_limit"));
         assert!(!touches_github_api("cargo test"));
+    }
+
+    // Cadence was only half the defect. 2026-08-05: a `sleep 180` loop — fully
+    // compliant with the cadence rule — waited 30 minutes on PR #323 while its
+    // CI had long been green and its state CLEAN. Nothing was ever going to
+    // merge it: auto-merge had not been armed. The same day, PR #298 burned 57
+    // minutes with auto-merge armed but the branch BEHIND, which auto-merge
+    // cannot resolve. Both are the same shape: waiting on a state with no actor
+    // able to change it, while "a task is running" masquerades as progress.
+
+    #[test]
+    fn waiting_for_a_pr_to_merge_is_denied_however_patient_the_loop() {
+        for command in [
+            "until [ \"$(gh pr view 323 --json state --jq .state)\" != OPEN ]; do sleep 180; done",
+            "while [ \"$(gh pr view 298 --json state --jq .state)\" = OPEN ]; do sleep 300; done",
+            "until gh pr view 323 --json mergedAt --jq .mergedAt; do sleep 600; done",
+        ] {
+            let policy = classify_command(command);
+            let ShellCommandPolicy::Deny { reason } = policy else {
+                panic!("{command:?} waits for an actor that may not exist, got {policy:?}");
+            };
+            assert!(
+                reason.contains("deliver_changes"),
+                "must name the tool that both waits AND merges: {reason}"
+            );
+            assert!(
+                reason.contains("report"),
+                "and must leave a path when delivery is not ours to drive: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_denial_leaves_a_way_forward() {
+        // The user's standing rule: a gate may never dead-end the work. Each
+        // denial has to name something the caller can actually do next.
+        for command in [
+            "gh pr checks 1 --watch",
+            "until gh pr view 1 --json state; do sleep 5; done",
+            "until [ \"$(gh pr view 1 --json state --jq .state)\" != OPEN ]; do sleep 300; done",
+        ] {
+            let ShellCommandPolicy::Deny { reason } = classify_command(command) else {
+                panic!("{command:?} should be denied");
+            };
+            assert!(
+                reason.contains("deliver_changes") || reason.contains("sleep 60"),
+                "denial without an alternative is a dead end: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn observing_a_pr_once_is_always_allowed() {
+        // Reading state is never the problem — looping on it without an actor
+        // is. A single query must stay open so the caller can look and report.
+        for command in [
+            "gh pr view 323 --json state,mergeStateStatus",
+            "gh pr checks 323",
+            "gh pr list --state open",
+        ] {
+            assert!(
+                matches!(classify_command(command), ShellCommandPolicy::Allow { .. }),
+                "{command:?} is a single observation and must stay allowed"
+            );
+        }
     }
 }
