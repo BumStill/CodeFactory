@@ -323,7 +323,15 @@ async fn execute_inner(
                 combined.truncate(OUTPUT_LIMIT);
                 combined.push_str("\n[output truncated]");
             }
-            append_audit(&mut combined, &ctx.cwd, output.status.code(), risk);
+            append_audit(
+                &mut combined,
+                &ctx.cwd,
+                output.status.code(),
+                risk,
+                shell_policy::touches_github_api(&a.command)
+                    .then(read_github_quota)
+                    .flatten(),
+            );
 
             let is_error = !output.status.success();
             if is_error {
@@ -340,11 +348,20 @@ fn append_audit(
     cwd: &std::path::Path,
     exit_code: Option<i32>,
     risk: shell_policy::ShellRisk,
+    quota: Option<shell_policy::GithubQuota>,
 ) {
     if !output.ends_with('\n') && !output.is_empty() {
         output.push('\n');
     }
-    output.push_str(&shell_policy::audit_footer(cwd, exit_code, risk));
+    output.push_str(&shell_policy::audit_footer_with_quota(
+        cwd, exit_code, risk, quota,
+    ));
+}
+
+/// Read the caller's remaining GitHub quota, or `None` when unavailable.
+fn read_github_quota() -> Option<shell_policy::GithubQuota> {
+    crate::util::github_cli::read_core_quota()
+        .map(|(remaining, limit)| shell_policy::GithubQuota { remaining, limit })
 }
 
 #[cfg(test)]
