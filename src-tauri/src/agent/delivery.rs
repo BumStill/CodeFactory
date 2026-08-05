@@ -3382,6 +3382,75 @@ fn gh_workflow_run_args(workflow: &str, git_ref: &str) -> Vec<String> {
     ]
 }
 
+
+fn github_release_live_from_value(
+    release: &serde_json::Value,
+    sha: &str,
+    tag_contains_sha: impl FnOnce(&str) -> Result<bool, String>,
+) -> Result<ObservationStatus, String> {
+    let tag = release
+        .get("tagName")
+        .or_else(|| release.get("tag_name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if tag.is_empty() {
+        return Ok(ObservationStatus::Unsupported(
+            "GitHub release verifier could not find a release tag".into(),
+        ));
+    }
+    if release
+        .get("isDraft")
+        .or_else(|| release.get("draft"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(ObservationStatus::Pending(format!(
+            "GitHub Release {tag} is still draft"
+        )));
+    }
+    if release
+        .get("isPrerelease")
+        .or_else(|| release.get("prerelease"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(ObservationStatus::Failure(format!(
+            "GitHub Release {tag} is a prerelease, not the live release"
+        )));
+    }
+    let published = release
+        .get("publishedAt")
+        .or_else(|| release.get("published_at"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if published.trim().is_empty() {
+        return Ok(ObservationStatus::Pending(format!(
+            "GitHub Release {tag} is not published yet"
+        )));
+    }
+    let assets = release
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    if assets == 0 {
+        return Ok(ObservationStatus::Pending(format!(
+            "GitHub Release {tag} has no assets yet"
+        )));
+    }
+    if !tag_contains_sha(tag)? {
+        return Ok(ObservationStatus::Pending(format!(
+            "GitHub Release {tag} does not include delivery commit {} yet",
+            sha.get(..7).unwrap_or(sha)
+        )));
+    }
+    Ok(ObservationStatus::Success(format!(
+        "GitHub Release {tag} is published with {assets} assets and contains delivery commit {}",
+        sha.get(..7).unwrap_or(sha)
+    )))
+}
+
 /// [`DeliveryRemote`] over a logged-in `gh` CLI. All commands run in the repo
 /// root so gh resolves the repo from the checkout, using the user's existing
 /// system-wide authentication — no app-side token required.
@@ -3492,7 +3561,7 @@ impl DeliveryRemote for GhCliRemote {
             ci: true,
             merge: true,
             release: true,
-            live: false,
+            live: true,
         }
     }
 
@@ -3777,6 +3846,25 @@ impl DeliveryRemote for GhCliRemote {
             &self.default_branch,
         ))
         .map(|_| format!("已通过 gh 触发发布工作流 {}", self.release_workflow))
+    }
+
+    async fn verify_live(&self, sha: &str, _url: Option<&str>) -> Result<ObservationStatus, String> {
+        let raw = self.gh(&[
+            "release".into(),
+            "view".into(),
+            "--json".into(),
+            "tagName,isDraft,isPrerelease,publishedAt,url,assets".into(),
+        ])?;
+        let release: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("gh release view returned non-JSON: {e}"))?;
+        github_release_live_from_value(&release, sha, |tag| {
+            git(&self.cwd, &["merge-base", "--is-ancestor", sha, tag])
+                .map(|_| true)
+                .or_else(|_| {
+                    git(&self.cwd, &["fetch", "--prune", "origin", "main", "--tags"])?;
+                    Ok(git(&self.cwd, &["merge-base", "--is-ancestor", sha, tag]).is_ok())
+                })
+        })
     }
 }
 
@@ -4291,7 +4379,7 @@ impl DeliveryRemote for GithubRemote {
             ci: true,
             merge: true,
             release: true,
-            live: false,
+            live: true,
         }
     }
 
@@ -4518,6 +4606,38 @@ impl DeliveryRemote for GithubRemote {
             .post(&path, serde_json::json!({ "ref": self.default_branch }))
             .await
             .map(|_| format!("已触发发布工作流 {}", self.release_workflow))
+    }
+
+    async fn verify_live(&self, sha: &str, _url: Option<&str>) -> Result<ObservationStatus, String> {
+        let release = self
+            .client
+            .get(&format!("/repos/{}/releases/latest", self.repo))
+            .await?;
+        let tag = release
+            .get("tagName")
+            .or_else(|| release.get("tag_name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let tag_contains_sha = if tag.is_empty() {
+            false
+        } else {
+            let compare = self
+                .client
+                .get(&format!("/repos/{}/compare/{sha}...{tag}", self.repo))
+                .await?;
+            let status = compare
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let behind_by = compare
+                .get("behind_by")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-1);
+            matches!(status, "identical" | "ahead") && behind_by == 0
+        };
+        github_release_live_from_value(&release, sha, |_| Ok(tag_contains_sha))
     }
 }
 
@@ -5263,6 +5383,53 @@ Release-Urgency: hold"
         let live = config.live.unwrap();
         assert_eq!(live.expected_body("1234567890abcdef"), "build:1234567");
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+
+    #[test]
+    fn github_release_live_verifier_requires_published_assets_and_tag_ancestry() {
+        let release = serde_json::json!({
+            "tagName": "v1.2.3",
+            "isDraft": false,
+            "isPrerelease": false,
+            "publishedAt": "2026-08-05T09:00:00Z",
+            "assets": [{"name": "CodeFactory.dmg"}]
+        });
+        let status = github_release_live_from_value(
+            &release,
+            "abcdef1234567890",
+            |tag| Ok(tag == "v1.2.3"),
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            ObservationStatus::Success(
+                "GitHub Release v1.2.3 is published with 1 assets and contains delivery commit abcdef1".into()
+            )
+        );
+
+        let draft = serde_json::json!({
+            "tagName": "v1.2.3",
+            "isDraft": true,
+            "isPrerelease": false,
+            "publishedAt": null,
+            "assets": []
+        });
+        assert!(matches!(
+            github_release_live_from_value(&draft, "abcdef1234567890", |_| Ok(true)).unwrap(),
+            ObservationStatus::Pending(detail) if detail.contains("draft")
+        ));
+
+        let missing_sha = github_release_live_from_value(
+            &release,
+            "abcdef1234567890",
+            |_| Ok(false),
+        )
+        .unwrap();
+        assert!(matches!(
+            missing_sha,
+            ObservationStatus::Pending(detail) if detail.contains("does not include")
+        ));
     }
 
     #[test]
