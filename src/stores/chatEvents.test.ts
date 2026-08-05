@@ -86,6 +86,36 @@ describe("chat tool call stream events", () => {
     expect(done.pendingPermission).toBeNull();
   });
 
+  it("keeps a remote delivery wait active until the terminal done event", () => {
+    const started = reduceChatStreamEvent(
+      baseState(),
+      { type: "tool_call_start", id: "delivery-1", name: "deliver_changes", args: {} },
+      "assistant-1",
+    );
+    const waiting = reduceChatStreamEvent(
+      started,
+      {
+        type: "tool_result",
+        tool_call_id: "delivery-1",
+        content: "CI is still pending",
+        is_error: false,
+        status: "waiting",
+        metadata: { recovery_class: "wait_retryable", retry_after_ms: 30_000 },
+      },
+      "assistant-1",
+    );
+
+    expect(waiting.streaming).toBe(true);
+    expect(waiting.messages[0].toolCalls?.[0]?.status).toBe("waiting");
+
+    const done = reduceChatStreamEvent(
+      waiting,
+      { type: "done", input_tokens: 0, output_tokens: 0 },
+      "assistant-1",
+    );
+    expect(done.streaming).toBe(false);
+  });
+
   it("marks the tool card cancelled and clears pending permission", () => {
     const waiting = reduceChatStreamEvent(
       baseState(),

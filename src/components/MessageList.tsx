@@ -780,7 +780,10 @@ const MessageRow = memo(function MessageRow({
       ? lastTextIndex === timeline.length - 1
       : !msg.toolCalls || msg.toolCalls.length === 0);
   const hasActiveTool = (msg.toolCalls ?? []).some(
-    (tool) => tool.status === "running" || tool.status === "waiting_permission",
+    (tool) =>
+      tool.status === "running" ||
+      tool.status === "waiting" ||
+      tool.status === "waiting_permission",
   );
   const isWaitingOnModelTransport = isStreamingTail && !hasActiveTool;
   const durationLabel = isStreamingTail

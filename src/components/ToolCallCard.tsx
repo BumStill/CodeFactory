@@ -2,7 +2,7 @@
 import { memo, useMemo, useState } from "react";
 import {
   ChevronDown, ChevronRight,
-  AlertCircle, Ban, CheckCircle, ShieldQuestion,
+  AlertCircle, Ban, CheckCircle, Clock3, ShieldQuestion,
   FileText, Edit3, Save, TerminalSquare, Search, FolderTree,
   Globe, Wrench, Bot, BookOpen, ExternalLink,
 } from "lucide-react";
@@ -331,6 +331,8 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
   const statusIcon =
     tc.status === "waiting_permission" ? (
       <ShieldQuestion size={12} className="text-status-warning shrink-0" />
+    ) : tc.status === "waiting" ? (
+      <Clock3 size={12} className="text-status-info shrink-0" aria-label="等待远端" />
     ) : tc.status === "done" && !tc.isError ? (
       <CheckCircle size={12} className="text-status-success shrink-0" />
     ) : tc.status === "cancelled" ? (
@@ -349,6 +351,8 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
       ? "rounded-r-sm border-l border-status-danger/50 bg-transparent"
       : tc.status === "blocked"
         ? "rounded-r-md border-l-2 border-status-warning/50 bg-status-warning-soft/55"
+      : tc.status === "waiting"
+        ? "rounded-r-md border-l-2 border-status-info/45 bg-status-info-soft/35"
       : tc.status === "waiting_permission"
         ? "rounded-r-md border-l-2 border-status-warning/40 bg-status-warning-soft/45"
         : "rounded-r-md border-l-2 border-accent/35 bg-accent/[0.025]"

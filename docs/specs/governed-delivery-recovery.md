@@ -20,12 +20,18 @@ PR 正文缺少治理字段、分支落后或远端暂时失败都不是新的�
 | DR-7 | cancelled、timed_out、stale、startup_failure 等基础设施结论允许有界 rerun；普通测试 failure 不盲重跑，必须把失败 check 和最小恢复动作交回实现循环 | CI classification/recovery tests |
 | DR-8 | 任何恢复都不得使用 `--admin`、force push 或 ruleset bypass；合并仍绑定 expected head | merge argv tests + live ruleset |
 | DR-9 | 完成边界是 required checks 全绿、PR 合并、批次发布成功、安装产物与 `latest.json` 可验证 | remote PR/release/artifact evidence |
+| DR-10 | `WAITING_RETRYABLE` 是运行中状态：在同一个 `deliver_changes` 调用内退避、心跳并自动核对，不消耗模型轮次，也不要求用户回复“继续” | tool-loop wait/cancel tests + live CI wait |
+| DR-11 | PR/MR 列表查询只有明确 `Absent` 才允许 create；查询错误、非 JSON、字段缺失均为 `Unknown`，必须 fail closed | GitHub/GitLab/gh adapter tests |
+| DR-12 | CI 观察不可用必须与真实 check failure 分开；限流、网络、schema 和 required-rules 查询失败不得触发代码修复或证明 CI 绿色 | CI observation classification tests |
+| DR-13 | `DeliveryOutcome` 必须满足状态不变量：waiting/recoverable/recovery_class/retry_after/next_action 一致；不合法结果不得渲染成成功或普通阻断 | table-driven contract tests |
+| DR-14 | 前端把 `tool_result.status=waiting` 视为活跃远端等待；只有 `Done`/`Error`/取消才结束 streaming | reducer/component tests |
 
 ## 状态机
 
 ```text
 pr_open
   -> gates_pending
+       -> waiting_retryable -> 同一工具调用内退避并重新观察
   -> failure_classified
        -> metadata_repaired -> gates_pending
        -> branch_updated -> gates_pending
@@ -44,7 +50,12 @@ pr_open
 
 - 同一根任务内可恢复的交付结果最多自动续跑两轮；每轮必须消费明确的
   `next_action`，不能原样重复同一外部写动作。
+- 上述“两轮”只约束需要 agent 修改代码、正文或配置的修复动作；纯远端
+  `WAITING_RETRYABLE` 不计入修复次数，也不再通过模型轮询。它保持同一工具 future，
+  每 30 秒发脱敏心跳，按结构化 `retry_after_ms` 重新观察，直到真实终态或用户取消。
 - README 正文修复、branch update 和 CI rerun 必须幂等。
+- 任何 create/merge/release 前置查询均采用三值语义 `Existing / Absent / Unknown`；
+  `Unknown` 永远不能降级为 `Absent`。
 - PR head 与回执绑定 SHA 不一致时旧授权失效，禁止自动合并。
 - 普通测试失败不允许无条件 rerun；先返回失败 check、结论和可执行诊断入口，由
   agent 修改代码或测试后再 push。

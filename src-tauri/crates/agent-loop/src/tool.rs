@@ -19,6 +19,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolExecutionStatus {
     Done,
+    Waiting,
     Blocked,
     Error,
 }

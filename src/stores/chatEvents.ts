@@ -9,7 +9,7 @@ export interface ToolCallState {
   result?: string;
   isError?: boolean;
   metadata?: Record<string, unknown> | null;
-  status: "waiting_permission" | "running" | "done" | "blocked" | "error" | "denied" | "cancelled";
+  status: "waiting_permission" | "running" | "waiting" | "done" | "blocked" | "error" | "denied" | "cancelled";
 }
 
 export interface TurnActivityState {

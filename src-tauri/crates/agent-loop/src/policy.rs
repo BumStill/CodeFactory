@@ -37,6 +37,12 @@ pub fn record_completion_outcome(
     request_id: &str,
     result: &crate::tool::ToolInvocationResult,
 ) -> CompletionRecord {
+    if matches!(result.status, crate::tool::ToolExecutionStatus::Waiting) {
+        return CompletionRecord {
+            progress_prompt: None,
+            succeeded: false,
+        };
+    }
     *sequence += 1;
     // The BACKEND supplies `command`/`kind` and the real shell streams (keystone
     // slice 4.8c b2). Previously this synthesized them from `(tool_name, args)`
@@ -55,9 +61,9 @@ pub fn record_completion_outcome(
         finished_at_ms: 0,
         return_code: result.return_code.or(Some(match result.status {
             crate::tool::ToolExecutionStatus::Done => 0,
-            crate::tool::ToolExecutionStatus::Blocked | crate::tool::ToolExecutionStatus::Error => {
-                1
-            }
+            crate::tool::ToolExecutionStatus::Waiting
+            | crate::tool::ToolExecutionStatus::Blocked
+            | crate::tool::ToolExecutionStatus::Error => 1,
         })),
         stdout: if result.stdout.is_empty() {
             result.content.clone()
@@ -66,8 +72,11 @@ pub fn record_completion_outcome(
         },
         stderr: result.stderr.clone(),
         error: result.error.clone().or_else(|| {
-            (!matches!(result.status, crate::tool::ToolExecutionStatus::Done))
-                .then(|| result.content.clone())
+            matches!(
+                result.status,
+                crate::tool::ToolExecutionStatus::Blocked | crate::tool::ToolExecutionStatus::Error
+            )
+            .then(|| result.content.clone())
         }),
         semantic_failure: false,
     }
@@ -665,14 +674,27 @@ pub fn capability_denial(
 /// a terminal blocker. Two rounds are enough to repair metadata/BEHIND and to
 /// return one real CI failure to implementation without creating an infinite
 /// agent loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryRecoveryAction {
+    pub prompt: String,
+    pub retry_after: std::time::Duration,
+    pub counts_as_repair_attempt: bool,
+}
+
 pub fn recoverable_delivery_prompt(
     tool_name: &str,
     metadata: &serde_json::Value,
     attempts: u8,
-) -> Option<String> {
+) -> Option<DeliveryRecoveryAction> {
     const MAX_ATTEMPTS: u8 = 2;
+    const MAX_RETRY_AFTER_MS: u64 = 60_000;
+    let recovery_class = metadata
+        .get("recovery_class")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("agent_action_required");
+    let is_retryable_wait = recovery_class == "wait_retryable";
     if tool_name != "deliver_changes"
-        || attempts >= MAX_ATTEMPTS
+        || (!is_retryable_wait && attempts >= MAX_ATTEMPTS)
         || metadata
             .get("recoverable")
             .and_then(serde_json::Value::as_bool)
@@ -689,13 +711,37 @@ pub fn recoverable_delivery_prompt(
         .get("code")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("delivery_recoverable");
-    Some(format!(
-        "受控交付返回可恢复状态 `{code}`。这是第 {}/{} 次有界恢复，不是终态，也不是权限问题。\
+    let retry_after = if is_retryable_wait {
+        std::time::Duration::from_millis(
+            metadata
+                .get("retry_after_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(30_000)
+                .clamp(1, MAX_RETRY_AFTER_MS),
+        )
+    } else {
+        std::time::Duration::ZERO
+    };
+    let prompt = if is_retryable_wait {
+        format!(
+            "受控交付仍在等待可恢复的远端状态 `{code}`。这不是终态、权限问题或需要用户再次推动的阻断。\
+等待退避已经完成；现在重新调用 deliver_changes 核对远端事实并续接同一 PR。\
+不要创建新 PR，不要重复已经完成的外部动作，也不得使用 --admin、force push 或门禁绕过。\n恢复动作：{next_action}"
+        )
+    } else {
+        format!(
+            "受控交付返回可恢复状态 `{code}`。这是第 {}/{} 次有界修复，不是终态，也不是权限问题。\
 立即执行下面的恢复动作；若修改了代码或正文，完成验证后再次调用 deliver_changes 续接同一 PR。\
 恢复过程必须保留 required checks，并继续使用受控交付；禁止 --admin、force push 和门禁绕过。\n恢复动作：{next_action}",
-        attempts + 1,
-        MAX_ATTEMPTS
-    ))
+            attempts + 1,
+            MAX_ATTEMPTS
+        )
+    };
+    Some(DeliveryRecoveryAction {
+        prompt,
+        retry_after,
+        counts_as_repair_attempt: !is_retryable_wait,
+    })
 }
 
 /// A completion-policy denial, kept STRUCTURED so each surface can word it its
@@ -825,15 +871,72 @@ mod tests {
 
         let first = recoverable_delivery_prompt("deliver_changes", &metadata, 0)
             .expect("the first recovery must continue the delivery loop");
-        assert!(first.contains("读取失败 check"));
-        assert!(first.contains("deliver_changes"));
-        assert!(!first.contains("只生成阻断总结"));
+        assert!(first.prompt.contains("读取失败 check"));
+        assert!(first.prompt.contains("deliver_changes"));
+        assert!(!first.prompt.contains("只生成阻断总结"));
+        assert!(first.counts_as_repair_attempt);
 
         let second = recoverable_delivery_prompt("deliver_changes", &metadata, 1)
             .expect("one retry may still need a second bounded recovery");
-        assert!(second.contains("第 2/2 次"));
+        assert!(second.prompt.contains("第 2/2 次"));
 
         assert!(recoverable_delivery_prompt("deliver_changes", &metadata, 2).is_none());
+    }
+
+    #[test]
+    fn retryable_delivery_wait_is_not_turned_into_a_terminal_blocker_after_two_polls() {
+        let metadata = serde_json::json!({
+            "status": "waiting",
+            "code": "delivery_merge_queued",
+            "recovery_class": "wait_retryable",
+            "recoverable": true,
+            "retry_after_ms": 30_000,
+            "next_action": "等待远端门禁产生新状态后续接同一 PR",
+            "pr_url": "https://example.test/pull/7"
+        });
+
+        let third_poll = recoverable_delivery_prompt("deliver_changes", &metadata, 2)
+            .expect("a remote waiting state is active work, not an exhausted repair attempt");
+        assert!(third_poll.prompt.contains("等待远端门禁"));
+        assert!(third_poll.prompt.contains("同一 PR"));
+        assert!(!third_poll.prompt.contains("第 3/2 次"));
+        assert!(!third_poll.counts_as_repair_attempt);
+        assert_eq!(third_poll.retry_after, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn delivery_wait_does_not_mutate_generic_completion_evidence() {
+        let mut gate = CompletionGate::default();
+        let before = gate.evidence();
+        let mut progress = ProgressTracker::new(8);
+        let mut sequence = 0;
+        let result = crate::tool::ToolInvocationResult {
+            content: "remote checks pending".into(),
+            is_error: false,
+            status: crate::tool::ToolExecutionStatus::Waiting,
+            command: "deliver_changes".into(),
+            kind: ToolKind::Mutation,
+            return_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+            metadata: None,
+            next_working_directory: None,
+            duration_ms: 30_000,
+        };
+
+        let record = record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/tmp"),
+            "delivery-wait",
+            &result,
+        );
+
+        assert_eq!(sequence, 0);
+        assert!(!record.succeeded);
+        assert_eq!(gate.evidence(), before);
     }
 
     #[test]
