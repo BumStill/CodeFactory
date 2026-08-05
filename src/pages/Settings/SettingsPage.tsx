@@ -607,7 +607,7 @@ export function SettingsPage({
     {
       label: "工作流",
       tabs: [
-        { id: "capabilities", label: "功能", description: "进入画像、资源、评测和控制平面等跨会话能力。" },
+        { id: "capabilities", label: "功能", description: "管理跨会话能力。当前会话的模型、Git 和检查点仍留在工作区顶栏。" },
         { id: "usage", label: "用量与预算", description: "查看模型调用、Token 成本趋势和预算提醒。" },
         { id: "general", label: "通用", description: "设置 shell、并行任务、交付上限、通知、沙箱和数据备份。" },
       ],
@@ -690,18 +690,14 @@ export function SettingsPage({
           aria-labelledby={`settings-tab-${activeTab.id}`}
           className="flex-1 overflow-y-auto p-5"
         >
-          <div className="mb-5 max-w-3xl rounded-lg border border-border bg-surface-1 px-3 py-2.5">
-            <div className="text-sm font-medium text-gray-200">{activeTab.label}</div>
+          <div className="mb-5">
+            <h2 id="settings-page-title" className="text-base font-semibold text-gray-100">{activeTab.label}</h2>
             <p className="mt-1 text-xs leading-5 text-gray-500">{activeTab.description}</p>
           </div>
 
         {/* ── Product capabilities moved out of the Workspace toolbar ── */}
         {tab === "capabilities" && (
-          <section className="max-w-3xl space-y-4" aria-labelledby="settings-capabilities-title">
-            <div>
-              <h2 id="settings-capabilities-title" className="text-base font-semibold text-gray-100">功能</h2>
-              <p className="mt-1 text-xs leading-5 text-gray-400">管理跨会话能力。当前会话的模型、Git 和检查点仍留在工作区顶栏。</p>
-            </div>
+          <section className="max-w-3xl space-y-4" aria-labelledby="settings-page-title">
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
               {([
                 { label: "我的画像", description: "查看偏好、长期记忆与可撤销建议", Icon: UserRound, action: onOpenProfile },
@@ -739,7 +735,7 @@ export function SettingsPage({
 
         {/* ── Endpoints ── */}
         {tab === "endpoints" && (
-          <div className="max-w-xl space-y-3">
+          <div className="max-w-2xl space-y-3">
             <ChatGptLoginCard />
 
             <div className="rounded-lg border border-border bg-surface-1 p-3">
@@ -772,7 +768,7 @@ export function SettingsPage({
             </div>
 
             <div className="flex items-center justify-between mb-1">
-              <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+              <h2 className="text-xs font-semibold text-gray-400">
                 API 端点
               </h2>
               <button
@@ -819,10 +815,7 @@ export function SettingsPage({
 
         {/* ── General ── */}
         {tab === "general" && (
-          <div className="max-w-xl space-y-4">
-            <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-              通用
-            </h2>
+          <div className="max-w-2xl space-y-4">
 
             <div className="rounded-lg border border-border bg-surface-1 px-3 py-2.5 text-[11px] text-gray-500 leading-5">
               <span className="text-gray-300 font-medium">当前模型</span> 现在按端点设置。
@@ -1250,19 +1243,14 @@ function BrowserSessionsTab() {
   };
 
   return (
-    <section className="max-w-3xl space-y-4" aria-labelledby="browser-sessions-title">
+    <section aria-label="受管浏览器会话" className="max-w-3xl space-y-4">
       <BrowserBridgePanel />
       <ChromiumFallbackPanel />
 
       <div className="flex items-start justify-between gap-4">
-        <div>
-          <h2 id="browser-sessions-title" className="text-base font-semibold text-gray-100">
-            受管浏览器会话
-          </h2>
-          <p className="mt-1 text-xs leading-5 text-gray-400">
-            这里显示 CodeFactory 创建的自动化浏览器和已连接的用户 Chrome。结束受管会话会关闭自动化浏览器；断开连接只会停止控制，不会关闭你的普通 Chrome 窗口。
-          </p>
-        </div>
+        <p className="text-xs leading-5 text-gray-500">
+          这里显示 CodeFactory 创建的自动化浏览器和已连接的用户 Chrome。结束受管会话会关闭自动化浏览器；断开连接只会停止控制，不会关闭你的普通 Chrome 窗口。
+        </p>
         <button
           type="button"
           onClick={() => void load()}
@@ -1390,9 +1378,9 @@ function HooksTab() {
   };
 
   return (
-    <div className="max-w-xl space-y-3">
+    <div className="max-w-2xl space-y-3">
       <div className="flex items-center justify-between">
-        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">钩子</h2>
+        <h2 className="text-xs font-semibold text-gray-400">钩子</h2>
         <button
           onClick={() => setAddOpen(true)}
           aria-label="打开添加钩子表单"
@@ -1566,9 +1554,9 @@ function RemotesTab() {
   };
 
   return (
-    <div className="max-w-xl space-y-3">
+    <div className="max-w-2xl space-y-3">
       <div className="flex items-center justify-between">
-        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+        <h2 className="text-xs font-semibold text-gray-400">
           Git 远程仓库(GitHub / GitLab)
         </h2>
         <button
@@ -1760,11 +1748,11 @@ function AppearanceTab() {
   ];
 
   return (
-    <div className="max-w-sm space-y-8">
+    <div className="max-w-2xl space-y-8">
 
       {/* Theme */}
       <div>
-        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">主题</h2>
+        <h2 className="text-xs font-semibold text-gray-400 mb-3">主题</h2>
         <div className="flex gap-2">
           {themeOptions.map(({ value, Icon, label }) => (
             <button
@@ -1785,7 +1773,7 @@ function AppearanceTab() {
 
       {/* Font family */}
       <div>
-        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">字体</h2>
+        <h2 className="text-xs font-semibold text-gray-400 mb-3">字体</h2>
         <div className="flex flex-col gap-2">
           {Object.entries(FONT_FAMILY_LABELS).map(([key, label]) => (
             <button
@@ -1811,7 +1799,7 @@ function AppearanceTab() {
 
       {/* Font size */}
       <div>
-        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
+        <h2 className="text-xs font-semibold text-gray-400 mb-3">
           字号 <span className="text-gray-300 font-mono normal-case font-normal ml-1">{settings.font_size}px</span>
         </h2>
         <div className="flex items-center gap-3">
@@ -2427,7 +2415,7 @@ function AboutTab() {
     phase.kind === "ready";
 
   return (
-    <div className="max-w-md space-y-6">
+    <div className="max-w-2xl space-y-6">
       {/* Identity */}
       <div className="flex items-center gap-3">
         <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-accent/15 text-accent">
@@ -2444,7 +2432,7 @@ function AboutTab() {
       {/* Update card */}
       <div className="space-y-3 rounded-lg border border-border bg-surface-1 p-4">
         <div className="flex items-center justify-between">
-          <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">
+          <span className="text-xs font-semibold text-gray-400">
             软件更新
           </span>
           <button
@@ -2557,7 +2545,7 @@ function DataSection() {
 
   return (
     <div className="pt-4 mt-4 border-t border-border space-y-3">
-      <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">数据</h2>
+      <h2 className="text-xs font-semibold text-gray-400">数据</h2>
 
       <div className="rounded-lg border border-border bg-surface-1 p-3 space-y-2">
         <div className="text-[11px] text-gray-500">存储位置</div>

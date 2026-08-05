@@ -208,7 +208,7 @@ describe("SettingsPage parallel-task controls", () => {
     // racing that flush rather than the fetch they actually depend on.
     expect(await screen.findByText("任务 task-123")).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "受管浏览器会话" }),
+      screen.getByRole("heading", { name: "浏览器会话" }),
     ).toBeInTheDocument();
     expect(screen.getByText(/不会关闭你的普通 Chrome/)).toBeInTheDocument();
     expect(
