@@ -752,10 +752,13 @@ impl AgentLoop {
             mcp_manager,
             execution_context,
             mode,
-            turn_capability: match mode {
-                AgentMode::Interactive => TurnCapability::ReviewOnly,
-                AgentMode::Execute | AgentMode::Autonomous => TurnCapability::Implement,
-            },
+            // Posture is not permission: an Interactive turn discusses first,
+            // it is not forbidden to write. `ReviewOnly` is a hard gate and is
+            // only ever set explicitly — `with_turn_capability(..)` from a
+            // contract whose user message actually asked for read-only. Deriving
+            // it from `mode` here is what let an ambiguous chat turn silently
+            // lose write capability with no way back (field report 2026-08-05).
+            turn_capability: TurnCapability::Implement,
             turn_grants: TurnGrants::default(),
             usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,
@@ -837,10 +840,13 @@ impl AgentLoop {
             mcp_manager,
             execution_context,
             mode,
-            turn_capability: match mode {
-                AgentMode::Interactive => TurnCapability::ReviewOnly,
-                AgentMode::Execute | AgentMode::Autonomous => TurnCapability::Implement,
-            },
+            // Posture is not permission: an Interactive turn discusses first,
+            // it is not forbidden to write. `ReviewOnly` is a hard gate and is
+            // only ever set explicitly — `with_turn_capability(..)` from a
+            // contract whose user message actually asked for read-only. Deriving
+            // it from `mode` here is what let an ambiguous chat turn silently
+            // lose write capability with no way back (field report 2026-08-05).
+            turn_capability: TurnCapability::Implement,
             turn_grants: TurnGrants::default(),
             usage_run_id: Uuid::new_v4().to_string(),
             anonymous: false,

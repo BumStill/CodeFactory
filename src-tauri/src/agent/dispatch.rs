@@ -212,6 +212,125 @@ const DIRECT_EXEC_EN_WORDS: &[&str] = &[
     "update",
 ];
 
+/// A visible defect in the product AS IT STANDS — something the user can point
+/// at. Deliberately excludes the speaker's own uncertainty ("不清楚 / not
+/// sure"), which is lexically similar but asks for an explanation instead.
+const DEFECT_CJK: &[&str] = &[
+    "太丑",
+    "很丑",
+    "丑了",
+    "难看",
+    "不好看",
+    "太挤",
+    "太乱",
+    "很乱",
+    "太紧",
+    "太宽",
+    "太窄",
+    "太小",
+    "太大",
+    "太长",
+    "不好用",
+    "难用",
+    "不方便",
+    "不对",
+    "不一致",
+    "不一样",
+    "不统一",
+    "不整齐",
+    "没对齐",
+    "不对齐",
+    "不直观",
+    "不明显",
+    "不合理",
+    "看不到",
+    "看不清",
+    "找不到",
+    "显示不全",
+    "别扭",
+    "怪怪的",
+    "有点怪",
+];
+/// Multi-word phrases only: unambiguous enough to match as substrings, unlike a
+/// bare word such as "off" (which would fire on "offered").
+const DEFECT_EN_PHRASES: &[&str] = &[
+    "too small",
+    "too big",
+    "too wide",
+    "too narrow",
+    "too tight",
+    "too cramped",
+    "not aligned",
+    "hard to read",
+    "hard to see",
+    "can't see",
+    "cannot see",
+    "doesn't match",
+    "does not match",
+    "looks off",
+    "looks wrong",
+];
+const DEFECT_EN_WORDS: &[&str] = &["ugly", "inconsistent", "misaligned", "awkward"];
+
+/// The TARGET state the user wants instead — the second half of a work order.
+/// "对齐" is intentionally absent: it is a substring of the defect cues
+/// "不对齐 / 没对齐", so including it would make a bare complaint self-satisfy
+/// both halves by accident.
+const TARGET_CJK: &[&str] = &[
+    "是不是应该",
+    "是不是可以",
+    "是不是该",
+    "应该",
+    "该改",
+    "能不能",
+    "可不可以",
+    "改成",
+    "换成",
+    "挪到",
+    "移到",
+    "放到",
+    "放在",
+    "调成",
+    "调整成",
+    "统一成",
+    "最好",
+    "更好",
+    "建议",
+    "希望",
+];
+const TARGET_EN_PHRASES: &[&str] = &[
+    "should be",
+    "should match",
+    "should we",
+    "shouldn't it",
+    "can we",
+    "could we",
+    "would be better",
+    "better to",
+    "instead of",
+    "make it",
+    "move it",
+];
+
+/// Asking HOW to change something is a request for a plan, even when the
+/// message also names a defect and a target.
+const METHOD_QUESTION_CJK: &[&str] = &[
+    "怎么改",
+    "怎样改",
+    "如何改",
+    "怎么做",
+    "怎么办",
+    "怎么处理",
+    "怎么弄",
+];
+const METHOD_QUESTION_EN: &[&str] = &[
+    "how should",
+    "how do we",
+    "how would",
+    "what's the best way",
+    "whats the best way",
+];
+
 const DELIVERY_CJK: &[&str] = &[
     "提交代码",
     "提交 pr",
@@ -407,6 +526,52 @@ fn is_explicit_continuation_request(user_msg: &str) -> bool {
         || m.contains("continue")
 }
 
+/// A change request that never reaches for an execution verb.
+///
+/// [`is_direct_execution_request`] only recognizes a user who writes like a
+/// ticket ("修复 / 实现 / 改掉 / fix"). Real messages on this surface are
+/// colloquial: the user points at something in their own product, says what is
+/// wrong with it, and proposes what it should be instead — "布局太丑了…是不是
+/// 应该把模型选择放这里啊". That is a work order wearing a question mark, and
+/// classifying it `ReviewOnly` is what produced the 2026-08-05 dead end: the
+/// write gate refused the edit, the denial forbade asking, and the agent told
+/// the user to switch to an "implementation 模式" that does not exist.
+///
+/// Every previous repair of this class added more imperative verbs to the cue
+/// tables (#37 → #204 → #261 → #265), which can never converge because the
+/// missing signal is not a verb. It is the pairing:
+///
+/// 1. a complaint about the product's CURRENT state, and
+/// 2. the TARGET state the user wants instead.
+///
+/// Both halves are required — that is what keeps a plain question out — and
+/// asking for the *method* ("应该怎么改比较好") vetoes, because that is a
+/// request for a plan.
+///
+/// Precision over recall on purpose. A miss now costs one polite question,
+/// because an ambiguity-default review turn carries the route back to
+/// implementation in its denial (`policy::review_only_denial`). A false
+/// positive starts editing against the user's wishes and has no such cheap
+/// undo.
+pub fn is_change_request(user_msg: &str) -> bool {
+    let m = user_msg.trim().to_lowercase();
+    if m.is_empty() || is_explicit_planning_request(&m) {
+        return false;
+    }
+    let toks = tokens(&m);
+    if METHOD_QUESTION_CJK.iter().any(|cue| m.contains(cue))
+        || METHOD_QUESTION_EN.iter().any(|cue| m.contains(cue))
+    {
+        return false;
+    }
+    let names_a_defect = DEFECT_CJK.iter().any(|cue| m.contains(cue))
+        || DEFECT_EN_PHRASES.iter().any(|cue| m.contains(cue))
+        || toks.iter().any(|token| DEFECT_EN_WORDS.contains(token));
+    let names_a_target = TARGET_CJK.iter().any(|cue| m.contains(cue))
+        || TARGET_EN_PHRASES.iter().any(|cue| m.contains(cue));
+    names_a_defect && names_a_target
+}
+
 pub fn proposal_capability(previous_assistant: &str) -> Option<TurnCapability> {
     let text = previous_assistant.trim().to_lowercase();
     if text.is_empty() {
@@ -535,6 +700,7 @@ pub fn steer_capability_override(user_msg: &str) -> Option<TurnCapability> {
         return Some(TurnCapability::Deliver);
     }
     if is_direct_execution_request(user_msg)
+        || is_change_request(user_msg)
         || is_explicit_continuation_request(user_msg)
         || is_strong_approval(user_msg)
     {
@@ -624,7 +790,7 @@ pub fn decide_chat_contract(prev_assistant: Option<&str>, user_msg: &str) -> Cha
             grants,
         };
     }
-    if is_direct_execution_request(user_msg) {
+    if is_direct_execution_request(user_msg) || is_change_request(user_msg) {
         return ChatContract {
             mode: AgentMode::Execute,
             capability: TurnCapability::Implement,
@@ -653,9 +819,33 @@ pub fn decide_chat_contract(prev_assistant: Option<&str>, user_msg: &str) -> Cha
             grants,
         };
     }
+    // Ambiguity picks a POSTURE, never a permission.
+    //
+    // `mode` and `capability` answer two different questions, and until
+    // 2026-08-05 this fallthrough answered both with the same guess:
+    //
+    // - `mode` — should the turn discuss first, or act? A wrong guess costs one
+    //   sentence and the model self-corrects. That is what this module was
+    //   built for (#37) and it stays inferred.
+    // - `capability` — may the turn write at all? A wrong guess is
+    //   unrecoverable: `policy::capability_denial` refuses every write and
+    //   tells the model not to re-ask, so the agent dead-ends and (field
+    //   report, 2026-08-05) invents a nonexistent "implementation 模式" for the
+    //   user to switch to.
+    //
+    // A cue-table guess is nowhere near accurate enough to carry an
+    // unrecoverable decision — published intent-classification benchmarks put
+    // regex baselines near 53%, and no shipping agent (Claude Code's plan mode,
+    // Cursor's mode selector) infers write permission from how a sentence is
+    // phrased; the user holds that switch. So the hard read-only gate is now
+    // reachable ONLY from an explicit user constraint, checked at the top of
+    // this function. Ambiguity keeps the discuss-first posture and leaves the
+    // real safety net where it belongs: the per-action permission gateway,
+    // which already answers `Ask` for `write_file`/`edit_file` outside trusted
+    // mode.
     ChatContract {
         mode: AgentMode::Interactive,
-        capability: TurnCapability::ReviewOnly,
+        capability: TurnCapability::Implement,
         grants,
     }
 }
@@ -678,7 +868,7 @@ mod tests {
             Some("我可以读取 Chrome，是否开始？"),
             "你去读一下我本机 Chrome 里的产品现网看看",
         );
-        assert_eq!(contract.capability, TurnCapability::ReviewOnly);
+        assert_eq!(contract.mode, AgentMode::Interactive);
         assert!(contract.grants.browser_read);
 
         assert!(
@@ -868,10 +1058,13 @@ mod tests {
             decide_chat_contract(Some("我会在本地修复并验证。可以开始吗？"), "做吧").capability,
             TurnCapability::Implement
         );
-        assert_eq!(
-            decide_chat_contract(Some("这是只读审视方案。"), "好的").capability,
-            TurnCapability::ReviewOnly
-        );
+        // A bare "好的" after a read-only summary approves nothing in
+        // particular, so the turn keeps the discuss-first posture. It does NOT
+        // lose write capability — that is a permission decision and nobody
+        // asked for read-only here.
+        let acknowledged = decide_chat_contract(Some("这是只读审视方案。"), "好的");
+        assert_eq!(acknowledged.mode, AgentMode::Interactive);
+        assert_ne!(acknowledged.capability, TurnCapability::ReviewOnly);
     }
 
     #[test]
@@ -901,7 +1094,7 @@ mod tests {
     #[test]
     fn ordinary_diagnostic_does_not_revoke_an_active_delivery_intent() {
         let diagnostic = decide_chat_contract(None, "你为啥没权限，没人限制你啊");
-        assert_eq!(diagnostic.capability, TurnCapability::ReviewOnly);
+        assert_eq!(diagnostic.mode, AgentMode::Interactive);
 
         let continued = with_persisted_delivery_authorization(diagnostic, true);
         assert_eq!(continued.capability, TurnCapability::Deliver);
@@ -951,6 +1144,196 @@ mod tests {
         assert_eq!(
             decide_chat_contract(Some("我会修复、开 PR、合并并发布。"), "可以，继续",).capability,
             TurnCapability::Deliver,
+        );
+    }
+
+    // ── Colloquial change requests ──────────────────────────────────────────
+    //
+    // Field report, 2026-08-05, twice in one day. Both sessions carried exactly
+    // ONE user message, neither asked for read-only, and both were classified
+    // `ReviewOnly` by the fallthrough at the bottom of `decide_chat_contract`:
+    // the cue tables above only recognize a user who speaks like a ticket
+    // ("修复 / 实现 / 改掉"), while the user actually points at something in
+    // their own app, says what is wrong with it, and proposes what it should
+    // be instead. The first session cost an extra "好，改" round-trip. The
+    // second dead-ended: the write gate refused the edit and the denial forbade
+    // asking, so the agent told the user to switch to an "implementation 模式"
+    // that does not exist. Both messages below are verbatim from those sessions.
+
+    #[test]
+    fn colloquial_defect_reports_are_work_orders_not_questions() {
+        for message in [
+            // Verbatim, session 074ac81c (the dead end).
+            "新建页面的这个窗口布局太丑了，另外也不能很直观的看到用什么模型，是不是应该把模型选择在新建页面放在这里啊",
+            // Verbatim, session 03c77092 (the wasted round-trip).
+            "你这个聊天输入框区域的底色为啥跟上面会话信息框的底色不一样啊？应该保持一样更好看一些",
+            // Same class, other phrasings of "wrong now, this instead".
+            "侧栏太挤了，能不能把间距放大一点",
+            "这两个按钮的圆角不一致，应该统一成 8px",
+            "会话标题看不清，最好加粗一点",
+            "this spacing is inconsistent, it should match the header",
+        ] {
+            assert_eq!(
+                decide_chat_contract(None, message).capability,
+                TurnCapability::Implement,
+                "{message:?} names a defect AND the target state — that is a work order, \
+                 not a request for analysis"
+            );
+        }
+    }
+
+    /// The invariant the 2026-08-05 dead end cost us: the hard read-only gate is
+    /// reachable ONLY from a user who actually asked for it. Everything else —
+    /// including a message the framework cannot classify — keeps write
+    /// capability, so a misclassification can never strand the turn.
+    ///
+    /// `policy::review_only_denial` says "显式只读意图" and forbids re-asking.
+    /// That sentence is only honest, and that instruction only correct, while
+    /// this holds.
+    #[test]
+    fn the_hard_read_only_gate_comes_only_from_an_explicit_user_constraint() {
+        for message in [
+            // Change requests, questions, diagnostics, bare noise — none of
+            // these asked for read-only, so none of them may lose write access.
+            "这个布局太丑了，是不是应该改成横排",
+            "这个 store 是干嘛的",
+            "我应该先看哪个文件",
+            "这个页面为什么会闪一下",
+            "你为啥没权限，没人限制你啊",
+            "嗯",
+            "",
+        ] {
+            let contract = decide_chat_contract(None, message);
+            assert!(
+                !contract.grants.explicit_read_only,
+                "{message:?} never constrained the turn"
+            );
+            assert_ne!(
+                contract.capability,
+                TurnCapability::ReviewOnly,
+                "{message:?} must not lose write capability on a guess"
+            );
+        }
+        for message in ["先分析一下，不要改代码", "只评估风险，别执行"] {
+            let contract = decide_chat_contract(None, message);
+            assert!(contract.grants.explicit_read_only, "{message:?}");
+            assert_eq!(
+                contract.capability,
+                TurnCapability::ReviewOnly,
+                "{message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn questions_without_a_desired_change_keep_the_discuss_first_posture() {
+        for message in [
+            // No complaint, no target — a plain question about the code.
+            "这个 store 是干嘛的",
+            "我应该先看哪个文件",
+            "为什么应该用 Postgres 而不是 SQLite",
+            // A complaint the user wants *explained*, not changed yet.
+            "这个页面为什么会闪一下",
+            // Asking for the method IS asking for a plan. (An English message
+            // carrying "fix" already reaches Implement through the pre-existing
+            // execution table; this change neither widens nor narrows that.)
+            "这个布局不好看，应该怎么改比较好",
+            "the spacing looks off, how should we handle it",
+            // The user's own uncertainty is not a product defect.
+            "我不太清楚这个模块应该怎么读",
+        ] {
+            assert_eq!(
+                decide_chat_contract(None, message).mode,
+                AgentMode::Interactive,
+                "{message:?} asks for understanding or method; the turn should answer \
+                 before acting"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_read_only_request_still_wins_over_a_change_request() {
+        for message in [
+            "先分析一下这个布局为什么这么丑，不要改代码",
+            "别改，先给个方案：这两个圆角不一致，应该统一成 8px",
+        ] {
+            let contract = decide_chat_contract(None, message);
+            assert_eq!(contract.capability, TurnCapability::ReviewOnly);
+            assert!(contract.grants.explicit_read_only, "{message:?}");
+        }
+    }
+
+    /// End-to-end reproduction of the field failure, across BOTH modules that
+    /// had to agree for it to happen. Each side's own unit tests were green
+    /// while the composition dead-ended, so this asserts the composition:
+    /// classify the verbatim user message, then ask the real structural gate
+    /// whether the edit it wanted is allowed.
+    #[test]
+    fn the_field_report_message_can_now_reach_the_edit_it_was_denied() {
+        use codefactory_agent_core::ToolKind;
+        use codefactory_agent_loop::policy::capability_denial;
+
+        // Verbatim, session 074ac81c — the only user message in that session.
+        let contract = decide_chat_contract(
+            None,
+            "新建页面的这个窗口布局太丑了，另外也不能很直观的看到用什么模型，\
+是不是应该把模型选择在新建页面放在这里啊",
+        );
+        // The two writes the agent actually attempted and was refused.
+        for (tool, args) in [
+            (
+                "edit_file",
+                serde_json::json!({
+                    "path": "src/pages/Workspace/WorkspacePage.draft.test.tsx",
+                    "old_string": "a",
+                    "new_string": "b",
+                }),
+            ),
+            (
+                "write_file",
+                serde_json::json!({
+                    "path": "src/components/DraftScopeBar.tsx",
+                    "content": "// …",
+                }),
+            ),
+        ] {
+            assert!(
+                capability_denial(
+                    contract.capability,
+                    tool,
+                    &format!("{tool} {}", args["path"]),
+                    &ToolKind::Mutation,
+                    &args,
+                )
+                .is_none(),
+                "{tool} was structurally denied for a user who never asked for read-only"
+            );
+        }
+
+        // …while a user who DID ask for read-only still gets the hard gate.
+        let constrained = decide_chat_contract(None, "先分析一下这个布局，不要改代码");
+        assert!(
+            capability_denial(
+                constrained.capability,
+                "edit_file",
+                "edit_file src/components/DraftScopeBar.tsx",
+                &ToolKind::Mutation,
+                &serde_json::json!({
+                    "path": "src/components/DraftScopeBar.tsx",
+                    "old_string": "a",
+                    "new_string": "b",
+                }),
+            )
+            .is_some(),
+            "an explicit read-only request must still block product edits"
+        );
+    }
+
+    #[test]
+    fn a_mid_turn_change_request_reaches_implementation() {
+        assert_eq!(
+            steer_capability_override("等下，这个间距也太挤了，应该跟上面对齐"),
+            Some(TurnCapability::Implement),
         );
     }
 
