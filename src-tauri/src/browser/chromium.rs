@@ -33,11 +33,53 @@ use super::profile::{self, LockOutcome, ProfileScope};
 use super::{BrowserDriver, PageContent};
 use crate::errors::{AppError, Result};
 
-/// Launching has to cover a cold profile and a first paint.
+/// How long the browser process gets to print its DevTools endpoint.
+///
+/// This has to be handed to chromiumoxide explicitly. Its own default is 20s,
+/// which fired long before the watchdog below and left this budget as dead
+/// code: a `windows-latest` runner whose virus scanner is reading a freshly
+/// unpacked `chrome.exe` has been measured silent past 20s with the process
+/// still alive and healthy — an empty `BrowserStderr` and a `LaunchTimeout`
+/// rather than an exit. That turned a slow start into a hard failure in
+/// roughly one CI run in three.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Backstop around the whole of `Browser::launch`. Resolving the endpoint is
+/// only its first half — the websocket connect that follows has no timeout of
+/// its own. Deliberately longer than `LAUNCH_TIMEOUT`, so a launch that merely
+/// ran slow reports as a launch failure naming the binary rather than as this.
+const LAUNCH_WATCHDOG: Duration = Duration::from_secs(75);
 /// Any single page operation. Generous enough for a slow site, short enough
 /// that a wedged page surfaces as an error instead of hanging the turn.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The marker every "the browser would not start" message carries.
+///
+/// Shared by [`launch_failure`] and [`is_launch_failure`] so the two cannot
+/// drift apart: rewording the message without moving this constant is a
+/// compile-time impossibility rather than a silently broken classifier.
+const LAUNCH_FAILURE_MARKER: &str = "Could not start the browser";
+
+/// The one place a failed launch becomes an error.
+///
+/// Naming the binary is the point. Which Chrome we resolved is the first thing
+/// anyone needs when a launch fails, and it is the one fact the underlying
+/// error never carries — its stderr is routinely empty when the process dies,
+/// or just stays silent, during startup.
+fn launch_failure(executable: &Path, detail: impl std::fmt::Display) -> AppError {
+    AppError::Other(format!(
+        "{LAUNCH_FAILURE_MARKER} at {}: {detail}",
+        executable.display()
+    ))
+}
+
+/// Whether a message came from [`launch_failure`] — i.e. this machine could not
+/// produce a working browser at all.
+///
+/// The browser-session smoke uses this to tell an unusable runner apart from
+/// the lifecycle regressions it actually asserts. Nothing else may be retried.
+pub fn is_launch_failure(message: &str) -> bool {
+    message.contains(LAUNCH_FAILURE_MARKER)
+}
 
 /// One launched browser and the page we drive in it.
 struct LiveSession {
@@ -331,7 +373,9 @@ impl BrowserDriver for ChromiumDriver {
 
         let builder = BrowserConfig::builder()
             .chrome_executable(&executable)
-            .user_data_dir(&user_data_dir);
+            .user_data_dir(&user_data_dir)
+            // Without this the crate's 20s default applies, not ours.
+            .launch_timeout(LAUNCH_TIMEOUT);
         // Headed by default: the user has to be able to complete a sign-in,
         // including any 2FA, in this window. A headless browser cannot be
         // signed in to anything by a person. The override exists for automated
@@ -357,26 +401,19 @@ impl BrowserDriver for ChromiumDriver {
             .build()
             .map_err(|error| AppError::Other(format!("Invalid browser configuration: {error}")))?;
 
-        let launched = tokio::time::timeout(LAUNCH_TIMEOUT, Browser::launch(config)).await;
+        let launched = tokio::time::timeout(LAUNCH_WATCHDOG, Browser::launch(config)).await;
         let (mut browser, mut handler) = match launched {
             Ok(Ok(pair)) => pair,
-            // Both failures name the binary. Which Chrome we resolved is the
-            // first thing anyone needs to know when a launch fails, and it is
-            // the one fact the underlying error never carries — its stderr is
-            // routinely empty when the process dies during startup.
             Ok(Err(error)) => {
                 release_profile(&profile_dir, session_id);
-                return Err(AppError::Other(format!(
-                    "Could not start the browser at {}: {error}",
-                    executable.display()
-                )));
+                return Err(launch_failure(&executable, error));
             }
             Err(_) => {
                 release_profile(&profile_dir, session_id);
-                return Err(AppError::Other(format!(
-                    "The browser at {} did not start in time",
-                    executable.display()
-                )));
+                return Err(launch_failure(
+                    &executable,
+                    format!("it did not respond within {}s", LAUNCH_WATCHDOG.as_secs()),
+                ));
             }
         };
 
@@ -542,6 +579,58 @@ fn release_profile(dir: &Option<PathBuf>, session_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_crate_default_launch_timeout_never_preempts_ours() {
+        // The bug this pins: chromiumoxide's own 20s default fired first and
+        // made LAUNCH_TIMEOUT unreachable, so a merely-slow Chrome on a cold CI
+        // runner failed the browser smoke about one run in three. The watchdog
+        // has to stay strictly the longer of the two, or a slow launch reports
+        // as "did not respond" instead of naming the binary and its real cause.
+        assert!(
+            LAUNCH_TIMEOUT > Duration::from_secs(20),
+            "our budget must exceed the crate default it now overrides"
+        );
+        assert!(
+            LAUNCH_WATCHDOG > LAUNCH_TIMEOUT,
+            "the watchdog must not preempt the launch budget it wraps"
+        );
+    }
+
+    #[test]
+    fn a_launch_failure_is_recognisable_to_the_smoke() {
+        // Built exactly the way `open` builds it, so this cannot keep passing
+        // while the real message drifts out from under `is_launch_failure`.
+        let message = launch_failure(
+            Path::new(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            "Timeout while resolving websocket URL from browser process, \
+             stderr: BrowserStderr(\"\")",
+        )
+        .to_string();
+        assert!(is_launch_failure(&message), "message was: {message}");
+        assert!(
+            message.contains("chrome.exe"),
+            "a launch failure has to name the binary it tried: {message}"
+        );
+    }
+
+    #[test]
+    fn nothing_the_smoke_asserts_looks_like_a_launch_failure() {
+        // The retry added for slow CI runners must never re-roll one of these.
+        // Each is a real regression in code we own, and gets exactly one shot.
+        for message in [
+            "smoke did not receive a session id",
+            "Could not extract readable content from the page",
+            "Browser session codefactory-1 is already open.",
+            "browser_session session is unknown or has already been reclaimed",
+            "That browser profile is already in use by session codefactory-1.",
+        ] {
+            assert!(
+                !is_launch_failure(message),
+                "{message} must fail loudly, not be retried"
+            );
+        }
+    }
 
     #[test]
     fn an_override_only_counts_when_the_binary_is_really_there() {
