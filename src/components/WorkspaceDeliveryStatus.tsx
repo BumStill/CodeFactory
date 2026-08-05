@@ -147,6 +147,7 @@ export function WorkspaceDeliveryStatus({ cwd, sessionId, currentBranch, message
   if (!cwd) return null;
   const pr = snapshot?.pr;
   const ci = ciLabel(snapshot?.ci_status);
+  const summary = deliverySummary(pr, ci, snapshot?.release ?? null, unavailable, snapshot);
   const statusTone = snapshot?.ci_status.startsWith("failure")
     ? "danger"
     : unavailable
@@ -176,27 +177,7 @@ export function WorkspaceDeliveryStatus({ cwd, sessionId, currentBranch, message
         title="查看本会话对应的 PR/MR、CI、合并、发布与线上验证状态"
       >
         <GitPullRequest size={12} className="shrink-0" />
-        {unavailable ? (
-          <span className="whitespace-nowrap">远程状态不可用</span>
-        ) : !snapshot ? (
-          <span className="inline-flex items-center gap-1 whitespace-nowrap"><LoaderCircle size={11} className="animate-spin motion-reduce:animate-none" />读取交付状态…</span>
-        ) : !pr ? (
-          <span className="whitespace-nowrap">未关联 PR</span>
-        ) : (
-          <>
-            <span className="shrink-0 font-medium">PR #{pr.number}</span>
-            <StatusDivider />
-            <span className="shrink-0">{ci}</span>
-            <StatusDivider />
-            <span className="shrink-0">{prStateLabel(pr)}</span>
-            {snapshot.release && (
-              <>
-                <StatusDivider />
-                <span className="truncate">{snapshot.release.tag} · 未验证上线</span>
-              </>
-            )}
-          </>
-        )}
+        <span className="truncate" title={summary}>{pr ? <><span className="font-medium">PR #{pr.number}</span><span className="ml-1.5">· {summary}</span></> : summary}</span>
       </button>
 
       {open && (
@@ -297,7 +278,16 @@ export function WorkspaceDeliveryStatus({ cwd, sessionId, currentBranch, message
   );
 }
 
-function StatusDivider() { return <span aria-hidden="true" className="text-current/40">·</span>; }
+function deliverySummary(pr: DeliveryPr | null | undefined, ci: string, release: DeliveryRelease | null, unavailable: boolean, snapshot: DeliverySnapshot | null): string {
+  if (unavailable) return "远程状态不可用";
+  if (!snapshot) return "读取交付状态…";
+  if (!pr) return "未关联 PR";
+  if (snapshot.ci_status.startsWith("failure")) return "CI 失败";
+  if (snapshot.ci_status.includes("running") || snapshot.ci_status.includes("pending")) return "CI 运行中";
+  if (pr.state === "merged") return release ? `${ci} · 已合并 · ${release.tag} · 未验证上线` : `${ci} · 已合并 · 待发布`;
+  if (pr.state === "open" && snapshot.ci_status.includes("success")) return `CI 通过 · ${prStateLabel(pr)}`;
+  return `${ci} · ${prStateLabel(pr)}`;
+}
 
 function ciLabel(status?: string): string {
   if (!status || status === "none") return "无 CI";
