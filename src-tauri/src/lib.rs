@@ -580,6 +580,7 @@ pub fn run() {
             commands::checkpoints::checkpoint_changeset,
             commands::checkpoints::revert_checkpoint,
             commands::control_plane::get_control_plane_snapshot,
+            commands::document::read_document,
             commands::memory::read_project_memory,
             commands::memory::write_project_memory,
             commands::learning::list_learning_events,

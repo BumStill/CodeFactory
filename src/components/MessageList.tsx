@@ -9,6 +9,7 @@ import { createHighlighter, type Highlighter } from "shiki";
 import { AlertTriangle, Check, Copy, ChevronDown, ChevronUp } from "lucide-react";
 import { ToolCallCard } from "./ToolCallCard";
 import { ImagePreview } from "./ImagePreview";
+import { FileArtifactCard, isDocumentPath } from "./FileArtifactCard";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import { ChatGptAuthRecovery } from "./ChatGptAuthRecovery";
@@ -41,6 +42,7 @@ interface Props {
   onOpenSession?: (id: string) => void;
   /** Re-scope the current draft to a project directory (null = standalone). */
   onPickProject?: (cwd: string | null) => void;
+  onOpenDocument?: (path: string) => void;
   conversationKey?: string | null;
   hasOlderHistory?: boolean;
   loadingOlderHistory?: boolean;
@@ -160,10 +162,24 @@ function normalizeLocalImageMarkdown(text: string): string {
   );
 }
 
-function MarkdownContent({ content }: { content: string }) {
+function MarkdownContent({ content, onOpenDocument }: { content: string; onOpenDocument?: (path: string) => void }) {
+  const components = onOpenDocument
+    ? {
+        ...markdownComponents,
+        code({ className, children, ...props }: { className?: string; children?: React.ReactNode }) {
+          const code = String(children).replace(/\n$/, "");
+          const match = /language-(\w+)/.exec(className || "");
+          if (!match && isDocumentPath(code)) {
+            return <FileArtifactCard path={code} compact onPreview={onOpenDocument} {...props} />;
+          }
+          if (match) return <CodeBlock lang={match[1]} code={code} />;
+          return <code className="rounded bg-accent/10 px-1 py-0.5 font-mono text-[12px] text-gray-300" {...props}>{children}</code>;
+        },
+      }
+    : markdownComponents;
   return (
     <ReactMarkdown
-      components={markdownComponents}
+      components={components}
       remarkPlugins={[remarkGfm]}
       urlTransform={allowedLocalImageUrl}
     >
@@ -203,6 +219,9 @@ const markdownComponents: Components = {
     const match = /language-(\w+)/.exec(className || "");
     const isBlock = !!match;
     const code = String(children).replace(/\n$/, "");
+    if (!isBlock && isDocumentPath(code)) {
+      return <FileArtifactCard path={code} compact {...props} />;
+    }
     if (isBlock) {
       return <CodeBlock lang={match![1]} code={code} />;
     }
@@ -303,6 +322,7 @@ export function MessageList({
   onOpenUsage,
   onOpenSession,
   onPickProject,
+  onOpenDocument,
   conversationKey,
   hasOlderHistory = false,
   loadingOlderHistory = false,
@@ -449,6 +469,7 @@ export function MessageList({
               msg={msg}
               isStreamingTail={streaming && msg.id === lastAssistantId}
               isLastAssistantInUserTurn={lastAssistantIdsByUserTurn.has(msg.id)}
+              onOpenDocument={onOpenDocument}
             />
           </div>
           );
@@ -570,10 +591,12 @@ const MessageRow = memo(function MessageRow({
   msg,
   isStreamingTail,
   isLastAssistantInUserTurn,
+  onOpenDocument,
 }: {
   msg: UIMessage;
   isStreamingTail: boolean;
   isLastAssistantInUserTurn: boolean;
+  onOpenDocument?: (path: string) => void;
 }) {
   const isUser = msg.role === "user";
   // Must run unconditionally (before the early return) to satisfy the rules
@@ -717,7 +740,7 @@ const MessageRow = memo(function MessageRow({
           }`}
         >
           <div className="prose dark:prose-invert prose-sm max-w-none whitespace-pre-wrap text-sm text-gray-200 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
-            <MarkdownContent content={msg.content} />
+            <MarkdownContent content={msg.content} onOpenDocument={onOpenDocument} />
           </div>
         </div>
         {/* Until a round boundary drains it the model genuinely has not seen
