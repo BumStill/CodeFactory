@@ -23,6 +23,32 @@ fn gh_command() -> Command {
     command
 }
 
+/// Remaining core API quota for the authenticated user, or `None` when it
+/// cannot be read.
+///
+/// `/rate_limit` is explicitly exempt from GitHub's own rate limit, so asking
+/// costs nothing. Best-effort: not knowing must never fail or slow the command
+/// the caller actually wanted to run.
+pub fn read_core_quota() -> Option<(u32, u32)> {
+    let out = gh_command()
+        .args([
+            "api",
+            "rate_limit",
+            "--jq",
+            ".resources.core.remaining,.resources.core.limit",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let remaining = lines.next()?.trim().parse().ok()?;
+    let limit = lines.next()?.trim().parse().ok()?;
+    Some((remaining, limit))
+}
+
 fn parse_token(success: bool, stdout: &[u8]) -> Option<String> {
     if !success {
         return None;

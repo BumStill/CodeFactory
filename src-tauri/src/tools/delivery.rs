@@ -43,7 +43,7 @@ pub fn definition() -> ToolDefinition {
                     "ceiling": {
                         "type": "string",
                         "enum": ["off", "pr_only", "through_ci_green", "through_merge", "through_release"],
-                        "description": "Optional per-call ceiling. Clamped to at most the user's configured ceiling — a call can lower, never raise it."
+                        "description": "Optional per-call ceiling. Clamped to at most the user's configured ceiling — a call can lower, never raise it. Use `through_ci_green` to WAIT for CI on the PR this branch already has: this tool polls with backoff (10s→60s) and is the supported way to wait. Never shell out to `gh pr checks --watch` or a tight `gh` polling loop — those refresh every 10s until CI ends, exhaust the shared GitHub quota, and the resulting 403s break unrelated releases."
                     },
                     "expect_branch": {
                         "type": "string",
@@ -456,5 +456,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// Gating `gh --watch` only works if the sanctioned alternative is
+    /// discoverable. `through_ci_green` already waits for CI with backoff, but
+    /// nothing said so — so the model reached for `--watch` and burned the
+    /// quota (2026-08-03/04). Deny without an alternative just moves the bypass.
+    #[test]
+    fn the_schema_points_at_the_managed_way_to_wait_for_ci() {
+        let schema = definition().function.parameters.to_string();
+        assert!(schema.contains("through_ci_green"));
+        assert!(
+            schema.contains("WAIT for CI"),
+            "the ceiling doc must name waiting as its purpose"
+        );
+        assert!(
+            schema.contains("--watch"),
+            "and must name the bypass it replaces: {schema}"
+        );
     }
 }
