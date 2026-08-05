@@ -643,6 +643,14 @@ export function SettingsPage({
           <ArrowLeft size={14} />
         </button>
         <span className="text-sm font-semibold">设置</span>
+        <button
+          type="button"
+          onClick={onBack}
+          className="ml-auto inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-xs text-gray-400 hover:bg-surface-3 hover:text-gray-200"
+          aria-label="完成并返回工作区"
+        >
+          完成
+        </button>
       </header>
 
       {/* Body: left grouped nav + content */}
