@@ -1,6 +1,6 @@
 # 会话执行治理 P0–P1
 
-状态：v1.76.0 已发布；长等待与工具放大 P1 已完成本地实现和 Dev App 验证，待 PR/CI
+状态：v1.77.5 已发布；2026-08-05 P0 已完成本地实现和 Dev App 验证，待 PR/CI/正式发布
 范围：turn capability、delivery preflight/outcome、completion convergence、task segment、进度快照、sub-agent attempt
 
 ## 现场基线
@@ -32,6 +32,30 @@
 - [x] 独立 QA 后补：跨 restart/resume/steer 计数与 notice 去重、活动快照写库失败不取消或覆盖工具 outcome、普通工具错误不误写 segment blocked、能力定制收敛提示、reload warning 语义一致。
 - [x] focused/full tests、CodeFactoryDev 成功与边界路径。
 - [ ] PR、CI、merge 与发布节奏判断。
+
+## 2026-08-05 P0：完成门禁、可恢复等待与交付幂等
+
+- [x] 正式版 24 小时轨迹确认：14 个根用户回合中 5 次需要用户再次推动；18 次
+  `deliver_changes` 全部 blocked，主要摩擦是可恢复等待被提前交还、远端读取失败后
+  重复交付，以及用户纠正后没有立即改变执行策略。
+- [x] Failure-first：第三次纯远端等待不能退化为 terminal blocker。
+- [x] Failure-first：gh PR 列表非 JSON、非数组、字段缺失不得当作空列表。
+- [x] Rust/前端增加结构化 `waiting`、`RecoveryClass`、`retry_after_ms` 和状态契约校验。
+- [x] `deliver_changes` 在同一工具调用内退避重试，复用 agent-loop 30 秒心跳，不新增
+  模型请求；等待中取消只发一次 terminal `Done`。
+- [x] GitHub/GitLab/gh PR 查询 fail closed；CI observation unavailable 不再伪装成
+  check failure，required-rules 读取失败不能证明绿色。
+- [x] focused/full tests、CodeFactoryDev 成功与边界路径。
+- [ ] PR、CI、merge、release artifact 与正式 App 验收。
+
+本轮验证：`agent-loop` 72/72、delivery 84/84、delivery tool 7/7、前端聚焦
+14/14、前端全量 95 文件 485/485、Rust 全量 732 通过/7 显式忽略/0 失败，
+`pnpm build`、TypeScript、diff check 与治理基线均通过。CodeFactoryDev 从当前
+worktree 以隔离端口启动，窗口标题 `CodeFactory P0 Verification`、URL
+`localhost:14201`，历史工具卡、输入区和普通会话路径可见；临时端口覆盖、进程组和
+wrapper 指针均已清理，未终止占用 1420 的其他开发会话。结构化 waiting 的状态呈现、
+streaming 保持和取消终态由 reducer/component/loop 测试覆盖，未通过修改 dev 数据库
+伪造远端等待。
 
 验证结果：`agent-loop` 65/65、SQLite persistence 12/12、前端 92 文件 474/474、`pnpm build`、Rust workspace check、治理基线通过。真实 CodeFactoryDev 绑定当前 worktree 与 DeepSeek v4 Flash：70 秒、100 秒和 65 秒命令均成功；30 秒时同一活动卡显示“命令仍在运行”，100 秒路径捕获到约 1 分钟文案，工具终态后不残留 running 状态。实地发现无结构化 plan 时未展示独立等待原因，补充 failure-first component 回归后修复；热更新后的 warning tone 有单测与 build 证据，但未在短暂 60–65 秒窗口内重新截到实地图。独立 QA 发现的续跑/steer 去重、活动快照失败和假 blocked 均先复现失败再修复，未触碰正式版数据库。
 

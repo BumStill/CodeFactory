@@ -98,6 +98,16 @@ impl StepResult {
 }
 
 /// The result of a delivery run.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryClass {
+    None,
+    WaitRetryable,
+    AgentActionRequired,
+    UserActionRequired,
+    ExternalStateUncertain,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryOutcome {
     pub steps: Vec<StepResult>,
@@ -113,6 +123,8 @@ pub struct DeliveryOutcome {
     pub stage: String,
     pub code: String,
     pub recoverable: bool,
+    pub recovery_class: RecoveryClass,
+    pub retry_after_ms: Option<u64>,
     pub next_action: Option<String>,
     pub reached_state: String,
     /// The policy target selected for this call and the highest rung the
@@ -129,11 +141,59 @@ pub struct DeliveryOutcome {
 }
 
 impl DeliveryOutcome {
+    pub fn validate_contract(&self) -> Result<(), String> {
+        let valid = match self.final_state.as_str() {
+            "delivered" | "noop" => {
+                !self.recoverable
+                    && self.recovery_class == RecoveryClass::None
+                    && self.retry_after_ms.is_none()
+                    && self.next_action.is_none()
+            }
+            "waiting" => {
+                self.recoverable
+                    && self.recovery_class == RecoveryClass::WaitRetryable
+                    && self.retry_after_ms.is_some_and(|value| value > 0)
+                    && self
+                        .next_action
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+            }
+            "blocked" => match self.recovery_class {
+                RecoveryClass::AgentActionRequired => {
+                    self.recoverable
+                        && self.retry_after_ms.is_none()
+                        && self
+                            .next_action
+                            .as_deref()
+                            .is_some_and(|value| !value.is_empty())
+                }
+                RecoveryClass::UserActionRequired | RecoveryClass::ExternalStateUncertain => {
+                    !self.recoverable
+                        && self.retry_after_ms.is_none()
+                        && self
+                            .next_action
+                            .as_deref()
+                            .is_some_and(|value| !value.is_empty())
+                }
+                RecoveryClass::None | RecoveryClass::WaitRetryable => false,
+            },
+            _ => false,
+        };
+        valid.then_some(()).ok_or_else(|| {
+            format!(
+                "invalid delivery outcome: state={}, recoverable={}, recovery_class={:?}",
+                self.final_state, self.recoverable, self.recovery_class
+            )
+        })
+    }
+
     fn blocked_at(mut self, step: StepResult) -> Self {
         let msg = step.detail.clone();
         self.stage = step.step.clone();
         self.code = format!("delivery_{}_blocked", step.step);
         self.recoverable = true;
+        self.recovery_class = RecoveryClass::AgentActionRequired;
+        self.retry_after_ms = None;
         self.next_action = Some(msg.clone());
         self.reached_state = reached_state_from_steps(&self.steps);
         self.steps.push(step);
@@ -142,11 +202,32 @@ impl DeliveryOutcome {
         self
     }
 
+    fn waiting_at(
+        mut self,
+        step: StepResult,
+        retry_after_ms: u64,
+        next_action: impl Into<String>,
+    ) -> Self {
+        self.stage = step.step.clone();
+        self.code = format!("delivery_{}_waiting", step.step);
+        self.recoverable = true;
+        self.recovery_class = RecoveryClass::WaitRetryable;
+        self.retry_after_ms = Some(retry_after_ms);
+        self.next_action = Some(next_action.into());
+        self.reached_state = reached_state_from_steps(&self.steps);
+        self.summary = step.detail.clone();
+        self.steps.push(step);
+        self.final_state = "waiting".into();
+        self
+    }
+
     fn blocked_on_uncertain_side_effect(mut self, step: StepResult) -> Self {
         let msg = step.detail.clone();
         self = self.blocked_at(step);
         self.code = "delivery_external_state_uncertain".into();
         self.recoverable = false;
+        self.recovery_class = RecoveryClass::ExternalStateUncertain;
+        self.retry_after_ms = None;
         self.next_action = Some(format!(
             "{msg} 外部动作结果不确定，禁止自动重试；请先核对远端事实，再人工续接。"
         ));
@@ -158,9 +239,69 @@ impl DeliveryOutcome {
         self = self.blocked_at(step);
         self.code = "delivery_human_action_required".into();
         self.recoverable = false;
+        self.recovery_class = RecoveryClass::UserActionRequired;
+        self.retry_after_ms = None;
         self.next_action = Some(msg);
         self
     }
+
+    fn remote_observation_failed(self, step: &str, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        if remote_error_is_retryable(&detail) {
+            return self.waiting_at(
+                StepResult::waiting(step, detail),
+                30_000,
+                "等待退避后重新核对同一远端对象；状态未知期间禁止重复外部写动作。",
+            );
+        }
+        if remote_error_requires_user_action(&detail) {
+            return self.human_action_required(StepResult::blocked(step, detail));
+        }
+        let mut outcome = self.blocked_at(StepResult::blocked(step, detail));
+        outcome.code = "delivery_remote_observation_unknown".into();
+        outcome.recoverable = false;
+        outcome.recovery_class = RecoveryClass::ExternalStateUncertain;
+        outcome.retry_after_ms = None;
+        outcome.next_action = Some(
+            "远端读取结果无法分类；先核对同一 PR/CI 的真实状态，再决定是否续接，禁止直接创建或重复触发。"
+                .into(),
+        );
+        outcome
+    }
+}
+
+fn remote_error_is_retryable(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    [
+        "rate limit",
+        "secondary rate",
+        "429",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "dns",
+        "502",
+        "503",
+        "504",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn remote_error_requires_user_action(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    [
+        "authentication",
+        "not authenticated",
+        "gh auth login",
+        "bad credentials",
+        "401",
+        "forbidden",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn reached_state_from_steps(steps: &[StepResult]) -> String {
@@ -294,6 +435,9 @@ pub enum MergeReadiness {
 pub enum CiStatus {
     Success,
     Failure(String),
+    /// The observer could not establish CI truth (rate limit/network/schema).
+    /// This is not a red check and must never trigger code changes.
+    Unavailable(String),
     Pending,
     /// No CI is configured for this commit — treated as "not blocking".
     None,
@@ -314,7 +458,7 @@ impl CiObservationStability {
     }
 
     fn confirm(&self, fingerprint: &str, status: CiStatus) -> CiStatus {
-        if matches!(status, CiStatus::Pending) {
+        if matches!(status, CiStatus::Pending | CiStatus::Unavailable(_)) {
             *self.candidate.lock().expect("ci stability mutex poisoned") = None;
             return status;
         }
@@ -813,22 +957,24 @@ async fn resume_queued_merge<R: DeliveryRemote>(
         ),
         Ok(MergeReadiness::Ready)
         | Ok(MergeReadiness::WaitingOnChecks)
-        | Ok(MergeReadiness::Unknown)
-        | Err(_) => {
-            outcome.steps.push(StepResult::waiting(
+        | Ok(MergeReadiness::Unknown) => {
+            let mut outcome = outcome.waiting_at(
+                StepResult::waiting(
                 "merge",
                 "GitHub 已登记受规则保护的 auto-merge；PR 正在等待远端门禁，后续续接只核对远端状态，不重复发起合并",
-            ));
-            outcome.final_state = "blocked".into();
-            outcome.stage = "merge".into();
+                ),
+                30_000,
+                "等待远端门禁产生新状态后重新调用 deliver_changes 续接合并和发布。",
+            );
             outcome.code = "delivery_merge_queued".into();
-            outcome.recoverable = true;
-            outcome.next_action =
-                Some("等待远端门禁产生新状态后重新调用 deliver_changes 续接合并和发布。".into());
             outcome.reached_state = "merge_queued".into();
             outcome.summary = "GitHub 已登记 auto-merge，正在等待远端门禁；不是权限不足。".into();
             outcome
         }
+        Err(error) => outcome.remote_observation_failed(
+            "merge_observation",
+            format!("暂时无法核对 PR #{pr_number} 的远端合并状态: {error}"),
+        ),
     }
 }
 
@@ -1551,6 +1697,8 @@ pub async fn deliver<R: DeliveryRemote>(
         stage: "preflight".into(),
         code: "delivery_ready".into(),
         recoverable: false,
+        recovery_class: RecoveryClass::None,
+        retry_after_ms: None,
         next_action: None,
         reached_state: "local".into(),
         requested_ceiling: ceiling_label(requested_ceiling).into(),
@@ -1939,11 +2087,12 @@ pub async fn deliver<R: DeliveryRemote>(
                 ));
             }
             Ok(None) => {}
-            // A guard that cannot run must not stop delivery.
-            Err(error) => outcome.steps.push(StepResult::ok(
-                "pr_guard",
-                format!("重名 PR 检查未能执行（{error}），继续交付"),
-            )),
+            Err(error) => {
+                return outcome.remote_observation_failed(
+                    "pr_observation",
+                    format!("无法确认是否已有同一交付的开放 PR: {error}"),
+                )
+            }
         }
         let had_pr_receipt = prior_receipt
             .as_ref()
@@ -1954,10 +2103,10 @@ pub async fn deliver<R: DeliveryRemote>(
         {
             Ok(pr) => pr,
             Err(e) => {
-                return outcome.blocked_at(StepResult::blocked(
+                return outcome.remote_observation_failed(
                     "pr",
                     format!("开 PR/MR 或读取远端真实正文失败: {e}"),
-                ))
+                )
             }
         };
         let pr_number = remote_pr.number;
@@ -2068,13 +2217,21 @@ pub async fn deliver<R: DeliveryRemote>(
                     ),
                 ))
             }
+            CiStatus::Unavailable(detail) => {
+                return outcome.remote_observation_failed(
+                    "ci_observation",
+                    format!("无法核对当前 head 的 CI 状态: {detail}"),
+                )
+            }
             CiStatus::Pending => {
-                return outcome.blocked_at(StepResult::blocked(
-                    "ci",
-                    format!(
-                        "CI 在 {ci_timeout_secs}s 内仍未出结论;稍后重新调用交付即可从此处续跑。"
+                return outcome.waiting_at(
+                    StepResult::waiting(
+                        "ci",
+                        format!("CI 在 {ci_timeout_secs}s 内仍未出结论，交付保持运行中。"),
                     ),
-                ))
+                    30_000,
+                    "等待退避后重新调用 deliver_changes，从同一 PR 和 head 继续核对 CI。",
+                )
             }
         }
 
@@ -2594,6 +2751,18 @@ fn block_unverified_release(
     outcome: DeliveryOutcome,
     detail: impl Into<String>,
 ) -> DeliveryOutcome {
+    let detail = detail.into();
+    if detail.contains("仍在等待") || detail.contains("仍未完成") {
+        return outcome.waiting_at(
+            StepResult::waiting("live", detail),
+            30_000,
+            "等待退避后重新核对同一 release/deployment，不重复触发发布。",
+        );
+    }
+    if detail.contains("没有可用的 live verifier") || detail.contains("未配置 live verifier")
+    {
+        return outcome.human_action_required(StepResult::blocked("live", detail));
+    }
     outcome.blocked_at(StepResult::blocked("live", detail))
 }
 
@@ -2621,7 +2790,9 @@ fn finish(mut outcome: DeliveryOutcome, branch: &str) -> DeliveryOutcome {
         outcome.final_state = "blocked".into();
         outcome.stage = "capability".into();
         outcome.code = "delivery_capability_gap".into();
-        outcome.recoverable = true;
+        outcome.recoverable = false;
+        outcome.recovery_class = RecoveryClass::UserActionRequired;
+        outcome.retry_after_ms = None;
         outcome.next_action = Some(next_action.clone());
         outcome.summary.push_str(&format!(
             "\n本次实际到达 {}，未达到请求的 {}：缺少 {gap}。{next_action}",
@@ -2698,7 +2869,7 @@ async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32
             }
             Err(e) => {
                 return CiWaitOutcome {
-                    status: CiStatus::Failure(e),
+                    status: CiStatus::Unavailable(e),
                     recoveries,
                 }
             }
@@ -3554,6 +3725,31 @@ fn parse_github_merge_observation(
     }
 }
 
+fn parse_gh_pr_list(raw: &str) -> Result<Option<DeliveryPr>, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("gh pr list returned non-JSON: {error}"))?;
+    let rows = value
+        .as_array()
+        .ok_or_else(|| "gh pr list returned JSON that is not an array".to_string())?;
+    let Some(pr) = rows.first() else {
+        return Ok(None);
+    };
+    let (Some(number), Some(url), Some(title), Some(body)) = (
+        pr.get("number").and_then(serde_json::Value::as_u64),
+        pr.get("url").and_then(serde_json::Value::as_str),
+        pr.get("title").and_then(serde_json::Value::as_str),
+        pr.get("body").and_then(serde_json::Value::as_str),
+    ) else {
+        return Err("gh pr list row missing number/url/title/body".into());
+    };
+    Ok(Some(DeliveryPr {
+        number,
+        url: url.into(),
+        title: title.into(),
+        body: body.into(),
+    }))
+}
+
 impl DeliveryRemote for GhCliRemote {
     fn capabilities(&self) -> DeliveryCapabilities {
         DeliveryCapabilities {
@@ -3587,22 +3783,8 @@ impl DeliveryRemote for GhCliRemote {
             "--limit".into(),
             "1".into(),
         ])?;
-        if let Ok(list) = serde_json::from_str::<serde_json::Value>(&existing) {
-            if let Some(pr) = list.as_array().and_then(|a| a.first()) {
-                if let (Some(n), Some(u), Some(t), Some(b)) = (
-                    pr["number"].as_u64(),
-                    pr["url"].as_str(),
-                    pr["title"].as_str(),
-                    pr["body"].as_str(),
-                ) {
-                    return Ok(DeliveryPr {
-                        number: n,
-                        url: u.to_string(),
-                        title: t.to_string(),
-                        body: b.to_string(),
-                    });
-                }
-            }
+        if let Some(pr) = parse_gh_pr_list(&existing)? {
+            return Ok(pr);
         }
         self.gh(&gh_pr_create_args(title, body, head, base))?;
         let created = self.gh(&[
@@ -3641,14 +3823,12 @@ impl DeliveryRemote for GhCliRemote {
         ])?;
         let v: serde_json::Value =
             serde_json::from_str(&raw).map_err(|e| format!("check-runs non-JSON: {e}"))?;
-        let rules = self
-            .gh(&[
-                "api".into(),
-                format!("repos/{}/rules/branches/{}", self.repo, self.default_branch),
-            ])
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .unwrap_or(serde_json::Value::Null);
+        let rules_raw = self.gh(&[
+            "api".into(),
+            format!("repos/{}/rules/branches/{}", self.repo, self.default_branch),
+        ])?;
+        let rules: serde_json::Value = serde_json::from_str(&rules_raw)
+            .map_err(|error| format!("required-rules returned non-JSON: {error}"))?;
         let required = crate::git_remote::github::parse_required_status_checks(&rules);
         let observation = crate::git_remote::github::classify_ci_observation(&v, &required);
         let status = match observation.status.as_str() {
@@ -4316,16 +4496,16 @@ impl DeliveryRemote for GitlabRemote {
         head: &str,
         base: &str,
     ) -> Result<DeliveryPr, String> {
-        if let Ok(mrs) = crate::git_remote::gitlab::list_prs(&self.client, &self.repo, "open").await
-        {
-            if let Some(mr) = mrs.into_iter().find(|mr| mr.head_branch == head) {
-                return Ok(DeliveryPr {
-                    number: mr.number,
-                    url: mr.url,
-                    title: mr.title,
-                    body: mr.body,
-                });
-            }
+        let mrs = crate::git_remote::gitlab::list_prs(&self.client, &self.repo, "open")
+            .await
+            .map_err(|error| format!("cannot reconcile existing GitLab merge requests: {error}"))?;
+        if let Some(mr) = mrs.into_iter().find(|mr| mr.head_branch == head) {
+            return Ok(DeliveryPr {
+                number: mr.number,
+                url: mr.url,
+                title: mr.title,
+                body: mr.body,
+            });
         }
         let mr = crate::git_remote::gitlab::create_pr(
             &self.client,
@@ -4391,16 +4571,16 @@ impl DeliveryRemote for GithubRemote {
         base: &str,
     ) -> Result<DeliveryPr, String> {
         // Idempotency: reuse an existing open PR for this head branch.
-        if let Ok(prs) = crate::git_remote::github::list_prs(&self.client, &self.repo, "open").await
-        {
-            if let Some(pr) = prs.into_iter().find(|p| p.head_branch == head) {
-                return Ok(DeliveryPr {
-                    number: pr.number,
-                    url: pr.url,
-                    title: pr.title,
-                    body: pr.body,
-                });
-            }
+        let prs = crate::git_remote::github::list_prs(&self.client, &self.repo, "open")
+            .await
+            .map_err(|error| format!("cannot reconcile existing GitHub pull requests: {error}"))?;
+        if let Some(pr) = prs.into_iter().find(|p| p.head_branch == head) {
+            return Ok(DeliveryPr {
+                number: pr.number,
+                url: pr.url,
+                title: pr.title,
+                body: pr.body,
+            });
         }
         let pr = crate::git_remote::github::create_pr(
             &self.client,
@@ -4675,6 +4855,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remote_observation_errors_separate_wait_from_user_action() {
+        assert!(remote_error_is_retryable("HTTP 429: API rate limit exceeded"));
+        assert!(remote_error_is_retryable("HTTP 503 Service Unavailable"));
+        assert!(!remote_error_is_retryable("HTTP 401: bad credentials"));
+        assert!(remote_error_requires_user_action(
+            "HTTP 403: authentication required"
+        ));
+        assert!(!remote_error_requires_user_action(
+            "HTTP 403: API rate limit exceeded"
+        ));
+    }
+
     fn make_repo(tag: &str) -> PathBuf {
         // The repo lives one level under a unique per-test parent, so
         // `root.parent()` is that isolated parent — cleanup via
@@ -4887,6 +5080,8 @@ mod tests {
             stage: "complete".into(),
             code: "delivery_ceiling_reached".into(),
             recoverable: false,
+            recovery_class: RecoveryClass::None,
+            retry_after_ms: None,
             next_action: None,
             reached_state: "pr_open".into(),
             requested_ceiling: "through_release".into(),
@@ -5447,6 +5642,8 @@ Release-Urgency: hold"
             stage: "release".into(),
             code: "release_triggered".into(),
             recoverable: false,
+            recovery_class: RecoveryClass::None,
+            retry_after_ms: None,
             next_action: None,
             reached_state: "release_triggered".into(),
             requested_ceiling: "through_release".into(),
@@ -6490,10 +6687,12 @@ Release-Urgency: hold"
             Some("main"),
         )
         .await;
-        assert_eq!(out.final_state, "blocked", "{:?}", out.steps);
+        assert_eq!(out.final_state, "waiting", "{:?}", out.steps);
         assert_eq!(out.reached_state, "merge_queued");
         assert_eq!(out.code, "delivery_merge_queued");
         assert!(out.recoverable);
+        assert_eq!(out.recovery_class, RecoveryClass::WaitRetryable);
+        assert_eq!(out.retry_after_ms, Some(30_000));
         assert!(out
             .steps
             .iter()
@@ -6716,7 +6915,8 @@ Release-Urgency: hold"
         assert_eq!(first.effective_ceiling, "through_release");
         assert_eq!(first.final_state, "blocked");
         assert_eq!(first.reached_state, "release_triggered");
-        assert!(first.recoverable);
+        assert!(!first.recoverable);
+        assert_eq!(first.recovery_class, RecoveryClass::UserActionRequired);
         assert!(first.next_action.as_deref().unwrap_or("").contains("live"));
 
         // Retrying the same session after an unverified release must only
@@ -7065,7 +7265,8 @@ Release-Urgency: hold"
         assert_eq!(out.effective_ceiling, "through_merge");
         assert_eq!(out.reached_state, "merged");
         assert_eq!(out.final_state, "blocked");
-        assert!(out.recoverable);
+        assert!(!out.recoverable);
+        assert_eq!(out.recovery_class, RecoveryClass::UserActionRequired);
         assert!(out.next_action.as_deref().unwrap_or("").contains("release"));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
@@ -7116,7 +7317,8 @@ Release-Urgency: hold"
         assert_eq!(out.effective_ceiling, "pr_only");
         assert_eq!(out.reached_state, "pr_open");
         assert_eq!(out.final_state, "blocked");
-        assert!(out.recoverable);
+        assert!(!out.recoverable);
+        assert_eq!(out.recovery_class, RecoveryClass::UserActionRequired);
         assert!(out.next_action.as_deref().unwrap_or("").contains("CI"));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
@@ -7153,7 +7355,8 @@ Release-Urgency: hold"
         assert_eq!(out.effective_ceiling, "through_ci_green");
         assert_eq!(out.reached_state, "ci_green");
         assert_eq!(out.final_state, "blocked");
-        assert!(out.recoverable);
+        assert!(!out.recoverable);
+        assert_eq!(out.recovery_class, RecoveryClass::UserActionRequired);
         assert!(out.next_action.as_deref().unwrap_or("").contains("merge"));
         assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
         assert_eq!(calls.release.load(Ordering::SeqCst), 0);
@@ -7262,6 +7465,24 @@ Release-Urgency: hold"
         assert!(conflicting_open_pr_from_list(&open, "  feat: add pane  ", "fix/fresh").is_some());
         // No open PRs at all → nothing to conflict with.
         assert!(conflicting_open_pr_from_list(&[], "feat: add pane", "feat/pane").is_none());
+    }
+
+    #[test]
+    fn gh_pr_list_unknown_is_never_treated_as_an_empty_list() {
+        assert!(parse_gh_pr_list("not json").is_err());
+        assert!(parse_gh_pr_list(r#"{"number":7}"#).is_err());
+        assert!(parse_gh_pr_list(
+            r#"[{"number":7,"url":"https://example/pr/7","title":"fix","body":null}]"#
+        )
+        .is_err());
+        assert_eq!(parse_gh_pr_list("[]").unwrap(), None);
+
+        let existing = parse_gh_pr_list(
+            r#"[{"number":7,"url":"https://example/pr/7","title":"fix","body":"body"}]"#,
+        )
+        .unwrap()
+        .expect("valid row");
+        assert_eq!(existing.number, 7);
     }
 
     #[tokio::test]

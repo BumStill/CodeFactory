@@ -32,6 +32,7 @@ use crate::errors::Result;
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecutionStatus {
     Done,
+    Waiting,
     Blocked,
     Error,
 }
@@ -59,6 +60,14 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             status: ToolExecutionStatus::Blocked,
+            metadata: None,
+        }
+    }
+    pub fn waiting(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            status: ToolExecutionStatus::Waiting,
             metadata: None,
         }
     }

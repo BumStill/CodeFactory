@@ -87,36 +87,63 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 
     let remote = delivery::resolve_delivery_remote(&ctx.cwd, &settings);
 
-    let outcome = delivery::deliver(
-        &ctx.cwd,
-        settings.delivery_ceiling,
-        settings.delivery_merge_method,
-        settings.delivery_ci_timeout_secs,
-        &opts,
-        remote.as_ref(),
-        None,
-    )
-    .await;
+    loop {
+        let outcome = delivery::deliver(
+            &ctx.cwd,
+            settings.delivery_ceiling,
+            settings.delivery_merge_method,
+            settings.delivery_ci_timeout_secs,
+            &opts,
+            remote.as_ref(),
+            None,
+        )
+        .await;
 
-    if let (Some(db), Some(session_id)) = (ctx.db.as_ref(), ctx.session_id.as_deref()) {
-        persist_delivery_ref(db, session_id, &outcome).await?;
+        if let (Some(db), Some(session_id)) = (ctx.db.as_ref(), ctx.session_id.as_deref()) {
+            persist_delivery_ref(db, session_id, &outcome).await?;
+        }
+
+        if outcome.validate_contract().is_err() {
+            return Ok(tool_output_for_outcome(&outcome));
+        }
+
+        if outcome.final_state != "waiting" {
+            return Ok(tool_output_for_outcome(&outcome));
+        }
+
+        // A waiting delivery remains one in-flight tool call. The shared loop
+        // keeps emitting its 30s heartbeat and can cancel by dropping this
+        // future; no extra model request or user "continue" is required.
+        let retry_after_ms = outcome.retry_after_ms.unwrap_or(30_000).clamp(1, 60_000);
+        tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms)).await;
     }
-
-    Ok(tool_output_for_outcome(&outcome))
 }
 
 fn tool_output_for_outcome(outcome: &delivery::DeliveryOutcome) -> ToolOutput {
+    if let Err(error) = outcome.validate_contract() {
+        return ToolOutput::err(format!(
+            "交付状态契约校验失败，未生成成功或阻断结论: {error}"
+        ))
+        .with_metadata(json!({
+            "status": "error",
+            "code": "delivery_contract_invalid",
+            "recoverable": false,
+            "recovery_class": "external_state_uncertain"
+        }));
+    }
     let report = render_report(outcome);
-    let output = if outcome.final_state == "blocked" {
-        ToolOutput::blocked(report)
-    } else {
-        ToolOutput::ok(report)
+    let output = match outcome.final_state.as_str() {
+        "waiting" => ToolOutput::waiting(report),
+        "blocked" => ToolOutput::blocked(report),
+        _ => ToolOutput::ok(report),
     };
     output.with_metadata(json!({
         "status": outcome.final_state,
         "stage": outcome.stage,
         "code": outcome.code,
         "recoverable": outcome.recoverable,
+        "recovery_class": outcome.recovery_class,
+        "retry_after_ms": outcome.retry_after_ms,
         "next_action": outcome.next_action,
         "requested_ceiling": outcome.requested_ceiling,
         "effective_ceiling": outcome.effective_ceiling,
@@ -192,13 +219,17 @@ fn render_report(outcome: &delivery::DeliveryOutcome) -> String {
         out.push_str(&format!("PR: {url}\n"));
     }
     out.push_str(&format!("\n{}", outcome.summary));
-    if outcome.final_state == "blocked" {
+    if outcome.final_state == "blocked" || outcome.final_state == "waiting" {
         out.push_str(
             "\n\n注意:本次交付没有达到请求边界；只能报告上面明确列出的已完成步骤。\
 即使之后查询发现仓库出现了新的合并或发布,那也是其他执行器(并行 agent 或自动化流水线)\
 完成的,不得归因为你本次的交付动作。",
         );
-        if outcome.recoverable {
+        if outcome.recovery_class == crate::agent::delivery::RecoveryClass::WaitRetryable {
+            out.push_str(
+                "\n\n这是等待中的交付状态，系统会在退避后自动核对同一 PR；用户无需回复『继续』。",
+            );
+        } else if outcome.recoverable {
             out.push_str(
                 "\n\n这是可恢复的交付状态，不是最终总结边界。执行 metadata/正文中的 next_action，\
 然后重新调用 deliver_changes 续接同一 PR；不得使用 --admin、force push 或删 required check。",
@@ -247,7 +278,7 @@ fn release_urgency_from_args(args: &Value) -> std::result::Result<Option<Release
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::delivery::{DeliveryOutcome, StepResult};
+    use crate::agent::delivery::{DeliveryOutcome, RecoveryClass, StepResult};
 
     fn outcome(final_state: &str) -> DeliveryOutcome {
         DeliveryOutcome {
@@ -255,6 +286,8 @@ mod tests {
                 step: "ci".into(),
                 status: if final_state == "blocked" {
                     "blocked"
+                } else if final_state == "waiting" {
+                    "waiting"
                 } else {
                     "ok"
                 }
@@ -269,12 +302,23 @@ mod tests {
             stage: "ci".into(),
             code: if final_state == "blocked" {
                 "delivery_ci_blocked"
+            } else if final_state == "waiting" {
+                "delivery_ci_waiting"
             } else {
                 "delivery_ceiling_reached"
             }
             .into(),
-            recoverable: final_state == "blocked",
-            next_action: None,
+            recoverable: matches!(final_state, "blocked" | "waiting"),
+            recovery_class: if final_state == "blocked" {
+                RecoveryClass::AgentActionRequired
+            } else if final_state == "waiting" {
+                RecoveryClass::WaitRetryable
+            } else {
+                RecoveryClass::None
+            },
+            retry_after_ms: (final_state == "waiting").then_some(30_000),
+            next_action: matches!(final_state, "blocked" | "waiting")
+                .then(|| "retry same PR".into()),
             reached_state: "local".into(),
             requested_ceiling: "through_release".into(),
             effective_ceiling: "through_release".into(),
@@ -328,6 +372,43 @@ mod tests {
         assert_eq!(metadata["effective_ceiling"], "through_release");
         assert_eq!(metadata["reached_state"], "local");
     }
+
+    #[test]
+    fn retryable_wait_has_a_distinct_tool_status_and_matching_report() {
+        let output = tool_output_for_outcome(&outcome("waiting"));
+        assert_eq!(output.status, ToolExecutionStatus::Waiting);
+        assert!(!output.is_error);
+        assert!(output.content.contains("交付结果: waiting"));
+        assert!(output.content.contains("用户无需回复『继续』"));
+        let metadata = output.metadata.expect("delivery metadata");
+        assert_eq!(metadata["status"], "waiting");
+        assert_eq!(metadata["recovery_class"], "wait_retryable");
+        assert_eq!(metadata["retry_after_ms"], 30_000);
+    }
+
+    #[test]
+    fn contradictory_delivery_contract_fails_closed() {
+        let mut invalid = outcome("delivered");
+        invalid.recoverable = true;
+        invalid.recovery_class = RecoveryClass::WaitRetryable;
+        invalid.retry_after_ms = Some(30_000);
+
+        let output = tool_output_for_outcome(&invalid);
+
+        assert_eq!(output.status, ToolExecutionStatus::Error);
+        assert!(output.is_error);
+        assert_eq!(
+            output.metadata.expect("contract error metadata")["code"],
+            "delivery_contract_invalid"
+        );
+
+        let mut zero_delay_wait = outcome("waiting");
+        zero_delay_wait.retry_after_ms = Some(0);
+        let output = tool_output_for_outcome(&zero_delay_wait);
+        assert_eq!(output.status, ToolExecutionStatus::Error);
+        assert!(output.is_error);
+    }
+
     #[tokio::test]
     async fn session_delivery_reference_is_durable_and_replaced_by_latest_pr() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()

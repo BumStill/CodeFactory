@@ -388,6 +388,32 @@ fn sanitized_tool_activity(name: &str) -> (&'static str, &'static str, &'static 
     }
 }
 
+fn structured_delivery_terminal_summary(metadata: &serde_json::Value) -> Option<String> {
+    if metadata.get("status").and_then(serde_json::Value::as_str) != Some("blocked")
+        || metadata
+            .get("recoverable")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+    {
+        return None;
+    }
+    let field = |name: &str, fallback: &'static str| {
+        metadata
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(fallback)
+    };
+    let next_action = field("next_action", "需要先核对阻断原因后再安全续接。");
+    Some(format!(
+        "交付未达到请求边界 `{}`。实际到达 `{}`，停止在 `{}`（`{}`）。下一步：{}",
+        field("requested_ceiling", "unknown"),
+        field("reached_state", "unknown"),
+        field("stage", "unknown"),
+        field("code", "delivery_blocked"),
+        next_action.trim(),
+    ))
+}
+
 fn approximate_wait_label(elapsed: std::time::Duration) -> String {
     if elapsed < std::time::Duration::from_secs(60) {
         format!("{} 秒", elapsed.as_secs().max(1))
@@ -1174,7 +1200,8 @@ pub async fn run_agent_loop(
             let mut result_messages = Vec::new();
             let mut progress_prompt = None;
             let mut blocked_tool_result = false;
-            let mut delivery_recovery_prompt = None;
+            let mut delivery_recovery_action = None;
+            let mut structured_delivery_blocker = None;
             let completion_evidence_before_tool_batch = completion_gate.evidence();
 
             for (tool_index, tc) in tool_calls.iter().enumerate() {
@@ -1490,6 +1517,23 @@ pub async fn run_agent_loop(
                         match tokio::time::timeout(interval, execution.as_mut()).await {
                             Ok(result) => break result,
                             Err(_) => {
+                                if cancel
+                                    .as_ref()
+                                    .is_some_and(|flag| flag.load(Ordering::SeqCst))
+                                {
+                                    finish_cancelled_tool_batch(
+                                        persistence.as_ref(),
+                                        events.as_ref(),
+                                        &tool_calls[tool_index..],
+                                    )
+                                    .await?;
+                                    return Ok(run_outcome_for_terminal(
+                                        &completion_gate,
+                                        StopReason::Cancelled,
+                                        (total_input_tokens, total_output_tokens),
+                                        &last_final_text,
+                                    ));
+                                }
                                 heartbeat_emitted = true;
                                 let elapsed = tool_start.elapsed();
                                 let elapsed_label = approximate_wait_label(elapsed);
@@ -1562,18 +1606,31 @@ pub async fn run_agent_loop(
                         }));
                     }
                 };
-                if matches!(output.status, crate::tool::ToolExecutionStatus::Blocked) {
-                    if let Some(prompt) = output.metadata.as_ref().and_then(|metadata| {
+                if matches!(
+                    output.status,
+                    crate::tool::ToolExecutionStatus::Waiting
+                        | crate::tool::ToolExecutionStatus::Blocked
+                ) {
+                    if let Some(action) = output.metadata.as_ref().and_then(|metadata| {
                         crate::policy::recoverable_delivery_prompt(
                             &tc.function.name,
                             metadata,
                             delivery_recovery_attempts,
                         )
                     }) {
-                        delivery_recovery_attempts = delivery_recovery_attempts.saturating_add(1);
-                        delivery_recovery_prompt = Some(prompt);
+                        if action.counts_as_repair_attempt {
+                            delivery_recovery_attempts =
+                                delivery_recovery_attempts.saturating_add(1);
+                        }
+                        delivery_recovery_action = Some(action);
                     } else {
                         blocked_tool_result = true;
+                        if tc.function.name == "deliver_changes" {
+                            structured_delivery_blocker = output
+                                .metadata
+                                .as_ref()
+                                .and_then(structured_delivery_terminal_summary);
+                        }
                     }
                 }
                 persistence
@@ -1581,6 +1638,7 @@ pub async fn run_agent_loop(
                         tc,
                         match output.status {
                             crate::tool::ToolExecutionStatus::Done => "done",
+                            crate::tool::ToolExecutionStatus::Waiting => "waiting",
                             crate::tool::ToolExecutionStatus::Blocked => "blocked",
                             crate::tool::ToolExecutionStatus::Error => "error",
                         },
@@ -1638,6 +1696,7 @@ pub async fn run_agent_loop(
                     is_error: output.is_error,
                     status: match output.status {
                         crate::tool::ToolExecutionStatus::Done => "done",
+                        crate::tool::ToolExecutionStatus::Waiting => "waiting",
                         crate::tool::ToolExecutionStatus::Blocked => "blocked",
                         crate::tool::ToolExecutionStatus::Error => "error",
                     }
@@ -1648,6 +1707,9 @@ pub async fn run_agent_loop(
                     let (status, label, terminal_reason) = match output.status {
                         crate::tool::ToolExecutionStatus::Done => {
                             ("active", "长时工具已完成，正在继续处理", None)
+                        }
+                        crate::tool::ToolExecutionStatus::Waiting => {
+                            ("active", "远端交付仍在等待，系统将自动续接", None)
                         }
                         crate::tool::ToolExecutionStatus::Blocked => {
                             ("blocked", "长时工具已在明确边界停止", Some("tool_blocked"))
@@ -1712,10 +1774,42 @@ pub async fn run_agent_loop(
                 reasoning_content: reasoning,
             });
             messages.extend(result_messages);
+            if let Some(summary) = structured_delivery_blocker {
+                persistence
+                    .persist_gate_message(&summary, "gate_blocked")
+                    .await?;
+                events.emit(crate::types::StreamEvent::CompletionGateAction {
+                    kind: "turn_notice".into(),
+                    detail: summary.clone(),
+                });
+                publish_turn_activity(
+                    persistence.as_ref(),
+                    events.as_ref(),
+                    root_turn_id.as_deref(),
+                    "finalizing",
+                    "blocked",
+                    "blocked",
+                    "交付已在明确边界停止",
+                    None,
+                    Some("delivery_blocked"),
+                )
+                .await?;
+                events.emit(crate::types::StreamEvent::Done {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                });
+                return Ok(run_outcome_for_terminal(
+                    &completion_gate,
+                    StopReason::Blocked,
+                    (total_input_tokens, total_output_tokens),
+                    &summary,
+                ));
+            }
             if !blocked_tool_result {
-                if let Some(prompt) = delivery_recovery_prompt {
+                if let Some(action) = delivery_recovery_action {
                     finalization_pending = false;
                     blocker_summary_pending = false;
+                    let retry_after = action.retry_after;
                     publish_turn_activity(
                         persistence.as_ref(),
                         events.as_ref(),
@@ -1728,9 +1822,39 @@ pub async fn run_agent_loop(
                         None,
                     )
                     .await?;
+                    if !retry_after.is_zero() {
+                        let deadline = tokio::time::Instant::now() + retry_after;
+                        loop {
+                            if cancel
+                                .as_ref()
+                                .is_some_and(|flag| flag.load(Ordering::SeqCst))
+                            {
+                                finish_cancelled_tool_batch(
+                                    persistence.as_ref(),
+                                    events.as_ref(),
+                                    &[],
+                                )
+                                .await?;
+                                return Ok(run_outcome_for_terminal(
+                                    &completion_gate,
+                                    StopReason::Cancelled,
+                                    (total_input_tokens, total_output_tokens),
+                                    &last_final_text,
+                                ));
+                            }
+                            let now = tokio::time::Instant::now();
+                            if now >= deadline {
+                                break;
+                            }
+                            tokio::time::sleep(
+                                (deadline - now).min(std::time::Duration::from_secs(1)),
+                            )
+                            .await;
+                        }
+                    }
                     messages.push(crate::types::ChatMessage {
                         role: "user".into(),
-                        content: crate::types::MessageContent::Text(prompt),
+                        content: crate::types::MessageContent::Text(action.prompt),
                         tool_calls: None,
                         tool_call_id: None,
                         name: None,
@@ -2400,6 +2524,46 @@ mod tests {
         delay: std::time::Duration,
     }
 
+    struct BlockedDeliveryTools;
+
+    #[async_trait::async_trait]
+    impl ToolBackend for BlockedDeliveryTools {
+        async fn list_schemas(&self) -> Vec<ToolDefinition> {
+            vec![tool_definition()]
+        }
+
+        async fn execute(
+            &self,
+            _call: &ToolCall,
+            _args: &serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolInvocationResult, ToolError> {
+            Ok(ToolInvocationResult {
+                content: "delivery blocked at live verification".into(),
+                is_error: false,
+                status: crate::tool::ToolExecutionStatus::Blocked,
+                command: "deliver_changes".into(),
+                kind: ToolKind::Mutation,
+                return_code: Some(1),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+                metadata: Some(serde_json::json!({
+                    "status": "blocked",
+                    "stage": "live",
+                    "code": "delivery_human_action_required",
+                    "recoverable": false,
+                    "recovery_class": "user_action_required",
+                    "requested_ceiling": "through_release",
+                    "reached_state": "release_triggered",
+                    "next_action": "configure a live verifier"
+                })),
+                next_working_directory: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
     #[async_trait::async_trait]
     impl ToolBackend for SlowTools {
         async fn list_schemas(&self) -> Vec<ToolDefinition> {
@@ -2839,6 +3003,86 @@ mod tests {
             StreamEvent::ToolResult { tool_call_id, status, .. }
                 if tool_call_id == "slow-1" && status == "done"
         )));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_a_waiting_tool_emits_one_terminal_done() {
+        let transport = Arc::new(ScriptedTransport::new(vec![response(
+            "",
+            vec![call("slow-delivery", "scripted", serde_json::json!({}))],
+            0,
+        )]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut loop_inputs = inputs();
+        loop_inputs.cancel = Some(cancel.clone());
+        let mut cfg = config();
+        cfg.tool_heartbeat_interval = Some(std::time::Duration::from_millis(2));
+        let mut svc = services(transport, persistence, events.clone());
+        svc.tools = Arc::new(SlowTools {
+            delay: std::time::Duration::from_millis(100),
+        });
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+            cancel.store(true, Ordering::SeqCst);
+        });
+
+        let outcome = run_agent_loop(loop_inputs, cfg, svc)
+            .await
+            .expect("cancellation is a normal terminal result");
+
+        assert_eq!(outcome.stop_reason, StopReason::Cancelled);
+        assert_eq!(
+            events
+                .events()
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::Done { .. }))
+                .count(),
+            1,
+        );
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult { tool_call_id, status, .. }
+                if tool_call_id == "slow-delivery" && status == "cancelled"
+        )));
+    }
+
+    #[tokio::test]
+    async fn nonrecoverable_delivery_uses_structured_terminal_facts_not_model_prose() {
+        let transport = Arc::new(ScriptedTransport::new(vec![response(
+            "I shipped the release successfully",
+            vec![call("delivery", "deliver_changes", serde_json::json!({}))],
+            0,
+        )]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut cfg = config();
+        cfg.turn_capability = TurnCapability::Deliver;
+        let mut svc = services(transport.clone(), persistence, events.clone());
+        svc.tools = Arc::new(BlockedDeliveryTools);
+
+        let outcome = run_agent_loop(inputs(), cfg, svc).await.expect("loop runs");
+
+        assert_eq!(outcome.stop_reason, StopReason::Blocked);
+        assert!(outcome
+            .final_text
+            .contains("delivery_human_action_required"));
+        assert!(outcome.final_text.contains("release_triggered"));
+        assert!(!outcome.final_text.contains("shipped successfully"));
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "no model-written blocker summary"
+        );
+        assert_eq!(
+            events
+                .events()
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::Done { .. }))
+                .count(),
+            1,
+        );
     }
 
     #[tokio::test]

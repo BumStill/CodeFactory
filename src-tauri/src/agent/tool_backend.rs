@@ -93,6 +93,7 @@ impl ToolBackend for DesktopToolBackend {
             is_error: output.is_error,
             status: match output.status {
                 crate::tools::ToolExecutionStatus::Done => ToolExecutionStatus::Done,
+                crate::tools::ToolExecutionStatus::Waiting => ToolExecutionStatus::Waiting,
                 crate::tools::ToolExecutionStatus::Blocked => ToolExecutionStatus::Blocked,
                 crate::tools::ToolExecutionStatus::Error => ToolExecutionStatus::Error,
             },

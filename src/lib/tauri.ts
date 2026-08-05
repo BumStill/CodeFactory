@@ -87,7 +87,7 @@ export type StreamEvent =
       tool_call_id: string;
       content: string;
       is_error: boolean;
-      status: "done" | "blocked" | "error" | "denied" | "cancelled";
+      status: "done" | "waiting" | "blocked" | "error" | "denied" | "cancelled";
       metadata?: Record<string, unknown> | null;
     }
   | {
