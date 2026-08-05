@@ -15,8 +15,10 @@ import {
   X,
   Globe2,
   ExternalLink,
+  FileText,
 } from "lucide-react";
 import { MessageList } from "../../components/MessageList";
+import { DocumentPreview, type DocumentTab } from "../../components/DocumentPreview";
 import { MessageInput } from "../../components/MessageInput";
 import { SessionSidebar } from "../../components/SessionSidebar";
 import { DraftScopeBar } from "../../components/DraftScopeBar";
@@ -237,6 +239,8 @@ export function WorkspacePage({
   const [browserSessions, setBrowserSessions] = useState<WorkspaceBrowserSession[]>([]);
   const [browserLoadError, setBrowserLoadError] = useState<string | null>(null);
   const [browserPaneCollapsed, setBrowserPaneCollapsed] = useState(false);
+  const [documentTabs, setDocumentTabs] = useState<DocumentTab[]>([]);
+  const [activeRightTab, setActiveRightTab] = useState<string | null>(null);
   const browserPaneWidth = BROWSER_PANE_DEFAULT_WIDTH;
   const loadProjectTasks = useTasksStore((state) => state.loadTasks);
   const subscribeProjectTasks = useTasksStore((state) => state.subscribe);
@@ -253,7 +257,7 @@ export function WorkspacePage({
       ),
     [browserSessions, sessionId],
   );
-  const browserPaneOpen = activeBrowserSessions.length > 0 && !browserPaneCollapsed;
+  const browserPaneOpen = (activeBrowserSessions.length > 0 || documentTabs.length > 0) && !browserPaneCollapsed;
 
   useEffect(() => {
     setBrowserPaneCollapsed(false);
@@ -568,6 +572,14 @@ export function WorkspacePage({
             onOpenUsage={onOpenUsage}
             onOpenSession={onOpenSession}
             onPickProject={activeDraft ? setDraftProject : undefined}
+            onOpenDocument={(path) => {
+              const id = `document:${path}`;
+              setDocumentTabs((tabs) => tabs.some((tab) => tab.id === id)
+                ? tabs
+                : [...tabs, { id, path, title: path.replace(/\\/g, "/").split("/").pop() ?? path }]);
+              setActiveRightTab(id);
+              setBrowserPaneCollapsed(false);
+            }}
             timingProfile={turnTimingProfile}
             externalJobs={externalJobs}
           />
@@ -610,10 +622,18 @@ export function WorkspacePage({
         </main>
 
         {browserPaneOpen && (
-          <EmbeddedBrowserPane
+          <RightWorkbenchPane
             sessions={activeBrowserSessions}
+            documents={documentTabs}
+            activeTab={activeRightTab}
             widthPercent={browserPaneWidth}
             loadError={browserLoadError}
+            cwd={activeCwd}
+            onSelectTab={setActiveRightTab}
+            onCloseDocument={(id) => {
+              setDocumentTabs((tabs) => tabs.filter((tab) => tab.id !== id));
+              setActiveRightTab((current) => current === id ? null : current);
+            }}
             onCollapse={() => setBrowserPaneCollapsed(true)}
             onCloseSession={(browserSessionId) => void closeBrowserPaneSession(browserSessionId)}
           />
@@ -687,12 +707,52 @@ export function WorkspacePage({
 // EmbeddedBrowserPane
 // ─────────────────────────────────────────────────────────────────────────────
 
-function EmbeddedBrowserPane({ sessions, widthPercent, loadError, onCollapse, onCloseSession }: {
+function RightWorkbenchPane({ sessions, documents, activeTab, widthPercent, loadError, cwd, onSelectTab, onCloseDocument, onCollapse, onCloseSession }: {
+  sessions: WorkspaceBrowserSession[];
+  documents: DocumentTab[];
+  activeTab: string | null;
+  widthPercent: number;
+  loadError: string | null;
+  cwd?: string | null;
+  onSelectTab: (id: string) => void;
+  onCloseDocument: (id: string) => void;
+  onCollapse: () => void;
+  onCloseSession: (sessionId: string) => void;
+}) {
+  const activeBrowser = sessions[0];
+  const selected = activeTab ?? (activeBrowser ? `browser:${activeBrowser.session_id}` : documents[0]?.id ?? null);
+  const activeDocument = documents.find((tab) => tab.id === selected);
+  return (
+    <aside aria-label={sessions.length > 0 ? "内置浏览器" : "右侧工作区"} data-browser-width={String(widthPercent)} className="hidden min-h-0 shrink-0 flex-col border-l border-border bg-surface-1 xl:flex" style={{ width: `${widthPercent}%`, minWidth: 420, maxWidth: "50%" }}>
+      <div className="flex min-w-0 items-center gap-1 border-b border-border px-2 py-1.5">
+        <div role="tablist" aria-label="右侧工作区标签" className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+          {sessions.map((session) => {
+            const id = `browser:${session.session_id}`;
+            return <button key={id} type="button" role="tab" aria-selected={selected === id} onClick={() => onSelectTab(id)} className={`shrink-0 rounded px-2 py-1 text-[11px] ${selected === id ? "bg-surface-3 text-gray-200" : "text-gray-500 hover:bg-surface-2 hover:text-gray-300"}`}><Globe2 size={11} className="mr-1 inline" />{sessionTitle(session)}</button>;
+          })}
+          {documents.map((tab) => <button key={tab.id} type="button" role="tab" aria-selected={selected === tab.id} onClick={() => onSelectTab(tab.id)} className={`flex max-w-40 shrink-0 items-center gap-1 rounded px-2 py-1 text-[11px] ${selected === tab.id ? "bg-surface-3 text-gray-200" : "text-gray-500 hover:bg-surface-2 hover:text-gray-300"}`}><FileText size={11} /> <span className="truncate">{tab.title}</span></button>)}
+        </div>
+        <button type="button" onClick={onCollapse} className="shrink-0 rounded px-1.5 py-1 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200" title="临时折叠右侧工作区">折叠</button>
+      </div>
+      {loadError && <div className="border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-[11px] text-red-700 dark:text-red-300">浏览器状态读取失败：{loadError}</div>}
+      {activeDocument ? (
+        <DocumentPreview tab={activeDocument} cwd={cwd} onClose={() => onCloseDocument(activeDocument.id)} />
+      ) : activeBrowser ? (
+        <EmbeddedBrowserPane sessions={sessions} widthPercent={widthPercent} loadError={loadError} onCollapse={onCollapse} onCloseSession={onCloseSession} hideHeader />
+      ) : null}
+    </aside>
+  );
+}
+
+// EmbeddedBrowserPane remains the isolated native-webview renderer. Its header
+// is supplied by RightWorkbenchPane so browser and document tabs share one rail.
+function EmbeddedBrowserPane({ sessions, widthPercent, loadError, onCollapse, onCloseSession, hideHeader = false }: {
   sessions: WorkspaceBrowserSession[];
   widthPercent: number;
   loadError: string | null;
   onCollapse: () => void;
   onCloseSession: (sessionId: string) => void;
+  hideHeader?: boolean;
 }) {
   const active = sessions[0];
   if (!active) return null;
@@ -726,41 +786,23 @@ function EmbeddedBrowserPane({ sessions, widthPercent, loadError, onCollapse, on
   }, [active.session_id, safeUrl, syncNativeWebView]);
 
   return (
-    <aside
-      aria-label="内置浏览器"
+    <div
+      aria-label={hideHeader ? undefined : "内置浏览器"}
       data-browser-width={String(widthPercent)}
       className="hidden min-h-0 shrink-0 flex-col border-l border-border bg-surface-1 xl:flex"
       style={{ width: `${widthPercent}%`, minWidth: 420, maxWidth: "50%" }}
     >
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+      {hideHeader && <div className="flex items-center gap-2 border-b border-border px-3 py-2"><Globe2 size={14} className="shrink-0 text-accent" aria-hidden="true" /><div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-gray-200">{host}</div><div className="truncate text-[11px] text-gray-500">{title}</div></div><button type="button" onClick={() => onCloseSession(active.session_id)} className="rounded bg-red-500/10 px-1.5 py-1 text-[11px] text-red-700 dark:text-red-300" aria-label="结束浏览器">结束</button></div>}
+      {!hideHeader && <div className="flex items-center gap-2 border-b border-border px-3 py-2">
         <Globe2 size={14} className="shrink-0 text-accent" aria-hidden="true" />
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs font-medium text-gray-200">{host}</div>
           <div className="truncate text-[11px] text-gray-500">{title}</div>
         </div>
-        {sessions.length > 1 && (
-          <span className="rounded-full bg-accent/10 px-1.5 py-0.5 text-[11px] text-accent">
-            {sessions.length}
-          </span>
-        )}
-        <button
-          type="button"
-          onClick={onCollapse}
-          className="rounded px-1.5 py-1 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
-          title="临时折叠浏览器"
-        >
-          折叠
-        </button>
-        <button
-          type="button"
-          onClick={() => onCloseSession(active.session_id)}
-          className="rounded bg-red-500/10 px-1.5 py-1 text-[11px] text-red-700 transition-colors hover:bg-red-500/20 dark:text-red-300"
-          aria-label="结束浏览器"
-          title="结束当前会话的受管浏览器"
-        >
-          结束
-        </button>
-      </div>
+        {sessions.length > 1 && <span className="rounded-full bg-accent/10 px-1.5 py-0.5 text-[11px] text-accent">{sessions.length}</span>}
+        <button type="button" onClick={onCollapse} className="rounded px-1.5 py-1 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200" title="临时折叠浏览器">折叠</button>
+        <button type="button" onClick={() => onCloseSession(active.session_id)} className="rounded bg-red-500/10 px-1.5 py-1 text-[11px] text-red-700 hover:bg-red-500/20 dark:text-red-300" aria-label="结束浏览器" title="结束当前会话的受管浏览器">结束</button>
+      </div>}
       {loadError && (
         <div className="border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-[11px] text-red-700 dark:text-red-300">
           浏览器状态读取失败：{loadError}
@@ -789,7 +831,7 @@ function EmbeddedBrowserPane({ sessions, widthPercent, loadError, onCollapse, on
           </div>
         )}
       </div>
-    </aside>
+    </div>
   );
 }
 
