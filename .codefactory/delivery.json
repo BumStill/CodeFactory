@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "remote": "origin",
+  "provider": "github-release",
+  "deployment_timeout_secs": 60,
+  "live": {
+    "url": "https://api.github.com/repos/BumStill/CodeFactory/commits/v1.77.5",
+    "method": "GET",
+    "expected_status": 200,
+    "body_contains": "$GIT_SHA",
+    "timeout_secs": 60,
+    "poll_interval_secs": 5
+  }
+}

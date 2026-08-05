@@ -43,8 +43,12 @@ interface Props {
 export function FileArtifactCard({ path, cwd, onPreview, compact = false }: Props) {
   const resolved = resolveFilePath(cwd, path);
   const name = basename(path);
-  const handleOpen = () => { void invoke("plugin:shell|open", { path: resolved }).catch(() => {}); };
-  const handleCopy = () => { void navigator.clipboard?.writeText(resolved); };
+  const handleOpen = () => {
+    void invoke("plugin:shell|open", { path: resolved }).catch(() => {});
+  };
+  const handleCopy = () => {
+    void navigator.clipboard?.writeText(resolved);
+  };
   return (
     <span className={`my-2 inline-flex max-w-full items-center gap-2 rounded-lg border border-border bg-surface-1 align-middle ${compact ? "px-2 py-1" : "px-2.5 py-2"}`}>
       <FileText size={compact ? 12 : 14} className="shrink-0 text-status-info" aria-hidden="true" />
@@ -55,9 +59,17 @@ export function FileArtifactCard({ path, cwd, onPreview, compact = false }: Prop
         </span>
         {!compact && <span className="block max-w-[32ch] truncate font-mono text-[11px] text-gray-500" title={resolved}>{path}</span>}
       </span>
-      {onPreview && <button type="button" className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] text-accent hover:bg-surface-3" onClick={() => onPreview(path)} aria-label={`查看文档 ${name}`}><Eye size={11} /> 查看</button>}
-      <button type="button" className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200" onClick={handleOpen} aria-label={`系统打开 ${name}`} title="用系统应用打开"><ExternalLink size={11} /> 打开</button>
-      <button type="button" className="rounded p-1 text-gray-500 hover:bg-surface-3 hover:text-gray-200" onClick={handleCopy} aria-label={`复制路径 ${name}`} title="复制完整路径"><Copy size={11} /></button>
+      {onPreview && (
+        <button type="button" className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] text-accent hover:bg-surface-3" onClick={() => onPreview(path)} aria-label={`查看文档 ${name}`}>
+          <Eye size={11} /> 查看
+        </button>
+      )}
+      <button type="button" className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200" onClick={handleOpen} aria-label={`系统打开 ${name}`} title="用系统应用打开">
+        <ExternalLink size={11} /> 打开
+      </button>
+      <button type="button" className="rounded p-1 text-gray-500 hover:bg-surface-3 hover:text-gray-200" onClick={handleCopy} aria-label={`复制路径 ${name}`} title="复制完整路径">
+        <Copy size={11} />
+      </button>
     </span>
   );
 }
