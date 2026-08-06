@@ -26,6 +26,7 @@ function DraftProjectPickerAcceptance() {
             cwd={cwd}
             anonymous={false}
             projects={projects}
+            modelPicker={<span className="text-[11px] text-gray-300">模型</span>}
             onPickProject={setCwd}
             onToggleAnonymous={() => {}}
           />

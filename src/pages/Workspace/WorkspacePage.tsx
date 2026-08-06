@@ -455,7 +455,7 @@ export function WorkspacePage({
             退出匿名
           </button>
         )}
-        <ModelPicker />
+        {!activeDraft && <ModelPicker />}
         {/* Per-session reasoning override needs a DB row; anonymous chats use
             the global default, so the picker is hidden for them. */}
         {!isAnonymous && <ReasoningEffortPicker />}
@@ -596,6 +596,7 @@ export function WorkspacePage({
                   cwd={activeDraft.cwd}
                   anonymous={activeDraft.anonymous}
                   projects={draftProjects}
+                  modelPicker={<ModelPicker portal prominent />}
                   onPickProject={setDraftProject}
                   onToggleAnonymous={setDraftAnonymous}
                 />

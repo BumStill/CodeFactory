@@ -12,7 +12,7 @@
 // never opens the project's previous conversation. Choosing where to work and
 // choosing which conversation to resume are different acts, and every surface
 // that blurred them is what made "选了项目" drop users into old history.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Folder, FolderOpen, Check, ChevronDown, EyeOff, MessageSquare } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -24,6 +24,8 @@ interface DraftScopeBarProps {
   anonymous: boolean;
   /** Recently used projects, newest first. */
   projects: ProjectGroup[];
+  /** The model control belongs beside the draft scope choices. */
+  modelPicker?: ReactNode;
   onPickProject: (cwd: string | null) => void;
   onToggleAnonymous: (anonymous: boolean) => void;
 }
@@ -32,6 +34,7 @@ export function DraftScopeBar({
   cwd,
   anonymous,
   projects,
+  modelPicker,
   onPickProject,
   onToggleAnonymous,
 }: DraftScopeBarProps) {
@@ -100,7 +103,13 @@ export function DraftScopeBar({
       : projects;
 
   return (
-    <div className="relative flex items-center gap-2 px-1 pb-1.5" ref={rootRef}>
+    <div
+      className="relative flex flex-wrap items-center gap-1.5 border-b border-border/60 bg-surface-1/30 px-3 py-2"
+      ref={rootRef}
+    >
+      <span className="mr-0.5 shrink-0 text-[10px] font-medium uppercase tracking-[0.08em] text-gray-600">
+        新会话
+      </span>
       <button
         ref={buttonRef}
         type="button"
@@ -108,7 +117,7 @@ export function DraftScopeBar({
         aria-label="选择项目"
         aria-expanded={menuOpen}
         title={cwd ?? "不使用项目，只做一个独立任务"}
-        className="flex max-w-[260px] items-center gap-1.5 rounded-full border border-border bg-surface-2 px-2.5 py-1 text-[11px] text-gray-300 transition-colors hover:border-accent/40 hover:text-gray-100"
+        className="flex min-h-8 max-w-[240px] items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-[11px] text-gray-300 transition-colors hover:border-accent/40 hover:bg-surface-3 hover:text-gray-100"
       >
         {cwd ? (
           <Folder size={11} className="shrink-0 text-accent" />
@@ -119,26 +128,35 @@ export function DraftScopeBar({
         <ChevronDown size={11} className="shrink-0 text-gray-600" />
       </button>
 
+      {modelPicker && (
+        <>
+          <span aria-hidden="true" className="mx-0.5 h-4 w-px shrink-0 bg-border/70" />
+          <div data-testid="draft-model-picker" className="min-w-0 max-w-full">
+            {modelPicker}
+          </div>
+        </>
+      )}
+
       <button
         type="button"
         onClick={() => onToggleAnonymous(!anonymous)}
         aria-pressed={anonymous}
         title="匿名：这次对话不留任何记录"
-        className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors ${
+        className={`flex min-h-8 items-center gap-1.5 rounded-lg border px-2.5 text-[11px] transition-colors ${
           anonymous
             ? "border-accent/50 bg-accent/10 text-accent"
-            : "border-border bg-surface-2 text-gray-500 hover:text-gray-300"
+            : "border-border bg-surface-2 text-gray-500 hover:bg-surface-3 hover:text-gray-300"
         }`}
       >
         <EyeOff size={11} />
         匿名
       </button>
 
-      <span className="truncate text-[11px] text-gray-600">
+      <span className="min-w-[160px] flex-1 truncate px-1 text-[11px] text-gray-600">
         {anonymous
           ? "聊完不留记录"
           : cwd
-            ? "新会话 · 不会打开这个项目的历史对话"
+            ? "不会打开这个项目的历史对话"
             : "没选项目，不会碰任何代码"}
       </span>
 
