@@ -34,33 +34,56 @@
         cursor: pointer;
       }
       #status {
-        margin-top: 12px;
         padding: 8px 10px;
         border-radius: 6px;
         background: #f6f8fa;
         font-size: 12px;
       }
+      details { margin-top: 14px; }
+      summary {
+        cursor: pointer;
+        font-size: 12px;
+        color: #59636e;
+      }
+      details > div { margin-top: 10px; }
+      .hint { font-size: 11px; color: #59636e; margin: 6px 0 0; }
       @media (prefers-color-scheme: dark) {
         body { background: #0d1117; color: #e6edf3; }
-        p, label { color: #9198a1; }
+        p, label, summary, .hint { color: #9198a1; }
         input { background: #0d1117; border-color: #3d444d; color: #e6edf3; }
         #status { background: #151b23; }
       }
     </style>
   </head>
   <body>
-    <h1>连接 CodeFactory</h1>
-    <p>在 CodeFactory 的「设置 → 浏览器」里复制端口和配对码,粘贴到下面。</p>
-
-    <label for="port">端口</label>
-    <input id="port" inputmode="numeric" placeholder="例如 51789" />
-
-    <label for="token">配对码</label>
-    <input id="token" placeholder="32 位字符" />
-
-    <button id="save">保存并连接</button>
+    <h1>CodeFactory 浏览器桥</h1>
 
     <div id="status">正在检查连接状态…</div>
+    <p class="hint" id="detail"></p>
+
+    <!--
+      Manual pairing is collapsed, not removed. CodeFactory writes the live port
+      and pairing code into this extension's own folder, so the normal path needs
+      no typing at all; the form is here only for a copy of the extension the app
+      did not write out itself.
+    -->
+    <details id="manual">
+      <summary>手动配对（一般不需要）</summary>
+      <div>
+        <p class="hint">
+          只有当这个扩展不是由 CodeFactory 自己写出的目录加载时才需要：到 CodeFactory
+          「设置 → 浏览器」复制端口和配对码。
+        </p>
+
+        <label for="port">端口</label>
+        <input id="port" inputmode="numeric" placeholder="例如 47615" />
+
+        <label for="token">配对码</label>
+        <input id="token" placeholder="32 位字符" />
+
+        <button id="save">保存并连接</button>
+      </div>
+    </details>
 
     <script src="options.js"></script>
   </body>

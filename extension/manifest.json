@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CodeFactory Browser Bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lets CodeFactory read pages you already have open, in the browser you already use.",
   "permissions": ["tabs", "scripting", "storage", "alarms"],
   "host_permissions": ["http://*/*", "https://*/*"],

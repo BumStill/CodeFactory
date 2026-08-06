@@ -8,15 +8,24 @@
 //!
 //! Three deliberate properties:
 //!
-//!   * **Bound to 127.0.0.1 on an ephemeral port.** Nothing is reachable off the
-//!     machine, and the port is written to a file only the user can read, so the
-//!     Settings page can show it for pairing.
+//!   * **Bound to 127.0.0.1.** Nothing is reachable off the machine, and the
+//!     port is written to a file only the user can read.
 //!   * **One extension at a time.** A second connection replaces the first
 //!     rather than both racing to answer the same command, which would make
 //!     replies non-deterministic.
 //!   * **Every command has a deadline.** The browser can be closed, a tab can
 //!     hang, the worker can be evicted mid-command — all of which look identical
 //!     to "no reply", so an unanswered command fails instead of stalling a turn.
+//!
+//! ## Pairing survives a restart
+//!
+//! Both halves of the pairing used to be per-process: a fresh token every launch
+//! and an ephemeral port. That quietly made pairing a chore the user repeated
+//! after every restart, since yesterday's values no longer matched anything. Now
+//! the token is persisted and reused, a preferred fixed port is tried first, and
+//! [`super::extension_package`] stamps the live values into the extension's own
+//! folder — so an extension paired once stays paired, and reconnects on its own
+//! even when the port does change.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,6 +44,14 @@ use crate::errors::{AppError, Result};
 
 /// How long to wait for the extension to answer one command.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Port the bridge asks for before falling back to whatever the OS offers.
+///
+/// A stable port is what lets a manually paired extension — one installed from a
+/// store, where the app cannot write into its package — keep working after a
+/// restart. Falling back to an ephemeral port when it is taken keeps two
+/// CodeFactory windows from fighting over it.
+const PREFERRED_PORT: u16 = 47615;
 
 /// A tab the user has open.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -68,7 +85,7 @@ pub struct ExtensionBridge {
 impl ExtensionBridge {
     pub fn new() -> Self {
         Self {
-            token: bridge::new_token(),
+            token: load_or_create_token(),
             port: Mutex::new(None),
             next_id: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -85,10 +102,7 @@ impl ExtensionBridge {
             });
         }
 
-        // Port 0: let the OS pick, so two CodeFactory instances don't collide.
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .map_err(|error| AppError::Other(format!("Could not open the bridge port: {error}")))?;
+        let listener = bind_listener().await?;
         let port = listener
             .local_addr()
             .map_err(|error| AppError::Other(format!("Could not read the bridge port: {error}")))?
@@ -109,7 +123,11 @@ impl ExtensionBridge {
             port,
             token: self.token.clone(),
         };
-        write_pairing_file(&pairing);
+        // Skipped under `cfg(test)` so the transport tests do not write into a
+        // developer's real home; the publishing itself is covered by
+        // `extension_package`'s own tests.
+        #[cfg(not(test))]
+        publish(&pairing);
         Ok(pairing)
     }
 
@@ -270,13 +288,73 @@ impl Default for ExtensionBridge {
     }
 }
 
-/// Where the Settings page reads the pairing details from.
+/// Bind the listener, preferring a stable port over an ephemeral one.
+///
+/// The preferred port being taken is not an error: it usually means another
+/// CodeFactory window already has it, and this one still needs a bridge. The
+/// extension is told which port to use either way, so a fallback costs nothing.
+async fn bind_listener() -> Result<TcpListener> {
+    match TcpListener::bind(("127.0.0.1", PREFERRED_PORT)).await {
+        Ok(listener) => Ok(listener),
+        Err(error) => {
+            tracing::debug!("bridge: port {PREFERRED_PORT} unavailable ({error}); using an ephemeral port");
+            TcpListener::bind(("127.0.0.1", 0)).await.map_err(|error| {
+                AppError::Other(format!("Could not open the bridge port: {error}"))
+            })
+        }
+    }
+}
+
+/// Where the pairing details are persisted between runs.
 fn pairing_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| {
         home.join(".codefactory")
             .join("browser")
             .join(bridge::BRIDGE_FILE)
     })
+}
+
+/// Re-use the token from the last run, or mint one and keep it.
+///
+/// A per-process token meant every restart silently un-paired the extension and
+/// sent the user back to Settings to copy a new one — the single biggest source
+/// of "why has it stopped working". The token stays a capability: it lives in an
+/// owner-only file, and deleting that file revokes every paired extension.
+fn load_or_create_token() -> String {
+    if let Some(existing) = pairing_path().and_then(read_token) {
+        return existing;
+    }
+    bridge::new_token()
+}
+
+/// Read a previously stored token, rejecting anything that is not one.
+///
+/// A corrupted or hand-edited file must not become the expected token: an empty
+/// or short value there would weaken the check the token exists to make.
+fn read_token(path: PathBuf) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let stored: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let token = stored.get("token")?.as_str()?.trim().to_string();
+    let looks_like_a_token =
+        token.len() == 32 && token.chars().all(|c| c.is_ascii_hexdigit());
+    looks_like_a_token.then_some(token)
+}
+
+/// Make the live pairing available to both the Settings page and the extension.
+///
+/// Best effort on purpose: the bridge is perfectly usable with a hand-pasted
+/// pairing, so a read-only home directory must not stop it from starting.
+#[cfg_attr(test, allow(dead_code))]
+fn publish(pairing: &Pairing) {
+    write_pairing_file(pairing);
+    // The step that removes the copy-and-paste: stamp the live port and token
+    // into the extension's own folder, if one has been prepared.
+    if let Some(dir) = super::extension_package::existing_dir() {
+        if let Err(error) = super::extension_package::write_pairing(&dir, pairing.port, &pairing.token)
+        {
+            tracing::warn!("bridge: could not update the extension pairing file: {error}");
+        }
+    }
 }
 
 /// Persist the port and token for the Settings page, owner-readable only.
@@ -327,6 +405,39 @@ mod tests {
             bridge.pending.lock().await.is_empty(),
             "a command that was never sent must not stay pending"
         );
+    }
+
+    #[test]
+    fn a_stored_token_is_reused_so_pairing_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"port": 1, "token": "0123456789abcdef0123456789abcdef"}).to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_token(path).as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn a_damaged_pairing_file_mints_a_new_token_instead_of_weakening_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("empty.json", ""),
+            ("blank-token.json", r#"{"token": ""}"#),
+            ("short.json", r#"{"token": "abc"}"#),
+            ("not-hex.json", r#"{"token": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}"#),
+            ("wrong-shape.json", r#"{"token": 12345}"#),
+            ("garbage.json", "not json at all"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            assert_eq!(read_token(path), None, "{name} must be rejected");
+        }
     }
 
     #[tokio::test]

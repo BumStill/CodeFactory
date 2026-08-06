@@ -65,11 +65,40 @@ describe("extension build", () => {
 
 describe("service worker command dispatch", () => {
   /** Load background.js against a stubbed chrome API and return the stubs. */
-  async function loadWorker(tabs: Record<string, unknown>[]) {
-    const storage: Record<string, unknown> = {};
+  async function loadWorker(
+    tabs: Record<string, unknown>[],
+    options: {
+      /** Contents of `pairing.json`, as the app would have written it. */
+      packaged?: unknown;
+      /** Values a user typed on the options page. */
+      stored?: Record<string, unknown>;
+    } = {},
+  ) {
+    const storage: Record<string, unknown> = { ...(options.stored ?? {}) };
     const executeScript = vi.fn(async ({ func, args }: Record<string, unknown>) =>
       func ? [{ result: { called: args } }] : [{ result: undefined }],
     );
+    const sockets: { url: string }[] = [];
+    class SocketStub {
+      static OPEN = 1;
+      static CONNECTING = 0;
+      readyState = 0;
+      constructor(public url: string) {
+        sockets.push({ url });
+      }
+      addEventListener() {}
+      send() {}
+      close() {}
+    }
+    // The init argument is part of the signature on purpose: the worker must ask
+    // for `cache: "no-store"`, and a stub that dropped it could not assert that.
+    const fetchStub = vi.fn(async (url: string, _init?: { cache?: string }) => {
+      if (options.packaged === undefined) {
+        // What a store install looks like: the file simply is not there.
+        return { ok: false, url, json: async () => ({}) };
+      }
+      return { ok: true, url, json: async () => options.packaged };
+    });
     const chromeStub = {
       storage: {
         local: {
@@ -84,26 +113,99 @@ describe("service worker command dispatch", () => {
       },
       tabs: { query: vi.fn(async () => tabs) },
       scripting: { executeScript },
-      alarms: { create: vi.fn(), onAlarm: { addListener: vi.fn() } },
+      alarms: {
+        create: vi.fn(),
+        get: vi.fn(async () => undefined),
+        onAlarm: { addListener: vi.fn() },
+      },
       runtime: {
         onInstalled: { addListener: vi.fn() },
         onStartup: { addListener: vi.fn() },
-        getManifest: () => ({ version: "0.1.0" }),
+        getManifest: () => ({ version: "0.2.0" }),
+        getURL: (path: string) => `chrome-extension://abcdefghijklmnopabcdefghijklmnop/${path}`,
       },
     };
 
-    // The worker calls connect() at load; without pairing it just sets a status.
     const source = read("extension/background.js");
-    const module = new Function("chrome", "WebSocket", `${source}\nreturn { handle, listTabs };`);
-    return {
-      api: module(chromeStub, class {} as unknown) as {
-        handle: (request: Record<string, unknown>) => Promise<Record<string, unknown>>;
-        listTabs: () => Promise<Record<string, unknown>[]>;
-      },
-      storage,
-      executeScript,
+    const module = new Function(
+      "chrome",
+      "WebSocket",
+      "fetch",
+      `${source}\nreturn { handle, listTabs, pairing, packagedPairing };`,
+    );
+    const api = module(chromeStub, SocketStub, fetchStub) as {
+      handle: (request: Record<string, unknown>) => Promise<Record<string, unknown>>;
+      listTabs: () => Promise<Record<string, unknown>[]>;
+      pairing: () => Promise<Record<string, unknown> | null>;
+      packagedPairing: () => Promise<Record<string, unknown> | null>;
     };
+    return { api, storage, executeScript, sockets, fetchStub, chromeStub };
   }
+
+  it("pairs from the file the app writes, with nothing typed in", async () => {
+    // The manual step this removes: the user copying a port and a token out of
+    // Settings, and doing it again after every restart.
+    const { api, fetchStub } = await loadWorker([], {
+      packaged: { port: 47615, token: "0123456789abcdef0123456789abcdef", protocol_version: 1 },
+    });
+
+    const paired = await api.pairing();
+
+    expect(paired).toMatchObject({ port: 47615, token: "0123456789abcdef0123456789abcdef" });
+    expect(paired?.source).toBe("packaged");
+    // Read straight out of its own package — the one place an extension can read.
+    expect(String(fetchStub.mock.calls[0][0])).toContain("pairing.json");
+  });
+
+  it("re-reads the pairing file instead of trusting a cached copy", async () => {
+    // The port changes when CodeFactory restarts. A cached read would leave the
+    // extension dialling a dead socket until a human intervened.
+    const { api, fetchStub } = await loadWorker([], {
+      packaged: { port: 47615, token: "0123456789abcdef0123456789abcdef" },
+    });
+
+    await api.pairing();
+    await api.pairing();
+
+    expect(fetchStub.mock.calls.length).toBeGreaterThanOrEqual(2);
+    for (const call of fetchStub.mock.calls) {
+      expect((call[1] as { cache?: string } | undefined)?.cache).toBe("no-store");
+    }
+  });
+
+  it("falls back to values typed on the options page when there is no file", async () => {
+    // A store install cannot be written into, so manual pairing has to keep
+    // working — as a fallback, not as an override.
+    const { api } = await loadWorker([], {
+      stored: { port: 51789, token: "f".repeat(32) },
+    });
+
+    const paired = await api.pairing();
+
+    expect(paired).toMatchObject({ port: 51789, source: "manual" });
+  });
+
+  it("prefers the app's live pairing over a stale one typed in earlier", async () => {
+    const { api } = await loadWorker([], {
+      packaged: { port: 47615, token: "0123456789abcdef0123456789abcdef" },
+      stored: { port: 51789, token: "f".repeat(32) },
+    });
+
+    expect(await api.pairing()).toMatchObject({ port: 47615, source: "packaged" });
+  });
+
+  it("ignores a pairing file that is not usable rather than dialling a bad port", async () => {
+    for (const packaged of [
+      { port: 0, token: "0123456789abcdef0123456789abcdef" },
+      { port: 70000, token: "0123456789abcdef0123456789abcdef" },
+      { port: 47615, token: "short" },
+      { port: "not-a-number", token: "0123456789abcdef0123456789abcdef" },
+      {},
+    ]) {
+      const { api } = await loadWorker([], { packaged });
+      expect(await api.packagedPairing()).toBeNull();
+    }
+  });
 
   it("lists only tabs that can actually be read", async () => {
     const { api } = await loadWorker([

@@ -15,24 +15,68 @@
 //   * Page work happens through `chrome.scripting`, in the isolated world. The
 //     injected file is the same `page.js` the desktop app injects over CDP, so
 //     extraction behaves identically on both paths.
+//
+// Pairing needs no typing. An extension cannot read the user's disk, which is
+// why the port and token used to be copied in by hand — but it can always read
+// its *own* package, and CodeFactory is what writes that package out. So the app
+// drops the live values into `pairing.json` beside this file and refreshes them
+// whenever the bridge restarts; this worker just re-reads the file on every
+// connection attempt. The manually entered values stay supported as a fallback,
+// for an install this app did not write (a store build, or a copy of the folder).
 
 const PROTOCOL_VERSION = 1;
 const PAGE_SCRIPT = "content/page.js";
+const PAIRING_FILE = "pairing.json";
 const KEEPALIVE_ALARM = "codefactory-bridge-keepalive";
 const RECONNECT_CEILING_MS = 30_000;
 
 let socket = null;
 let reconnectDelayMs = 1000;
 
-/** Pairing details the user pasted on the options page. */
-async function pairing() {
-  const stored = await chrome.storage.local.get(["port", "token"]);
-  if (!stored.port || !stored.token) return null;
-  return { port: Number(stored.port), token: String(stored.token) };
+/**
+ * Pairing written into this extension's folder by the running app.
+ *
+ * Read fresh every time, with the HTTP cache bypassed: the port can change when
+ * CodeFactory restarts, and a cached answer would leave the extension dialling a
+ * socket nobody is listening on until the user intervened — the exact manual
+ * step this file exists to remove.
+ */
+async function packagedPairing() {
+  try {
+    const response = await fetch(chrome.runtime.getURL(PAIRING_FILE), { cache: "no-store" });
+    if (!response.ok) return null;
+    const paired = await response.json();
+    const port = Number(paired.port);
+    const token = String(paired.token || "");
+    if (!Number.isInteger(port) || port < 1 || port > 65535 || token.length < 16) return null;
+    return { port, token, source: "packaged" };
+  } catch {
+    // No file at all is the normal case for a store install, not an error.
+    return null;
+  }
 }
 
-async function setStatus(status) {
-  await chrome.storage.local.set({ status, statusAt: Date.now() });
+/** Pairing details the user entered on the options page, if any. */
+async function storedPairing() {
+  const stored = await chrome.storage.local.get(["port", "token"]);
+  if (!stored.port || !stored.token) return null;
+  return { port: Number(stored.port), token: String(stored.token), source: "manual" };
+}
+
+/**
+ * Which pairing to dial.
+ *
+ * The packaged file wins: it is written by the app that is running right now, so
+ * it is the only one that can be relied on to be current. Manual values are the
+ * fallback rather than the override — otherwise a stale value typed in months
+ * ago would permanently shadow the live one.
+ */
+async function pairing() {
+  return (await packagedPairing()) || (await storedPairing());
+}
+
+async function setStatus(status, extra = {}) {
+  await chrome.storage.local.set({ status, statusAt: Date.now(), ...extra });
 }
 
 function connect() {
@@ -41,6 +85,9 @@ function connect() {
       setStatus("not_paired");
       return;
     }
+    // Recorded so the options page can say "paired automatically" instead of
+    // showing an empty form that looks like nothing has been set up.
+    setStatus("connecting", { pairingSource: paired.source, activePort: paired.port });
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
       return;
     }
@@ -160,11 +207,27 @@ async function inPage(tabId, fn, args = []) {
   return result.result;
 }
 
+/**
+ * Make sure the alarm that revives this worker exists.
+ *
+ * Creating it only on install was a single point of failure: the worker is
+ * evicted when idle, and without an alarm nothing would ever wake it to notice
+ * that CodeFactory had come back — leaving the user to click the extension to
+ * "fix" a bridge that was only asleep.
+ */
+async function ensureKeepalive() {
+  const existing = await chrome.alarms.get(KEEPALIVE_ALARM);
+  if (!existing) chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
+}
+
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
+  void ensureKeepalive();
   connect();
 });
-chrome.runtime.onStartup.addListener(connect);
+chrome.runtime.onStartup.addListener(() => {
+  void ensureKeepalive();
+  connect();
+});
 // The worker is evicted when idle; the alarm is what brings it back so the
 // bridge reconnects without the user touching anything.
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -174,4 +237,6 @@ chrome.storage.onChanged.addListener((changes) => {
   if (changes.port || changes.token) connect();
 });
 
+// Every cold start of the worker, however it was triggered.
+void ensureKeepalive();
 connect();
