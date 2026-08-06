@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 use chrono::Utc;
-use sqlx::{migrate::MigrateDatabase, sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::{
+    migrate::MigrateDatabase,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    Row, SqlitePool,
+};
 
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
@@ -1411,11 +1415,128 @@ async fn ensure_column(
     Ok(())
 }
 
+/// Close `pool` and make SQLite release *every* file the database owns —
+/// including the `-wal` and `-shm` sidecars — so the containing directory can
+/// be deleted immediately afterwards.
+///
+/// [`connect`] does not set a journal mode, so sqlx's default applies and every
+/// database is opened in WAL mode. WAL creates two sidecars next to the `.db`
+/// file, and the `-shm` one is *memory-mapped*. SQLite only checkpoints and
+/// unlinks those sidecars when the **last** connection closes, and only if that
+/// connection can take an exclusive lock — with a multi-connection pool the
+/// closes race and the unlink is skipped. Measured on a 5-connection pool:
+/// roughly two thirds of plain `pool.close()` calls leave `-wal`/`-shm` on disk.
+///
+/// That is invisible on Unix, where an unlinked-but-mapped file just goes away.
+/// On Windows a file with a live section object cannot be deleted until the
+/// kernel tears the mapping down, and that teardown is asynchronous with handle
+/// close — so `remove_dir_all` fails with `ERROR_SHARING_VIOLATION` (os error
+/// 32) even though no process visibly holds the file.
+///
+/// Taking a single exclusive connection after the pool is gone and switching the
+/// journal mode out of WAL forces the checkpoint-and-unlink to actually happen.
+///
+/// Callers that are about to delete the database's directory should use this
+/// instead of a bare `pool.close()`. Everything here is best-effort: the
+/// database is being torn down regardless, so failures are logged, not raised.
+pub async fn close_and_release_files(pool: SqlitePool) {
+    let filename = pool.connect_options().get_filename().to_path_buf();
+    pool.close().await;
+    drop(pool);
+
+    // An in-memory database owns no files, and a file that is already gone has
+    // nothing left to release. `create_if_missing(false)` below keeps us from
+    // resurrecting a database a caller has already deleted.
+    if filename.as_os_str() == ":memory:" || !filename.exists() {
+        return;
+    }
+
+    let solo = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&filename)
+                .create_if_missing(false),
+        )
+        .await;
+
+    match solo {
+        Ok(solo) => {
+            // Now genuinely the only connection, so this cannot lose the
+            // exclusive lock to a sibling and silently skip the unlink.
+            if let Err(error) = sqlx::query("PRAGMA journal_mode = DELETE")
+                .execute(&solo)
+                .await
+            {
+                tracing::debug!(
+                    "could not switch {} out of WAL mode before cleanup: {error}",
+                    filename.display()
+                );
+            }
+            solo.close().await;
+        }
+        Err(error) => {
+            tracing::debug!(
+                "could not reopen {} to release its WAL sidecars: {error}",
+                filename.display()
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::util::no_window::NoWindow;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    /// The WAL sidecars must be gone once the pool is closed, every single time.
+    ///
+    /// This is the deterministic form of a Windows-only CI flake: the evidence
+    /// pack test failed in fixture cleanup with `os error 32` because a
+    /// memory-mapped `-shm` file outlived the pool. Asserting the invariant here
+    /// catches a teardown regression on every platform, rather than waiting for
+    /// a sharing violation to surface on windows-latest.
+    #[tokio::test]
+    async fn close_and_release_files_unlinks_wal_sidecars() {
+        let mut survivors = Vec::new();
+
+        for attempt in 0..20 {
+            let root = std::env::temp_dir()
+                .join(format!("codefactory-db-sidecar-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let db_path = root.join("test.db");
+            let db_url = format!("sqlite:{}", db_path.display());
+
+            let pool = connect(&db_url).await.unwrap();
+            sqlx::query(
+                "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at) \
+                 VALUES ('s', 't', 'c', 'm', 1, 1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            close_and_release_files(pool).await;
+
+            let wal = root.join("test.db-wal").exists();
+            let shm = root.join("test.db-shm").exists();
+            if wal || shm {
+                survivors.push(format!("attempt {attempt}: -wal={wal} -shm={shm}"));
+            }
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        assert!(
+            survivors.is_empty(),
+            "WAL sidecars outlived close_and_release_files in {}/20 attempts \
+             (on Windows each survivor is a potential ERROR_SHARING_VIOLATION \
+             during cleanup):\n  {}",
+            survivors.len(),
+            survivors.join("\n  ")
+        );
+    }
 
     /// Synthesise the exact "old user DB" shape from the v0.3.7 regression:
     /// `messages` table predates the `reasoning_content` column, but the

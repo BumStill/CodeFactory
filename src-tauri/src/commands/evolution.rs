@@ -1356,26 +1356,10 @@ pub async fn list_evolution_eval_case_results(
         .collect())
 }
 
+/// The release smoke reports `cleanup` in its receipt, so a removal that never
+/// lands has to stay a hard failure here — unlike test fixtures, which only warn.
 async fn remove_smoke_root(root: &Path) -> std::io::Result<()> {
-    const ATTEMPTS: usize = 40;
-    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-
-    for attempt in 0..ATTEMPTS {
-        match std::fs::remove_dir_all(root) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error)
-                if attempt + 1 < ATTEMPTS
-                    && (error.kind() == std::io::ErrorKind::PermissionDenied
-                        || error.raw_os_error() == Some(32)) =>
-            {
-                tokio::time::sleep(RETRY_DELAY).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    unreachable!("cleanup retry loop returns on its final attempt")
+    crate::util::fs_cleanup::remove_dir_all_with_retry(root).await
 }
 
 /// Run the activation-safety closed loop without starting Tauri. Release CI
@@ -1531,7 +1515,9 @@ pub async fn run_release_smoke(output_path: &Path) -> Result<serde_json::Value, 
             "redaction_verified": true,
             "cleanup": false
         });
-        pool.close().await;
+        // `remove_smoke_root` below deletes this directory, so the WAL sidecars
+        // have to be unlinked first or Windows refuses the delete.
+        crate::storage::db::close_and_release_files(pool).await;
         Ok(receipt)
     }
     .await;
