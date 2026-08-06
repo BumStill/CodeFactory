@@ -2,7 +2,7 @@
 use chrono::Utc;
 use sqlx::{
     migrate::MigrateDatabase,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     Row, SqlitePool,
 };
 
@@ -1433,55 +1433,100 @@ async fn ensure_column(
 /// close — so `remove_dir_all` fails with `ERROR_SHARING_VIOLATION` (os error
 /// 32) even though no process visibly holds the file.
 ///
-/// Taking a single exclusive connection after the pool is gone and switching the
-/// journal mode out of WAL forces the checkpoint-and-unlink to actually happen.
+/// Reopening the database alone with `journal_mode = DELETE` forces that
+/// checkpoint-and-unlink to actually happen.
+///
+/// The retry is load-bearing, and it was learned from Windows CI rather than
+/// from local runs: a single-shot version of this function still left the
+/// sidecars behind in **3 of 20 Windows attempts** while being perfect locally.
+/// `pool.close()` returning does not guarantee Windows has finished releasing
+/// the old handles, so the exclusive access this needs can lose a race. Both
+/// macOS measurements — plain reopen and DELETE-mode reopen — cleared the
+/// sidecars 100% of the time, which is exactly why the local signal was useless
+/// here and the loop condition is the *filesystem*, not an error code: it keeps
+/// retrying until the sidecars are actually gone, whatever the reason was.
+///
+/// Setting the journal mode through [`SqliteConnectOptions`] rather than as a
+/// follow-up `PRAGMA` is a smaller point: it folds a failed mode switch into the
+/// connect error, so it is retried rather than swallowed.
 ///
 /// Callers that are about to delete the database's directory should use this
 /// instead of a bare `pool.close()`. Everything here is best-effort: the
 /// database is being torn down regardless, so failures are logged, not raised.
 pub async fn close_and_release_files(pool: SqlitePool) {
+    /// Long enough to outlast a contended handoff, short enough that a database
+    /// genuinely still in use does not stall a teardown for long.
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    const FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(400);
+
     let filename = pool.connect_options().get_filename().to_path_buf();
     pool.close().await;
     drop(pool);
 
-    // An in-memory database owns no files, and a file that is already gone has
-    // nothing left to release. `create_if_missing(false)` below keeps us from
-    // resurrecting a database a caller has already deleted.
-    if filename.as_os_str() == ":memory:" || !filename.exists() {
+    // An in-memory database owns no files to release.
+    if filename.as_os_str() == ":memory:" {
         return;
     }
 
-    let solo = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .filename(&filename)
-                .create_if_missing(false),
-        )
-        .await;
+    let wal = sidecar_path(&filename, "-wal");
+    let shm = sidecar_path(&filename, "-shm");
+    let settled = |wal: &std::path::Path, shm: &std::path::Path| !wal.exists() && !shm.exists();
 
-    match solo {
-        Ok(solo) => {
-            // Now genuinely the only connection, so this cannot lose the
-            // exclusive lock to a sibling and silently skip the unlink.
-            if let Err(error) = sqlx::query("PRAGMA journal_mode = DELETE")
-                .execute(&solo)
-                .await
-            {
-                tracing::debug!(
-                    "could not switch {} out of WAL mode before cleanup: {error}",
-                    filename.display()
-                );
+    let deadline = std::time::Instant::now() + BUDGET;
+    let mut backoff = FIRST_BACKOFF;
+    let mut last_error: Option<String> = None;
+
+    loop {
+        // A database the caller already deleted, or one whose sidecars are
+        // already gone, needs nothing further.
+        if !filename.exists() || settled(&wal, &shm) {
+            return;
+        }
+
+        // `create_if_missing(false)` keeps this from resurrecting a database a
+        // caller has already deleted.
+        match SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&filename)
+                    .create_if_missing(false)
+                    .journal_mode(SqliteJournalMode::Delete),
+            )
+            .await
+        {
+            Ok(solo) => {
+                solo.close().await;
+                if settled(&wal, &shm) {
+                    return;
+                }
+                last_error = Some("sidecars survived a successful DELETE-mode open".into());
             }
-            solo.close().await;
+            Err(error) => last_error = Some(error.to_string()),
         }
-        Err(error) => {
-            tracing::debug!(
-                "could not reopen {} to release its WAL sidecars: {error}",
-                filename.display()
+
+        if std::time::Instant::now() + backoff >= deadline {
+            tracing::warn!(
+                "could not release the WAL sidecars of {} within {:?}: {}",
+                filename.display(),
+                BUDGET,
+                last_error.as_deref().unwrap_or("unknown"),
             );
+            return;
         }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
+}
+
+/// `foo.db` + `-wal` → `foo.db-wal`, matching how SQLite names its sidecars.
+/// Deliberately appends to the whole filename rather than replacing an
+/// extension, which would produce `foo-wal` and silently check the wrong path.
+fn sidecar_path(db: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = db.as_os_str().to_os_string();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
 }
 
 #[cfg(test)]
