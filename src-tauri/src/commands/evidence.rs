@@ -870,29 +870,10 @@ mod tests {
         assert!(tool_calls.contains("visible"));
         assert!(!tool_calls.contains("CF_EVO_EVIDENCE_SECRET"));
 
-        pool.close().await;
-        drop(pool);
-
-        // Windows can briefly retain the SQLite file handle after the pool is
-        // closed. Retry only the test-fixture cleanup so a transient lock does
-        // not turn a successful evidence assertion into a CI failure.
-        let mut last_error = None;
-        for attempt in 0..10 {
-            match std::fs::remove_dir_all(&root) {
-                Ok(()) => {
-                    last_error = None;
-                    break;
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                    if attempt < 9 {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                }
-            }
-        }
-        if let Some(error) = last_error {
-            panic!("failed to remove evidence test directory: {error}");
-        }
+        // Releases the WAL sidecars too — a plain `pool.close()` leaves a
+        // memory-mapped `-shm` file behind most of the time, which is what used
+        // to make the cleanup below fail on Windows with os error 32.
+        crate::storage::db::close_and_release_files(pool).await;
+        crate::util::fs_cleanup::remove_fixture_dir(&root).await;
     }
 }

@@ -933,7 +933,11 @@ impl AgentLoop {
         );
         let events_recorded = sink.events().len();
 
-        let _ = std::fs::remove_dir_all(&root);
+        // The loop holds a clone of the pool, so it has to go first; until it
+        // does the database is still open and Windows refuses to delete `root`.
+        drop(_agent);
+        crate::storage::db::close_and_release_files(pool).await;
+        crate::util::fs_cleanup::remove_fixture_dir(&root).await;
 
         if tool_count == 0 {
             return Err(crate::errors::AppError::Other(
