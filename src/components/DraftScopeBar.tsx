@@ -107,7 +107,7 @@ export function DraftScopeBar({
       className="relative flex flex-wrap items-center gap-1.5 border-b border-border/60 bg-surface-1/30 px-3 py-2"
       ref={rootRef}
     >
-      <span className="mr-0.5 shrink-0 text-[10px] font-medium uppercase tracking-[0.08em] text-gray-600">
+      <span className="mr-0.5 shrink-0 text-[11px] font-medium uppercase tracking-[0.08em] text-gray-600">
         新会话
       </span>
       <button
