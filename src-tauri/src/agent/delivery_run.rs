@@ -136,6 +136,35 @@ pub struct CoreInputRequest {
     pub resume_stage: String,
 }
 
+fn delivery_progress_rank(state: &str) -> Option<u8> {
+    match state {
+        "local" => Some(0),
+        "committed" => Some(1),
+        "pushed" => Some(2),
+        "pr_open" => Some(3),
+        "ci_green" => Some(4),
+        "merge_queued" => Some(5),
+        "merged" => Some(6),
+        "release_triggered" => Some(7),
+        "deployment_succeeded" => Some(8),
+        "live_verified" => Some(9),
+        _ => None,
+    }
+}
+
+fn monotonic_reached_ceiling(previous: &str, observed: &str) -> String {
+    match (
+        delivery_progress_rank(previous),
+        delivery_progress_rank(observed),
+    ) {
+        (Some(previous_rank), Some(observed_rank)) if previous_rank > observed_rank => {
+            previous.to_string()
+        }
+        (Some(_), None) => previous.to_string(),
+        _ => observed.to_string(),
+    }
+}
+
 pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS delivery_runs (
@@ -408,7 +437,7 @@ pub async fn record_delivery_observation(
     let mut tx = pool.begin().await?;
     let previous = sqlx::query(
         "SELECT head_branch, stage, status, reached_ceiling, expected_head_sha,
-                canonical_pr_number, canonical_head_sha, progress_revision
+                canonical_pr_number, canonical_pr_url, canonical_head_sha, progress_revision
          FROM delivery_runs WHERE id=? AND lease_owner=?",
     )
     .bind(run_id)
@@ -421,15 +450,27 @@ pub async fn record_delivery_observation(
         )
     })?;
 
+    let previous_reached = previous.try_get::<String, _>("reached_ceiling")?;
+    let reached_ceiling =
+        monotonic_reached_ceiling(&previous_reached, &observation.reached_ceiling);
+    let canonical_pr_number = observation
+        .canonical_pr_number
+        .or(previous.try_get::<Option<i64>, _>("canonical_pr_number")?);
+    let canonical_pr_url = observation
+        .canonical_pr_url
+        .clone()
+        .or(previous.try_get::<Option<String>, _>("canonical_pr_url")?);
+    let canonical_head_sha = observation
+        .canonical_head_sha
+        .clone()
+        .or(previous.try_get::<Option<String>, _>("canonical_head_sha")?);
     let progressed = previous.try_get::<String, _>("head_branch")? != observation.head_branch
         || previous.try_get::<String, _>("stage")? != observation.stage
         || previous.try_get::<String, _>("status")? != observation.status
-        || previous.try_get::<String, _>("reached_ceiling")? != observation.reached_ceiling
+        || previous_reached != reached_ceiling
         || previous.try_get::<String, _>("expected_head_sha")? != observation.expected_head_sha
-        || previous.try_get::<Option<i64>, _>("canonical_pr_number")?
-            != observation.canonical_pr_number
-        || previous.try_get::<Option<String>, _>("canonical_head_sha")?
-            != observation.canonical_head_sha;
+        || previous.try_get::<Option<i64>, _>("canonical_pr_number")? != canonical_pr_number
+        || previous.try_get::<Option<String>, _>("canonical_head_sha")? != canonical_head_sha;
     let progress_revision = previous.try_get::<i64, _>("progress_revision")?;
     let has_core_input = observation.core_input.is_some();
     let core_input = observation.core_input.as_ref();
@@ -457,11 +498,11 @@ pub async fn record_delivery_observation(
     .bind(&observation.status)
     .bind(&observation.wait_class)
     .bind(&observation.next_action)
-    .bind(&observation.reached_ceiling)
+    .bind(&reached_ceiling)
     .bind(&observation.expected_head_sha)
-    .bind(observation.canonical_pr_number)
-    .bind(&observation.canonical_pr_url)
-    .bind(&observation.canonical_head_sha)
+    .bind(canonical_pr_number)
+    .bind(&canonical_pr_url)
+    .bind(&canonical_head_sha)
     .bind(&observation.failure_signature)
     .bind(&observation.failure_signature)
     .bind(&observation.failure_signature)
@@ -503,6 +544,8 @@ pub async fn record_delivery_observation(
         serde_json::json!({
             "next_action": observation.next_action,
             "failure_signature": observation.failure_signature,
+            "observed_reached_ceiling": observation.reached_ceiling,
+            "persisted_reached_ceiling": reached_ceiling,
         })
         .to_string(),
     )
@@ -822,6 +865,83 @@ mod tests {
             clocks,
             (120, 110, 1),
             "heartbeat must not masquerade as progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_uncertain_observations_cannot_erase_remote_identity_or_regress_progress() {
+        let pool = pool().await;
+        let process = ProcessIdentity::new("process", "1.79.0", "17900");
+        let run = NewDeliveryRun {
+            id: "monotonic-run".into(),
+            run_kind: "chat_delivery".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: None,
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            repo_identity: "example.invalid/repo".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest".into(),
+            expected_head_sha: "abc".into(),
+            canonical_pr_number: Some(42),
+            canonical_pr_url: Some("https://example.invalid/pr/42".into()),
+            canonical_head_sha: Some("abc".into()),
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "merged".into(),
+            stage: "release".into(),
+            status: "waiting".into(),
+            wait_class: Some("external_state_uncertain".into()),
+            next_action: Some("reconcile_receipt".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        create_delivery_run(&pool, &run, &process, 100, 30)
+            .await
+            .unwrap();
+
+        let uncertain_receipt = DeliveryObservation {
+            head_branch: "feature".into(),
+            stage: "receipt".into(),
+            status: "waiting".into(),
+            wait_class: Some("external_state_uncertain".into()),
+            next_action: Some("reconcile_receipt".into()),
+            reached_ceiling: "pushed".into(),
+            expected_head_sha: "abc".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            failure_signature: Some("delivery_external_state_uncertain".into()),
+            core_input: None,
+        };
+        record_delivery_observation(
+            &pool,
+            "monotonic-run",
+            &process,
+            &uncertain_receipt,
+            110,
+            30,
+        )
+        .await
+        .unwrap();
+
+        let persisted: (String, Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT reached_ceiling, canonical_pr_number, canonical_pr_url, canonical_head_sha
+             FROM delivery_runs WHERE id='monotonic-run'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted,
+            (
+                "merged".into(),
+                Some(42),
+                Some("https://example.invalid/pr/42".into()),
+                Some("abc".into()),
+            ),
+            "uncertain readback must preserve the highest proven ceiling and canonical remote identity"
         );
     }
 
