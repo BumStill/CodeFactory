@@ -389,7 +389,10 @@ pub(crate) fn should_resume_claimed_delivery(claimed: &delivery_run::ClaimedReco
     // Technical waits never need a second user decision. The explicit
     // authorization attached to the same objective is the only gate here;
     // autonomous_completion governs default business choices, not liveness.
-    claimed.status == "waiting" && claimed.next_action_authorized
+    matches!(
+        claimed.status.as_str(),
+        "waiting" | "platform_incident" | "agent_action_required"
+    ) && claimed.next_action_authorized
 }
 
 fn ceiling_label(ceiling: DeliveryCeiling) -> &'static str {
@@ -460,14 +463,19 @@ fn tool_output_for_outcome(outcome: &delivery::DeliveryOutcome) -> ToolOutput {
             "recovery_class": "external_state_uncertain"
         }));
     }
+    let system_owned_recovery = outcome.final_state == "blocked"
+        && outcome.recoverable
+        && outcome.recovery_class == delivery::RecoveryClass::AgentActionRequired;
     let report = render_report(outcome);
     let output = match outcome.final_state.as_str() {
         "waiting" => ToolOutput::waiting(report),
+        "blocked" if system_owned_recovery => ToolOutput::waiting(report),
         "blocked" => ToolOutput::blocked(report),
         _ => ToolOutput::ok(report),
     };
     output.with_metadata(json!({
-        "status": outcome.final_state,
+        "status": if system_owned_recovery { "recovering" } else { outcome.final_state.as_str() },
+        "delivery_state": outcome.final_state,
         "stage": outcome.stage,
         "code": outcome.code,
         "recoverable": outcome.recoverable,
@@ -529,7 +537,14 @@ async fn persist_delivery_ref(
 /// blocked outcomes stays unit-testable.
 fn render_report(outcome: &delivery::DeliveryOutcome) -> String {
     let mut out = String::new();
-    out.push_str(&format!("交付结果: {}\n", outcome.final_state));
+    let system_owned_recovery = outcome.final_state == "blocked"
+        && outcome.recoverable
+        && outcome.recovery_class == delivery::RecoveryClass::AgentActionRequired;
+    if system_owned_recovery {
+        out.push_str("交付状态: recovering\n");
+    } else {
+        out.push_str(&format!("交付结果: {}\n", outcome.final_state));
+    }
     if let Some(branch) = &outcome.branch {
         out.push_str(&format!("分支: {branch}\n"));
     }
@@ -541,6 +556,7 @@ fn render_report(outcome: &delivery::DeliveryOutcome) -> String {
         let mark = match s.status.as_str() {
             "ok" => "✅",
             "skipped" => "⏭️",
+            "blocked" if system_owned_recovery => "↻",
             "blocked" => "⛔",
             _ => "•",
         };
@@ -562,8 +578,8 @@ fn render_report(outcome: &delivery::DeliveryOutcome) -> String {
             );
         } else if outcome.recoverable {
             out.push_str(
-                "\n\n这是可恢复的交付状态，不是最终总结边界。执行 metadata/正文中的 next_action，\
-然后重新调用 deliver_changes 续接同一 PR；不得使用 --admin、force push 或删 required check。",
+                "\n\n这是系统负责的恢复阶段，不是用户阻断或最终总结边界。系统将执行 next_action，\
+然后续接同一 PR；用户无需回复『继续』，且不得使用 --admin、force push 或删 required check。",
             );
         } else if outcome.recovery_class == crate::agent::delivery::RecoveryClass::CoreInputRequired
         {
@@ -785,15 +801,34 @@ mod tests {
     }
 
     #[test]
-    fn business_blocker_maps_to_blocked_tool_status() {
+    fn system_owned_recovery_never_projects_as_a_blocked_tool() {
         let output = tool_output_for_outcome(&outcome("blocked"));
-        assert_eq!(output.status, ToolExecutionStatus::Blocked);
-        assert!(!output.is_error, "blocked is not a tool crash");
+        assert_eq!(output.status, ToolExecutionStatus::Waiting);
+        assert!(!output.is_error, "system-owned recovery is active work");
+        assert!(output.content.contains("交付状态: recovering"));
+        assert!(!output.content.contains("交付结果: blocked"));
         let metadata = output.metadata.expect("delivery metadata");
+        assert_eq!(metadata["status"], "recovering");
+        assert_eq!(metadata["delivery_state"], "blocked");
         assert_eq!(metadata["recoverable"], true);
+        assert_eq!(metadata["decision_type"], "system_owned");
+        assert_eq!(metadata["requires_user_continue"], false);
         assert_eq!(metadata["requested_ceiling"], "through_release");
         assert_eq!(metadata["effective_ceiling"], "through_release");
         assert_eq!(metadata["reached_state"], "local");
+    }
+
+    #[test]
+    fn genuine_core_input_still_projects_as_blocked() {
+        let mut core_input = outcome("blocked");
+        core_input.recoverable = false;
+        core_input.recovery_class = RecoveryClass::CoreInputRequired;
+        let output = tool_output_for_outcome(&core_input);
+        assert_eq!(output.status, ToolExecutionStatus::Blocked);
+        assert_eq!(
+            output.metadata.expect("delivery metadata")["decision_type"],
+            "core_input_required"
+        );
     }
 
     #[test]
@@ -900,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_resumes_only_authorized_waiting_without_requiring_autonomous_flag() {
+    fn startup_resumes_authorized_system_owned_states_without_requiring_autonomous_flag() {
         let claimed = |status: &str, authorized: bool| delivery_run::ClaimedRecovery {
             run_id: "run".into(),
             workspace_path: "/workspace".into(),
@@ -925,6 +960,18 @@ mod tests {
         };
 
         assert!(should_resume_claimed_delivery(&claimed("waiting", true)));
+        assert!(should_resume_claimed_delivery(&claimed(
+            "platform_incident",
+            true
+        )));
+        assert!(should_resume_claimed_delivery(&claimed(
+            "agent_action_required",
+            true
+        )));
+        assert!(!should_resume_claimed_delivery(&claimed(
+            "platform_incident",
+            false
+        )));
         assert!(!should_resume_claimed_delivery(&claimed("waiting", false)));
         assert!(!should_resume_claimed_delivery(&claimed(
             "core_input_required",

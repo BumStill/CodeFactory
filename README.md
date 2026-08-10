@@ -32,7 +32,8 @@ want on something doing that.
 
 Most AI coding tools are chat windows that paste snippets. The interesting
 work — running tests, applying multi-file edits, recovering from a flubbed
-refactor, knowing when to stop and ask — happens between the snippets.
+refactor, and distinguishing system recovery from a real business decision —
+happens between the snippets.
 CodeFactory is built around that loop.
 
 It runs locally — your conversations and settings stay on your machine
@@ -56,7 +57,7 @@ your own API key, or sign in with ChatGPT for the Codex-backed provider.
 | 🌐 **On-demand browser** | Task-scoped managed browser sessions open an embedded pane only when needed; pause for login or approval, then recover the session without leaving an idle browser daemon behind. |
 | 📦 **Docker sandbox** | Optional `sandbox_mode: Docker` runs every shell/tool command in a disposable container instead of your host shell. |
 | 🔔 **IM notifications** | Optional WeCom / Feishu / generic-JSON webhook pings you when a task finishes, fails, or needs permission — fire-and-forget, no secrets in the payload. |
-| 🚚 **Controlled delivery** | Turn a completed task into an auditable PR → CI → merge → release flow. Recoverable CI/metadata/branch failures return to a bounded repair loop; genuine permission or policy blockers stay explicit. |
+| 🚚 **Controlled delivery** | Turn a completed task into an auditable PR → CI → merge → release flow. CI, metadata, branch, remote-observation, and restart failures remain system-owned recovery; only irreducible core input or a material business decision is handed back. |
 | 🔁 **Auto-update** | Signed updates over GitHub Releases. New version arrives → in-app banner → one-click install + relaunch. Your data stays. |
 
 ## Install

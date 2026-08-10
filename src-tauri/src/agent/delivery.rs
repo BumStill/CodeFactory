@@ -153,7 +153,10 @@ impl DeliveryOutcome {
             }
             "waiting" => {
                 self.recoverable
-                    && self.recovery_class == RecoveryClass::WaitRetryable
+                    && matches!(
+                        self.recovery_class,
+                        RecoveryClass::WaitRetryable | RecoveryClass::ExternalStateUncertain
+                    )
                     && self.retry_after_ms.is_some_and(|value| value > 0)
                     && self
                         .next_action
@@ -225,14 +228,15 @@ impl DeliveryOutcome {
 
     fn blocked_on_uncertain_side_effect(mut self, step: StepResult) -> Self {
         let msg = step.detail.clone();
-        self = self.blocked_at(step);
+        self = self.waiting_at(
+            StepResult::waiting(&step.step, step.detail),
+            30_000,
+            "只读核对同一远端对象和持久回执；确认外部动作未发生前不得重复写入。",
+        );
         self.code = "delivery_external_state_uncertain".into();
-        self.recoverable = false;
         self.recovery_class = RecoveryClass::ExternalStateUncertain;
-        self.retry_after_ms = None;
-        self.next_action = Some(format!(
-            "{msg} 外部动作结果不确定，禁止自动重试；请先核对远端事实，再人工续接。"
-        ));
+        self.summary =
+            format!("{msg} 外部动作结果不确定；系统保持运行并只读对账，不向用户回交。");
         self
     }
 
@@ -259,15 +263,12 @@ impl DeliveryOutcome {
         if remote_error_requires_core_input(&detail) {
             return self.core_input_required(StepResult::blocked(step, detail));
         }
-        let mut outcome = self.blocked_at(StepResult::blocked(step, detail));
-        outcome.code = "delivery_remote_observation_unknown".into();
-        outcome.recoverable = false;
-        outcome.recovery_class = RecoveryClass::ExternalStateUncertain;
-        outcome.retry_after_ms = None;
-        outcome.next_action = Some(
-            "远端读取结果无法分类；先核对同一 PR/CI 的真实状态，再决定是否续接，禁止直接创建或重复触发。"
-                .into(),
+        let mut outcome = self.waiting_at(
+            StepResult::waiting(step, detail),
+            30_000,
+            "只读重新核对同一 PR/CI/发布对象；状态未知期间禁止创建重复对象或重放外部写动作。",
         );
+        outcome.code = "delivery_remote_observation_unknown".into();
         outcome
     }
 }
@@ -287,9 +288,30 @@ fn remote_error_is_retryable(detail: &str) -> bool {
         "502",
         "503",
         "504",
+        "upgrade to github pro or make this repository public",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
+}
+
+fn github_rules_capability_unavailable(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("upgrade to github pro or make this repository public")
+        || lower.contains("repository rules are not available")
+}
+
+fn github_required_status_checks(
+    rules_raw: Result<String, String>,
+) -> Result<Vec<crate::git_remote::github::RequiredStatusCheck>, String> {
+    let rules = match rules_raw {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map_err(|error| format!("required-rules returned non-JSON: {error}"))?,
+        Err(error) if github_rules_capability_unavailable(&error) => serde_json::Value::Null,
+        Err(error) => return Err(error),
+    };
+    Ok(crate::git_remote::github::parse_required_status_checks(
+        &rules,
+    ))
 }
 
 fn remote_error_requires_core_input(detail: &str) -> bool {
@@ -3845,13 +3867,10 @@ impl DeliveryRemote for GhCliRemote {
         ])?;
         let v: serde_json::Value =
             serde_json::from_str(&raw).map_err(|e| format!("check-runs non-JSON: {e}"))?;
-        let rules_raw = self.gh(&[
+        let required = github_required_status_checks(self.gh(&[
             "api".into(),
             format!("repos/{}/rules/branches/{}", self.repo, self.default_branch),
-        ])?;
-        let rules: serde_json::Value = serde_json::from_str(&rules_raw)
-            .map_err(|error| format!("required-rules returned non-JSON: {error}"))?;
-        let required = crate::git_remote::github::parse_required_status_checks(&rules);
+        ]))?;
         let observation = crate::git_remote::github::classify_ci_observation(&v, &required);
         let status = match observation.status.as_str() {
             "success" => CiStatus::Success,
@@ -4898,6 +4917,39 @@ mod tests {
         assert!(!remote_error_requires_core_input(
             "HTTP 403: API rate limit exceeded"
         ));
+        let private_rules_403 =
+            "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)";
+        assert!(remote_error_is_retryable(private_rules_403));
+        assert!(github_rules_capability_unavailable(private_rules_403));
+        assert!(github_required_status_checks(Err(private_rules_403.into()))
+            .unwrap()
+            .is_empty());
+        assert!(github_required_status_checks(Err("HTTP 500".into())).is_err());
+
+        let unknown = DeliveryOutcome {
+            steps: vec![],
+            branch: Some("feature/x".into()),
+            commit_sha: Some("abc".into()),
+            pr_url: None,
+            pr_number: None,
+            final_state: "delivered".into(),
+            stage: "preflight".into(),
+            code: "delivery_ready".into(),
+            recoverable: false,
+            recovery_class: RecoveryClass::None,
+            retry_after_ms: None,
+            next_action: None,
+            reached_state: "local".into(),
+            requested_ceiling: "through_release".into(),
+            effective_ceiling: "through_release".into(),
+            capability_gap: None,
+            release_receipt: None,
+            summary: String::new(),
+        }
+        .remote_observation_failed("ci_observation", "unclassified remote schema drift");
+        assert_eq!(unknown.final_state, "waiting");
+        assert!(unknown.recoverable);
+        assert_eq!(unknown.recovery_class, RecoveryClass::WaitRetryable);
     }
 
     fn make_repo(tag: &str) -> PathBuf {
@@ -5494,20 +5546,27 @@ Release-Urgency: hold"
             eprintln!("skipping gh smoke: gh missing or unauthenticated");
             return;
         }
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = std::env::var_os("CODEFACTORY_GH_SMOKE_CWD")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
         let Some(remote) = gh_remote_for(&cwd) else {
             eprintln!("skipping gh smoke: not a github repo checkout");
             return;
         };
         let default_branch =
             remote_default_branch(&cwd, "origin").unwrap_or_else(|| "main".to_string());
-        // A commit the remote is guaranteed to know. Only skip when this
-        // checkout has no such ref at all (fresh clone with no fetch).
-        let Ok(sha) = git(&cwd, &["rev-parse", &format!("origin/{default_branch}")]) else {
-            eprintln!(
-                "skipping gh smoke: no local ref for origin/{default_branch}; run `git fetch origin`"
-            );
-            return;
+        // A commit the remote is guaranteed to know. A production incident can
+        // supply its exact durable head; otherwise use origin/<default>.
+        let sha = if let Ok(sha) = std::env::var("CODEFACTORY_GH_SMOKE_SHA") {
+            sha
+        } else {
+            let Ok(sha) = git(&cwd, &["rev-parse", &format!("origin/{default_branch}")]) else {
+                eprintln!(
+                    "skipping gh smoke: no local ref for origin/{default_branch}; run `git fetch origin`"
+                );
+                return;
+            };
+            sha
         };
         match remote.ci_status(sha.trim()).await {
             Ok(_) => {}
@@ -7242,8 +7301,11 @@ Release-Urgency: hold"
             Some("main"),
         )
         .await;
-        assert_eq!(out.final_state, "blocked");
+        assert_eq!(out.final_state, "waiting");
         assert_eq!(out.code, "delivery_external_state_uncertain");
+        assert!(out.recoverable);
+        assert_eq!(out.recovery_class, RecoveryClass::ExternalStateUncertain);
+        assert!(out.retry_after_ms.is_some());
         assert_eq!(calls.release.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
