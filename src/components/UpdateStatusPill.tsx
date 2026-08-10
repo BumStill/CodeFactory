@@ -7,7 +7,7 @@
 // flow directly — no need to navigate anywhere.
 
 import { Download, RefreshCw, Check, AlertCircle } from "lucide-react";
-import { useUpdaterStore } from "../stores/updater";
+import { countUpdateBlockers, useUpdaterStore } from "../stores/updater";
 
 export function UpdateStatusPill() {
   const phase = useUpdaterStore((s) => s.phase);
@@ -35,6 +35,18 @@ export function UpdateStatusPill() {
       <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent/10 text-[11px] text-accent">
         <RefreshCw size={11} className="animate-spin motion-reduce:animate-none" />
         正在下载 {pct}%
+      </span>
+    );
+  }
+
+  if (phase.kind === "waiting_for_safe_restart") {
+    return (
+      <span
+        className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-amber-500/15 text-[11px] text-amber-800 dark:text-amber-300"
+        title="执行中的本地 session 结束后会自动安装，不会直接重启。"
+      >
+        <RefreshCw size={11} />
+        等待安全更新 · {countUpdateBlockers(phase.blockers)}
       </span>
     );
   }

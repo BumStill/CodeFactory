@@ -21,6 +21,7 @@
 | CF-DR-R11 | 非业务恢复耗尽进入 `failed_internal/platform_incident` 与 remediation queue，不生成“回复继续” | recovery supervisor、incident projection | exhaustion + restart integration |
 | CF-DR-R12 | 用户要求搞定或离开时持久化 `autonomous_completion=true`，推荐配置在授权范围内自动采用 | objective policy、decision router | restart + recommended-default tests |
 | CF-DR-R13 | 外部核心输入仅在穷尽安全替代后一次性合并请求；缺失不得降低功能、签名、测试、发布或 live 要求 | input request contract、remediation | missing-credential acceptance |
+| CF-DR-R14 | 程序内更新可下载但不得安装或重启仍有本地执行 owner 的 App；安全状态未知时 fail closed，归零后自动续接安装 | update safety command、updater store、状态 UI | frontend retry contract + Rust owner aggregation + real App |
 
 ## Completion predicate
 

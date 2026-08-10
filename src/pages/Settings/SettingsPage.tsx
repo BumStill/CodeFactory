@@ -21,7 +21,7 @@ import {
 import { useSettingsStore } from "../../stores/settings";
 import { useChatStore } from "../../stores/chat";
 import { useGitRemoteStore } from "../../stores/gitRemote";
-import { useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
+import { countUpdateBlockers, useUpdaterStore, type UpdaterPhase } from "../../stores/updater";
 import type {
   Settings,
   Endpoint,
@@ -2440,6 +2440,17 @@ function UpdateStatusLine({
           <RefreshCw size={12} className="animate-spin" /> 正在安装…
         </p>
       );
+    case "waiting_for_safe_restart":
+      return (
+        <div className="space-y-1.5 text-xs text-amber-700 dark:text-amber-300">
+          <p className="flex items-center gap-1.5">
+            <RefreshCw size={12} /> 更新已下载，等待本地 session 安全结束。
+          </p>
+          <p className="text-[11px] text-gray-600">
+            当前 {countUpdateBlockers(phase.blockers)} 项工作仍在运行；归零后自动安装并重启，无需再次点击。
+          </p>
+        </div>
+      );
     case "ready":
       return (
         <p className="flex items-center gap-1.5 text-xs text-emerald-700 dark:text-emerald-400">
@@ -2477,6 +2488,7 @@ function AboutTab() {
   const busy =
     phase.kind === "checking" ||
     phase.kind === "downloading" ||
+    phase.kind === "waiting_for_safe_restart" ||
     phase.kind === "installing" ||
     phase.kind === "ready";
 
