@@ -219,7 +219,8 @@ impl From<ToolError> for LoopError {
 /// byte-for-byte (hardest-problem #2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalizationPolicy {
-    /// Chat surface: release with an amber warning instead of blocking (#135/#136).
+    /// Chat surface: the provisional text may be displayed, but unmet evidence
+    /// remains a system-owned `failed_internal` business outcome.
     ReleaseWithWarning,
     /// Autonomous/subagent: block + Error on unmet evidence, scheduler respawns.
     BlockOnIncomplete,
@@ -476,8 +477,16 @@ pub struct RunOutcome {
 /// sidecar branches its terminal `finished` payload on it (keystone 4.8c).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// A tool-call-free reply passed (or was released by) the completion gate.
+    /// A tool-call-free reply passed the completion gate.
     Finished,
+    /// The current objective is not complete, but a system-owned continuation
+    /// can still resume from the persisted evidence.
+    Incomplete,
+    /// Bounded technical recovery was exhausted. This is owned by the system,
+    /// never a request for the user to say "continue".
+    FailedInternal,
+    /// The execution platform itself is unavailable and must remediate the run.
+    PlatformIncident,
     /// The gate blocked the run (`BlockOnIncomplete` with unmet evidence).
     Blocked,
     /// The shared cancel flag tripped.
@@ -596,6 +605,7 @@ pub async fn run_agent_loop(
     // stream always closes after completion, cancellation, or a visible
     // recoverable stop.
     let mut emitted_terminal = false;
+    let mut terminal_stop_reason = None;
     let mut completion_gate = codefactory_agent_core::CompletionGate::new_for_instruction(
         gate_benchmark,
         &completion_instruction,
@@ -658,6 +668,7 @@ pub async fn run_agent_loop(
                     output_tokens: 0,
                 });
                 emitted_terminal = true;
+                terminal_stop_reason = Some(StopReason::Cancelled);
                 break;
             }
             // ── Mid-run steering ─────────────────────────────────────────────
@@ -1038,6 +1049,7 @@ pub async fn run_agent_loop(
                         output_tokens: done_out,
                     });
                     emitted_terminal = true;
+                    terminal_stop_reason = Some(StopReason::Blocked);
                     break;
                 }
                 if structural_denial_seen {
@@ -1063,6 +1075,7 @@ pub async fn run_agent_loop(
                         output_tokens: done_out,
                     });
                     emitted_terminal = true;
+                    terminal_stop_reason = Some(StopReason::Blocked);
                     break;
                 }
                 // Systemic fact-check: a tool-call-free reply asserting a
@@ -1145,8 +1158,9 @@ pub async fn run_agent_loop(
                         continue;
                     }
                     crate::policy::CompletionFinalization::ReleaseWithWarning(warning) => {
-                        // The reply stands — no folding, no Error. Persist a
-                        // visible warning and fall through to the normal Done.
+                        // The text may stand as a provisional transport payload,
+                        // but exhausted technical recovery is a system-owned
+                        // failure, never business completion or a user gate.
                         persistence
                             .persist_gate_message(&warning, "gate_warning")
                             .await?;
@@ -1154,6 +1168,7 @@ pub async fn run_agent_loop(
                             kind: "warning".into(),
                             detail: warning.clone(),
                         });
+                        terminal_stop_reason = Some(StopReason::FailedInternal);
                     }
                     crate::policy::CompletionFinalization::Blocked(message) => {
                         persistence
@@ -1162,25 +1177,55 @@ pub async fn run_agent_loop(
                         persistence
                             .persist_gate_message(&message, "gate_blocked")
                             .await?;
+                        publish_turn_activity(
+                            persistence.as_ref(),
+                            events.as_ref(),
+                            root_turn_id.as_deref(),
+                            "finalizing",
+                            "failed_internal",
+                            "failed_internal",
+                            "系统未能完成任务",
+                            None,
+                            Some("completion_recovery_exhausted"),
+                        )
+                        .await?;
                         events.emit(crate::types::StreamEvent::Error { message });
                         emitted_terminal = true;
+                        terminal_stop_reason = Some(StopReason::FailedInternal);
                         break;
                     }
-                    crate::policy::CompletionFinalization::Complete => {}
+                    crate::policy::CompletionFinalization::Complete => {
+                        terminal_stop_reason = Some(StopReason::Finished);
+                    }
                 }
                 last_final_text = text.clone();
-                publish_turn_activity(
-                    persistence.as_ref(),
-                    events.as_ref(),
-                    root_turn_id.as_deref(),
-                    "finalizing",
-                    "completed",
-                    "completed",
-                    "任务已完成",
-                    None,
-                    None,
-                )
-                .await?;
+                if matches!(terminal_stop_reason, Some(StopReason::FailedInternal)) {
+                    publish_turn_activity(
+                        persistence.as_ref(),
+                        events.as_ref(),
+                        root_turn_id.as_deref(),
+                        "finalizing",
+                        "failed_internal",
+                        "failed_internal",
+                        "系统未能完成任务",
+                        None,
+                        Some("completion_recovery_exhausted"),
+                    )
+                    .await?;
+                } else {
+                    publish_turn_activity(
+                        persistence.as_ref(),
+                        events.as_ref(),
+                        root_turn_id.as_deref(),
+                        "finalizing",
+                        "completed",
+                        "completed",
+                        "任务已完成",
+                        None,
+                        None,
+                    )
+                    .await?;
+                }
                 // Always emit a terminal Done so the frontend's `streaming`
                 // flag clears — even when the provider omitted usage on the
                 // final turn. Previously Done was gated behind `usage`, so a
@@ -2066,10 +2111,23 @@ pub async fn run_agent_loop(
             checkpoint_decision,
             crate::policy::SegmentCheckpointDecision::Terminal
         ) {
+            publish_turn_activity(
+                persistence.as_ref(),
+                events.as_ref(),
+                root_turn_id.as_deref(),
+                "finalizing",
+                "incomplete",
+                "incomplete",
+                "任务尚未达到完成条件",
+                None,
+                Some("completion_evidence_incomplete"),
+            )
+            .await?;
             events.emit(crate::policy::iteration_ceiling_terminal_event(
                 &evidence,
                 finalization,
             ));
+            terminal_stop_reason = Some(StopReason::Incomplete);
             break;
         }
 
@@ -2122,7 +2180,7 @@ pub async fn run_agent_loop(
         if !checkpoint_tool_calls.is_empty() {
             let notice = format!(
                 "连续执行检查点返回了 {} 个未执行的工具请求。为避免会话记录与实际文件状态不一致，\
-本轮已安全停止，当前进度已保存；回复「继续执行」可从检查点恢复。",
+本轮已安全停止，当前进度和失败证据已保存，并已转入系统内部修复。",
                 checkpoint_tool_calls.len()
             );
             persistence
@@ -2132,10 +2190,22 @@ pub async fn run_agent_loop(
                 kind: "turn_notice".into(),
                 detail: notice.clone(),
             });
+            publish_turn_activity(
+                persistence.as_ref(),
+                events.as_ref(),
+                root_turn_id.as_deref(),
+                "finalizing",
+                "failed_internal",
+                "failed_internal",
+                "系统检查点协议异常",
+                None,
+                Some("checkpoint_protocol_violation"),
+            )
+            .await?;
             events.emit(crate::types::StreamEvent::Error { message: notice });
             return Ok(run_outcome_for_terminal(
                 &completion_gate,
-                StopReason::Blocked,
+                StopReason::FailedInternal,
                 (total_input_tokens, total_output_tokens),
                 &last_final_text,
             ));
@@ -2190,7 +2260,7 @@ pub async fn run_agent_loop(
                 };
                 if !budget.may_continue(model_round_index) {
                     let notice = "执行环境已到安全停止点，当前进度已保存。\
-恢复可用执行环境后回复「继续执行」即可接着完成。";
+系统将保留原目标并转入平台恢复队列；本轮不标记为完成。";
                     persistence
                         .persist_gate_message(notice, "turn_notice")
                         .await?;
@@ -2198,11 +2268,28 @@ pub async fn run_agent_loop(
                         kind: "turn_notice".into(),
                         detail: notice.into(),
                     });
+                    publish_turn_activity(
+                        persistence.as_ref(),
+                        events.as_ref(),
+                        root_turn_id.as_deref(),
+                        "waiting",
+                        "platform_incident",
+                        "platform_incident",
+                        "执行平台暂不可用",
+                        Some("等待系统恢复执行环境"),
+                        Some("execution_budget_exhausted"),
+                    )
+                    .await?;
                     events.emit(crate::types::StreamEvent::Done {
                         input_tokens: 0,
                         output_tokens: 0,
                     });
-                    break;
+                    return Ok(run_outcome_for_terminal(
+                        &completion_gate,
+                        StopReason::PlatformIncident,
+                        (total_input_tokens, total_output_tokens),
+                        &last_final_text,
+                    ));
                 }
                 messages.push(crate::types::ChatMessage {
                     role: "user".into(),
@@ -2225,11 +2312,28 @@ pub async fn run_agent_loop(
                     kind: "turn_notice".into(),
                     detail: notice,
                 });
+                publish_turn_activity(
+                    persistence.as_ref(),
+                    events.as_ref(),
+                    root_turn_id.as_deref(),
+                    "finalizing",
+                    "failed_internal",
+                    "failed_internal",
+                    "系统未能取得可验证进展",
+                    None,
+                    Some("stalled_recovery_exhausted"),
+                )
+                .await?;
                 events.emit(crate::types::StreamEvent::Done {
                     input_tokens: 0,
                     output_tokens: 0,
                 });
-                break;
+                return Ok(run_outcome_for_terminal(
+                    &completion_gate,
+                    StopReason::FailedInternal,
+                    (total_input_tokens, total_output_tokens),
+                    &last_final_text,
+                ));
             }
             crate::policy::SegmentCheckpointDecision::Terminal => {
                 unreachable!("non-chat terminal checkpoint was handled before finalization")
@@ -2239,11 +2343,11 @@ pub async fn run_agent_loop(
 
     // The loop fell out of its segments: either a terminal reply already
     // emitted (emitted_terminal) or the ceiling/budget stopped it.
-    let stop_reason = if emitted_terminal {
+    let stop_reason = terminal_stop_reason.unwrap_or(if emitted_terminal {
         StopReason::Finished
     } else {
         StopReason::IterationCeiling
-    };
+    });
     Ok(run_outcome_for_terminal(
         &completion_gate,
         stop_reason,
@@ -2551,9 +2655,9 @@ mod tests {
                 metadata: Some(serde_json::json!({
                     "status": "blocked",
                     "stage": "live",
-                    "code": "delivery_human_action_required",
-                    "recoverable": false,
-                    "recovery_class": "user_action_required",
+                    "code": "delivery_live_verifier_platform_incident",
+                    "recoverable": true,
+                    "recovery_class": "agent_action_required",
                     "requested_ceiling": "through_release",
                     "reached_state": "release_triggered",
                     "next_action": "configure a live verifier"
@@ -3458,6 +3562,64 @@ mod tests {
         )));
     }
 
+    #[tokio::test]
+    async fn release_with_warning_is_failed_internal_but_still_closes_transport() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "先修改工作区。",
+                vec![call("write-1", "scripted", serde_json::json!({}))],
+                0,
+            ),
+            response("当前结果仍缺少修改后的验证证据。", vec![], 1),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut cfg = config();
+        cfg.recovery_limit = 0;
+
+        let outcome = run_agent_loop(
+            inputs(),
+            cfg,
+            services(transport, persistence.clone(), events.clone()),
+        )
+        .await
+        .expect("an incomplete chat result still terminates normally");
+
+        assert_eq!(outcome.stop_reason, StopReason::FailedInternal);
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated {
+                status,
+                recent_activity_kind,
+                terminal_reason: Some(reason),
+                ..
+            } if status == "failed_internal"
+                && recent_activity_kind == "failed_internal"
+                && reason == "completion_recovery_exhausted"
+        )));
+        assert!(!events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated { status, .. } if status == "completed"
+        )));
+        assert_eq!(
+            events
+                .events()
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::Done { .. }))
+                .count(),
+            1,
+            "transport Done remains required to clear streaming",
+        );
+        let notices = persistence.notices.lock().expect("notices");
+        let warning = notices
+            .iter()
+            .find(|(state, _)| state == "gate_warning")
+            .map(|(_, content)| content)
+            .expect("incomplete result must include a visible system notice");
+        assert!(warning.contains("未完成"));
+        assert!(!warning.contains("回复「继续"));
+    }
+
     /// End-to-end through the real loop, not just the pure rule.
     ///
     /// `policy::capability_denial` unit tests prove the DECISION; they cannot
@@ -4116,7 +4278,7 @@ mod tests {
         let persistence = Arc::new(RecordingPersistence::default());
         let events = Arc::new(CollectingEventSink::new());
 
-        run_agent_loop(
+        let outcome = run_agent_loop(
             inputs(),
             config(),
             services(transport.clone(), persistence.clone(), events.clone()),
@@ -4124,6 +4286,7 @@ mod tests {
         .await
         .expect("checkpoint protocol violation is handled as a visible terminal");
 
+        assert_eq!(outcome.stop_reason, StopReason::FailedInternal);
         assert_eq!(transport.advertised_tool_counts(), vec![1, 1, 0]);
         assert!(
             persistence
@@ -4131,9 +4294,20 @@ mod tests {
                 .lock()
                 .expect("notices")
                 .iter()
-                .any(|(state, body)| state == "turn_notice" && body.contains("未执行的工具请求")),
-            "the protocol violation must be persisted as a resumable notice"
+                .any(|(state, body)| state == "turn_notice"
+                    && body.contains("未执行的工具请求")
+                    && body.contains("系统内部修复")
+                    && !body.contains("回复「继续")),
+            "the protocol violation must be persisted as a system-owned failure"
         );
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated {
+                status,
+                terminal_reason: Some(reason),
+                ..
+            } if status == "failed_internal" && reason == "checkpoint_protocol_violation"
+        )));
         assert!(
             events
                 .events()

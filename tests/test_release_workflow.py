@@ -287,6 +287,67 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertIn("python -m unittest tests.test_release_workflow", ci_workflow)
 
+    def test_macos_release_requires_developer_id_and_notarization_credentials(self) -> None:
+        release = (REPO_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        auto_release = (REPO_ROOT / ".github/workflows/auto-release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        required_secrets = (
+            "APPLE_CERTIFICATE",
+            "APPLE_CERTIFICATE_PASSWORD",
+            "APPLE_API_ISSUER",
+            "APPLE_API_KEY",
+            "APPLE_API_PRIVATE_KEY",
+        )
+        for workflow in (release, auto_release):
+            self.assertIn("macos-signing-preflight:", workflow)
+            self.assertIn("platform_incident", workflow)
+            self.assertIn("requires_user_continue", workflow)
+            for secret in required_secrets:
+                self.assertIn(secret, workflow)
+
+        macos_job = release.split("\n  build-macos:\n", 1)[1].split(
+            "\n  finalize:\n", 1
+        )[0]
+        identity_import = (
+            REPO_ROOT / "scripts/import-apple-signing-identity.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("scripts/import-apple-signing-identity.sh", macos_job)
+        self.assertIn("APPLE_API_KEY_PATH", macos_job)
+        self.assertIn("APPLE_SIGNING_IDENTITY", identity_import)
+        self.assertIn("$GITHUB_ENV", identity_import)
+        self.assertNotIn("macOS, unsigned", macos_job)
+        self.assertNotIn("unsigned/un-notarized", macos_job)
+
+    def test_macos_release_artifacts_are_gatekeeper_and_updater_verified(self) -> None:
+        release = (REPO_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        artifact_smoke = (
+            REPO_ROOT / "scripts/verify-macos-release-artifact.sh"
+        ).read_text(encoding="utf-8")
+
+        for assertion in (
+            "codesign --verify --deep --strict",
+            "Developer ID Application:",
+            "flags=.*runtime",
+            "Timestamp=",
+            "TeamIdentifier=",
+            "xcrun stapler validate",
+            "spctl --assess",
+        ):
+            self.assertIn(assertion, artifact_smoke)
+
+        published_job = release.split("\n  verify-published-macos:\n", 1)[1]
+        self.assertIn("latest.json", published_job)
+        self.assertIn("*.app.tar.gz", published_job)
+        self.assertIn("*.app.tar.gz.sig", published_job)
+        self.assertIn("scripts/verify-macos-updater-artifact.sh", published_job)
+        self.assertIn("previous_version", published_job)
+
     def test_ci_runs_agent_bridge_and_evaluation_tests_on_linux(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
             encoding="utf-8"

@@ -497,6 +497,67 @@ pub fn run() {
 
             let pool = tauri::async_runtime::block_on(storage::db::connect(&db_url))?;
 
+            // Claim expired identity-complete delivery runs, then resume only
+            // already-authorized autonomous waits. Recovery reuses the same
+            // branch/PR/head and starts by reconciling local + remote truth.
+            let process_instance = format!(
+                "{}:{}",
+                std::process::id(),
+                storage::db::current_process_start_token()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+            );
+            let app_version = app.package_info().version.to_string();
+            let process_identity = agent::delivery_run::ProcessIdentity::new(
+                process_instance,
+                &app_version,
+                option_env!("CODEFACTORY_BUILD_NUMBER").unwrap_or(&app_version),
+            );
+            match tauri::async_runtime::block_on(storage::db::plan_delivery_run_boot_recovery(
+                &pool,
+                &process_identity,
+            )) {
+                Ok(plan) => {
+                    if !plan.claimed.is_empty() {
+                        tracing::info!(
+                            "startup: claimed {} expired delivery run(s) for observation",
+                            plan.claimed.len()
+                        );
+                    }
+                    if !plan.fail_closed_identity_missing.is_empty() {
+                        tracing::warn!(
+                            "startup: left {} delivery run(s) unclaimed because durable identity was incomplete",
+                            plan.fail_closed_identity_missing.len()
+                        );
+                    }
+                    for claimed in plan.claimed {
+                        if !tools::delivery::should_resume_claimed_delivery(&claimed) {
+                            continue;
+                        }
+                        let recovery_db = pool.clone();
+                        let recovery_settings = settings.clone();
+                        let recovery_process = process_identity.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let run_id = claimed.run_id.clone();
+                            if let Err(error) = tools::delivery::resume_claimed_delivery(
+                                recovery_db,
+                                recovery_settings,
+                                claimed,
+                                recovery_process,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "startup: durable delivery run {run_id} could not resume: {error}"
+                                );
+                            }
+                        });
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    "startup: durable delivery recovery planning failed (non-fatal): {error}"
+                ),
+            }
+
             // Create a single McpManager and wrap in Arc so it can be shared with
             // the startup task and also managed by Tauri.
             let mcp_manager = Arc::new(mcp::McpManager::new());

@@ -6,11 +6,15 @@
 //! opening one. The model invokes this instead of hand-running git in bash.
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 use super::ToolExecutionStatus;
 use super::{ExecCtx, ToolOutput};
 use crate::agent::delivery::{self, DeliverOpts, ReleaseUrgency};
+use crate::agent::delivery_run::{
+    self, CoreInputRequest, DeliveryObservation, NewDeliveryRun, ProcessIdentity,
+};
 use crate::config::settings::DeliveryCeiling;
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
@@ -48,6 +52,10 @@ pub fn definition() -> ToolDefinition {
                     "expect_branch": {
                         "type": "string",
                         "description": "Optional guard: the branch you believe you are delivering. This tool has no branch argument — it delivers whatever branch the working directory is on. When resuming a specific PR, pass its head branch here; if the working directory is somewhere else the call stops before touching anything instead of opening a second PR for unrelated work."
+                    },
+                    "autonomous_completion": {
+                        "type": "boolean",
+                        "description": "Defaults true once deliver_changes is authorized, so technical waits survive restart and apply the recommended recovery without asking the user to continue. Set false only when the user explicitly limited unattended continuation; it never expands authority or bypasses release/test/signing gates."
                     }
                 }
             }),
@@ -85,6 +93,9 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             .map(String::from),
     };
 
+    let durable =
+        prepare_durable_run(&args, ctx, settings.delivery_ceiling, requested_ceiling).await?;
+
     let remote = delivery::resolve_delivery_remote(&ctx.cwd, &settings);
 
     loop {
@@ -102,6 +113,9 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         if let (Some(db), Some(session_id)) = (ctx.db.as_ref(), ctx.session_id.as_deref()) {
             persist_delivery_ref(db, session_id, &outcome).await?;
         }
+        if let (Some(db), Some(durable)) = (ctx.db.as_ref(), durable.as_ref()) {
+            persist_durable_outcome(db, durable, &outcome).await?;
+        }
 
         if outcome.validate_contract().is_err() {
             return Ok(tool_output_for_outcome(&outcome));
@@ -117,6 +131,317 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         let retry_after_ms = outcome.retry_after_ms.unwrap_or(30_000).clamp(1, 60_000);
         tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms)).await;
     }
+}
+
+struct PreparedDurableRun {
+    id: String,
+    process: ProcessIdentity,
+    expected_head_sha: String,
+    head_branch: String,
+}
+
+async fn prepare_durable_run(
+    args: &Value,
+    ctx: &ExecCtx,
+    configured_ceiling: DeliveryCeiling,
+    requested_ceiling: Option<DeliveryCeiling>,
+) -> Result<Option<PreparedDurableRun>> {
+    let Some(db) = ctx.db.as_ref() else {
+        return Ok(None);
+    };
+    let repo = delivery::resolve_repo(&ctx.cwd, None).map_err(crate::errors::AppError::Other)?;
+    let source_identity = ctx
+        .root_turn_id
+        .as_deref()
+        .or(ctx.task_id.as_deref())
+        .ok_or_else(|| {
+            crate::errors::AppError::Other(
+                "deliver_changes refused external mutation without a durable root-turn/task identity"
+                    .into(),
+            )
+        })?;
+    let repo_identity = durable_repo_identity(&repo);
+    let expected_head_sha = git2::Repository::open(&repo.root)
+        .ok()
+        .and_then(|repository| repository.head().ok()?.target().map(|oid| oid.to_string()))
+        .ok_or_else(|| {
+            crate::errors::AppError::Other(
+                "deliver_changes could not establish the expected git head before mutation".into(),
+            )
+        })?;
+    let change_set_digest = durable_change_set_digest(&repo.root, &expected_head_sha)?;
+    let id = durable_run_id(source_identity, &repo_identity);
+    let process = ProcessIdentity::new(
+        format!(
+            "{}:{}",
+            std::process::id(),
+            crate::storage::db::current_process_start_token()
+                .unwrap_or_else(|| "unknown-start".into())
+        ),
+        env!("CARGO_PKG_VERSION"),
+        option_env!("CODEFACTORY_BUILD_NUMBER").unwrap_or(env!("CARGO_PKG_VERSION")),
+    );
+    let selected_ceiling = requested_ceiling
+        .map(|requested| configured_ceiling.clamp_request(requested))
+        .unwrap_or(configured_ceiling);
+    let head_branch = repo.branch.clone();
+    let run = NewDeliveryRun {
+        id: id.clone(),
+        run_kind: "deliver_changes".into(),
+        session_id: ctx.session_id.clone(),
+        root_turn_id: ctx.root_turn_id.clone(),
+        task_segment_id: None,
+        task_id: ctx.task_id.clone(),
+        workspace_path: repo.root.to_string_lossy().into_owned(),
+        repo_identity,
+        base_branch: repo.default_branch,
+        head_branch: head_branch.clone(),
+        change_set_digest,
+        expected_head_sha: expected_head_sha.clone(),
+        canonical_pr_number: None,
+        canonical_pr_url: None,
+        canonical_head_sha: None,
+        requested_ceiling: ceiling_label(selected_ceiling).into(),
+        reached_ceiling: "local".into(),
+        stage: "preflight".into(),
+        status: "running".into(),
+        wait_class: None,
+        next_action: Some("deliver".into()),
+        next_action_authorized: true,
+        autonomous_completion: autonomous_completion_from_args(args),
+    };
+    delivery_run::create_delivery_run(
+        db,
+        &run,
+        &process,
+        chrono::Utc::now().timestamp_millis(),
+        90_000,
+    )
+    .await?;
+    Ok(Some(PreparedDurableRun {
+        id,
+        process,
+        expected_head_sha,
+        head_branch,
+    }))
+}
+
+fn autonomous_completion_from_args(args: &Value) -> bool {
+    // Invoking deliver_changes is already the user's authorization to reach
+    // the selected ceiling. Technical waits/restarts must not manufacture a
+    // second confirmation gate; only an explicit false opts out.
+    args.get("autonomous_completion")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+async fn persist_durable_outcome(
+    db: &sqlx::SqlitePool,
+    durable: &PreparedDurableRun,
+    outcome: &delivery::DeliveryOutcome,
+) -> Result<()> {
+    let core_input = core_input_request_for_outcome(outcome);
+    let status = match outcome.final_state.as_str() {
+        "delivered" | "noop" => "completed",
+        "waiting" => "waiting",
+        _ if core_input.is_some() => "core_input_required",
+        _ if outcome.recoverable => "agent_action_required",
+        _ if outcome.recovery_class == delivery::RecoveryClass::ExternalStateUncertain => {
+            "platform_incident"
+        }
+        _ => "failed_internal",
+    };
+    let recovery_class = serde_json::to_value(outcome.recovery_class)
+        .ok()
+        .and_then(|value| value.as_str().map(String::from));
+    let expected_head_sha = outcome
+        .commit_sha
+        .clone()
+        .unwrap_or_else(|| durable.expected_head_sha.clone());
+    let observation = DeliveryObservation {
+        head_branch: outcome
+            .branch
+            .clone()
+            .unwrap_or_else(|| durable.head_branch.clone()),
+        stage: outcome.stage.clone(),
+        status: status.into(),
+        wait_class: recovery_class,
+        next_action: outcome.next_action.clone(),
+        reached_ceiling: outcome.reached_state.clone(),
+        expected_head_sha: expected_head_sha.clone(),
+        canonical_pr_number: outcome.pr_number.map(|value| value as i64),
+        canonical_pr_url: outcome.pr_url.clone(),
+        canonical_head_sha: outcome.pr_number.map(|_| expected_head_sha),
+        failure_signature: (outcome.final_state != "delivered" && outcome.final_state != "noop")
+            .then(|| outcome.code.clone()),
+        core_input,
+    };
+    delivery_run::record_delivery_observation(
+        db,
+        &durable.id,
+        &durable.process,
+        &observation,
+        chrono::Utc::now().timestamp_millis(),
+        outcome
+            .retry_after_ms
+            .unwrap_or(30_000)
+            .saturating_add(60_000) as i64,
+    )
+    .await?;
+    Ok(())
+}
+
+fn core_input_request_for_outcome(outcome: &delivery::DeliveryOutcome) -> Option<CoreInputRequest> {
+    if outcome.recovery_class != delivery::RecoveryClass::CoreInputRequired {
+        return None;
+    }
+    let mut missing = Vec::new();
+    if let Some(capability) = outcome.capability_gap.as_deref() {
+        missing.push(serde_json::json!({
+            "kind": "capability",
+            "key": capability,
+        }));
+    }
+    if let Some(next_action) = outcome.next_action.as_deref() {
+        missing.push(serde_json::json!({
+            "kind": "required_input",
+            "key": outcome.code,
+            "resume_action": next_action,
+        }));
+    }
+    if missing.is_empty() {
+        return None;
+    }
+    Some(CoreInputRequest {
+        request_key: outcome.code.clone(),
+        inputs_json: serde_json::Value::Array(missing).to_string(),
+        attempts_json: serde_json::json!({
+            "alternatives_exhausted": true,
+            "observed_stages": outcome.steps.iter().map(|step| &step.step).collect::<Vec<_>>(),
+        })
+        .to_string(),
+        resume_stage: outcome.stage.clone(),
+    })
+}
+
+/// Resume an expired recoverable wait after startup. The durable lease was
+/// claimed before this function is called; only already-authorized autonomous
+/// waits are eligible. `deliver` begins with local/remote reconciliation and is
+/// idempotent against the canonical PR/head receipts.
+pub(crate) async fn resume_claimed_delivery(
+    db: sqlx::SqlitePool,
+    settings: crate::config::settings::Settings,
+    claimed: delivery_run::ClaimedRecovery,
+    process: ProcessIdentity,
+) -> Result<()> {
+    if !should_resume_claimed_delivery(&claimed) {
+        return Ok(());
+    }
+    let Some(requested_ceiling) = parse_ceiling(&claimed.requested_ceiling) else {
+        return Err(crate::errors::AppError::Other(format!(
+            "durable delivery run {} has an invalid requested ceiling",
+            claimed.run_id
+        )));
+    };
+    let cwd = std::path::PathBuf::from(&claimed.workspace_path);
+    let opts = DeliverOpts {
+        title: None,
+        body: None,
+        release_urgency: None,
+        requested_ceiling: Some(requested_ceiling),
+        extra_excludes: settings.delivery_exclude_globs.clone(),
+        expect_branch: Some(claimed.head_branch.clone()),
+    };
+    let remote = delivery::resolve_delivery_remote(&cwd, &settings);
+    let prepared = PreparedDurableRun {
+        id: claimed.run_id,
+        process,
+        expected_head_sha: claimed.expected_head_sha,
+        head_branch: claimed.head_branch,
+    };
+    loop {
+        let outcome = delivery::deliver(
+            &cwd,
+            requested_ceiling,
+            settings.delivery_merge_method,
+            settings.delivery_ci_timeout_secs,
+            &opts,
+            remote.as_ref(),
+            Some(&claimed.base_branch),
+        )
+        .await;
+        persist_durable_outcome(&db, &prepared, &outcome).await?;
+        if outcome.final_state != "waiting" {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(
+            outcome.retry_after_ms.unwrap_or(30_000).clamp(1, 60_000),
+        ))
+        .await;
+    }
+}
+
+pub(crate) fn should_resume_claimed_delivery(claimed: &delivery_run::ClaimedRecovery) -> bool {
+    // Technical waits never need a second user decision. The explicit
+    // authorization attached to the same objective is the only gate here;
+    // autonomous_completion governs default business choices, not liveness.
+    claimed.status == "waiting" && claimed.next_action_authorized
+}
+
+fn ceiling_label(ceiling: DeliveryCeiling) -> &'static str {
+    match ceiling {
+        DeliveryCeiling::Off => "off",
+        DeliveryCeiling::PrOnly => "pr_only",
+        DeliveryCeiling::ThroughCiGreen => "through_ci_green",
+        DeliveryCeiling::ThroughMerge => "through_merge",
+        DeliveryCeiling::ThroughRelease => "through_release",
+    }
+}
+
+fn durable_repo_identity(repo: &delivery::RepoContext) -> String {
+    let source = repo
+        .remote_url
+        .as_deref()
+        .unwrap_or_else(|| repo.root.to_str().unwrap_or("local-repository"));
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn durable_run_id(source_identity: &str, repo_identity: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source_identity.as_bytes());
+    hasher.update([0]);
+    hasher.update(repo_identity.as_bytes());
+    format!("delivery-{:x}", hasher.finalize())
+}
+
+fn durable_change_set_digest(root: &std::path::Path, head: &str) -> Result<String> {
+    let repository = git2::Repository::open(root).map_err(|error| {
+        crate::errors::AppError::Other(format!("cannot inspect delivery worktree: {error}"))
+    })?;
+    let statuses = repository.statuses(None).map_err(|error| {
+        crate::errors::AppError::Other(format!("cannot inspect delivery changes: {error}"))
+    })?;
+    let mut entries: Vec<_> = statuses
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .path()
+                .map(|path| (path.to_owned(), entry.status().bits()))
+        })
+        .collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    hasher.update(head.as_bytes());
+    for (path, status) in entries {
+        hasher.update(path.as_bytes());
+        hasher.update(status.to_le_bytes());
+        if let Ok(bytes) = std::fs::read(root.join(&path)) {
+            hasher.update(bytes);
+        }
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn tool_output_for_outcome(outcome: &delivery::DeliveryOutcome) -> ToolOutput {
@@ -143,6 +468,8 @@ fn tool_output_for_outcome(outcome: &delivery::DeliveryOutcome) -> ToolOutput {
         "code": outcome.code,
         "recoverable": outcome.recoverable,
         "recovery_class": outcome.recovery_class,
+        "decision_type": if outcome.recovery_class == crate::agent::delivery::RecoveryClass::CoreInputRequired { "core_input_required" } else { "system_owned" },
+        "requires_user_continue": false,
         "retry_after_ms": outcome.retry_after_ms,
         "next_action": outcome.next_action,
         "requested_ceiling": outcome.requested_ceiling,
@@ -233,6 +560,12 @@ fn render_report(outcome: &delivery::DeliveryOutcome) -> String {
             out.push_str(
                 "\n\n这是可恢复的交付状态，不是最终总结边界。执行 metadata/正文中的 next_action，\
 然后重新调用 deliver_changes 续接同一 PR；不得使用 --admin、force push 或删 required check。",
+            );
+        } else if outcome.recovery_class == crate::agent::delivery::RecoveryClass::CoreInputRequired
+        {
+            out.push_str(
+                "\n\n系统已把无法推导的外部核心输入合并为一次请求；输入补齐后应自动续接原 run，\
+不得要求用户再回复『继续』，也不得降低原交付边界。",
             );
         } else {
             out.push_str("如实报告缺失能力、实际到达层级和恢复动作即可。");
@@ -362,6 +695,17 @@ mod tests {
     }
 
     #[test]
+    fn delivery_defaults_to_autonomous_completion_unless_explicitly_disabled() {
+        assert!(autonomous_completion_from_args(&json!({})));
+        assert!(autonomous_completion_from_args(&json!({
+            "autonomous_completion": true
+        })));
+        assert!(!autonomous_completion_from_args(&json!({
+            "autonomous_completion": false
+        })));
+    }
+
+    #[test]
     fn business_blocker_maps_to_blocked_tool_status() {
         let output = tool_output_for_outcome(&outcome("blocked"));
         assert_eq!(output.status, ToolExecutionStatus::Blocked);
@@ -474,5 +818,42 @@ mod tests {
             schema.contains("--watch"),
             "and must name the bypass it replaces: {schema}"
         );
+    }
+
+    #[test]
+    fn startup_resumes_only_authorized_waiting_without_requiring_autonomous_flag() {
+        let claimed = |status: &str, authorized: bool| delivery_run::ClaimedRecovery {
+            run_id: "run".into(),
+            workspace_path: "/workspace".into(),
+            repo_identity: "repo".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest".into(),
+            expected_head_sha: "abc".into(),
+            requested_ceiling: "through_release".into(),
+            autonomous_completion: false,
+            canonical_pr_number: Some(1),
+            canonical_head_sha: Some("abc".into()),
+            stage: "ci".into(),
+            status: status.into(),
+            wait_class: Some("wait_retryable".into()),
+            next_action: Some("observe_ci".into()),
+            next_action_authorized: authorized,
+            failure_signature: None,
+            stage_attempt: 0,
+            progress_revision: 1,
+            action: delivery_run::RecoveryAction::ObserveOnly,
+        };
+
+        assert!(should_resume_claimed_delivery(&claimed("waiting", true)));
+        assert!(!should_resume_claimed_delivery(&claimed("waiting", false)));
+        assert!(!should_resume_claimed_delivery(&claimed(
+            "core_input_required",
+            true
+        )));
+        assert!(!should_resume_claimed_delivery(&claimed(
+            "needs_business_decision",
+            true
+        )));
     }
 }

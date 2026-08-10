@@ -1181,7 +1181,13 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ensure_column(pool, "sessions", "reasoning_effort", "TEXT").await?;
     // Per-session delivery authorization (0/1). Survives app restarts so a
     // user who said "提交上线" is not asked to re-confirm after relaunching.
-    ensure_column(pool, "sessions", "delivery_authorized", "INTEGER NOT NULL DEFAULT 0").await?;
+    ensure_column(
+        pool,
+        "sessions",
+        "delivery_authorized",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
     // Per-session permission preset. Existing sessions get standard so old
     // global allow/ask/deny details no longer leak into the primary UX.
     ensure_column(
@@ -1336,6 +1342,11 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         tracing::warn!("task orphan recovery at boot failed (non-fatal): {e}");
     }
 
+    // Delivery recovery has its own durable identity and lease model. Schema
+    // setup is idempotent because historical databases may have already used
+    // migration version 4 for an older, now-consolidated migration.
+    crate::agent::delivery_run::ensure_schema(pool).await?;
+
     // Existing rows all carry a frozen activity time; pull them up to their
     // newest message so the sidebar's order is right on first launch after the
     // upgrade. Best-effort: a stale session list must never block startup.
@@ -1349,6 +1360,22 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     crate::benchmark::ensure_schema(pool).await?;
 
     Ok(())
+}
+
+/// Startup hook for durable delivery reconciliation. This only acquires an
+/// expired lease and returns an observe-first plan; it never runs git/GitHub,
+/// merges, releases, or performs any other external mutation.
+pub(crate) async fn plan_delivery_run_boot_recovery(
+    pool: &SqlitePool,
+    process: &crate::agent::delivery_run::ProcessIdentity,
+) -> crate::errors::Result<crate::agent::delivery_run::StartupRecoveryPlan> {
+    crate::agent::delivery_run::plan_startup_recovery(
+        pool,
+        process,
+        Utc::now().timestamp_millis(),
+        60_000,
+    )
+    .await
 }
 
 /// Pull each session's activity time up to its newest message.
@@ -2322,7 +2349,11 @@ mod tests {
             }
         };
         assert_eq!(at("frozen").await, 900, "pulled up to its newest message");
-        assert_eq!(at("renamed").await, 5000, "a later rename must not be undone");
+        assert_eq!(
+            at("renamed").await,
+            5000,
+            "a later rename must not be undone"
+        );
         assert_eq!(at("empty").await, 42, "no messages, nothing to derive");
 
         // Idempotent: a second pass is a no-op, so it can run on every boot.

@@ -306,7 +306,7 @@ describe("session-native task delegation", () => {
 
     await userEvent.click(screen.getByRole("button", { name: /打开任务活动/ }));
     expect(screen.getByText("已委派，还有 1 项等待后台调度。" )).toBeInTheDocument();
-    expect(screen.getByText("任务已委派，由后台调度器自动执行；若长时间未开始请检查模型配置或重试委派。")).toBeInTheDocument();
+    expect(screen.getByText("任务已委派，系统会持续调度并自动诊断恢复，无需手动重试。")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /开始|继续执行/ })).not.toBeInTheDocument();
   });
 

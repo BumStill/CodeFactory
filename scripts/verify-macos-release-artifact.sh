@@ -82,6 +82,36 @@ if [[ " $ARCHS " != *" arm64 "* ]]; then
   exit 1
 fi
 
+# The public artifact must be distributable without the historical right-click
+# bypass. Ad-hoc signatures fail the Developer ID authority and notarization
+# assertions below even if the app happens to launch on the CI host.
+codesign --verify --deep --strict --verbose=4 "$INSTALLED_APP"
+SIGNATURE_INFO="$(codesign --display --verbose=4 "$INSTALLED_APP" 2>&1)"
+grep -q 'Authority=Developer ID Application:' <<<"$SIGNATURE_INFO" || {
+  echo "macOS release artifact smoke failed: app lacks Developer ID Application authority" >&2
+  exit 1
+}
+grep -Eq 'flags=.*runtime' <<<"$SIGNATURE_INFO" || {
+  echo "macOS release artifact smoke failed: app lacks hardened runtime" >&2
+  exit 1
+}
+grep -q '^Timestamp=' <<<"$SIGNATURE_INFO" || {
+  echo "macOS release artifact smoke failed: app lacks a secure signing timestamp" >&2
+  exit 1
+}
+grep -Eq '^TeamIdentifier=.+$' <<<"$SIGNATURE_INFO" || {
+  echo "macOS release artifact smoke failed: app lacks a signing team identifier" >&2
+  exit 1
+}
+if grep -q 'com.apple.security.get-task-allow' <(
+  codesign --display --entitlements :- "$INSTALLED_APP" 2>&1 || true
+); then
+  echo "macOS release artifact smoke failed: release app contains get-task-allow" >&2
+  exit 1
+fi
+xcrun stapler validate "$INSTALLED_APP"
+spctl --assess --type execute --verbose=4 "$INSTALLED_APP"
+
 EVOLUTION_RECEIPT="$INSTALL_DIR/evolution-release-smoke.json"
 "$EXECUTABLE_PATH" --evolution-smoke "$EVOLUTION_RECEIPT"
 if [[ "$(/usr/bin/plutil -extract status raw "$EVOLUTION_RECEIPT")" != "pass" ]]; then
