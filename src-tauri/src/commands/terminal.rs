@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::util::no_window::NoWindow;
+use crate::AppState;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -62,7 +63,18 @@ pub async fn terminal_create(
     rows: u16,
     app_handle: AppHandle,
     state: State<'_, TerminalState>,
+    app_state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // The updater holds this same map while reserving a restart. Keep the lock
+    // for the whole terminal admission so a PTY cannot be spawned in the gap
+    // between the safety snapshot and the reservation bit.
+    let mut sessions = state.0.lock().await;
+    if app_state
+        .update_restart_reserved
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("应用更新已进入安全重启阶段，请等待自动恢复工作区".into());
+    }
     let pty_system = native_pty_system();
 
     let pair = pty_system
@@ -116,7 +128,7 @@ pub async fn terminal_create(
         _master: pair.master,
     };
 
-    state.0.lock().await.insert(id, session);
+    sessions.insert(id, session);
     Ok(())
 }
 
@@ -165,10 +177,7 @@ pub async fn terminal_resize(
 }
 
 #[tauri::command]
-pub async fn terminal_kill(
-    id: String,
-    state: State<'_, TerminalState>,
-) -> Result<(), String> {
+pub async fn terminal_kill(id: String, state: State<'_, TerminalState>) -> Result<(), String> {
     state.0.lock().await.remove(&id);
     Ok(())
 }

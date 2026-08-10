@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect } from "react";
 import { Download, X, RefreshCw, CheckCircle, AlertCircle } from "lucide-react";
-import { useUpdaterStore } from "../stores/updater";
+import { countUpdateBlockers, useUpdaterStore } from "../stores/updater";
 
 /**
  * Floating update banner — appears top-right when a new version is
@@ -24,6 +24,7 @@ export function UpdaterBanner() {
   const visible =
     (phase.kind === "available" && phase.update.version !== dismissedVersion) ||
     phase.kind === "downloading" ||
+    phase.kind === "waiting_for_safe_restart" ||
     phase.kind === "installing" ||
     phase.kind === "ready";
   if (!visible) return null;
@@ -96,6 +97,18 @@ export function UpdaterBanner() {
         <div className="flex items-center gap-2 p-3 text-xs text-gray-300">
           <RefreshCw size={12} className="text-accent animate-spin motion-reduce:animate-none" />
           <span>安装中…</span>
+        </div>
+      )}
+
+      {phase.kind === "waiting_for_safe_restart" && (
+        <div className="p-3 space-y-1 text-xs text-amber-700 dark:text-amber-300">
+          <div className="flex items-center gap-2">
+            <RefreshCw size={12} />
+            <span>更新已下载，等待执行中的 session 到达安全点…</span>
+          </div>
+          <p className="text-[11px] text-gray-500">
+            当前 {countUpdateBlockers(phase.blockers)} 项本地工作仍在运行；归零后会自动安装，无需再次操作。
+          </p>
         </div>
       )}
 

@@ -324,11 +324,18 @@ pub async fn send_message(
     // Register cancellation before any database, model, or credential work so
     // a stop click cannot race the command's setup phase.
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    state
-        .chat_cancels
-        .lock()
-        .await
-        .insert(session_id.clone(), cancel_flag.clone());
+    {
+        let mut active = state.chat_cancels.lock().await;
+        if state
+            .update_restart_reserved
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AppError::Other(
+                "应用更新已进入安全重启阶段，请等待自动恢复工作区".into(),
+            ));
+        }
+        active.insert(session_id.clone(), cancel_flag.clone());
+    }
     let mut running_setup_guard = ChatRunningSetupGuard::new(
         state.chat_cancels.clone(),
         session_id.clone(),
@@ -834,11 +841,18 @@ pub async fn send_message_anonymous(
 ) -> Result<(), AppError> {
     // Match persisted chats: expose the cancellation flag before setup work.
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    state
-        .chat_cancels
-        .lock()
-        .await
-        .insert(session_id.clone(), cancel_flag.clone());
+    {
+        let mut active = state.chat_cancels.lock().await;
+        if state
+            .update_restart_reserved
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AppError::Other(
+                "应用更新已进入安全重启阶段，请等待自动恢复工作区".into(),
+            ));
+        }
+        active.insert(session_id.clone(), cancel_flag.clone());
+    }
     let mut running_setup_guard = ChatRunningSetupGuard::new(
         state.chat_cancels.clone(),
         session_id.clone(),

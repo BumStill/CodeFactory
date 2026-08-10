@@ -28,5 +28,6 @@ pub mod settings;
 pub mod skills;
 pub mod tasks;
 pub mod terminal;
+pub mod update_safety;
 #[cfg(test)]
 mod usage_acceptance_tests;

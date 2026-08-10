@@ -233,6 +233,14 @@ pub async fn start_implementation(
     state: State<'_, AppState>,
     handles: State<'_, SchedulerHandles>,
 ) -> Result<(), AppError> {
+    if state
+        .update_restart_reserved
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(AppError::Other(
+            "应用更新已进入安全重启阶段，请等待自动恢复工作区".into(),
+        ));
+    }
     {
         let h = handles.lock().await;
         if h.contains_key(&session_id) {
@@ -298,10 +306,18 @@ pub async fn start_implementation(
     let scheduler = Arc::new(TaskScheduler::new(pool.clone()));
     let cancel = scheduler.cancel_handle();
 
-    handles
-        .lock()
-        .await
-        .insert(session_id.clone(), cancel.clone());
+    {
+        let mut active = handles.lock().await;
+        if state
+            .update_restart_reserved
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AppError::Other(
+                "应用更新已进入安全重启阶段，请等待自动恢复工作区".into(),
+            ));
+        }
+        active.insert(session_id.clone(), cancel.clone());
+    }
 
     let session_id_clone = session_id.clone();
     let handles_clone = handles.inner().clone();

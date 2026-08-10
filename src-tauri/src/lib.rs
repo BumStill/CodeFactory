@@ -86,6 +86,9 @@ pub struct AppState {
     pub pending_permissions: PendingPermissionMap,
     pub chat_cancels: ChatCancelMap,
     pub interjections: commands::interjections::InterjectionQueue,
+    /// Admission barrier set only after every live-work owner reports idle.
+    /// New work must not enter between updater safety admission and relaunch.
+    pub update_restart_reserved: Arc<AtomicBool>,
 }
 
 /// Handle the release-only Evolution smoke mode before Tauri initializes.
@@ -586,6 +589,7 @@ pub fn run() {
                 pending_permissions: Arc::new(Mutex::new(HashMap::new())),
                 chat_cancels: Arc::new(Mutex::new(HashMap::new())),
                 interjections: Arc::new(Mutex::new(HashMap::new())),
+                update_restart_reserved: Arc::new(AtomicBool::new(false)),
             });
             // Manage the Arc so all commands share the same McpManager instance.
             app.manage(mcp_manager);
@@ -632,6 +636,8 @@ pub fn run() {
             commands::settings::save_settings,
             commands::settings::save_api_key,
             commands::settings::delete_api_key,
+            commands::update_safety::reserve_update_install,
+            commands::update_safety::release_update_install_reservation,
             codex_auth::codex_login,
             codex_auth::codex_login_start,
             codex_auth::codex_login_status,
