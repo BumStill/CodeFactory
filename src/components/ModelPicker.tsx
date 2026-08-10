@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useState, useRef, useEffect } from "react";
+import { createPortal } from "react-dom";
 import { ChevronDown, Sparkles } from "lucide-react";
 import { useChatStore } from "../stores/chat";
 import { useSettingsStore } from "../stores/settings";
 import { invoke } from "../lib/tauri";
 
-export function ModelPicker() {
+interface ModelPickerProps {
+  /** Render the menu in document.body so a draft composer cannot clip it. */
+  portal?: boolean;
+  /** Give the draft-context control a clearer visual affordance. */
+  prominent?: boolean;
+}
+
+export function ModelPicker({ portal = false, prominent = false }: ModelPickerProps) {
   const {
     models,
     activeModel,
@@ -20,6 +28,7 @@ export function ModelPicker() {
   const [query, setQuery] = useState("");
   const [loadingEndpoint, setLoadingEndpoint] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   // When the active endpoint changes:
   //   1. Reload the model list for that endpoint
@@ -52,7 +61,9 @@ export function ModelPicker() {
 
   useEffect(() => {
     const close = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      const target = e.target as Node;
+      if (ref.current?.contains(target) || menuRef.current?.contains(target)) return;
+      setOpen(false);
     };
     document.addEventListener("mousedown", close);
     return () => document.removeEventListener("mousedown", close);
@@ -78,11 +89,156 @@ export function ModelPicker() {
       return a.id.localeCompare(b.id);
     });
 
+  const menu = (
+      <div ref={menuRef} className="z-[100] w-72 rounded-lg border border-border bg-surface-2 shadow-xl">
+      <div className="space-y-2 border-b border-border p-2">
+        {activeSession && (
+          <>
+            <select
+              aria-label="模型策略"
+              value={activePolicy}
+              onChange={(event) => {
+                void updateActiveSessionModelConfig({
+                  endpointId: activeEndpoint,
+                  modelId: activeModel,
+                  policy: event.target.value as "fixed" | "prefer" | "auto",
+                });
+              }}
+              className="w-full rounded bg-surface-3 px-2 py-1 text-xs text-gray-200 outline-none"
+            >
+              <option value="fixed">固定 · 只使用当前模型</option>
+              <option value="prefer">首选 · 安全时允许兼容接管</option>
+              <option value="auto">自动 · 按能力与状态选择</option>
+            </select>
+            <p className="px-0.5 text-xs leading-5 text-gray-500">
+              会话策略更改只从下一轮开始生效；当前运行中的回合不会改路。
+            </p>
+          </>
+        )}
+        {endpointKeys.length > 1 && (
+          <select
+            aria-label="模型端点"
+            value={activeEndpoint}
+            onChange={async (e) => {
+              if (!settings) return;
+              const endpointName = e.target.value;
+              setLoadingEndpoint(endpointName);
+              setQuery("");
+              try {
+                const modelsLoading = loadModels(endpointName);
+                const model = await invoke<string>("get_endpoint_active_model", {
+                  endpointName,
+                }).catch(() => "");
+                if (model) {
+                  if (activeSession) {
+                    await updateActiveSessionModelConfig({
+                      endpointId: endpointName,
+                      modelId: model,
+                      policy: activePolicy,
+                    });
+                  } else {
+                    await saveSettings({
+                      ...settings,
+                      default_endpoint: endpointName,
+                      default_model: model,
+                    });
+                    setModel(model);
+                  }
+                }
+                await modelsLoading;
+                await reloadSettings();
+              } finally {
+                setLoadingEndpoint(null);
+              }
+            }}
+            className="w-full rounded bg-surface-3 px-2 py-1 text-xs text-gray-200 outline-none"
+          >
+            {endpointKeys.map((key) => (
+              <option key={key} value={key}>{key}</option>
+            ))}
+          </select>
+        )}
+        <input
+          autoFocus
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          disabled={modelListLoading}
+          placeholder="搜索模型…"
+          className="w-full rounded bg-surface-3 px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none disabled:opacity-50"
+        />
+      </div>
+      <ul className="max-h-64 overflow-y-auto py-1">
+        {modelListLoading ? (
+          <li className="px-3 py-2 text-xs text-gray-600">正在加载模型…</li>
+        ) : filtered.slice(0, 50).map((m) => (
+          <li key={m.id}>
+            <button
+              className={`flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-xs transition-colors hover:bg-surface-3 ${
+                m.id === activeModel ? "text-accent" : "text-gray-300"
+              }`}
+              onClick={async () => {
+                if (activeSession) {
+                  await updateActiveSessionModelConfig({
+                    endpointId: activeEndpoint,
+                    modelId: m.id,
+                    policy: activePolicy,
+                  });
+                } else {
+                  // Outside an existing session this remains the
+                  // new-session default for the endpoint.
+                  await invoke("set_endpoint_active_model", {
+                    endpointName: activeEndpoint,
+                    modelId: m.id,
+                  }).catch(() => { /* best-effort */ });
+                  await updateActiveSessionModel(m.id);
+                  await reloadSettings();
+                }
+                setOpen(false);
+              }}
+              title={m.id}
+            >
+              {m.is_custom && <Sparkles size={10} className="shrink-0 text-amber-400" />}
+              <span className="truncate">{m.id}</span>
+            </button>
+          </li>
+        ))}
+        {!modelListLoading && filtered.length === 0 && (
+          <li className="px-3 py-2 text-xs text-gray-600">未找到模型</li>
+        )}
+      </ul>
+    </div>
+  );
+
+  const menuContent = portal && typeof document !== "undefined" ? (
+    createPortal(
+      <div
+        data-testid="model-picker-portal-menu"
+        className="fixed z-[100]"
+        style={(() => {
+          const rect = ref.current?.getBoundingClientRect();
+          return rect
+            ? { left: Math.max(8, Math.min(rect.right - 288, window.innerWidth - 296)), top: rect.bottom + 4 }
+            : { left: 8, top: 8 };
+        })()}
+      >
+        {menu}
+      </div>,
+      document.body,
+    )
+  ) : (
+    <div className="absolute right-0 top-full z-50 mt-1">{menu}</div>
+  );
+
   return (
     <div ref={ref} className="relative">
       <button
         onClick={() => setOpen((o) => !o)}
-        className="flex items-center gap-1 rounded px-2 py-1 text-xs text-gray-400 hover:text-gray-200 hover:bg-surface-3 transition-colors"
+        className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors ${
+          prominent
+            ? "min-h-8 max-w-full border border-accent/30 bg-accent/5 font-medium text-gray-200 hover:border-accent/60 hover:bg-accent/10"
+            : "text-gray-400 hover:bg-surface-3 hover:text-gray-200"
+        }`}
+        aria-label={prominent ? "选择模型" : undefined}
         title={`${activeEndpoint} / ${activeModel} · ${activePolicy}`}
       >
         <span className="max-w-[190px] truncate">
@@ -93,130 +249,7 @@ export function ModelPicker() {
         <ChevronDown size={12} />
       </button>
 
-      {open && (
-        <div className="absolute right-0 top-full mt-1 z-50 w-72 rounded-lg border border-border bg-surface-2 shadow-xl">
-          <div className="space-y-2 p-2 border-b border-border">
-            {activeSession && (
-              <>
-                <select
-                  aria-label="模型策略"
-                  value={activePolicy}
-                  onChange={(event) => {
-                    void updateActiveSessionModelConfig({
-                      endpointId: activeEndpoint,
-                      modelId: activeModel,
-                      policy: event.target.value as "fixed" | "prefer" | "auto",
-                    });
-                  }}
-                  className="w-full rounded bg-surface-3 px-2 py-1 text-xs text-gray-200 outline-none"
-                >
-                  <option value="fixed">固定 · 只使用当前模型</option>
-                  <option value="prefer">首选 · 安全时允许兼容接管</option>
-                  <option value="auto">自动 · 按能力与状态选择</option>
-                </select>
-                <p className="px-0.5 text-xs leading-5 text-gray-500">
-                  会话策略更改只从下一轮开始生效；当前运行中的回合不会改路。
-                </p>
-              </>
-            )}
-            {endpointKeys.length > 1 && (
-              <select
-                aria-label="模型端点"
-                value={activeEndpoint}
-                onChange={async (e) => {
-                  if (!settings) return;
-                  const endpointName = e.target.value;
-                  setLoadingEndpoint(endpointName);
-                  setQuery("");
-                  try {
-                    const modelsLoading = loadModels(endpointName);
-                    const model = await invoke<string>("get_endpoint_active_model", {
-                      endpointName,
-                    }).catch(() => "");
-                    if (model) {
-                      if (activeSession) {
-                        await updateActiveSessionModelConfig({
-                          endpointId: endpointName,
-                          modelId: model,
-                          policy: activePolicy,
-                        });
-                      } else {
-                        await saveSettings({
-                          ...settings,
-                          default_endpoint: endpointName,
-                          default_model: model,
-                        });
-                        setModel(model);
-                      }
-                    }
-                    await modelsLoading;
-                    await reloadSettings();
-                  } finally {
-                    setLoadingEndpoint(null);
-                  }
-                }}
-                className="w-full bg-surface-3 rounded px-2 py-1 text-xs text-gray-200 outline-none"
-              >
-                {endpointKeys.map((key) => (
-                  <option key={key} value={key}>{key}</option>
-                ))}
-              </select>
-            )}
-            <input
-              autoFocus
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              disabled={modelListLoading}
-              placeholder="搜索模型…"
-              className="w-full bg-surface-3 rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none disabled:opacity-50"
-            />
-          </div>
-          <ul className="max-h-64 overflow-y-auto py-1">
-            {modelListLoading ? (
-              <li className="px-3 py-2 text-xs text-gray-600">正在加载模型…</li>
-            ) : filtered.slice(0, 50).map((m) => (
-              <li key={m.id}>
-                <button
-                  className={`flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-xs hover:bg-surface-3 transition-colors ${
-                    m.id === activeModel ? "text-accent" : "text-gray-300"
-                  }`}
-                  onClick={async () => {
-                    if (activeSession) {
-                      await updateActiveSessionModelConfig({
-                        endpointId: activeEndpoint,
-                        modelId: m.id,
-                        policy: activePolicy,
-                      });
-                    } else {
-                      // Outside an existing session this remains the
-                      // new-session default for the endpoint.
-                      await invoke("set_endpoint_active_model", {
-                        endpointName: activeEndpoint,
-                        modelId: m.id,
-                      }).catch(() => { /* best-effort */ });
-                      await updateActiveSessionModel(m.id);
-                      await reloadSettings();
-                    }
-                    setOpen(false);
-                  }}
-                  title={m.id}
-                >
-                  {m.is_custom && (
-                    <Sparkles
-                      size={10}
-                      className="shrink-0 text-amber-400"
-                    />
-                  )}
-                  <span className="truncate">{m.id}</span>
-                </button>
-              </li>
-            ))}
-            {!modelListLoading && filtered.length === 0 && (
-              <li className="px-3 py-2 text-xs text-gray-600">未找到模型</li>
-            )}
-          </ul>
-        </div>
-      )}
+      {open && menuContent}
     </div>
   );
 }

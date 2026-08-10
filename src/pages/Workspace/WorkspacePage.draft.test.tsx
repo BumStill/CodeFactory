@@ -56,7 +56,9 @@ vi.mock("../../stores/learning", () => ({
     selector({ events: {}, load: vi.fn(), subscribe: vi.fn(async () => () => {}) }),
 }));
 vi.mock("../../stores/skills", () => ({ useSkillsStore: () => ({ skills: [], loadSkills: vi.fn() }) }));
-vi.mock("../../components/ModelPicker", () => ({ ModelPicker: () => null }));
+vi.mock("../../components/ModelPicker", () => ({
+  ModelPicker: () => <button aria-label="选择模型">模型：model</button>,
+}));
 vi.mock("../../components/ReasoningEffortPicker", () => ({ ReasoningEffortPicker: () => null }));
 vi.mock("../../components/GitStatusBar", () => ({ GitStatusBar: () => null }));
 vi.mock("../../components/CheckpointsPanel", () => ({ CheckpointsPanel: () => <span>不应出现检查点</span> }));
@@ -107,6 +109,9 @@ describe("Workspace virtual draft", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "展开会话侧栏" }));
     expect(screen.getByRole("complementary", { name: "会话列表" })).toBeInTheDocument();
+    const composer = screen.getByTestId("workspace-composer-shell");
+    expect(within(composer).getByRole("button", { name: "选择模型" })).toHaveTextContent("模型：model");
+    expect(within(workspaceHeader).queryByRole("button", { name: "选择模型" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "发送第一条消息" })).toBeEnabled();
     expect(screen.getAllByText("草稿").length).toBeGreaterThan(0);
     expect(screen.queryByText("不应出现检查点")).not.toBeInTheDocument();
