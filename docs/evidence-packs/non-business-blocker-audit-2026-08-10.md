@@ -339,3 +339,88 @@ within_objective_authority, recommended_action
 5. 通过上述 P0 Given/When/Then 的跨重启集成测试；
 6. 在正式版真实路径验证：锁屏/重启、单模型失败、permission channel closed、CI wait/conflict、OAuth 恢复、browser 2FA、release receipt 对账；
 7. 用最近 24 小时正式版会话重新计算“非业务阻断用户回交率”，目标 0%，并确认没有靠隐藏错误或降低验收达成。
+
+## 10. 正式版事故复盘：原则为何已经记录却仍被执行偏（P0）
+
+### 10.1 已验证事实
+
+2026-08-10 正式版出现一条匿名化交付链：用户明确要求继续完成发布；第一次交付因处于默认分支返回可恢复状态，Agent 已自动切换到修复分支并跑过目标测试；第二次交付已提交、推送并复用同一 PR，但 GitHub 私有仓库的 branch-rules API 返回套餐能力 403。正式版随后把这次**只读观察能力差异**记录为：
+
+```text
+decision_type=system_owned
+requires_user_continue=false
+next_action_authorized=true
+autonomous_completion=true
+requested_ceiling=through_release
+status=platform_incident
+tool_result=blocked
+```
+
+这些字段自身已经构成矛盾：状态明确不需要人且已授权续接，工具和 UI 却仍投影 `blocked`，当前 turn 也停止。生产 SQLite 只读完整性检查通过；同一事故 head 上，check-runs 可读，只有 rules API 因仓库套餐不可用。修复后的真实私库 smoke 已在同一仓库、同一 head 通过。
+
+### 10.2 要求到执行的偏移链
+
+| 要求 | 应有强制语义 | 实际偏移 | 机制根因 |
+| --- | --- | --- | --- |
+| 非业务阻断不得回交 | `system_owned` 只能进入 recovery/wait/incident owner | delivery 仍可直接构造 terminal `blocked` | 原则未成为 outcome schema 不变量 |
+| 用户说“搞定”后自动采用推荐方案 | `autonomous_completion + next_action_authorized` 必须驱动 supervisor | 字段被持久化但启动器只筛 `status=waiting` | 授权字段与恢复状态机分离 |
+| 不允许再次要求“继续” | 技术失败不产生用户 CTA、伪 user turn 或 blocked card | tool card 显示 `blocked`，任务终止后只能靠用户再提示 | UI 直接投影工具枚举，没有经过 DecisionRouter |
+| 先尝试其他解决路径 | provider 能力缺口应使用等价只读证据 | rules API 403 后没有退回已取得的 check-runs | GitHub CLI 适配器与 REST 适配器策略漂移 |
+| 不能降低人的要求 | requested ceiling 保持 through_release 直到 live evidence | ceiling 字段保持正确，但 objective 因 turn 结束失去 owner | requested acceptance 与 objective lifecycle 未绑定 |
+| 写操作不确定不能盲重放 | 进入 read-only reconcile，依 canonical PR/head/receipt 去重 | 旧代码设 non-recoverable 并写“人工续接” | 安全 fail-closed 被错误等同于人肉处理 |
+
+### 10.3 为什么先前修复没有拦住
+
+先前改动分别修了 completion evidence、durable delivery run、`apply_recommended` 默认和 waiting 自动续接，但它们是四个局部机制：
+
+1. completion gate 只决定能否写 `completed`，不禁止工具产生 `blocked`；
+2. durable run 保存了正确授权，却没有把授权变成所有非业务状态的恢复义务；
+3. waiting supervisor 按字符串筛选 `waiting`，遗漏 `platform_incident/agent_action_required`；
+4. GitHub REST adapter 在 rules 不可读时已有 check-runs fallback，CLI adapter 却使用 `?` 直接传播错误；
+5. UI 读取 tool status，不检查 `decision_type/requires_user_continue` 的矛盾。
+
+因此问题不是“模型没听懂原则”，而是原则只存在于提示词、文档和部分字段，没有成为跨模块可拒绝非法状态的类型与数据库约束。只要任一旧分支仍能产生 `system_owned + blocked`，用户就会再次成为恢复触发器。
+
+### 10.4 本次 P0 修复范围
+
+状态：`fixed_not_released`（发布并在正式版真实交付链验证前不得改为 live verified）。
+
+- GitHub 私库 branch-rules 能力 403 自动退回实际 check-runs；其他未知错误仍保留明确失败，不伪造 CI green；
+- 未分类远端只读异常进入可恢复等待，不再终结 objective；
+- 外部写动作结果不确定进入 `external_state_uncertain + waiting`，只读核对 canonical remote/receipt，禁止盲重放；
+- startup recovery 接管已授权的 `waiting/platform_incident/agent_action_required`；
+- `AgentActionRequired` 对模型仍保留恢复指令，但 tool/UI 投影为 `recovering/Waiting`，不再显示 `blocked`；
+- `CoreInputRequired` 仍保持真正 blocked，保留不可替代外部输入的安全边界。
+
+### 10.5 尚未闭环的系统项
+
+本次止血没有把 42 组命中全部宣称修复。发布后仍必须按以下顺序关闭：
+
+1. **P0：DecisionRouter schema 约束**——数据库与 serde 拒绝 `decision_type=system_owned && requires_user_continue=false && terminal_projection=blocked`；
+2. **P0：统一 RemediationSupervisor**——permission、provider、scheduler、delivery、browser、context 都必须有 durable owner，不能各自解释重试预算；
+3. **P0：Objective lifecycle**——turn/transport 结束与 objective 完成分离；`platform_incident` 必须保留 objective lease 和 remediation id；
+4. **P0：UI 单一投影**——只有 `core_input_required/needs_business_decision` 可以出现 CTA，技术恢复只展示 owner、阶段、下次动作和证据；
+5. **P1：适配器一致性契约**——同一 provider 的 CLI/REST/hook 必须共享 capability fallback 测试，禁止策略漂移；
+6. **P1：跨重启故障注入**——对 private-rules 403、网络超时、permission channel close、intent merge/release、单模型失败执行正式版 fault injection。
+
+### 10.6 新增验收
+
+1. **私库规则能力缺失**
+   - Given：check-runs 可读，branch-rules API 因仓库套餐返回 403；
+   - When：requested ceiling 为 `through_release`；
+   - Then：按实际 checks 继续同一 PR，tool/UI 不出现 blocked，不请求升级套餐或公开仓库。
+
+2. **系统拥有状态投影**
+   - Given：`decision_type=system_owned`、`requires_user_continue=false`、`next_action_authorized=true`；
+   - When：任一工具返回可恢复技术状态；
+   - Then：transport/tool projection 只能是 active/recovering/waiting，schema 拒绝 terminal blocked。
+
+3. **重启恢复旧 incident**
+   - Given：正式版升级前遗留 `platform_incident`，canonical PR/head、requested ceiling 和 next action 均持久化；
+   - When：新版本启动且 lease 可认领；
+   - Then：自动只读对账并续接，不要求用户发送新消息。
+
+4. **不可重复副作用边界**
+   - Given：merge/release 请求结果未知；
+   - When：恢复器运行；
+   - Then：先观察 receipt/PR/head/release，未证明未发生前不重放；等待期间 objective 不完成、用户无 CTA。

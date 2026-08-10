@@ -728,7 +728,10 @@ pub fn recoverable_delivery_prompt(
         .get("recovery_class")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("agent_action_required");
-    let is_retryable_wait = recovery_class == "wait_retryable";
+    let is_retryable_wait = matches!(
+        recovery_class,
+        "wait_retryable" | "external_state_uncertain"
+    );
     let signature = delivery_failure_signature(metadata);
     let spinning = !is_retryable_wait && previous_signature == Some(signature.as_str());
     if tool_name != "deliver_changes"
@@ -1082,6 +1085,28 @@ mod tests {
             recoverable_delivery_prompt("deliver_changes", &waiting, Some(&first.signature))
                 .is_some(),
             "a repeated wait must keep waiting, not turn into a block"
+        );
+    }
+
+    #[test]
+    fn uncertain_external_side_effect_reconciles_without_counting_as_repair() {
+        let waiting = serde_json::json!({
+            "recoverable": true,
+            "recovery_class": "external_state_uncertain",
+            "code": "delivery_external_state_uncertain",
+            "stage": "release",
+            "reached_state": "merged",
+            "commit_sha": "aaa",
+            "retry_after_ms": 30_000,
+            "next_action": "只读核对远端发布事实，禁止重复触发",
+        });
+        let first = recoverable_delivery_prompt("deliver_changes", &waiting, None).unwrap();
+        assert!(!first.counts_as_repair_attempt);
+        assert!(first.prompt.contains("禁止重复触发"));
+        assert!(
+            recoverable_delivery_prompt("deliver_changes", &waiting, Some(&first.signature))
+                .is_some(),
+            "an uncertain side effect remains a system-owned reconciliation wait"
         );
     }
 
