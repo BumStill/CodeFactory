@@ -111,6 +111,13 @@ jobs:
           README_CONTRACT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python tools/governance/validate_readme_contract.py --ci
 
+      - name: Frontend test contract
+        if: ${{ !cancelled() }}
+        env:
+          FRONTEND_TEST_EVENT_PATH: ${{ github.event_path }}
+          FRONTEND_TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python tools/governance/validate_frontend_test_contract.py --ci
+
       - name: Evolution workbench headless viewport gate
         id: evolution_gate
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}

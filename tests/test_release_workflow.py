@@ -213,6 +213,37 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "unknown must exit before any duplicate release dispatch",
         )
 
+    # 2026-08-05: a preflight job was added to auto-release.yml demanding five
+    # APPLE_* secrets before any version mutation. release.yml references
+    # APPLE_* exactly zero times — the build has never done Apple codesigning,
+    # only Tauri updater signing — so the gate demanded credentials the pipeline
+    # cannot use, and blocked EVERY release including Windows-only fixes. It was
+    # a prerequisite invented out of nothing, and the user was nearly sent to
+    # buy an Apple developer certificate to satisfy it.
+    #
+    # The rule this pins: auto-release may only gate on secrets the release
+    # build actually consumes, plus the tokens it needs to drive itself.
+    def test_release_gates_may_not_require_secrets_the_build_never_uses(self) -> None:
+        import re
+
+        def secrets_in(name: str) -> set[str]:
+            text = (REPO_ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+            return set(re.findall(r"secrets\.([A-Z0-9_]+)", text))
+
+        # Tokens auto-release needs for its own git/API work, not for building.
+        self_drive = {"GITHUB_TOKEN", "RELEASE_PAT"}
+        demanded = secrets_in("auto-release.yml") - self_drive
+        consumed = secrets_in("release.yml")
+        fabricated = demanded - consumed
+        self.assertEqual(
+            fabricated,
+            set(),
+            "auto-release gates on secret(s) that release.yml never uses: "
+            f"{sorted(fabricated)}. A prerequisite the build cannot consume is a "
+            "fabricated blocker — it stops every release and only the user can "
+            "clear it. Either make the build use it, or drop the gate.",
+        )
+
     def test_auto_release_dispatches_tag_from_main_for_shared_cache_scope(self) -> None:
         release = (REPO_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
