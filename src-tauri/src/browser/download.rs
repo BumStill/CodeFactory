@@ -808,7 +808,12 @@ mod tests {
         let stale = scratch.join("chromium-abandoned.zip");
         std::fs::write(&stale, b"leftover").unwrap();
         let long_ago = std::time::SystemTime::now() - (SCRATCH_TTL + Duration::from_secs(60));
-        std::fs::File::open(&stale)
+        // Opened for writing, not reading: Windows refuses to change a file's
+        // timestamps through a read-only handle (`Access is denied`), so
+        // `File::open` would fail here on the very platform this module is for.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
             .unwrap()
             .set_modified(long_ago)
             .unwrap();
@@ -992,6 +997,10 @@ mod end_to_end {
                     let _ = stream.write_all(header.as_bytes()).await;
                     let _ = stream.write_all(&body).await;
                     let _ = stream.flush().await;
+                    // Shut the write half down explicitly rather than letting the
+                    // socket drop: on Windows a close with anything still unread
+                    // can reach the client as a reset and truncate the body.
+                    let _ = stream.shutdown().await;
                 });
             }
         });
