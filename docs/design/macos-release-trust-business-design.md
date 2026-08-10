@@ -2,10 +2,14 @@
 
 ## 用户结果
 
-用户从 GitHub 或程序内更新拿到的 CodeFactory，应直接通过 macOS 标准安全检查，不再依赖右键打开、手工白名单或忽略安全告警。
+现有用户继续获得可安装、可启动并可通过 Tauri updater 签名校验升级的 macOS 正式版。发布机制不得因为一个尚未被采纳的安全增强而中断这条已工作的用户路径。
 
-## 业务门禁
+## 业务判断
 
-“Windows 包已生成”或“macOS 在 CI 能启动”都不等于可发布。只要 macOS Developer ID、公证、staple、Gatekeeper 或 updater 载荷任一失败，整个跨平台 release 保持未发布。
+“必须通过 Apple Developer ID/notarization，完全消除 Gatekeeper 绕行”是产品分发策略选择，不是可由实现层自动扩张的既有要求。未获得这项业务决策前：
 
-签名凭据缺失属于 release platform incident，不是产品范围选择，也不是要求用户回复“继续”的业务决策。系统安全默认是保留目标、停止发版、产出可审计诊断并由平台维护路径补齐凭据。
+- 基线发布继续使用现有 Tauri updater 签名；
+- Apple 凭据缺失不构成 blocker，也不向用户索取；
+- 发布证据如实标记“未证明 Apple 公证”，不把兼容性通道包装成已公证通道。
+
+若未来决定启用增强通道，应先验证凭据、签名、公证、staple、Gatekeeper 和真实升级路径，再决定是否将其提升为强制门禁；切换失败必须能够回滚到基线通道，不能制造半成品 release。

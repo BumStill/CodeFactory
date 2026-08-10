@@ -18,63 +18,11 @@ permissions:
   contents: write
 
 jobs:
-  # Apple signing is a platform-owned release dependency, not a business
-  # decision. Diagnose it before creating a draft or consuming build minutes.
-  # Missing credentials fail closed with an auditable incident artifact and
-  # must never be translated into a request for the user to say "continue".
-  macos-signing-preflight:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Diagnose macOS signing platform readiness
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          required=(APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY)
-          missing=()
-          for name in "${required[@]}"; do
-            [ -n "${!name:-}" ] || missing+=("$name")
-          done
-          mkdir -p "$RUNNER_TEMP/release-platform-preflight"
-          MISSING_JSON="$(printf '%s\n' "${missing[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
-          STATUS=ready
-          SAFE_ACTION=proceed
-          if [ "${#missing[@]}" -gt 0 ]; then
-            STATUS=platform_incident
-            SAFE_ACTION=release_blocked_before_draft
-          fi
-          jq -n \
-            --arg status "$STATUS" \
-            --arg safe_action "$SAFE_ACTION" \
-            --argjson missing "$MISSING_JSON" \
-            '{status:$status, component:"macos_release_signing", missing_secret_names:$missing,
-              remediation_owner:"release-platform", requires_user_continue:false,
-              safe_action:$safe_action}' \
-            > "$RUNNER_TEMP/release-platform-preflight/macos-signing.json"
-          cat "$RUNNER_TEMP/release-platform-preflight/macos-signing.json" >> "$GITHUB_STEP_SUMMARY"
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::error::macOS signing platform incident: missing repository secrets: ${missing[*]}. Release stopped before draft creation; do not request user continue."
-            exit 1
-          fi
-
-      - name: Upload release platform preflight
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-platform-preflight-${{ inputs.tag }}
-          path: ${{ runner.temp }}/release-platform-preflight
-          if-no-files-found: error
-
   # ── Step 1: generate release notes from conventional commits ───────────────
   # We install git-cliff from its prebuilt binary (taiki-e/install-action)
   # instead of running orhun/git-cliff-action, whose Docker base image
   # (Debian buster) is EOL and breaks the apt-get build.
   changelog:
-    needs: macos-signing-preflight
     runs-on: ubuntu-latest
     outputs:
       content: ${{ steps.cliff.outputs.content }}
@@ -302,11 +250,12 @@ jobs:
           if (-not $smoke.cleanup) { throw "Evolution smoke did not clean isolated state" }
           Get-Content $receipt
 
-  # ── Step 3: build the Developer ID signed macOS app + dmg ─────────────────
+  # ── Step 3: build the macOS (Apple Silicon) app + dmg ─────────────────────
   # Runs in parallel with Windows after prepare-release creates the draft;
-  # tauri-action uploads the .app.tar.gz (+ updater .sig) and the .dmg only
-  # after Developer ID signing, hardened runtime, Apple notarization and
-  # stapling succeed. Artifact smoke then independently checks Gatekeeper.
+  # tauri-action uploads the .app.tar.gz (+ .sig) and the .dmg. The updater
+  # archive remains Tauri-signed with the same key as Windows so in-app
+  # updates can verify it. Apple Developer ID/notarization is an optional
+  # hardening track and must not block this established compatibility release.
   build-macos:
     runs-on: macos-latest          # macos-latest is Apple Silicon (arm64)
     needs: [changelog, prepare-release]
@@ -362,26 +311,7 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Import Developer ID Application identity
-        shell: bash
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: scripts/import-apple-signing-identity.sh
-
-      - name: Prepare App Store Connect notarization key
-        shell: bash
-        env:
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
-          printf '%s' "$APPLE_API_PRIVATE_KEY" > "$KEY_PATH"
-          chmod 600 "$KEY_PATH"
-          echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
-
-      - name: Build Tauri app (macOS, Developer ID signed and notarized)
+      - name: Build Tauri app (macOS compatibility channel)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -392,12 +322,10 @@ jobs:
           CODEFACTORY_BUILD_GIT_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           CARGO_PROFILE_RELEASE_LTO: "false"
-          # Tauri updater signing and Apple platform signing are independent;
-          # both are mandatory for a publishable macOS update.
+          # This signs the updater archive. It is independent from optional
+          # Apple Developer ID/notarization and preserves the existing channel.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         with:
           tagName: ${{ inputs.tag }}
           # Upload into the existing draft; keep it draft for `finalize`.
@@ -431,18 +359,6 @@ jobs:
           name: macos-release-gui-evidence
           path: ${{ runner.temp }}/codefactory-release-evidence
           if-no-files-found: error
-
-      - name: Remove ephemeral Apple credentials
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -n "${CODEFACTORY_SIGNING_KEYCHAIN:-}" ]; then
-            security delete-keychain "$CODEFACTORY_SIGNING_KEYCHAIN" || true
-          fi
-          if [ -n "${APPLE_API_KEY_PATH:-}" ]; then
-            rm -f "$APPLE_API_KEY_PATH"
-          fi
 
   # ── Step 4: assemble the cross-platform updater manifest, then publish ────
   # Build jobs intentionally skip latest.json to avoid a concurrent same-name
@@ -515,10 +431,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
-          fetch-depth: 0
 
-      - name: Download published macOS DMG and updater assets
-        id: published-assets
+      - name: Download published macOS DMG
         shell: bash
         env:
           REPO: ${{ github.repository }}
@@ -537,29 +451,6 @@ jobs:
             --retry 4 --retry-all-errors --retry-delay 3 \
             --output "$DMG_PATH" \
             "$PUBLIC_URL"
-          RELEASE_JSON="$RELEASE_DIR/release.json"
-          env -u GH_TOKEN curl \
-            --fail --location --silent --show-error \
-            --retry 4 --retry-all-errors --retry-delay 3 \
-            --output "$RELEASE_JSON" \
-            "https://api.github.com/repos/$REPO/releases/tags/$TAG"
-          for suffix in '.app.tar.gz' '.app.tar.gz.sig'; do
-            ASSET_URL="$(jq -er --arg suffix "$suffix" \
-              '[.assets[] | select(.name | endswith($suffix))] | if length == 1 then .[0].browser_download_url else error("expected exactly one " + $suffix) end' \
-              "$RELEASE_JSON")"
-            env -u GH_TOKEN curl \
-              --fail --location --silent --show-error \
-              --retry 4 --retry-all-errors --retry-delay 3 \
-              --remote-name --output-dir "$RELEASE_DIR" \
-              "$ASSET_URL"
-          done
-          env -u GH_TOKEN curl \
-            --fail --location --silent --show-error \
-            --retry 4 --retry-all-errors --retry-delay 3 \
-            --output "$RELEASE_DIR/latest.json" \
-            "https://github.com/$REPO/releases/download/$TAG/latest.json"
-          PREVIOUS_TAG="$(git describe --tags --abbrev=0 "${TAG}^")"
-          echo "previous_version=${PREVIOUS_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Verify published macOS release artifact
         shell: bash
@@ -580,23 +471,6 @@ jobs:
             DMG_PATH="$(find "$DMG_DIR" -type f -name '*.dmg' -print -quit)"
             scripts/verify-macos-release-artifact.sh "$DMG_PATH" "${RELEASE_TAG#v}"
           } 2>&1 | tee "$CODEFACTORY_RELEASE_EVIDENCE_DIR/verification.log"
-
-      - name: Verify published macOS updater from previous version
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.tag }}
-          PREVIOUS_VERSION: ${{ steps.published-assets.outputs.previous_version }}
-        run: |
-          set -euo pipefail
-          RELEASE_DIR="$RUNNER_TEMP/codefactory-published-release"
-          UPDATER_ARCHIVE="$(find "$RELEASE_DIR" -type f -name '*.app.tar.gz' -print -quit)"
-          UPDATER_SIGNATURE="$(find "$RELEASE_DIR" -type f -name '*.app.tar.gz.sig' -print -quit)"
-          scripts/verify-macos-updater-artifact.sh \
-            "$RELEASE_DIR/latest.json" \
-            "$UPDATER_ARCHIVE" \
-            "$UPDATER_SIGNATURE" \
-            "${RELEASE_TAG#v}" \
-            "$PREVIOUS_VERSION"
 
       - name: Upload published release GUI evidence
         if: always()

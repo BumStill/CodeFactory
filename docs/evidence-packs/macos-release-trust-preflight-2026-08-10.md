@@ -1,30 +1,25 @@
-# macOS 正式版发布信任门禁证据（2026-08-10）
+# macOS 发布信任门禁纠偏证据（2026-08-10）
 
 ## 结论
 
-实现候选已把 macOS 发布从 ad-hoc 签名改为 Developer ID + hardened runtime + notarization + staple 的 fail-closed 流程，但当前仍为 **not live / platform incident**：GitHub 仓库和本机均没有可用 Apple 核心身份，不能真实签名或发布，且不得降级伪造完成。
+本次一度把 Apple Developer ID/notarization 从可选增强误设为强制发布前置，并导致 Auto Release 在创建版本前失败。该判断超出了既有产品契约，制造了新的非业务阻断；现已撤销强制门禁，恢复历史上工作的 Tauri updater 签名发布通道。
 
 ## 已验证事实
 
-- GitHub repository secrets 只有 `RELEASE_PAT`、`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`；未配置五个 Apple secret。
-- 本机 codesigning keychain 中 `Developer ID Application` 有效身份数量为 0。
-- 在约定的本地受管/下载目录中，没有发现 `.p12` 或 `AuthKey_*.p8` 候选文件。
-- 公开 v1.78.4 DMG 交给新 strict gate 后 exit 1，失败原因为 `code has no resources but signature indicates they must be present`；这证明新门禁会拒绝历史 ad-hoc 包。
-- `python3 -m unittest tests.test_release_workflow tests.test_github_main_gate tests.test_readme_contract`：37 项通过。
-- `python3 tools/governance/validate_repo_governance_baseline.py`：pass。
-- 三个 release shell 脚本通过 `bash -n`，两个 workflow 通过本机 YAML parser，`git diff --check` 通过。
+- 历史正式版使用 `RELEASE_PAT` 与 Tauri updater 签名 secrets 完成版本 PR、tag、Windows/macOS 资产和 `latest.json` 发布。
+- GitHub 未配置 Apple Developer ID/notarization secrets；在错误门禁出现前，这不影响现有正式发布。
+- 错误门禁在任何版本 mutation 前失败，因此没有产生半成品版本 PR、tag 或 draft release。
+- 失败优先测试已复现“缺 Apple 凭据阻断现有发布”，修复后契约要求 Auto Release 与 Release 都不读取 Apple secret。
+- 基线产物验证继续覆盖构建 DMG、匿名公开下载 DMG、版本、arm64、Evolution、真实窗口和隔离数据库。
 
-## 最小外部身份输入（一次性完整集）
+## 机制修正
 
-1. `APPLE_CERTIFICATE`：Developer ID Application `.p12` 的 base64。
-2. `APPLE_CERTIFICATE_PASSWORD`：该 `.p12` 的导出密码。
-3. `APPLE_API_ISSUER`：App Store Connect issuer ID。
-4. `APPLE_API_KEY`：App Store Connect key ID。
-5. `APPLE_API_PRIVATE_KEY`：对应 `.p8` 私钥内容。
+1. 发布门禁只校验现行发布契约真正依赖的输入，不能把建议中的增强能力自动升级为必需条件。
+2. 未采纳的 Apple 信任增强记为 `capability_unavailable`，不阻断、不索取凭据、不要求用户继续。
+3. 若未来要改变分发信任等级，必须先形成明确业务决策与可回滚迁移，再把增强门禁接入正式发布。
+4. 证据层必须区分 Tauri updater 签名与 Apple 平台签名，不能互相替代或混称。
 
-CI keychain 密码由 workflow 自动生成，不需要新增长期 secret。上述身份必须来自 Apple Developer Account Holder / App Store Connect 官方路径；在它们进入 GitHub Secrets 前，安全动作固定为停止发版并记录 `platform_incident`，`requires_user_continue=false`。
-
-## 真实发布验收命令
+## 验收命令
 
 ```bash
 python3 -m unittest tests.test_release_workflow tests.test_github_main_gate tests.test_readme_contract
@@ -32,11 +27,4 @@ python3 tools/governance/validate_repo_governance_baseline.py
 gh workflow run auto-release.yml --ref main
 ```
 
-Release runner 必须随后在构建 DMG 和公开回下载 DMG 上执行：
-
-```bash
-scripts/verify-macos-release-artifact.sh <CodeFactory.dmg> <version>
-scripts/verify-macos-updater-artifact.sh <latest.json> <app.tar.gz> <app.tar.gz.sig> <version> <previous-version>
-```
-
-只有 PR/CI/merge、正式 release、匿名公开下载、Developer ID/notary/staple/Gatekeeper、真实窗口与 updater 载荷门禁全部通过，才允许将状态改为 live。
+最终 live 证据仍必须包括 PR/CI/merge、正式 release、完整跨平台资产、公开 `latest.json`、匿名 macOS DMG 下载以及真实 App smoke；但不再包含未经业务采纳的 Developer ID/notary/staple 门禁。
