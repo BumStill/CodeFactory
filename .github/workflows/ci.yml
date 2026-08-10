@@ -151,9 +151,6 @@ jobs:
           path: ${{ runner.temp }}/codefactory-resume-headless
           if-no-files-found: error
 
-      - name: Cargo check
-        if: ${{ !cancelled() }}
-        run: cargo check --manifest-path src-tauri/Cargo.toml
 
       # Run the Rust test suite. New regressions like the v0.3.7
       # "old sessions won't open" bug land here as failing tests so we
