@@ -153,7 +153,7 @@
 - 首次外部身份授权、OAuth/2FA/CAPTCHA 或不可替代生产账号授权；
 - 只有用户持有的文件、license、法律主体信息；
 - 用户浏览器的首次 extension pairing，且目标确实依赖现有登录态、managed browser 无法替代；
-- 发布签名材料确由外部 repo/admin 控制且没有受管 release identity。
+- 已批准发布契约真正要求的签名材料确由外部 repo/admin 控制且没有受管 release identity；未采纳的增强凭据不得据此阻断。
 
 当前缺口：这些路径大多只有自然语言错误，没有 `request_key`、完整 missing inputs、attempted routes、最小输入、resume stage、request_count=1 和 objective lease。
 

@@ -1,31 +1,30 @@
 # macOS 正式版发布信任：架构设计
 
-## 流程
+## 基线通道（当前生效）
 
 ```text
-Auto Release preflight
-  -> version PR / tag
-  -> Release preflight
-  -> ephemeral keychain imports Developer ID Application .p12
-  -> App Store Connect API key enables Tauri notarytool path
-  -> Tauri build signs + notarizes + staples App/DMG and signs updater archive
-  -> build DMG trust + GUI smoke
-  -> finalize publishes latest.json
-  -> anonymous re-download of DMG/latest.json/archive/.sig
-  -> public DMG trust + GUI smoke + updater payload trust
+Auto Release
+  -> version PR / required checks / tag
+  -> Tauri build + updater signature
+  -> build DMG real-app smoke
+  -> publish latest.json
+  -> anonymous public DMG download
+  -> public DMG real-app smoke
 ```
 
-## Secret contract
+基线通道只依赖现有 `RELEASE_PAT`、`TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。它不得读取或检查 Apple Developer ID/notarization 凭据。
 
-- `APPLE_CERTIFICATE`：Developer ID Application `.p12` 的 base64。
-- `APPLE_CERTIFICATE_PASSWORD`：`.p12` 导出密码。
-- `APPLE_API_ISSUER`：App Store Connect API issuer ID。
-- `APPLE_API_KEY`：App Store Connect key ID。
-- `APPLE_API_PRIVATE_KEY`：一次下载的 `.p8` 私钥内容。
-- 既有 `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 继续只负责 updater 签名，不能替代 Apple 平台签名。
+## 可选 Apple 信任增强（尚未启用）
 
-凭据只进入 GitHub secret env；CI 自动生成一次性 keychain 密码，证书导入一次性 keychain，notary key 写入 runner temp，job 结束 always 清理。preflight artifact 只含状态和缺失名称。
+Developer ID、公证与 stapling 若未来被业务明确采纳，应作为独立 capability 实现：
+
+1. 先在不影响基线发布的验证 workflow 中证明证书导入、hardened runtime、notary、staple 与 `spctl`。
+2. 对构建 DMG、公开回下载 DMG 和 updater App 验证同一身份与公证状态。
+3. 在凭据和真实产物证据稳定后，再通过显式配置切换发布策略。
+4. 配置缺失或增强验证失败时保持基线通道可用；只有产品契约明确要求增强通道时才 fail closed。
 
 ## 失败语义
 
-凭据缺失或无效、notary rejection、staple/codesign/spctl 失败均 fail closed。Auto Release 在版本 mutation 前阻断；Release 在 draft 创建前阻断。状态统一为 `platform_incident`，不转换为 `needs_user`。
+- 现有 updater 签名或真实产物验证失败：`platform_incident`，自动修复/重试，不能伪造发布。
+- Apple 可选能力未配置：`capability_unavailable`，非终态、非 blocker、不得请求用户继续。
+- 需要改变发布信任等级：`needs_business_decision`，仅在确实要采用该业务目标时提出一次完整决策。
