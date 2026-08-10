@@ -119,8 +119,14 @@ beforeEach(() => {
 
   mocks.invoke.mockImplementation(async (command: string) => {
     switch (command) {
-      case "browser_bridge_pairing":
-        return { port: 51789, token: "0123456789abcdef0123456789abcdef", connected: false };
+      case "browser_extension_prepare":
+        return {
+          dir: "C:\\Users\\Ada\\AppData\\Local\\CodeFactory\\browser\\extension",
+          port: 47615,
+          token: "0123456789abcdef0123456789abcdef",
+          connected: false,
+          chrome_available: true,
+        };
       case "browser_chromium_status":
         return { supported: true, installed: false };
       case "list_browser_sessions":
@@ -134,25 +140,80 @@ beforeEach(() => {
 });
 
 describe("browser bridge pairing panel", () => {
-  it("shows the port and token the extension needs", async () => {
+  it("prepares the extension itself instead of asking for a build command", async () => {
+    // The regression this guards: setup used to start with `pnpm ext:build`,
+    // which an installed app's user has no way to run.
     renderBrowserTab();
 
-    expect(await screen.findByText("51789")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith("browser_extension_prepare"),
+    );
     expect(
-      screen.getByText("0123456789abcdef0123456789abcdef"),
+      await screen.findByText(
+        "C:\\Users\\Ada\\AppData\\Local\\CodeFactory\\browser\\extension",
+      ),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/pnpm ext:build/)).not.toBeInTheDocument();
   });
 
-  it("copies a value to the clipboard and confirms it", async () => {
-    // The whole panel exists because the token has to cross to the browser by
-    // hand; a copy button that silently does nothing would be the worst bug.
+  it("does not ask the user to copy a pairing code", async () => {
+    // The port and token are written into the extension's folder by the app, so
+    // the main flow must not present them as something to carry across.
     renderBrowserTab();
-    await screen.findByText("51789");
+    await screen.findByRole("button", { name: "复制路径" });
 
-    await userEvent.click(screen.getAllByRole("button", { name: "复制" })[0]);
+    expect(screen.getByText(/不用复制任何东西/)).toBeInTheDocument();
+    // Still reachable for a store install, but folded away.
+    expect(screen.getByText("手动配对(一般不需要)")).toBeInTheDocument();
+  });
 
-    expect(mocks.writeText).toHaveBeenCalledWith("51789");
+  it("copies the folder path, which is the one value the user still needs", async () => {
+    renderBrowserTab();
+
+    await userEvent.click(await screen.findByRole("button", { name: "复制路径" }));
+
+    expect(mocks.writeText).toHaveBeenCalledWith(
+      "C:\\Users\\Ada\\AppData\\Local\\CodeFactory\\browser\\extension",
+    );
     expect(await screen.findByText("已复制")).toBeInTheDocument();
+  });
+
+  it("opens Chrome's extensions page and the folder on request", async () => {
+    // Both shortcuts exist so the remaining step is clicking, not navigating a
+    // path under AppData by hand.
+    renderBrowserTab();
+
+    await userEvent.click(await screen.findByRole("button", { name: "打开 Chrome 扩展页" }));
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_open_extensions_page");
+
+    await userEvent.click(screen.getByRole("button", { name: "打开扩展文件夹" }));
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_extension_reveal");
+  });
+
+  it("says what to do when there is no Chrome to open", async () => {
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "browser_open_extensions_page") {
+        throw new Error("No Chrome, Chromium or Edge was found to open.");
+      }
+      if (command === "browser_extension_prepare") {
+        return {
+          dir: "/home/ada/.codefactory/browser/extension",
+          port: 47615,
+          token: "t".repeat(32),
+          connected: false,
+          chrome_available: false,
+        };
+      }
+      if (command === "browser_chromium_status") return { supported: true, installed: false };
+      return [];
+    });
+    renderBrowserTab();
+
+    await userEvent.click(await screen.findByRole("button", { name: "打开 Chrome 扩展页" }));
+
+    expect(await screen.findByText(/No Chrome, Chromium or Edge was found/)).toBeInTheDocument();
+    // The path is still on screen, so the user can finish by hand.
+    expect(screen.getByText("/home/ada/.codefactory/browser/extension")).toBeInTheDocument();
   });
 
   // Slower than the rest on purpose: the panel polls every 5s because finishing
@@ -163,8 +224,14 @@ describe("browser bridge pairing panel", () => {
     expect(await screen.findByText("未连接")).toBeInTheDocument();
 
     mocks.invoke.mockImplementation(async (command: string) =>
-      command === "browser_bridge_pairing"
-        ? { port: 51789, token: "t".repeat(32), connected: true }
+      command === "browser_extension_prepare"
+        ? {
+            dir: "/home/ada/.codefactory/browser/extension",
+            port: 47615,
+            token: "t".repeat(32),
+            connected: true,
+            chrome_available: true,
+          }
         : command === "browser_chromium_status"
           ? { supported: true, installed: false }
           : [],
@@ -174,15 +241,22 @@ describe("browser bridge pairing panel", () => {
     await waitFor(() => expect(screen.getByText("已连接")).toBeInTheDocument(), {
       timeout: 8000,
     });
+    // Once connected there is nothing left to set up, so the instructions go away.
+    expect(screen.getByText(/重启后会自己恢复/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "复制路径" })).not.toBeInTheDocument();
   });
 
-  it("spells out the install steps, since they cannot be automated", async () => {
+  it("surfaces a folder that could not be prepared", async () => {
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "browser_extension_prepare") {
+        throw new Error("CodeFactory could not find a writable folder for the extension");
+      }
+      if (command === "browser_chromium_status") return { supported: true, installed: false };
+      return [];
+    });
     renderBrowserTab();
-    await screen.findByText("51789");
 
-    expect(screen.getByText(/pnpm ext:build/)).toBeInTheDocument();
-    expect(screen.getByText(/chrome:\/\/extensions/)).toBeInTheDocument();
-    expect(screen.getByText(/extension\/dist/)).toBeInTheDocument();
+    expect(await screen.findByText(/could not find a writable folder/)).toBeInTheDocument();
   });
 });
 
@@ -217,8 +291,14 @@ describe("managed chromium panel", () => {
     mocks.invoke.mockImplementation(async (command: string) =>
       command === "browser_chromium_status"
         ? { supported: true, installed: true, version: "151.0.7922.71" }
-        : command === "browser_bridge_pairing"
-          ? { port: 1, token: "t".repeat(32), connected: false }
+        : command === "browser_extension_prepare"
+          ? {
+              dir: "/home/ada/.codefactory/browser/extension",
+              port: 47615,
+              token: "t".repeat(32),
+              connected: false,
+              chrome_available: true,
+            }
           : [],
     );
     renderBrowserTab();
@@ -232,8 +312,14 @@ describe("managed chromium panel", () => {
     mocks.invoke.mockImplementation(async (command: string) =>
       command === "browser_chromium_status"
         ? { supported: true, installed: false, needs_repair: true }
-        : command === "browser_bridge_pairing"
-          ? { port: 1, token: "t".repeat(32), connected: false }
+        : command === "browser_extension_prepare"
+          ? {
+              dir: "/home/ada/.codefactory/browser/extension",
+              port: 47615,
+              token: "t".repeat(32),
+              connected: false,
+              chrome_available: true,
+            }
           : [],
     );
     renderBrowserTab();
@@ -247,8 +333,14 @@ describe("managed chromium panel", () => {
     mocks.invoke.mockImplementation(async (command: string) =>
       command === "browser_chromium_status"
         ? { supported: false }
-        : command === "browser_bridge_pairing"
-          ? { port: 1, token: "t".repeat(32), connected: false }
+        : command === "browser_extension_prepare"
+          ? {
+              dir: "/home/ada/.codefactory/browser/extension",
+              port: 47615,
+              token: "t".repeat(32),
+              connected: false,
+              chrome_available: true,
+            }
           : [],
     );
     renderBrowserTab();
@@ -260,8 +352,14 @@ describe("managed chromium panel", () => {
     mocks.invoke.mockImplementation(async (command: string) => {
       if (command === "browser_download_chromium") throw new Error("network unreachable");
       if (command === "browser_chromium_status") return { supported: true, installed: false };
-      if (command === "browser_bridge_pairing")
-        return { port: 1, token: "t".repeat(32), connected: false };
+      if (command === "browser_extension_prepare")
+        return {
+          dir: "/home/ada/.codefactory/browser/extension",
+          port: 47615,
+          token: "t".repeat(32),
+          connected: false,
+          chrome_available: true,
+        };
       return [];
     });
     renderBrowserTab();

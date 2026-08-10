@@ -10,7 +10,8 @@
 //
 // What it verifies that unit tests cannot:
 //   * the manifest loads in a real Chrome (permissions, MV3 service worker)
-//   * the service worker dials the loopback socket and completes the handshake
+//   * the service worker finds its pairing in the file the app writes into the
+//     extension folder, and dials the bridge with nothing typed in anywhere
 //   * chrome.scripting injection of the shared page.js works in a real page
 //   * list_tabs / read / find return real content from a real tab
 //   * a page-origin socket is refused by the Origin check
@@ -19,8 +20,8 @@
 
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
@@ -34,16 +35,76 @@ const fail = (message) => {
   process.exitCode = 1;
 };
 
-/** Locate the Chromium the app's installer downloaded. */
+const exists = async (path) => {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Where the managed install puts the executable, per platform.
+ *
+ * Mirrors `install::Platform::binary_relative_path`; if that ever moves, this
+ * check fails to find a browser and says so rather than passing vacuously.
+ */
+function managedRelativePath(version) {
+  const machine = platform();
+  const arch = process.arch === "arm64" ? "arm64" : "x64";
+  if (machine === "darwin") {
+    return join(
+      version,
+      `chrome-mac-${arch}`,
+      "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+    );
+  }
+  if (machine === "win32") return join(version, "chrome-win64", "chrome.exe");
+  return join(version, "chrome-linux64", "chrome");
+}
+
+/**
+ * Find a Chromium to drive.
+ *
+ * Ordered so the check can run wherever it is invoked: an explicit override, the
+ * browser the app manages (in either of the roots the installer may have used),
+ * then a Chromium the environment already provides. Hard-coding one platform's
+ * path is what previously made this "works on the author's machine only", which
+ * is the same class of problem as the install bug it is here to guard.
+ */
 async function chromiumBinary() {
-  const home = process.env.HOME;
-  const marker = join(home, ".codefactory/browser/chromium/.codefactory-chromium-version");
-  const version = (await readFile(marker, "utf8")).trim();
-  return join(
-    home,
-    ".codefactory/browser/chromium",
-    version,
-    "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+  if (process.env.CODEFACTORY_CHROME) return process.env.CODEFACTORY_CHROME;
+
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  const roots = [
+    process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "CodeFactory/browser/chromium"),
+    join(home, ".codefactory/browser/chromium"),
+    join(tmpdir(), "CodeFactory/browser/chromium"),
+  ].filter(Boolean);
+
+  for (const managedRoot of roots) {
+    const marker = join(managedRoot, ".codefactory-chromium-version");
+    if (!(await exists(marker))) continue;
+    const version = (await readFile(marker, "utf8")).trim();
+    const binary = join(managedRoot, managedRelativePath(version));
+    if (await exists(binary)) return binary;
+  }
+
+  // Environment-provided Chromium: what CI and the cloud dev containers have.
+  const fallbacks = [
+    process.env.PLAYWRIGHT_BROWSERS_PATH && join(process.env.PLAYWRIGHT_BROWSERS_PATH, "chromium"),
+    "/opt/pw-browsers/chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  ].filter(Boolean);
+  for (const candidate of fallbacks) {
+    if (await exists(candidate)) return candidate;
+  }
+
+  throw new Error(
+    "No Chromium found. Download the managed browser from Settings → Browser, or set CODEFACTORY_CHROME.",
   );
 }
 
@@ -201,23 +262,22 @@ const bridge = serveBridge();
 bridge.port = await bridge.portReady;
 log(`page on ${page.port}, bridge on ${bridge.port}`);
 
-// Preseed the extension's pairing so no options-page clicking is needed. The
-// storage is per-profile, so this writes into the throwaway profile only.
 const profile = await mkdtemp(join(tmpdir(), "cf-ext-"));
 
-// The service worker reads pairing from chrome.storage, which cannot be written
-// from outside the browser. So load a *copy* of the built extension with the
-// pairing prepended. Production code is untouched, and the seed lands before
-// connect() runs — which also exercises the real "re-connect when pairing
-// changes" path via the storage.onChanged listener.
+// Pair exactly the way the app does: write `pairing.json` into the extension's
+// own folder and let the service worker read it. This used to prepend a
+// `chrome.storage.local.set(...)` line to background.js, because pairing lived in
+// storage and nothing outside the browser can write there — so the check ran
+// against modified production code and could not have caught a broken pairing
+// path. Now the file *is* the mechanism, and a connection below is proof that a
+// user has nothing to copy.
 const binary = await chromiumBinary();
+log(`chromium: ${binary}`);
 const extension = join(profile, "ext");
 await cp(join(root, "extension/dist"), extension, { recursive: true });
-const backgroundPath = join(extension, "background.js");
 await writeFile(
-  backgroundPath,
-  `chrome.storage.local.set(${JSON.stringify({ port: bridge.port, token: TOKEN })});\n` +
-    (await readFile(backgroundPath, "utf8")),
+  join(extension, "pairing.json"),
+  JSON.stringify({ port: bridge.port, token: TOKEN, protocol_version: PROTOCOL_VERSION }),
 );
 const chrome = spawn(
   binary,
@@ -227,6 +287,7 @@ const chrome = spawn(
     `--disable-extensions-except=${extension}`,
     "--no-first-run",
     "--no-default-browser-check",
+    "--no-sandbox",
     "--headless=new",
     `http://127.0.0.1:${page.port}/`,
   ],
@@ -234,9 +295,8 @@ const chrome = spawn(
 );
 
 try {
-  // The service worker reads pairing from chrome.storage, which we cannot write
-  // from outside — so pair by driving the extension's own options page instead.
-  // `--load-extension` gives a stable id, discovered from the connection.
+  // No options page, no typing, no seeded storage: if this connects, the packaged
+  // pairing file is doing the whole job.
   await waitFor(() => bridge.state.socket, "extension to dial in and pair", 40000);
 
   const tabs = await bridge.state.call({ cmd: "list_tabs" });
@@ -290,5 +350,16 @@ try {
   chrome.kill("SIGKILL");
   bridge.server.close();
   page.server.close();
-  await rm(profile, { recursive: true, force: true });
+  // Chrome keeps writing to its profile for a moment after the signal, so a
+  // straight recursive delete loses a race with it and throws ENOTEMPTY — which
+  // would fail a run whose assertions all passed. Retry, then give up quietly: a
+  // leftover temp profile is not a result.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rm(profile, { recursive: true, force: true });
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
 }

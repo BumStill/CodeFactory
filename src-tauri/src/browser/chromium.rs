@@ -123,7 +123,7 @@ fn headless_requested() -> bool {
 /// Chromium-family only. These all speak the DevTools protocol the driver is
 /// built on; Firefox and Safari do not, so listing them here would produce a
 /// launch that fails later instead of an honest "not found" now.
-fn system_chrome() -> Option<PathBuf> {
+pub fn system_chrome() -> Option<PathBuf> {
     if let Some(path) = override_executable(std::env::var_os("CODEFACTORY_CHROME")) {
         return Some(path);
     }
@@ -212,9 +212,13 @@ impl ChromiumDriver {
     /// pages they are already signed into is what the extension path is for.
     fn executable() -> Result<PathBuf> {
         let platform = install::Platform::current();
-        let state = platform.and_then(|platform| {
-            let root = install::install_root()?;
-            Some(install::detect(&root, platform))
+        // Every candidate root, not just the preferred one: an install that landed
+        // in a fallback folder because the preferred one was not writable is still
+        // the browser the user downloaded, and ignoring it would silently fall
+        // through to a system Chrome — or to a download prompt for a browser that
+        // is already on disk.
+        let state = platform.map(|platform| {
+            install::detect_in_any(&install::install_root_candidates(), platform).1
         });
         if let Some(InstallState::Ready(found)) = state {
             return Ok(found.binary);

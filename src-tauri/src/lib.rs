@@ -604,6 +604,27 @@ pub fn run() {
                 }
             });
 
+            // Start the extension bridge as part of coming up, not on the first
+            // visit to Settings. An extension the user paired weeks ago is
+            // dialling for a listener the moment their browser is open, and
+            // starting here is also what refreshes the pairing file in the
+            // extension's folder — so a restart re-pairs itself instead of
+            // sending the user back to Settings to copy a new port.
+            tauri::async_runtime::spawn(async {
+                let bridge = std::sync::Arc::clone(&tools::browser_session::BRIDGE);
+                match bridge.start().await {
+                    Ok(pairing) => {
+                        tracing::info!("startup: browser extension bridge listening on {}", pairing.port)
+                    }
+                    Err(error) => {
+                        // Not fatal: everything except the extension backend works
+                        // without it, and Settings will report the failure if the
+                        // user goes looking.
+                        tracing::warn!("startup: could not start the extension bridge: {error}")
+                    }
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -632,6 +653,9 @@ pub fn run() {
             commands::browser_sessions::list_browser_sessions,
             commands::browser_sessions::close_browser_session,
             commands::browser_sessions::browser_bridge_pairing,
+            commands::browser_sessions::browser_extension_prepare,
+            commands::browser_sessions::browser_extension_reveal,
+            commands::browser_sessions::browser_open_extensions_page,
             commands::browser_sessions::browser_chromium_status,
             commands::browser_sessions::browser_download_chromium,
             commands::browser_sessions::embedded_browser_mount,

@@ -17,6 +17,7 @@
 //!
 //! [Chrome for Testing]: https://googlechromelabs.github.io/chrome-for-testing/
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Index of known-good builds, keyed by channel and platform.
@@ -84,38 +85,136 @@ impl Platform {
 /// Directory segment used for browser cache storage.
 const BROWSER_CACHE_SEGMENTS: &[&str] = &["browser", "chromium"];
 
-/// Where downloaded browsers live.
-///
-/// On Windows installed apps may run from `Program Files` and user profiles may
-/// be redirected or locked down; the fallback browser must therefore live under
-/// the per-user LocalAppData tree (`%LOCALAPPDATA%\CodeFactory\browser\chromium`)
-/// instead of the app install directory or process working directory.
-/// Non-Windows keeps the historical `~/.codefactory/browser/chromium` location.
-pub fn install_root() -> Option<PathBuf> {
-    install_root_from_dirs(dirs::data_local_dir(), dirs::home_dir())
-}
-
-fn install_root_from_dirs(local_data_dir: Option<PathBuf>, home_dir: Option<PathBuf>) -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        local_data_dir
-            .map(|dir| append_segments(dir.join("CodeFactory"), BROWSER_CACHE_SEGMENTS))
-            .or_else(|| {
-                home_dir.map(|home| append_segments(home.join(".codefactory"), BROWSER_CACHE_SEGMENTS))
-            })
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = local_data_dir;
-        home_dir.map(|home| append_segments(home.join(".codefactory"), BROWSER_CACHE_SEGMENTS))
-    }
-}
-
 fn append_segments(mut root: PathBuf, segments: &[&str]) -> PathBuf {
     for segment in segments {
         root.push(segment);
     }
     root
+}
+
+/// Every location the managed browser is allowed to live in, best first.
+///
+/// One path is not enough on Windows. `%LOCALAPPDATA%` is the right answer for a
+/// normal machine, but it is also the folder most likely to be redirected onto a
+/// network share, synced by OneDrive's Known Folder Move, or covered by
+/// Controlled Folder Access — all of which turn "unpack a browser here" into an
+/// access-denied error that no amount of retrying fixes. Having a second and
+/// third candidate means such a machine ends up with a working browser in a
+/// slightly less tidy place instead of no browser at all.
+///
+/// Ordering is deliberate: the historical location per platform first (so an
+/// existing install keeps being found), then the user's home, then the temp
+/// tree, which is the last place that is essentially always writable.
+pub fn install_root_candidates() -> Vec<PathBuf> {
+    install_root_candidates_from(
+        dirs::data_local_dir(),
+        dirs::home_dir(),
+        Some(std::env::temp_dir()),
+    )
+}
+
+fn install_root_candidates_from(
+    local_data_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+    temp_dir: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let local = local_data_dir
+        .map(|dir| append_segments(dir.join("CodeFactory"), BROWSER_CACHE_SEGMENTS));
+    let home =
+        home_dir.map(|home| append_segments(home.join(".codefactory"), BROWSER_CACHE_SEGMENTS));
+    let temp = temp_dir.map(|dir| append_segments(dir.join("CodeFactory"), BROWSER_CACHE_SEGMENTS));
+
+    #[cfg(target_os = "windows")]
+    let ordered = [local, home, temp];
+    #[cfg(not(target_os = "windows"))]
+    let ordered = [home, local, temp];
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for candidate in ordered.into_iter().flatten() {
+        if !roots.contains(&candidate) {
+            roots.push(candidate);
+        }
+    }
+    roots
+}
+
+/// Why a candidate root could not be used, for a message that names the paths.
+#[derive(Debug, Clone)]
+pub struct RootAttempt {
+    pub root: PathBuf,
+    pub reason: String,
+}
+
+/// The first candidate root this process can really write to.
+///
+/// Called *before* the download so a locked-down directory costs a message, not
+/// 150 MB followed by a permission error at the very last step.
+pub fn first_writable_root(candidates: &[PathBuf]) -> Result<PathBuf, Vec<RootAttempt>> {
+    let mut attempts = Vec::new();
+    for root in candidates {
+        match probe_writable(root) {
+            Ok(()) => return Ok(root.clone()),
+            Err(error) => attempts.push(RootAttempt {
+                root: root.clone(),
+                reason: error.to_string(),
+            }),
+        }
+    }
+    Err(attempts)
+}
+
+/// Explain a total failure to find a writable root, naming what was tried.
+pub fn unwritable_message(attempts: &[RootAttempt]) -> String {
+    let tried = attempts
+        .iter()
+        .map(|attempt| format!("  {} — {}", attempt.root.display(), attempt.reason))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "CodeFactory could not find a writable folder for the browser. Tried:\n{tried}\n\
+         Grant write access to one of these folders (on Windows, an anti-virus \
+         \"controlled folder access\" rule or a redirected AppData folder is the usual cause) \
+         and start the download again."
+    )
+}
+
+/// Prove a directory is usable by doing the things the install actually does.
+///
+/// Creating a file is not a sufficient test. The step that fails on Windows is
+/// the *directory rename* that moves a finished extract into place, which can be
+/// refused when a file write would have succeeded — so the probe renames a
+/// directory too, and does it before the download rather than after.
+fn probe_writable(root: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)?;
+
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default()
+    );
+    let staging = root.join(format!(".codefactory-probe-{unique}"));
+    let renamed = root.join(format!(".codefactory-probe-{unique}-moved"));
+
+    // Clean up whatever a previous interrupted probe left behind, so a stale
+    // directory cannot make a writable root look broken.
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_dir_all(&renamed);
+
+    let result = (|| -> std::io::Result<()> {
+        std::fs::create_dir(&staging)?;
+        let mut file = std::fs::File::create(staging.join("probe"))?;
+        file.write_all(b"codefactory")?;
+        drop(file);
+        std::fs::rename(&staging, &renamed)?;
+        Ok(())
+    })();
+
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_dir_all(&renamed);
+    result
 }
 
 /// Directory for one version, so an upgrade doesn't clobber a working install.
@@ -165,6 +264,42 @@ pub fn detect(root: &Path, platform: Platform) -> InstallState {
         InstallState::Missing {
             previous: Some(version),
         }
+    }
+}
+
+/// Look for a usable browser in any of the candidate roots.
+///
+/// The install can legitimately live in a fallback root — either because the
+/// preferred one was not writable when it was downloaded, or because it predates
+/// a change in the preferred location. Searching all of them is what stops the
+/// app from re-downloading 150 MB it already has, and keeps Settings' "installed"
+/// badge honest about a browser that is genuinely there.
+///
+/// Returns the root it was found in alongside the state, so a repair writes back
+/// where the broken install already is instead of splitting it across two trees.
+pub fn detect_in_any(candidates: &[PathBuf], platform: Platform) -> (Option<PathBuf>, InstallState) {
+    let mut repairable: Option<(PathBuf, String)> = None;
+    for root in candidates {
+        match detect(root, platform) {
+            InstallState::Ready(found) => return (Some(root.clone()), InstallState::Ready(found)),
+            InstallState::Missing { previous: Some(version) } => {
+                // Remember the first repairable install but keep looking: a
+                // complete install in a later root beats repairing this one.
+                if repairable.is_none() {
+                    repairable = Some((root.clone(), version));
+                }
+            }
+            InstallState::Missing { previous: None } => {}
+        }
+    }
+    match repairable {
+        Some((root, version)) => (
+            Some(root),
+            InstallState::Missing {
+                previous: Some(version),
+            },
+        ),
+        None => (None, InstallState::Missing { previous: None }),
     }
 }
 
@@ -331,7 +466,10 @@ mod tests {
     fn install_root_policy_uses_windows_local_app_data_when_available() {
         let local = PathBuf::from(r"C:\Users\Ada\AppData\Local");
         let home = PathBuf::from(r"C:\Users\Ada");
-        let root = install_root_from_dirs(Some(local), Some(home)).expect("install root");
+        let root = install_root_candidates_from(Some(local), Some(home), None)
+            .into_iter()
+            .next()
+            .expect("install root");
 
         #[cfg(target_os = "windows")]
         assert_eq!(
@@ -356,7 +494,9 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let local = cwd.join("Program Files").join("CodeFactory");
         let home = PathBuf::from(r"C:\Users\Ada");
-        let root = install_root_from_dirs(Some(local.clone()), Some(home.clone())).expect("install root");
+        let candidates =
+            install_root_candidates_from(Some(local.clone()), Some(home.clone()), None);
+        let root = candidates.first().expect("install root");
 
         #[cfg(target_os = "windows")]
         {
@@ -365,6 +505,159 @@ mod tests {
         }
         #[cfg(not(target_os = "windows"))]
         assert!(root.starts_with(&home));
+        // Whichever platform: no candidate may be derived from the process's
+        // working directory, which an installed app cannot rely on.
+        for candidate in &candidates {
+            assert!(
+                candidate.starts_with(&local) || candidate.starts_with(&home),
+                "{candidate:?} came from somewhere other than the configured roots"
+            );
+        }
+    }
+
+    #[test]
+    fn the_preferred_root_comes_first_and_a_fallback_always_exists() {
+        let candidates = install_root_candidates_from(
+            Some(PathBuf::from(r"C:\Users\Ada\AppData\Local")),
+            Some(PathBuf::from(r"C:\Users\Ada")),
+            Some(PathBuf::from(r"C:\Temp")),
+        );
+
+        // A single root is the bug this exists to fix: when the first choice is
+        // not writable there has to be somewhere else to go.
+        assert!(candidates.len() >= 2, "a fallback root must exist: {candidates:?}");
+        // Compared as text rather than with `starts_with`, which is component-wise
+        // and so cannot match a Windows-shaped prefix when the test runs on Linux.
+        let first = candidates[0].to_string_lossy().to_string();
+        #[cfg(target_os = "windows")]
+        assert!(first.contains("AppData"), "{first}");
+        #[cfg(not(target_os = "windows"))]
+        assert!(first.contains(".codefactory"), "{first}");
+        assert!(
+            candidates
+                .iter()
+                .any(|root| root.to_string_lossy().contains("Temp")),
+            "the temp tree must be a candidate: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_roots_are_not_repeated_when_two_sources_agree() {
+        // dirs can resolve two of these to the same place; probing it twice would
+        // report the same failure twice in the error message.
+        let same = PathBuf::from("/home/ada");
+        let candidates =
+            install_root_candidates_from(Some(same.clone()), Some(same.clone()), Some(same));
+        let mut unique = candidates.clone();
+        unique.dedup();
+        assert_eq!(candidates.len(), unique.len());
+    }
+
+    #[test]
+    fn an_unusable_root_is_skipped_before_anything_is_downloaded() {
+        // A path blocked by a *file* where a directory has to go fails identically
+        // for every user on every platform, which is what makes this testable at
+        // all — the real cause on Windows is a permission rule we cannot install.
+        let base = tempfile::tempdir().unwrap();
+        let blocked = base.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let usable = base.path().join("usable");
+
+        let chosen = first_writable_root(&[blocked.join("chromium"), usable.clone()])
+            .expect("the second root is usable");
+
+        assert_eq!(chosen, usable);
+        assert!(usable.is_dir(), "the chosen root is created, ready to use");
+    }
+
+    #[test]
+    fn no_writable_root_names_every_path_it_tried() {
+        // The user has to be able to act on this, which means knowing which
+        // folders to unblock.
+        let base = tempfile::tempdir().unwrap();
+        let blocker = base.path().join("blocked");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let attempts = first_writable_root(&[blocker.join("a"), blocker.join("b")])
+            .expect_err("both roots are unusable");
+        let message = unwritable_message(&attempts);
+
+        assert_eq!(attempts.len(), 2);
+        assert!(message.contains("blocked"));
+        assert!(message.contains(&blocker.join("a").display().to_string()));
+        assert!(message.contains(&blocker.join("b").display().to_string()));
+    }
+
+    #[test]
+    fn the_probe_leaves_nothing_behind_in_a_root_it_approves() {
+        let root = tempfile::tempdir().unwrap();
+        probe_writable(root.path()).expect("a temp dir is writable");
+        let leftovers: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .collect();
+        assert!(leftovers.is_empty(), "probe left {leftovers:?} behind");
+    }
+
+    #[test]
+    fn an_install_in_a_fallback_root_is_found_instead_of_downloaded_again() {
+        let base = tempfile::tempdir().unwrap();
+        let preferred = base.path().join("preferred");
+        let fallback = base.path().join("fallback");
+        let binary =
+            version_dir(&fallback, "151.0.7922.47").join(Platform::Linux64.binary_relative_path());
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+        write_marker(&fallback, "151.0.7922.47").unwrap();
+
+        let (root, state) = detect_in_any(&[preferred, fallback.clone()], Platform::Linux64);
+
+        assert_eq!(root, Some(fallback));
+        assert_eq!(
+            state,
+            InstallState::Ready(ChromiumInstall {
+                version: "151.0.7922.47".into(),
+                binary,
+            })
+        );
+    }
+
+    #[test]
+    fn a_complete_install_wins_over_a_broken_one_in_an_earlier_root() {
+        // Otherwise a half-extracted install in LocalAppData would send the user
+        // through a "repair" that re-downloads a browser they already have.
+        let base = tempfile::tempdir().unwrap();
+        let broken = base.path().join("broken");
+        write_marker(&broken, "150.0.0.1").unwrap();
+        let good = base.path().join("good");
+        let binary =
+            version_dir(&good, "151.0.7922.47").join(Platform::Linux64.binary_relative_path());
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+        write_marker(&good, "151.0.7922.47").unwrap();
+
+        let (root, state) = detect_in_any(&[broken, good.clone()], Platform::Linux64);
+
+        assert_eq!(root, Some(good));
+        assert!(matches!(state, InstallState::Ready(_)));
+    }
+
+    #[test]
+    fn a_broken_install_is_reported_for_repair_where_it_lives() {
+        let base = tempfile::tempdir().unwrap();
+        let empty = base.path().join("empty");
+        let broken = base.path().join("broken");
+        write_marker(&broken, "151.0.7922.47").unwrap();
+
+        let (root, state) = detect_in_any(&[empty, broken.clone()], Platform::Linux64);
+
+        assert_eq!(root, Some(broken));
+        assert_eq!(
+            state,
+            InstallState::Missing {
+                previous: Some("151.0.7922.47".into())
+            }
+        );
     }
 
     #[test]

@@ -1834,19 +1834,36 @@ function AppearanceTab() {
 
 // ── BrowserBridgePanel — pairing the extension with the user's own browser ───
 //
-// The extension cannot read a file on disk, so the port and token have to cross
-// by hand exactly once. Showing them here — rather than asking the user to dig
-// through a config file — is the whole point of this panel.
+// Setup used to be four manual steps, one of which needed a repository checkout
+// and a build command, and it had to be redone after every restart because both
+// the port and the pairing token were per-process. The app now writes the
+// extension out itself with the pairing already inside it, so this panel exists
+// to do that in one click and then get out of the way.
+//
+// The one step that cannot be automated is loading an unpacked extension: Chrome
+// reserves that for a human on purpose, and the alternatives (an enterprise
+// force-install policy, a registry key) need administrator rights. So the panel
+// aims to make it the *only* step — open the folder, open the extensions page,
+// nothing to type.
 function BrowserBridgePanel() {
-  const [pairing, setPairing] = useState<
-    { port: number; token: string; connected: boolean } | null
-  >(null);
+  const [state, setState] = useState<{
+    dir: string;
+    port: number;
+    token: string;
+    connected: boolean;
+    chrome_available: boolean;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState<"port" | "token" | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [copied, setCopied] = useState<"dir" | "port" | "token" | null>(null);
 
+  // Preparing is idempotent and writes only what changed, so it is safe to do on
+  // mount: opening this panel is a good enough signal that the user wants the
+  // extension ready, and it means the pairing file is refreshed for an extension
+  // that is already installed.
   const load = async () => {
     try {
-      setPairing(await invoke("browser_bridge_pairing"));
+      setState(await invoke("browser_extension_prepare"));
       setError(null);
     } catch (loadError) {
       setError(String(loadError));
@@ -1855,16 +1872,27 @@ function BrowserBridgePanel() {
 
   useEffect(() => {
     void load();
-    // Connection state changes when the user finishes pairing in Chrome, and
-    // there is no event for that — a slow poll is honest and cheap.
+    // Connection state changes when the user finishes loading the extension in
+    // Chrome, and there is no event for that — a slow poll is honest and cheap.
     const timer = setInterval(() => void load(), 5000);
     return () => clearInterval(timer);
   }, []);
 
-  const copy = async (what: "port" | "token", value: string) => {
+  const copy = async (what: "dir" | "port" | "token", value: string) => {
     await navigator.clipboard.writeText(value);
     setCopied(what);
     setTimeout(() => setCopied(null), 1500);
+  };
+
+  const run = async (command: string, failureNote: string) => {
+    setNotice(null);
+    try {
+      await invoke(command);
+    } catch (commandError) {
+      // A missing Chrome or file manager is a fact to state, not an error that
+      // should replace the panel's own status.
+      setNotice(`${failureNote}${commandError}`);
+    }
   };
 
   return (
@@ -1878,57 +1906,87 @@ function BrowserBridgePanel() {
         </div>
         <span
           className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] ${
-            pairing?.connected
+            state?.connected
               ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400"
               : "bg-surface-3 text-gray-500"
           }`}
         >
-          {pairing?.connected ? "已连接" : "未连接"}
+          {state?.connected ? "已连接" : "未连接"}
         </span>
       </div>
 
-      {error && (
-        <p className="text-xs leading-5 text-rose-500">{error}</p>
-      )}
+      {error && <p className="text-xs leading-5 text-rose-500">{error}</p>}
 
-      {pairing && (
-        <>
-          <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded-md border border-border/70 bg-surface-2 p-2.5 text-xs">
-            <span className="text-gray-500">端口</span>
-            <span className="font-mono text-gray-200">{pairing.port}</span>
-            <button
-              type="button"
-              onClick={() => void copy("port", String(pairing.port))}
-              className="rounded border border-border px-2 py-0.5 text-[11px] text-gray-400 hover:text-gray-200"
-            >
-              {copied === "port" ? "已复制" : "复制"}
-            </button>
+      {state?.connected ? (
+        <p className="text-xs leading-5 text-gray-500">
+          扩展已连接,配对信息由 CodeFactory 自动维护——重启后会自己恢复,不需要再填端口或配对码。
+        </p>
+      ) : (
+        state && (
+          <>
+            <p className="text-xs leading-5 text-gray-500">
+              扩展已准备好(配对信息已经写进去了,不用复制任何东西)。只剩 Chrome 那一步:开启
+              「开发者模式」→ 点「加载已解压的扩展程序」→ 选下面这个目录。
+            </p>
 
-            <span className="text-gray-500">配对码</span>
-            <span className="truncate font-mono text-gray-200">{pairing.token}</span>
-            <button
-              type="button"
-              onClick={() => void copy("token", pairing.token)}
-              className="rounded border border-border px-2 py-0.5 text-[11px] text-gray-400 hover:text-gray-200"
-            >
-              {copied === "token" ? "已复制" : "复制"}
-            </button>
-          </div>
+            <div className="flex items-center gap-2 rounded-md border border-border/70 bg-surface-2 p-2.5">
+              <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-gray-300">
+                {state.dir}
+              </span>
+              <button
+                type="button"
+                onClick={() => void copy("dir", state.dir)}
+                className="shrink-0 rounded border border-border px-2 py-0.5 text-[11px] text-gray-400 hover:text-gray-200"
+              >
+                {copied === "dir" ? "已复制" : "复制路径"}
+              </button>
+            </div>
 
-          <ol className="ml-4 list-decimal space-y-1 text-xs leading-5 text-gray-500">
-            <li>
-              在项目里运行 <span className="font-mono text-gray-400">pnpm ext:build</span>
-            </li>
-            <li>
-              Chrome 打开 <span className="font-mono text-gray-400">chrome://extensions</span>,
-              开启右上角「开发者模式」
-            </li>
-            <li>
-              点「加载已解压的扩展程序」,选 <span className="font-mono text-gray-400">extension/dist</span>
-            </li>
-            <li>点扩展图标,把上面的端口和配对码填进去</li>
-          </ol>
-        </>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void run("browser_open_extensions_page", "打不开 Chrome 扩展页：")}
+                className="rounded bg-accent px-2.5 py-1 text-xs text-white hover:bg-accent-hover"
+              >
+                打开 Chrome 扩展页
+              </button>
+              <button
+                type="button"
+                onClick={() => void run("browser_extension_reveal", "打不开文件夹：")}
+                className="rounded border border-border px-2.5 py-1 text-xs text-gray-300 hover:text-gray-100"
+              >
+                打开扩展文件夹
+              </button>
+            </div>
+
+            {notice && <p className="text-xs leading-5 text-amber-500">{notice}</p>}
+
+            <details className="text-xs text-gray-500">
+              <summary className="cursor-pointer">手动配对(一般不需要)</summary>
+              <div className="mt-2 grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded-md border border-border/70 bg-surface-2 p-2.5">
+                <span className="text-gray-500">端口</span>
+                <span className="font-mono text-gray-200">{state.port}</span>
+                <button
+                  type="button"
+                  onClick={() => void copy("port", String(state.port))}
+                  className="rounded border border-border px-2 py-0.5 text-[11px] text-gray-400 hover:text-gray-200"
+                >
+                  {copied === "port" ? "已复制" : "复制"}
+                </button>
+
+                <span className="text-gray-500">配对码</span>
+                <span className="truncate font-mono text-gray-200">{state.token}</span>
+                <button
+                  type="button"
+                  onClick={() => void copy("token", state.token)}
+                  className="rounded border border-border px-2 py-0.5 text-[11px] text-gray-400 hover:text-gray-200"
+                >
+                  {copied === "token" ? "已复制" : "复制"}
+                </button>
+              </div>
+            </details>
+          </>
+        )
       )}
     </div>
   );

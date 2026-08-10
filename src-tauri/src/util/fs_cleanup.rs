@@ -65,15 +65,85 @@ pub async fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
     let mut backoff = FIRST_BACKOFF;
 
     loop {
-        match std::fs::remove_dir_all(path) {
+        match attempt_removal(path) {
             Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
                 if !is_transient(&error) || Instant::now() + backoff >= deadline {
                     return Err(error);
                 }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+/// [`remove_dir_all_with_retry`] for callers that are already on a blocking
+/// thread.
+///
+/// The browser installer needs this: unpacking 150 MB and moving it into place
+/// runs under `spawn_blocking`, and the removal it has to survive is the same
+/// Windows handle race — a scanner reading the `chrome.exe` that was written a
+/// moment ago. Sharing the classification and the budget with the async version
+/// keeps one policy for "the filesystem has not let go yet" rather than two that
+/// drift.
+pub fn remove_dir_all_blocking(path: &Path) -> std::io::Result<()> {
+    let deadline = Instant::now() + TOTAL_BUDGET;
+    let mut backoff = FIRST_BACKOFF;
+
+    loop {
+        match attempt_removal(path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if !is_transient(&error) || Instant::now() + backoff >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+/// One removal attempt, with the read-only attribute cleared first if needed.
+///
+/// Windows refuses to delete a file carrying `FILE_ATTRIBUTE_READONLY`, and a zip
+/// entry can arrive with it set — a case no amount of waiting resolves, so it is
+/// handled here rather than treated as a transient failure. Clearing is only
+/// attempted after a failure, so the overwhelmingly common case stays a single
+/// `remove_dir_all` call.
+fn attempt_removal(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            clear_read_only(path);
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => Ok(()),
+                Err(second) if second.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                // Report the original error: it describes why the removal failed
+                // before we started changing attributes.
+                Err(_) => Err(error),
+            }
+        }
+    }
+}
+
+/// Clear the read-only attribute across a tree so deletion can proceed.
+fn clear_read_only(path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    let mut permissions = metadata.permissions();
+    if permissions.readonly() {
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(path, permissions);
+    }
+    if metadata.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                clear_read_only(&entry.path());
             }
         }
     }
@@ -154,6 +224,32 @@ mod tests {
     async fn removes_a_populated_directory() {
         let root = fixture_root("basic");
         remove_dir_all_with_retry(&root).await.unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn the_blocking_flavour_removes_the_same_tree() {
+        // Used by the browser installer, which runs on a blocking thread and
+        // cannot await.
+        let root = fixture_root("blocking");
+        remove_dir_all_blocking(&root).unwrap();
+        assert!(!root.exists());
+        // Idempotent, like the async one: an already-gone path is success.
+        remove_dir_all_blocking(&root).unwrap();
+    }
+
+    #[test]
+    fn a_read_only_file_does_not_block_removal() {
+        // Windows refuses to delete a read-only file, and archives can set that
+        // attribute. Waiting would never fix it, so the attribute is cleared.
+        let root = fixture_root("readonly");
+        let file = root.join("nested").join("file.txt");
+        let mut permissions = std::fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&file, permissions).unwrap();
+
+        remove_dir_all_blocking(&root).unwrap();
+
         assert!(!root.exists());
     }
 
