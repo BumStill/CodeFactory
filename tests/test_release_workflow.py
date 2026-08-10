@@ -244,6 +244,21 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "clear it. Either make the build use it, or drop the gate.",
         )
 
+    # `cargo check` and `cargo test` ran over the identical manifest with no
+    # `-p` filter, so the same code was compiled twice: `cargo test` cannot run
+    # without compiling, which makes the separate check step 62s of pure
+    # duplication in a 583s job. Measured on run 31354756400.
+    def test_ci_does_not_compile_the_rust_workspace_twice(self) -> None:
+        ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "cargo check --manifest-path src-tauri/Cargo.toml",
+            ci,
+            "`cargo test` over the same manifest already compiles everything; a "
+            "separate unscoped `cargo check` only pays the compile cost twice.",
+        )
+        # The coverage it was standing in for must still be there.
+        self.assertIn("cargo test --manifest-path src-tauri/Cargo.toml", ci)
+
     def test_auto_release_dispatches_tag_from_main_for_shared_cache_scope(self) -> None:
         release = (REPO_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
@@ -407,7 +422,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         steps = self._check_job_steps()
 
         rust_steps = [
-            "Cargo check",
+            # `Cargo check` intentionally absent: `Cargo test` compiles the same
+            # manifest, so a separate check step only doubled the compile cost.
             "Cargo test",
             "Cargo test (agent-loop crate)",
             "Cargo test (agent-headless crate)",
