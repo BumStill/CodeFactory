@@ -62,7 +62,7 @@
 
 ## 未修的系统性缺口（按严重度）
 
-### 1. `MAX_ATTEMPTS = 2` 把可恢复失败转成终局
+### ~~1. `MAX_ATTEMPTS = 2` 把可恢复失败转成终局~~（本 PR 已修）
 
 `policy.rs::recoverable_delivery_prompt`：
 
@@ -85,7 +85,7 @@ if tool_name != "deliver_changes" || (!is_retryable_wait && attempts >= MAX_ATTE
 
 `WaitRetryable` 已有退避续跑机制，但仍有等待落到终局。需要确认这些是分类打错，还是退避次数耗尽后转终局——若是后者，与第 1 条同源。
 
-### 4. 框架层的兜底提示仍是「不要重试」
+### ~~4. 框架层的兜底提示仍是「不要重试」~~（本 PR 已修）
 
 `run.rs` 在 `blocked_tool_result` 为真时注入：
 
@@ -94,6 +94,17 @@ if tool_name != "deliver_changes" || (!is_retryable_wait && attempts >= MAX_ATTE
 只要第 1 条还在，这句话就会在非业务阻断上生效，把「本可继续」硬变成「必须收工」。修完第 1 条后，这句话应当只在 `UserActionRequired` 时出现。
 
 ---
+
+## 已修（第 1、4 条）
+
+判据从「固定次数」改为「**失败签名是否变化**」：签名为
+`{code}|{stage}|{reached_state}|{commit_sha}`，其中 `commit_sha` 是关键——推了修复就
+说明 head 动了，下一次结论尚未可知，即便报错文字相同也算进展。**唯一的停是「同一个
+失败在同一个 head 上原地重复」**。等待类永不终止：它的签名按设计就会重复，而推进它
+的执行者是 GitHub。
+
+终局提示同步改写，明说触发条件是「同一失败在未改变的 head 上重复，或需要用户提供
+只有用户能给的输入」，并要求指出**需要用户做的那一件具体事**。
 
 ## 建议的下一步顺序
 

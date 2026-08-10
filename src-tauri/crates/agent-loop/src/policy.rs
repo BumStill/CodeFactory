@@ -679,22 +679,59 @@ pub struct DeliveryRecoveryAction {
     pub prompt: String,
     pub retry_after: std::time::Duration,
     pub counts_as_repair_attempt: bool,
+    /// What failed, and on which head. The caller hands the previous one back
+    /// so repair is judged by CHANGE rather than by depth.
+    pub signature: String,
 }
 
+/// `{code}|{stage}|{reached_state}|{commit_sha}` — the identity of a failure.
+///
+/// `commit_sha` is the load-bearing part: pushing a fix moves the head, so the
+/// next verdict is genuinely unknown even when the message text repeats.
+fn delivery_failure_signature(metadata: &serde_json::Value) -> String {
+    let field = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    format!(
+        "{}|{}|{}|{}",
+        field("code"),
+        field("stage"),
+        field("reached_state"),
+        field("commit_sha")
+    )
+}
+
+/// Decide whether a blocked/waiting delivery should keep going.
+///
+/// **Progress, not depth, is the criterion.** A fixed `MAX_ATTEMPTS = 2` used to
+/// end the turn here, so a CI failure that needed a third fix became a terminal
+/// block — non-business blocking, which this product forbids. A count cannot
+/// tell "actively repairing" from "spinning"; the failure signature can, and
+/// pushing a fix moves `commit_sha` so even a repeated message on a new head
+/// still reads as progress.
+///
+/// The only stop is an IDENTICAL failure on an UNCHANGED head. Waits never
+/// stop: their signature repeats by design and GitHub is the actor that ends
+/// them. The loop's own iteration and segment ceilings stay the backstop
+/// against a pathological run.
 pub fn recoverable_delivery_prompt(
     tool_name: &str,
     metadata: &serde_json::Value,
-    attempts: u8,
+    previous_signature: Option<&str>,
 ) -> Option<DeliveryRecoveryAction> {
-    const MAX_ATTEMPTS: u8 = 2;
     const MAX_RETRY_AFTER_MS: u64 = 60_000;
     let recovery_class = metadata
         .get("recovery_class")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("agent_action_required");
     let is_retryable_wait = recovery_class == "wait_retryable";
+    let signature = delivery_failure_signature(metadata);
+    let spinning = !is_retryable_wait && previous_signature == Some(signature.as_str());
     if tool_name != "deliver_changes"
-        || (!is_retryable_wait && attempts >= MAX_ATTEMPTS)
+        || spinning
         || metadata
             .get("recoverable")
             .and_then(serde_json::Value::as_bool)
@@ -730,17 +767,18 @@ pub fn recoverable_delivery_prompt(
         )
     } else {
         format!(
-            "受控交付返回可恢复状态 `{code}`。这是第 {}/{} 次有界修复，不是终态，也不是权限问题。\
+            "受控交付返回可恢复状态 `{code}`。这不是终态，也不是权限问题。\
 立即执行下面的恢复动作；若修改了代码或正文，完成验证后再次调用 deliver_changes 续接同一 PR。\
-恢复过程必须保留 required checks，并继续使用受控交付；禁止 --admin、force push 和门禁绕过。\n恢复动作：{next_action}",
-            attempts + 1,
-            MAX_ATTEMPTS
+只要每次尝试都改变了失败签名或推进了 head，就继续修下去——没有次数上限，\
+只有「同一个失败在同一个 head 上原地重复」才是真的走不下去。\
+恢复过程必须保留 required checks，并继续使用受控交付；禁止 --admin、force push 和门禁绕过。\n恢复动作：{next_action}"
         )
     };
     Some(DeliveryRecoveryAction {
         prompt,
         retry_after,
         counts_as_repair_attempt: !is_retryable_wait,
+        signature,
     })
 }
 
@@ -869,18 +907,18 @@ mod tests {
             "pr_url": "https://example.test/pull/7"
         });
 
-        let first = recoverable_delivery_prompt("deliver_changes", &metadata, 0)
+        let first = recoverable_delivery_prompt("deliver_changes", &metadata, None)
             .expect("the first recovery must continue the delivery loop");
         assert!(first.prompt.contains("读取失败 check"));
         assert!(first.prompt.contains("deliver_changes"));
         assert!(!first.prompt.contains("只生成阻断总结"));
         assert!(first.counts_as_repair_attempt);
 
-        let second = recoverable_delivery_prompt("deliver_changes", &metadata, 1)
-            .expect("one retry may still need a second bounded recovery");
-        assert!(second.prompt.contains("第 2/2 次"));
-
-        assert!(recoverable_delivery_prompt("deliver_changes", &metadata, 2).is_none());
+        // The identical failure on an unchanged head is the one real dead end.
+        assert!(
+            recoverable_delivery_prompt("deliver_changes", &metadata, Some(&first.signature))
+                .is_none()
+        );
     }
 
     #[test]
@@ -895,7 +933,7 @@ mod tests {
             "pr_url": "https://example.test/pull/7"
         });
 
-        let third_poll = recoverable_delivery_prompt("deliver_changes", &metadata, 2)
+        let third_poll = recoverable_delivery_prompt("deliver_changes", &metadata, None)
             .expect("a remote waiting state is active work, not an exhausted repair attempt");
         assert!(third_poll.prompt.contains("等待远端门禁"));
         assert!(third_poll.prompt.contains("同一 PR"));
@@ -945,13 +983,105 @@ mod tests {
             "recoverable": false,
             "next_action": "ask a human"
         });
-        assert!(recoverable_delivery_prompt("deliver_changes", &blocked, 0).is_none());
+        assert!(recoverable_delivery_prompt("deliver_changes", &blocked, None).is_none());
 
         let unrelated = serde_json::json!({
             "recoverable": true,
             "next_action": "retry"
         });
-        assert!(recoverable_delivery_prompt("browser_session", &unrelated, 0).is_none());
+        assert!(recoverable_delivery_prompt("browser_session", &unrelated, None).is_none());
+    }
+
+    fn delivery_meta(code: &str, sha: &str) -> serde_json::Value {
+        serde_json::json!({
+            "recoverable": true,
+            "recovery_class": "agent_action_required",
+            "code": code,
+            "stage": "ci",
+            "reached_state": "pr_open",
+            "commit_sha": sha,
+            "next_action": "读取失败日志，修复后重新调用",
+        })
+    }
+
+    // 2026-08-05 trajectory: 54 blocked deliveries in one week, not one of them
+    // a business decision — 18 were real CI failures. `MAX_ATTEMPTS = 2` turned
+    // "this needs a third fix" into a terminal block, which is exactly the
+    // non-business blocking this product forbids. Depth cannot tell repairing
+    // from spinning; the failure signature can.
+
+    #[test]
+    fn repair_continues_as_long_as_the_failure_signature_keeps_changing() {
+        let first =
+            recoverable_delivery_prompt("deliver_changes", &delivery_meta("ci_blocked", "aaa"), None)
+                .expect("first failure is recoverable");
+        // A different failure — the agent fixed the first one.
+        let second = recoverable_delivery_prompt(
+            "deliver_changes",
+            &delivery_meta("lint_blocked", "bbb"),
+            Some(&first.signature),
+        )
+        .expect("a different failure is progress");
+        // Same message, NEW head: a fix was pushed, so the verdict is unknown.
+        assert!(
+            recoverable_delivery_prompt(
+                "deliver_changes",
+                &delivery_meta("lint_blocked", "ccc"),
+                Some(&second.signature),
+            )
+            .is_some(),
+            "a new commit means the next result is not yet known"
+        );
+
+        // Far past the old cap of 2 — depth is no longer the criterion.
+        let mut previous = second.signature.clone();
+        for round in 0..8 {
+            let action = recoverable_delivery_prompt(
+                "deliver_changes",
+                &delivery_meta("ci_blocked", &format!("sha{round}")),
+                Some(&previous),
+            )
+            .unwrap_or_else(|| panic!("round {round} still shows progress"));
+            previous = action.signature;
+        }
+    }
+
+    #[test]
+    fn only_an_identical_failure_on_an_unchanged_head_is_terminal() {
+        let meta = delivery_meta("ci_blocked", "aaa");
+        let first = recoverable_delivery_prompt("deliver_changes", &meta, None).unwrap();
+        assert!(
+            recoverable_delivery_prompt("deliver_changes", &meta, Some(&first.signature)).is_none(),
+            "same failure, same head, nothing moved — the one honest stop"
+        );
+        assert!(
+            !first.prompt.contains("第 2/2"),
+            "the prompt must not promise a fixed budget any more: {}",
+            first.prompt
+        );
+    }
+
+    #[test]
+    fn a_wait_never_becomes_terminal_however_often_it_repeats() {
+        // A wait reports the same signature every poll by design, and GitHub is
+        // the actor that ends it. Counting those as failed repairs is what made
+        // ordinary waiting look like blocking.
+        let waiting = serde_json::json!({
+            "recoverable": true,
+            "recovery_class": "wait_retryable",
+            "code": "ci_pending",
+            "stage": "ci",
+            "reached_state": "pr_open",
+            "commit_sha": "aaa",
+            "next_action": "等待 CI 结论",
+        });
+        let first = recoverable_delivery_prompt("deliver_changes", &waiting, None).unwrap();
+        assert!(!first.counts_as_repair_attempt);
+        assert!(
+            recoverable_delivery_prompt("deliver_changes", &waiting, Some(&first.signature))
+                .is_some(),
+            "a repeated wait must keep waiting, not turn into a block"
+        );
     }
 
     #[test]
