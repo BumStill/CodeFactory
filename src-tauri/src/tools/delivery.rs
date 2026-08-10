@@ -38,12 +38,16 @@ pub fn definition() -> ToolDefinition {
                     "release_urgency": {
                         "type": "string",
                         "enum": ["immediate", "hold"],
-                        "description": "Optional release-cadence signal. `immediate` is preserved in the final commit and requests the express lane; `hold` is preserved and blocks release until the whole batch is explicitly reviewed."
+                        "description": "Optional release-cadence signal. `immediate` is yours to judge: use it when the rubric applies (main path broken, data loss, security bypass, a released version exposing the defect, the user said urgent, or a large self-contained capability just landed). `hold` is NOT yours to set — it stops the entire batch including other people's merges and only the user can clear it. Pass it only when the user explicitly asked to withhold the release, and quote their instruction in `hold_requested_by_user`; an unmandated `hold` is ignored and delivery proceeds normally."
                     },
                     "ceiling": {
                         "type": "string",
                         "enum": ["off", "pr_only", "through_ci_green", "through_merge", "through_release"],
                         "description": "Optional per-call ceiling. Clamped to at most the user's configured ceiling — a call can lower, never raise it. Use `through_ci_green` to WAIT for CI on the PR this branch already has: this tool polls with backoff (10s→60s) and is the supported way to wait. Never shell out to `gh pr checks --watch` or a tight `gh` polling loop — those refresh every 10s until CI ends, exhaust the shared GitHub quota, and the resulting 403s break unrelated releases."
+                    },
+                    "hold_requested_by_user": {
+                        "type": "string",
+                        "description": "Required to make `hold` take effect: quote the user's own instruction to withhold this release. Without it a `hold` is dropped, because gating a batch is the user's decision, not the agent's."
                     },
                     "expect_branch": {
                         "type": "string",
@@ -260,6 +264,21 @@ fn parse_release_urgency(s: &str) -> Option<ReleaseUrgency> {
     }
 }
 
+/// `hold` is the pipeline's one real business gate: it stops the WHOLE batch —
+/// other people's merges included — and only a human can clear it with
+/// `allow_guarded_batch`. So only a human may set it.
+///
+/// On 2026-08-05 five commits carried `Release-Urgency: hold`, every one
+/// authored by the delivery identity rather than the user. The schema presented
+/// it as a neutral cautious choice, so the agent picked it, manufactured a
+/// block only the user could undo, and then walked into it. `immediate` is not
+/// symmetric — it accelerates, its rubric is objective, and a wrong call costs
+/// one early release — so it stays agent-decidable.
+///
+/// An unmandated `hold` is DROPPED, never turned into an error: refusing the
+/// call would replace a self-inflicted release block with a self-inflicted
+/// delivery block. Delivery proceeds on the ordinary cadence and the report
+/// says the signal was ignored.
 fn release_urgency_from_args(args: &Value) -> std::result::Result<Option<ReleaseUrgency>, String> {
     let Some(raw) = args.get("release_urgency") else {
         return Ok(None);
@@ -267,16 +286,76 @@ fn release_urgency_from_args(args: &Value) -> std::result::Result<Option<Release
     let Some(value) = raw.as_str() else {
         return Err("deliver_changes.release_urgency 必须是 immediate 或 hold".into());
     };
-    parse_release_urgency(value).map(Some).ok_or_else(|| {
+    let urgency = parse_release_urgency(value).ok_or_else(|| {
         format!(
             "无效的 deliver_changes.release_urgency: {value}; 只允许 immediate 或 hold，\
 未执行任何交付动作。"
         )
-    })
+    })?;
+    if urgency == ReleaseUrgency::Hold && !user_mandated_hold(args) {
+        tracing::info!(
+            "dropping agent-initiated Release-Urgency: hold — only the user may gate a batch"
+        );
+        return Ok(None);
+    }
+    Ok(Some(urgency))
+}
+
+/// Did the USER ask for the hold? The caller must quote their instruction, so
+/// the mandate is auditable in the commit rather than asserted by a boolean.
+fn user_mandated_hold(args: &Value) -> bool {
+    args.get("hold_requested_by_user")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|reason| !reason.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
+
+    // 2026-08-05: five commits carried `Release-Urgency: hold`, all authored by
+    // the delivery identity "CodeFactory" — the user never asked for any of
+    // them. `hold` is the one genuine business gate in the pipeline: it blocks
+    // the WHOLE batch, including other people's merges, and only a human can
+    // clear it with allow_guarded_batch. An agent setting it on its own
+    // manufactures a block only the user can undo, then walks into it. The tool
+    // description read like a neutral safe choice, which is how it happened.
+    //
+    // `immediate` is not symmetric: it accelerates, its rubric is objective,
+    // and a wrong call costs one early release. It stays agent-decidable.
+
+    #[test]
+    fn hold_requires_a_user_mandate_and_never_stops_the_delivery_without_one() {
+        let unmandated = json!({"release_urgency": "hold"});
+        let decided = release_urgency_from_args(&unmandated)
+            .expect("an unmandated hold must not fail the delivery");
+        assert!(
+            decided.is_none(),
+            "hold without a user mandate must be dropped, not applied"
+        );
+
+        let mandated = json!({
+            "release_urgency": "hold",
+            "hold_requested_by_user": "用户要求先别发，等文档就绪",
+        });
+        assert!(
+            matches!(
+                release_urgency_from_args(&mandated).expect("a mandated hold is valid"),
+                Some(ReleaseUrgency::Hold)
+            ),
+            "an explicit user mandate still allows hold"
+        );
+    }
+
+    #[test]
+    fn immediate_stays_agent_decidable() {
+        assert!(matches!(
+            release_urgency_from_args(&json!({"release_urgency": "immediate"}))
+                .expect("immediate needs no mandate"),
+            Some(ReleaseUrgency::Immediate)
+        ));
+    }
+
     use super::*;
     use crate::agent::delivery::{DeliveryOutcome, RecoveryClass, StepResult};
 
