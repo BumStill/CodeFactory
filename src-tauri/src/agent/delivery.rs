@@ -104,7 +104,9 @@ pub enum RecoveryClass {
     None,
     WaitRetryable,
     AgentActionRequired,
-    UserActionRequired,
+    /// A non-derivable input owned by an external identity/provider. This is
+    /// not a generic permission to hand technical recovery back to the user.
+    CoreInputRequired,
     ExternalStateUncertain,
 }
 
@@ -167,7 +169,7 @@ impl DeliveryOutcome {
                             .as_deref()
                             .is_some_and(|value| !value.is_empty())
                 }
-                RecoveryClass::UserActionRequired | RecoveryClass::ExternalStateUncertain => {
+                RecoveryClass::CoreInputRequired | RecoveryClass::ExternalStateUncertain => {
                     !self.recoverable
                         && self.retry_after_ms.is_none()
                         && self
@@ -234,12 +236,12 @@ impl DeliveryOutcome {
         self
     }
 
-    fn human_action_required(mut self, step: StepResult) -> Self {
+    fn core_input_required(mut self, step: StepResult) -> Self {
         let msg = step.detail.clone();
         self = self.blocked_at(step);
-        self.code = "delivery_human_action_required".into();
+        self.code = "delivery_core_input_required".into();
         self.recoverable = false;
-        self.recovery_class = RecoveryClass::UserActionRequired;
+        self.recovery_class = RecoveryClass::CoreInputRequired;
         self.retry_after_ms = None;
         self.next_action = Some(msg);
         self
@@ -254,8 +256,8 @@ impl DeliveryOutcome {
                 "等待退避后重新核对同一远端对象；状态未知期间禁止重复外部写动作。",
             );
         }
-        if remote_error_requires_user_action(&detail) {
-            return self.human_action_required(StepResult::blocked(step, detail));
+        if remote_error_requires_core_input(&detail) {
+            return self.core_input_required(StepResult::blocked(step, detail));
         }
         let mut outcome = self.blocked_at(StepResult::blocked(step, detail));
         outcome.code = "delivery_remote_observation_unknown".into();
@@ -290,7 +292,7 @@ fn remote_error_is_retryable(detail: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-fn remote_error_requires_user_action(detail: &str) -> bool {
+fn remote_error_requires_core_input(detail: &str) -> bool {
     let lower = detail.to_ascii_lowercase();
     [
         "authentication",
@@ -952,9 +954,10 @@ async fn resume_queued_merge<R: DeliveryRemote>(
             );
             outcome
         }
-        Ok(MergeReadiness::NeedsAction(reason)) => outcome.human_action_required(
-            StepResult::blocked("merge", format!("PR #{pr_number} 无法自动恢复: {reason}")),
-        ),
+        Ok(MergeReadiness::NeedsAction(reason)) => outcome.blocked_at(StepResult::blocked(
+            "merge",
+            format!("PR #{pr_number} 需要系统修复仓库门禁后续接同一 PR: {reason}"),
+        )),
         Ok(MergeReadiness::Ready)
         | Ok(MergeReadiness::WaitingOnChecks)
         | Ok(MergeReadiness::Unknown) => {
@@ -2775,7 +2778,13 @@ fn block_unverified_release(
     }
     if detail.contains("没有可用的 live verifier") || detail.contains("未配置 live verifier")
     {
-        return outcome.human_action_required(StepResult::blocked("live", detail));
+        let mut outcome = outcome.blocked_at(StepResult::blocked("live", detail));
+        outcome.code = "delivery_live_verifier_platform_incident".into();
+        outcome.next_action = Some(
+            "系统必须配置或修复与该部署匹配的 live verifier，然后自动续接同一 release；不得重述任务，也不得降低 live 验收边界。"
+                .into(),
+        );
+        return outcome;
     }
     outcome.blocked_at(StepResult::blocked("live", detail))
 }
@@ -2804,8 +2813,8 @@ fn finish(mut outcome: DeliveryOutcome, branch: &str) -> DeliveryOutcome {
         outcome.final_state = "blocked".into();
         outcome.stage = "capability".into();
         outcome.code = "delivery_capability_gap".into();
-        outcome.recoverable = false;
-        outcome.recovery_class = RecoveryClass::UserActionRequired;
+        outcome.recoverable = true;
+        outcome.recovery_class = RecoveryClass::AgentActionRequired;
         outcome.retry_after_ms = None;
         outcome.next_action = Some(next_action.clone());
         outcome.summary.push_str(&format!(
@@ -3567,7 +3576,6 @@ fn gh_workflow_run_args(workflow: &str, git_ref: &str) -> Vec<String> {
     ]
 }
 
-
 fn github_release_live_from_value(
     release: &serde_json::Value,
     sha: &str,
@@ -4042,7 +4050,11 @@ impl DeliveryRemote for GhCliRemote {
         .map(|_| format!("已通过 gh 触发发布工作流 {}", self.release_workflow))
     }
 
-    async fn verify_live(&self, sha: &str, _url: Option<&str>) -> Result<ObservationStatus, String> {
+    async fn verify_live(
+        &self,
+        sha: &str,
+        _url: Option<&str>,
+    ) -> Result<ObservationStatus, String> {
         let raw = self.gh(&[
             "release".into(),
             "view".into(),
@@ -4802,7 +4814,11 @@ impl DeliveryRemote for GithubRemote {
             .map(|_| format!("已触发发布工作流 {}", self.release_workflow))
     }
 
-    async fn verify_live(&self, sha: &str, _url: Option<&str>) -> Result<ObservationStatus, String> {
+    async fn verify_live(
+        &self,
+        sha: &str,
+        _url: Option<&str>,
+    ) -> Result<ObservationStatus, String> {
         let release = self
             .client
             .get(&format!("/repos/{}/releases/latest", self.repo))
@@ -4870,14 +4886,16 @@ mod tests {
     }
 
     #[test]
-    fn remote_observation_errors_separate_wait_from_user_action() {
-        assert!(remote_error_is_retryable("HTTP 429: API rate limit exceeded"));
+    fn remote_observation_errors_separate_wait_from_core_input() {
+        assert!(remote_error_is_retryable(
+            "HTTP 429: API rate limit exceeded"
+        ));
         assert!(remote_error_is_retryable("HTTP 503 Service Unavailable"));
         assert!(!remote_error_is_retryable("HTTP 401: bad credentials"));
-        assert!(remote_error_requires_user_action(
+        assert!(remote_error_requires_core_input(
             "HTTP 403: authentication required"
         ));
-        assert!(!remote_error_requires_user_action(
+        assert!(!remote_error_requires_core_input(
             "HTTP 403: API rate limit exceeded"
         ));
     }
@@ -5594,7 +5612,6 @@ Release-Urgency: hold"
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
-
     #[test]
     fn github_release_live_verifier_requires_published_assets_and_tag_ancestry() {
         let release = serde_json::json!({
@@ -5604,12 +5621,9 @@ Release-Urgency: hold"
             "publishedAt": "2026-08-05T09:00:00Z",
             "assets": [{"name": "CodeFactory.dmg"}]
         });
-        let status = github_release_live_from_value(
-            &release,
-            "abcdef1234567890",
-            |tag| Ok(tag == "v1.2.3"),
-        )
-        .unwrap();
+        let status =
+            github_release_live_from_value(&release, "abcdef1234567890", |tag| Ok(tag == "v1.2.3"))
+                .unwrap();
         assert_eq!(
             status,
             ObservationStatus::Success(
@@ -5629,12 +5643,8 @@ Release-Urgency: hold"
             ObservationStatus::Pending(detail) if detail.contains("draft")
         ));
 
-        let missing_sha = github_release_live_from_value(
-            &release,
-            "abcdef1234567890",
-            |_| Ok(false),
-        )
-        .unwrap();
+        let missing_sha =
+            github_release_live_from_value(&release, "abcdef1234567890", |_| Ok(false)).unwrap();
         assert!(matches!(
             missing_sha,
             ObservationStatus::Pending(detail) if detail.contains("does not include")
@@ -5673,6 +5683,19 @@ Release-Urgency: hold"
             .iter()
             .any(|s| s.step == "live" && s.status == "blocked"));
         assert!(!outcome.summary.contains("已上线"));
+        assert!(
+            outcome.recoverable,
+            "missing system live-verifier configuration is platform-owned, not a human gate"
+        );
+        assert_eq!(
+            outcome.recovery_class,
+            RecoveryClass::AgentActionRequired,
+            "the agent/system remediation loop must own this blocker"
+        );
+        assert!(outcome
+            .next_action
+            .as_deref()
+            .is_some_and(|action| !action.contains("用户")));
     }
 
     #[test]
@@ -6929,8 +6952,8 @@ Release-Urgency: hold"
         assert_eq!(first.effective_ceiling, "through_release");
         assert_eq!(first.final_state, "blocked");
         assert_eq!(first.reached_state, "release_triggered");
-        assert!(!first.recoverable);
-        assert_eq!(first.recovery_class, RecoveryClass::UserActionRequired);
+        assert!(first.recoverable);
+        assert_eq!(first.recovery_class, RecoveryClass::AgentActionRequired);
         assert!(first.next_action.as_deref().unwrap_or("").contains("live"));
 
         // Retrying the same session after an unverified release must only
@@ -7279,8 +7302,8 @@ Release-Urgency: hold"
         assert_eq!(out.effective_ceiling, "through_merge");
         assert_eq!(out.reached_state, "merged");
         assert_eq!(out.final_state, "blocked");
-        assert!(!out.recoverable);
-        assert_eq!(out.recovery_class, RecoveryClass::UserActionRequired);
+        assert!(out.recoverable);
+        assert_eq!(out.recovery_class, RecoveryClass::AgentActionRequired);
         assert!(out.next_action.as_deref().unwrap_or("").contains("release"));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
@@ -7331,8 +7354,8 @@ Release-Urgency: hold"
         assert_eq!(out.effective_ceiling, "pr_only");
         assert_eq!(out.reached_state, "pr_open");
         assert_eq!(out.final_state, "blocked");
-        assert!(!out.recoverable);
-        assert_eq!(out.recovery_class, RecoveryClass::UserActionRequired);
+        assert!(out.recoverable);
+        assert_eq!(out.recovery_class, RecoveryClass::AgentActionRequired);
         assert!(out.next_action.as_deref().unwrap_or("").contains("CI"));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
@@ -7369,8 +7392,8 @@ Release-Urgency: hold"
         assert_eq!(out.effective_ceiling, "through_ci_green");
         assert_eq!(out.reached_state, "ci_green");
         assert_eq!(out.final_state, "blocked");
-        assert!(!out.recoverable);
-        assert_eq!(out.recovery_class, RecoveryClass::UserActionRequired);
+        assert!(out.recoverable);
+        assert_eq!(out.recovery_class, RecoveryClass::AgentActionRequired);
         assert!(out.next_action.as_deref().unwrap_or("").contains("merge"));
         assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
         assert_eq!(calls.release.load(Ordering::SeqCst), 0);

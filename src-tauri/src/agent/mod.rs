@@ -7,6 +7,7 @@ pub mod context;
 pub mod context_budget;
 mod context_policy;
 pub mod delivery;
+pub mod delivery_run;
 pub mod dispatch;
 pub mod events;
 mod fact_checker;
@@ -594,31 +595,23 @@ async fn fetch_session_reasoning_effort(db: &SqlitePool, session_id: &str) -> Op
 /// restarts, so a user who granted delivery once is not re-asked after a
 /// relaunch.
 pub async fn fetch_session_delivery_authorized(db: &SqlitePool, session_id: &str) -> bool {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT delivery_authorized FROM sessions WHERE id = ?",
-    )
-    .bind(session_id)
-    .fetch_one(db)
-    .await
-    .ok()
-    .map(|v| v != 0)
-    .unwrap_or(false)
+    sqlx::query_scalar::<_, i64>("SELECT delivery_authorized FROM sessions WHERE id = ?")
+        .bind(session_id)
+        .fetch_one(db)
+        .await
+        .ok()
+        .map(|v| v != 0)
+        .unwrap_or(false)
 }
 
 /// Persist the per-session delivery authorization. `true` on an explicit
 /// delivery request, `false` on revocation.
-pub async fn set_session_delivery_authorized(
-    db: &SqlitePool,
-    session_id: &str,
-    authorized: bool,
-) {
-    let _ = sqlx::query(
-        "UPDATE sessions SET delivery_authorized = ? WHERE id = ?",
-    )
-    .bind(if authorized { 1 } else { 0 })
-    .bind(session_id)
-    .execute(db)
-    .await;
+pub async fn set_session_delivery_authorized(db: &SqlitePool, session_id: &str, authorized: bool) {
+    let _ = sqlx::query("UPDATE sessions SET delivery_authorized = ? WHERE id = ?")
+        .bind(if authorized { 1 } else { 0 })
+        .bind(session_id)
+        .execute(db)
+        .await;
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -4425,17 +4418,11 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_recovery_releases_with_warning_in_chat_and_blocks_autonomous() {
-        // Updated from `exhausted_recovery_is_a_blocked_terminal_not_success`,
-        // which pinned the behavior the 2026-07-21 field report complained
-        // about: in Interactive/Execute chat, exhausting recovery FOLDED the
-        // model's final reply and killed the turn with an untranslated
-        // internal-contract Error ("Completion blocked because required
-        // verification is still missing: rerun every unresolved failed
-        // check…"). With the user present, the reply is the best available
-        // answer: release it WITH a visible warning. Hard-blocking remains
-        // correct only for unattended Autonomous runs (the scheduler
-        // respawns those).
+    fn exhausted_recovery_keeps_transport_visible_but_never_marks_business_complete() {
+        // Chat still releases a provisional payload so streaming closes and
+        // evidence remains visible, but the warning must explicitly classify
+        // the objective as system-owned incomplete work. Autonomous runs keep
+        // their scheduler-respawn blocker.
         let unsatisfied = CompletionGate::new(true).evidence();
         assert!(matches!(
             completion_finalization(&unsatisfied, 0, AgentMode::Interactive),
@@ -4452,8 +4439,11 @@ mod tests {
         if let CompletionFinalization::ReleaseWithWarning(warning) =
             completion_finalization(&unsatisfied, 1, AgentMode::Interactive)
         {
-            // Human-readable Chinese, no internal-contract terminology.
-            assert!(warning.contains("未经完整验证"));
+            // Human-readable Chinese, no internal-contract terminology and no
+            // manufactured request for the user to say continue.
+            assert!(warning.contains("本轮任务未完成"));
+            assert!(warning.contains("内部失败"));
+            assert!(!warning.contains("回复继续"));
             assert!(!warning.contains("Completion blocked"));
         }
         assert!(matches!(

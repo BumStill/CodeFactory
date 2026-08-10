@@ -161,7 +161,12 @@ impl Persistence for SqlitePersistence {
         let now = Utc::now().timestamp_millis();
         let terminal = matches!(
             update.status.as_str(),
-            "completed" | "blocked" | "cancelled" | "interrupted"
+            "completed"
+                | "blocked"
+                | "cancelled"
+                | "interrupted"
+                | "failed_internal"
+                | "platform_incident"
         );
         sqlx::query(
             "UPDATE chat_turn_state SET
@@ -881,6 +886,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_internal_is_a_terminal_turn_but_never_completed() {
+        let db = pool().await;
+        sqlx::query(
+            "INSERT INTO chat_task_segments (id, status, updated_at) \
+             VALUES ('segment-1','active',1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state \
+             (root_turn_id, task_segment_id, revision, phase, status, updated_at) \
+             VALUES ('root-1','segment-1',1,'working','active',1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: false,
+        };
+
+        p.update_turn_activity(&TurnActivityUpdate {
+            root_turn_id: "root-1".into(),
+            phase: "finalizing".into(),
+            status: "failed_internal".into(),
+            recent_activity_kind: "failed_internal".into(),
+            recent_activity_label: "系统未能完成任务".into(),
+            waiting_reason: None,
+            terminal_reason: Some("completion_recovery_exhausted".into()),
+        })
+        .await
+        .unwrap();
+
+        let turn: (String, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT status, completed_at, terminal_reason FROM chat_turn_state \
+             WHERE root_turn_id='root-1'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let segment: String =
+            sqlx::query_scalar("SELECT status FROM chat_task_segments WHERE id='segment-1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(turn.0, "failed_internal");
+        assert!(
+            turn.1.is_some(),
+            "terminal system failure needs a stop timestamp"
+        );
+        assert_eq!(turn.2.as_deref(), Some("completion_recovery_exhausted"));
+        assert_eq!(segment, "failed_internal");
+    }
+
+    #[tokio::test]
     async fn turn_notice_is_persisted_as_internal_system_provenance() {
         let db = pool().await;
         let p = SqlitePersistence {
@@ -1060,6 +1122,9 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
-        assert_eq!(updated, 100, "anonymous sessions leave no trace by definition");
+        assert_eq!(
+            updated, 100,
+            "anonymous sessions leave no trace by definition"
+        );
     }
 }

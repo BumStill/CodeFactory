@@ -165,9 +165,9 @@ pub fn reusable_local_verification_key(
 pub enum CompletionFinalization {
     Complete,
     Recover(String),
-    /// Chat surfaces after recovery exhaustion: the reply is the best available
-    /// answer — release it, but persist a human-readable warning. Never an Error,
-    /// never internal-contract wording (2026-07-21 field report).
+    /// Chat surfaces after recovery exhaustion: the reply is only a provisional
+    /// transport payload. The business turn is `failed_internal`, never
+    /// completed and never a user-owned "continue" gate.
     ReleaseWithWarning(String),
     /// Unattended Autonomous runs only — the scheduler treats this as an
     /// incomplete attempt and respawns.
@@ -200,16 +200,17 @@ pub fn completion_finalization(
     }
 }
 
-/// User-facing warning when a chat turn ends without complete verification.
-/// Chinese, plain language, no gate terminology; the raw blocker list goes to
-/// the log only.
+/// User-facing system-owned failure notice when a chat turn exhausts completion
+/// recovery without complete verification. Chinese, plain language, no gate
+/// terminology; the raw blocker list goes to the log only. It deliberately has
+/// no "reply continue" escape hatch: technical recovery is the platform's job.
 pub fn unverified_release_warning(evidence: &CompletionEvidence) -> String {
     tracing::info!(
         "releasing chat turn with unverified blockers: {}",
         evidence.blockers.join("; ")
     );
-    "⚠ 以上回复未经完整验证:本轮修改后仍有检查未复验(或失败未复跑)。\
-结论可能不完整;回复「继续验证」可让我补齐。"
+    "⚠ 本轮任务未完成：修改后仍有检查未复验，或失败检查尚未修复并重跑。\
+系统已将本轮记录为内部失败；以上内容仅为阶段性结果，不代表任务完成。"
         .to_string()
 }
 
@@ -251,7 +252,7 @@ pub enum SegmentCheckpointDecision {
     Complete,
     /// Persist the checkpoint summary and automatically open the next segment.
     Continue,
-    /// Stop a demonstrably stalled loop with a visible, resumable notice.
+    /// Stop a demonstrably stalled loop and transfer it to system remediation.
     Pause(String),
     /// Non-chat policies retain their existing terminal ceiling semantics.
     Terminal,
@@ -274,7 +275,7 @@ pub fn segment_checkpoint_decision(
     }
     SegmentCheckpointDecision::Pause(
         "连续两个执行段未取得可验证进展，已停止自动重试以避免原地循环。\
-当前进度已保存；修正阻塞条件后回复「继续执行」即可从这里恢复。"
+当前进度和失败证据已保存，并已转入系统内部修复；本轮不标记为完成。"
             .to_string(),
     )
 }
@@ -1548,8 +1549,9 @@ mod tests {
             panic!("repeated stalled chat segments must persist a resumable pause");
         };
         assert!(notice.contains("连续"));
-        assert!(notice.contains("进度已保存"));
-        assert!(notice.contains("继续执行"));
+        assert!(notice.contains("进度和失败证据已保存"));
+        assert!(notice.contains("系统内部修复"));
+        assert!(!notice.contains("回复「继续"));
     }
 
     #[test]

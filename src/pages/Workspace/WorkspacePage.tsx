@@ -925,7 +925,7 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onRequestRe
           {isRunning ? (
             <button onClick={() => void handleCancel()} className="flex min-h-8 items-center gap-1.5 rounded-lg bg-status-danger-soft px-2.5 text-[13px] text-status-danger hover:brightness-95"><Square size={11} />停止</button>
           ) : pendingCount > 0 && failedTasks.length === 0 ? (
-            <span className="text-[12px] leading-5 text-gray-500">任务已委派，由后台调度器自动执行；若长时间未开始请检查模型配置或重试委派。</span>
+            <span className="text-[12px] leading-5 text-gray-500">任务已委派，系统会持续调度并自动诊断恢复，无需手动重试。</span>
           ) : null}
           {!isRunning && repairableFailedCount > 0 && (
             <button onClick={() => void handleRepairFailed()} disabled={repairBusy} className="flex min-h-8 items-center gap-1.5 rounded-lg bg-status-warning-soft px-2.5 text-[13px] text-status-warning disabled:opacity-40" title="重试可自动修复的失败步骤">

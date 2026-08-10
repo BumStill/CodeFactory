@@ -48,6 +48,53 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  macos-signing-preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Diagnose macOS signing platform readiness
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          required=(APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY)
+          missing=()
+          for name in "${required[@]}"; do
+            [ -n "${!name:-}" ] || missing+=("$name")
+          done
+          mkdir -p "$RUNNER_TEMP/release-platform-preflight"
+          MISSING_JSON="$(printf '%s\n' "${missing[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+          STATUS=ready
+          SAFE_ACTION=proceed
+          if [ "${#missing[@]}" -gt 0 ]; then
+            STATUS=platform_incident
+            SAFE_ACTION=release_blocked_before_version_mutation
+          fi
+          jq -n \
+            --arg status "$STATUS" \
+            --arg safe_action "$SAFE_ACTION" \
+            --argjson missing "$MISSING_JSON" \
+            '{status:$status, component:"macos_release_signing", missing_secret_names:$missing,
+              remediation_owner:"release-platform", requires_user_continue:false,
+              safe_action:$safe_action}' \
+            > "$RUNNER_TEMP/release-platform-preflight/macos-signing.json"
+          cat "$RUNNER_TEMP/release-platform-preflight/macos-signing.json" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::macOS signing platform incident: missing repository secrets: ${missing[*]}. Release stopped before version mutation; do not request user continue."
+            exit 1
+          fi
+
+      - name: Upload release platform preflight
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-platform-preflight
+          path: ${{ runner.temp }}/release-platform-preflight
+          if-no-files-found: error
+
   release-token-preflight:
     runs-on: ubuntu-latest
     steps:
@@ -61,7 +108,7 @@ jobs:
           }
 
   release:
-    needs: release-token-preflight
+    needs: [release-token-preflight, macos-signing-preflight]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
