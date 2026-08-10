@@ -619,7 +619,10 @@ pub async fn run_agent_loop(
     let mut blocker_terminal_reason: Option<String> = None;
     let mut completion_summary_retry_used = false;
     let mut completion_recovery_attempts = 0_u32;
-    let mut delivery_recovery_attempts = 0_u8;
+    // The last delivery failure we saw, as `{code}|{stage}|{reached}|{sha}`.
+    // Repair is judged by whether this CHANGES, not by how many tries have
+    // happened — a count cannot tell "fixing it" from "spinning".
+    let mut delivery_failure_signature: Option<String> = None;
     let mut structural_denial_seen = false;
     let mut fact_check_used = false;
     let mut require_tool_next = false;
@@ -1660,12 +1663,11 @@ pub async fn run_agent_loop(
                         crate::policy::recoverable_delivery_prompt(
                             &tc.function.name,
                             metadata,
-                            delivery_recovery_attempts,
+                            delivery_failure_signature.as_deref(),
                         )
                     }) {
                         if action.counts_as_repair_attempt {
-                            delivery_recovery_attempts =
-                                delivery_recovery_attempts.saturating_add(1);
+                            delivery_failure_signature = Some(action.signature.clone());
                         }
                         delivery_recovery_action = Some(action);
                     } else {
@@ -1926,7 +1928,15 @@ pub async fn run_agent_loop(
                 messages.push(crate::types::ChatMessage {
                     role: "user".into(),
                     content: crate::types::MessageContent::Text(
-                        "工具链已在明确边界停止。不要重试、绕过授权或把其他来源冒充等价证据；请只用已有事实生成一次简洁阻断总结，说明停在哪一步、已完成什么和下一步。".into(),
+                        // Reached only when recovery is genuinely exhausted:
+                        // the same failure repeated on an unchanged head, or a
+                        // blocker that needs the user. Everything technical is
+                        // routed through `recoverable_delivery_prompt` above and
+                        // never gets here, so "don't retry" no longer lands on
+                        // work that could still have continued.
+                        "工具链已在明确边界停止:同一失败在未改变的 head 上重复出现,或需要用户提供只有用户能给的输入。\
+不要重试同一动作、绕过授权或把其他来源冒充等价证据;请只用已有事实生成一次简洁阻断总结,\
+说明停在哪一步、已完成什么、以及需要用户做的那一件具体事。".into(),
                     ),
                     tool_calls: None,
                     tool_call_id: None,
