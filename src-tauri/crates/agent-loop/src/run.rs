@@ -2653,7 +2653,7 @@ mod tests {
             _ctx: &ToolCtx,
         ) -> Result<ToolInvocationResult, ToolError> {
             Ok(ToolInvocationResult {
-                content: "delivery blocked at live verification".into(),
+                content: "delivery requires an external signing identity".into(),
                 is_error: false,
                 status: crate::tool::ToolExecutionStatus::Blocked,
                 command: "deliver_changes".into(),
@@ -2664,13 +2664,13 @@ mod tests {
                 error: None,
                 metadata: Some(serde_json::json!({
                     "status": "blocked",
-                    "stage": "live",
-                    "code": "delivery_live_verifier_platform_incident",
-                    "recoverable": true,
-                    "recovery_class": "agent_action_required",
+                    "stage": "release_signing",
+                    "code": "delivery_signing_identity_required",
+                    "recoverable": false,
+                    "recovery_class": "core_input_required",
                     "requested_ceiling": "through_release",
                     "reached_state": "release_triggered",
-                    "next_action": "configure a live verifier"
+                    "next_action": "provide the external signing identity once"
                 })),
                 next_working_directory: None,
                 duration_ms: 1,
@@ -3163,7 +3163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonrecoverable_delivery_uses_structured_terminal_facts_not_model_prose() {
+    async fn core_input_required_delivery_uses_structured_terminal_facts_not_model_prose() {
         let transport = Arc::new(ScriptedTransport::new(vec![response(
             "I shipped the release successfully",
             vec![call("delivery", "deliver_changes", serde_json::json!({}))],
@@ -3181,7 +3181,7 @@ mod tests {
         assert_eq!(outcome.stop_reason, StopReason::Blocked);
         assert!(outcome
             .final_text
-            .contains("delivery_human_action_required"));
+            .contains("delivery_signing_identity_required"));
         assert!(outcome.final_text.contains("release_triggered"));
         assert!(!outcome.final_text.contains("shipped successfully"));
         assert_eq!(
