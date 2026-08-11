@@ -49,7 +49,11 @@
               "integration_id": 15368
             },
             {
-              "context": "check",
+              "context": "check-frontend",
+              "integration_id": 15368
+            },
+            {
+              "context": "check-rust",
               "integration_id": 15368
             },
             {

@@ -21,7 +21,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = REPO_ROOT / ".github" / "rulesets" / "main.json"
 EXPECTED_CHECKS = {
     "agent-bridge-linux",
-    "check",
+    "check-frontend",
+    "check-rust",
     "governance-baseline",
     "remote-real-app-gui",
 }
@@ -91,7 +92,8 @@ class GitHubMainGateTests(unittest.TestCase):
         self.assertNotIn("refs/heads/main", auto_release)
         self.assertIn("gh pr create", auto_release)
         self.assertIn("gh pr merge", auto_release)
-        self.assertNotIn("--auto", auto_release)
+        self.assertIn("--auto", auto_release)
+        self.assertNotIn("--admin", auto_release)
         self.assertIn("--match-head-commit", auto_release)
         self.assertNotIn("gh pr update-branch", auto_release)
         self.assertIn("automation/release-next", auto_release)
