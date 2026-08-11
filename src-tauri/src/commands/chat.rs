@@ -324,10 +324,18 @@ async fn project_chat_objective(
         ObjectiveStatus::Cancelled => ("finalizing", "objective_cancelled", "已按用户要求停止"),
         ObjectiveStatus::WaitingSystem => ("recovering", "system_recovery", "系统正在恢复并续接"),
         ObjectiveStatus::WaitingCoreInput => ("waiting", "core_input_required", "需要补充核心输入"),
-        ObjectiveStatus::WaitingAuthorization => ("waiting", "authorization_required", "等待必要授权"),
-        ObjectiveStatus::WaitingBusinessDecision => ("waiting", "business_decision_required", "等待业务决策"),
+        ObjectiveStatus::WaitingAuthorization => {
+            ("waiting", "authorization_required", "等待必要授权")
+        }
+        ObjectiveStatus::WaitingBusinessDecision => {
+            ("waiting", "business_decision_required", "等待业务决策")
+        }
         ObjectiveStatus::Active => ("working", "objective_active", "系统正在继续处理"),
-        ObjectiveStatus::LegacyOrphan => ("recovering", "legacy_reconciliation", "系统正在核对历史工作"),
+        ObjectiveStatus::LegacyOrphan => (
+            "recovering",
+            "legacy_reconciliation",
+            "系统正在核对历史工作",
+        ),
     };
     let waiting_reason = objective
         .failure_code
@@ -390,6 +398,7 @@ async fn settle_chat_objective_from_outcome(
     objective_id: &str,
     root_turn_id: &str,
     outcome: &codefactory_agent_loop::run::RunOutcome,
+    mutation_permit: Option<&codefactory_agent_loop::tool::MutationPermit>,
 ) -> Result<crate::agent::objective::ObjectiveSnapshot, AppError> {
     let store = crate::agent::objective::ObjectiveStore::new(db.clone());
     let current = store
@@ -409,10 +418,15 @@ async fn settle_chat_objective_from_outcome(
         terminal_reason.as_deref(),
     )
     .map_err(|error| AppError::Other(error.to_string()))?;
-    let revised = store
-        .apply_decision(current.revision, decision)
-        .await
-        .map_err(|error| AppError::Other(error.to_string()))?;
+    let revised = match mutation_permit {
+        Some(permit) => {
+            store
+                .apply_claimed_decision(current.revision, decision, permit)
+                .await
+        }
+        None => store.apply_decision(current.revision, decision).await,
+    }
+    .map_err(|error| AppError::Other(error.to_string()))?;
     project_chat_objective(db, app, event_name, root_turn_id, &revised).await?;
     Ok(revised)
 }
@@ -425,6 +439,7 @@ async fn settle_chat_objective_from_error(
     root_turn_id: &str,
     auth_expired: bool,
     error_text: &str,
+    mutation_permit: Option<&codefactory_agent_loop::tool::MutationPermit>,
 ) -> Result<crate::agent::objective::ObjectiveSnapshot, AppError> {
     use crate::agent::objective::{DecisionRouter, RecoveryDomain, RouteSignal};
     let store = crate::agent::objective::ObjectiveStore::new(db.clone());
@@ -451,10 +466,15 @@ async fn settle_chat_objective_from_error(
     };
     let decision = DecisionRouter::route(&current, signal)
         .map_err(|error| AppError::Other(error.to_string()))?;
-    let revised = store
-        .apply_decision(current.revision, decision)
-        .await
-        .map_err(|error| AppError::Other(error.to_string()))?;
+    let revised = match mutation_permit {
+        Some(permit) => {
+            store
+                .apply_claimed_decision(current.revision, decision, permit)
+                .await
+        }
+        None => store.apply_decision(current.revision, decision).await,
+    }
+    .map_err(|error| AppError::Other(error.to_string()))?;
     project_chat_objective(db, app, event_name, root_turn_id, &revised).await?;
     Ok(revised)
 }
@@ -633,17 +653,18 @@ pub async fn send_message(
         .bind(now)
         .execute(&*pool)
         .await?;
-        let continuation_root_turn_id = if let Some(previous_segment_id) = previous_segment_id.as_deref() {
-            sqlx::query_scalar::<_, String>(
-                "SELECT goal_root_turn_id FROM chat_task_segments WHERE id=? AND session_id=?",
-            )
-            .bind(previous_segment_id)
-            .bind(&session_id)
-            .fetch_optional(&*pool)
-            .await?
-        } else {
-            None
-        };
+        let continuation_root_turn_id =
+            if let Some(previous_segment_id) = previous_segment_id.as_deref() {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT goal_root_turn_id FROM chat_task_segments WHERE id=? AND session_id=?",
+                )
+                .bind(previous_segment_id)
+                .bind(&session_id)
+                .fetch_optional(&*pool)
+                .await?
+            } else {
+                None
+            };
         if let Some(continuation_root_turn_id) = continuation_root_turn_id.as_deref() {
             let objective_id = sqlx::query_scalar::<_, Option<String>>(
                 "SELECT objective_id FROM chat_turn_state
@@ -956,6 +977,7 @@ pub async fn send_message(
                     &objective_for_settlement,
                     &root_turn_for_error,
                     &outcome,
+                    None,
                 )
                 .await
                 {
@@ -973,6 +995,7 @@ pub async fn send_message(
                     &root_turn_for_error,
                     auth_expired,
                     &error_text,
+                    None,
                 )
                 .await
                 {
@@ -1029,11 +1052,17 @@ pub async fn send_message(
 pub(crate) async fn resume_chat_objective(
     app: AppHandle,
     objective: crate::agent::objective::ObjectiveSnapshot,
+    mutation_permit: codefactory_agent_loop::tool::MutationPermit,
 ) -> Result<(), AppError> {
     use crate::agent::objective::{ObjectiveKind, ObjectiveStatus};
 
     if objective.status != ObjectiveStatus::WaitingSystem {
         return Ok(());
+    }
+    if mutation_permit.objective_id != objective.id {
+        return Err(AppError::Other(
+            "chat recovery mutation permit objective mismatch".into(),
+        ));
     }
     let session_id = objective
         .session_id
@@ -1049,13 +1078,17 @@ pub(crate) async fn resume_chat_objective(
     {
         let mut active = state.chat_cancels.lock().await;
         if active.contains_key(&session_id) {
-            return Err(AppError::Other("chat session already has an active runner".into()));
+            return Err(AppError::Other(
+                "chat session already has an active runner".into(),
+            ));
         }
         if state
             .update_restart_reserved
             .load(std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(AppError::Other("update restart reservation is active".into()));
+            return Err(AppError::Other(
+                "update restart reservation is active".into(),
+            ));
         }
         active.insert(session_id.clone(), cancel_flag.clone());
     }
@@ -1074,18 +1107,17 @@ pub(crate) async fn resume_chat_objective(
     drop(state);
     let mcp_manager = Arc::clone(&*app.state::<Arc<McpManager>>());
 
-    let session = sqlx::query_as::<_, crate::storage::Session>(
-        "SELECT * FROM sessions WHERE id=?",
+    let session = sqlx::query_as::<_, crate::storage::Session>("SELECT * FROM sessions WHERE id=?")
+        .bind(&session_id)
+        .fetch_one(&db)
+        .await?;
+    let original_content: String = sqlx::query_scalar(
+        "SELECT content FROM messages WHERE id=? AND session_id=? AND role='user'",
     )
+    .bind(&root_turn_id)
     .bind(&session_id)
     .fetch_one(&db)
     .await?;
-    let original_content: String =
-        sqlx::query_scalar("SELECT content FROM messages WHERE id=? AND session_id=? AND role='user'")
-            .bind(&root_turn_id)
-            .bind(&session_id)
-            .fetch_one(&db)
-            .await?;
     let history = crate::storage::load_agent_history(&db, &session_id).await?;
     let turn_settings = settings_for_session_route(
         &settings_snapshot,
@@ -1134,6 +1166,7 @@ pub(crate) async fn resume_chat_objective(
     let app_for_run = app.clone();
     let db_for_run = db.clone();
     let session_for_run = session_id.clone();
+    let permit_for_run = mutation_permit.clone();
     let loop_result = supervise_chat_task(async move {
         let mut agent = AgentLoop::new_with_mode(
             app_for_run,
@@ -1148,7 +1181,13 @@ pub(crate) async fn resume_chat_objective(
             settings_state,
             pending_permissions,
             mcp_manager,
-            None,
+            Some(crate::agent::AgentExecutionContext {
+                parent_session_id: None,
+                task_id: None,
+                knowledge_library_ids: Vec::new(),
+                usage_surface: crate::agent::UsageSurface::Interactive,
+                mutation_permit: Some(permit_for_run),
+            }),
             mode,
         )
         .with_turn_capability(capability)
@@ -1169,6 +1208,7 @@ pub(crate) async fn resume_chat_objective(
                 &objective.id,
                 &root_turn_id,
                 &outcome,
+                Some(&mutation_permit),
             )
             .await?;
         }
@@ -1182,6 +1222,7 @@ pub(crate) async fn resume_chat_objective(
                 &root_turn_id,
                 auth_expired,
                 &error_text,
+                Some(&mutation_permit),
             )
             .await?;
             if auth_expired {

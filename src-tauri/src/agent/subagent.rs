@@ -108,6 +108,7 @@ pub async fn run_subagent(
     settings: &Settings,
     app_handle: &AppHandle,
     pending_perms: &PendingPermissionMap,
+    mutation_permit: Option<codefactory_agent_loop::tool::MutationPermit>,
 ) -> std::result::Result<SubagentResult, AppError> {
     let requested_model = resolved_subagent_model(settings)?;
     // Resolve before creating the child session so its stored model reflects
@@ -218,6 +219,7 @@ pub async fn run_subagent(
                 .map(|ctx| ctx.knowledge_library_ids())
                 .unwrap_or_default(),
             usage_surface: crate::agent::UsageSurface::Subagent,
+            mutation_permit,
         }),
         crate::agent::AgentMode::Autonomous,
     )

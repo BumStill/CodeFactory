@@ -181,7 +181,7 @@ pub(crate) async fn record_tool_call_finished(
 ) -> Result<(), AppError> {
     if !matches!(
         status,
-        "done" | "blocked" | "error" | "denied" | "cancelled"
+        "done" | "waiting" | "blocked" | "error" | "denied" | "cancelled"
     ) {
         return Err(AppError::Other(format!(
             "unsupported normalized tool-call status: {status}"
@@ -220,7 +220,7 @@ pub(crate) async fn record_terminal_tool_outcome(
 ) -> Result<(), AppError> {
     if !matches!(
         status,
-        "done" | "blocked" | "error" | "denied" | "cancelled"
+        "done" | "waiting" | "blocked" | "error" | "denied" | "cancelled"
     ) {
         return Err(AppError::Other(format!(
             "unsupported normalized tool-call status: {status}"

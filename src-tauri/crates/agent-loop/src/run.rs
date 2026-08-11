@@ -305,6 +305,7 @@ pub struct LoopInputs {
     pub fact_check_instruction: String,
     pub audit_session_id: String,
     pub root_turn_id: Option<String>,
+    pub mutation_permit: Option<crate::tool::MutationPermit>,
     pub knowledge_library_ids: Option<Vec<String>>,
     pub cancel: Option<Arc<AtomicBool>>,
 }
@@ -537,6 +538,7 @@ pub async fn run_agent_loop(
         fact_check_instruction,
         audit_session_id,
         root_turn_id,
+        mutation_permit,
         knowledge_library_ids,
         cancel,
     } = inputs;
@@ -1595,6 +1597,8 @@ pub async fn run_agent_loop(
                     session_id: Some(audit_session_id.clone()),
                     root_turn_id: root_turn_id.clone(),
                     task_id: task_id.clone(),
+                    trajectory_session_id: Some(session_id.clone()),
+                    mutation_permit: mutation_permit.clone(),
                     knowledge_library_ids: knowledge_library_ids.clone(),
                     timeout_sec: None,
                 };
@@ -1865,12 +1869,9 @@ pub async fn run_agent_loop(
                 reasoning_content: reasoning,
             });
             messages.extend(result_messages);
-            if blocker_terminal_reason
-                .as_deref()
-                .is_some_and(|reason| {
-                    matches!(reason, "permission_timed_out" | "permission_channel_closed")
-                })
-                && !blocked_tool_result
+            if blocker_terminal_reason.as_deref().is_some_and(|reason| {
+                matches!(reason, "permission_timed_out" | "permission_channel_closed")
+            }) && !blocked_tool_result
             {
                 publish_turn_activity(
                     persistence.as_ref(),
@@ -3026,6 +3027,7 @@ mod tests {
             fact_check_instruction: String::new(),
             audit_session_id: "audit".into(),
             root_turn_id: Some("root".into()),
+            mutation_permit: None,
             knowledge_library_ids: None,
             cancel: None,
         }

@@ -10,7 +10,7 @@ use anyhow::{anyhow, bail, Context};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 macro_rules! string_enum {
@@ -763,6 +763,63 @@ pub struct ClaimedRemediation {
     pub objective: ObjectiveSnapshot,
     pub remediation_id: String,
     pub domain: RecoveryDomain,
+    /// Monotonic claim generation. Owner strings are process-scoped and can
+    /// reclaim the same row after expiry; the epoch is what fences an older
+    /// future owned by that same process.
+    pub claim_epoch: i64,
+    pub binding_id: Option<String>,
+    pub resource_generation: Option<i64>,
+}
+
+fn objective_binding_digest(objective_id: &str, resource_kind: &str, resource_id: &str) -> String {
+    let material = format!("{objective_id}\0{resource_kind}\0{resource_id}");
+    format!("sha256:{:x}", Sha256::digest(material.as_bytes()))
+}
+
+/// Idempotently bind one opaque persisted resource to its Objective. The
+/// digest contains only opaque ids; tool arguments, user content and secrets
+/// are never copied into the identity ledger.
+async fn ensure_objective_binding(
+    tx: &mut Transaction<'_, Sqlite>,
+    objective_id: &str,
+    domain: RecoveryDomain,
+    resource_kind: &str,
+    resource_id: &str,
+    now: i64,
+) -> anyhow::Result<(String, i64)> {
+    let digest = objective_binding_digest(objective_id, resource_kind, resource_id);
+    sqlx::query(
+        "INSERT OR IGNORE INTO objective_bindings
+         (id, objective_id, domain, resource_kind, resource_id,
+          resource_generation, identity_digest, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(objective_id)
+    .bind(domain.as_str())
+    .bind(resource_kind)
+    .bind(resource_id)
+    .bind(&digest)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    let (binding_id, bound_objective_id, generation, stored_digest): (String, String, i64, String) =
+        sqlx::query_as(
+            "SELECT id, objective_id, resource_generation, identity_digest
+         FROM objective_bindings
+         WHERE domain=? AND resource_kind=? AND resource_id=?
+           AND resource_generation=1",
+        )
+        .bind(domain.as_str())
+        .bind(resource_kind)
+        .bind(resource_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if bound_objective_id != objective_id || stored_digest != digest {
+        bail!("objective binding identity conflict for {resource_kind}:{resource_id}");
+    }
+    Ok((binding_id, generation))
 }
 
 impl ObjectiveStore {
@@ -902,6 +959,15 @@ impl ObjectiveStore {
             if current_binding.as_deref() == Some(objective_id.as_str())
                 && legacy_root_to_reconcile.is_none()
             {
+                ensure_objective_binding(
+                    &mut tx,
+                    &objective_id,
+                    RecoveryDomain::Chat,
+                    "chat_root_turn",
+                    root_turn_id,
+                    now,
+                )
+                .await?;
                 tx.commit().await?;
                 return self
                     .get(&objective_id)
@@ -990,6 +1056,26 @@ impl ObjectiveStore {
                 if linked.rows_affected() != 1 {
                     bail!("legacy chat root objective binding changed concurrently");
                 }
+            }
+            ensure_objective_binding(
+                &mut tx,
+                &objective_id,
+                RecoveryDomain::Chat,
+                "chat_root_turn",
+                root_turn_id,
+                now,
+            )
+            .await?;
+            if let Some(legacy_root_turn_id) = legacy_root_to_reconcile.as_deref() {
+                ensure_objective_binding(
+                    &mut tx,
+                    &objective_id,
+                    RecoveryDomain::Chat,
+                    "chat_root_turn",
+                    legacy_root_turn_id,
+                    now,
+                )
+                .await?;
             }
             sqlx::query(
                 "INSERT INTO objective_events
@@ -1100,6 +1186,26 @@ impl ObjectiveStore {
             .execute(&mut *tx)
             .await?;
         }
+        ensure_objective_binding(
+            &mut tx,
+            &objective_id,
+            RecoveryDomain::Chat,
+            "chat_root_turn",
+            root_turn_id,
+            now,
+        )
+        .await?;
+        if let Some(legacy_root_turn_id) = legacy_root_to_reconcile.as_deref() {
+            ensure_objective_binding(
+                &mut tx,
+                &objective_id,
+                RecoveryDomain::Chat,
+                "chat_root_turn",
+                legacy_root_turn_id,
+                now,
+            )
+            .await?;
+        }
         tx.commit().await?;
         self.get(&objective_id)
             .await?
@@ -1152,6 +1258,15 @@ impl ObjectiveStore {
         if linked.rows_affected() != 1 {
             bail!("task row missing while binding objective");
         }
+        ensure_objective_binding(
+            &mut tx,
+            &objective_id,
+            RecoveryDomain::Task,
+            "task_run",
+            task_id,
+            now,
+        )
+        .await?;
         tx.commit().await?;
         self.get(&objective_id)
             .await?
@@ -1213,11 +1328,12 @@ impl ObjectiveStore {
             let remediation_id: String = row.try_get("remediation_id")?;
             let objective_id: String = row.try_get("objective_id")?;
             let domain = RecoveryDomain::parse(row.try_get::<String, _>("domain")?.as_str())?;
-            let lease_expires_at = now + lease_ms.max(1_000);
+            let lease_expires_at = now + lease_ms.max(1);
             let mut tx = self.pool.begin().await?;
             let updated = sqlx::query(
                 "UPDATE objective_remediations
-                 SET status='claimed', lease_owner=?, lease_expires_at=?, updated_at=?
+                 SET status='claimed', attempt_index=attempt_index+1,
+                     lease_owner=?, lease_expires_at=?, updated_at=?
                  WHERE id=? AND objective_id=?
                    AND status IN ('queued','waiting','claimed')
                    AND next_observation_at<=?
@@ -1238,25 +1354,54 @@ impl ObjectiveStore {
             }
             let objective_updated = sqlx::query(
                 "UPDATE objectives SET lease_owner=?, lease_expires_at=?, updated_at=?
-                 WHERE id=? AND status='waiting_system' AND remediation_id=?",
+                 WHERE id=? AND status='waiting_system' AND remediation_id=?
+                   AND (lease_expires_at IS NULL OR lease_expires_at<=?)",
             )
             .bind(owner)
             .bind(lease_expires_at)
             .bind(now)
             .bind(&objective_id)
             .bind(&remediation_id)
+            .bind(now)
             .execute(&mut *tx)
             .await?;
             if objective_updated.rows_affected() != 1 {
                 tx.rollback().await?;
                 continue;
             }
+            let (claim_epoch, binding_id): (i64, Option<String>) = sqlx::query_as(
+                "SELECT attempt_index, binding_id FROM objective_remediations
+                 WHERE id=? AND objective_id=? AND status='claimed'
+                   AND lease_owner=?",
+            )
+            .bind(&remediation_id)
+            .bind(&objective_id)
+            .bind(owner)
+            .fetch_one(&mut *tx)
+            .await?;
+            let resource_generation = if let Some(binding_id) = binding_id.as_deref() {
+                Some(
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT resource_generation FROM objective_bindings
+                         WHERE id=? AND objective_id=?",
+                    )
+                    .bind(binding_id)
+                    .bind(&objective_id)
+                    .fetch_one(&mut *tx)
+                    .await?,
+                )
+            } else {
+                None
+            };
             tx.commit().await?;
             if let Some(objective) = self.get(&objective_id).await? {
                 claimed.push(ClaimedRemediation {
                     objective,
                     remediation_id,
                     domain,
+                    claim_epoch,
+                    binding_id,
+                    resource_generation,
                 });
             }
         }
@@ -1268,6 +1413,7 @@ impl ObjectiveStore {
         objective_id: &str,
         remediation_id: &str,
         owner: &str,
+        claim_epoch: i64,
         delay_ms: i64,
     ) -> anyhow::Result<()> {
         let now = Utc::now().timestamp_millis();
@@ -1275,33 +1421,41 @@ impl ObjectiveStore {
         let mut tx = self.pool.begin().await?;
         let remediation = sqlx::query(
             "UPDATE objective_remediations
-             SET status='waiting', attempt_index=attempt_index+1,
+             SET status='waiting',
                  next_observation_at=?, lease_owner=NULL, lease_expires_at=NULL,
                  updated_at=?
-             WHERE id=? AND objective_id=? AND status='claimed' AND lease_owner=?",
+             WHERE id=? AND objective_id=? AND status='claimed' AND lease_owner=?
+               AND attempt_index=? AND lease_expires_at>?",
         )
         .bind(next)
         .bind(now)
         .bind(remediation_id)
         .bind(objective_id)
         .bind(owner)
+        .bind(claim_epoch)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
         if remediation.rows_affected() != 1 {
             bail!("remediation claim ownership changed before defer");
         }
-        sqlx::query(
+        let objective = sqlx::query(
             "UPDATE objectives SET next_observation_at=?, lease_owner=NULL,
                lease_expires_at=NULL, updated_at=?
-             WHERE id=? AND status='waiting_system' AND remediation_id=? AND lease_owner=?",
+             WHERE id=? AND status='waiting_system' AND remediation_id=? AND lease_owner=?
+               AND lease_expires_at>?",
         )
         .bind(next)
         .bind(now)
         .bind(objective_id)
         .bind(remediation_id)
         .bind(owner)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
+        if objective.rows_affected() != 1 {
+            bail!("objective claim ownership changed before defer");
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -1314,15 +1468,17 @@ impl ObjectiveStore {
         objective_id: &str,
         remediation_id: &str,
         owner: &str,
+        claim_epoch: i64,
         lease_ms: i64,
     ) -> anyhow::Result<bool> {
         let now = Utc::now().timestamp_millis();
-        let lease_expires_at = now + lease_ms.max(1_000);
+        let lease_expires_at = now + lease_ms.max(1);
         let mut tx = self.pool.begin().await?;
         let remediation = sqlx::query(
             "UPDATE objective_remediations
              SET lease_expires_at=?, last_progress_at=?, updated_at=?
-             WHERE id=? AND objective_id=? AND status='claimed' AND lease_owner=?",
+             WHERE id=? AND objective_id=? AND status='claimed' AND lease_owner=?
+               AND attempt_index=? AND lease_expires_at>?",
         )
         .bind(lease_expires_at)
         .bind(now)
@@ -1330,6 +1486,8 @@ impl ObjectiveStore {
         .bind(remediation_id)
         .bind(objective_id)
         .bind(owner)
+        .bind(claim_epoch)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
         if remediation.rows_affected() != 1 {
@@ -1339,7 +1497,8 @@ impl ObjectiveStore {
         let objective = sqlx::query(
             "UPDATE objectives
              SET lease_expires_at=?, last_progress_at=?, updated_at=?
-             WHERE id=? AND status='waiting_system' AND remediation_id=? AND lease_owner=?",
+             WHERE id=? AND status='waiting_system' AND remediation_id=? AND lease_owner=?
+               AND lease_expires_at>?",
         )
         .bind(lease_expires_at)
         .bind(now)
@@ -1347,6 +1506,7 @@ impl ObjectiveStore {
         .bind(objective_id)
         .bind(remediation_id)
         .bind(owner)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
         if objective.rows_affected() != 1 {
@@ -1354,6 +1514,60 @@ impl ObjectiveStore {
             return Ok(false);
         }
         tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Observe whether an adapter still owns the exact durable claim it was
+    /// launched for. This is intentionally stronger than comparing only the
+    /// owner string: a same-process reclaim increments `attempt_index`, and a
+    /// resource rebind invalidates the generation carried by the old permit.
+    pub async fn claim_is_current(
+        &self,
+        permit: &codefactory_agent_loop::tool::MutationPermit,
+    ) -> anyhow::Result<bool> {
+        if permit.binding_id.is_some() != permit.resource_generation.is_some() {
+            bail!("mutation permit binding and resource generation must be paired");
+        }
+        let now = Utc::now().timestamp_millis();
+        let claimed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM objective_remediations remediation
+             JOIN objectives objective
+               ON objective.id=remediation.objective_id
+              AND objective.remediation_id=remediation.id
+             WHERE remediation.id=? AND remediation.objective_id=?
+               AND remediation.status='claimed' AND remediation.lease_owner=?
+               AND remediation.attempt_index=? AND remediation.lease_expires_at>?
+               AND COALESCE(remediation.binding_id, '')=COALESCE(?, '')
+               AND objective.status='waiting_system' AND objective.lease_owner=?
+               AND objective.lease_expires_at>?",
+        )
+        .bind(&permit.remediation_id)
+        .bind(&permit.objective_id)
+        .bind(&permit.owner)
+        .bind(permit.claim_epoch)
+        .bind(now)
+        .bind(&permit.binding_id)
+        .bind(&permit.owner)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        if claimed != 1 {
+            return Ok(false);
+        }
+        if let Some(binding_id) = permit.binding_id.as_deref() {
+            let generation = sqlx::query_scalar::<_, i64>(
+                "SELECT resource_generation FROM objective_bindings
+                 WHERE id=? AND objective_id=?",
+            )
+            .bind(binding_id)
+            .bind(&permit.objective_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if generation != permit.resource_generation {
+                bail!("mutation permit binding generation changed while claim was live");
+            }
+        }
         Ok(true)
     }
 
@@ -1451,6 +1665,30 @@ impl ObjectiveStore {
         expected_revision: i64,
         decision: DecisionEnvelope,
     ) -> anyhow::Result<ObjectiveSnapshot> {
+        self.apply_decision_inner(expected_revision, decision, None)
+            .await
+    }
+
+    /// Settle a recovery attempt only while its exact owner+epoch lease is
+    /// still live. A same-process reclaim deliberately keeps the owner string,
+    /// so omitting the epoch here would let the stale future supersede the new
+    /// remediation after takeover.
+    pub async fn apply_claimed_decision(
+        &self,
+        expected_revision: i64,
+        decision: DecisionEnvelope,
+        permit: &codefactory_agent_loop::tool::MutationPermit,
+    ) -> anyhow::Result<ObjectiveSnapshot> {
+        self.apply_decision_inner(expected_revision, decision, Some(permit))
+            .await
+    }
+
+    async fn apply_decision_inner(
+        &self,
+        expected_revision: i64,
+        decision: DecisionEnvelope,
+        permit: Option<&codefactory_agent_loop::tool::MutationPermit>,
+    ) -> anyhow::Result<ObjectiveSnapshot> {
         let current = self
             .get(&decision.objective_id)
             .await?
@@ -1470,13 +1708,204 @@ impl ObjectiveStore {
             .as_ref()
             .map(|evidence| evidence.evidence_ref.clone());
         let mut tx = self.pool.begin().await?;
+        if let Some(permit) = permit {
+            if permit.objective_id != decision.objective_id {
+                bail!("mutation permit objective does not match decision");
+            }
+            let remediation_claim = sqlx::query(
+                "UPDATE objective_remediations SET updated_at=updated_at
+                 WHERE id=? AND objective_id=? AND status='claimed'
+                   AND lease_owner=? AND attempt_index=? AND lease_expires_at>?
+                   AND COALESCE(binding_id, '')=COALESCE(?, '')",
+            )
+            .bind(&permit.remediation_id)
+            .bind(&permit.objective_id)
+            .bind(&permit.owner)
+            .bind(permit.claim_epoch)
+            .bind(now)
+            .bind(&permit.binding_id)
+            .execute(&mut *tx)
+            .await?;
+            if remediation_claim.rows_affected() != 1 {
+                bail!("remediation claim expired or changed before settlement");
+            }
+            let objective_claim = sqlx::query(
+                "UPDATE objectives SET updated_at=updated_at
+                 WHERE id=? AND status='waiting_system' AND remediation_id=?
+                   AND lease_owner=? AND lease_expires_at>?",
+            )
+            .bind(&permit.objective_id)
+            .bind(&permit.remediation_id)
+            .bind(&permit.owner)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            if objective_claim.rows_affected() != 1 {
+                bail!("objective claim expired or changed before settlement");
+            }
+        }
+        if decision.status == ObjectiveStatus::Completed {
+            let unresolved_receipts: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM side_effect_receipts
+                 WHERE objective_id=? AND status IN ('not_started','started','unknown')",
+            )
+            .bind(&decision.objective_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if unresolved_receipts > 0 {
+                bail!(
+                    "objective completion refused with {unresolved_receipts} unresolved side-effect receipt(s)"
+                );
+            }
+            let tool_calls_exist: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='tool_calls'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if tool_calls_exist == 1 {
+                let unresolved_tool_calls: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM tool_calls
+                     WHERE objective_id=? AND status='pending'",
+                )
+                .bind(&decision.objective_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if unresolved_tool_calls > 0 {
+                    bail!(
+                        "objective completion refused with {unresolved_tool_calls} unresolved tool call(s)"
+                    );
+                }
+            }
+
+            let objective_side_effect_started: i64 = sqlx::query_scalar(
+                "SELECT side_effect_started FROM objectives
+                 WHERE id=? AND revision=?",
+            )
+            .bind(&decision.objective_id)
+            .bind(expected_revision)
+            .fetch_one(&mut *tx)
+            .await?;
+            let current_binding: Option<(String, i64, i64)> =
+                if let Some(binding_id) = permit.and_then(|permit| permit.binding_id.as_deref()) {
+                    sqlx::query_as(
+                        "SELECT id, resource_generation, side_effect_started
+                         FROM objective_bindings
+                         WHERE id=? AND objective_id=?",
+                    )
+                    .bind(binding_id)
+                    .bind(&decision.objective_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                } else {
+                    sqlx::query_as(
+                        "SELECT id, resource_generation, side_effect_started
+                         FROM objective_bindings
+                         WHERE objective_id=?
+                         ORDER BY CASE WHEN resource_id=? THEN 0 ELSE 1 END,
+                                  resource_generation DESC, updated_at DESC, id DESC
+                         LIMIT 1",
+                    )
+                    .bind(&decision.objective_id)
+                    .bind(decision.resume_cursor.as_deref().unwrap_or(""))
+                    .fetch_optional(&mut *tx)
+                    .await?
+                };
+            let binding_side_effect_started = current_binding
+                .as_ref()
+                .is_some_and(|(_, _, started)| *started != 0);
+            if objective_side_effect_started != 0 || binding_side_effect_started {
+                let Some((binding_id, resource_generation, _)) = current_binding else {
+                    bail!(
+                        "objective completion refused because a side effect started without a current Objective binding"
+                    );
+                };
+                if tool_calls_exist != 1 {
+                    bail!(
+                        "objective completion refused because a side effect started without normalized tool attribution"
+                    );
+                }
+                let attributed_actions: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM tool_calls
+                     WHERE objective_id=? AND resource_generation=?
+                       AND NULLIF(TRIM(action_signature), '') IS NOT NULL",
+                )
+                .bind(&decision.objective_id)
+                .bind(resource_generation)
+                .fetch_one(&mut *tx)
+                .await?;
+                if attributed_actions == 0 {
+                    bail!(
+                        "objective completion refused because a side effect started without a trustworthy current attributed receipt"
+                    );
+                }
+                let unmatched_actions: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM tool_calls AS tool
+                     WHERE tool.objective_id=? AND tool.resource_generation=?
+                       AND NULLIF(TRIM(tool.action_signature), '') IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM side_effect_receipts AS receipt
+                           WHERE receipt.objective_id=tool.objective_id
+                             AND receipt.binding_id=?
+                             AND receipt.action_fingerprint=tool.action_signature
+                             AND receipt.status IN ('committed','reconciled')
+                       )",
+                )
+                .bind(&decision.objective_id)
+                .bind(resource_generation)
+                .bind(&binding_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if unmatched_actions > 0 {
+                    bail!(
+                        "objective completion refused with {unmatched_actions} current attributed side effect(s) lacking a matching committed receipt"
+                    );
+                }
+            }
+        }
+        if permit.is_some_and(|permit| {
+            permit.binding_id.is_some() != permit.resource_generation.is_some()
+        }) {
+            bail!("mutation permit binding and resource generation must be paired");
+        }
+        let authoritative_binding_id =
+            if let Some(binding_id) = permit.and_then(|permit| permit.binding_id.clone()) {
+                let generation = sqlx::query_scalar::<_, i64>(
+                    "SELECT resource_generation FROM objective_bindings
+                 WHERE id=? AND objective_id=?",
+                )
+                .bind(&binding_id)
+                .bind(&decision.objective_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let Some(generation) = generation else {
+                    bail!("mutation permit binding does not belong to objective");
+                };
+                if permit.and_then(|permit| permit.resource_generation) != Some(generation) {
+                    bail!("mutation permit resource generation changed before settlement");
+                }
+                Some(binding_id)
+            } else {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM objective_bindings
+                 WHERE objective_id=?
+                 ORDER BY CASE WHEN resource_id=? THEN 0 ELSE 1 END,
+                          updated_at DESC, resource_generation DESC
+                 LIMIT 1",
+                )
+                .bind(&decision.objective_id)
+                .bind(decision.resume_cursor.as_deref().unwrap_or(""))
+                .fetch_optional(&mut *tx)
+                .await?
+            };
         let result = sqlx::query(
             "UPDATE objectives SET
                revision=?, status=?, decision_type=?, domain=?,
                reached_acceptance=?, requires_user_action=?, request_key=?,
                decision_key=?, action_signature=?, failure_code=?, failure_signature=?,
                recovery_owner=?, remediation_id=?, resume_cursor=?,
-               output_started=?, side_effect_started=?, next_observation_at=?,
+               output_started=MAX(output_started, ?),
+               side_effect_started=MAX(side_effect_started, ?), next_observation_at=?,
                lease_owner=NULL, lease_expires_at=NULL, evidence_ref=?,
                cancellation_provenance=?, last_observed_process_instance=?,
                last_progress_at=?, updated_at=?, completed_at=?
@@ -1556,10 +1985,10 @@ impl ObjectiveStore {
         if decision.status == ObjectiveStatus::WaitingSystem {
             sqlx::query(
                 "INSERT INTO objective_remediations
-                 (id, objective_id, domain, status, failure_code, failure_signature,
+                 (id, objective_id, binding_id, domain, status, failure_code, failure_signature,
                   strategy, approach_index, attempt_index, resume_cursor,
                   next_observation_at, created_at, updated_at)
-                 VALUES (?, ?, ?, 'queued', ?, ?, 'reconcile_then_resume', 0, 0, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, 'queued', ?, ?, 'reconcile_then_resume', 0, 0, ?, ?, ?, ?)",
             )
             .bind(
                 decision
@@ -1568,6 +1997,7 @@ impl ObjectiveStore {
                     .ok_or_else(|| anyhow!("waiting_system remediation id missing"))?,
             )
             .bind(&decision.objective_id)
+            .bind(&authoritative_binding_id)
             .bind(decision.domain.as_str())
             .bind(
                 decision
@@ -1653,6 +2083,49 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ))
     .execute(pool)
     .await?;
+
+    // Preserve historical duplicate rows as immutable audit evidence, while
+    // ratcheting every upgraded database so no new cross-revision duplicate
+    // can be admitted. A unique index is still installed for clean databases
+    // below, but it cannot be created when legacy duplicates already exist.
+    sqlx::query(
+        "CREATE TRIGGER IF NOT EXISTS trg_side_effect_receipts_idempotency_ratchet
+         BEFORE INSERT ON side_effect_receipts
+         WHEN EXISTS (
+             SELECT 1 FROM side_effect_receipts
+             WHERE objective_id = NEW.objective_id
+               AND idempotency_key = NEW.idempotency_key
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'duplicate side-effect receipt idempotency key');
+         END",
+    )
+    .execute(pool)
+    .await?;
+
+    let duplicate_idempotency_groups: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+             SELECT objective_id, idempotency_key
+             FROM side_effect_receipts
+             GROUP BY objective_id, idempotency_key
+             HAVING COUNT(*) > 1
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    if duplicate_idempotency_groups == 0 {
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_side_effect_receipts_objective_idempotency
+             ON side_effect_receipts(objective_id, idempotency_key)",
+        )
+        .execute(pool)
+        .await?;
+    } else {
+        tracing::error!(
+            duplicate_groups = duplicate_idempotency_groups,
+            "historical side-effect receipts violate cross-revision idempotency; preserved rows, installed the insert ratchet, and skipped the unique index"
+        );
+    }
 
     // Compatibility projections are nullable and therefore safe for old
     // readers. Identity is linked only by ObjectiveStore after it has proved a
@@ -1753,6 +2226,277 @@ mod tests {
             .unwrap();
         ensure_schema(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn fresh_schema_enforces_cross_revision_side_effect_receipt_idempotency() {
+        let pool = pool().await;
+        let index_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='index'
+               AND name='idx_side_effect_receipts_objective_idempotency'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(index_exists, 1);
+
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-cross-revision-idempotency".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-cross-revision-idempotency".into()),
+                root_turn_id: Some("turn-cross-revision-idempotency".into()),
+                domain: RecoveryDomain::Tool,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO side_effect_receipts
+             (id, objective_id, revision, action_fingerprint, idempotency_key,
+              status, created_at, observed_at)
+             VALUES (?, ?, 1, 'sha256:first-action', 'sha256:stable-key',
+                     'committed', ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let duplicate = sqlx::query(
+            "INSERT INTO side_effect_receipts
+             (id, objective_id, revision, action_fingerprint, idempotency_key,
+              status, created_at, observed_at)
+             VALUES (?, ?, 2, 'sha256:second-action', 'sha256:stable-key',
+                     'committed', ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await;
+        assert!(duplicate.is_err());
+    }
+
+    #[tokio::test]
+    async fn historical_duplicate_receipts_are_preserved_but_new_duplicates_are_rejected() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0006_unified_objective_control_plane.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-historical-duplicate-ratchet".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-historical-duplicate-ratchet".into()),
+                root_turn_id: Some("turn-historical-duplicate-ratchet".into()),
+                domain: RecoveryDomain::Tool,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp_millis();
+        for (id, revision, action) in [
+            ("historical-receipt-a", 1_i64, "sha256:action-a"),
+            ("historical-receipt-b", 2_i64, "sha256:action-b"),
+        ] {
+            sqlx::query(
+                "INSERT INTO side_effect_receipts
+                 (id, objective_id, revision, action_fingerprint, idempotency_key,
+                  status, created_at, observed_at)
+                 VALUES (?, ?, ?, ?, 'sha256:historical-stable-key',
+                         'committed', ?, ?)",
+            )
+            .bind(id)
+            .bind(&objective.id)
+            .bind(revision)
+            .bind(action)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        ensure_schema(&pool).await.unwrap();
+        let preserved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM side_effect_receipts
+             WHERE objective_id=? AND idempotency_key='sha256:historical-stable-key'",
+        )
+        .bind(&objective.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(preserved, 2, "schema repair must not delete audit evidence");
+
+        let third = sqlx::query(
+            "INSERT INTO side_effect_receipts
+             (id, objective_id, revision, action_fingerprint, idempotency_key,
+              status, created_at, observed_at)
+             VALUES ('historical-receipt-c', ?, 3, 'sha256:action-c',
+                     'sha256:historical-stable-key', 'committed', ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await;
+        assert!(
+            third.is_err(),
+            "legacy duplicates may remain for audit, but the schema ratchet must reject new ones"
+        );
+    }
+
+    const CURRENT_ACTION_SIGNATURE: &str = "sha256:current-action";
+
+    struct GenericReceiptCompletionFixture {
+        pool: SqlitePool,
+        store: ObjectiveStore,
+        objective: ObjectiveSnapshot,
+        evidence: ObjectiveEvidence,
+        old_binding_id: String,
+        current_binding_id: String,
+        now: i64,
+    }
+
+    async fn generic_receipt_completion_fixture(test_id: &str) -> GenericReceiptCompletionFixture {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE tool_calls (
+               id TEXT PRIMARY KEY,
+               objective_id TEXT,
+               status TEXT NOT NULL,
+               action_signature TEXT,
+               resource_generation INTEGER NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: format!("objective-{test_id}"),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some(format!("session-{test_id}")),
+                root_turn_id: Some(format!("turn-{test_id}")),
+                domain: RecoveryDomain::Tool,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp_millis();
+        let old_binding_id = format!("binding-{test_id}-generation-1");
+        let current_binding_id = format!("binding-{test_id}-generation-2");
+        for (binding_id, generation, side_effect_started) in [
+            (old_binding_id.as_str(), 1_i64, 0_i64),
+            (current_binding_id.as_str(), 2_i64, 1_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO objective_bindings
+                 (id, objective_id, domain, resource_kind, resource_id,
+                  resource_generation, identity_digest, side_effect_started,
+                  created_at, updated_at)
+                 VALUES (?, ?, 'tool', 'chat_root_turn', ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(binding_id)
+            .bind(&objective.id)
+            .bind(format!("turn-{test_id}"))
+            .bind(generation)
+            .bind(format!("sha256:binding-{test_id}-{generation}"))
+            .bind(side_effect_started)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE objectives SET side_effect_started=1 WHERE id=?")
+            .bind(&objective.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_calls
+             (id, objective_id, status, action_signature, resource_generation)
+             VALUES (?, ?, 'done', ?, 2)",
+        )
+        .bind(format!("tool-{test_id}"))
+        .bind(&objective.id)
+        .bind(CURRENT_ACTION_SIGNATURE)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let objective = store.get(&objective.id).await.unwrap().unwrap();
+        assert!(objective.side_effect_started);
+        let evidence = ObjectiveEvidence {
+            id: format!("evidence-{test_id}"),
+            kind: EvidenceKind::CurrentStateAcceptance,
+            scope: format!("turn-{test_id}"),
+            digest: "sha256:validated-current-state".into(),
+            evidence_ref: format!("db:test-validation/{test_id}"),
+            observed_at: now,
+            reached_acceptance: "validated_change".into(),
+        };
+
+        GenericReceiptCompletionFixture {
+            pool,
+            store,
+            objective,
+            evidence,
+            old_binding_id,
+            current_binding_id,
+            now,
+        }
+    }
+
+    async fn insert_generic_receipt(
+        fixture: &GenericReceiptCompletionFixture,
+        receipt_id: &str,
+        objective_id: &str,
+        binding_id: &str,
+        action_signature: &str,
+        status: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO side_effect_receipts
+             (id, objective_id, binding_id, revision, action_fingerprint,
+              idempotency_key, status, created_at, observed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(receipt_id)
+        .bind(objective_id)
+        .bind(binding_id)
+        .bind(fixture.objective.revision)
+        .bind(action_signature)
+        .bind(format!("sha256:key-{receipt_id}"))
+        .bind(status)
+        .bind(fixture.now)
+        .bind(fixture.now)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    }
+
+    fn completion_decision(fixture: &GenericReceiptCompletionFixture) -> DecisionEnvelope {
+        CompletionArbiter::decide(&fixture.objective, &[fixture.evidence.clone()]).unwrap()
     }
 
     #[test]
@@ -1907,6 +2651,266 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_fails_closed_while_receipt_or_tool_call_is_unresolved() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE tool_calls (
+               id TEXT PRIMARY KEY, objective_id TEXT, status TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-unresolved-effect".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-unresolved-effect".into()),
+                root_turn_id: Some("turn-unresolved-effect".into()),
+                domain: RecoveryDomain::Tool,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO side_effect_receipts
+             (id, objective_id, revision, action_fingerprint, idempotency_key,
+              status, created_at, observed_at)
+             VALUES ('receipt-unresolved', ?, 1, 'sha256:action', 'sha256:key',
+                     'started', ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_calls(id, objective_id, status)
+             VALUES ('tool-unresolved', ?, 'pending')",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let evidence = ObjectiveEvidence {
+            id: "evidence-unresolved-effect".into(),
+            kind: EvidenceKind::CurrentStateAcceptance,
+            scope: "turn-unresolved-effect".into(),
+            digest: "sha256:validation".into(),
+            evidence_ref: "db:test-validation".into(),
+            observed_at: now,
+            reached_acceptance: "validated_change".into(),
+        };
+        let complete = CompletionArbiter::decide(&objective, &[evidence]).unwrap();
+
+        assert!(store
+            .apply_decision(objective.revision, complete.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unresolved side-effect receipt"));
+        sqlx::query(
+            "UPDATE side_effect_receipts SET status='committed' WHERE id='receipt-unresolved'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(store
+            .apply_decision(objective.revision, complete.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unresolved tool call"));
+        sqlx::query("UPDATE tool_calls SET status='done' WHERE id='tool-unresolved'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let completed = store
+            .apply_decision(objective.revision, complete)
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ObjectiveStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_side_effect_started_without_current_binding_receipt() {
+        let fixture = generic_receipt_completion_fixture("zero-receipt").await;
+
+        assert!(fixture
+            .store
+            .apply_decision(fixture.objective.revision, completion_decision(&fixture))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_committed_receipt_owned_by_another_objective() {
+        let fixture = generic_receipt_completion_fixture("wrong-objective").await;
+        let other_objective = fixture
+            .store
+            .create(CreateObjective {
+                id: "objective-receipt-owner".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-receipt-owner".into()),
+                root_turn_id: Some("turn-receipt-owner".into()),
+                domain: RecoveryDomain::Tool,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let other_binding_id = "binding-receipt-owner";
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, side_effect_started,
+              created_at, updated_at)
+             VALUES (?, ?, 'tool', 'chat_root_turn', 'turn-receipt-owner', 1,
+                     'sha256:binding-receipt-owner', 1, ?, ?)",
+        )
+        .bind(other_binding_id)
+        .bind(&other_objective.id)
+        .bind(fixture.now)
+        .bind(fixture.now)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        insert_generic_receipt(
+            &fixture,
+            "receipt-wrong-objective",
+            &other_objective.id,
+            other_binding_id,
+            CURRENT_ACTION_SIGNATURE,
+            "committed",
+        )
+        .await;
+
+        assert!(fixture
+            .store
+            .apply_decision(fixture.objective.revision, completion_decision(&fixture))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_committed_receipt_from_prior_binding_generation() {
+        let fixture = generic_receipt_completion_fixture("old-binding-generation").await;
+        insert_generic_receipt(
+            &fixture,
+            "receipt-old-binding-generation",
+            &fixture.objective.id,
+            &fixture.old_binding_id,
+            CURRENT_ACTION_SIGNATURE,
+            "committed",
+        )
+        .await;
+
+        assert!(fixture
+            .store
+            .apply_decision(fixture.objective.revision, completion_decision(&fixture))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_committed_receipt_for_wrong_action_signature() {
+        let fixture = generic_receipt_completion_fixture("wrong-action").await;
+        insert_generic_receipt(
+            &fixture,
+            "receipt-wrong-action",
+            &fixture.objective.id,
+            &fixture.current_binding_id,
+            "sha256:different-action",
+            "committed",
+        )
+        .await;
+
+        assert!(fixture
+            .store
+            .apply_decision(fixture.objective.revision, completion_decision(&fixture))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn completion_accepts_matching_current_binding_committed_or_reconciled_receipt() {
+        for status in ["committed", "reconciled"] {
+            let fixture =
+                generic_receipt_completion_fixture(&format!("current-receipt-{status}")).await;
+            insert_generic_receipt(
+                &fixture,
+                &format!("receipt-current-{status}"),
+                &fixture.objective.id,
+                &fixture.current_binding_id,
+                CURRENT_ACTION_SIGNATURE,
+                status,
+            )
+            .await;
+
+            let completed = fixture
+                .store
+                .apply_decision(fixture.objective.revision, completion_decision(&fixture))
+                .await
+                .unwrap();
+            assert_eq!(completed.status, ObjectiveStatus::Completed, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prior_delivery_wait_row_does_not_block_later_receipt_backed_completion() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE tool_calls (
+               id TEXT PRIMARY KEY, objective_id TEXT, status TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-delivery-wait-history".into(),
+                kind: ObjectiveKind::Delivery,
+                session_id: Some("session-delivery-wait-history".into()),
+                root_turn_id: Some("turn-delivery-wait-history".into()),
+                domain: RecoveryDomain::Delivery,
+                requested_acceptance: "delivery_receipt".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_calls(id, objective_id, status)
+             VALUES ('delivery-wait-history', ?, 'waiting')",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = Utc::now().timestamp_millis();
+        let evidence = ObjectiveEvidence {
+            id: "delivery-receipt-history".into(),
+            kind: EvidenceKind::DeliveryReceipt,
+            scope: "turn-delivery-wait-history".into(),
+            digest: "sha256:delivery-receipt".into(),
+            evidence_ref: "delivery-run:completed".into(),
+            observed_at: now,
+            reached_acceptance: "delivery_receipt".into(),
+        };
+        let complete = CompletionArbiter::decide(&objective, &[evidence]).unwrap();
+        let completed = store
+            .apply_decision(objective.revision, complete)
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ObjectiveStatus::Completed);
+    }
+
+    #[tokio::test]
     async fn chat_objective_is_created_once_and_linked_to_the_transport_projection() {
         let pool = pool().await;
         sqlx::query(
@@ -1960,6 +2964,95 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 1);
+        let binding: (String, String, i64, String) = sqlx::query_as(
+            "SELECT id, objective_id, resource_generation, identity_digest
+             FROM objective_bindings
+             WHERE domain='chat' AND resource_kind='chat_root_turn'
+               AND resource_id='turn-linked'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(binding.1, first.id);
+        assert_eq!(binding.2, 1);
+        assert!(binding.3.starts_with("sha256:"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM objective_bindings
+                 WHERE objective_id=? AND domain='chat' AND resource_kind='chat_root_turn'",
+            )
+            .bind(&first.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1,
+            "idempotent ensure must preserve one authoritative binding"
+        );
+
+        let waiting = DecisionRouter::route(
+            &second,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: "provider_timeout".into(),
+                failure_signature: "sha256:linked-timeout".into(),
+                next_observation_at: Utc::now().timestamp_millis() - 1,
+                resume_cursor: Some("turn-linked".into()),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(second.revision, waiting)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_due_remediations("binding-supervisor", 1, 30_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(claim.binding_id.as_deref(), Some(binding.0.as_str()));
+        assert_eq!(claim.resource_generation, Some(1));
+        let permit = codefactory_agent_loop::tool::MutationPermit {
+            objective_id: claim.objective.id.clone(),
+            remediation_id: claim.remediation_id.clone(),
+            owner: "binding-supervisor".into(),
+            claim_epoch: claim.claim_epoch,
+            binding_id: claim.binding_id.clone(),
+            resource_generation: claim.resource_generation,
+        };
+        let retry = DecisionRouter::route(
+            &claim.objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: "provider_still_unavailable".into(),
+                failure_signature: "sha256:linked-timeout-retry".into(),
+                next_observation_at: Utc::now().timestamp_millis() + 1_000,
+                resume_cursor: Some("turn-linked".into()),
+            },
+        )
+        .unwrap();
+        sqlx::query("UPDATE objective_bindings SET resource_generation=2 WHERE id=?")
+            .bind(&binding.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(store
+            .apply_claimed_decision(claim.objective.revision, retry.clone(), &permit)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("resource generation"));
+        sqlx::query("UPDATE objective_bindings SET resource_generation=1 WHERE id=?")
+            .bind(&binding.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retried = store
+            .apply_claimed_decision(claim.objective.revision, retry, &permit)
+            .await
+            .unwrap();
+        assert_eq!(retried.status, ObjectiveStatus::WaitingSystem);
+        assert_ne!(retried.remediation_id, Some(claim.remediation_id));
     }
 
     #[tokio::test]
@@ -2180,6 +3273,7 @@ mod tests {
                 &first[0].objective.id,
                 &first[0].remediation_id,
                 "supervisor-a",
+                first[0].claim_epoch,
                 1_000,
             )
             .await
@@ -2202,10 +3296,21 @@ mod tests {
             .await
             .unwrap();
         let reclaimed = store
-            .claim_due_remediations("supervisor-b", 4, 30_000)
+            .claim_due_remediations("supervisor-a", 4, 30_000)
             .await
             .unwrap();
         assert_eq!(reclaimed.len(), 1);
+        assert!(reclaimed[0].claim_epoch > first[0].claim_epoch);
+        assert!(!store
+            .renew_claimed_remediation(
+                &first[0].objective.id,
+                &first[0].remediation_id,
+                "supervisor-a",
+                first[0].claim_epoch,
+                30_000,
+            )
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -2254,6 +3359,7 @@ mod tests {
                 &claim.objective.id,
                 &claim.remediation_id,
                 "another-supervisor",
+                claim.claim_epoch,
                 60_000,
             )
             .await
@@ -2263,6 +3369,44 @@ mod tests {
                 &claim.objective.id,
                 &claim.remediation_id,
                 "supervisor-renewal",
+                claim.claim_epoch,
+                60_000,
+            )
+            .await
+            .unwrap());
+
+        let (renewed_remediation_lease, renewed_objective_lease): (i64, i64) = sqlx::query_as(
+            "SELECT remediation.lease_expires_at, objective.lease_expires_at
+             FROM objective_remediations remediation
+             JOIN objectives objective ON objective.id=remediation.objective_id
+             WHERE remediation.id=?",
+        )
+        .bind(&claim.remediation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(renewed_remediation_lease > before);
+        assert_eq!(renewed_remediation_lease, renewed_objective_lease);
+
+        let expired = Utc::now().timestamp_millis() - 1;
+        sqlx::query("UPDATE objective_remediations SET lease_expires_at=? WHERE id=?")
+            .bind(expired)
+            .bind(&claim.remediation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objectives SET lease_expires_at=? WHERE id=?")
+            .bind(expired)
+            .bind(&claim.objective.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!store
+            .renew_claimed_remediation(
+                &claim.objective.id,
+                &claim.remediation_id,
+                "supervisor-renewal",
+                claim.claim_epoch,
                 60_000,
             )
             .await
@@ -2278,7 +3422,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(remediation_lease > before);
+        assert_eq!(remediation_lease, expired);
         assert_eq!(remediation_lease, objective_lease);
     }
 

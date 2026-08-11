@@ -183,13 +183,17 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     }
 
     let Some(db) = ctx.db.clone() else {
-        return Ok(ToolOutput::err("delegate_tasks requires a persisted project session"));
+        return Ok(ToolOutput::err(
+            "delegate_tasks requires a persisted project session",
+        ));
     };
     let Some(session_id) = ctx.session_id.clone() else {
         return Ok(ToolOutput::err("delegate_tasks requires a current session"));
     };
     let Some(app) = ctx.app.clone() else {
-        return Ok(ToolOutput::err("delegate_tasks is unavailable in this runtime"));
+        return Ok(ToolOutput::err(
+            "delegate_tasks is unavailable in this runtime",
+        ));
     };
     let Some(settings) = ctx.settings.clone() else {
         return Ok(ToolOutput::err("delegate_tasks requires project settings"));
@@ -203,21 +207,19 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         ));
     }
 
-    let persisted_cwd: Option<String> = sqlx::query_scalar(
-        "SELECT cwd FROM sessions WHERE id = ? AND kind = 'project'",
-    )
-    .bind(&session_id)
-    .fetch_optional(&db)
-    .await?;
+    let persisted_cwd: Option<String> =
+        sqlx::query_scalar("SELECT cwd FROM sessions WHERE id = ? AND kind = 'project'")
+            .bind(&session_id)
+            .fetch_optional(&db)
+            .await?;
     if persisted_cwd.as_deref() != Some(ctx.cwd.to_string_lossy().as_ref()) {
         return Ok(ToolOutput::err(
             "delegate_tasks is available only in the current persisted project session",
         ));
     }
 
-    let task_context_json = serde_json::to_string(
-        &crate::knowledge::enabled_library_context(&db).await?,
-    )?;
+    let task_context_json =
+        serde_json::to_string(&crate::knowledge::enabled_library_context(&db).await?)?;
     let now = Utc::now().to_rfc3339();
     let mut tmp_to_real = HashMap::new();
     let mut ids = Vec::with_capacity(args.tasks.len());
@@ -243,9 +245,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                 attempt_count: 0,
                 verification_results: None,
                 task_context_json: Some(task_context_json.clone()),
-                acceptance_criteria_json: Some(serde_json::to_string(
-                    &task.acceptance_criteria,
-                )?),
+                acceptance_criteria_json: Some(serde_json::to_string(&task.acceptance_criteria)?),
                 spec_req_id: None,
                 spec_title: None,
             },
@@ -255,21 +255,17 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     }
     for task in &args.tasks {
         for dependency in &task.dependencies {
-            task_storage::add_dependency(
-                &db,
-                &tmp_to_real[&task.id],
-                &tmp_to_real[dependency],
-            )
-            .await?;
+            task_storage::add_dependency(&db, &tmp_to_real[&task.id], &tmp_to_real[dependency])
+                .await?;
         }
     }
 
     let scheduler = Arc::new(TaskScheduler::new(db.clone()));
-    let cancel = scheduler.cancel_handle();
-    handles
-        .lock()
-        .await
-        .insert(session_id.clone(), cancel);
+    let handle = crate::commands::tasks::SchedulerHandle {
+        cancel: scheduler.cancel_handle(),
+        mutation_permits: scheduler.mutation_permits(),
+    };
+    handles.lock().await.insert(session_id.clone(), handle);
     crate::commands::tasks::spawn_delegated_session(
         scheduler,
         session_id.clone(),
@@ -291,7 +287,6 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         .to_string(),
     ))
 }
-
 
 // Keep validation and tool-dispatch coverage in unit-test builds without
 // linking the desktop scheduler runtime into the standalone Windows test
@@ -338,8 +333,14 @@ mod tests {
     fn definition_explains_session_native_automatic_execution() {
         let definition = definition();
         assert_eq!(definition.function.name, "delegate_tasks");
-        assert!(definition.function.description.contains("current conversation"));
-        assert!(definition.function.description.contains("starts automatically"));
+        assert!(definition
+            .function
+            .description
+            .contains("current conversation"));
+        assert!(definition
+            .function
+            .description
+            .contains("starts automatically"));
         assert!(!definition.function.description.contains("open the task"));
     }
 }

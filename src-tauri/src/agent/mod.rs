@@ -642,12 +642,25 @@ pub struct AgentExecutionContext {
     pub task_id: Option<String>,
     pub knowledge_library_ids: Vec<String>,
     pub usage_surface: UsageSurface,
+    pub mutation_permit: Option<codefactory_agent_loop::tool::MutationPermit>,
 }
 
 fn knowledge_scope_for_tools(
     execution_context: Option<&AgentExecutionContext>,
 ) -> Option<Vec<String>> {
-    execution_context.map(|context| context.knowledge_library_ids.clone())
+    execution_context.and_then(|context| {
+        // A resumed interactive chat carries an execution permit but keeps the
+        // normal dynamic knowledge scope. Autonomous task contexts deliberately
+        // preserve `Some([])` as an explicit deny-all snapshot.
+        if context.usage_surface == UsageSurface::Interactive
+            && context.parent_session_id.is_none()
+            && context.task_id.is_none()
+        {
+            None
+        } else {
+            Some(context.knowledge_library_ids.clone())
+        }
+    })
 }
 
 impl AgentLoop {
@@ -1155,6 +1168,14 @@ impl AgentLoop {
             db: self.db.clone(),
             mcp_manager: self.mcp_manager.clone(),
             settings: self.settings.clone(),
+            mcp_tool_names: std::sync::Arc::new(std::sync::RwLock::new(
+                self.mcp_manager
+                    .list_all_tools()
+                    .await
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect(),
+            )),
         };
         let effective_instruction = effective_fact_check_instruction(&history);
         let completion_instruction = effective_instruction.clone();
@@ -1173,6 +1194,10 @@ impl AgentLoop {
             fact_check_instruction,
             audit_session_id: self.audit_session_id(),
             root_turn_id,
+            mutation_permit: self
+                .execution_context
+                .as_ref()
+                .and_then(|context| context.mutation_permit.clone()),
             knowledge_library_ids: knowledge_scope_for_tools(self.execution_context.as_ref()),
             cancel: self.cancel.clone(),
         };
@@ -2867,6 +2892,7 @@ mod tests {
             task_id: Some("task".into()),
             knowledge_library_ids: Vec::new(),
             usage_surface: UsageSurface::Subagent,
+            mutation_permit: None,
         };
 
         assert_eq!(knowledge_scope_for_tools(Some(&context)), Some(Vec::new()));
