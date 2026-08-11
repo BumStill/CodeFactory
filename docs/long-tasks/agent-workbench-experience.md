@@ -15,8 +15,8 @@
 ## Current State
 
 - Current phase: 第二批 — 统一控制面与共享检查器
-- Current checkpoint: 第一批已完成公开发布；本批正在实现 R17/R22/R28 单一响应式 pane、R19/R24/R25 图标优先状态、R20 composer 运行策略、R21/R23 context 圆环、R26 责任人语义与 R29/R30 视觉/无障碍门禁。
-- Next owner: 当前交付继续完成失败验收、实现、真实 App、PR/CI、发布与正式产物验收。
+- Current checkpoint: 第二批实现与本地自动化门禁完成；正在执行真实 CodeFactoryDev 视口/键盘验收，随后进入 PR/CI、发布与正式产物验收。
+- Next owner: 当前交付继续完成真实 App、PR/CI、发布与正式产物验收；browser child WebView 仅按 Phase 1 同 URL 预览交付，EBP-R3/R9 保持 `not live`。
 - Updated at: 2026-08-11
 
 ## Completed Items
@@ -42,18 +42,18 @@
 ## Remaining Items
 
 - [ ] 补齐 1366×768 与 200% zoom 独立截图证据；≤720px 行为当前由真实 800×600 + `matchMedia` component test 覆盖。
-- [ ] 第二批：R17 单一右侧 pane arbiter，合并任务、Git、交付、证据和按需浏览器入口。
+- [x] 第二批：R17 单一右侧 pane arbiter，合并任务、Git、交付、证据和按需浏览器入口。
 - [ ] 第二批：R18 Workspace/acceptance 共用 TaskActivityDrawer，并清理旧 TaskDashboard/ExecutionStream 虚假验收面。
-- [ ] 第二批：R19 顶栏图标优先并移除模型/思考/权限重复控件。
-- [ ] 第二批：R20 模型/思考/权限进入 composer，验证会话切换和下一回合生效语义。
-- [ ] 第二批：R21 context 圆环与累计 Token 渐进披露，不混合指标。
-- [ ] 第二批：R22 1440px 停靠、低于 1440px overlay、宽度调节与空白回收。
-- [ ] 第二批：R23 未知 context 不伪造百分比，累计 Token/成本/压缩信息只进入详情。
-- [ ] 第二批：R24/R25 Git、交付和任务图标化，异常/下一步保留短文字与完整可访问名称。
-- [ ] 第二批：R26 引入结构化下一动作责任人，纠正 `6/6 + failure evidence` 与 system-owned 恢复文案。
-- [ ] 第二批：R27 当前结构化状态与历史消息分层。
-- [ ] 第二批：R28 单 pane tabs、overlay 与 separator 完整键盘/focus 契约。
-- [ ] 第二批：R29 正文/composer 同一 880px 网格，多视口无页面级横向溢出。
+- [x] 第二批：R19 顶栏图标优先并移除模型/思考/权限重复控件。
+- [x] 第二批：R20 模型/思考/权限进入 composer，验证会话切换和下一回合生效语义。
+- [x] 第二批：R21 context 圆环与累计 Token 渐进披露，不混合指标。
+- [x] 第二批：R22 1440px dock、1024–1439px drawer、<1024px overlay、宽度调节与空白回收。
+- [x] 第二批：R23 未知 context 不伪造百分比，累计 Token/成本/压缩信息只进入详情。
+- [x] 第二批：R24/R25 Git、交付和任务图标化，异常/下一步保留短文字与完整可访问名称。
+- [x] 第二批：R26 引入结构化下一动作责任人，纠正 `6/6 + failure evidence` 与 system-owned 恢复文案。
+- [x] 第二批：R27 当前结构化状态与历史消息分层。
+- [x] 第二批：R28 单 pane tabs、overlay 与 separator 完整键盘/focus 契约；原生 child WebView Escape 已桥接到宿主。
+- [x] 第二批：R29 正文/composer 同一 880px 网格，多视口无页面级横向溢出。
 - [ ] 第二批：R30 图标命中区、VoiceOver、200% zoom 和 reduced-motion 放行。
 - [ ] 第二批：R31 PR/CI/merge/release/public artifact/正式 App 完整上线证据。
 - [ ] 无障碍 P2：补齐消息/工具/任务 disclosure 的 `aria-controls`，项目选择与会话菜单键盘模式，以及 ImagePreview 初始聚焦、focus trap、回焦和最小 11px 说明。
@@ -66,6 +66,10 @@
 ## Evidence
 
 - Local evidence:
+  - 第二批：`pnpm test -- --run --reporter=dot` 为 101 files / 564 tests passed；`pnpm build` 通过。
+  - 第二批 Rust：embedded browser 6/6、update_plan 5/5、plan hydration 1/1、legacy/intermediate schema repair 1/1、agent-loop owner wire 1/1。
+  - 第二批治理：repo governance baseline 与 long-task validator 均通过；`git diff --check` 通过。
+  - 第二批 browser 边界：child WebView 只提供 lease 初始 URL 的独立 Phase-1 预览，与 Agent 的 `LOCAL` ChromiumDriver 不共享 Cookie、DOM、导航或控制权；不得宣称实时观察/接管。
   - `pnpm test`：89 files / 447 tests passed。
   - `pnpm build`：TypeScript + Vite production build passed。
   - `python3 tools/governance/validate_repo_governance_baseline.py`：pass。
