@@ -97,6 +97,26 @@ string_enum!(RecoveryDomain {
     Update => "update",
 });
 
+impl RecoveryDomain {
+    /// Closed world used by the recovery adapter registry and its conformance
+    /// tests. Adding a domain without registering an adapter must fail review
+    /// and tests instead of silently falling back to another domain's runner.
+    pub const ALL: [Self; 12] = [
+        Self::Chat,
+        Self::Context,
+        Self::Tool,
+        Self::Permission,
+        Self::Task,
+        Self::Provider,
+        Self::Auth,
+        Self::Browser,
+        Self::Terminal,
+        Self::Delivery,
+        Self::Release,
+        Self::Update,
+    ];
+}
+
 string_enum!(DecisionType {
     Continue => "continue",
     Waiting => "waiting",
