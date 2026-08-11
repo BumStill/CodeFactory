@@ -402,7 +402,64 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("APPLE_API_", macos_job)
         self.assertNotIn("scripts/import-apple-signing-identity.sh", macos_job)
 
-    def test_macos_release_keeps_real_app_and_tauri_updater_verification(self) -> None:
+    def test_macos_compatibility_channel_uses_full_adhoc_bundle_signing(self) -> None:
+        tauri_config = json.loads(
+            (REPO_ROOT / "src-tauri/tauri.conf.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(
+            tauri_config["bundle"]["macOS"].get("signingIdentity"),
+            "-",
+            "the no-Apple-credential compatibility channel still needs a complete "
+            "ad-hoc app-bundle signature, not the linker-only Mach-O signature",
+        )
+
+    def test_macos_artifact_verifier_fences_execution_with_signatures_and_sha(
+        self,
+    ) -> None:
+        artifact_smoke = (
+            REPO_ROOT / "scripts/verify-macos-release-artifact.sh"
+        ).read_text(encoding="utf-8")
+
+        strict_verification = (
+            '/usr/bin/codesign --verify --deep --strict --verbose=4 "$app_path"'
+        )
+        self.assertIn(strict_verification, artifact_smoke)
+        self.assertIn('verify_app_bundle "$INSTALLED_APP" "DMG"', artifact_smoke)
+        self.assertIn('verify_app_bundle "$UPDATER_APP" "updater"', artifact_smoke)
+        self.assertLess(
+            artifact_smoke.index('verify_app_bundle "$INSTALLED_APP" "DMG"'),
+            artifact_smoke.index('"$EXECUTABLE_PATH" --evolution-smoke'),
+            "the downloaded app must pass strict signature verification before it executes",
+        )
+        self.assertLess(
+            artifact_smoke.index('verify_app_bundle "$UPDATER_APP" "updater"'),
+            artifact_smoke.index('"$EXECUTABLE_PATH" --evolution-smoke'),
+            "the public updater app must also be verified before any release app executes",
+        )
+        self.assertIn("build_git_sha", artifact_smoke)
+        self.assertIn("EXPECTED_BUILD_SHA", artifact_smoke)
+        self.assertNotIn("Developer ID Application:", artifact_smoke)
+        self.assertNotIn("xcrun stapler validate", artifact_smoke)
+        self.assertNotIn("spctl --assess", artifact_smoke)
+
+    def test_macos_updater_archive_is_link_safe_and_matches_the_dmg_binary(
+        self,
+    ) -> None:
+        artifact_smoke = (
+            REPO_ROOT / "scripts/verify-macos-release-artifact.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('tar -tvzf "$UPDATER_ARCHIVE"', artifact_smoke)
+        self.assertIn("only regular files and directories", artifact_smoke)
+        self.assertIn("DMG_EXECUTABLE_SHA256", artifact_smoke)
+        self.assertIn("UPDATER_EXECUTABLE_SHA256", artifact_smoke)
+        self.assertIn(
+            '[[ "$DMG_EXECUTABLE_SHA256" != "$UPDATER_EXECUTABLE_SHA256" ]]',
+            artifact_smoke,
+        )
+
+    def test_macos_release_keeps_real_app_and_public_updater_verification(self) -> None:
         release = (REPO_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
         )
@@ -412,11 +469,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
         self.assertIn("--evolution-smoke", artifact_smoke)
         self.assertIn("CODEFACTORY_GUI_PROOF_TIER", release)
-        self.assertNotIn("Developer ID Application:", artifact_smoke)
-        self.assertNotIn("xcrun stapler validate", artifact_smoke)
-
+        build_job = release.split("\n  build-macos:\n", 1)[1].split(
+            "\n  finalize:\n", 1
+        )[0]
+        self.assertIn("UPDATER_ARCHIVE", build_job)
+        self.assertIn("needs.prepare-release.outputs.tag_sha", build_job)
         published_job = release.split("\n  verify-published-macos:\n", 1)[1]
         self.assertIn("env -u GH_TOKEN curl", published_job)
+        self.assertIn("CodeFactory_aarch64.app.tar.gz", published_job)
+        self.assertIn('EXPECTED_BUILD_SHA="$(git rev-parse HEAD)"', published_job)
+        self.assertIn("UPDATER_ARCHIVE", published_job)
         self.assertIn("scripts/verify-macos-release-artifact.sh", published_job)
         self.assertIn("macos-published-release-gui-evidence", published_job)
 
