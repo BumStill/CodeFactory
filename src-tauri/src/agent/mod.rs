@@ -1236,14 +1236,14 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// OpenAI/ChatGPT: compress history, no overload backoff, expandable window.
+    /// OpenAI/ChatGPT: compress history, recover transient overloads, expandable window.
     async fn run_openai(
         &mut self,
         history: Vec<Message>,
         tool_defs: &[ToolDefinition],
         system_prompt: &str,
     ) -> Result<()> {
-        self.run_via_agent_loop(history, tool_defs, system_prompt, true, false, true)
+        self.run_via_agent_loop(history, tool_defs, system_prompt, true, true, true)
             .await
     }
 

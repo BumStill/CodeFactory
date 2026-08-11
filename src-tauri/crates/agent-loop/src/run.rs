@@ -18,7 +18,7 @@ use std::sync::Arc;
 use codefactory_agent_core::CompletionEvidence;
 
 use crate::events::EventSink;
-use crate::journal::{PersistError, Persistence, UsageRow};
+use crate::journal::{PersistError, Persistence, RecoveryAttemptRow, UsageRow};
 use crate::services::PermissionOutcome;
 use crate::tool::ToolError;
 use crate::transport::TransportError;
@@ -851,33 +851,52 @@ pub async fn run_agent_loop(
                         .complete(&messages, &active_tool_defs, &round_options)
                         .await?
                 }
-                // Transient provider saturation (Anthropic 529/overloaded, 503,
-                // rate limit): back off + retry, up to twice, cancel-aware. No
-                // StreamEvent — a persisted turn_notice is the only trace. Only
-                // installed for surfaces that set `overload_backoff` (Anthropic);
-                // OpenAI leaves it off, so this arm never matches there (slice 4.7).
+                // Transient provider saturation (529/overloaded, 503, rate
+                // limit): keep the authorized root turn alive with bounded
+                // backoff. Technical retry-budget exhaustion is not a user
+                // decision; only explicit cancellation exits this remediation.
                 Err(e)
                     if overload_backoff
-                        && crate::context::is_provider_overloaded(&e.to_string()) =>
+                        && crate::context::is_provider_overloaded(&e.to_string())
+                        && completion_gate.evidence().outcome_count == 0 =>
                 {
-                    let notice = "模型服务过载,正在自动退避重试(最多 2 次)。".to_string();
+                    let notice = "模型服务过载，正在自动退避恢复；无需回复“继续”。".to_string();
                     persistence
                         .persist_gate_message_once("自动退避重试", &notice, "turn_notice")
                         .await?;
                     let mut last_err = e;
-                    let mut recovered = None;
-                    for delay in [20u64, 40] {
+                    let mut recovery_attempt = 0i64;
+                    loop {
                         if is_cancelled(cancel.as_ref()) {
-                            break;
+                            return Err(last_err.into());
                         }
+                        recovery_attempt += 1;
+                        if let Some(root_turn_id) = root_turn_id.as_deref() {
+                            persistence
+                                .record_recovery_attempt(&RecoveryAttemptRow {
+                                    root_turn_id: root_turn_id.to_string(),
+                                    domain: "provider".into(),
+                                    attempt_index: recovery_attempt,
+                                    failure_code: "PROVIDER_OVERLOADED".into(),
+                                    failure_class: "transient_provider".into(),
+                                    output_started: false,
+                                    side_effect_started: false,
+                                    terminal_decision: "continue".into(),
+                                })
+                                .await?;
+                        }
+                        let delay = match recovery_attempt {
+                            1 => 20,
+                            2 => 40,
+                            _ => 60,
+                        };
                         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                         match transport
                             .complete(&messages, &active_tool_defs, &round_options)
                             .await
                         {
                             Ok(ok) => {
-                                recovered = Some(ok);
-                                break;
+                                break ok;
                             }
                             Err(next)
                                 if crate::context::is_provider_overloaded(&next.to_string()) =>
@@ -886,10 +905,6 @@ pub async fn run_agent_loop(
                             }
                             Err(next) => return Err(next.into()),
                         }
-                    }
-                    match recovered {
-                        Some(resp) => resp,
-                        None => return Err(last_err.into()),
                     }
                 }
                 Err(e) if crate::protocol::is_vision_rejection(&e.to_string()) => {

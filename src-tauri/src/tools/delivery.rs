@@ -19,6 +19,8 @@ use crate::config::settings::DeliveryCeiling;
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
+const RECOVERY_SUPERVISOR_POLL_MS: u64 = 15_000;
+
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         r#type: "function".into(),
@@ -83,7 +85,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         .and_then(Value::as_str)
         .and_then(parse_ceiling);
 
-    let opts = DeliverOpts {
+    let mut opts = DeliverOpts {
         title,
         body,
         release_urgency,
@@ -97,8 +99,39 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             .map(String::from),
     };
 
-    let durable =
-        prepare_durable_run(&args, ctx, settings.delivery_ceiling, requested_ceiling).await?;
+    let durable = match prepare_durable_run(
+        &args,
+        ctx,
+        settings.delivery_ceiling,
+        requested_ceiling,
+    )
+    .await
+    {
+        Ok(durable) => durable,
+        Err(error) if error.to_string().contains("系统身份冲突") => {
+            return Ok(ToolOutput::waiting(
+                "交付目标身份不唯一；系统将只读核对 objective/worktree 映射，未执行任何交付副作用。",
+            )
+            .with_metadata(json!({
+                "status": "recovering",
+                "delivery_state": "waiting",
+                "stage": "identity",
+                "code": "delivery_identity_incident",
+                "recoverable": true,
+                "recovery_class": "agent_action_required",
+                "decision_type": "system_owned",
+                "requires_user_continue": false,
+                "retry_after_ms": 1_000,
+                "next_action": "只读核对当前 objective 所属 worktree/branch，再用 expect_branch 续接；不得询问用户选择技术身份。",
+                "requested_ceiling": requested_ceiling.map(ceiling_label).unwrap_or_else(|| ceiling_label(settings.delivery_ceiling)),
+                "reached_state": "local"
+            })));
+        }
+        Err(error) => return Err(error),
+    };
+    if opts.expect_branch.is_none() {
+        opts.expect_branch = durable.as_ref().map(|run| run.head_branch.clone());
+    }
 
     let remote = delivery::resolve_delivery_remote(&ctx.cwd, &settings);
 
@@ -153,17 +186,14 @@ async fn prepare_durable_run(
     let Some(db) = ctx.db.as_ref() else {
         return Ok(None);
     };
-    let repo = delivery::resolve_repo(&ctx.cwd, None).map_err(crate::errors::AppError::Other)?;
-    let source_identity = ctx
-        .root_turn_id
-        .as_deref()
-        .or(ctx.task_id.as_deref())
-        .ok_or_else(|| {
-            crate::errors::AppError::Other(
-                "deliver_changes refused external mutation without a durable root-turn/task identity"
-                    .into(),
-            )
-        })?;
+    let expected_branch = args
+        .get("expect_branch")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (repo, _) = delivery::resolve_delivery_repo(&ctx.cwd, None, expected_branch)
+        .map_err(crate::errors::AppError::Other)?;
+    let (objective_id, task_segment_id) = durable_objective_identity(db, ctx).await?;
     let repo_identity = durable_repo_identity(&repo);
     let expected_head_sha = git2::Repository::open(&repo.root)
         .ok()
@@ -174,7 +204,8 @@ async fn prepare_durable_run(
             )
         })?;
     let change_set_digest = durable_change_set_digest(&repo.root, &expected_head_sha)?;
-    let id = durable_run_id(source_identity, &repo_identity);
+    let worktree_identity = durable_worktree_identity(&repo.root)?;
+    let id = durable_run_id(&objective_id, &repo_identity);
     let process = ProcessIdentity::new(
         format!(
             "{}:{}",
@@ -191,12 +222,14 @@ async fn prepare_durable_run(
     let head_branch = repo.branch.clone();
     let run = NewDeliveryRun {
         id: id.clone(),
+        objective_id,
         run_kind: "deliver_changes".into(),
         session_id: ctx.session_id.clone(),
         root_turn_id: ctx.root_turn_id.clone(),
-        task_segment_id: None,
+        task_segment_id,
         task_id: ctx.task_id.clone(),
         workspace_path: repo.root.to_string_lossy().into_owned(),
+        worktree_identity,
         repo_identity,
         base_branch: repo.default_branch,
         head_branch: head_branch.clone(),
@@ -246,7 +279,8 @@ async fn persist_durable_outcome(
 ) -> Result<()> {
     let core_input = core_input_request_for_outcome(outcome);
     let status = match outcome.final_state.as_str() {
-        "delivered" | "noop" => "completed",
+        "delivered" if delivery_completion_evidence_satisfied(outcome) => "completed",
+        "delivered" | "noop" => "awaiting_completion_arbitration",
         "waiting" => "waiting",
         _ if core_input.is_some() => "core_input_required",
         _ if outcome.recoverable => "agent_action_required",
@@ -293,6 +327,40 @@ async fn persist_durable_outcome(
     )
     .await?;
     Ok(())
+}
+
+fn delivery_completion_evidence_satisfied(outcome: &delivery::DeliveryOutcome) -> bool {
+    if outcome.final_state != "delivered" {
+        return false;
+    }
+    let reached = match outcome.reached_state.as_str() {
+        "local" => 0,
+        "committed" => 1,
+        "pushed" => 2,
+        "pr_open" => 3,
+        "ci_green" => 4,
+        "merge_queued" => 5,
+        "merged" => 6,
+        "release_triggered" => 7,
+        "deployment_succeeded" => 8,
+        "live_verified" => 9,
+        _ => return false,
+    };
+    let required = match outcome.requested_ceiling.as_str() {
+        "off" => return false,
+        "pr_only" => 3,
+        "through_ci_green" => 4,
+        "through_merge" => 6,
+        "through_release" => 9,
+        _ => return false,
+    };
+    let remote_identity_present = required < 3
+        || (outcome.pr_number.is_some()
+            && outcome
+                .commit_sha
+                .as_deref()
+                .is_some_and(|sha| !sha.is_empty()));
+    reached >= required && remote_identity_present
 }
 
 fn core_input_request_for_outcome(outcome: &delivery::DeliveryOutcome) -> Option<CoreInputRequest> {
@@ -391,8 +459,73 @@ pub(crate) fn should_resume_claimed_delivery(claimed: &delivery_run::ClaimedReco
     // autonomous_completion governs default business choices, not liveness.
     matches!(
         claimed.status.as_str(),
-        "waiting" | "platform_incident" | "agent_action_required"
+        "waiting"
+            | "platform_incident"
+            | "agent_action_required"
+            | "failed_internal"
+            | "awaiting_completion_arbitration"
     ) && claimed.next_action_authorized
+}
+
+pub(crate) fn recovery_supervisor_poll_interval() -> std::time::Duration {
+    std::time::Duration::from_millis(RECOVERY_SUPERVISOR_POLL_MS)
+}
+
+/// Continuously claims expired system-owned delivery work. A tool future can
+/// disappear without a process restart (cancelled task, UI teardown, panic),
+/// so a startup-only sweep is insufficient. The CAS lease in
+/// `plan_startup_recovery` prevents sibling processes from owning the same run.
+pub(crate) fn spawn_delivery_recovery_supervisor(
+    pool: sqlx::SqlitePool,
+    settings: crate::config::settings::Settings,
+    process: ProcessIdentity,
+) {
+    tauri::async_runtime::spawn(async move {
+        tracing::info!(
+            poll_ms = RECOVERY_SUPERVISOR_POLL_MS,
+            "recovery supervisor: started"
+        );
+        loop {
+            let now = chrono::Utc::now().timestamp_millis();
+            match delivery_run::plan_startup_recovery(&pool, &process, now, 60_000).await {
+                Ok(plan) => {
+                    if !plan.fail_closed_identity_missing.is_empty() {
+                        tracing::warn!(
+                            "recovery supervisor: left {} run(s) unclaimed because stable identity was incomplete",
+                            plan.fail_closed_identity_missing.len()
+                        );
+                    }
+                    for claimed in plan.claimed {
+                        if !should_resume_claimed_delivery(&claimed) {
+                            continue;
+                        }
+                        let recovery_db = pool.clone();
+                        let recovery_settings = settings.clone();
+                        let recovery_process = process.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let run_id = claimed.run_id.clone();
+                            if let Err(error) = resume_claimed_delivery(
+                                recovery_db,
+                                recovery_settings,
+                                claimed,
+                                recovery_process,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "recovery supervisor: durable delivery run {run_id} could not resume: {error}"
+                                );
+                            }
+                        });
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    "recovery supervisor: lease planning failed (will retry): {error}"
+                ),
+            }
+            tokio::time::sleep(recovery_supervisor_poll_interval()).await;
+        }
+    });
 }
 
 fn ceiling_label(ceiling: DeliveryCeiling) -> &'static str {
@@ -413,6 +546,66 @@ fn durable_repo_identity(repo: &delivery::RepoContext) -> String {
     let mut hasher = Sha256::new();
     hasher.update(source.as_bytes());
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn durable_worktree_identity(root: &std::path::Path) -> Result<String> {
+    let repository = git2::Repository::open(root).map_err(|error| {
+        crate::errors::AppError::Other(format!(
+            "cannot resolve delivery worktree identity: {error}"
+        ))
+    })?;
+    let admin_path = repository.path().canonicalize().map_err(|error| {
+        crate::errors::AppError::Other(format!(
+            "cannot canonicalize delivery worktree identity: {error}"
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(admin_path.to_string_lossy().as_bytes());
+    Ok(format!("gitdir-sha256:{:x}", hasher.finalize()))
+}
+
+async fn durable_objective_identity(
+    db: &sqlx::SqlitePool,
+    ctx: &ExecCtx,
+) -> Result<(String, Option<String>)> {
+    if let Some(task_id) = ctx.task_id.as_deref().filter(|value| !value.is_empty()) {
+        return Ok((format!("task:{task_id}"), None));
+    }
+    let root_turn_id = ctx
+        .root_turn_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            crate::errors::AppError::Other(
+                "deliver_changes refused external mutation without a durable objective identity"
+                    .into(),
+            )
+        })?;
+    let task_segment_id = sqlx::query_scalar::<_, String>(
+        "SELECT task_segment_id FROM chat_turn_state WHERE root_turn_id=?",
+    )
+    .bind(root_turn_id)
+    .fetch_optional(db)
+    .await?;
+    let Some(segment_id) = task_segment_id else {
+        return Ok((format!("chat-turn:{root_turn_id}"), None));
+    };
+    let anchor = sqlx::query_scalar::<_, String>(
+        "WITH RECURSIVE objective_chain(id, previous_segment_id, depth) AS (
+             SELECT id, previous_segment_id, 0 FROM chat_task_segments WHERE id=?
+             UNION ALL
+             SELECT prior.id, prior.previous_segment_id, objective_chain.depth + 1
+             FROM chat_task_segments prior
+             JOIN objective_chain ON prior.id=objective_chain.previous_segment_id
+             WHERE objective_chain.depth < 100
+         )
+         SELECT id FROM objective_chain ORDER BY depth DESC LIMIT 1",
+    )
+    .bind(&segment_id)
+    .fetch_optional(db)
+    .await?
+    .unwrap_or_else(|| segment_id.clone());
+    Ok((format!("chat:{anchor}"), Some(segment_id)))
 }
 
 fn durable_run_id(source_identity: &str, repo_identity: &str) -> String {
@@ -916,6 +1109,79 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    #[tokio::test]
+    async fn incomplete_or_noop_delivery_never_projects_business_completed() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        delivery_run::ensure_schema(&pool).await.unwrap();
+        let process = ProcessIdentity::new("process", "1.79.1", "17901");
+        let run = NewDeliveryRun {
+            id: "arbiter-run".into(),
+            objective_id: "chat:arbiter".into(),
+            run_kind: "chat_delivery".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("objective".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:arbiter".into(),
+            repo_identity: "repo".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest".into(),
+            expected_head_sha: "abc".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "preflight".into(),
+            status: "running".into(),
+            wait_class: None,
+            next_action: Some("deliver".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        delivery_run::create_delivery_run(&pool, &run, &process, 100, 30)
+            .await
+            .unwrap();
+        let prepared = PreparedDurableRun {
+            id: run.id,
+            process,
+            expected_head_sha: "abc".into(),
+            head_branch: "feature".into(),
+        };
+
+        let mut incomplete = outcome("delivered");
+        incomplete.requested_ceiling = "through_release".into();
+        incomplete.reached_state = "local".into();
+        persist_durable_outcome(&pool, &prepared, &incomplete)
+            .await
+            .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM delivery_runs WHERE id='arbiter-run'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "awaiting_completion_arbitration");
+
+        let mut noop = outcome("noop");
+        noop.requested_ceiling = "through_release".into();
+        noop.reached_state = "local".into();
+        persist_durable_outcome(&pool, &prepared, &noop)
+            .await
+            .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM delivery_runs WHERE id='arbiter-run'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "awaiting_completion_arbitration");
+    }
+
     /// Gating `gh --watch` only works if the sanctioned alternative is
     /// discoverable. `through_ci_green` already waits for CI with backoff, but
     /// nothing said so — so the model reached for `--watch` and burned the
@@ -968,6 +1234,14 @@ mod tests {
             "agent_action_required",
             true
         )));
+        assert!(should_resume_claimed_delivery(&claimed(
+            "failed_internal",
+            true
+        )));
+        assert!(should_resume_claimed_delivery(&claimed(
+            "awaiting_completion_arbitration",
+            true
+        )));
         assert!(!should_resume_claimed_delivery(&claimed(
             "platform_incident",
             false
@@ -981,5 +1255,64 @@ mod tests {
             "needs_business_decision",
             true
         )));
+    }
+
+    #[test]
+    fn recovery_supervisor_reclaims_within_product_slo() {
+        assert!(recovery_supervisor_poll_interval() <= std::time::Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn contextual_root_turns_share_one_durable_objective() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_task_segments (
+                id TEXT PRIMARY KEY,
+                previous_segment_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+                root_turn_id TEXT PRIMARY KEY,
+                task_segment_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_task_segments(id, previous_segment_id) VALUES
+             ('segment-a', NULL), ('segment-b', 'segment-a')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, task_segment_id) VALUES
+             ('turn-a', 'segment-a'), ('turn-b', 'segment-b')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut first = ExecCtx::new(std::path::PathBuf::from("/tmp"), Some(pool.clone()));
+        first.root_turn_id = Some("turn-a".into());
+        let mut continuation = ExecCtx::new(std::path::PathBuf::from("/tmp"), Some(pool.clone()));
+        continuation.root_turn_id = Some("turn-b".into());
+
+        let first_identity = durable_objective_identity(&pool, &first).await.unwrap();
+        let continuation_identity = durable_objective_identity(&pool, &continuation)
+            .await
+            .unwrap();
+        assert_eq!(first_identity.0, "chat:segment-a");
+        assert_eq!(continuation_identity.0, first_identity.0);
+        assert_eq!(continuation_identity.1.as_deref(), Some("segment-b"));
     }
 }

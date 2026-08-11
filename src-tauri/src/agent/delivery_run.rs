@@ -14,9 +14,11 @@ use crate::errors::Result;
 const NON_TERMINAL_PREDICATE: &str =
     "status NOT IN ('completed', 'failed', 'cancelled', 'rejected')";
 const STABLE_IDENTITY_PREDICATE: &str = "(
-    ((session_id IS NOT NULL AND session_id <> '' AND root_turn_id IS NOT NULL AND root_turn_id <> '')
+    objective_id IS NOT NULL AND objective_id <> ''
+    AND ((session_id IS NOT NULL AND session_id <> '' AND root_turn_id IS NOT NULL AND root_turn_id <> '')
       OR (task_id IS NOT NULL AND task_id <> ''))
     AND repo_identity IS NOT NULL AND repo_identity <> ''
+    AND worktree_identity IS NOT NULL AND worktree_identity <> ''
     AND base_branch IS NOT NULL AND base_branch <> ''
     AND head_branch IS NOT NULL AND head_branch <> ''
     AND change_set_digest IS NOT NULL AND change_set_digest <> ''
@@ -34,12 +36,14 @@ pub struct ProcessIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewDeliveryRun {
     pub id: String,
+    pub objective_id: String,
     pub run_kind: String,
     pub session_id: Option<String>,
     pub root_turn_id: Option<String>,
     pub task_segment_id: Option<String>,
     pub task_id: Option<String>,
     pub workspace_path: String,
+    pub worktree_identity: String,
     pub repo_identity: String,
     pub base_branch: String,
     pub head_branch: String,
@@ -165,16 +169,36 @@ fn monotonic_reached_ceiling(previous: &str, observed: &str) -> String {
     }
 }
 
+async fn ensure_delivery_run_column(pool: &SqlitePool, name: &str, definition: &str) -> Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(delivery_runs)")
+        .fetch_all(pool)
+        .await?;
+    if columns
+        .iter()
+        .any(|column| column.try_get::<String, _>("name").ok().as_deref() == Some(name))
+    {
+        return Ok(());
+    }
+    sqlx::query(&format!(
+        "ALTER TABLE delivery_runs ADD COLUMN {name} {definition}"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS delivery_runs (
             id                     TEXT PRIMARY KEY,
+            objective_id           TEXT,
             run_kind               TEXT NOT NULL,
             session_id             TEXT,
             root_turn_id           TEXT,
             task_segment_id        TEXT,
             task_id                TEXT,
             workspace_path         TEXT,
+            worktree_identity      TEXT,
             repo_identity          TEXT,
             base_branch            TEXT,
             head_branch            TEXT,
@@ -202,6 +226,18 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
             app_version            TEXT NOT NULL,
             app_build              TEXT NOT NULL,
             process_instance       TEXT NOT NULL,
+            created_app_version    TEXT,
+            created_app_build      TEXT,
+            created_process_instance TEXT,
+            last_observed_app_version TEXT,
+            last_observed_app_build TEXT,
+            last_observed_process_instance TEXT,
+            recovery_attempt       INTEGER NOT NULL DEFAULT 0 CHECK(recovery_attempt >= 0),
+            failure_code           TEXT,
+            failure_class          TEXT,
+            queue_wait_ms          INTEGER,
+            runtime_ms             INTEGER,
+            remediation_id         TEXT,
             business_decision_key  TEXT,
             decision_options_json  TEXT,
             recommended_option     TEXT,
@@ -241,6 +277,28 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    for (name, definition) in [
+        ("objective_id", "TEXT"),
+        ("worktree_identity", "TEXT"),
+        ("created_app_version", "TEXT"),
+        ("created_app_build", "TEXT"),
+        ("created_process_instance", "TEXT"),
+        ("last_observed_app_version", "TEXT"),
+        ("last_observed_app_build", "TEXT"),
+        ("last_observed_process_instance", "TEXT"),
+        (
+            "recovery_attempt",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(recovery_attempt >= 0)",
+        ),
+        ("failure_code", "TEXT"),
+        ("failure_class", "TEXT"),
+        ("queue_wait_ms", "INTEGER"),
+        ("runtime_ms", "INTEGER"),
+        ("remediation_id", "TEXT"),
+    ] {
+        ensure_delivery_run_column(pool, name, definition).await?;
+    }
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS delivery_run_events (
             id                 TEXT PRIMARY KEY,
@@ -258,11 +316,38 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS objective_recovery_attempts (
+            id TEXT PRIMARY KEY,
+            objective_id TEXT,
+            root_turn_id TEXT,
+            delivery_run_id TEXT,
+            domain TEXT NOT NULL,
+            attempt_index INTEGER NOT NULL CHECK(attempt_index >= 1),
+            failure_code TEXT NOT NULL,
+            failure_class TEXT NOT NULL,
+            output_started INTEGER NOT NULL DEFAULT 0 CHECK(output_started IN (0, 1)),
+            side_effect_started INTEGER NOT NULL DEFAULT 0 CHECK(side_effect_started IN (0, 1)),
+            queue_wait_ms INTEGER,
+            runtime_ms INTEGER,
+            process_instance TEXT NOT NULL,
+            resume_owner TEXT NOT NULL,
+            terminal_decision TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(delivery_run_id) REFERENCES delivery_runs(id) ON DELETE SET NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     for index in [
         "CREATE INDEX IF NOT EXISTS idx_delivery_runs_recovery ON delivery_runs(status, lease_expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_delivery_runs_session ON delivery_runs(session_id, updated_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_delivery_runs_pr ON delivery_runs(canonical_pr_number, canonical_head_sha)",
         "CREATE INDEX IF NOT EXISTS idx_delivery_run_events_run ON delivery_run_events(run_id, created_at)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_runs_active_objective_repo ON delivery_runs(objective_id, repo_identity) WHERE objective_id IS NOT NULL AND objective_id <> '' AND status NOT IN ('completed', 'failed', 'cancelled', 'rejected')",
+        "CREATE INDEX IF NOT EXISTS idx_objective_recovery_attempts_objective ON objective_recovery_attempts(objective_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_objective_recovery_attempts_turn ON objective_recovery_attempts(root_turn_id, created_at)",
     ] {
         sqlx::query(index).execute(pool).await?;
     }
@@ -307,6 +392,11 @@ pub async fn create_delivery_run(
             "durable delivery run requires a chat-turn or task identity".into(),
         ));
     }
+    if run.objective_id.is_empty() || run.worktree_identity.is_empty() {
+        return Err(crate::errors::AppError::Other(
+            "durable delivery run requires stable objective and worktree identity".into(),
+        ));
+    }
     if [
         run.repo_identity.as_str(),
         run.workspace_path.as_str(),
@@ -326,23 +416,27 @@ pub async fn create_delivery_run(
     let mut tx = pool.begin().await?;
     let inserted = sqlx::query(
         "INSERT OR IGNORE INTO delivery_runs (
-            id, run_kind, session_id, root_turn_id, task_segment_id, task_id, workspace_path,
-            repo_identity, base_branch, head_branch, change_set_digest, expected_head_sha,
+            id, objective_id, run_kind, session_id, root_turn_id, task_segment_id, task_id, workspace_path,
+            worktree_identity, repo_identity, base_branch, head_branch, change_set_digest, expected_head_sha,
             canonical_pr_number, canonical_pr_url, canonical_head_sha,
             requested_ceiling, reached_ceiling, stage, status, wait_class, next_action,
             next_action_authorized, autonomous_completion,
             failure_signature, stage_attempt, lease_owner, lease_expires_at,
             last_observed_at, last_progress_at, progress_revision, app_version,
-            app_build, process_instance, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+            app_build, process_instance, created_app_version, created_app_build,
+            created_process_instance, last_observed_app_version, last_observed_app_build,
+            last_observed_process_instance, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&run.id)
+    .bind(&run.objective_id)
     .bind(&run.run_kind)
     .bind(&run.session_id)
     .bind(&run.root_turn_id)
     .bind(&run.task_segment_id)
     .bind(&run.task_id)
     .bind(&run.workspace_path)
+    .bind(&run.worktree_identity)
     .bind(&run.repo_identity)
     .bind(&run.base_branch)
     .bind(&run.head_branch)
@@ -366,6 +460,12 @@ pub async fn create_delivery_run(
     .bind(&process.app_version)
     .bind(&process.app_build)
     .bind(&process.instance_id)
+    .bind(&process.app_version)
+    .bind(&process.app_build)
+    .bind(&process.instance_id)
+    .bind(&process.app_version)
+    .bind(&process.app_build)
+    .bind(&process.instance_id)
     .bind(now)
     .bind(now)
     .execute(&mut *tx)
@@ -373,12 +473,46 @@ pub async fn create_delivery_run(
     .rows_affected();
 
     if inserted == 0 {
+        let existing = sqlx::query(
+            "SELECT objective_id, run_kind, session_id, task_id,
+                    workspace_path, worktree_identity, repo_identity, base_branch, head_branch,
+                    change_set_digest, expected_head_sha, requested_ceiling
+             FROM delivery_runs WHERE id=?",
+        )
+        .bind(&run.id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            crate::errors::AppError::Other(
+                "delivery run identity disappeared during collision reconciliation".into(),
+            )
+        })?;
+        let identity_matches = existing.try_get::<String, _>("objective_id")? == run.objective_id
+            && existing.try_get::<String, _>("run_kind")? == run.run_kind
+            && existing.try_get::<Option<String>, _>("session_id")? == run.session_id
+            && existing.try_get::<Option<String>, _>("task_id")? == run.task_id
+            && existing.try_get::<String, _>("workspace_path")? == run.workspace_path
+            && existing.try_get::<String, _>("worktree_identity")? == run.worktree_identity
+            && existing.try_get::<String, _>("repo_identity")? == run.repo_identity
+            && existing.try_get::<String, _>("base_branch")? == run.base_branch
+            && existing.try_get::<String, _>("head_branch")? == run.head_branch
+            && existing.try_get::<String, _>("change_set_digest")? == run.change_set_digest
+            && existing.try_get::<String, _>("expected_head_sha")? == run.expected_head_sha
+            && existing.try_get::<String, _>("requested_ceiling")? == run.requested_ceiling;
+        if !identity_matches {
+            return Err(crate::errors::AppError::Other(
+                "delivery run identity collision: objective/worktree/change-set changed; refused before side effects"
+                    .into(),
+            ));
+        }
         let renewed = sqlx::query(
             "UPDATE delivery_runs
              SET lease_owner=?, lease_expires_at=?, process_instance=?, app_version=?, app_build=?,
+                 root_turn_id=COALESCE(?, root_turn_id), task_segment_id=COALESCE(?, task_segment_id),
+                 last_observed_app_version=?, last_observed_app_build=?, last_observed_process_instance=?,
                  next_action_authorized=MAX(next_action_authorized, ?),
                  autonomous_completion=MAX(autonomous_completion, ?), updated_at=?
-             WHERE id=? AND repo_identity=? AND root_turn_id IS ?
+             WHERE id=? AND objective_id=? AND repo_identity=?
                AND (lease_owner=? OR lease_expires_at IS NULL OR lease_expires_at <= ?)",
         )
         .bind(&process.instance_id)
@@ -386,12 +520,17 @@ pub async fn create_delivery_run(
         .bind(&process.instance_id)
         .bind(&process.app_version)
         .bind(&process.app_build)
+        .bind(&run.root_turn_id)
+        .bind(&run.task_segment_id)
+        .bind(&process.app_version)
+        .bind(&process.app_build)
+        .bind(&process.instance_id)
         .bind(i64::from(run.next_action_authorized))
         .bind(i64::from(run.autonomous_completion))
         .bind(now)
         .bind(&run.id)
+        .bind(&run.objective_id)
         .bind(&run.repo_identity)
-        .bind(&run.root_turn_id)
         .bind(&process.instance_id)
         .bind(now)
         .execute(&mut *tx)
@@ -488,9 +627,15 @@ pub async fn record_delivery_observation(
              core_input_attempts_json=CASE WHEN ? THEN ? ELSE core_input_attempts_json END,
              core_input_resume_stage=CASE WHEN ? THEN ? ELSE core_input_resume_stage END,
              core_input_request_count=CASE WHEN ? THEN 1 ELSE core_input_request_count END,
+             failure_code=?, failure_class=?,
+             recovery_attempt=recovery_attempt + CASE
+               WHEN ? IS NOT NULL AND COALESCE(failure_signature, '') <> ? THEN 1
+               ELSE 0 END,
              lease_expires_at=?, last_observed_at=?,
              last_progress_at=CASE WHEN ? THEN ? ELSE last_progress_at END,
-             progress_revision=?, process_instance=?, app_version=?, app_build=?, updated_at=?
+             progress_revision=?, process_instance=?, app_version=?, app_build=?,
+             last_observed_app_version=?, last_observed_app_build=?,
+             last_observed_process_instance=?, updated_at=?
          WHERE id=? AND lease_owner=?",
     )
     .bind(&observation.head_branch)
@@ -515,6 +660,10 @@ pub async fn record_delivery_observation(
     .bind(has_core_input)
     .bind(core_input.map(|value| &value.resume_stage))
     .bind(has_core_input)
+    .bind(&observation.failure_signature)
+    .bind(&observation.wait_class)
+    .bind(&observation.failure_signature)
+    .bind(&observation.failure_signature)
     .bind(now.saturating_add(lease_ttl))
     .bind(now)
     .bind(progressed)
@@ -523,6 +672,9 @@ pub async fn record_delivery_observation(
     .bind(&process.instance_id)
     .bind(&process.app_version)
     .bind(&process.app_build)
+    .bind(&process.app_version)
+    .bind(&process.app_build)
+    .bind(&process.instance_id)
     .bind(now)
     .bind(run_id)
     .bind(&process.instance_id)
@@ -618,7 +770,8 @@ pub async fn plan_startup_recovery(
         let claim_sql = format!(
             "UPDATE delivery_runs
              SET lease_owner=?, lease_expires_at=?, process_instance=?, app_version=?, app_build=?,
-                 last_observed_at=?, updated_at=?
+                 last_observed_app_version=?, last_observed_app_build=?,
+                 last_observed_process_instance=?, last_observed_at=?, updated_at=?
              WHERE id=? AND {NON_TERMINAL_PREDICATE}
                AND (lease_expires_at IS NULL OR lease_expires_at <= ?)"
         );
@@ -628,6 +781,9 @@ pub async fn plan_startup_recovery(
             .bind(&process.instance_id)
             .bind(&process.app_version)
             .bind(&process.app_build)
+            .bind(&process.app_version)
+            .bind(&process.app_build)
+            .bind(&process.instance_id)
             .bind(now)
             .bind(now)
             .bind(&run_id)
@@ -778,12 +934,14 @@ mod tests {
         let process = ProcessIdentity::new("process", "1.79.0", "17900");
         let mut run = NewDeliveryRun {
             id: "new-run".into(),
+            objective_id: "chat:turn".into(),
             run_kind: "chat_delivery".into(),
             session_id: None,
             root_turn_id: None,
             task_segment_id: None,
             task_id: None,
             workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:new-run".into(),
             repo_identity: "example.invalid/repo".into(),
             base_branch: "main".into(),
             head_branch: "feature".into(),
@@ -854,6 +1012,27 @@ mod tests {
                 .await
                 .unwrap()
         );
+        let successor = ProcessIdentity::new("process-next", "1.80.0", "18000");
+        create_delivery_run(&pool, &run, &successor, 200, 30)
+            .await
+            .unwrap();
+        let provenance: (String, String, String, String) = sqlx::query_as(
+            "SELECT created_app_version, created_process_instance,
+                    last_observed_app_version, last_observed_process_instance
+             FROM delivery_runs WHERE id='new-run'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            provenance,
+            (
+                "1.79.0".into(),
+                "process".into(),
+                "1.80.0".into(),
+                "process-next".into(),
+            )
+        );
         let clocks: (i64, i64, i64) = sqlx::query_as(
             "SELECT last_observed_at, last_progress_at, progress_revision
              FROM delivery_runs WHERE id='new-run'",
@@ -869,17 +1048,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_run_id_with_different_workspace_or_change_set_is_rejected_without_lease_renewal()
+    {
+        let pool = pool().await;
+        let process = ProcessIdentity::new("process", "1.79.1", "17901");
+        let original = NewDeliveryRun {
+            id: "identity-run".into(),
+            objective_id: "chat:objective".into(),
+            run_kind: "chat_delivery".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("objective".into()),
+            task_id: None,
+            workspace_path: "/workspace-a".into(),
+            worktree_identity: "worktree:a".into(),
+            repo_identity: "example.invalid/repo".into(),
+            base_branch: "main".into(),
+            head_branch: "feature-a".into(),
+            change_set_digest: "digest-a".into(),
+            expected_head_sha: "aaa".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "preflight".into(),
+            status: "running".into(),
+            wait_class: None,
+            next_action: Some("deliver".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        create_delivery_run(&pool, &original, &process, 100, 30)
+            .await
+            .unwrap();
+
+        let mut mismatched = original.clone();
+        mismatched.workspace_path = "/workspace-b".into();
+        mismatched.head_branch = "feature-b".into();
+        mismatched.change_set_digest = "digest-b".into();
+        mismatched.expected_head_sha = "bbb".into();
+        let error = create_delivery_run(&pool, &mismatched, &process, 110, 90)
+            .await
+            .expect_err("identity collision must fail before delivery side effects");
+        assert!(error.to_string().contains("identity"));
+
+        let persisted: (String, String, String, String, i64) = sqlx::query_as(
+            "SELECT workspace_path, head_branch, change_set_digest, expected_head_sha, lease_expires_at
+             FROM delivery_runs WHERE id='identity-run'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted,
+            (
+                "/workspace-a".into(),
+                "feature-a".into(),
+                "digest-a".into(),
+                "aaa".into(),
+                130,
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn later_uncertain_observations_cannot_erase_remote_identity_or_regress_progress() {
         let pool = pool().await;
         let process = ProcessIdentity::new("process", "1.79.0", "17900");
         let run = NewDeliveryRun {
             id: "monotonic-run".into(),
+            objective_id: "chat:monotonic".into(),
             run_kind: "chat_delivery".into(),
             session_id: Some("session".into()),
             root_turn_id: Some("turn".into()),
             task_segment_id: None,
             task_id: None,
             workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:monotonic".into(),
             repo_identity: "example.invalid/repo".into(),
             base_branch: "main".into(),
             head_branch: "feature".into(),
@@ -1146,19 +1392,21 @@ mod tests {
     ) {
         sqlx::query(
             "INSERT INTO delivery_runs (
-                id, run_kind, session_id, root_turn_id, workspace_path, repo_identity, base_branch,
+                id, objective_id, run_kind, session_id, root_turn_id, workspace_path, worktree_identity, repo_identity, base_branch,
                 head_branch, change_set_digest, expected_head_sha, requested_ceiling, reached_ceiling,
                 stage, status, wait_class, next_action, next_action_authorized, stage_attempt,
                 lease_owner, lease_expires_at, last_observed_at, last_progress_at,
                 progress_revision, app_version, app_build, process_instance, created_at, updated_at
-             ) VALUES (?, 'chat_delivery', ?, ?, '/workspace', 'example.invalid/repo', 'main',
+             ) VALUES (?, ?, 'chat_delivery', ?, ?, '/workspace', ?, 'example.invalid/repo', 'main',
                        'feature', 'digest', 'abc', 'through_release', 'local',
                        'deliver', ?, 'recoverable', 'observe_remote', 0, 1, 'process-old', ?, 1, 1, 1,
                        '1.78.4', '17804', 'process-old', 1, 1)",
         )
         .bind(id)
+        .bind(session_id.zip(root_turn_id).map(|_| format!("chat:{id}")))
         .bind(session_id)
         .bind(root_turn_id)
+        .bind(session_id.zip(root_turn_id).map(|_| "worktree:fixture"))
         .bind(status)
         .bind(lease_expires_at)
         .execute(pool)

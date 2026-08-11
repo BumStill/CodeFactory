@@ -2333,6 +2333,14 @@ pub struct CompletionEvidence {
     pub required_observable_states: Vec<String>,
     #[serde(default)]
     pub observed_observable_states: Vec<String>,
+    #[serde(default)]
+    pub delivery_completion_required: bool,
+    #[serde(default)]
+    pub delivery_completion_satisfied: bool,
+    #[serde(default)]
+    pub delivery_requested_ceiling: Option<String>,
+    #[serde(default)]
+    pub delivery_reached_ceiling: Option<String>,
     pub completed: bool,
     pub blockers: Vec<String>,
 }
@@ -2829,6 +2837,10 @@ pub struct CompletionGate {
     missing_test_runner: Option<String>,
     required_observable_states: BTreeSet<String>,
     observed_observable_states: BTreeMap<String, u64>,
+    delivery_completion_required: bool,
+    delivery_completion_satisfied: bool,
+    delivery_requested_ceiling: Option<String>,
+    delivery_reached_ceiling: Option<String>,
 }
 
 impl Default for CompletionGate {
@@ -2972,7 +2984,26 @@ impl CompletionGate {
             missing_test_runner: None,
             required_observable_states: BTreeSet::new(),
             observed_observable_states: BTreeMap::new(),
+            delivery_completion_required: false,
+            delivery_completion_satisfied: false,
+            delivery_requested_ceiling: None,
+            delivery_reached_ceiling: None,
         }
+    }
+
+    /// Record the structured result of the delivery state machine. Generic
+    /// tool success is not business completion: only the arbiter may close the
+    /// delivery requirement after requested/reached evidence agrees.
+    pub fn record_delivery_completion(
+        &mut self,
+        requested_ceiling: impl Into<String>,
+        reached_ceiling: impl Into<String>,
+        satisfied: bool,
+    ) {
+        self.delivery_completion_required = true;
+        self.delivery_completion_satisfied = satisfied;
+        self.delivery_requested_ceiling = Some(requested_ceiling.into());
+        self.delivery_reached_ceiling = Some(reached_ceiling.into());
     }
 
     pub fn record(&mut self, outcome: &ToolOutcome) {
@@ -3160,6 +3191,13 @@ impl CompletionGate {
 
     pub fn evidence(&self) -> CompletionEvidence {
         let mut blockers = Vec::new();
+        if self.delivery_completion_required && !self.delivery_completion_satisfied {
+            blockers.push(format!(
+                "delivery completion arbitration is still open: reached {} but objective requires {}",
+                self.delivery_reached_ceiling.as_deref().unwrap_or("unknown"),
+                self.delivery_requested_ceiling.as_deref().unwrap_or("unknown")
+            ));
+        }
         if !self.failed_verifications.is_empty() {
             blockers.push(
                 "rerun every unresolved failed check at the same or broader scope after the repair; unrelated or narrower green checks cannot close these failures"
@@ -3382,6 +3420,10 @@ impl CompletionGate {
                 })
                 .cloned()
                 .collect(),
+            delivery_completion_required: self.delivery_completion_required,
+            delivery_completion_satisfied: self.delivery_completion_satisfied,
+            delivery_requested_ceiling: self.delivery_requested_ceiling.clone(),
+            delivery_reached_ceiling: self.delivery_reached_ceiling.clone(),
             completed: blockers.is_empty(),
             blockers,
         }

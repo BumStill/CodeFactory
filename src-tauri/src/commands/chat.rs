@@ -396,12 +396,22 @@ pub async fn send_message(
         .bind(&session_id)
         .fetch_one(&*pool)
         .await?;
+        let previous_segment_id = if crate::agent::is_contextual_approval(&content) {
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM chat_task_segments WHERE session_id=? ORDER BY ordinal DESC LIMIT 1",
+            )
+            .bind(&session_id)
+            .fetch_optional(&*pool)
+            .await?
+        } else {
+            None
+        };
         let segment_id = Uuid::new_v4().to_string();
         let title: String = content.chars().take(60).collect();
         sqlx::query(
             "INSERT OR IGNORE INTO chat_task_segments
-             (id, session_id, ordinal, title, status, goal_root_turn_id, created_at, updated_at)
-             VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+             (id, session_id, ordinal, title, status, goal_root_turn_id, previous_segment_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)",
         )
         .bind(&segment_id)
         .bind(&session_id)
@@ -412,6 +422,7 @@ pub async fn send_message(
             &title
         })
         .bind(&root_turn_id)
+        .bind(&previous_segment_id)
         .bind(now)
         .bind(now)
         .execute(&*pool)
@@ -439,6 +450,50 @@ pub async fn send_message(
         .bind(now)
         .execute(&*pool)
         .await?;
+        if let Some(previous_segment_id) = previous_segment_id.as_deref() {
+            let objective_anchor = sqlx::query_scalar::<_, String>(
+                "WITH RECURSIVE objective_chain(id, previous_segment_id, depth) AS (
+                     SELECT id, previous_segment_id, 0 FROM chat_task_segments WHERE id=?
+                     UNION ALL
+                     SELECT prior.id, prior.previous_segment_id, objective_chain.depth+1
+                     FROM chat_task_segments prior
+                     JOIN objective_chain ON prior.id=objective_chain.previous_segment_id
+                     WHERE objective_chain.depth < 100
+                 )
+                 SELECT id FROM objective_chain ORDER BY depth DESC LIMIT 1",
+            )
+            .bind(previous_segment_id)
+            .fetch_optional(&*pool)
+            .await?;
+            if let Some(objective_anchor) = objective_anchor {
+                let open_state = sqlx::query_as::<_, (String, Option<String>)>(
+                    "SELECT status, wait_class FROM delivery_runs
+                     WHERE objective_id=?
+                       AND status NOT IN ('completed', 'failed', 'cancelled', 'rejected')
+                     ORDER BY updated_at DESC LIMIT 1",
+                )
+                .bind(format!("chat:{objective_anchor}"))
+                .fetch_optional(&*pool)
+                .await?;
+                if let Some((status, _wait_class)) = open_state {
+                    let driver = match status.as_str() {
+                        "waiting" => "recoverable_waiting_open",
+                        "platform_incident" | "agent_action_required" | "failed_internal" => {
+                            "system_owned_remediation_open"
+                        }
+                        "awaiting_completion_arbitration" => "completion_arbitration_open",
+                        _ => "authorized_objective_still_open",
+                    };
+                    sqlx::query(
+                        "UPDATE chat_turn_state SET user_reprompt_driver=? WHERE root_turn_id=?",
+                    )
+                    .bind(driver)
+                    .bind(&root_turn_id)
+                    .execute(&*pool)
+                    .await?;
+                }
+            }
+        }
     }
 
     // Fetch session for cwd + model

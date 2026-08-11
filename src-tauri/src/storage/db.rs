@@ -810,6 +810,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ] {
         sqlx::query(statement).execute(pool).await?;
     }
+    ensure_column(pool, "chat_turn_state", "user_reprompt_driver", "TEXT").await?;
 
     // ── task_runs has a verification_results JSON column referenced by
     //    the verification engine. Some older DBs and all fresh installs
@@ -1360,22 +1361,6 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     crate::benchmark::ensure_schema(pool).await?;
 
     Ok(())
-}
-
-/// Startup hook for durable delivery reconciliation. This only acquires an
-/// expired lease and returns an observe-first plan; it never runs git/GitHub,
-/// merges, releases, or performs any other external mutation.
-pub(crate) async fn plan_delivery_run_boot_recovery(
-    pool: &SqlitePool,
-    process: &crate::agent::delivery_run::ProcessIdentity,
-) -> crate::errors::Result<crate::agent::delivery_run::StartupRecoveryPlan> {
-    crate::agent::delivery_run::plan_startup_recovery(
-        pool,
-        process,
-        Utc::now().timestamp_millis(),
-        60_000,
-    )
-    .await
 }
 
 /// Pull each session's activity time up to its newest message.

@@ -235,8 +235,7 @@ impl DeliveryOutcome {
         );
         self.code = "delivery_external_state_uncertain".into();
         self.recovery_class = RecoveryClass::ExternalStateUncertain;
-        self.summary =
-            format!("{msg} 外部动作结果不确定；系统保持运行并只读对账，不向用户回交。");
+        self.summary = format!("{msg} 外部动作结果不确定；系统保持运行并只读对账，不向用户回交。");
         self
     }
 
@@ -1068,7 +1067,7 @@ enum WorktreeDiscovery {
     /// Exactly one worktree branch is ahead — that is the delivery target.
     Single(RepoContext),
     /// Several worktree branches are ahead; ambiguous, list them for the user.
-    Multiple(Vec<String>),
+    Multiple(Vec<RepoContext>),
 }
 
 /// When the current checkout is on the default branch (can't open a PR from
@@ -1130,7 +1129,70 @@ fn discover_worktree_target(repo: &RepoContext) -> WorktreeDiscovery {
                 remote_url,
             })
         }
-        n => WorktreeDiscovery::Multiple(candidates.into_iter().take(n).map(|(_, b)| b).collect()),
+        n => WorktreeDiscovery::Multiple(
+            candidates
+                .into_iter()
+                .take(n)
+                .map(|(root, branch)| RepoContext {
+                    remote_url: git(&root, &["remote", "get-url", &repo.remote]).ok(),
+                    root,
+                    branch,
+                    default_branch: repo.default_branch.clone(),
+                    remote: repo.remote.clone(),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Resolve the exact checkout that delivery would mutate. This is shared with
+/// the durable-run preflight so persisted identity and the side-effect target
+/// cannot diverge when the caller starts from the default checkout.
+pub fn resolve_delivery_repo(
+    cwd: &Path,
+    default_branch_hint: Option<&str>,
+    expected_branch: Option<&str>,
+) -> Result<(RepoContext, Option<String>), String> {
+    let repo = resolve_repo(cwd, default_branch_hint)?;
+    if repo.branch != repo.default_branch {
+        return Ok((repo, None));
+    }
+    match discover_worktree_target(&repo) {
+        WorktreeDiscovery::Single(target) => {
+            let from = repo.branch;
+            let message = format!(
+                "主 checkout 在默认分支 {from} 上；检测到 worktree 分支 {} 有未合并提交，改为以该分支为交付目标",
+                target.branch
+            );
+            Ok((target, Some(message)))
+        }
+        WorktreeDiscovery::Multiple(candidates) => {
+            if let Some(expected_branch) = expected_branch {
+                if let Some(target) = candidates
+                    .iter()
+                    .find(|candidate| candidate.branch == expected_branch)
+                    .cloned()
+                {
+                    let message = format!(
+                        "主 checkout 上存在多个待交付 worktree；依据已持久化 expect_branch={expected_branch} 解析到唯一目标"
+                    );
+                    return Ok((target, Some(message)));
+                }
+            }
+            Err(format!(
+                "当前在默认分支 {} 上,检测到多个 worktree 分支有待交付提交({});这是系统身份冲突，未执行任何交付动作。",
+                repo.default_branch,
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.branch.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+        WorktreeDiscovery::None => Err(format!(
+            "当前在默认分支 {} 上,不能从默认分支向自身开 PR;且未发现唯一待交付 worktree；未执行任何交付动作。",
+            repo.default_branch
+        )),
     }
 }
 
@@ -1743,49 +1805,14 @@ pub async fn deliver<R: DeliveryRemote>(
     }
 
     // ── Resolve repo ────────────────────────────────────────────────────────
-    let mut repo = match resolve_repo(cwd, default_branch_hint) {
-        Ok(r) => r,
-        Err(e) => return outcome.blocked_at(StepResult::blocked("repo", e)),
-    };
+    let (repo, worktree_resolution) =
+        match resolve_delivery_repo(cwd, default_branch_hint, opts.expect_branch.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(e) => return outcome.blocked_at(StepResult::blocked("repo", e)),
+        };
     outcome.branch = Some(repo.branch.clone());
-    if repo.branch == repo.default_branch {
-        // On the default branch we cannot open a PR from it to itself, but the
-        // worktree-default workflow leaves the feature branch in a sibling
-        // worktree while the main checkout sits on main. Discover that branch
-        // and deliver it instead of refusing outright.
-        match discover_worktree_target(&repo) {
-            WorktreeDiscovery::Single(target) => {
-                let from = repo.branch.clone();
-                repo = target;
-                outcome.branch = Some(repo.branch.clone());
-                outcome.steps.push(StepResult::ok(
-                    "repo",
-                    format!(
-                        "主 checkout 在默认分支 {from} 上；检测到 worktree 分支 {} 有未合并提交，改为以该分支为交付目标",
-                        repo.branch
-                    ),
-                ));
-            }
-            WorktreeDiscovery::Multiple(candidates) => {
-                return outcome.blocked_at(StepResult::blocked(
-                    "repo",
-                    format!(
-                        "当前在默认分支 {} 上,不能从默认分支向自身开 PR;且检测到多个 worktree 分支有待交付提交({}),请先切到目标功能分支。",
-                        repo.default_branch,
-                        candidates.join(", ")
-                    ),
-                ));
-            }
-            WorktreeDiscovery::None => {
-                return outcome.blocked_at(StepResult::blocked(
-                    "repo",
-                    format!(
-                        "当前在默认分支 {} 上,不能从默认分支向自身开 PR;请先切到功能分支(未发现待交付的 worktree 分支)。",
-                        repo.default_branch
-                    ),
-                ));
-            }
-        }
+    if let Some(message) = worktree_resolution {
+        outcome.steps.push(StepResult::ok("repo", message));
     }
 
     // The caller stated which delivery this is. A mismatch is a stale
@@ -7995,6 +8022,27 @@ Release-Urgency: hold"
         assert!(out.summary.contains("feat/wt2"), "candidate 2 named");
         // No PR was opened for an ambiguous choice.
         assert_eq!(remote.calls.open_pr.load(Ordering::SeqCst), 0);
+
+        let selected = rt.block_on(deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            1,
+            &DeliverOpts {
+                title: None,
+                body: None,
+                release_urgency: None,
+                requested_ceiling: None,
+                extra_excludes: vec![],
+                expect_branch: Some("feat/wt".into()),
+            },
+            Some(&remote),
+            Some("main"),
+        ));
+        assert_eq!(selected.branch.as_deref(), Some("feat/wt"));
+        assert_eq!(selected.pr_number, Some(7));
+        assert_eq!(remote.calls.open_pr.load(Ordering::SeqCst), 1);
+        assert!(wt1.join("feature.rs").exists());
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 

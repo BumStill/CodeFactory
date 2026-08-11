@@ -76,12 +76,30 @@ pub struct TurnActivityUpdate {
     pub terminal_reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecoveryAttemptRow {
+    pub root_turn_id: String,
+    pub domain: String,
+    pub attempt_index: i64,
+    pub failure_code: String,
+    pub failure_class: String,
+    pub output_started: bool,
+    pub side_effect_started: bool,
+    pub terminal_decision: String,
+}
+
 /// Persistence boundary. Mutating methods no-op (returning the "not written"
 /// value) when the run is anonymous; the root-turn count read also returns 0.
 #[async_trait::async_trait]
 pub trait Persistence: Send + Sync {
     async fn update_turn_activity(&self, _update: &TurnActivityUpdate) -> PersistResult<i64> {
         Ok(0)
+    }
+
+    /// Persist one system-owned recovery attempt. Stable codes and process
+    /// identity make a retry auditable without storing raw provider text.
+    async fn record_recovery_attempt(&self, _attempt: &RecoveryAttemptRow) -> PersistResult<()> {
+        Ok(())
     }
 
     /// A redacted user/assistant/tool message. Returns the new id, or `None`
