@@ -14,9 +14,9 @@
 
 ## Current State
 
-- Current phase: 第二批 — 统一控制面与共享检查器
-- Current checkpoint: 第二批实现、本地自动化、PR #362 全套 CI 与锁屏无关远端真实 App 启动/窗口验收均通过；本机处于锁屏状态，未绕过系统安全，也不把未执行的 VoiceOver/200% 本机交互写成已验证。当前按锁屏交付基线进入 Ready、merge、Auto Release 与公开产物验收。
-- Next owner: 当前交付继续完成 PR #362 merge、公开 release、`latest.json`、macOS/Windows 产物和 released-artifact GUI smoke；browser child WebView 仅按 Phase 1 同 URL 预览交付，EBP-R3/R9 保持 `not live`。
+- Current phase: 第二批已上线；后续无障碍与任务验收面收敛
+- Current checkpoint: PR #362 已 squash merge 为 `defbc350`，Auto Release run `31489599245` 生成 v1.80.0，Release run `31490295360` 全绿；公开 DMG、Windows installer、updater 签名、`latest.json` 与匿名重新下载 DMG 的 released-artifact GUI 均已验收。该批统一控制面已 live。
+- Next owner: 后续独立完成 R18 共用任务验收面、R30 本机 VoiceOver/200% zoom 证据及既有 P2 可访问性 backlog；browser child WebView 仍只按 Phase 1 同 URL 预览，EBP-R3/R9 保持 `not live`。
 - Updated at: 2026-08-11
 
 ## Completed Items
@@ -55,7 +55,7 @@
 - [x] 第二批：R28 单 pane tabs、overlay 与 separator 完整键盘/focus 契约；原生 child WebView Escape 已桥接到宿主。
 - [x] 第二批：R29 正文/composer 同一 880px 网格，多视口无页面级横向溢出。
 - [ ] 第二批：R30 图标命中区、VoiceOver、200% zoom 和 reduced-motion 放行。
-- [ ] 第二批：R31 PR/CI/merge/release/public artifact/正式 App 完整上线证据。
+- [x] 第二批：R31 PR/CI/merge/release/public artifact/正式 App 完整上线证据。
 - [ ] 无障碍 P2：补齐消息/工具/任务 disclosure 的 `aria-controls`，项目选择与会话菜单键盘模式，以及 ImagePreview 初始聚焦、focus trap、回焦和最小 11px 说明。
 - [ ] 测试/性能 P2：清理 Workspace `act(...)` 警告，并单独治理 Vite 既存大 chunk 提示。
 
@@ -85,6 +85,11 @@
   - v1.76.1 为公开非预发布 release；macOS DMG、Windows NSIS、签名与 `latest.json` 均可公开下载，HTTP 返回 200。
   - `latest.json` 的版本为 `1.76.1`，Windows x86_64 / NSIS 与 Darwin arm64 URL 均指向 v1.76.1 且签名非空。
   - Release run 30690692975 全部绿色；公开 DMG 被重新下载并通过安装产物与 GUI 验收。
+  - 第二批由 PR #362（merge `defbc350`）进入 main；最终 squash footer 保留 `Release-Urgency: immediate`。发布规划器对 `v1.79.2..main` 返回 `slot=minor`、`immediate=1`、`hold=0`、`invalid_urgency=0`。
+  - Auto Release run `31489599245` 通过仅含四个版本 manifest 的 PR #363，merge/tag SHA 为 `4c2fd733`；Release run `31490295360` 的 changelog、prepare、Windows Evolution closed loop、macOS 安装产物 GUI、finalize/publish 和匿名公开 DMG GUI 复验全部通过。
+  - v1.80.0 为公开非 Draft、非 prerelease latest release，精确包含 macOS DMG、Windows NSIS、Windows `.sig`、macOS updater archive、macOS `.sig` 与 `latest.json` 六个资产。`latest.json` 版本为 `1.80.0`，三个平台 URL 均指向 v1.80.0 且签名非空。
+  - 发布后公开 DMG SHA-256 为 `177b855ad8c1ceb32e5e8d130558f020cce083c023ddfc0e1ef6a865c46a2a27`，与 GitHub asset digest 一致，`hdiutil verify` 通过；published release receipt 的 `app_version=1.80.0`、`build_git_sha=4c2fd733…`、`status=pass`，窗口 `1024×674`、proof tier 为 `published-release-artifact-gui`。
+  - macOS 分发保持仓库现行兼容通道：未使用 Apple Developer ID/公证，严格 `codesign --verify` 不作为已满足声明；Tauri updater 签名与首启 Gatekeeper 边界按 README 和 `macos-release-trust` 规格如实保留。
 - Blocking evidence: 当前无。
 
 ## AI Collaboration
@@ -92,7 +97,7 @@
 - context scope: Workspace theme、session rail、conversation、result、composer、context、task activity、delivery、Settings/Onboarding delivery copy。
 - assumptions: 第一批不修改持久化 schema；release snapshot 当前没有 live verifier 字段；外部机器人不属于产品。
 - review point: 独立 QA 先后阻止低对比 muted/status 色、嵌套交互、抽屉焦点、窄屏、9–10px、hardcoded 状态色和 reduced-motion 缺口进入交付；逐项修复后复审。
-- validation result: 第一批与两轮用户反馈均已公开发布；PR #274 的全量测试、build、治理、本地真实 App、远程 GUI 与 v1.76.1 公开产物验收通过；R17/R18 和补充视口证据仍待后续批次。
+- validation result: 第一批与两轮用户反馈均已公开发布；第二批 R17、R19–R29 已由 PR #362 合并并随 v1.80.0 上线，PR/CI、远端真实 App、双平台构建、公开元数据与 released-artifact GUI 均通过。R18、R30 的本机 VoiceOver/200% zoom 与既有 P2 backlog 仍明确留在后续，不冒充本次已完成。
 
 ## Stop Boundary
 
