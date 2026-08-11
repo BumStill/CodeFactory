@@ -607,7 +607,7 @@ mod tests {
             max_chars: 500,
             history,
         };
-        let out = compactor.compact(messages, "", 0);
+        let out = compactor.compact(messages, "", 0, &[]);
 
         assert!(out.compacted);
         assert_eq!(body_of(&out.messages[0]), "shared contract");
