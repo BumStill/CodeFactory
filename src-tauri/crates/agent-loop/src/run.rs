@@ -730,11 +730,24 @@ pub async fn run_agent_loop(
                     content: steer_text,
                 });
             }
+            // Resolve the exact tool schema that this round will send before
+            // estimating the prompt. Tool definitions are part of the provider
+            // input budget, so calculating the budget first can cause an avoidable
+            // over-context request followed by a compression retry.
+            let active_tool_defs = crate::policy::active_tool_definitions_for_capability(
+                tool_defs,
+                finalization_pending,
+                turn_capability,
+            );
             // ── Context-window management ────────────────────────────────────
             // Estimate prompt tokens before sending. If we're over 75% of the
             // model's window, elide oversized tool results from the older
             // half. Notify the UI so the user knows what happened.
-            let estimated = crate::context::estimate_prompt_tokens(&messages, system_prompt);
+            let estimated = crate::context::estimate_prompt_tokens_with_tools(
+                &messages,
+                system_prompt,
+                &active_tool_defs,
+            );
             let (context_limit, max_context_limit) = context_policy.context_window(estimated).await;
             // Compression is OpenAI/ChatGPT-only (slice 4.7): the Anthropic path
             // never elides history, so with `context_compression=false` the
@@ -745,8 +758,12 @@ pub async fn run_agent_loop(
                 // surface keeps its own budget discipline: desktop = token-based
                 // elision (DefaultCompressor, byte-identical to before),
                 // sidecar = its destructive char-budget digest.
-                let compaction =
-                    compactor.compact(std::mem::take(&mut messages), system_prompt, context_limit);
+                let compaction = compactor.compact(
+                    std::mem::take(&mut messages),
+                    system_prompt,
+                    context_limit,
+                    &active_tool_defs,
+                );
                 messages = compaction.messages;
                 if compaction.compacted {
                     events.emit(crate::types::StreamEvent::ContextCompressed {

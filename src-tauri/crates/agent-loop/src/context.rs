@@ -8,7 +8,7 @@
 //! resolution (`resolve_context_window`, `model_supports_vision`) stays in the
 //! bin behind `ContextPolicy` and re-exports these under the `context::` path.
 
-use crate::types::{ChatMessage, MessageContent};
+use crate::types::{ChatMessage, MessageContent, ToolDefinition};
 
 /// Compression kicks in above this fraction of the window. 0.75 leaves
 /// headroom for the system prompt, tool definitions, and the new user
@@ -55,21 +55,49 @@ fn is_cjk(ch: char) -> bool {
 }
 
 /// Estimate the total prompt tokens for a message list, including a system
-/// prompt and the tool schema overhead (rough constant).
+/// prompt and message/tool-call overhead. Use
+/// [`estimate_prompt_tokens_with_tools`] when the active tool definitions are
+/// available.
 pub fn estimate_prompt_tokens(messages: &[ChatMessage], system_prompt: &str) -> u32 {
-    // Rough overhead per message for role/separators/wrappers
+    estimate_prompt_tokens_with_tools(messages, system_prompt, &[])
+}
+
+/// Estimate the complete prompt envelope that is sent to a provider. Besides
+/// message text and tool calls, this includes replayed reasoning and the exact
+/// tool definitions active for this round. The estimate is intentionally
+/// conservative: an underestimated budget causes a failed request followed by
+/// an avoidable compression/retry cycle.
+pub fn estimate_prompt_tokens_with_tools(
+    messages: &[ChatMessage],
+    system_prompt: &str,
+    tools: &[ToolDefinition],
+) -> u32 {
+    // Rough overhead per message for role/separators/wrappers.
     const PER_MESSAGE_OVERHEAD: u32 = 4;
+    // Tool envelopes carry type/function keys and provider-side separators in
+    // addition to the serialized definition fields.
+    const TOOL_ENVELOPE_OVERHEAD: u32 = 8;
 
     let mut total = estimate_tokens(system_prompt);
     for m in messages {
         total += PER_MESSAGE_OVERHEAD;
         total += estimate_tokens(&content_text(&m.content));
+        if let Some(reasoning) = &m.reasoning_content {
+            total += estimate_tokens(reasoning);
+        }
         if let Some(tcs) = &m.tool_calls {
             for tc in tcs {
                 total += estimate_tokens(&tc.function.name);
                 total += estimate_tokens(&tc.function.arguments);
             }
         }
+    }
+    for tool in tools {
+        total += TOOL_ENVELOPE_OVERHEAD;
+        total += estimate_tokens(&tool.r#type);
+        total += estimate_tokens(&tool.function.name);
+        total += estimate_tokens(&tool.function.description);
+        total += estimate_tokens(&tool.function.parameters.to_string());
     }
     total
 }
@@ -153,8 +181,20 @@ pub fn compress_if_needed(
     system_prompt: &str,
     limit: u32,
 ) -> CompressionResult {
+    compress_if_needed_with_tools(messages, system_prompt, limit, &[])
+}
+
+/// Compress a prompt using the actual tool definitions active for this round.
+/// The legacy [`compress_if_needed`] wrapper remains for callers that do not
+/// send tools (and for tests that exercise message-only compression).
+pub fn compress_if_needed_with_tools(
+    messages: Vec<ChatMessage>,
+    system_prompt: &str,
+    limit: u32,
+    tools: &[ToolDefinition],
+) -> CompressionResult {
     let trigger = (limit as f32 * COMPRESSION_TRIGGER) as u32;
-    let estimate = estimate_prompt_tokens(&messages, system_prompt);
+    let estimate = estimate_prompt_tokens_with_tools(&messages, system_prompt, tools);
 
     if estimate <= trigger {
         return CompressionResult {
@@ -227,7 +267,7 @@ pub fn compress_if_needed(
     const MIN_KEEP_PAIRS: usize = 2;
     let mut trimmed = messages;
     loop {
-        let est = estimate_prompt_tokens(&trimmed, system_prompt);
+        let est = estimate_prompt_tokens_with_tools(&trimmed, system_prompt, tools);
         if est <= limit {
             break;
         }
@@ -283,8 +323,11 @@ fn compact_head_tail(
 
 #[cfg(test)]
 mod tests {
-    use super::{compress_if_needed, estimate_prompt_tokens, estimate_tokens};
-    use crate::types::{ChatMessage, MessageContent};
+    use super::{
+        compress_if_needed, estimate_prompt_tokens, estimate_prompt_tokens_with_tools,
+        estimate_tokens,
+    };
+    use crate::types::{ChatMessage, FunctionDefinition, MessageContent, ToolDefinition};
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
@@ -303,6 +346,64 @@ mod tests {
 
     fn content_of(msg: &ChatMessage) -> String {
         super::content_text(&msg.content)
+    }
+
+    #[test]
+    fn prompt_estimate_includes_tool_schema_and_reasoning_replay() {
+        let mut assistant = msg("assistant", "short reply");
+        assistant.reasoning_content = Some("R".repeat(900));
+        let messages = vec![msg("user", "inspect the project"), assistant];
+        let tools = vec![ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "read_file".into(),
+                description: "D".repeat(900),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+            },
+        }];
+
+        let messages_only = estimate_prompt_tokens(&messages, "");
+        let complete = estimate_prompt_tokens_with_tools(&messages, "", &tools);
+        let reasoning = estimate_tokens(&"R".repeat(900));
+
+        assert!(
+            complete >= messages_only + reasoning,
+            "reasoning replay must count toward the prompt estimate"
+        );
+        assert!(
+            complete > messages_only + reasoning,
+            "tool schema must add its own prompt cost"
+        );
+    }
+
+    #[test]
+    fn compression_accounts_for_active_tool_schema() {
+        let messages = vec![
+            msg("user", "old task"),
+            msg("assistant", &"A".repeat(1_200)),
+            msg("user", "inspect"),
+            msg("assistant", "ready"),
+        ];
+        let tools = vec![ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "large_tool".into(),
+                description: "D".repeat(2_000),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"payload": {"type": "string", "description": "P".repeat(2_000)}}
+                }),
+            },
+        }];
+        let result = super::compress_if_needed_with_tools(messages, "", 1_000, &tools);
+        assert!(
+            result.compressed,
+            "tool schema must participate in the compression trigger"
+        );
     }
 
     #[test]

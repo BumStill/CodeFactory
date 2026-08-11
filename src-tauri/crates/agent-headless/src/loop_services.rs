@@ -330,6 +330,7 @@ impl ContextCompactor for CharBudgetCompactor {
         messages: Vec<ChatMessage>,
         _system_prompt: &str,
         _context_limit: u32,
+        _tool_definitions: &[codefactory_agent_loop::types::ToolDefinition],
     ) -> CompactionOutcome {
         let serialized_len = serde_json::to_string(&messages)
             .map(|s| s.len())

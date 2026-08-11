@@ -166,6 +166,7 @@ pub trait ContextCompactor: Send + Sync {
         messages: Vec<crate::types::ChatMessage>,
         system_prompt: &str,
         context_limit: u32,
+        tool_definitions: &[crate::types::ToolDefinition],
     ) -> CompactionOutcome;
 }
 
@@ -179,9 +180,14 @@ impl ContextCompactor for DefaultCompressor {
         messages: Vec<crate::types::ChatMessage>,
         system_prompt: &str,
         context_limit: u32,
+        tool_definitions: &[crate::types::ToolDefinition],
     ) -> CompactionOutcome {
-        let compression =
-            crate::context::compress_if_needed(messages, system_prompt, context_limit);
+        let compression = crate::context::compress_if_needed_with_tools(
+            messages,
+            system_prompt,
+            context_limit,
+            tool_definitions,
+        );
         CompactionOutcome {
             // Storage repair is not enough: compression can change the final
             // provider payload, so enforce the tool-call protocol at the last
@@ -204,6 +210,7 @@ impl ContextCompactor for NoOpCompactor {
         messages: Vec<crate::types::ChatMessage>,
         _system_prompt: &str,
         _context_limit: u32,
+        _tool_definitions: &[crate::types::ToolDefinition],
     ) -> CompactionOutcome {
         CompactionOutcome {
             messages,
@@ -294,6 +301,7 @@ mod tests {
                 messages: Vec<crate::types::ChatMessage>,
                 _system_prompt: &str,
                 _context_limit: u32,
+                _tool_definitions: &[crate::types::ToolDefinition],
             ) -> CompactionOutcome {
                 let elided = messages.len().saturating_sub(1);
                 CompactionOutcome {
@@ -315,7 +323,7 @@ mod tests {
             }
         }
         let c: std::sync::Arc<dyn ContextCompactor> = std::sync::Arc::new(DropAllButLast);
-        let out = c.compact(vec![msg("a"), msg("b"), msg("c")], "sys", 1_000);
+        let out = c.compact(vec![msg("a"), msg("b"), msg("c")], "sys", 1_000, &[]);
         assert_eq!(
             out.messages.len(),
             1,
@@ -327,13 +335,13 @@ mod tests {
         // The desktop default leaves a small history untouched (well under the
         // 75% trigger) — i.e. it is genuinely a different discipline.
         let d: std::sync::Arc<dyn ContextCompactor> = std::sync::Arc::new(DefaultCompressor);
-        let out = d.compact(vec![msg("a"), msg("b"), msg("c")], "sys", 1_000_000);
+        let out = d.compact(vec![msg("a"), msg("b"), msg("c")], "sys", 1_000_000, &[]);
         assert_eq!(out.messages.len(), 3);
         assert!(!out.compacted);
 
         // NoOpCompactor never touches anything.
         let n: std::sync::Arc<dyn ContextCompactor> = std::sync::Arc::new(NoOpCompactor);
-        let out = n.compact(vec![msg("a"), msg("b")], "sys", 1);
+        let out = n.compact(vec![msg("a"), msg("b")], "sys", 1, &[]);
         assert_eq!(out.messages.len(), 2);
         assert!(!out.compacted);
     }
