@@ -42,7 +42,7 @@ CodeFactory 的现代感定义为：安静、精确、可信、响应及时。�
 
 ### 2.3 几何
 
-- 主按钮与图标按钮最小 32×32px；
+- 图标视觉尺寸 16–20px，桌面命中区域至少 36×36px，窄屏/触控至少 44×44px；
 - 通用圆角：行/按钮 8px，输入框/浮层 12–16px；
 - 会话行 40–44px，任务行至少 36px；
 - 区域间距优先使用 4/8/12/16/24px 节奏。
@@ -50,16 +50,16 @@ CodeFactory 的现代感定义为：安静、精确、可信、响应及时。�
 ## 3. 页面布局
 
 ```text
-┌ Session rail ┬ Header: identity · model · permission · git · delivery · jobs ┐
-│ search       ├──────────────── Conversation canvas ───────────────────────────┤
-│ attention    │             readable 760–880px column                         │
-│ running      │     answer → evidence → compact result footer                 │
-│ recent       ├───────────────────────────────────────────────────────────────┤
-│              │ raised composer: scope/queue · input · context                │
-└──────────────┴───────────────────────────────────────────────────────────────┘
+┌ Session rail ┬ Header: identity · git · delivery · jobs · settings            ┐
+│ search       ├──────────────── Conversation canvas ───────────┬ Auxiliary ────┤
+│ attention    │             readable 760–880px column          │ one pane only  │
+│ running      │     answer → evidence → compact result footer  │ task/git/...   │
+│ recent       ├────────────────────────────────────────────────┴───────────────┤
+│              │ raised composer: scope/queue · input · model/safety · ◔ context│
+└──────────────┴────────────────────────────────────────────────────────────────┘
 ```
 
-正文是唯一视觉主角。顶栏回答“在哪里、用什么、交付到哪”；右侧工作面只在查看任务、diff、Git、交付或浏览器时出现。
+正文是唯一视觉主角。顶栏回答“在哪里、工程与交付到哪”；composer 回答“下一回合用什么模型、思考和权限”；右侧工作面只在查看任务、diff、Git、交付、证据、文档或浏览器时出现。
 
 ## 4. 作业流
 
@@ -135,10 +135,17 @@ PR → CI → 合并 → 正式发布 → 线上验证
   查看证据   执行过程   结果摘要
 ```
 
-未完成或阻塞：
+已执行但证据有缺口：
 
 ```text
-! 需要处理 · 4/6
+! 已执行，证据待复核 · 6/6       失败证据 1
+  查看证据   执行过程   结果摘要
+```
+
+明确需要用户动作：
+
+```text
+! 需要你处理 · 4/6
   当前：交付预检     原因：缺少 live verifier
   下一步：补齐 verifier 或调整目标上限
 ```
@@ -150,11 +157,28 @@ PR → CI → 合并 → 正式发布 → 线上验证
 - placeholder 简化为“描述任务或继续对话…”；
 - 支持格式只在附件按钮 tooltip/menu 展示；
 - 附件 chips 和错误在输入框上方；
-- 会话/今日用量与 context meter 作为 composer header 放在输入框上方，不在底部制造独立 footer 留白；
+- 模型/思考合并为一个紧凑入口，权限使用盾牌入口；两者位于输入框 footer，并明确下一回合/当前会话作用域；
+- context 使用 20–24px 圆环视觉、36px 桌面命中区域；圆环表示当前窗口已用比例，不表示会话或今日累计 Token；
+- 会话/今日累计 Token、当前窗口 used/limit、压缩信息在点击圆环后的详情中渐进披露，不常驻占一行；
 - 曲别针、单行 textarea 和发送/停止按钮使用同一 32px 垂直盒；textarea 以 24px 行高 + 上下各 4px 内边距对齐图标视觉中心，多行时控制继续贴底；
 - send 在可发送时为清晰主动作，stop 使用 danger 语义；
 - queue、draft scope、context 都属于同一 raised surface；
-- context 正常区为 neutral/progress，70–85% warning，≥85% danger；显示 meter 的 accessible name/value。
+- context <75% 只显示 neutral/progress 圆环，75–89% 追加百分比，≥90% 追加“接近上限”；未知值使用虚线圆环且不伪造百分比；meter 提供 accessible name/value。
+
+### 5.5 顶栏状态
+
+- 正常状态使用图标 + 对象标识/数量：分支名可截断、变更使用 badge、同步使用图标；
+- 交付使用 PR/CI/合并/发布/live 阶段图标，只给当前阶段保留短文字；
+- 异常、阻塞和用户动作必须显示文字，不能只靠图标或颜色；
+- 模型、思考和权限不再在顶栏重复出现；设置保留图标入口。
+
+### 5.6 单一辅助 pane
+
+- ≥1440px：停靠在右侧；状态/证据默认 360–420px，浏览器/文档 480–720px 并可调整；
+- 1024–1439px：右侧 drawer；<1024px 或 200% zoom：全高 overlay，不压缩正文；
+- pane header 始终显示当前类型、加载/错误状态、折叠/关闭动作；
+- 无有效 tab 时收起；browser 没有 URL 时显示“等待页面地址”，加载失败显示可重试错误，不出现纯白空区；
+- 任务、Git、交付、证据、文档、浏览器切换时复用同一 pane，不叠加第二层 drawer。
 
 ## 6. 动效
 
@@ -179,7 +203,7 @@ PR → CI → 合并 → 正式发布 → 线上验证
 
 - 左栏至少自然显示 10 条会话；
 - 正文宽度不超过 880px；
-- 顶栏核心状态不重叠；
+- 顶栏核心状态不重叠，辅助详情使用 overlay；
 - composer、context 和主动作完整可见。
 
 ### 800×600
@@ -200,6 +224,6 @@ PR → CI → 合并 → 正式发布 → 线上验证
 
 - `chat-continuity` 中“最终回复不切 dashboard”保留；P2 结果卡解释为紧凑 footer。
 - `workspace-navigation` 中“latest release 即已上线”作废；正式发布与 live verification 分离。
-- `token-usage` 的常驻独立底栏改为 composer 输入框上方的低强调 header，数据语义不变。
-- `TasksColumn`、Git/交付 drawer 与按需 browser pane 后续统一受 pane arbiter 管理。
+- `token-usage` 的累计用量进入 context 圆环详情；圆环仅表示当前窗口百分比，数据语义不混合。
+- `TasksColumn`、Git/交付 drawer、证据、文档与按需 browser pane 统一受 pane arbiter 管理。
 - 外部机器人不计入 CodeFactory 视觉审计、布局避让或产品品牌。

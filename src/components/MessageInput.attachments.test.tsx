@@ -76,6 +76,12 @@ describe("MessageInput attachments", () => {
     expect(convertFileSrcMock).toHaveBeenCalledWith("/proj/.codefactory/attachments/x.png");
     expect(preview).toHaveAttribute("src", "asset://localhost/%2Fproj%2F.codefactory%2Fattachments%2Fx.png");
     expect(screen.getByText("screenshot.png")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "移除 screenshot.png" })).toHaveClass(
+      "h-11",
+      "w-11",
+      "lg:h-8",
+      "lg:w-8",
+    );
   });
 
   it("paste with no cwd shows an error and does NOT invoke save", () => {

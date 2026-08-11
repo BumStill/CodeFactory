@@ -43,6 +43,9 @@ interface Props {
   /** Re-scope the current draft to a project directory (null = standalone). */
   onPickProject?: (cwd: string | null) => void;
   onOpenDocument?: (path: string) => void;
+  onOpenEvidence?: (messageId: string) => void;
+  evidenceControlsId?: string;
+  openEvidenceMessageId?: string | null;
   conversationKey?: string | null;
   hasOlderHistory?: boolean;
   loadingOlderHistory?: boolean;
@@ -323,6 +326,9 @@ export function MessageList({
   onOpenSession,
   onPickProject,
   onOpenDocument,
+  onOpenEvidence,
+  evidenceControlsId,
+  openEvidenceMessageId,
   conversationKey,
   hasOlderHistory = false,
   loadingOlderHistory = false,
@@ -470,6 +476,9 @@ export function MessageList({
               isStreamingTail={streaming && msg.id === lastAssistantId}
               isLastAssistantInUserTurn={lastAssistantIdsByUserTurn.has(msg.id)}
               onOpenDocument={onOpenDocument}
+              onOpenEvidence={onOpenEvidence}
+              evidenceControlsId={evidenceControlsId}
+              evidenceOpen={openEvidenceMessageId === msg.id}
             />
           </div>
           );
@@ -592,11 +601,17 @@ const MessageRow = memo(function MessageRow({
   isStreamingTail,
   isLastAssistantInUserTurn,
   onOpenDocument,
+  onOpenEvidence,
+  evidenceControlsId,
+  evidenceOpen,
 }: {
   msg: UIMessage;
   isStreamingTail: boolean;
   isLastAssistantInUserTurn: boolean;
   onOpenDocument?: (path: string) => void;
+  onOpenEvidence?: (messageId: string) => void;
+  evidenceControlsId?: string;
+  evidenceOpen: boolean;
 }) {
   const isUser = msg.role === "user";
   // Must run unconditionally (before the early return) to satisfy the rules
@@ -827,7 +842,7 @@ const MessageRow = memo(function MessageRow({
     <div
       data-testid={msg.failureEvidence ? "failure-resolution-card" : undefined}
       data-status-tone={msg.failureEvidence ? "warning" : undefined}
-      aria-label={msg.failureEvidence ? "需要处理" : undefined}
+      aria-label={msg.failureEvidence ? "失败证据" : undefined}
       className={`group space-y-1.5 text-sm text-gray-200 ${
         msg.failureEvidence
           ? "max-w-[72ch] rounded-xl border border-status-warning/25 bg-status-warning-soft/55 px-3 py-2.5"
@@ -842,7 +857,7 @@ const MessageRow = memo(function MessageRow({
             className="shrink-0 text-status-warning"
           />
           <span className="text-[13px] font-semibold text-gray-200">
-            需要处理
+            执行异常
           </span>
         </div>
       )}
@@ -995,6 +1010,11 @@ const MessageRow = memo(function MessageRow({
             onToggleProcess={
               collapsible ? () => setShowAllSteps((value) => !value) : undefined
             }
+            onOpenEvidence={
+              onOpenEvidence ? () => onOpenEvidence(msg.id) : undefined
+            }
+            evidenceControlsId={evidenceControlsId}
+            evidenceOpen={evidenceOpen}
           />
         );
       })()}

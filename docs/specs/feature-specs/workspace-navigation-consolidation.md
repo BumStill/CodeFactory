@@ -4,7 +4,7 @@
 
 | Req ID | 要求 | 验证 |
 | --- | --- | --- |
-| CF-NAV-R1 | Workspace 顶栏只保留会话侧栏收展、模型、推理强度、本地 Git、会话交付状态和设置；新建会话只从侧栏进入 | component + real app |
+| CF-NAV-R1 | Workspace 顶栏只保留会话侧栏收展、会话身份、本地 Git、会话交付状态、后台活动和设置；模型、推理强度、会话权限进入 composer 控制区且不得在顶栏重复；新建会话只从侧栏进入 | component + real app |
 | CF-NAV-R2 | 主题、画像、进化、评测、资源、AI Coding OS 不再作为 Workspace 顶栏按钮 | negative component + screenshot |
 | CF-NAV-R3 | 设置「功能」用带说明的卡片到达五个现有能力页 | route component + real app |
 | CF-NAV-R4 | 独立规范/计划入口删除，仓库文档与会话内部执行为唯一入口 | repository-intent tests + real app |
@@ -17,12 +17,12 @@
 | CF-NAV-R11 | 左侧会话栏采用单一紧凑新建入口、时间分组和扁平高密度会话行；768px 高窗口自然显示至少 10 条，单行不超过 46px | component geometry + real app |
 | CF-NAV-R12 | 成功工具调用使用不超过 30px 的低强调活动行，连续三项以上归组；运行、权限、失败保持高可见且失败首行默认外露 | timeline component + real app |
 | CF-NAV-R13 | 本地 Git 摘要必须用可读文案同时回答当前分支、工作树变更数和上游同步状态；提交历史、远程仓库与有效恢复点进入同一个按需抽屉 | component + viewport + real app |
-| CF-NAV-R14 | 会话交付状态必须持久关联会话对应的 GitHub PR；CI 绑定该 PR 的 head SHA/check-runs，合并绑定 GitHub PR merged 字段，发布仅在 latest release tag 包含 merge commit 时显示已上线 | Rust contract + component + authenticated GitHub probe |
+| CF-NAV-R14 | 会话交付状态必须持久关联会话对应的 GitHub PR；CI 绑定该 PR 的 head SHA/check-runs，合并绑定 GitHub PR merged 字段；latest release tag 包含 merge commit 只证明“正式版本已创建”，没有显式 live verifier 时必须显示“未验证上线” | Rust contract + component + authenticated GitHub probe |
 | CF-NAV-R15 | 自动检查点只有在快照与当前工作树存在实际差异时显示为“恢复 N”；任务活动只为 pending/running/failed 显示，completed/cancelled 历史不得形成持续告警 | component + real app |
 
 ## Primary User Path
 
-用户在 Workspace 顶栏处理当前会话并收展左侧会话栏；本地工作树与会话交付分成两个可读状态：前者回答分支、变更和同步，后者回答对应 GitHub PR、CI、合并和发布；新建会话只使用侧栏右上角的紧凑「＋」，不在顶栏重复出现。会话正文始终是视觉主角；后台任务通过紧凑活动入口进入抽屉，成功命令折叠为低强调活动行；点击唯一的设置入口，在「功能」中打开画像、进化审查、能力评测、资源中心或 AI Coding OS。新会话 Welcome 先看到紧凑今日用量与 28 天趋势，再选择一个建议任务。规范来自当前代码库，计划由会话内部执行，不出现独立工作台。
+用户在 Workspace 顶栏确认当前会话并收展左侧会话栏；本地工作树与会话交付分成两个可读状态：前者回答分支、变更和同步，后者回答对应 GitHub PR、CI、合并、正式发布和 live verification。模型、推理强度与权限在 composer 控制区设置下一回合/下一次权限判断的策略。新建会话只使用侧栏右上角的紧凑「＋」，不在顶栏重复出现。会话正文始终是视觉主角；后台任务通过紧凑活动入口进入唯一辅助 pane，成功命令折叠为低强调活动行；点击唯一的设置入口，在「功能」中打开画像、进化审查、能力评测、资源中心或 AI Coding OS。新会话 Welcome 先看到紧凑今日用量与 28 天趋势，再选择一个建议任务。规范来自当前代码库，计划由会话内部执行，不出现独立工作台。
 
 ## Applicable Harnesses
 

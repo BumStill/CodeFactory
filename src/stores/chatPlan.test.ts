@@ -51,6 +51,7 @@ describe("structured chat plan events", () => {
         rootTurnId: "user-1",
         revision: 1,
         explanation: "进入实现阶段",
+        nextActionOwner: "system",
       }),
     );
     expect(reduced.messages[0].plan?.steps[1]).toEqual(
@@ -80,6 +81,23 @@ describe("structured chat plan events", () => {
 
     expect(final.messages[0].plan?.waitingHistory).toEqual(["等待 CI"]);
     expect(final.messages[0].plan?.changeHistory).toEqual(["增加安装 smoke"]);
+  });
+
+  it("preserves the structured next-action owner instead of inferring it from waiting text", () => {
+    const event = {
+      ...planEvent(1),
+      waiting_reason: "需要检查权限配置",
+      next_action_owner: "system",
+    } as StreamEvent;
+
+    const reduced = reduceChatStreamEvent(state(), event, "assistant-1");
+
+    expect(reduced.messages[0].plan).toEqual(
+      expect.objectContaining({
+        waitingReason: "需要检查权限配置",
+        nextActionOwner: "system",
+      }),
+    );
   });
 
   it("does not render update_plan as a low-level tool card", () => {

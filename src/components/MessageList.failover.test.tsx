@@ -165,7 +165,9 @@ describe("MessageList model route failover", () => {
       '[data-testid="failure-resolution-card"]',
     );
     expect(resolutionCard).toHaveAttribute("data-status-tone", "warning");
-    expect(screen.getByText("需要处理")).toBeInTheDocument();
+    expect(resolutionCard).toHaveAccessibleName("失败证据");
+    expect(screen.getByText("执行异常")).toBeInTheDocument();
+    expect(screen.queryByText("需要处理")).not.toBeInTheDocument();
   });
 
   it("keeps actionable route-exhaustion guidance after a failed turn is reloaded", () => {

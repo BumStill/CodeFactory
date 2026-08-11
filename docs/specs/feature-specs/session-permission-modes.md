@@ -6,7 +6,7 @@ tags: [permissions, session, ux, security]
 acceptance_criteria:
   - 权限不再作为 Settings 的独立页签展示给普通用户
   - 每个会话持久化一个 permission_mode，默认 standard
-  - 会话顶栏可选择 safe / standard / trusted 三种权限模式
+  - 会话 composer 控制区可选择 safe / standard / trusted 三种权限模式
   - 工具明细列表隐藏在后台预设中，不要求用户维护 allow/ask/deny 列表
   - 后端工具权限决策读取当前会话的 permission_mode，而不是全局 Settings.permissions
   - 高风险和永久拒绝命令在 trusted 模式下仍不可静默放行
@@ -26,4 +26,4 @@ acceptance_criteria:
 
 ## 主路径
 
-用户在会话顶栏看到“会话权限”控件，选择本会话的权限模式。切换只影响当前会话，从下一次工具权限判断开始生效；不改变消息是分析还是执行。
+用户在会话输入框底部控制区看到“会话权限”控件，选择本会话的权限模式。切换只影响当前会话，从下一次工具权限判断开始生效；不改变消息是分析还是执行。顶栏不得重复出现同一控件。

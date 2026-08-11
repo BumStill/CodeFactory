@@ -391,7 +391,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
                 <button
                   type="button"
                   onClick={() => removeAttachment(a.id)}
-                  className="absolute right-1 top-1 rounded-full bg-surface-0/80 p-0.5 text-gray-400 opacity-90 transition-colors hover:bg-status-danger-soft hover:text-status-danger"
+                  className="absolute right-0 top-0 flex h-11 w-11 items-center justify-center rounded-full bg-surface-0/80 text-gray-400 opacity-90 transition-colors hover:bg-status-danger-soft hover:text-status-danger lg:right-1 lg:top-1 lg:h-8 lg:w-8"
                   title="移除"
                   aria-label={`移除 ${a.name}`}
                 >
@@ -412,7 +412,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
                 <button
                   type="button"
                   onClick={() => removeAttachment(a.id)}
-                  className="text-gray-500 hover:text-status-danger"
+                  className="flex h-11 w-11 items-center justify-center rounded-full text-gray-500 hover:bg-status-danger-soft hover:text-status-danger lg:h-8 lg:w-8"
                   title="移除"
                   aria-label={`移除 ${a.name}`}
                 >
@@ -448,7 +448,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
           onClick={() => fileInputRef.current?.click()}
           disabled={!cwd || uploading}
           aria-label="附加文件"
-          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-gray-500 transition-colors enabled:hover:bg-surface-4 disabled:opacity-30"
+          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-gray-500 transition-colors enabled:hover:bg-surface-4 disabled:opacity-30 lg:h-8 lg:w-8"
           title={cwd ? "附加文件（图片 / pptx / docx / pdf / xlsx）" : "打开项目后可附加文件"}
         >
           <Paperclip size={16} />
@@ -492,7 +492,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
             onClick={() => void submit({ forceQueue: true })}
             disabled={!submitReady}
             aria-label="排到当前执行之后"
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-status-progress-soft text-status-progress transition-colors enabled:hover:brightness-95"
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-status-progress-soft text-status-progress transition-colors enabled:hover:brightness-95 lg:h-8 lg:w-8"
             title="排到当前执行之后"
           >
             <Send size={16} />
@@ -503,7 +503,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
           onClick={streaming ? onCancel : () => void submit()}
           disabled={!streaming && !submitReady}
           aria-label={streaming ? "停止后续生成" : guidanceActive ? "引导当前执行" : "发送"}
-          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors disabled:opacity-30 ${
+          className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-lg transition-colors disabled:opacity-30 lg:h-8 lg:w-8 ${
             streaming
               ? "bg-status-danger-soft text-status-danger hover:brightness-95"
               : submitReady

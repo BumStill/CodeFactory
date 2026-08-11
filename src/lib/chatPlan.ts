@@ -9,6 +9,7 @@ export type PlanStepKind =
   | "other";
 
 export type PlanStepStatus = "pending" | "in_progress" | "completed";
+export type NextActionOwner = "system" | "external" | "user";
 
 export interface PlanStep {
   id: string;
@@ -24,6 +25,8 @@ export interface TurnPlan {
   steps: PlanStep[];
   explanation: string | null;
   waitingReason: string | null;
+  /** Missing legacy state is fail-safe system-owned. */
+  nextActionOwner?: NextActionOwner;
   changeReason: string | null;
   waitingHistory?: string[];
   changeHistory?: string[];
@@ -76,6 +79,10 @@ export function planProgress(plan: TurnPlan): PlanProgress {
   };
 }
 
+export function normalizeNextActionOwner(value: unknown): NextActionOwner {
+  return value === "external" || value === "user" ? value : "system";
+}
+
 export function turnPlanFromEvent(event: {
   root_turn_id: string;
   revision: number;
@@ -88,6 +95,7 @@ export function turnPlanFromEvent(event: {
   }>;
   explanation?: string | null;
   waiting_reason?: string | null;
+  next_action_owner?: NextActionOwner | null;
   change_reason?: string | null;
   waiting_history?: string[];
   change_history?: string[];
@@ -105,6 +113,7 @@ export function turnPlanFromEvent(event: {
     })),
     explanation: event.explanation ?? null,
     waitingReason: event.waiting_reason ?? null,
+    nextActionOwner: normalizeNextActionOwner(event.next_action_owner),
     changeReason: event.change_reason ?? null,
     waitingHistory: event.waiting_history ?? (
       event.waiting_reason ? [event.waiting_reason] : []
