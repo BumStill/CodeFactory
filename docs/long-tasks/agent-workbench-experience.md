@@ -15,8 +15,8 @@
 ## Current State
 
 - Current phase: 第二批 — 统一控制面与共享检查器
-- Current checkpoint: 第二批实现与本地自动化门禁完成；正在执行真实 CodeFactoryDev 视口/键盘验收，随后进入 PR/CI、发布与正式产物验收。
-- Next owner: 当前交付继续完成真实 App、PR/CI、发布与正式产物验收；browser child WebView 仅按 Phase 1 同 URL 预览交付，EBP-R3/R9 保持 `not live`。
+- Current checkpoint: 第二批实现、本地自动化、PR #362 全套 CI 与锁屏无关远端真实 App 启动/窗口验收均通过；本机处于锁屏状态，未绕过系统安全，也不把未执行的 VoiceOver/200% 本机交互写成已验证。当前按锁屏交付基线进入 Ready、merge、Auto Release 与公开产物验收。
+- Next owner: 当前交付继续完成 PR #362 merge、公开 release、`latest.json`、macOS/Windows 产物和 released-artifact GUI smoke；browser child WebView 仅按 Phase 1 同 URL 预览交付，EBP-R3/R9 保持 `not live`。
 - Updated at: 2026-08-11
 
 ## Completed Items
@@ -69,6 +69,9 @@
   - 第二批：`pnpm test -- --run --reporter=dot` 为 101 files / 564 tests passed；`pnpm build` 通过。
   - 第二批 Rust：embedded browser 6/6、update_plan 5/5、plan hydration 1/1、legacy/intermediate schema repair 1/1、agent-loop owner wire 1/1。
   - 第二批治理：repo governance baseline 与 long-task validator 均通过；`git diff --check` 通过。
+  - PR #362：最新 head 的 `governance-baseline`、`agent-bridge-linux`、`check-frontend`、`check-rust` 与 `remote-real-app-gui` 全部通过，PR 为 `MERGEABLE/CLEAN` 且相对 `origin/main` 无落后。
+  - 锁屏无关桌面证据：GitHub macOS runner 从 PR #362 精确 head 构建并启动真实 debug App，窗口状态 `ok`，尺寸 `1024×674`，截图 `1136×786`；截图可见模型入口已进入 composer footer、顶栏无旧模型/思考/权限重复控件。该证据证明 Tauri 壳与候选渲染，不冒充未执行的本机 VoiceOver、200% zoom 或 child WebView 接管路径。
+  - 本机边界：CodeFactoryDev 读取被 macOS 锁屏拒绝；未请求绕过系统锁。R30 的 44px、accessible name、focus 与 overlay 契约有 component/TypeScript/build 证据；VoiceOver/200% 本机交互保持未验证，发布后由锁屏无关 headless/远端 release artifact 分层证据承接，不能互相冒充。
   - 第二批 browser 边界：child WebView 只提供 lease 初始 URL 的独立 Phase-1 预览，与 Agent 的 `LOCAL` ChromiumDriver 不共享 Cookie、DOM、导航或控制权；不得宣称实时观察/接管。
   - `pnpm test`：89 files / 447 tests passed。
   - `pnpm build`：TypeScript + Vite production build passed。
