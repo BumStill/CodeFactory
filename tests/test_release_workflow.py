@@ -385,8 +385,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("harbor==0.15.0", job)
         self.assertIn("python -m unittest discover -s tests -p 'test_*.py'", job)
 
-    def _check_job_steps(self) -> dict[str, str]:
-        """Map every `- name:` step in ci.yml's `check` job to its own block.
+    def _check_job_steps(self, job: str = "check-rust") -> dict[str, str]:
+        """Map every `- name:` step in one ci.yml job to its own block.
 
         PyYAML is not installed in the jobs that run this module, so the steps
         are split on the `      - name:` indentation ci.yml uses rather than
@@ -396,8 +396,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("\n  check:\n", workflow)
-        job = workflow.split("\n  check:\n", 1)[1]
+        self.assertIn(f"\n  {job}:\n", workflow)
+        job = workflow.split(f"\n  {job}:\n", 1)[1]
 
         steps: dict[str, str] = {}
         current: str | None = None
@@ -412,14 +412,30 @@ class ReleaseWorkflowTests(unittest.TestCase):
         return steps
 
     def test_a_frontend_failure_does_not_hide_the_rust_suite(self) -> None:
-        """A red `check` must report every gate, not just the first to break.
+        """A frontend failure must not hide the Rust suite.
 
         Run 30795455214 lost a timing-sensitive Vitest case on a loaded Windows
         runner and skipped the entire Rust suite — on a PR whose only change was
-        Rust. The Rust gates only need the toolchain, so nothing above them in
-        the step list may decide whether they run.
+        Rust. That was patched with `!cancelled()` on every Rust step; the real
+        fix is that they no longer share a job at all, so a frontend failure
+        cannot reach them. Both properties are asserted: separate jobs, and no
+        residual coupling inside the Rust job.
         """
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("\n  check-frontend:\n", workflow)
+        self.assertIn("\n  check-rust:\n", workflow)
+        self.assertNotIn(
+            "\n  check:\n",
+            workflow,
+            "the combined job is what made one Vitest flake skip every Rust gate",
+        )
+        # Parallel, not chained: a `needs:` on the frontend job would rebuild
+        # the very coupling this split removes.
+        rust_job = workflow.split("\n  check-rust:\n", 1)[1].split("\n  ", 1)[0]
+        self.assertNotIn("needs:", rust_job, "check-rust must not wait on the frontend")
+
         steps = self._check_job_steps()
+        front = self._check_job_steps("check-frontend")
 
         rust_steps = [
             # `Cargo check` intentionally absent: `Cargo test` compiles the same
@@ -432,7 +448,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "Browser session lifecycle smoke",
         ]
         for name in rust_steps:
-            self.assertIn(name, steps, f"`check` lost its {name!r} step")
+            self.assertIn(name, steps, f"`check-rust` lost its {name!r} step")
             block = steps[name]
             self.assertIn(
                 "!cancelled()",
@@ -451,8 +467,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 f"{name!r} is gated on the frontend install",
             )
 
-        self.assertIn("Vitest", steps)
-        self.assertIn("id: deps", steps["Install frontend deps"])
+        self.assertIn("Vitest", front)
+        self.assertIn("id: deps", front["Install frontend deps"])
 
     def test_viewport_evidence_is_required_only_when_its_gate_ran(self) -> None:
         """Skipped gates must not manufacture a second failure.
@@ -461,7 +477,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         mandatory. Combined with `if: always()` that turned one skipped gate
         into an extra red step in run 30795455214.
         """
-        steps = self._check_job_steps()
+        steps = self._check_job_steps("check-frontend")
 
         for upload, gate in (
             ("Upload evolution viewport evidence", "evolution_gate"),
