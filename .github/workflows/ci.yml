@@ -30,7 +30,8 @@ jobs:
           PYTHONPATH: .
         run: python -m unittest discover -s tests -p 'test_*.py'
 
-  check:
+  check-frontend:
+    # Frontend + governance gates. Independent of the Rust chain, so the two run in parallel: `check` used to pay their sum (583s) instead of their max.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,16 +51,6 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
 
       - name: Install frontend deps
         id: deps
@@ -156,6 +147,28 @@ jobs:
       # "old sessions won't open" bug land here as failing tests so we
       # catch them before tagging a release instead of after a user
       # reports it.
+
+  check-rust:
+    # Rust build, tests and executable smokes. Needs no pnpm — every smoke here shells out to `cargo run`.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # README-Update: required compares the PR base SHA with HEAD.
+          # A shallow checkout does not contain the base object, so the
+          # contract check would fail before it can inspect the real diff.
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
       - name: Cargo test
         if: ${{ !cancelled() }}
         run: cargo test --manifest-path src-tauri/Cargo.toml --quiet
