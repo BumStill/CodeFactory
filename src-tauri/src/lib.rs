@@ -649,6 +649,7 @@ pub fn run() {
             commands::browser_sessions::browser_download_chromium,
             commands::browser_sessions::embedded_browser_mount,
             commands::browser_sessions::embedded_browser_resize,
+            commands::browser_sessions::embedded_browser_set_visible,
             commands::browser_sessions::embedded_browser_unmount,
             commands::checkpoints::list_checkpoints,
             commands::checkpoints::checkpoint_changeset,

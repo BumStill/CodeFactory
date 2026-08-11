@@ -150,4 +150,44 @@ describe("ModelPicker", () => {
       screen.getByRole("button", { name: /chatgpt.*gpt-5\.5.*首选/ }),
     ).toBeInTheDocument();
   });
+
+  it("exposes an owned popup, opens upward from the composer, and returns focus on Escape", async () => {
+    const user = userEvent.setup();
+    mocks.loadModels.mockResolvedValue(undefined);
+    const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      x: 600,
+      y: 600,
+      top: 600,
+      right: 820,
+      bottom: 632,
+      left: 600,
+      width: 220,
+      height: 32,
+      toJSON: () => ({}),
+    });
+
+    try {
+      render(<ModelPicker portal />);
+
+      const trigger = screen.getByRole("button", { name: /选择下一回合模型.*chatgpt.*gpt-5\.5.*首选/ });
+      expect(trigger).toHaveClass("min-h-11", "lg:min-h-9");
+      expect(trigger).toHaveAttribute("aria-expanded", "false");
+      expect(trigger).toHaveAttribute("aria-controls");
+
+      await user.click(trigger);
+      expect(trigger).toHaveAttribute("aria-expanded", "true");
+      const controlledId = trigger.getAttribute("aria-controls");
+      expect(controlledId).toBeTruthy();
+      expect(document.getElementById(controlledId as string)).toBeInTheDocument();
+      const portal = screen.getByTestId("model-picker-portal-menu");
+      expect(Number.parseFloat(portal.style.top)).toBeLessThan(600);
+
+      await user.keyboard("{Escape}");
+      expect(screen.queryByTestId("model-picker-portal-menu")).not.toBeInTheDocument();
+      expect(trigger).toHaveAttribute("aria-expanded", "false");
+      expect(trigger).toHaveFocus();
+    } finally {
+      rectSpy.mockRestore();
+    }
+  });
 });

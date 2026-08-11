@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { TurnPlan } from "../lib/chatPlan";
 import type { UIMessage } from "../stores/chatEvents";
@@ -192,9 +192,20 @@ describe("MessageList structured progress and result", () => {
   });
 
   it("forms a local result snapshot immediately after the terminal state", () => {
-    render(<MessageList messages={messages(true)} streaming={false} cwd={null} />);
+    const onOpenEvidence = vi.fn();
+    render(
+      <MessageList
+        messages={messages(true)}
+        streaming={false}
+        cwd={null}
+        onOpenEvidence={onOpenEvidence}
+      />,
+    );
 
     expect(screen.getByTestId("turn-result-snapshot")).toHaveTextContent("已完成");
+    fireEvent.click(screen.getByRole("button", { name: "查看证据" }));
+    expect(onOpenEvidence).toHaveBeenCalledWith("assistant");
+    expect(screen.queryByText("等待与失败边界")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "结果摘要" }));
     expect(screen.getByRole("status")).toHaveTextContent("完成 3/3 个计划步骤");
   });
@@ -213,7 +224,36 @@ describe("MessageList structured progress and result", () => {
       "warning",
     );
     expect(screen.getByTestId("turn-result-snapshot")).toHaveTextContent(
-      "需要处理",
+      "已执行，证据待复核",
     );
+    expect(screen.getByTestId("turn-result-snapshot")).not.toHaveTextContent(
+      "需要你处理",
+    );
+    expect(screen.getByTestId("failure-resolution-card")).toHaveAccessibleName("失败证据");
+    expect(screen.queryByText("需要处理")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["system", "系统继续处理", false],
+    ["external", "外部等待", false],
+    ["user", "需要你处理", true],
+  ] as const)("keeps failure evidence neutral when next action owner is %s", (owner, label, userOwned) => {
+    const failed = messages(true);
+    failed[1] = {
+      ...failed[1],
+      failureEvidence: "provider credential unavailable",
+      plan: {
+        ...failed[1].plan!,
+        waitingReason: "等待下一步",
+        nextActionOwner: owner,
+      },
+    };
+
+    render(<MessageList messages={failed} streaming={false} cwd={null} />);
+
+    expect(screen.getByTestId("failure-resolution-card")).toHaveAccessibleName("失败证据");
+    expect(screen.getByTestId("turn-result-snapshot")).toHaveTextContent(label);
+    expect(screen.queryByText("需要处理")).not.toBeInTheDocument();
+    expect(screen.queryAllByText("需要你处理")).toHaveLength(userOwned ? 1 : 0);
   });
 });

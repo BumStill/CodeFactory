@@ -26,6 +26,23 @@ export interface ChromiumProgress {
   version?: string;
 }
 
+export interface EmbeddedBrowserEscapePayload {
+  session_id: string;
+}
+
+/// Escape pressed while the native child webview owns keyboard focus.
+///
+/// A child webview is a separate native surface, so DOM keyboard events cannot
+/// bubble into the main React document. Rust bridges that one key through this
+/// event without granting the remote page access to Tauri IPC.
+export function onEmbeddedBrowserEscape(
+  handler: (payload: EmbeddedBrowserEscapePayload) => void,
+): Promise<UnlistenFn> {
+  return listen<EmbeddedBrowserEscapePayload>("embedded-browser:escape", (event) =>
+    handler(event.payload),
+  );
+}
+
 /// Subscribe to Chromium download progress.
 ///
 /// Wrapped here rather than importing `listen` in the component: a component
@@ -64,6 +81,7 @@ export type StreamEvent =
       }>;
       explanation?: string | null;
       waiting_reason?: string | null;
+      next_action_owner?: "system" | "external" | "user" | null;
       change_reason?: string | null;
       created_at: number;
     }
@@ -210,6 +228,7 @@ export interface TurnPlanSnapshot {
   }>;
   explanation?: string | null;
   waiting_reason?: string | null;
+  next_action_owner?: "system" | "external" | "user" | null;
   change_reason?: string | null;
   waiting_history?: string[];
   change_history?: string[];

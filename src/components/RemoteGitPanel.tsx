@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useState } from "react";
+import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import {
   X,
   GitPullRequest,
@@ -46,15 +46,17 @@ function renderBody(text: string): string {
 interface IssueDetailProps {
   issue: RemoteIssue;
   onBack: () => void;
+  largeTargets: boolean;
 }
 
-function IssueDetail({ issue, onBack }: IssueDetailProps) {
+function IssueDetail({ issue, onBack, largeTargets }: IssueDetailProps) {
   return (
     <div className="flex flex-col h-full">
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0">
         <button
           onClick={onBack}
-          className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+          aria-label="返回问题列表"
+          className={`inline-flex shrink-0 items-center justify-center rounded text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
         >
           <ChevronLeft size={14} />
         </button>
@@ -63,7 +65,8 @@ function IssueDetail({ issue, onBack }: IssueDetailProps) {
         </span>
         <button
           onClick={() => openUrl(issue.url)}
-          className="p-1 rounded text-gray-600 hover:text-gray-300 transition-colors"
+          aria-label="在浏览器中打开问题"
+          className={`inline-flex shrink-0 items-center justify-center rounded text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
           title="在浏览器中打开"
         >
           <ExternalLink size={12} />
@@ -116,9 +119,10 @@ interface NewIssueFormProps {
   repo: string;
   onCreated: () => void;
   onCancel: () => void;
+  largeTargets: boolean;
 }
 
-function NewIssueForm({ remoteId, repo, onCreated, onCancel }: NewIssueFormProps) {
+function NewIssueForm({ remoteId, repo, onCreated, onCancel, largeTargets }: NewIssueFormProps) {
   const { createIssue } = useGitRemoteStore();
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
@@ -142,7 +146,11 @@ function NewIssueForm({ remoteId, repo, onCreated, onCancel }: NewIssueFormProps
   return (
     <div className="flex flex-col h-full">
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0">
-        <button onClick={onCancel} className="p-1 rounded text-gray-600 hover:text-gray-300">
+        <button
+          onClick={onCancel}
+          aria-label="返回问题列表"
+          className={`inline-flex shrink-0 items-center justify-center rounded text-gray-600 hover:bg-surface-3 hover:text-gray-300 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
+        >
           <ChevronLeft size={14} />
         </button>
         <span className="text-xs font-semibold text-gray-300">新建问题</span>
@@ -176,14 +184,14 @@ function NewIssueForm({ remoteId, repo, onCreated, onCancel }: NewIssueFormProps
       <div className="flex gap-2 p-3 border-t border-border shrink-0">
         <button
           onClick={onCancel}
-          className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+          className={`${largeTargets ? "h-11" : "h-9"} px-3 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors`}
         >
           取消
         </button>
         <button
           onClick={handleSubmit}
           disabled={busy || !title.trim()}
-          className="flex-1 px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
+          className={`${largeTargets ? "h-11" : "h-9"} flex-1 px-3 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors`}
         >
           {busy ? "创建中…" : "创建问题"}
         </button>
@@ -200,9 +208,10 @@ interface NewPRFormProps {
   currentBranch: string;
   onCreated: () => void;
   onCancel: () => void;
+  largeTargets: boolean;
 }
 
-function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPRFormProps) {
+function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel, largeTargets }: NewPRFormProps) {
   const { createPR } = useGitRemoteStore();
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
@@ -230,7 +239,11 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
   return (
     <div className="flex flex-col h-full">
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0">
-        <button onClick={onCancel} className="p-1 rounded text-gray-600 hover:text-gray-300">
+        <button
+          onClick={onCancel}
+          aria-label="返回拉取请求列表"
+          className={`inline-flex shrink-0 items-center justify-center rounded text-gray-600 hover:bg-surface-3 hover:text-gray-300 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
+        >
           <ChevronLeft size={14} />
         </button>
         <span className="text-xs font-semibold text-gray-300">创建拉取请求</span>
@@ -293,14 +306,14 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
       <div className="flex gap-2 p-3 border-t border-border shrink-0">
         <button
           onClick={onCancel}
-          className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+          className={`${largeTargets ? "h-11" : "h-9"} px-3 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors`}
         >
           取消
         </button>
         <button
           onClick={handleSubmit}
           disabled={busy || !title.trim()}
-          className="flex-1 px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
+          className={`${largeTargets ? "h-11" : "h-9"} flex-1 px-3 rounded text-xs bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors`}
         >
           {busy ? "创建中…" : "创建拉取请求"}
         </button>
@@ -313,9 +326,10 @@ function NewPRForm({ remoteId, repo, currentBranch, onCreated, onCancel }: NewPR
 
 interface IssuesTabProps {
   remotes: GitRemoteConfig[];
+  largeTargets: boolean;
 }
 
-function IssuesTab({ remotes }: IssuesTabProps) {
+function IssuesTab({ remotes, largeTargets }: IssuesTabProps) {
   const { issues, loading, error, loadIssues } = useGitRemoteStore();
   const [remoteId, setRemoteId] = useState(remotes[0]?.id ?? "");
   const [repo, setRepo] = useState(remotes[0]?.default_repo ?? "");
@@ -351,6 +365,7 @@ function IssuesTab({ remotes }: IssuesTabProps) {
     return (
       <IssueDetail
         issue={selectedIssue}
+        largeTargets={largeTargets}
         onBack={() => setSelectedIssue(null)}
       />
     );
@@ -361,6 +376,7 @@ function IssuesTab({ remotes }: IssuesTabProps) {
       <NewIssueForm
         remoteId={remoteId}
         repo={repo}
+        largeTargets={largeTargets}
         onCreated={() => {
           setNewIssueOpen(false);
           handleLoad();
@@ -378,7 +394,7 @@ function IssuesTab({ remotes }: IssuesTabProps) {
           <select
             value={remoteId}
             onChange={(e) => handleRemoteChange(e.target.value)}
-            className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-300 outline-none focus:border-accent/50"
+            className={`${largeTargets ? "h-11" : "h-9"} flex-1 bg-surface-3 border border-border rounded px-2 text-xs text-gray-300 outline-none focus:border-accent/50`}
           >
             {remotes.map((r) => (
               <option key={r.id} value={r.id}>
@@ -389,7 +405,7 @@ function IssuesTab({ remotes }: IssuesTabProps) {
           <select
             value={stateFilter}
             onChange={(e) => setStateFilter(e.target.value)}
-            className="bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-300 outline-none focus:border-accent/50"
+            className={`${largeTargets ? "h-11" : "h-9"} bg-surface-3 border border-border rounded px-2 text-xs text-gray-300 outline-none focus:border-accent/50`}
           >
             <option value="open">开放</option>
             <option value="closed">已关闭</option>
@@ -402,12 +418,13 @@ function IssuesTab({ remotes }: IssuesTabProps) {
             value={repo}
             onChange={(e) => setRepo(e.target.value)}
             placeholder="owner/repo"
-            className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50"
+            className={`${largeTargets ? "h-11" : "h-9"} flex-1 bg-surface-3 border border-border rounded px-2 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50`}
           />
           <button
             onClick={handleLoad}
             disabled={!repo || loading}
-            className="p-1.5 rounded bg-surface-3 text-gray-400 hover:text-gray-200 disabled:opacity-50 transition-colors"
+            aria-label="刷新问题"
+            className={`inline-flex shrink-0 items-center justify-center rounded bg-surface-3 text-gray-400 transition-colors hover:text-gray-200 disabled:opacity-50 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
             title="刷新"
           >
             <RefreshCw size={12} className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
@@ -415,7 +432,8 @@ function IssuesTab({ remotes }: IssuesTabProps) {
           <button
             onClick={() => setNewIssueOpen(true)}
             disabled={!repo}
-            className="p-1.5 rounded bg-surface-3 text-gray-400 hover:text-gray-200 disabled:opacity-50 transition-colors"
+            aria-label="新建问题"
+            className={`inline-flex shrink-0 items-center justify-center rounded bg-surface-3 text-gray-400 transition-colors hover:text-gray-200 disabled:opacity-50 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
             title="新建问题"
           >
             <Plus size={12} />
@@ -475,9 +493,10 @@ function IssuesTab({ remotes }: IssuesTabProps) {
 interface PRsTabProps {
   remotes: GitRemoteConfig[];
   currentBranch: string;
+  largeTargets: boolean;
 }
 
-function PRsTab({ remotes, currentBranch }: PRsTabProps) {
+function PRsTab({ remotes, currentBranch, largeTargets }: PRsTabProps) {
   const { prs, loading, error, loadPRs } = useGitRemoteStore();
   const [remoteId, setRemoteId] = useState(remotes[0]?.id ?? "");
   const [repo, setRepo] = useState(remotes[0]?.default_repo ?? "");
@@ -505,6 +524,7 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
         remoteId={remoteId}
         repo={repo}
         currentBranch={currentBranch}
+        largeTargets={largeTargets}
         onCreated={() => {
           setNewPROpen(false);
           handleLoad();
@@ -530,7 +550,7 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
           <select
             value={remoteId}
             onChange={(e) => handleRemoteChange(e.target.value)}
-            className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-300 outline-none focus:border-accent/50"
+            className={`${largeTargets ? "h-11" : "h-9"} flex-1 bg-surface-3 border border-border rounded px-2 text-xs text-gray-300 outline-none focus:border-accent/50`}
           >
             {remotes.map((r) => (
               <option key={r.id} value={r.id}>{r.name}</option>
@@ -539,7 +559,7 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
           <select
             value={stateFilter}
             onChange={(e) => setStateFilter(e.target.value)}
-            className="bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-300 outline-none focus:border-accent/50"
+            className={`${largeTargets ? "h-11" : "h-9"} bg-surface-3 border border-border rounded px-2 text-xs text-gray-300 outline-none focus:border-accent/50`}
           >
             <option value="open">开放</option>
             <option value="closed">已关闭</option>
@@ -552,12 +572,13 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
             value={repo}
             onChange={(e) => setRepo(e.target.value)}
             placeholder="owner/repo"
-            className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50"
+            className={`${largeTargets ? "h-11" : "h-9"} flex-1 bg-surface-3 border border-border rounded px-2 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50`}
           />
           <button
             onClick={handleLoad}
             disabled={!repo || loading}
-            className="p-1.5 rounded bg-surface-3 text-gray-400 hover:text-gray-200 disabled:opacity-50 transition-colors"
+            aria-label="刷新拉取请求"
+            className={`inline-flex shrink-0 items-center justify-center rounded bg-surface-3 text-gray-400 transition-colors hover:text-gray-200 disabled:opacity-50 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
             title="刷新"
           >
             <RefreshCw size={12} className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
@@ -565,7 +586,8 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
           <button
             onClick={() => setNewPROpen(true)}
             disabled={!repo}
-            className="p-1.5 rounded bg-surface-3 text-gray-400 hover:text-gray-200 disabled:opacity-50 transition-colors"
+            aria-label="创建拉取请求"
+            className={`inline-flex shrink-0 items-center justify-center rounded bg-surface-3 text-gray-400 transition-colors hover:text-gray-200 disabled:opacity-50 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
             title="创建拉取请求"
           >
             <Plus size={12} />
@@ -622,19 +644,58 @@ function PRsTab({ remotes, currentBranch }: PRsTabProps) {
 interface RemoteGitPanelProps {
   currentBranch: string;
   onClose: () => void;
+  embedded?: boolean;
 }
 
-export function RemoteGitPanel({ currentBranch, onClose }: RemoteGitPanelProps) {
+export function RemoteGitPanel({ currentBranch, onClose, embedded = false }: RemoteGitPanelProps) {
   const { remotes, loadRemotes } = useGitRemoteStore();
   const [tab, setTab] = useState<"issues" | "prs">("issues");
+  const [isNarrowEmbedded, setIsNarrowEmbedded] = useState(embedded);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const issuesTabRef = useRef<HTMLButtonElement>(null);
+  const prsTabRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!embedded) {
+      setIsNarrowEmbedded(false);
+      return;
+    }
+    const panel = panelRef.current;
+    if (!panel) return;
+    const update = () => setIsNarrowEmbedded(panel.getBoundingClientRect().width < 640);
+    update();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(update);
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [embedded]);
 
   useEffect(() => {
     loadRemotes();
   }, [loadRemotes]);
 
+  const largeTargets = embedded && isNarrowEmbedded;
+  const activeTabId = `remote-git-tab-${tab}`;
+  const activePanelId = `remote-git-tabpanel-${tab}`;
+
+  const handleTabKeyDown = (
+    event: KeyboardEvent<HTMLButtonElement>,
+    currentTab: "issues" | "prs",
+  ) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const nextTab = currentTab === "issues" ? "prs" : "issues";
+    setTab(nextTab);
+    (nextTab === "issues" ? issuesTabRef : prsTabRef).current?.focus();
+  };
+
   return (
     <div
-      className="fixed right-0 top-0 h-full w-[600px] z-40 flex flex-col border-l border-border bg-surface-1 shadow-2xl"
+      ref={panelRef}
+      data-embedded-layout={embedded ? (isNarrowEmbedded ? "narrow" : "wide") : undefined}
+      className={embedded
+        ? "flex min-h-0 h-full w-full flex-col overflow-hidden bg-surface-1"
+        : "fixed right-0 top-0 h-full w-[600px] z-40 flex flex-col border-l border-border bg-surface-1 shadow-2xl"}
       style={{ maxWidth: "100vw" }}
     >
       {/* Header */}
@@ -643,19 +704,35 @@ export function RemoteGitPanel({ currentBranch, onClose }: RemoteGitPanelProps) 
         <span className="flex-1 text-xs font-semibold text-gray-300">远程仓库</span>
         <button
           onClick={onClose}
-          className="p-1 rounded text-gray-600 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+          aria-label={embedded ? "返回本地 Git" : "关闭远程仓库"}
+          data-auxiliary-initial-focus={embedded ? true : undefined}
+          className={embedded
+            ? `inline-flex shrink-0 items-center justify-center rounded text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300 ${isNarrowEmbedded ? "h-11 w-11" : "h-9 w-9"}`
+            : "inline-flex h-9 w-9 shrink-0 items-center justify-center rounded text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300"}
+          title={embedded ? "返回本地 Git" : "关闭远程仓库"}
         >
-          <X size={14} />
+          {embedded ? <ChevronLeft size={14} /> : <X size={14} />}
         </button>
       </div>
 
       {/* Tab bar */}
-      <div className="flex border-b border-border shrink-0 bg-surface-1">
+      <div
+        role="tablist"
+        aria-label="远程仓库视图"
+        className="flex border-b border-border shrink-0 bg-surface-1"
+      >
         {(["issues", "prs"] as const).map((t) => (
           <button
             key={t}
+            ref={t === "issues" ? issuesTabRef : prsTabRef}
+            id={`remote-git-tab-${t}`}
+            role="tab"
+            aria-selected={tab === t}
+            aria-controls={`remote-git-tabpanel-${t}`}
+            tabIndex={tab === t ? 0 : -1}
             onClick={() => setTab(t)}
-            className={`flex items-center gap-1.5 px-4 py-2 text-xs border-b-2 transition-colors capitalize ${
+            onKeyDown={(event) => handleTabKeyDown(event, t)}
+            className={`${largeTargets ? "h-11" : "h-9"} flex items-center gap-1.5 px-4 text-xs border-b-2 transition-colors capitalize ${
               tab === t
                 ? "border-accent text-gray-200"
                 : "border-transparent text-gray-500 hover:text-gray-300"
@@ -669,17 +746,27 @@ export function RemoteGitPanel({ currentBranch, onClose }: RemoteGitPanelProps) 
 
       {/* No remotes configured */}
       {remotes.length === 0 ? (
-        <div className="flex-1 flex items-center justify-center flex-col gap-2 p-6 text-center">
+        <div
+          id={activePanelId}
+          role="tabpanel"
+          aria-labelledby={activeTabId}
+          className="flex-1 flex items-center justify-center flex-col gap-2 p-6 text-center"
+        >
           <GitPullRequest size={32} className="text-gray-600" />
           <p className="text-xs text-gray-600">未配置远程仓库。</p>
           <p className="text-[11px] text-gray-600">在设置中添加 GitHub 或 GitLab 远程仓库。</p>
         </div>
       ) : (
-        <div className="flex-1 min-h-0">
+        <div
+          id={activePanelId}
+          role="tabpanel"
+          aria-labelledby={activeTabId}
+          className="flex-1 min-h-0"
+        >
           {tab === "issues" ? (
-            <IssuesTab remotes={remotes} />
+            <IssuesTab remotes={remotes} largeTargets={largeTargets} />
           ) : (
-            <PRsTab remotes={remotes} currentBranch={currentBranch} />
+            <PRsTab remotes={remotes} currentBranch={currentBranch} largeTargets={largeTargets} />
           )}
         </div>
       )}

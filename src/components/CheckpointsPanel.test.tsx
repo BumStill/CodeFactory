@@ -116,4 +116,45 @@ describe("CheckpointsPanel recovery entry", () => {
     expect(mocks.invoke.mock.calls.filter(([command]) => command === "checkpoint_changeset")).toHaveLength(12);
   });
 
+  it("keeps the embedded checkpoint drawer in-pane, traps focus, and returns focus on Escape", async () => {
+    const user = userEvent.setup();
+    render(<CheckpointsPanel embedded sessionId="s1" />);
+
+    const trigger = await screen.findByRole("button", { name: "恢复 4" });
+    expect(trigger).toHaveClass("h-11");
+    await user.click(trigger);
+
+    const dialog = screen.getByRole("dialog", { name: "检查点抽屉" });
+    expect(dialog).toHaveAttribute("aria-modal", "false");
+    expect(dialog.parentElement).toHaveClass("absolute");
+    expect(dialog.parentElement).not.toHaveClass("fixed");
+    const close = screen.getByRole("button", { name: "关闭检查点" });
+    expect(close).toHaveFocus();
+    expect(close).toHaveClass("h-11", "w-11");
+
+    await user.tab({ shift: true });
+    expect(dialog).toContainElement(document.activeElement as HTMLElement);
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "检查点抽屉" })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("closes embedded restore confirmation with Escape and restores the row control", async () => {
+    const user = userEvent.setup();
+    render(<CheckpointsPanel embedded sessionId="s1" />);
+
+    await user.click(await screen.findByRole("button", { name: "恢复 4" }));
+    const rowTrigger = await screen.findByRole("button", { name: "恢复检查点 修复登录" });
+    await user.click(rowTrigger);
+
+    const confirmDialog = screen.getByRole("dialog", { name: "恢复检查点" });
+    expect(confirmDialog).toHaveAttribute("aria-modal", "false");
+    expect(confirmDialog.parentElement).toHaveClass("absolute");
+    expect(screen.getByRole("button", { name: "取消恢复" })).toHaveFocus();
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog", { name: "恢复检查点" })).not.toBeInTheDocument();
+    expect(rowTrigger).toHaveFocus();
+  });
+
 });

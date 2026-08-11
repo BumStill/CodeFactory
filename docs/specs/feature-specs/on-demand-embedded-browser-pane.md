@@ -6,6 +6,12 @@ CodeFactory 已具备 `browser_session` 受管浏览器工具、浏览器 Profil
 
 本特性将浏览器定义为**当前 Agent run 按需创建的内置右侧分屏**：没有活动浏览器时不显示任何常设入口；Agent 实际需要浏览网页时自动创建并展开；主会话同步压缩；任务结束后按生命周期自动关闭和收起。
 
+### 当前交付边界（2026-08-11）
+
+本批只交付 Phase 1 的 Workspace 辅助 pane 仲裁、按会话显隐、响应式布局、原生 child WebView 同 URL 预览和失败恢复。Agent 工具仍操作 `LOCAL` ChromiumDriver 中的受管页面，child WebView 依据 lease 的 `pane_url` 独立加载；两者不共享 Cookie、DOM、导航状态或页面控制权。因此当前 pane **不是 Agent 实际页面的实时镜像，也不支持接管/交还**，EBP-R3 的“同一受管页面”与 EBP-R9 保持 `not live`。PR、release 与 UI 文案不得用“实时观察”“接管 Agent 页面”描述本批能力。
+
+以下 Primary User Path、控制权和生命周期条款是完整目标态；每个阶段只能按已取得的真实证据声明完成。
+
 ## 2. 产品原则
 
 1. **按需而非常设**：只有当前会话实际持有活动 `browser_session` 时才显示浏览器分屏，不在输入框、侧栏或全局导航增加浏览器入口。
@@ -22,8 +28,8 @@ CodeFactory 已具备 `browser_session` 受管浏览器工具、浏览器 Profil
 | EBP-R1 | 浏览器不应有常设入口 | 无活动浏览器时 Workspace 不呈现浏览器按钮、占位 pane 或导航项 | Workspace | 组件测试 + 真实应用截图 | frontend |
 | EBP-R2 | 浏览器应按需自动打开 | Agent 首次成功创建当前会话的 `browser_session` 后自动展开 pane | Workspace / Tauri events | 集成测试 + 真实主路径 | full-stack |
 | EBP-R3 | 浏览器应该是内置的 | 网页在右侧隔离 WebView/受管浏览器 pane 中显示，不默认打开外部窗口 | Workspace / browser host | 桌面集成测试 | desktop |
-| EBP-R4 | 右侧占三分之一或一半 | 默认宽度约 38%，允许用户在 33%–50% 间拖动；主会话占剩余空间 | Workspace layout | Viewport Harness | frontend |
-| EBP-R5 | 主会话空间压缩 | pane 展开时主会话发生流式重排，不被覆盖，输入框与关键控制保持可用 | Workspace layout | 真实应用视口验证 | frontend |
+| EBP-R4 | 宽屏使用可调右侧 pane | ≥1440px 时默认约 38vw，并限制在 480–720px；separator 可由指针或键盘调整并保存偏好 | Workspace layout | Viewport Harness | frontend |
+| EBP-R5 | 主会话保持可读 | ≥1440px 停靠时主会话流式重排且不低于可读下限；更窄窗口使用 overlay，不继续把正文压成细栏；输入框与关键控制始终可用 | Workspace layout | 真实应用视口验证 | frontend |
 | EBP-R6 | 审视自动关闭 | run 完成、失败、取消默认自动关闭；等待用户或用户接管时按活动租约延后 | lifecycle manager | Rust 单元/集成测试 + smoke | backend |
 | EBP-R7 | 长方案写入文件 | 长期产品决策保存在仓库规格中，会话只返回摘要和文件链接 | `docs/specs` | 治理基线检查 | planning |
 | EBP-R8 | 并行会话隔离 | 只显示当前 `owner_session_id` 的 pane；其他会话浏览器继续后台运行但不占当前布局 | Workspace / manager | 多会话集成测试 | full-stack |
@@ -35,7 +41,7 @@ CodeFactory 已具备 `browser_session` 受管浏览器工具、浏览器 Profil
 1. 用户在普通项目会话中提出需要网页研究或网页验证的任务。
 2. Agent 判断确有需要并调用 `browser_session.open`；在调用成功前，界面不预留浏览器空间。
 3. BrowserSessionManager 创建与当前 `owner_session_id` 绑定的受管页面，并发出 `browser-session-opened` 事件。
-4. Workspace 收到当前会话事件后，在右侧自动展开内置浏览器 pane；默认约占可用宽度的 38%，主会话平滑压缩到剩余区域。
+4. Workspace 收到当前会话事件后，通过单一辅助 pane 仲裁器显示内置浏览器：≥1440px 时右侧停靠，默认约 38vw 并限制在 480–720px；更窄窗口使用 overlay，不压缩主会话到不可读宽度。
 5. Agent 在 pane 中导航、读取和截图。若仅做后台读取，不强制把键盘焦点从输入框抢走；页面仍实时可见。
 6. 需要登录、验证码、Passkey 或用户接管时，pane 提升为注意状态，Agent 暂停页面动作，并将焦点引导到明确的“接管浏览器”控制。
 7. 用户完成操作并选择“交还 Agent”；原 DOM 引用全部失效，Agent 必须重新 snapshot 后继续。
@@ -54,15 +60,15 @@ CodeFactory 已具备 `browser_session` 受管浏览器工具、浏览器 Profil
 
 ### 5.2 宽度
 
-- 宽屏默认比例：浏览器 `38%`，主会话 `62%`。
-- 拖动范围：浏览器最小 `33%`，最大 `50%`。
-- 两个 pane 均设置像素最小宽度；推荐浏览器不低于 `420px`、主会话不低于 `560px`。
+- ≥1440px 宽屏默认比例约为浏览器 `38vw`，像素范围 `480–720px`；主会话保留剩余空间并维持阅读列下限。
+- separator 支持指针与键盘调整，不能只依赖精细拖拽。
+- 状态、任务和 Git 等非浏览器 surface 使用更紧凑的默认宽度，不沿用浏览器宽度。
 - 用户调整后的比例只在应用本地保存，作为下次按需展开的偏好；它不代表浏览器常驻。
 - 当窗口无法同时满足两个最小宽度时，不允许继续横向压缩到不可用状态，按 5.3 降级。
 
 ### 5.3 窄窗口降级
 
-- 可用宽度不足 `980px` 时，浏览器切换为覆盖 Workspace 内容区的可返回页面或上下分屏；不得把聊天压缩成不可读细栏。
+- 窗口宽度 `1024–1439px` 时，浏览器使用右侧 drawer overlay；小于 `1024px` 或 200% zoom 下使用全高 overlay，不得把聊天压缩成不可读细栏。
 - 输入框、停止生成、权限确认和“结束/交还浏览器”必须保持可达。
 - 浏览器 UI 不能覆盖系统标题栏、Workspace 主导航或权限弹窗。
 
@@ -146,34 +152,34 @@ CodeFactory 已具备 `browser_session` 受管浏览器工具、浏览器 Profil
 - **Spec Harness**：Req ID、主路径、测试矩阵与证据要求。
 - **Compatibility Harness**：Windows/macOS、持久 Profile、旧设置和 WebView 能力差异。
 - **Observation Harness**：浏览器状态事件、close receipt、崩溃回收原因。
-- **Viewport Harness**：33%–50% 分屏、主会话压缩、窄窗口降级和权限弹窗可达性。
+- **Viewport Harness**：≥1440px 的 480–720px 可调停靠 pane、1024–1439px drawer、小于 1024px/200% zoom 全高 overlay 和权限弹窗可达性。
 - **Payload Harness**：截图、下载、文件选择和页面数据进入工具输出时的尺寸与敏感信息边界。
 - **AI Collaboration Harness**：模型决定何时创建浏览器、用户接管后的 stale reference 处理与自动关闭假设。
 
 ## 11. Viewport Harness
 
-- **Target viewport**：`1440×900`、`1280×800`、`1024×768`、窄于 `980px` 的降级视口。
+- **Target viewport**：`1440×900`、`1366×768`、`1024×768`、`800×600` 与 200% zoom。
 - **First-screen expectations**：浏览器展开后当前执行消息、输入框、浏览器状态条和页面首屏同时可识别。
 - **Fixed action expectations**：停止生成、权限决定、接管/交还、折叠和结束浏览器始终可达。
 - **Overflow rule**：主会话与浏览器各自滚动；不得形成页面级双横向滚动条；拖动不得越过最小宽度。
 - **Animation visibility rule**：展开/收起使用短时布局过渡；`prefers-reduced-motion` 下取消过渡；流式回答时不得因频繁页面事件触发布局抖动。
-- **Screenshot or recording**：每个目标视口记录无浏览器、默认 38%、最大 50%、等待授权、用户接管和自动收起状态。
+- **Screenshot or recording**：每个目标视口记录无浏览器、默认/边界宽度或 overlay、等待授权、用户接管和自动收起状态。
 
 ## 12. 测试矩阵
 
 | Path type | Scenario | Expected result | Evidence |
 | --- | --- | --- | --- |
-| Primary | Agent 首次打开公开网页 | pane 自动在右侧展开为约 38%，聊天压缩但输入仍可用 | 真实 app 录屏 + 状态事件 |
+| Primary | Agent 首次打开公开网页 | ≥1440px 自动停靠，较窄窗口使用 overlay；聊天与输入始终可用 | 真实 app 录屏 + 状态事件 |
 | Primary | run 正常完成 | 浏览器真实关闭，pane 收起，主会话恢复全宽 | close receipt + 截图 |
-| Interaction | 用户拖动分隔条 | 浏览器限制在 33%–50%，偏好在下一次按需展开时恢复 | 浏览器布局断言 + 录屏 |
+| Interaction | 用户拖动或键盘调整分隔条 | 浏览器限制在 480–720px，偏好在下一次按需展开时恢复 | 浏览器布局断言 + 录屏 |
 | Interaction | 用户接管再交还 | Agent 操作暂停；交还后旧引用失效并重新 snapshot | 工具轨迹 + UI 录屏 |
 | Failure | open 失败 | pane 不留下空壳，租约与 Profile 锁均被清理 | 集成测试 |
 | Failure | run 失败或取消 | 所属浏览器被自动关闭，不影响并行聊天 | 多会话集成测试 |
 | Failure | 前端重载 | 活动会话经快照恢复并通过真实 snapshot 验证 | 桌面集成测试 |
 | Compatibility | macOS 与 Windows | child webview、焦点、Cookie/Profile 和关闭行为一致 | 双平台 CI + 实机证据 |
 | Security | 网页尝试访问 Tauri IPC / 非 HTTP(S) | 无法访问 IPC，非法 scheme 被拒绝 | 安全测试 |
-| Viewport | 1280 宽默认分屏 | 主会话与浏览器均不低于最小可用宽度 | 截图 + 尺寸断言 |
-| Viewport | 小于 980 宽 | 切换到规定降级布局，关键操作仍可达 | 真实 app 录屏 |
+| Viewport | 1366 宽 | 使用右侧 drawer，不把主会话压成细栏 | 截图 + 尺寸断言 |
+| Viewport | 小于 1024 宽或 200% zoom | 切换到全高 overlay，关键操作仍可达 | 真实 app 录屏 |
 | Parallel | 当前会话切换 | pane 不串台；返回原会话恢复正确页面 | 多会话实测 |
 | Lifecycle | 等待登录超过无活动租约 | 先提醒，未续期后关闭；用户活动会刷新租约 | 时钟测试 + 实地验证 |
 
@@ -183,7 +189,7 @@ CodeFactory 已具备 `browser_session` 受管浏览器工具、浏览器 Profil
 
 1. 当前会话从 `browser_session.open` 到 pane 自动展开的事件与 UI 对应证据；
 2. 目标网页确实显示在隔离的内置容器中，而非 mock 或静态截图；
-3. 38% 默认宽度、33%–50% 拖动边界和窄窗口降级的机器断言；
+3. ≥1440px 的 480–720px 调整边界、较窄窗口 overlay 降级和键盘 separator 的机器断言；
 4. 正常完成、失败、取消、用户接管和崩溃恢复的真实 close receipt；
 5. 并行会话不串台、用户普通 Chrome 不受影响的证据；
 6. macOS 与 Windows 至少各一条真实主路径；
@@ -198,8 +204,9 @@ CodeFactory 已具备 `browser_session` 受管浏览器工具、浏览器 Profil
 
 - 扩展 browser session view/state event，带上 `owner_session_id`、状态、当前 host 与页面标识。
 - Workspace 依据当前会话活动状态自动挂载/收起 pane。
-- 实现 38% 默认比例、33%–50% 拖动和窄窗口降级。
+- 实现 ≥1440px 的 480–720px 停靠宽度、键盘/指针调节与较窄窗口 overlay 降级。
 - 先使用可验证的隔离页面 host 打通生命周期，不声明第三方站点全面兼容。
+- 当前实现的 child WebView 是同 URL 独立预览，不等价于 Agent 的 ChromiumDriver 页面；该限制必须在交付证据中显式保留。
 
 ### Phase 2：真实内置页面与控制权
 

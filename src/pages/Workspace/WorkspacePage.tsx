@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject, type PointerEvent as ReactPointerEvent } from "react";
 import {
   AlertTriangle,
   BookOpen,
@@ -15,6 +15,7 @@ import {
   Globe2,
   ExternalLink,
   FileText,
+  PanelRightOpen,
 } from "lucide-react";
 import { MessageList } from "../../components/MessageList";
 import { DocumentPreview, type DocumentTab } from "../../components/DocumentPreview";
@@ -27,14 +28,14 @@ import { PermissionModePicker } from "../../components/PermissionModePicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
 import { GitStatusBar } from "../../components/GitStatusBar";
-import { WorkspaceDeliveryStatus } from "../../components/WorkspaceDeliveryStatus";
+import { WorkspaceDeliveryStatus, type WorkspaceDeliveryState } from "../../components/WorkspaceDeliveryStatus";
 import { GitChangesPanel } from "../../components/GitChangesPanel";
 import { GitHistoryPanel } from "../../components/GitHistoryPanel";
 import { RemoteGitPanel } from "../../components/RemoteGitPanel";
 import { useGitStore } from "../../stores/git";
 import { recentProjects } from "../../lib/projects";
-import { invoke } from "../../lib/tauri";
-import { useChatStore, activeRuntime } from "../../stores/chat";
+import { invoke, onEmbeddedBrowserEscape } from "../../lib/tauri";
+import { useChatStore, activeRuntime, type UIMessage } from "../../stores/chat";
 import { QueueBadge } from "../../components/QueueBadge";
 import { useTasksStore } from "../../stores/tasks";
 import type { BrowserSession, TaskRun, VerificationResult } from "../../lib/tauri";
@@ -48,7 +49,40 @@ type WorkspaceBrowserSession = BrowserSession & {
   page_title?: string | null;
 };
 
-const BROWSER_PANE_DEFAULT_WIDTH = 38;
+type AuxiliaryPaneKind = "browser" | "document" | "git" | "tasks" | "delivery" | "evidence";
+type AuxiliaryLayout = "dock" | "drawer" | "overlay";
+
+const AUXILIARY_PANE_DEFAULT_WIDTH = 520;
+const AUXILIARY_PANE_MIN_WIDTH = 480;
+const AUXILIARY_PANE_MAX_WIDTH = 720;
+const AUXILIARY_STATUS_PANE_WIDTH = 400;
+const WORKSPACE_READING_MIN_WIDTH = 560;
+const WORKSPACE_SIDEBAR_WIDTH = 272;
+const AUXILIARY_PANE_STORAGE_KEY = "cf.workspace.auxiliaryPaneWidth";
+
+function auxiliaryLayoutForWidth(width: number): AuxiliaryLayout {
+  if (width >= 1440) return "dock";
+  if (width >= 1024) return "drawer";
+  return "overlay";
+}
+
+function clampAuxiliaryPaneWidth(
+  width: number,
+  maxWidth = AUXILIARY_PANE_MAX_WIDTH,
+): number {
+  return Math.min(maxWidth, Math.max(AUXILIARY_PANE_MIN_WIDTH, width));
+}
+
+function auxiliaryPaneLabel(kind: AuxiliaryPaneKind): string {
+  switch (kind) {
+    case "browser": return "浏览器";
+    case "document": return "文档";
+    case "git": return "Git";
+    case "tasks": return "任务活动";
+    case "delivery": return "交付详情";
+    case "evidence": return "回合证据";
+  }
+}
 
 function sessionHost(session: WorkspaceBrowserSession): string {
   if (session.current_host) return session.current_host;
@@ -115,6 +149,10 @@ export function WorkspacePage({
   const isAnonymous = activeSession?.kind === "anonymous";
   const persistedRunActive = useTasksStore((state) => state.running[sessionId] ?? false);
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
+  const [deliveryState, setDeliveryState] = useState<WorkspaceDeliveryState>({
+    snapshot: null,
+    unavailable: false,
+  });
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
       return localStorage.getItem("cf.workspace.sidebarCollapsed") === "1";
@@ -142,7 +180,9 @@ export function WorkspacePage({
   const sidebarVisible = narrowViewport ? narrowSidebarOpen : !sidebarCollapsed;
   const toggleSidebar = () => {
     if (narrowViewport) {
-      setNarrowSidebarOpen((open) => !open);
+      const opening = !narrowSidebarOpen;
+      setNarrowSidebarOpen(opening);
+      if (opening) setBrowserPaneCollapsed(true);
       return;
     }
     setSidebarCollapsed((collapsed) => {
@@ -176,15 +216,43 @@ export function WorkspacePage({
   // pending edit can't blur-commit onto the wrong session.
   useEffect(() => {
     setTitleEditing(false);
-    setTaskActivityOpen(Boolean(initialTaskLogId));
+    setRequestedAuxiliaryPane(initialTaskLogId ? "tasks" : null);
+    setGitPanel(null);
+    setEvidenceId(null);
+    setDeliveryState({ snapshot: null, unavailable: false });
   }, [initialTaskLogId, sessionId]);
-  // Git / environment panel — surface the (previously unwired) git UI in the
-  // right column: a branch/status bar + slide-out Changes / History / PR panels.
+  // Every secondary surface is arbitrated here. A single union prevents Git,
+  // tasks, delivery, evidence, documents and the managed browser from stacking
+  // independent drawers over the conversation.
   const [gitPanel, setGitPanel] = useState<"changes" | "history" | "remote" | null>(null);
+  const [requestedAuxiliaryPane, setRequestedAuxiliaryPane] =
+    useState<AuxiliaryPaneKind | null>(null);
+  const [evidenceId, setEvidenceId] = useState<string | null>(null);
+  const auxiliaryOpenerRef = useRef<HTMLElement | null>(null);
+  const auxiliaryRestoreButtonRef = useRef<HTMLButtonElement>(null);
+  const auxiliaryPaneRef = useRef<HTMLElement>(null);
+  const workspaceMainRef = useRef<HTMLElement>(null);
+  const [auxiliaryFocusRequest, setAuxiliaryFocusRequest] = useState(0);
+  const handledAuxiliaryFocusRequestRef = useRef(0);
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    typeof window === "undefined" ? 1440 : window.innerWidth,
+  );
+  const [auxiliaryPaneWidth, setAuxiliaryPaneWidth] = useState(() => {
+    try {
+      const persisted = Number(localStorage.getItem(AUXILIARY_PANE_STORAGE_KEY));
+      return Number.isFinite(persisted) && persisted > 0
+        ? clampAuxiliaryPaneWidth(persisted)
+        : AUXILIARY_PANE_DEFAULT_WIDTH;
+    } catch {
+      return AUXILIARY_PANE_DEFAULT_WIDTH;
+    }
+  });
   const gitBranch = useGitStore((s) => s.status?.branch ?? "");
   const activeCwd = activeSession?.cwd ?? activeDraft?.cwd ?? null;
   const draftProjects = useMemo(() => recentProjects(sessions ?? []), [sessions]);
   const projectTasks = useTasksStore((state) => state.tasks[sessionId]);
+  const projectTasksLoading = Boolean(useTasksStore((state) => state.loading?.[sessionId]));
+  const projectTasksError = useTasksStore((state) => state.error?.[sessionId] ?? null);
   const sessionTasks = projectTasks ?? [];
   const externalJobs = useMemo<ExternalJobState[]>(
     () =>
@@ -231,19 +299,23 @@ export function WorkspacePage({
     }
     return null;
   }, [taskBlockedCount, taskFailedCount, taskPendingCount, taskProviderBlockedCount, taskRunningCount]);
-  const [taskActivityOpen, setTaskActivityOpen] = useState(Boolean(initialTaskLogId));
   const taskActivityButtonRef = useRef<HTMLButtonElement>(null);
-  const taskActivityDialogRef = useRef<HTMLElement>(null);
   const closeTaskActivity = useCallback(() => {
-    setTaskActivityOpen(false);
-    requestAnimationFrame(() => taskActivityButtonRef.current?.focus());
+    setRequestedAuxiliaryPane(null);
+    setBrowserPaneCollapsed(true);
+    requestAnimationFrame(() => {
+      if (taskActivityButtonRef.current?.isConnected) taskActivityButtonRef.current.focus();
+      else if (auxiliaryOpenerRef.current?.isConnected) auxiliaryOpenerRef.current.focus();
+      else if (auxiliaryRestoreButtonRef.current?.isConnected) auxiliaryRestoreButtonRef.current.focus();
+      else workspaceMainRef.current?.focus();
+    });
   }, []);
   const [browserSessions, setBrowserSessions] = useState<WorkspaceBrowserSession[]>([]);
   const [browserLoadError, setBrowserLoadError] = useState<string | null>(null);
+  const [browserRefreshRequest, setBrowserRefreshRequest] = useState(0);
   const [browserPaneCollapsed, setBrowserPaneCollapsed] = useState(false);
   const [documentTabs, setDocumentTabs] = useState<DocumentTab[]>([]);
   const [activeRightTab, setActiveRightTab] = useState<string | null>(null);
-  const browserPaneWidth = BROWSER_PANE_DEFAULT_WIDTH;
   const loadProjectTasks = useTasksStore((state) => state.loadTasks);
   const subscribeProjectTasks = useTasksStore((state) => state.subscribe);
   const isProjectSession = Boolean(
@@ -259,10 +331,129 @@ export function WorkspacePage({
       ),
     [browserSessions, sessionId],
   );
-  const browserPaneOpen = (activeBrowserSessions.length > 0 || documentTabs.length > 0) && !browserPaneCollapsed;
+  const selectedRightTab = useMemo(() => {
+    const tabIds = new Set([
+      ...activeBrowserSessions.map((session) => `browser:${session.session_id}`),
+      ...documentTabs.map((tab) => tab.id),
+    ]);
+    if (activeRightTab && tabIds.has(activeRightTab)) return activeRightTab;
+    return activeBrowserSessions[0]
+      ? `browser:${activeBrowserSessions[0].session_id}`
+      : documentTabs[0]?.id ?? null;
+  }, [activeBrowserSessions, activeRightTab, documentTabs]);
+  const passiveAuxiliaryPane: AuxiliaryPaneKind | null = selectedRightTab?.startsWith("document:")
+    ? "document"
+    : selectedRightTab?.startsWith("browser:")
+      ? "browser"
+      : null;
+  const auxiliaryPaneKind = requestedAuxiliaryPane ?? passiveAuxiliaryPane;
+  const auxiliaryPaneHasContent = auxiliaryPaneKind !== "tasks"
+    ? auxiliaryPaneKind !== "evidence" || messages.some((message) => message.id === evidenceId)
+    : projectTasks === undefined || projectTaskCount > 0;
+  const auxiliaryPaneOpen = Boolean(auxiliaryPaneKind) && !browserPaneCollapsed && auxiliaryPaneHasContent;
+  const taskActivityOpen = auxiliaryPaneOpen && auxiliaryPaneKind === "tasks";
+  const auxiliaryLayout = auxiliaryLayoutForWidth(viewportWidth);
+  const selectedBrowserSessionId = selectedRightTab?.startsWith("browser:")
+    ? selectedRightTab.slice("browser:".length)
+    : null;
+  const auxiliaryPaneMaxWidth = Math.min(
+    AUXILIARY_PANE_MAX_WIDTH,
+    Math.max(
+      AUXILIARY_PANE_MIN_WIDTH,
+      viewportWidth - (sidebarVisible ? WORKSPACE_SIDEBAR_WIDTH : 0) - WORKSPACE_READING_MIN_WIDTH,
+    ),
+  );
+
+  const openAuxiliaryPane = useCallback((kind: AuxiliaryPaneKind, opener?: HTMLElement | null) => {
+    auxiliaryOpenerRef.current = opener ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    setAuxiliaryFocusRequest((request) => request + 1);
+    setNarrowSidebarOpen(false);
+    setRequestedAuxiliaryPane(kind);
+    setBrowserPaneCollapsed(false);
+  }, []);
+
+  const collapseAuxiliaryPane = useCallback(() => {
+    setBrowserPaneCollapsed(true);
+    requestAnimationFrame(() => {
+      const opener = auxiliaryOpenerRef.current;
+      if (opener?.isConnected) opener.focus();
+      else if (auxiliaryRestoreButtonRef.current) auxiliaryRestoreButtonRef.current.focus();
+      else workspaceMainRef.current?.focus();
+    });
+  }, []);
+
+  const embeddedBrowserEscapeStateRef = useRef({
+    auxiliaryLayout,
+    auxiliaryPaneKind,
+    auxiliaryPaneOpen,
+    pendingPermission: Boolean(pendingPermission),
+    selectedBrowserSessionId,
+  });
+  embeddedBrowserEscapeStateRef.current = {
+    auxiliaryLayout,
+    auxiliaryPaneKind,
+    auxiliaryPaneOpen,
+    pendingPermission: Boolean(pendingPermission),
+    selectedBrowserSessionId,
+  };
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void onEmbeddedBrowserEscape(({ session_id }) => {
+      if (disposed) return;
+      const state = embeddedBrowserEscapeStateRef.current;
+      if (
+        state.auxiliaryLayout === "dock" ||
+        state.auxiliaryPaneKind !== "browser" ||
+        !state.auxiliaryPaneOpen ||
+        state.pendingPermission ||
+        state.selectedBrowserSessionId !== session_id
+      ) return;
+      collapseAuxiliaryPane();
+    })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {
+        // Browser preview remains usable through its explicit collapse button
+        // when the native event bus is unavailable (for example, web-only dev).
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [collapseAuxiliaryPane]);
+
+  const restoreAuxiliaryPane = useCallback(() => {
+    auxiliaryOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setAuxiliaryFocusRequest((request) => request + 1);
+    setNarrowSidebarOpen(false);
+    setBrowserPaneCollapsed(false);
+  }, []);
+
+  useEffect(() => {
+    if (!auxiliaryPaneKind || auxiliaryPaneHasContent) return;
+    setRequestedAuxiliaryPane(null);
+    setBrowserPaneCollapsed(true);
+    requestAnimationFrame(() => {
+      if (auxiliaryOpenerRef.current?.isConnected) auxiliaryOpenerRef.current.focus();
+      else workspaceMainRef.current?.focus();
+    });
+  }, [auxiliaryPaneHasContent, auxiliaryPaneKind]);
+
+  useEffect(() => {
+    const onResize = () => setViewportWidth(window.innerWidth);
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   useEffect(() => {
     setBrowserPaneCollapsed(false);
+    setDocumentTabs([]);
+    setActiveRightTab(null);
   }, [sessionId]);
 
   useEffect(() => {
@@ -286,13 +477,21 @@ export function WorkspacePage({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [sessionId]);
+  }, [browserRefreshRequest, sessionId]);
 
   const closeBrowserPaneSession = async (browserSessionId: string) => {
     await invoke("close_browser_session", { sessionId: browserSessionId });
     setBrowserSessions((sessions) =>
       sessions.filter((session) => session.session_id !== browserSessionId),
     );
+    requestAnimationFrame(() => {
+      const target = auxiliaryPaneRef.current?.querySelector<HTMLElement>(
+        '[role="tab"][tabindex="0"], [data-auxiliary-initial-focus]',
+      );
+      if (target) target.focus();
+      else if (auxiliaryOpenerRef.current?.isConnected) auxiliaryOpenerRef.current.focus();
+      else workspaceMainRef.current?.focus();
+    });
   };
 
   useEffect(() => {
@@ -329,18 +528,23 @@ export function WorkspacePage({
   }, [isProjectSession, loadProjectTasks, sessionId, subscribeProjectTasks]);
 
   useEffect(() => {
-    if (!taskActivityOpen) return;
-    const dialog = taskActivityDialogRef.current;
-    requestAnimationFrame(() => {
-      dialog?.querySelector<HTMLElement>("[data-dialog-initial-focus]")?.focus();
-    });
+    if (!auxiliaryPaneOpen || pendingPermission) return;
+    const dialog = auxiliaryPaneRef.current;
+    if (auxiliaryFocusRequest > handledAuxiliaryFocusRequestRef.current) {
+      handledAuxiliaryFocusRequestRef.current = auxiliaryFocusRequest;
+      requestAnimationFrame(() => {
+        const target = dialog?.querySelector<HTMLElement>("[data-auxiliary-initial-focus], [data-dialog-initial-focus]") ?? dialog;
+        target?.focus();
+      });
+    }
+    if (auxiliaryLayout === "dock") return;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        closeTaskActivity();
+        collapseAuxiliaryPane();
         return;
       }
-      if (event.key !== "Tab" || !dialog) return;
+      if (event.key !== "Tab" || !dialog || auxiliaryLayout !== "overlay") return;
       const focusable = Array.from(
         dialog.querySelectorAll<HTMLElement>(
           'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
@@ -362,7 +566,15 @@ export function WorkspacePage({
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [closeTaskActivity, taskActivityOpen]);
+  }, [auxiliaryFocusRequest, auxiliaryLayout, auxiliaryPaneKind, auxiliaryPaneOpen, collapseAuxiliaryPane, gitPanel, pendingPermission]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(AUXILIARY_PANE_STORAGE_KEY, String(auxiliaryPaneWidth));
+    } catch {
+      // Persistence is optional; resize still works for the current session.
+    }
+  }, [auxiliaryPaneWidth]);
 
   return (
     <div className="h-full flex flex-col bg-surface-0">
@@ -373,7 +585,7 @@ export function WorkspacePage({
           <button
             type="button"
             onClick={toggleSidebar}
-            className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2 text-[13px] font-medium text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
+            className="flex h-11 shrink-0 items-center gap-1.5 rounded-lg px-2 text-[13px] font-medium text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:h-9"
             title="展开会话侧栏"
             aria-label="展开会话侧栏"
             aria-expanded={false}
@@ -450,23 +662,24 @@ export function WorkspacePage({
               exitAnonymous();
               onNewConversation(null);
             }}
-            className="flex min-h-8 items-center gap-1 rounded-lg border border-status-warning/30 bg-status-warning-soft px-2 text-[13px] text-status-warning transition-colors hover:brightness-95"
+            className="flex min-h-11 items-center gap-1 rounded-lg border border-status-warning/30 bg-status-warning-soft px-2 text-[13px] text-status-warning transition-colors hover:brightness-95 lg:min-h-9"
             title="退出匿名会话并丢弃其历史"
           >
             <EyeOff size={12} />
             退出匿名
           </button>
         )}
-        {!activeDraft && <ModelPicker />}
-        {/* Per-session reasoning override needs a DB row; anonymous chats use
-            the global default, so the picker is hidden for them. */}
-        {!isAnonymous && <ReasoningEffortPicker />}
-        <PermissionModePicker />
-
         <div className="flex items-center gap-1.5">
           <GitStatusBar
             cwd={activeCwd}
-            onOpenChanges={() => setGitPanel("changes")}
+            detailsId={auxiliaryPaneOpen && auxiliaryPaneKind === "git"
+              ? "workspace-auxiliary-pane"
+              : undefined}
+            detailsOpen={auxiliaryPaneOpen && auxiliaryPaneKind === "git"}
+            onOpenChanges={() => {
+              setGitPanel("changes");
+              openAuxiliaryPane("git");
+            }}
           />
           {!activeDraft && (
             <WorkspaceDeliveryStatus
@@ -474,6 +687,12 @@ export function WorkspacePage({
               sessionId={sessionId}
               currentBranch={gitBranch}
               messages={messages}
+              detailsOpen={auxiliaryPaneOpen && auxiliaryPaneKind === "delivery"}
+              detailsId={auxiliaryPaneOpen && auxiliaryPaneKind === "delivery"
+                ? "workspace-auxiliary-pane"
+                : undefined}
+              onOpenDetails={() => openAuxiliaryPane("delivery")}
+              onDeliveryStateChange={setDeliveryState}
             />
           )}
         </div>
@@ -481,11 +700,11 @@ export function WorkspacePage({
           <button
             ref={taskActivityButtonRef}
             type="button"
-            onClick={() => setTaskActivityOpen(true)}
+            onClick={() => openAuxiliaryPane("tasks", taskActivityButtonRef.current)}
             aria-label={`打开任务活动：${taskActivitySummary.label}`}
             aria-expanded={taskActivityOpen}
-            aria-controls="workspace-task-activity-dialog"
-            className={`inline-flex h-8 min-w-8 items-center justify-center gap-1 rounded-lg px-2 text-[13px] font-medium transition-colors ${
+            aria-controls={taskActivityOpen ? "workspace-auxiliary-pane" : undefined}
+            className={`inline-flex h-11 min-w-11 items-center justify-center gap-1 rounded-lg px-2 text-[13px] font-medium transition-colors lg:h-9 lg:min-w-9 ${
               taskActivitySummary.tone === "danger"
                 ? "bg-status-danger-soft text-status-danger hover:brightness-95"
                 : taskActivitySummary.tone === "warning"
@@ -508,9 +727,21 @@ export function WorkspacePage({
             <span>{taskActivitySummary.count}</span>
           </button>
         )}
+        {browserPaneCollapsed && auxiliaryPaneKind && (
+          <button
+            ref={auxiliaryRestoreButtonRef}
+            type="button"
+            onClick={restoreAuxiliaryPane}
+            aria-label={`恢复辅助工作区：${auxiliaryPaneLabel(auxiliaryPaneKind)}`}
+            className="flex h-11 w-11 items-center justify-center rounded-lg text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:h-9 lg:w-9"
+            title={`恢复${auxiliaryPaneLabel(auxiliaryPaneKind)}`}
+          >
+            <PanelRightOpen size={14} aria-hidden="true" />
+          </button>
+        )}
         <button
           onClick={() => onOpenSettings()}
-          className="flex h-8 w-8 items-center justify-center rounded-lg text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300"
+          className="flex h-11 w-11 items-center justify-center rounded-lg text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300 lg:h-9 lg:w-9"
           title="设置"
           aria-label="设置"
         >
@@ -557,8 +788,10 @@ export function WorkspacePage({
 
         {/* ─── Center: conversation remains the primary surface. ─────────── */}
         <main
+          ref={workspaceMainRef}
+          tabIndex={-1}
           aria-label="会话窗口"
-          data-browser-pane={browserPaneOpen ? "open" : "closed"}
+          data-auxiliary-pane={auxiliaryPaneOpen ? "open" : "closed"}
           className="flex min-w-0 flex-1 flex-col bg-surface-2"
         >
           <MessageList
@@ -575,18 +808,33 @@ export function WorkspacePage({
             onOpenSession={onOpenSession}
             onPickProject={activeDraft ? setDraftProject : undefined}
             onOpenDocument={(path) => {
+              auxiliaryOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+              setNarrowSidebarOpen(false);
               const id = `document:${path}`;
               setDocumentTabs((tabs) => tabs.some((tab) => tab.id === id)
                 ? tabs
                 : [...tabs, { id, path, title: path.replace(/\\/g, "/").split("/").pop() ?? path }]);
               setActiveRightTab(id);
+              setRequestedAuxiliaryPane(null);
               setBrowserPaneCollapsed(false);
             }}
+            onOpenEvidence={(id) => {
+              setEvidenceId(id);
+              openAuxiliaryPane("evidence");
+            }}
+            evidenceControlsId={
+              auxiliaryPaneOpen && auxiliaryPaneKind === "evidence"
+                ? "workspace-auxiliary-pane"
+                : undefined
+            }
+            openEvidenceMessageId={
+              auxiliaryPaneOpen && auxiliaryPaneKind === "evidence" ? evidenceId : null
+            }
             timingProfile={turnTimingProfile}
             externalJobs={externalJobs}
           />
           <div data-testid="workspace-composer-shell" className="shrink-0 bg-surface-2 px-3 pb-3 pt-2">
-            <div className="mx-auto w-full max-w-[920px] overflow-hidden rounded-2xl border border-border/80 bg-surface-2 shadow-lg">
+            <div className="mx-auto w-full max-w-[880px] overflow-hidden rounded-2xl border border-border/80 bg-surface-2 shadow-lg">
               {queue.length > 0 && (
                 <QueueBadge queue={queue} onRemove={removeFromQueue} />
               )}
@@ -598,15 +846,10 @@ export function WorkspacePage({
                   cwd={activeDraft.cwd}
                   anonymous={activeDraft.anonymous}
                   projects={draftProjects}
-                  modelPicker={<ModelPicker portal prominent />}
                   onPickProject={setDraftProject}
                   onToggleAnonymous={setDraftAnonymous}
                 />
               )}
-              <ContextUsageBar
-                sessionId={activeSession?.id}
-                onOpenUsage={onOpenUsage ? () => onOpenUsage() : undefined}
-              />
               <MessageInput
                 key={activeSession?.id ?? activeDraft?.id ?? sessionId}
                 initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
@@ -620,72 +863,139 @@ export function WorkspacePage({
                 onInsertConsumed={() => setPendingInsert(undefined)}
                 cwd={activeCwd}
               />
+              <div
+                role="group"
+                aria-label="下一回合控制"
+                className="flex min-h-10 flex-wrap items-center gap-1.5 border-t border-border/60 bg-surface-1/35 px-3 py-1.5"
+              >
+                <ModelPicker portal />
+                {!activeDraft && !isAnonymous && <ReasoningEffortPicker />}
+                {!activeDraft && !isAnonymous && <PermissionModePicker />}
+                {!activeDraft && (
+                  <div className="ml-auto">
+                    <ContextUsageBar
+                      sessionId={activeSession?.id}
+                      onOpenUsage={onOpenUsage ? () => onOpenUsage() : undefined}
+                    />
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </main>
 
-        {browserPaneOpen && (
-          <RightWorkbenchPane
+        {auxiliaryPaneOpen && auxiliaryPaneKind && (
+          <>
+          {auxiliaryLayout !== "dock" && (
+            <div
+              aria-hidden="true"
+              className={`absolute inset-0 z-30 ${auxiliaryLayout === "overlay" ? "bg-black/40" : "bg-black/15"}`}
+              onMouseDown={collapseAuxiliaryPane}
+            />
+          )}
+          <WorkspaceAuxiliaryPane
+            paneRef={auxiliaryPaneRef}
+            kind={auxiliaryPaneKind}
+            layout={auxiliaryLayout}
+            width={auxiliaryPaneWidth}
+            maxWidth={auxiliaryPaneMaxWidth}
             sessions={activeBrowserSessions}
             documents={documentTabs}
-            activeTab={activeRightTab}
-            widthPercent={browserPaneWidth}
+            activeTab={selectedRightTab}
             loadError={browserLoadError}
+            suspendNativeBrowser={Boolean(pendingPermission)}
+            onRetryBrowserSessions={() => setBrowserRefreshRequest((request) => request + 1)}
             cwd={activeCwd}
-            onSelectTab={setActiveRightTab}
+            onSelectTab={(id) => {
+              setActiveRightTab(id);
+              setRequestedAuxiliaryPane(null);
+            }}
             onCloseDocument={(id) => {
               setDocumentTabs((tabs) => tabs.filter((tab) => tab.id !== id));
               setActiveRightTab((current) => current === id ? null : current);
+              requestAnimationFrame(() => {
+                const target = auxiliaryPaneRef.current?.querySelector<HTMLElement>(
+                  '[role="tab"][tabindex="0"], [data-auxiliary-initial-focus]',
+                );
+                if (target) target.focus();
+                else if (auxiliaryOpenerRef.current?.isConnected) auxiliaryOpenerRef.current.focus();
+                else workspaceMainRef.current?.focus();
+              });
             }}
-            onCollapse={() => setBrowserPaneCollapsed(true)}
+            onCollapse={collapseAuxiliaryPane}
             onCloseSession={(browserSessionId) => void closeBrowserPaneSession(browserSessionId)}
+            onResize={setAuxiliaryPaneWidth}
+            content={
+              auxiliaryPaneKind === "git" ? (
+                gitPanel === "history" ? (
+                  <GitHistoryPanel embedded onClose={() => {
+                    setGitPanel("changes");
+                    setAuxiliaryFocusRequest((request) => request + 1);
+                  }} />
+                ) : gitPanel === "remote" ? (
+                  <RemoteGitPanel embedded currentBranch={gitBranch} onClose={() => {
+                    setGitPanel("changes");
+                    setAuxiliaryFocusRequest((request) => request + 1);
+                  }} />
+                ) : (
+                  <GitChangesPanel
+                    embedded
+                    sessionId={activeDraft ? null : sessionId}
+                    onOpenHistory={() => {
+                      setGitPanel("history");
+                      setAuxiliaryFocusRequest((request) => request + 1);
+                    }}
+                    onOpenRemote={() => {
+                      setGitPanel("remote");
+                      setAuxiliaryFocusRequest((request) => request + 1);
+                    }}
+                    onClose={collapseAuxiliaryPane}
+                  />
+                )
+              ) : auxiliaryPaneKind === "tasks" ? (
+                isProjectSession && projectTaskCount > 0 ? (
+                  <TasksColumn
+                    sessionId={sessionId}
+                    highlightedTaskId={initialTaskLogId}
+                    onOpenSettings={onOpenSettings}
+                    onFocusPermission={() => {
+                      collapseAuxiliaryPane();
+                      requestAnimationFrame(() => {
+                        document.getElementById("workspace-permission-mode")?.focus();
+                      });
+                    }}
+                    onClose={closeTaskActivity}
+                  />
+                ) : projectTasksError ? (
+                  <TaskActivityState
+                    error={projectTasksError}
+                    onRetry={() => void loadProjectTasks(sessionId)}
+                    onClose={closeTaskActivity}
+                  />
+                ) : projectTasksLoading || projectTasks === undefined ? (
+                  <TaskActivityState onClose={closeTaskActivity} />
+                ) : (
+                  null
+                )
+              ) : auxiliaryPaneKind === "delivery" ? (
+                <WorkspaceDeliveryStatus
+                  detailsOnly
+                  cwd={activeCwd}
+                  sessionId={sessionId}
+                  currentBranch={gitBranch}
+                  messages={messages}
+                  onCloseDetails={collapseAuxiliaryPane}
+                  deliveryState={deliveryState}
+                />
+              ) : auxiliaryPaneKind === "evidence" ? (
+                <TurnEvidencePane evidenceId={evidenceId} messages={messages} onClose={collapseAuxiliaryPane} />
+              ) : null
+            }
           />
+          </>
         )}
 
       </div>
-
-      {taskActivityOpen && isProjectSession && projectTaskCount > 0 && (
-        <div
-          className="fixed inset-0 z-40 flex justify-end bg-black/20"
-          role="presentation"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) closeTaskActivity();
-          }}
-        >
-          <section
-            id="workspace-task-activity-dialog"
-            ref={taskActivityDialogRef}
-            role="dialog"
-            aria-label="任务活动"
-            aria-modal="true"
-            className="flex h-full w-[min(420px,92vw)] flex-col border-l border-border bg-surface-1 shadow-2xl"
-          >
-            <TasksColumn
-              sessionId={sessionId}
-              highlightedTaskId={initialTaskLogId}
-              onOpenSettings={onOpenSettings}
-              onClose={closeTaskActivity}
-            />
-          </section>
-        </div>
-      )}
-
-      {/* ── Git / environment slide-out panels (opened from the status bar) ─ */}
-      {gitPanel === "changes" && (
-        <GitChangesPanel
-          sessionId={activeDraft ? null : sessionId}
-          onOpenHistory={() => setGitPanel("history")}
-          onOpenRemote={() => setGitPanel("remote")}
-          onClose={() => setGitPanel(null)}
-        />
-      )}
-      {gitPanel === "history" && <GitHistoryPanel onClose={() => setGitPanel(null)} />}
-      {gitPanel === "remote" && (
-        <RemoteGitPanel
-          currentBranch={gitBranch}
-          onClose={() => setGitPanel(null)}
-        />
-      )}
 
       {/* ── Permission dialog overlay ───────────────────────────────────── */}
       {pendingPermission && (
@@ -705,52 +1015,201 @@ export function WorkspacePage({
 // EmbeddedBrowserPane
 // ─────────────────────────────────────────────────────────────────────────────
 
-function RightWorkbenchPane({ sessions, documents, activeTab, widthPercent, loadError, cwd, onSelectTab, onCloseDocument, onCollapse, onCloseSession }: {
+function WorkspaceAuxiliaryPane({ paneRef, kind, layout, width, maxWidth, sessions, documents, activeTab, loadError, suspendNativeBrowser, cwd, content, onSelectTab, onCloseDocument, onCollapse, onCloseSession, onResize, onRetryBrowserSessions }: {
+  paneRef: RefObject<HTMLElement>;
+  kind: AuxiliaryPaneKind;
+  layout: AuxiliaryLayout;
+  width: number;
+  maxWidth: number;
   sessions: WorkspaceBrowserSession[];
   documents: DocumentTab[];
   activeTab: string | null;
-  widthPercent: number;
   loadError: string | null;
+  suspendNativeBrowser: boolean;
   cwd?: string | null;
+  content: ReactNode;
   onSelectTab: (id: string) => void;
   onCloseDocument: (id: string) => void;
   onCollapse: () => void;
   onCloseSession: (sessionId: string) => void;
+  onResize: (width: number) => void;
+  onRetryBrowserSessions: () => void;
 }) {
-  const activeBrowser = sessions[0];
-  const selected = activeTab ?? (activeBrowser ? `browser:${activeBrowser.session_id}` : documents[0]?.id ?? null);
-  const activeDocument = documents.find((tab) => tab.id === selected);
+  const tabRefs = useRef(new Map<string, HTMLButtonElement>());
+  const tabs = [
+    ...sessions.map((session) => ({ id: `browser:${session.session_id}`, label: sessionTitle(session), kind: "browser" as const })),
+    ...documents.map((document) => ({ id: document.id, label: document.title, kind: "document" as const })),
+  ];
+  const selected = tabs.some((tab) => tab.id === activeTab) ? activeTab : tabs[0]?.id ?? null;
+  const activeBrowser = sessions.find((session) => `browser:${session.session_id}` === selected) ?? null;
+  const activeDocument = documents.find((tab) => tab.id === selected) ?? null;
+  const tabbed = kind === "browser" || kind === "document";
+  const resizable = tabbed || kind === "git";
+  const effectiveWidth = resizable
+    ? clampAuxiliaryPaneWidth(width, maxWidth)
+    : AUXILIARY_STATUS_PANE_WIDTH;
+  const activeTabDomId = selected ? `workspace-aux-tab-${selected.replace(/[^a-zA-Z0-9_-]/g, "-")}` : undefined;
+  const panelId = "workspace-auxiliary-tabpanel";
+
+  const selectAdjacentTab = (currentId: string, direction: -1 | 1) => {
+    const currentIndex = tabs.findIndex((tab) => tab.id === currentId);
+    if (currentIndex < 0 || tabs.length === 0) return;
+    const next = tabs[(currentIndex + direction + tabs.length) % tabs.length];
+    onSelectTab(next.id);
+    requestAnimationFrame(() => tabRefs.current.get(next.id)?.focus());
+  };
+
+  const beginResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = width;
+    const move = (pointerEvent: PointerEvent) => {
+      onResize(clampAuxiliaryPaneWidth(startWidth + startX - pointerEvent.clientX, maxWidth));
+    };
+    const end = () => {
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", end);
+    };
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", end);
+  };
+
+  const paneStyle = layout === "overlay"
+    ? { width: "100%" }
+    : { width: `${Math.min(effectiveWidth, viewportSafeWidth())}px`, maxWidth: "100%" };
+  const paneClass = layout === "dock"
+    ? "relative z-20 flex min-h-0 shrink-0 flex-col border-l border-border bg-surface-1"
+    : "absolute inset-y-0 right-0 z-40 flex min-h-0 flex-col border-l border-border bg-surface-1 shadow-2xl";
+
   return (
-    <aside aria-label={sessions.length > 0 ? "内置浏览器" : "右侧工作区"} data-browser-width={String(widthPercent)} className="hidden min-h-0 shrink-0 flex-col border-l border-border bg-surface-1 xl:flex" style={{ width: `${widthPercent}%`, minWidth: 420, maxWidth: "50%" }}>
-      <div className="flex min-w-0 items-center gap-1 border-b border-border px-2 py-1.5">
+    <aside
+      ref={paneRef}
+      id="workspace-auxiliary-pane"
+      data-testid="workspace-auxiliary-pane"
+      data-pane-kind={kind}
+      data-layout={layout}
+      aria-label={kind === "tasks" && layout !== "dock" ? "任务活动" : "辅助工作区"}
+      role={layout === "dock" ? "complementary" : "dialog"}
+      aria-modal={layout === "dock" ? undefined : layout === "overlay"}
+      tabIndex={-1}
+      className={paneClass}
+      style={paneStyle}
+    >
+      {resizable && layout === "dock" && (
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-label="调整辅助工作区宽度"
+          aria-orientation="vertical"
+          aria-valuemin={AUXILIARY_PANE_MIN_WIDTH}
+          aria-valuemax={maxWidth}
+          aria-valuenow={effectiveWidth}
+          onPointerDown={beginResize}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+              event.preventDefault();
+              const delta = event.key === "ArrowLeft" ? 24 : -24;
+              onResize(clampAuxiliaryPaneWidth(effectiveWidth + delta, maxWidth));
+            }
+          }}
+          className="absolute inset-y-0 -left-1.5 z-10 w-3 cursor-col-resize outline-none after:absolute after:inset-y-0 after:left-1/2 after:w-px after:bg-border hover:after:bg-accent focus:after:bg-accent"
+        />
+      )}
+      {tabbed && <div className="flex min-w-0 items-center gap-1 border-b border-border px-2 py-1.5">
         <div role="tablist" aria-label="右侧工作区标签" className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
-          {sessions.map((session) => {
-            const id = `browser:${session.session_id}`;
-            return <button key={id} type="button" role="tab" aria-selected={selected === id} onClick={() => onSelectTab(id)} className={`shrink-0 rounded px-2 py-1 text-[11px] ${selected === id ? "bg-surface-3 text-gray-200" : "text-gray-500 hover:bg-surface-2 hover:text-gray-300"}`}><Globe2 size={11} className="mr-1 inline" />{sessionTitle(session)}</button>;
-          })}
-          {documents.map((tab) => <button key={tab.id} type="button" role="tab" aria-selected={selected === tab.id} onClick={() => onSelectTab(tab.id)} className={`flex max-w-40 shrink-0 items-center gap-1 rounded px-2 py-1 text-[11px] ${selected === tab.id ? "bg-surface-3 text-gray-200" : "text-gray-500 hover:bg-surface-2 hover:text-gray-300"}`}><FileText size={11} /> <span className="truncate">{tab.title}</span></button>)}
+          {tabs.map((tab) => <button
+            key={tab.id}
+            id={`workspace-aux-tab-${tab.id.replace(/[^a-zA-Z0-9_-]/g, "-")}`}
+            ref={(element) => { if (element) tabRefs.current.set(tab.id, element); else tabRefs.current.delete(tab.id); }}
+            type="button"
+            role="tab"
+            aria-selected={selected === tab.id}
+            aria-controls={panelId}
+            tabIndex={selected === tab.id ? 0 : -1}
+            onClick={() => onSelectTab(tab.id)}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowLeft") { event.preventDefault(); selectAdjacentTab(tab.id, -1); }
+              if (event.key === "ArrowRight") { event.preventDefault(); selectAdjacentTab(tab.id, 1); }
+            }}
+            className={`flex min-h-11 min-w-11 max-w-44 shrink-0 items-center gap-1 rounded px-2 py-1 text-[11px] lg:min-h-9 lg:min-w-9 ${selected === tab.id ? "bg-surface-3 text-gray-200" : "text-gray-500 hover:bg-surface-2 hover:text-gray-300"}`}
+          >
+            {tab.kind === "browser" ? <Globe2 size={11} /> : <FileText size={11} />}
+            <span className="truncate">{tab.label}</span>
+          </button>)}
         </div>
-        <button type="button" onClick={onCollapse} className="shrink-0 rounded px-1.5 py-1 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200" title="临时折叠右侧工作区">折叠</button>
-      </div>
-      {loadError && <div className="border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-[11px] text-red-700 dark:text-red-300">浏览器状态读取失败：{loadError}</div>}
-      {activeDocument ? (
-        <DocumentPreview tab={activeDocument} cwd={cwd} onClose={() => onCloseDocument(activeDocument.id)} />
-      ) : activeBrowser ? (
-        <EmbeddedBrowserPane sessions={sessions} widthPercent={widthPercent} loadError={loadError} onCollapse={onCollapse} onCloseSession={onCloseSession} hideHeader />
-      ) : null}
+        <button data-auxiliary-initial-focus type="button" onClick={onCollapse} aria-label="折叠辅助工作区" className="min-h-11 min-w-11 shrink-0 rounded px-2 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200 lg:min-h-9 lg:min-w-9">折叠</button>
+      </div>}
+      {tabbed ? (
+        <div id={panelId} role="tabpanel" aria-labelledby={activeTabDomId} className="flex min-h-0 flex-1 flex-col">
+          {activeBrowser && loadError && (
+            <div role="alert" className="flex items-center gap-2 border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-[11px] text-red-700 dark:text-red-300">
+              <span className="min-w-0 flex-1 break-words">浏览器状态读取失败：{loadError}</span>
+              <button type="button" onClick={onRetryBrowserSessions} className="min-h-11 shrink-0 rounded-lg px-2 hover:bg-red-500/10 lg:min-h-9">重试</button>
+            </div>
+          )}
+          {activeDocument ? (
+            <DocumentPreview tab={activeDocument} cwd={cwd} onClose={() => onCloseDocument(activeDocument.id)} />
+          ) : activeBrowser ? (
+            <EmbeddedBrowserPane sessions={[activeBrowser]} width={effectiveWidth} suspended={suspendNativeBrowser} onCloseSession={onCloseSession} />
+          ) : null}
+        </div>
+      ) : content}
     </aside>
+  );
+}
+
+function viewportSafeWidth(): number {
+  return typeof window === "undefined" ? AUXILIARY_PANE_MAX_WIDTH : Math.max(0, window.innerWidth);
+}
+
+function TaskActivityState({ error, onRetry, onClose }: {
+  error?: string | null;
+  onRetry?: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <section className="flex min-h-0 flex-1 flex-col">
+      <header className="flex items-center gap-3 border-b border-border px-4 py-3">
+        <PanelRightOpen size={15} className="text-gray-500" aria-hidden="true" />
+        <h2 className="flex-1 text-sm font-semibold text-gray-200">任务活动</h2>
+        <button
+          data-auxiliary-initial-focus
+          type="button"
+          onClick={onClose}
+          aria-label="关闭任务活动"
+          className="flex h-11 w-11 items-center justify-center rounded-lg text-gray-500 hover:bg-surface-3 hover:text-gray-200 lg:h-9 lg:w-9"
+        >
+          <X size={14} aria-hidden="true" />
+        </button>
+      </header>
+      {error ? (
+        <div role="alert" className="m-4 rounded-lg border border-status-danger/25 bg-status-danger-soft p-4 text-xs text-status-danger">
+          <p className="break-words">任务活动读取失败：{error}</p>
+          <button
+            type="button"
+            onClick={onRetry}
+            className="mt-3 min-h-11 min-w-11 rounded-lg border border-current/20 px-3 font-medium hover:brightness-95 lg:min-h-9 lg:min-w-9"
+          >
+            重试加载任务
+          </button>
+        </div>
+      ) : (
+        <div role="status" className="m-4 flex items-center justify-center gap-2 rounded-lg border border-dashed border-border px-3 py-8 text-center text-xs text-gray-500">
+          <Loader2 size={14} className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
+          正在加载任务活动
+        </div>
+      )}
+    </section>
   );
 }
 
 // EmbeddedBrowserPane remains the isolated native-webview renderer. Its header
 // is supplied by RightWorkbenchPane so browser and document tabs share one rail.
-function EmbeddedBrowserPane({ sessions, widthPercent, loadError, onCollapse, onCloseSession, hideHeader = false }: {
+function EmbeddedBrowserPane({ sessions, width, suspended, onCloseSession }: {
   sessions: WorkspaceBrowserSession[];
-  widthPercent: number;
-  loadError: string | null;
-  onCollapse: () => void;
+  width: number;
+  suspended: boolean;
   onCloseSession: (sessionId: string) => void;
-  hideHeader?: boolean;
 }) {
   const active = sessions[0];
   if (!active) return null;
@@ -758,54 +1217,94 @@ function EmbeddedBrowserPane({ sessions, widthPercent, loadError, onCollapse, on
   const title = sessionTitle(active);
   const safeUrl = active.pane_url && /^https?:\/\//i.test(active.pane_url) ? active.pane_url : null;
   const viewportRef = useRef<HTMLDivElement>(null);
+  const mountInFlightRef = useRef(false);
+  const mountFailedRef = useRef(false);
+  const visibilityFallbackRef = useRef(false);
+  const suspendedRef = useRef(suspended);
+  const [mountError, setMountError] = useState<string | null>(null);
+  suspendedRef.current = suspended;
 
-  const syncNativeWebView = useCallback(() => {
-    if (!safeUrl || !viewportRef.current) return;
+  const syncNativeWebView = useCallback(async () => {
+    if (
+      suspendedRef.current ||
+      mountFailedRef.current ||
+      mountInFlightRef.current ||
+      !safeUrl ||
+      !viewportRef.current
+    ) return;
     const rect = viewportRef.current.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
-    void invoke("embedded_browser_mount", {
-      sessionId: active.session_id,
-      url: safeUrl,
-      bounds: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
-    });
+    mountInFlightRef.current = true;
+    try {
+      await invoke("embedded_browser_mount", {
+        sessionId: active.session_id,
+        url: safeUrl,
+        bounds: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+      });
+      setMountError(null);
+    } catch (error) {
+      mountFailedRef.current = true;
+      setMountError(String(error));
+    } finally {
+      mountInFlightRef.current = false;
+    }
   }, [active.session_id, safeUrl]);
 
   useEffect(() => {
-    syncNativeWebView();
+    mountFailedRef.current = false;
+    setMountError(null);
+    void syncNativeWebView();
     if (!safeUrl) return;
-    const onResize = () => syncNativeWebView();
+    const onResize = () => { void syncNativeWebView(); };
     window.addEventListener("resize", onResize);
-    const timer = window.setInterval(syncNativeWebView, 1000);
+    const timer = window.setInterval(() => { void syncNativeWebView(); }, 1000);
     return () => {
       window.removeEventListener("resize", onResize);
       window.clearInterval(timer);
-      void invoke("embedded_browser_unmount", { sessionId: active.session_id });
+      void invoke("embedded_browser_unmount", { sessionId: active.session_id }).catch(() => {});
     };
   }, [active.session_id, safeUrl, syncNativeWebView]);
 
+  useEffect(() => {
+    if (!safeUrl) return;
+    if (!suspended && visibilityFallbackRef.current) {
+      visibilityFallbackRef.current = false;
+      mountFailedRef.current = false;
+      setMountError(null);
+    }
+    void invoke("embedded_browser_set_visible", {
+      sessionId: active.session_id,
+      visible: !suspended,
+    }).catch((error) => {
+      if (!suspended) {
+        setMountError(`内置浏览器可见性恢复失败：${String(error)}`);
+        return;
+      }
+      // A native child sits above the DOM compositor. If hiding it fails while
+      // a permission modal owns the foreground, close only the child webview
+      // (not the managed browser session) so it cannot intercept approval input.
+      visibilityFallbackRef.current = true;
+      setMountError(`权限确认前无法暂停内置浏览器：${String(error)}`);
+      void invoke("embedded_browser_unmount", { sessionId: active.session_id }).catch(() => {});
+    });
+    if (!suspended) void syncNativeWebView();
+  }, [active.session_id, safeUrl, suspended, syncNativeWebView]);
+
   return (
     <div
-      aria-label={hideHeader ? undefined : "内置浏览器"}
-      data-browser-width={String(widthPercent)}
-      className="hidden min-h-0 shrink-0 flex-col border-l border-border bg-surface-1 xl:flex"
-      style={{ width: `${widthPercent}%`, minWidth: 420, maxWidth: "50%" }}
+      aria-label="内置浏览器"
+      data-browser-width={String(width)}
+      className="flex min-h-0 flex-1 flex-col bg-surface-1"
     >
-      {hideHeader && <div className="flex items-center gap-2 border-b border-border px-3 py-2"><Globe2 size={14} className="shrink-0 text-accent" aria-hidden="true" /><div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-gray-200">{host}</div><div className="truncate text-[11px] text-gray-500">{title}</div></div><button type="button" onClick={() => onCloseSession(active.session_id)} className="rounded bg-red-500/10 px-1.5 py-1 text-[11px] text-red-700 dark:text-red-300" aria-label="结束浏览器">结束</button></div>}
-      {!hideHeader && <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
         <Globe2 size={14} className="shrink-0 text-accent" aria-hidden="true" />
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs font-medium text-gray-200">{host}</div>
           <div className="truncate text-[11px] text-gray-500">{title}</div>
         </div>
         {sessions.length > 1 && <span className="rounded-full bg-accent/10 px-1.5 py-0.5 text-[11px] text-accent">{sessions.length}</span>}
-        <button type="button" onClick={onCollapse} className="rounded px-1.5 py-1 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200" title="临时折叠浏览器">折叠</button>
-        <button type="button" onClick={() => onCloseSession(active.session_id)} className="rounded bg-red-500/10 px-1.5 py-1 text-[11px] text-red-700 hover:bg-red-500/20 dark:text-red-300" aria-label="结束浏览器" title="结束当前会话的受管浏览器">结束</button>
-      </div>}
-      {loadError && (
-        <div className="border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-[11px] text-red-700 dark:text-red-300">
-          浏览器状态读取失败：{loadError}
-        </div>
-      )}
+        <button type="button" onClick={() => onCloseSession(active.session_id)} className="min-h-11 min-w-11 rounded bg-red-500/10 px-2 text-[11px] text-red-700 hover:bg-red-500/20 dark:text-red-300 lg:min-h-9 lg:min-w-9" aria-label="结束浏览器" title="结束当前会话的受管浏览器">结束</button>
+      </div>
       <div className="flex min-h-0 flex-1 flex-col bg-surface-0">
         {safeUrl ? (
           <div
@@ -815,9 +1314,30 @@ function EmbeddedBrowserPane({ sessions, widthPercent, loadError, onCollapse, on
             className="relative min-h-0 flex-1 overflow-hidden bg-white"
             data-codefactory-browser-session={active.session_id}
           >
-            <div className="absolute inset-0 flex items-center justify-center bg-white text-xs text-gray-600">
-              正在内置浏览器中打开 {host}
-            </div>
+            {mountError ? (
+              <div role="alert" className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-white p-6 text-center text-xs text-red-700">
+                <div>
+                  <p className="font-medium">内置浏览器打开失败</p>
+                  <p className="mt-1 max-w-sm break-words text-gray-600">{mountError}</p>
+                </div>
+                <button
+                  type="button"
+                  aria-label="重试内置浏览器"
+                  onClick={() => {
+                    mountFailedRef.current = false;
+                    setMountError(null);
+                    void syncNativeWebView();
+                  }}
+                  className="min-h-11 rounded-lg border border-red-200 px-3 text-xs text-red-700 hover:bg-red-50 lg:min-h-9"
+                >
+                  重试
+                </button>
+              </div>
+            ) : (
+              <div className="absolute inset-0 flex items-center justify-center bg-white text-xs text-gray-600">
+                {suspended ? "权限确认期间已暂停网页交互" : `正在内置浏览器中打开 ${host}`}
+              </div>
+            )}
           </div>
         ) : (
           <div className="flex flex-1 items-center justify-center p-6 text-center text-xs text-gray-500">
@@ -833,16 +1353,96 @@ function EmbeddedBrowserPane({ sessions, widthPercent, loadError, onCollapse, on
   );
 }
 
+function turnEvidenceArgs(args: string): { summary: string | null; full: string } {
+  try {
+    const parsed = JSON.parse(args) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { summary: null, full: args };
+    }
+    const record = parsed as Record<string, unknown>;
+    const summary = [record.path, record.command, record.cwd, record.url]
+      .find((value): value is string => typeof value === "string" && value.trim().length > 0)
+      ?? null;
+    return { summary, full: JSON.stringify(record, null, 2) };
+  } catch {
+    return { summary: args.trim() || null, full: args };
+  }
+}
+
+export function TurnEvidencePane({ evidenceId, messages, onClose }: {
+  evidenceId: string | null;
+  messages: UIMessage[];
+  onClose: () => void;
+}) {
+  const message = messages.find((candidate) => candidate.id === evidenceId) ?? null;
+  const calls = message?.turnToolCalls ?? message?.toolCalls ?? [];
+  const totalCallCount = Math.max(calls.length, message?.turnToolCallCount ?? 0);
+  return (
+    <section className="flex min-h-0 flex-1 flex-col">
+      <header className="flex items-start gap-3 border-b border-border px-4 py-3">
+        <CheckCircle2 size={15} className="mt-0.5 text-accent" aria-hidden="true" />
+        <div className="min-w-0 flex-1">
+          <h2 className="text-sm font-semibold text-gray-100">回合证据</h2>
+          <p className="mt-0.5 text-[11px] text-gray-600">本回合实际执行的工具、验证与失败边界。</p>
+        </div>
+        <button data-auxiliary-initial-focus type="button" onClick={onClose} aria-label="关闭回合证据" className="flex h-11 w-11 items-center justify-center rounded text-gray-500 hover:bg-surface-3 hover:text-gray-200 lg:h-9 lg:w-9"><X size={14} /></button>
+      </header>
+      <div className="min-h-0 flex-1 overflow-y-auto p-4">
+        {!message ? (
+          <p className="rounded-lg border border-dashed border-border px-3 py-8 text-center text-xs text-gray-600">该回合的证据仍保留在消息结果卡中。</p>
+        ) : (
+          <div className="space-y-3">
+            {message.failureEvidence && <div className="rounded-lg border border-status-warning/25 bg-status-warning-soft p-3 text-xs leading-5 text-status-warning">{message.failureEvidence}</div>}
+            {totalCallCount > calls.length && (
+              <p role="status" className="rounded-lg border border-status-info/25 bg-status-info-soft px-3 py-2 text-xs text-status-info">
+                仅显示最近 {calls.length}/{totalCallCount} 项操作
+              </p>
+            )}
+            <ol className="space-y-1" aria-label="回合操作证据">
+              {calls.map((call) => {
+                const input = turnEvidenceArgs(call.args);
+                return (
+                  <li key={call.id} className="flex items-start gap-2 rounded-lg border border-border/60 bg-surface-2 px-3 py-2 text-xs">
+                    {call.status === "done" && !call.isError ? <CheckCircle2 size={13} aria-hidden="true" className="mt-0.5 shrink-0 text-status-success" /> : <AlertTriangle size={13} aria-hidden="true" className="mt-0.5 shrink-0 text-status-warning" />}
+                    <div className="min-w-0 flex-1 space-y-1.5">
+                      <div className="font-mono text-gray-300">{call.name}</div>
+                      {input.summary && <code className="block break-all text-[11px] text-gray-500">{input.summary}</code>}
+                      {input.full && (
+                        <details>
+                          <summary className="cursor-pointer text-[11px] text-gray-500 hover:text-gray-300">完整输入</summary>
+                          <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-surface-0 p-2 text-[11px] text-gray-500">{input.full}</pre>
+                        </details>
+                      )}
+                      {call.result && (
+                        <details open={Boolean(call.isError)}>
+                          <summary className="cursor-pointer text-[11px] text-gray-500 hover:text-gray-300">完整输出</summary>
+                          <pre className="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded bg-surface-0 p-2 text-[11px] text-gray-500">{call.result}</pre>
+                        </details>
+                      )}
+                    </div>
+                  </li>
+                );
+              })}
+            </ol>
+            {calls.length === 0 && !message.failureEvidence && <p className="text-xs text-gray-600">本回合没有工具或失败证据。</p>}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TasksColumn
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Task decomposition is internal to the conversation; this panel only renders
 // the execution detail after the agent has delegated work.
-function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onClose }: {
+function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onFocusPermission, onClose }: {
   sessionId: string;
   highlightedTaskId?: string | null;
   onOpenSettings: (tab: "endpoints") => void;
+  onFocusPermission: () => void;
   onClose: () => void;
 }) {
   const { tasks, running, cancel } = useTasksStore();
@@ -871,7 +1471,7 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onClose }: 
           <h2 className="text-sm font-medium text-gray-200">任务活动</h2>
           <p className="text-[11px] text-gray-600">后台步骤、验收结果与恢复操作</p>
         </div>
-        <button data-dialog-initial-focus type="button" onClick={onClose} aria-label="关闭任务活动" className="flex h-8 w-8 items-center justify-center rounded-lg text-gray-500 hover:bg-surface-3 hover:text-gray-200">
+        <button data-dialog-initial-focus type="button" onClick={onClose} aria-label="关闭任务活动" className="flex h-11 w-11 items-center justify-center rounded-lg text-gray-500 hover:bg-surface-3 hover:text-gray-200 lg:h-9 lg:w-9">
           <X size={15} />
         </button>
       </div>
@@ -893,7 +1493,7 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onClose }: 
         )}
         <div className="flex flex-wrap items-center gap-1">
           {isRunning ? (
-            <button onClick={() => void handleCancel()} className="flex min-h-8 items-center gap-1.5 rounded-lg bg-status-danger-soft px-2.5 text-[13px] text-status-danger hover:brightness-95"><Square size={11} />停止</button>
+            <button onClick={() => void handleCancel()} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-status-danger-soft px-2.5 text-[13px] text-status-danger hover:brightness-95 lg:min-h-9"><Square size={11} />停止</button>
           ) : pendingCount > 0 && failedTasks.length === 0 ? (
             <span className="text-[12px] leading-5 text-gray-500">任务已委派，系统会持续调度并自动诊断恢复，无需手动重试。</span>
           ) : null}
@@ -901,7 +1501,7 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onClose }: 
             <button onClick={() => onOpenSettings("endpoints")} className="min-h-8 rounded-lg bg-status-progress-soft px-2.5 text-[13px] text-status-progress hover:brightness-95">打开模型设置</button>
           )}
           {!isRunning && permissionBlockedTasks.length > 0 && (
-            <button onClick={() => onOpenSettings("endpoints")} className="min-h-8 rounded-lg bg-status-progress-soft px-2.5 text-[13px] text-status-progress hover:brightness-95">调整会话权限</button>
+            <button onClick={onFocusPermission} className="min-h-8 rounded-lg bg-status-progress-soft px-2.5 text-[13px] text-status-progress hover:brightness-95">调整会话权限</button>
           )}
           {!isRunning && systemRecoveryTasks.length > 0 && (
             <span role="status" className="text-[12px] leading-5 text-status-warning">
@@ -964,7 +1564,7 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
               <button
                 onClick={() => setVerifOpen((v) => !v)}
                 title={`验收验证：${summary.passed}/${summary.total} 通过（点击展开逐条）`}
-                className={`mt-0.5 inline-flex min-h-7 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] transition-colors hover:bg-surface-2 ${
+                className={`mt-0.5 inline-flex min-h-11 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] transition-colors hover:bg-surface-2 lg:min-h-9 ${
                   summary.allPassed ? "text-status-success" : "text-status-danger"
                 }`}
               >
@@ -1036,7 +1636,7 @@ function VerifCheckRow({ result }: { result: VerificationResult }) {
   return (
     <div className="rounded bg-surface-2">
       <div
-        className={`flex items-center gap-1.5 px-1.5 py-0.5 ${hasOutput ? "cursor-pointer" : ""}`}
+        className={`flex min-h-11 items-center gap-1.5 px-1.5 py-0.5 lg:min-h-9 ${hasOutput ? "cursor-pointer" : ""}`}
         role={hasOutput ? "button" : undefined}
         tabIndex={hasOutput ? 0 : undefined}
         aria-expanded={hasOutput ? showOutput : undefined}

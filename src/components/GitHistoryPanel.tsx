@@ -1,16 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useState } from "react";
-import { X, History, RefreshCw, ChevronRight, ChevronDown } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { X, History, RefreshCw, ChevronLeft, ChevronRight, ChevronDown } from "lucide-react";
 import { useGitStore } from "../stores/git";
 
 interface Props {
   onClose: () => void;
+  embedded?: boolean;
 }
 
-export function GitHistoryPanel({ onClose }: Props) {
+export function GitHistoryPanel({ onClose, embedded = false }: Props) {
   const { commits, refreshCommits } = useGitStore();
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
+  const [isNarrowEmbedded, setIsNarrowEmbedded] = useState(embedded);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!embedded) {
+      setIsNarrowEmbedded(false);
+      return;
+    }
+    const panel = panelRef.current;
+    if (!panel) return;
+    const update = () => setIsNarrowEmbedded(panel.getBoundingClientRect().width < 640);
+    update();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(update);
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [embedded]);
 
   useEffect(() => {
     setLoading(true);
@@ -36,24 +54,35 @@ export function GitHistoryPanel({ onClose }: Props) {
   };
 
   return (
-    <div className="fixed right-0 top-0 bottom-0 z-40 w-[480px] max-w-[70vw] bg-surface-1 border-l border-border shadow-2xl flex flex-col">
+    <div
+      ref={panelRef}
+      data-embedded-layout={embedded ? (isNarrowEmbedded ? "narrow" : "wide") : undefined}
+      className={embedded
+        ? "flex min-h-0 h-full w-full flex-col overflow-hidden bg-surface-1"
+        : "fixed right-0 top-0 bottom-0 z-40 w-[480px] max-w-[70vw] bg-surface-1 border-l border-border shadow-2xl flex flex-col"}
+    >
       {/* Header */}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0">
+      <div className={`flex items-center gap-2 px-3 py-2 border-b border-border shrink-0 ${embedded && isNarrowEmbedded ? "flex-wrap" : "flex-nowrap"}`}>
         <History size={14} className="text-gray-400" />
         <span className="text-xs font-semibold text-gray-200 flex-1">历史记录</span>
         <button
           onClick={handleRefresh}
-          className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors"
+          aria-label="刷新提交历史"
+          className={`inline-flex shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-300 ${embedded && isNarrowEmbedded ? "h-11 w-11" : "h-9 w-9"}`}
           title="刷新"
         >
           <RefreshCw size={12} className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
         </button>
         <button
           onClick={onClose}
-          className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors"
-          title="关闭"
+          aria-label={embedded ? "返回本地 Git" : "关闭"}
+          data-auxiliary-initial-focus={embedded ? true : undefined}
+          className={embedded
+            ? `inline-flex shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-300 ${isNarrowEmbedded ? "h-11 w-11" : "h-9 w-9"}`
+            : "inline-flex h-9 w-9 shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-300"}
+          title={embedded ? "返回本地 Git" : "关闭"}
         >
-          <X size={14} />
+          {embedded ? <ChevronLeft size={14} /> : <X size={14} />}
         </button>
       </div>
 
@@ -66,10 +95,16 @@ export function GitHistoryPanel({ onClose }: Props) {
         )}
         {commits.map((c) => {
           const isExpanded = expanded.has(c.hash);
+          const commitId = `git-history-commit-${c.hash}`;
+          const detailsId = `git-history-details-${c.hash}`;
           return (
             <div key={c.hash} className="border-b border-border">
               <button
+                id={commitId}
                 onClick={() => toggle(c.hash)}
+                aria-label={`${c.short_hash} ${c.message}`}
+                aria-expanded={isExpanded}
+                aria-controls={detailsId}
                 className="w-full text-left px-3 py-2 hover:bg-surface-2 transition-colors flex items-start gap-2"
               >
                 {isExpanded ? (
@@ -89,20 +124,24 @@ export function GitHistoryPanel({ onClose }: Props) {
                   </div>
                 </div>
               </button>
-              {isExpanded && (
-                <div className="px-3 pb-2 pt-0 ml-5">
-                  <pre className="text-[11px] text-gray-400 whitespace-pre-wrap break-words font-mono bg-surface-2 rounded p-2 border border-border">
-                    {c.message_body || c.message}
-                  </pre>
-                  <div className="mt-1.5 text-[11px] text-gray-600">
-                    <span className="font-mono">{c.hash}</span>
-                    <span className="mx-1">·</span>
-                    <span>{c.email}</span>
-                    <span className="mx-1">·</span>
-                    <span>{new Date(c.timestamp * 1000).toLocaleString()}</span>
-                  </div>
+              <div
+                id={detailsId}
+                role="region"
+                aria-labelledby={commitId}
+                hidden={!isExpanded}
+                className="px-3 pb-2 pt-0 ml-5"
+              >
+                <pre className="text-[11px] text-gray-400 whitespace-pre-wrap break-words font-mono bg-surface-2 rounded p-2 border border-border">
+                  {c.message_body || c.message}
+                </pre>
+                <div className="mt-1.5 text-[11px] text-gray-600">
+                  <span className="font-mono">{c.hash}</span>
+                  <span className="mx-1">·</span>
+                  <span>{c.email}</span>
+                  <span className="mx-1">·</span>
+                  <span>{new Date(c.timestamp * 1000).toLocaleString()}</span>
                 </div>
-              )}
+              </div>
             </div>
           );
         })}
