@@ -199,7 +199,12 @@ mod tests {
             .find(|body| body.contains("simulated async failure"))
             .expect("the panic must be on disk, not only on stderr");
         assert!(record.contains("thread: tokio-rt-worker"), "{record}");
-        assert!(record.contains("location: src/panic_log.rs:"), "{record}");
+        // `file!()` uses the host separator — `src/panic_log.rs` on unix,
+        // `src\panic_log.rs` on Windows — so match on the parts, not the
+        // joined path. Asserting the unix spelling passed locally and failed
+        // the whole release build on the windows-latest runner.
+        assert!(record.contains("location: src"), "{record}");
+        assert!(record.contains("panic_log.rs:"), "{record}");
         assert!(record.contains(env!("CARGO_PKG_VERSION")), "{record}");
 
         let _ = std::panic::take_hook();
