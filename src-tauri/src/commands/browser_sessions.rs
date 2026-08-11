@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::errors::AppError;
 use crate::tools::browser_session::{self, BrowserSessionView};
-use tauri::{Manager, WebviewUrl};
+use tauri::{Emitter, Manager, WebviewUrl};
+
+const EMBEDDED_BROWSER_ESCAPE_EVENT: &str = "embedded-browser:escape";
+const EMBEDDED_BROWSER_ESCAPE_URL: &str =
+    "https://codefactory.invalid/.well-known/embedded-browser-escape";
 
 #[derive(Debug, serde::Deserialize)]
 pub struct EmbeddedBrowserBounds {
@@ -20,13 +24,85 @@ fn embedded_label(session_id: &str) -> String {
 }
 
 fn parse_https_url(url: &str) -> Result<url::Url, AppError> {
-    let parsed = url::Url::parse(url).map_err(|e| AppError::Other(format!("Invalid browser URL: {e}")))?;
+    let parsed =
+        url::Url::parse(url).map_err(|e| AppError::Other(format!("Invalid browser URL: {e}")))?;
     match parsed.scheme() {
         "http" | "https" => Ok(parsed),
         scheme => Err(AppError::Other(format!(
             "Embedded browser only supports HTTP(S) URLs, got {scheme}"
         ))),
     }
+}
+
+trait EmbeddedBrowserVisibilityTarget {
+    type Error: std::fmt::Display;
+
+    fn show_embedded_browser(&self) -> Result<(), Self::Error>;
+    fn hide_embedded_browser(&self) -> Result<(), Self::Error>;
+}
+
+impl<R: tauri::Runtime> EmbeddedBrowserVisibilityTarget for tauri::Webview<R> {
+    type Error = tauri::Error;
+
+    fn show_embedded_browser(&self) -> Result<(), Self::Error> {
+        self.show()
+    }
+
+    fn hide_embedded_browser(&self) -> Result<(), Self::Error> {
+        self.hide()
+    }
+}
+
+fn apply_embedded_browser_visibility<T: EmbeddedBrowserVisibilityTarget>(
+    webview: Option<&T>,
+    visible: bool,
+) -> Result<(), AppError> {
+    let Some(webview) = webview else {
+        return Ok(());
+    };
+
+    if visible {
+        webview
+            .show_embedded_browser()
+            .map_err(|e| AppError::Other(format!("Failed to show embedded browser: {e}")))
+    } else {
+        webview
+            .hide_embedded_browser()
+            .map_err(|e| AppError::Other(format!("Failed to hide embedded browser: {e}")))
+    }
+}
+
+fn embedded_browser_escape_bridge_script() -> String {
+    format!(
+        r#"
+(() => {{
+  if (window.__CODEFACTORY_EMBEDDED_ESCAPE_BRIDGE__) return;
+  Object.defineProperty(window, "__CODEFACTORY_EMBEDDED_ESCAPE_BRIDGE__", {{ value: true }});
+  window.addEventListener("keydown", (event) => {{
+    if (event.key !== "Escape" || event.repeat || event.isComposing) return;
+    // Let the page finish its own Escape handling first. In dock layout the
+    // host intentionally ignores the bridge event, so the native page must
+    // never lose its normal keyboard behavior.
+    window.setTimeout(() => {{
+      window.location.href = "{EMBEDDED_BROWSER_ESCAPE_URL}";
+    }}, 0);
+  }}, true);
+}})();
+"#,
+    )
+}
+
+fn handle_embedded_browser_navigation<E: std::fmt::Display>(
+    url: &url::Url,
+    emit_escape: impl FnOnce() -> Result<(), E>,
+) -> bool {
+    if url.as_str() == EMBEDDED_BROWSER_ESCAPE_URL {
+        if let Err(error) = emit_escape() {
+            tracing::warn!("Could not bridge embedded browser Escape to main webview: {error}");
+        }
+        return false;
+    }
+    matches!(url.scheme(), "http" | "https")
 }
 
 #[tauri::command]
@@ -51,7 +127,10 @@ pub async fn close_browser_session(session_id: String) -> Result<(), AppError> {
 #[tauri::command]
 pub async fn browser_bridge_pairing() -> Result<serde_json::Value, AppError> {
     let bridge = std::sync::Arc::clone(&crate::tools::browser_session::BRIDGE);
-    let pairing = bridge.start().await.map_err(|error| AppError::Other(error.to_string()))?;
+    let pairing = bridge
+        .start()
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?;
     Ok(serde_json::json!({
         "port": pairing.port,
         "token": pairing.token,
@@ -94,9 +173,8 @@ pub async fn browser_extension_prepare() -> Result<serde_json::Value, AppError> 
 /// a path under AppData from memory.
 #[tauri::command]
 pub async fn browser_extension_reveal() -> Result<(), AppError> {
-    let dir = crate::browser::extension_package::existing_dir().ok_or_else(|| {
-        AppError::Other("The extension folder has not been prepared yet.".into())
-    })?;
+    let dir = crate::browser::extension_package::existing_dir()
+        .ok_or_else(|| AppError::Other("The extension folder has not been prepared yet.".into()))?;
     open_path(&dir)
 }
 
@@ -119,12 +197,7 @@ pub async fn browser_open_extensions_page() -> Result<(), AppError> {
         .arg("chrome://extensions")
         .spawn()
         .map(|_| ())
-        .map_err(|error| {
-            AppError::Other(format!(
-                "Could not start {}: {error}",
-                chrome.display()
-            ))
-        })
+        .map_err(|error| AppError::Other(format!("Could not start {}: {error}", chrome.display())))
 }
 
 /// Open a path in the platform's file manager.
@@ -180,7 +253,9 @@ pub async fn browser_chromium_status() -> Result<serde_json::Value, AppError> {
 
 /// Download the app-managed Chromium, emitting progress to the frontend.
 #[tauri::command]
-pub async fn browser_download_chromium(app: tauri::AppHandle) -> Result<serde_json::Value, AppError> {
+pub async fn browser_download_chromium(
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, AppError> {
     use tauri::Emitter;
     let install = crate::browser::download::ensure_installed(&move |progress| {
         // Progress is emitted rather than returned so a 150 MB download can show
@@ -214,8 +289,19 @@ pub async fn embedded_browser_mount(
         return Ok(());
     }
 
+    let escape_app = app.clone();
+    let escape_session_id = session_id.clone();
     let builder = tauri::webview::WebviewBuilder::new(label, WebviewUrl::External(url))
-        .on_navigation(|url| matches!(url.scheme(), "http" | "https"));
+        .initialization_script(embedded_browser_escape_bridge_script())
+        .on_navigation(move |url| {
+            handle_embedded_browser_navigation(url, || {
+                escape_app.emit_to(
+                    tauri::EventTarget::webview("main"),
+                    EMBEDDED_BROWSER_ESCAPE_EVENT,
+                    serde_json::json!({ "session_id": escape_session_id.as_str() }),
+                )
+            })
+        });
     window
         .add_child(
             builder,
@@ -250,8 +336,29 @@ pub async fn embedded_browser_resize(
     Ok(())
 }
 
+/// Show or hide an already-mounted child webview without destroying its page
+/// state. A session can be unmounted while a frontend transition is in flight,
+/// so absence of either the main window or child webview is intentionally a
+/// successful no-op.
 #[tauri::command]
-pub async fn embedded_browser_unmount(app: tauri::AppHandle, session_id: String) -> Result<(), AppError> {
+pub async fn embedded_browser_set_visible(
+    app: tauri::AppHandle,
+    session_id: String,
+    visible: bool,
+) -> Result<(), AppError> {
+    let Some(window) = app.get_window("main") else {
+        return Ok(());
+    };
+    let label = embedded_label(&session_id);
+    let webview = window.webviews().into_iter().find(|w| w.label() == label);
+    apply_embedded_browser_visibility(webview.as_ref(), visible)
+}
+
+#[tauri::command]
+pub async fn embedded_browser_unmount(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<(), AppError> {
     if let Some(window) = app.get_window("main") {
         let label = embedded_label(&session_id);
         if let Some(webview) = window.webviews().into_iter().find(|w| w.label() == label) {
@@ -261,4 +368,148 @@ pub async fn embedded_browser_unmount(app: tauri::AppHandle, session_id: String)
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct FakeEmbeddedBrowser<'a> {
+        show_calls: &'a Cell<usize>,
+        hide_calls: &'a Cell<usize>,
+        fail_show: bool,
+        fail_hide: bool,
+    }
+
+    impl EmbeddedBrowserVisibilityTarget for FakeEmbeddedBrowser<'_> {
+        type Error = &'static str;
+
+        fn show_embedded_browser(&self) -> Result<(), Self::Error> {
+            self.show_calls.set(self.show_calls.get() + 1);
+            if self.fail_show {
+                Err("show failed")
+            } else {
+                Ok(())
+            }
+        }
+
+        fn hide_embedded_browser(&self) -> Result<(), Self::Error> {
+            self.hide_calls.set(self.hide_calls.get() + 1);
+            if self.fail_hide {
+                Err("hide failed")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_browser_visibility_is_a_safe_noop_when_not_mounted() {
+        let result = apply_embedded_browser_visibility::<FakeEmbeddedBrowser<'_>>(None, true);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn embedded_browser_visibility_uses_show_or_hide_for_the_requested_state() {
+        let show_calls = Cell::new(0);
+        let hide_calls = Cell::new(0);
+        let browser = FakeEmbeddedBrowser {
+            show_calls: &show_calls,
+            hide_calls: &hide_calls,
+            fail_show: false,
+            fail_hide: false,
+        };
+
+        apply_embedded_browser_visibility(Some(&browser), true).expect("show succeeds");
+        assert_eq!(show_calls.get(), 1);
+        assert_eq!(hide_calls.get(), 0);
+
+        apply_embedded_browser_visibility(Some(&browser), false).expect("hide succeeds");
+        assert_eq!(show_calls.get(), 1);
+        assert_eq!(hide_calls.get(), 1);
+    }
+
+    #[test]
+    fn embedded_browser_visibility_maps_native_failures_to_app_error() {
+        let show_calls = Cell::new(0);
+        let hide_calls = Cell::new(0);
+        let browser = FakeEmbeddedBrowser {
+            show_calls: &show_calls,
+            hide_calls: &hide_calls,
+            fail_show: true,
+            fail_hide: true,
+        };
+
+        let show_error = apply_embedded_browser_visibility(Some(&browser), true)
+            .expect_err("native show failure is surfaced");
+        assert_eq!(
+            show_error.to_string(),
+            "Failed to show embedded browser: show failed"
+        );
+
+        let hide_error = apply_embedded_browser_visibility(Some(&browser), false)
+            .expect_err("native hide failure is surfaced");
+        assert_eq!(
+            hide_error.to_string(),
+            "Failed to hide embedded browser: hide failed"
+        );
+    }
+
+    #[test]
+    fn embedded_browser_escape_script_preserves_the_pages_native_escape_behavior() {
+        let script = embedded_browser_escape_bridge_script();
+
+        assert!(script.contains("addEventListener(\"keydown\""));
+        assert!(script.contains("event.key !== \"Escape\""));
+        assert!(script.contains("window.setTimeout"));
+        assert!(!script.contains("event.preventDefault()"));
+        assert!(!script.contains("event.stopPropagation()"));
+        assert!(!script.contains("event.stopImmediatePropagation()"));
+        assert!(script.contains(EMBEDDED_BROWSER_ESCAPE_URL));
+        assert!(!script.contains("__TAURI_INTERNALS__"));
+        assert!(!script.contains("window.ipc"));
+    }
+
+    #[test]
+    fn embedded_browser_navigation_bridges_only_the_escape_sentinel() {
+        let escape_emissions = Cell::new(0);
+        let escape_url = url::Url::parse(EMBEDDED_BROWSER_ESCAPE_URL).unwrap();
+        let allowed = handle_embedded_browser_navigation(&escape_url, || {
+            escape_emissions.set(escape_emissions.get() + 1);
+            Ok::<(), &'static str>(())
+        });
+        // Returning false cancels the sentinel navigation, so the current page
+        // remains mounted after the Escape event is bridged.
+        assert!(!allowed);
+        assert_eq!(escape_emissions.get(), 1);
+
+        let ordinary_url = url::Url::parse("https://example.com/next").unwrap();
+        let allowed = handle_embedded_browser_navigation(&ordinary_url, || {
+            escape_emissions.set(escape_emissions.get() + 1);
+            Ok::<(), &'static str>(())
+        });
+        assert!(allowed);
+        assert_eq!(escape_emissions.get(), 1);
+
+        let blocked_url = url::Url::parse("file:///tmp/not-allowed").unwrap();
+        let allowed = handle_embedded_browser_navigation(&blocked_url, || {
+            escape_emissions.set(escape_emissions.get() + 1);
+            Ok::<(), &'static str>(())
+        });
+        assert!(!allowed);
+        assert_eq!(escape_emissions.get(), 1);
+    }
+
+    #[test]
+    fn embedded_browser_escape_stays_consumed_when_event_delivery_fails() {
+        let escape_url = url::Url::parse(EMBEDDED_BROWSER_ESCAPE_URL).unwrap();
+
+        let allowed = handle_embedded_browser_navigation(&escape_url, || {
+            Err::<(), &'static str>("main webview unavailable")
+        });
+
+        assert!(!allowed);
+    }
 }

@@ -29,9 +29,9 @@ describe("MessageInput cancellation contract", () => {
     const controlRow = screen.getByTestId("message-input-control-row");
     const prompt = screen.getByPlaceholderText("描述任务或继续对话…");
     expect(controlRow).toHaveClass("items-end");
-    expect(screen.getByRole("button", { name: "附加文件" })).toHaveClass("h-8");
+    expect(screen.getByRole("button", { name: "附加文件" })).toHaveClass("h-11", "w-11", "lg:h-8", "lg:w-8");
     expect(prompt).toHaveClass("min-h-8", "py-1");
-    expect(screen.getByRole("button", { name: "发送" })).toHaveClass("h-8");
+    expect(screen.getByRole("button", { name: "发送" })).toHaveClass("h-11", "w-11", "lg:h-8", "lg:w-8");
   });
 
   it("explains that stopping future generation does not roll back completed work", () => {

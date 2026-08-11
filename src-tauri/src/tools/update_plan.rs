@@ -23,6 +23,8 @@ struct UpdatePlanArgs {
     #[serde(default)]
     waiting_reason: Option<String>,
     #[serde(default)]
+    next_action_owner: codefactory_agent_loop::types::NextActionOwner,
+    #[serde(default)]
     change_reason: Option<String>,
 }
 
@@ -73,6 +75,12 @@ pub fn definition() -> ToolDefinition {
                     },
                     "explanation": { "type": ["string", "null"] },
                     "waiting_reason": { "type": ["string", "null"], "description": "Concrete current wait; null when not waiting" },
+                    "next_action_owner": {
+                        "type": "string",
+                        "enum": ["system", "external", "user"],
+                        "default": "system",
+                        "description": "Who owns the next action while waiting. Use user only for an explicit human action; never infer it from waiting_reason text."
+                    },
                     "change_reason": { "type": ["string", "null"], "description": "Required when an existing plan changes step ids, titles, kinds, or order" }
                 },
                 "required": ["steps"],
@@ -208,8 +216,8 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     sqlx::query(
         "INSERT INTO chat_plan_events
          (id, session_id, root_turn_id, revision, plan_json, explanation,
-          waiting_reason, change_reason, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?)",
+          waiting_reason, next_action_owner, change_reason, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(session_id)
@@ -218,6 +226,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     .bind(serde_json::to_string(&args.steps)?)
     .bind(&args.explanation)
     .bind(&args.waiting_reason)
+    .bind(args.next_action_owner.as_str())
     .bind(&args.change_reason)
     .bind(created_at)
     .execute(&mut *tx)
@@ -244,6 +253,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             steps,
             explanation: args.explanation,
             waiting_reason: args.waiting_reason,
+            next_action_owner: args.next_action_owner,
             change_reason: args.change_reason,
             created_at,
         },
@@ -282,6 +292,7 @@ mod tests {
             steps: vec![step("a", "in_progress"), step("b", "in_progress")],
             explanation: None,
             waiting_reason: None,
+            next_action_owner: Default::default(),
             change_reason: None,
         };
         assert_eq!(
@@ -309,6 +320,7 @@ mod tests {
             ],
             explanation: None,
             waiting_reason: None,
+            next_action_owner: Default::default(),
             change_reason: None,
         };
         assert!(validate(&args).is_ok());
@@ -316,5 +328,31 @@ mod tests {
         sanitize(&mut args);
 
         assert!(validate(&args).is_err());
+    }
+
+    #[test]
+    fn update_plan_schema_exposes_structured_next_action_owner() {
+        let parameters = definition().function.parameters;
+        assert_eq!(
+            parameters["properties"]["next_action_owner"]["enum"],
+            json!(["system", "external", "user"]),
+        );
+    }
+
+    #[test]
+    fn missing_next_action_owner_fails_safe_to_system() {
+        let args: UpdatePlanArgs = serde_json::from_value(json!({
+            "steps": [
+                {"id": "a", "title": "a", "kind": "analysis", "status": "completed"},
+                {"id": "b", "title": "b", "kind": "verification", "status": "pending"}
+            ],
+            "waiting_reason": "需要检查权限配置"
+        }))
+        .expect("legacy arguments remain valid");
+
+        assert_eq!(
+            args.next_action_owner,
+            codefactory_agent_loop::types::NextActionOwner::System,
+        );
     }
 }

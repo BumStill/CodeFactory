@@ -7,6 +7,7 @@ import {
   CircleDashed,
   FileCode2,
   ListTree,
+  PanelRightOpen,
   RefreshCw,
   TestTube2,
 } from "lucide-react";
@@ -55,10 +56,12 @@ export function summarizeTurnEvidence(toolCalls: ToolCallState[]): TurnEvidenceS
   let failureCount = 0;
   for (const tool of toolCalls) {
     const args = parseArgs(tool.args);
-    if (tool.isError || tool.status === "blocked" || tool.status === "error" || tool.status === "denied" || tool.status === "cancelled") {
+    const succeeded = tool.status === "done" && !tool.isError;
+    const failed = tool.isError || tool.status === "blocked" || tool.status === "error" || tool.status === "denied" || tool.status === "cancelled";
+    if (failed) {
       failureCount += 1;
     }
-    if (tool.name === "write_file" || tool.name === "edit_file") {
+    if (succeeded && (tool.name === "write_file" || tool.name === "edit_file")) {
       if (
         typeof args.path === "string" &&
         args.path.trim() &&
@@ -68,7 +71,7 @@ export function summarizeTurnEvidence(toolCalls: ToolCallState[]): TurnEvidenceS
         truncated = pushUniqueBounded(changedFiles, args.path) || truncated;
       }
     }
-    if (tool.name === "bash" && typeof args.command === "string") {
+    if (succeeded && tool.name === "bash" && typeof args.command === "string") {
       const command = args.command;
       if (
         /\b(test|build|check|lint|verify|smoke|typecheck)\b/i.test(command) &&
@@ -98,6 +101,9 @@ interface Props {
   durationMs: number | null;
   processExpanded: boolean;
   onToggleProcess?: () => void;
+  onOpenEvidence?: () => void;
+  evidenceControlsId?: string;
+  evidenceOpen?: boolean;
 }
 
 export function TurnResultSnapshot({
@@ -107,6 +113,9 @@ export function TurnResultSnapshot({
   durationMs,
   processExpanded,
   onToggleProcess,
+  onOpenEvidence,
+  evidenceControlsId,
+  evidenceOpen = false,
 }: Props) {
   const [resultOpen, setResultOpen] = useState(false);
   const [summaryOpen, setSummaryOpen] = useState(false);
@@ -114,30 +123,58 @@ export function TurnResultSnapshot({
   const complete = progress.total > 0 && progress.completed === progress.total;
   const effectiveFailureCount =
     evidence.failureCount + (turnBoundaryFailure && evidence.failureCount === 0 ? 1 : 0);
-  const needsAttention = effectiveFailureCount > 0 || Boolean(plan.waitingReason);
-  const status = complete && !needsAttention
+  const hasFailureEvidence = effectiveFailureCount > 0;
+  const hasWaitingBoundary = Boolean(plan.waitingReason);
+  // Legacy plans and malformed owners remain system-owned. The visible wait
+  // reason is evidence, never an authorization signal.
+  const nextActionOwner = plan.nextActionOwner ?? "system";
+  const status = hasWaitingBoundary && nextActionOwner === "user"
     ? {
-        tone: "success",
-        label: "已完成",
-        icon: CheckCircle2,
-        iconClass: "text-status-success",
-        borderClass: "border-l-status-success",
+        tone: "warning",
+        label: "需要你处理",
+        icon: AlertTriangle,
+        iconClass: "text-status-warning",
+        borderClass: "border-l-status-warning",
       }
-    : needsAttention
+    : hasWaitingBoundary && nextActionOwner === "external"
       ? {
-          tone: "warning",
-          label: "需要处理",
-          icon: AlertTriangle,
-          iconClass: "text-status-warning",
-          borderClass: "border-l-status-warning",
-        }
-      : {
           tone: "neutral",
-          label: "未完成",
+          label: "外部等待",
           icon: CircleDashed,
           iconClass: "text-gray-500",
           borderClass: "border-l-border",
-        };
+        }
+      : hasWaitingBoundary
+        ? {
+            tone: "neutral",
+            label: "系统继续处理",
+            icon: CircleDashed,
+            iconClass: "text-gray-500",
+            borderClass: "border-l-border",
+          }
+        : hasFailureEvidence
+          ? {
+              tone: "warning",
+              label: complete ? "已执行，证据待复核" : "执行未完成，证据待复核",
+              icon: AlertTriangle,
+              iconClass: "text-status-warning",
+              borderClass: "border-l-status-warning",
+            }
+          : complete
+            ? {
+                tone: "success",
+                label: "已完成",
+                icon: CheckCircle2,
+                iconClass: "text-status-success",
+                borderClass: "border-l-status-success",
+              }
+            : {
+                tone: "neutral",
+                label: "未完成",
+                icon: CircleDashed,
+                iconClass: "text-gray-500",
+                borderClass: "border-l-border",
+              };
   const StatusIcon = status.icon;
   const attentionDetail = plan.waitingReason
     ?? (turnBoundaryFailure
@@ -145,7 +182,7 @@ export function TurnResultSnapshot({
       : effectiveFailureCount > 0
         ? `${effectiveFailureCount} 项操作失败或未完成`
         : null);
-  const summary = `完成 ${progress.completed}/${progress.total} 个计划步骤；修改 ${evidence.changedFileCount} 个文件；执行 ${evidence.verificationCount} 项验证；${
+  const summary = `完成 ${progress.completed}/${progress.total} 个计划步骤；修改 ${evidence.changedFileCount} 个文件；记录 ${evidence.verificationCount} 项验证操作；${
     effectiveFailureCount === 0 ? "没有失败证据。" : `有 ${effectiveFailureCount} 项失败证据。`
   }`;
 
@@ -170,20 +207,30 @@ export function TurnResultSnapshot({
           <button
             type="button"
             aria-label="查看证据"
-            aria-expanded={resultOpen}
-            onClick={() => setResultOpen((value) => !value)}
-            className="inline-flex min-h-8 items-center gap-1 rounded-lg px-2 text-[13px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200"
+            aria-haspopup={onOpenEvidence ? "dialog" : undefined}
+            aria-controls={onOpenEvidence ? evidenceControlsId : undefined}
+            aria-expanded={onOpenEvidence ? evidenceOpen : resultOpen}
+            onClick={() => {
+              if (onOpenEvidence) {
+                onOpenEvidence();
+              } else {
+                setResultOpen((value) => !value);
+              }
+            }}
+            className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-[13px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
           >
             查看证据
-            <ChevronDown size={12} aria-hidden="true" className={resultOpen ? "rotate-180" : ""} />
+            {onOpenEvidence
+              ? <PanelRightOpen size={12} aria-hidden="true" />
+              : <ChevronDown size={12} aria-hidden="true" className={resultOpen ? "rotate-180" : ""} />}
           </button>
           {onToggleProcess && (
             <button
               type="button"
               aria-label="执行过程"
-              aria-pressed={processExpanded}
+              aria-expanded={processExpanded}
               onClick={onToggleProcess}
-              className="inline-flex min-h-8 items-center gap-1 rounded-lg px-2 text-[13px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200"
+              className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-[13px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
             >
               <ListTree size={12} aria-hidden="true" />
               执行过程
@@ -194,7 +241,7 @@ export function TurnResultSnapshot({
             aria-label="结果摘要"
             aria-expanded={summaryOpen}
             onClick={() => setSummaryOpen((value) => !value)}
-            className="inline-flex min-h-8 items-center gap-1 rounded-lg px-2 text-[13px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200"
+            className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-[13px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
           >
             <RefreshCw size={12} aria-hidden="true" />
             结果摘要
@@ -245,13 +292,13 @@ export function TurnResultSnapshot({
             )}
             <p
               className={
-                evidence.failureCount > 0
+                effectiveFailureCount > 0
                   ? "mt-1 text-status-danger"
                   : "mt-1 text-gray-600"
               }
             >
-              {evidence.failureCount > 0
-                ? `${evidence.failureCount} 项操作失败或未完成`
+              {effectiveFailureCount > 0
+                ? `${effectiveFailureCount} 项失败或中断证据`
                 : "没有失败操作证据"}
             </p>
           </div>

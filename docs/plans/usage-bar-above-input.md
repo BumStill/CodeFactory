@@ -1,5 +1,7 @@
 # 修正方案：token/context 条移到聊天输入框上方
 
+> 2026-08-11 裁决：常驻文字用量条已被 context 圆环与点击渐进披露取代。当前权威契约见 `docs/specs/feature-specs/agent-workbench-experience.md` 的 CF-WB-R6/R7/R21；本文保留为历史计划，不再作为实现验收依据。
+
 ## 背景
 
 用户反馈：新版把 token 消耗 + context 显示放在聊天区**最底部**，占用明显空间。

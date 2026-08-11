@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useState, useRef, useEffect } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, Sparkles } from "lucide-react";
 import { useChatStore } from "../stores/chat";
@@ -28,7 +28,10 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
   const [query, setQuery] = useState("");
   const [loadingEndpoint, setLoadingEndpoint] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const menuId = `model-picker-menu-${useId().replace(/:/g, "")}`;
+  const [portalPosition, setPortalPosition] = useState({ left: 8, top: 8, maxHeight: 360 });
 
   // When the active endpoint changes:
   //   1. Reload the model list for that endpoint
@@ -69,6 +72,52 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
     return () => document.removeEventListener("mousedown", close);
   }, []);
 
+  const closeAndRestoreFocus = useCallback(() => {
+    setOpen(false);
+    triggerRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeAndRestoreFocus();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [closeAndRestoreFocus, open]);
+
+  const updatePortalPosition = useCallback(() => {
+    if (!portal || typeof window === "undefined") return;
+    const triggerRect = ref.current?.getBoundingClientRect();
+    if (!triggerRect) return;
+    const viewportPadding = 8;
+    const menuWidth = Math.min(288, Math.max(0, window.innerWidth - viewportPadding * 2));
+    const availableAbove = Math.max(96, triggerRect.top - viewportPadding * 2);
+    const measuredHeight = menuRef.current?.getBoundingClientRect().height || 360;
+    const menuHeight = Math.min(measuredHeight, availableAbove, window.innerHeight - viewportPadding * 2);
+    setPortalPosition({
+      left: Math.max(
+        viewportPadding,
+        Math.min(triggerRect.right - menuWidth, window.innerWidth - menuWidth - viewportPadding),
+      ),
+      top: Math.max(viewportPadding, triggerRect.top - menuHeight - viewportPadding),
+      maxHeight: availableAbove,
+    });
+  }, [portal]);
+
+  useLayoutEffect(() => {
+    if (!open || !portal) return;
+    updatePortalPosition();
+    window.addEventListener("resize", updatePortalPosition);
+    window.addEventListener("scroll", updatePortalPosition, true);
+    return () => {
+      window.removeEventListener("resize", updatePortalPosition);
+      window.removeEventListener("scroll", updatePortalPosition, true);
+    };
+  }, [open, portal, updatePortalPosition]);
+
   const displayed = activeModel.split("/").pop() ?? activeModel;
   const activeEndpoint =
     activeSession?.endpoint_id ?? settings?.default_endpoint ?? "openrouter";
@@ -88,9 +137,17 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
       if (!!a.is_custom !== !!b.is_custom) return a.is_custom ? -1 : 1;
       return a.id.localeCompare(b.id);
     });
+  const policyLabel =
+    activePolicy === "fixed" ? "固定" : activePolicy === "auto" ? "自动" : "首选";
 
   const menu = (
-      <div ref={menuRef} className="z-[100] w-72 rounded-lg border border-border bg-surface-2 shadow-xl">
+      <div
+        ref={menuRef}
+        id={menuId}
+        role="dialog"
+        aria-label="选择下一回合模型"
+        className="z-[100] w-72 max-w-[calc(100vw-1rem)] rounded-lg border border-border bg-surface-2 shadow-xl"
+      >
       <div className="space-y-2 border-b border-border p-2">
         {activeSession && (
           <>
@@ -104,7 +161,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
                   policy: event.target.value as "fixed" | "prefer" | "auto",
                 });
               }}
-              className="w-full rounded bg-surface-3 px-2 py-1 text-xs text-gray-200 outline-none"
+              className="min-h-11 w-full rounded bg-surface-3 px-2 py-1 text-xs text-gray-200 outline-none lg:min-h-9"
             >
               <option value="fixed">固定 · 只使用当前模型</option>
               <option value="prefer">首选 · 安全时允许兼容接管</option>
@@ -151,7 +208,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
                 setLoadingEndpoint(null);
               }
             }}
-            className="w-full rounded bg-surface-3 px-2 py-1 text-xs text-gray-200 outline-none"
+            className="min-h-11 w-full rounded bg-surface-3 px-2 py-1 text-xs text-gray-200 outline-none lg:min-h-9"
           >
             {endpointKeys.map((key) => (
               <option key={key} value={key}>{key}</option>
@@ -164,7 +221,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
           onChange={(e) => setQuery(e.target.value)}
           disabled={modelListLoading}
           placeholder="搜索模型…"
-          className="w-full rounded bg-surface-3 px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none disabled:opacity-50"
+          className="min-h-11 w-full rounded bg-surface-3 px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none disabled:opacity-50 lg:min-h-9"
         />
       </div>
       <ul className="max-h-64 overflow-y-auto py-1">
@@ -173,7 +230,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
         ) : filtered.slice(0, 50).map((m) => (
           <li key={m.id}>
             <button
-              className={`flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-xs transition-colors hover:bg-surface-3 ${
+              className={`flex min-h-11 w-full items-center gap-1.5 px-3 py-1.5 text-left text-xs transition-colors hover:bg-surface-3 lg:min-h-9 ${
                 m.id === activeModel ? "text-accent" : "text-gray-300"
               }`}
               onClick={async () => {
@@ -194,6 +251,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
                   await reloadSettings();
                 }
                 setOpen(false);
+                triggerRef.current?.focus();
               }}
               title={m.id}
             >
@@ -213,13 +271,8 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
     createPortal(
       <div
         data-testid="model-picker-portal-menu"
-        className="fixed z-[100]"
-        style={(() => {
-          const rect = ref.current?.getBoundingClientRect();
-          return rect
-            ? { left: Math.max(8, Math.min(rect.right - 288, window.innerWidth - 296)), top: rect.bottom + 4 }
-            : { left: 8, top: 8 };
-        })()}
+        className="fixed z-[100] overflow-y-auto"
+        style={portalPosition}
       >
         {menu}
       </div>,
@@ -232,19 +285,22 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
   return (
     <div ref={ref} className="relative">
       <button
+        ref={triggerRef}
+        type="button"
         onClick={() => setOpen((o) => !o)}
-        className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors ${
+        className={`flex min-h-11 items-center gap-1 rounded-lg px-2 py-1 text-xs transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9 ${
           prominent
-            ? "min-h-8 max-w-full border border-accent/30 bg-accent/5 font-medium text-gray-200 hover:border-accent/60 hover:bg-accent/10"
+            ? "max-w-full border border-accent/30 bg-accent/5 font-medium text-gray-200 hover:border-accent/60 hover:bg-accent/10"
             : "text-gray-400 hover:bg-surface-3 hover:text-gray-200"
         }`}
-        aria-label={prominent ? "选择模型" : undefined}
+        aria-label={`选择下一回合模型：${activeEndpoint} / ${displayed} · ${policyLabel}`}
+        aria-expanded={open}
+        aria-controls={menuId}
+        aria-haspopup="dialog"
         title={`${activeEndpoint} / ${activeModel} · ${activePolicy}`}
       >
         <span className="max-w-[190px] truncate">
-          {activeEndpoint} / {displayed} · {
-            activePolicy === "fixed" ? "固定" : activePolicy === "auto" ? "自动" : "首选"
-          }
+          {activeEndpoint} / {displayed} · {policyLabel}
         </span>
         <ChevronDown size={12} />
       </button>

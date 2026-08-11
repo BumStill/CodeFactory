@@ -16,8 +16,8 @@
 | CF-USAGE-R10 | 用户路径 | 选择日期后入口拆分与 Top 会话同步过滤，并可分别深链会话或真实端到端作业日志 | Settings + routing | integration + real deep-link path | frontend + backend + QA |
 | CF-USAGE-R11 | 用户需求 | 新会话显示 28 天横向趋势，进入完整地图不丢选中范围 | Welcome + Settings routing | route-state test + real app | frontend + QA |
 | CF-USAGE-R12 | 预算治理 | 支持日/月 Token 预算和 50/80/100% 本机提醒，不自动停止或换模型 | settings + alert receipt | threshold/idempotency tests | backend + frontend + QA |
-| CF-USAGE-R13 | 现有界面 | Workspace 底栏继续区分累计 Token 与上下文窗口，并可深链详情 | ContextUsageBar | component + stream real app | frontend + QA |
-| CF-USAGE-R14 | 单一入口 | Profile 移除旧成本透视；新会话、Workspace 底栏与设置首个一级 tab 均进入同一用量真相面，无第二套统计/预算写入口 | Profile + Settings | navigation/negative action assertion | frontend + QA |
+| CF-USAGE-R13 | 现有界面 | Workspace composer 只常驻当前上下文窗口圆环；会话/今日累计 Token 进入圆环详情，并可深链完整用量页，两个真相源不得混成一个百分比 | ContextUsageBar | component + stream real app | frontend + QA |
+| CF-USAGE-R14 | 单一入口 | Profile 移除旧成本透视；新会话、Workspace context 详情与设置首个一级 tab 均进入同一用量真相面，无第二套统计/预算写入口 | Profile + Settings | navigation/negative action assertion | frontend + QA |
 | CF-USAGE-R15 | 兼容迁移 | additive 新表；历史 message 可幂等回填；旧 cost_entries 不重复求和并保留回退期 | SQLite migration | old DB fixture + rerun/rollback | backend + QA |
 | CF-USAGE-R16 | Provider 兼容 | OpenAI-compatible、Anthropic、ChatGPT 订阅、本地和 Usage 缺失均有明确行为 | provider adapters | route matrix + payload assertions | backend + QA |
 | CF-USAGE-R17 | 实时性/可观测 | 落库后 2 秒内刷新；失败/partial/unavailable 不静默显示成 0 | event + queries + UI | latency + failure injection | backend + frontend + QA |
@@ -41,7 +41,7 @@
 - **Compatibility Harness**：旧数据库、`cost_entries`、历史 messages、Provider Usage 差异、旧事件名和回退旧版本。
 - **Observation Harness**：逐请求 route、采集覆盖、幂等、刷新延迟、partial/unavailable 和汇总对账。
 - **Payload Harness**：Provider usage/reasoning/cache/cost 字段解析、SSE 最终 usage、缺失/非法字段和脱敏。
-- **Viewport Harness**：Welcome 卡、设置页、年度地图、tooltip/内联详情、底栏及 1366×768/390×812。
+- **Viewport Harness**：Welcome 卡、设置页、年度地图、tooltip/内联详情、composer context 圆环及 1366×768/390×812。
 - **Release Harness**：迁移后的精确安装包、版本/build metadata、启动、重启、回滚和公开产物。
 - **AI Collaboration Harness**：规划/开发/QA/发布角色按 Req ID 交接，记录 context scope、assumptions、review point、validation result。
 

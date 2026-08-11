@@ -4,7 +4,8 @@
 // every snapshot; the UI deduplicates identical SHAs and prioritises snapshots
 // that would actually change files when restored.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertCircle,
@@ -23,18 +24,24 @@ import type { CheckpointFileChange, CheckpointInfo } from "../lib/tauri";
 
 interface Props {
   sessionId: string | null;
+  /** Render inside the owning Git auxiliary pane instead of opening a second drawer. */
+  embedded?: boolean;
+  /** Whether the owning embedded pane is narrower than 640px. */
+  narrow?: boolean;
 }
 
 const RECENT_LIMIT = 3;
 const CANDIDATE_LIMIT = 12;
 
-export function CheckpointsPanel({ sessionId }: Props) {
+export function CheckpointsPanel({ sessionId, embedded = false, narrow = embedded }: Props) {
   const [checkpoints, setCheckpoints] = useState<CheckpointInfo[]>([]);
   const [changes, setChanges] = useState<Record<string, CheckpointFileChange[]>>({});
   const [open, setOpen] = useState(false);
   const [showAllChanged, setShowAllChanged] = useState(false);
   const [showUnchanged, setShowUnchanged] = useState(false);
   const [confirming, setConfirming] = useState<CheckpointInfo | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const drawerCloseRef = useRef<HTMLButtonElement>(null);
 
   const refresh = useCallback(async () => {
     if (!sessionId) {
@@ -80,6 +87,15 @@ export function CheckpointsPanel({ sessionId }: Props) {
     };
   }, [sessionId, refresh]);
 
+  useEffect(() => {
+    if (!open) return;
+    const returnTarget = triggerRef.current;
+    drawerCloseRef.current?.focus();
+    return () => {
+      if (returnTarget?.isConnected) returnTarget.focus();
+    };
+  }, [open]);
+
 
   const changed = useMemo(
     () => checkpoints.filter((checkpoint) => (changes[checkpoint.id]?.length ?? 0) > 0),
@@ -97,10 +113,13 @@ export function CheckpointsPanel({ sessionId }: Props) {
   return (
     <>
       <button
+        ref={triggerRef}
         onClick={() => setOpen(true)}
         aria-label={`恢复 ${changed.length}`}
         title="查看可恢复快照"
-        className="inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-2 py-1 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"
+        className={embedded
+          ? `inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-2 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200 ${narrow ? "h-11" : "h-9"}`
+          : "inline-flex h-9 items-center gap-1 rounded border border-border bg-surface-2 px-2 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"}
       >
         <History size={11} />
         <span>恢复</span>
@@ -108,13 +127,19 @@ export function CheckpointsPanel({ sessionId }: Props) {
       </button>
 
       {open && (
-        <div className="fixed inset-0 z-40 bg-black/30" onClick={() => setOpen(false)}>
+        <div
+          className={embedded ? "absolute inset-0 z-30 bg-surface-1" : "fixed inset-0 z-40 bg-black/30"}
+          onClick={() => setOpen(false)}
+        >
           <aside
             role="dialog"
-            aria-modal="true"
+            aria-modal={embedded ? "false" : "true"}
             aria-label="检查点抽屉"
-            className="absolute inset-y-0 right-0 flex w-[min(420px,92vw)] flex-col border-l border-border bg-surface-1 shadow-2xl"
+            className={embedded
+              ? "flex h-full w-full flex-col bg-surface-1"
+              : "absolute inset-y-0 right-0 flex w-[min(420px,92vw)] flex-col border-l border-border bg-surface-1 shadow-2xl"}
             onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => trapDialogKeyboard(event, () => setOpen(false))}
           >
             <header className="flex items-start gap-3 border-b border-border px-4 py-3">
               <GitBranch size={15} className="mt-0.5 text-accent" />
@@ -125,9 +150,13 @@ export function CheckpointsPanel({ sessionId }: Props) {
                 </p>
               </div>
               <button
+                ref={drawerCloseRef}
                 onClick={() => setOpen(false)}
                 aria-label="关闭检查点"
-                className="rounded p-1 text-gray-600 hover:bg-surface-3 hover:text-gray-200"
+                data-auxiliary-initial-focus={embedded ? true : undefined}
+                className={embedded
+                  ? `inline-flex shrink-0 items-center justify-center rounded text-gray-600 hover:bg-surface-3 hover:text-gray-200 ${narrow ? "h-11 w-11" : "h-9 w-9"}`
+                  : "inline-flex h-9 w-9 shrink-0 items-center justify-center rounded text-gray-600 hover:bg-surface-3 hover:text-gray-200"}
               >
                 <X size={14} />
               </button>
@@ -154,6 +183,7 @@ export function CheckpointsPanel({ sessionId }: Props) {
                             key={checkpoint.id}
                             checkpoint={checkpoint}
                             fileCount={changes[checkpoint.id]?.filter((file) => file.path).length ?? 0}
+                            narrow={narrow}
                             onRequestRevert={setConfirming}
                           />
                         ))}
@@ -187,6 +217,7 @@ export function CheckpointsPanel({ sessionId }: Props) {
                               key={checkpoint.id}
                               checkpoint={checkpoint}
                               fileCount={0}
+                              narrow={narrow}
                               onRequestRevert={setConfirming}
                             />
                           ))}
@@ -203,6 +234,8 @@ export function CheckpointsPanel({ sessionId }: Props) {
 
       {confirming && (
         <RevertConfirmModal
+          embedded={embedded}
+          narrow={narrow}
           checkpoint={confirming}
           initialChanges={changes[confirming.id]}
           onCancel={() => setConfirming(null)}
@@ -228,10 +261,12 @@ export function dedupeBySnapshot(checkpoints: CheckpointInfo[]): CheckpointInfo[
 function CheckpointRow({
   checkpoint,
   fileCount,
+  narrow,
   onRequestRevert,
 }: {
   checkpoint: CheckpointInfo;
   fileCount: number;
+  narrow: boolean;
   onRequestRevert: (checkpoint: CheckpointInfo) => void;
 }) {
   const when = new Date(checkpoint.created_at);
@@ -263,7 +298,7 @@ function CheckpointRow({
         <button
           onClick={() => onRequestRevert(checkpoint)}
           aria-label={`恢复检查点 ${checkpoint.label}`}
-          className="inline-flex shrink-0 items-center gap-0.5 rounded px-1.5 py-1 text-[11px] text-gray-500 transition-colors hover:bg-status-warning-soft hover:text-status-warning"
+          className={`inline-flex shrink-0 items-center gap-0.5 rounded px-1.5 text-[11px] text-gray-500 transition-colors hover:bg-status-warning-soft hover:text-status-warning ${narrow ? "h-11" : "h-9"}`}
         >
           <RotateCcw size={10} /> 恢复
         </button>
@@ -273,11 +308,15 @@ function CheckpointRow({
 }
 
 function RevertConfirmModal({
+  embedded,
+  narrow,
   checkpoint,
   initialChanges,
   onCancel,
   onDone,
 }: {
+  embedded: boolean;
+  narrow: boolean;
   checkpoint: CheckpointInfo;
   initialChanges?: CheckpointFileChange[];
   onCancel: () => void;
@@ -286,6 +325,15 @@ function RevertConfirmModal({
   const [fileChanges, setFileChanges] = useState<CheckpointFileChange[] | null>(initialChanges ?? null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const cancelButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const returnTarget = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    cancelButtonRef.current?.focus();
+    return () => {
+      if (returnTarget?.isConnected) returnTarget.focus();
+    };
+  }, []);
 
   useEffect(() => {
     if (initialChanges) return;
@@ -308,13 +356,21 @@ function RevertConfirmModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onCancel}>
+    <div
+      className={`${embedded ? "absolute" : "fixed"} inset-0 z-50 flex items-center justify-center bg-black/60 p-3`}
+      onClick={() => {
+        if (!busy) onCancel();
+      }}
+    >
       <div
         role="dialog"
-        aria-modal="true"
+        aria-modal={embedded ? "false" : "true"}
         aria-label="恢复检查点"
         className="flex max-h-[80vh] w-[min(560px,92vw)] flex-col rounded-xl border border-border bg-surface-2 shadow-2xl"
         onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => trapDialogKeyboard(event, () => {
+          if (!busy) onCancel();
+        })}
       >
         <header className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
           <div className="min-w-0">
@@ -323,7 +379,12 @@ function RevertConfirmModal({
               {checkpoint.git_sha.slice(0, 7)} · {checkpoint.label || "(空)"}
             </p>
           </div>
-          <button onClick={onCancel} aria-label="取消恢复" className="text-gray-600 hover:text-gray-300">
+          <button
+            ref={cancelButtonRef}
+            onClick={onCancel}
+            aria-label="取消恢复"
+            className={`inline-flex shrink-0 items-center justify-center rounded text-gray-600 hover:bg-surface-3 hover:text-gray-300 ${narrow ? "h-11 w-11" : "h-9 w-9"}`}
+          >
             <X size={14} />
           </button>
         </header>
@@ -357,14 +418,14 @@ function RevertConfirmModal({
         </div>
 
         <footer className="flex justify-end gap-2 border-t border-border px-4 py-3">
-          <button onClick={onCancel} className="rounded px-3 py-1.5 text-xs text-gray-400 hover:bg-surface-3 hover:text-gray-200">
+          <button onClick={onCancel} className={`${narrow ? "h-11" : "h-9"} rounded px-3 text-xs text-gray-400 hover:bg-surface-3 hover:text-gray-200`}>
             取消
           </button>
           <button
             onClick={() => void restore()}
             disabled={busy || fileChanges === null || fileChanges.length === 0}
             aria-label="确认恢复"
-            className="inline-flex items-center gap-1.5 rounded border border-status-warning/40 bg-status-warning-soft px-3 py-1.5 text-xs text-status-warning transition-colors hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-40"
+            className={`${narrow ? "h-11" : "h-9"} inline-flex items-center gap-1.5 rounded border border-status-warning/40 bg-status-warning-soft px-3 text-xs text-status-warning transition-colors hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-40`}
           >
             <RotateCcw size={11} />
             {busy ? "正在恢复…" : "恢复"}
@@ -391,5 +452,32 @@ function statusLabel(status: CheckpointFileChange["status"]): string {
     case "modified": return "修改";
     case "renamed": return "重命名";
     case "typechange": return "类型变化";
+  }
+}
+
+function trapDialogKeyboard(event: ReactKeyboardEvent<HTMLElement>, onEscape: () => void) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    onEscape();
+    return;
+  }
+  if (event.key !== "Tab") return;
+
+  const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+    'button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+  )).filter((element) => !element.hasAttribute("hidden"));
+  if (focusable.length === 0) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
   }
 }
