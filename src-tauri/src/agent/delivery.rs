@@ -1789,28 +1789,17 @@ pub async fn deliver<R: DeliveryRemote>(
     }
 
     // The caller stated which delivery this is. A mismatch is a stale
-    // DECLARATION, not a business decision, so it must never stop the work:
-    // self-correct to what is actually on disk and record why.
-    //
-    // This guard used to block. In the week after it shipped it produced 13 of
-    // the 54 blocked deliveries — the largest single cause after real CI
-    // failures — and the evidence showed the declaration was the wrong half:
-    // two parallel worktrees each declared the OTHER's branch while sitting on
-    // the right one. cwd plus its commits is the ground truth; the declaration
-    // is a hint that can go stale when sessions run side by side.
-    //
-    // Nothing is lost by trusting the checkout. The defect this guard was added
-    // for — opening a second PR for unrelated work under an existing PR's title
-    // — is caught by `conflicting_open_pr`, which compares real titles and heads
-    // instead of a caller-supplied string.
+    // declaration or a worktree mix-up, and must fail closed before any
+    // commit, push, PR, merge, or release side effect can occur. The caller
+    // can retry after switching to the declared branch or omitting the guard
+    // when it intentionally wants the current checkout.
     if let Some(expected) = opts.expect_branch.as_deref() {
         if expected != repo.branch {
-            outcome.steps.push(StepResult::ok(
+            return outcome.blocked_at(StepResult::blocked(
                 "preflight",
                 format!(
-                    "调用方声明的分支 `{expected}` 与工作目录实际所在的 `{}` 不符。\
-以工作目录为准继续交付——声明可能来自过期或并行会话的上下文，而磁盘上的分支和提交才是事实。\
-若这不是你要交付的改动，请切到目标分支后重新调用。",
+                    "调用方声明要交付分支 `{expected}`，但当前工作目录在 `{}` 上，未执行任何交付动作。\
+先切到 `{expected}`，或在确实要交付当前分支时去掉该声明。",
                     repo.branch
                 ),
             ));
@@ -7585,13 +7574,11 @@ Release-Urgency: hold"
     }
 
     #[tokio::test]
-    async fn a_stale_branch_declaration_self_corrects_instead_of_stopping_the_work() {
-        // Shipped as a hard block; in its first week it caused 13 of 54 blocked
-        // deliveries — second only to real CI failures. The evidence showed the
-        // DECLARATION was the stale half, not the checkout: two parallel
-        // worktrees each declared the other's branch while sitting on the right
-        // one. A stale hint is not a business decision, so it must not stop the
-        // delivery — self-correct to the checkout and say so.
+    async fn a_stale_branch_declaration_blocks_before_touching_the_work() {
+        // A caller-supplied branch guard is the only binding between a resumed
+        // delivery and the checkout it is allowed to mutate. A mismatch must
+        // fail closed; trusting cwd can stamp an unrelated worktree with the
+        // resumed session's title and PR metadata.
         let root = feature_branch_repo("staleclaim");
         let remote = StubRemote {
             ci: CiStatus::Success,
@@ -7615,17 +7602,20 @@ Release-Urgency: hold"
         )
         .await;
 
+        assert_eq!(out.final_state, "blocked");
         assert!(
-            out.steps.iter().any(|s| s.step == "commit" && s.status == "ok"),
-            "a stale declaration must not stop the delivery: {:?}",
+            !out.steps
+                .iter()
+                .any(|s| s.step == "commit" || s.step == "push" || s.step == "pr"),
+            "a branch mismatch must not mutate or deliver the checkout: {:?}",
             out.steps
         );
         let note = out
             .steps
             .iter()
             .find(|s| s.step == "preflight" && s.detail.contains("feat/some-other-branch"))
-            .expect("the correction must be recorded, not silent");
-        assert_eq!(note.status, "ok", "recorded as a correction, not a blocker");
+            .expect("the mismatch must be reported");
+        assert_eq!(note.status, "blocked");
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
