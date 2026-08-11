@@ -14,6 +14,7 @@ mod http_util;
 mod knowledge;
 mod mcp;
 mod notify;
+mod panic_log;
 mod openrouter;
 mod secrets;
 mod storage;
@@ -487,6 +488,11 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir().expect("app data dir unavailable");
             std::fs::create_dir_all(&data_dir)?;
+
+            // Before anything else can panic: a stripped release binary with
+            // `panic = "abort"` leaves a crash report that names no symbols and
+            // a message on a stderr nobody reads (v1.78.6, 2026-08-10).
+            crate::panic_log::install(&data_dir);
 
             // Rolling daily DB backup — one snapshot per day, 7-day retention.
             // Best-effort: failures are logged and never block startup.
