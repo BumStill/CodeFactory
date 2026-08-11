@@ -52,6 +52,12 @@ pub(super) struct DesktopModelTransport {
     pub(super) api_key: String,
     pub(super) api_style: ApiStyle,
     pub(super) cancel: Option<Arc<AtomicBool>>,
+    /// Internal sidecars such as session-title generation need a strict output
+    /// ceiling. `None` preserves the interactive transport's existing limits.
+    pub(super) max_output_tokens: Option<u32>,
+    /// Metadata prompts must not be echoed from transient Provider bodies into
+    /// logs or retry events. Interactive requests retain their diagnostics.
+    pub(super) retry_response_body: crate::http_util::RetryResponseBody,
 }
 
 pub(super) struct RoutedDesktopModelTransport {
@@ -103,6 +109,12 @@ fn effective_route(route: &RouteCandidate) -> EffectiveRoute {
         model_id: route.model_id.clone(),
         base_url: route.base_url.clone(),
         is_chatgpt: matches!(route.api_style, ApiStyle::Chatgpt),
+    }
+}
+
+fn apply_chatgpt_output_ceiling(body: &mut serde_json::Value, ceiling: Option<u32>) {
+    if let Some(ceiling) = ceiling {
+        body["max_output_tokens"] = serde_json::json!(ceiling);
     }
 }
 
@@ -172,6 +184,8 @@ impl RoutedDesktopModelTransport {
             api_key,
             api_style: route.api_style.clone(),
             cancel: self.cancel.clone(),
+            max_output_tokens: None,
+            retry_response_body: crate::http_util::RetryResponseBody::Include,
         })
     }
 }
@@ -305,11 +319,12 @@ impl DesktopModelTransport {
             "stream": true,
             "reasoning": { "effort": reasoning_effort, "summary": "auto" },
         });
+        apply_chatgpt_output_ceiling(&mut body, self.max_output_tokens);
         if !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(tools);
         }
 
-        let mut response = crate::http_util::send_with_retry_and_notify(
+        let mut response = crate::http_util::send_with_retry_and_notify_policy(
             "ChatGPT Responses stream request",
             || {
                 let mut request = self
@@ -327,11 +342,12 @@ impl DesktopModelTransport {
                 request
             },
             |notice| super::AgentLoop::emit_transport_retry(self.events.as_ref(), notice),
+            self.retry_response_body,
         )
         .await?;
         if response.status().as_u16() == 401 {
             (access_token, account_id) = crate::codex_auth::force_refresh_access_token().await?;
-            response = crate::http_util::send_with_retry_and_notify(
+            response = crate::http_util::send_with_retry_and_notify_policy(
                 "ChatGPT Responses stream request after forced token refresh",
                 || {
                     let mut request = self
@@ -349,6 +365,7 @@ impl DesktopModelTransport {
                     request
                 },
                 |notice| super::AgentLoop::emit_transport_retry(self.events.as_ref(), notice),
+                self.retry_response_body,
             )
             .await?;
             if response.status().as_u16() == 401 {
@@ -508,7 +525,9 @@ impl DesktopModelTransport {
         .map_err(crate::errors::AppError::Other)?;
 
         if finalization_response {
-            text_buf = sanitize_completion_summary(&text_buf);
+            if self.max_output_tokens.is_none() {
+                text_buf = sanitize_completion_summary(&text_buf);
+            }
             tool_calls.clear();
             self.events.emit(StreamEvent::TextDelta {
                 content: text_buf.clone(),
@@ -546,7 +565,7 @@ impl DesktopModelTransport {
             tool_choice: Some(tool_choice),
             stream: true,
             temperature: 0.2,
-            max_tokens: 8192,
+            max_tokens: self.max_output_tokens.unwrap_or(8192),
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
@@ -577,7 +596,7 @@ impl DesktopModelTransport {
             }
         }
 
-        let mut response = crate::http_util::send_with_retry_and_notify(
+        let mut response = crate::http_util::send_with_retry_and_notify_policy(
             "OpenAI-compatible chat stream request",
             || {
                 self.http
@@ -587,6 +606,7 @@ impl DesktopModelTransport {
                     .json(&body)
             },
             |notice| super::AgentLoop::emit_transport_retry(self.events.as_ref(), notice),
+            self.retry_response_body,
         )
         .await?;
 
@@ -600,8 +620,11 @@ impl DesktopModelTransport {
         if response.status().as_u16() == 400 && body.get("max_tokens").is_some() {
             let err_text = response.text().await.unwrap_or_default();
             if err_text.contains("max_completion_tokens") {
-                crate::config::settings::force_max_completion_tokens(&mut body);
-                response = crate::http_util::send_with_retry_and_notify(
+                crate::config::settings::force_max_completion_tokens_with_minimum(
+                    &mut body,
+                    self.max_output_tokens.map(u64::from).unwrap_or(8192),
+                );
+                response = crate::http_util::send_with_retry_and_notify_policy(
                     "OpenAI-compatible chat stream request after max_tokens adaptation",
                     || {
                         self.http
@@ -611,6 +634,7 @@ impl DesktopModelTransport {
                             .json(&body)
                     },
                     |notice| super::AgentLoop::emit_transport_retry(self.events.as_ref(), notice),
+                    self.retry_response_body,
                 )
                 .await?;
             } else {
@@ -748,7 +772,9 @@ impl DesktopModelTransport {
         tool_calls.sort_by_key(|tc| tc.id.clone());
 
         if finalization_response {
-            text_buf = sanitize_completion_summary(&text_buf);
+            if self.max_output_tokens.is_none() {
+                text_buf = sanitize_completion_summary(&text_buf);
+            }
             tool_calls.clear();
             self.events.emit(StreamEvent::TextDelta {
                 content: text_buf.clone(),
@@ -842,6 +868,10 @@ impl DesktopModelTransport {
             wire_messages.clone(),
             tools,
             require_tool,
+            self.max_output_tokens.unwrap_or(8096),
+            self.max_output_tokens.map(|_| 0.2),
+            self.retry_response_body,
+            self.max_output_tokens.is_none(),
             self.cancel.as_ref(),
             self.events.as_ref(),
         )
@@ -861,6 +891,10 @@ impl DesktopModelTransport {
             wire_messages,
             tools,
             false,
+            self.max_output_tokens.unwrap_or(8096),
+            self.max_output_tokens.map(|_| 0.2),
+            self.retry_response_body,
+            self.max_output_tokens.is_none(),
             self.cancel.as_ref(),
             self.events.as_ref(),
         )
@@ -1442,7 +1476,20 @@ mod tests {
             api_key: "k".into(),
             api_style: ApiStyle::Openai,
             cancel: None,
+            max_output_tokens: None,
+            retry_response_body: crate::http_util::RetryResponseBody::Include,
         }
+    }
+
+    #[test]
+    fn chatgpt_metadata_output_cap_uses_responses_field() {
+        let mut body = serde_json::json!({"model": "gpt-test"});
+        apply_chatgpt_output_ceiling(&mut body, Some(64));
+        assert_eq!(body["max_output_tokens"], serde_json::json!(64));
+
+        let mut interactive = serde_json::json!({"model": "gpt-test"});
+        apply_chatgpt_output_ceiling(&mut interactive, None);
+        assert!(interactive.get("max_output_tokens").is_none());
     }
 
     #[test]

@@ -3,7 +3,7 @@ use chrono::Utc;
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::agent::failover::{RouteCandidate, RouteCandidatePlan};
@@ -12,6 +12,10 @@ use crate::config::settings::Settings;
 use crate::errors::AppError;
 use crate::mcp::McpManager;
 use crate::openrouter::types::StreamEvent;
+use crate::session_title::{
+    apply_local_title_fallback, is_low_information, spawn_title_generation,
+    TITLE_SOURCE_PLACEHOLDER,
+};
 use crate::AppState;
 
 fn is_chatgpt_auth_expired(endpoint_name: &str, message: &str) -> bool {
@@ -345,9 +349,8 @@ pub async fn send_message(
     let settings = state.settings.read().await.clone();
 
     // Persist user message unless draft materialization already wrote it in
-    // the same transaction as the session row. The count still determines
-    // first-turn title behavior for legacy create-then-send callers.
-    let (is_first_message, root_turn_id) = {
+    // the same transaction as the session row.
+    let root_turn_id = {
         let pool = state.db.read().await;
         let inserted_id = if !user_message_persisted.unwrap_or(false) {
             let msg_id = Uuid::new_v4().to_string();
@@ -367,10 +370,6 @@ pub async fn send_message(
             None
         };
 
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages WHERE session_id = ?")
-            .bind(&session_id)
-            .fetch_one(&*pool)
-            .await?;
         let root_turn_id = match inserted_id {
             Some(id) => id,
             None => {
@@ -384,7 +383,7 @@ pub async fn send_message(
                 .await?
             }
         };
-        (count.0 == 1, root_turn_id)
+        root_turn_id
     };
 
     {
@@ -504,6 +503,25 @@ pub async fn send_message(
             .fetch_one(&*pool)
             .await?
     };
+    // A placeholder can survive a crash between the first reply and its
+    // background title request. Re-read the first real user message on every
+    // later turn while the source is still placeholder so the next successful
+    // turn repairs it. The title service has an in-process single-flight guard
+    // and a database CAS, so recovery cannot overwrite manual titles.
+    let title_user_message = if session.title_source == TITLE_SOURCE_PLACEHOLDER {
+        let pool = state.db.read().await;
+        sqlx::query_scalar::<_, String>(
+            "SELECT content FROM messages
+             WHERE session_id = ? AND role = 'user'
+               AND (completion_state IS NULL OR completion_state = '')
+             ORDER BY created_at ASC, rowid ASC LIMIT 1",
+        )
+        .bind(&session_id)
+        .fetch_optional(&*pool)
+        .await?
+    } else {
+        None
+    };
 
     // Auto-checkpoint: capture the working-tree snapshot before the agent
     // starts so the user can revert with one click if anything goes wrong.
@@ -538,45 +556,6 @@ pub async fn send_message(
             }
             Ok(None) => {} // cwd not a git repo — silently skip
             Err(e) => tracing::warn!("checkpoint create failed: {e}"),
-        }
-    }
-
-    // Auto-update title from first message content
-    if is_first_message {
-        let new_title: String = content
-            .split_whitespace()
-            .take(6)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(40)
-            .collect::<String>()
-            .trim()
-            .to_string();
-
-        if !new_title.is_empty() {
-            let pool = state.db.read().await;
-            let now = Utc::now().timestamp_millis();
-            if let Ok(()) =
-                sqlx::query("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?")
-                    .bind(&new_title)
-                    .bind(now)
-                    .bind(&session_id)
-                    .execute(&*pool)
-                    .await
-                    .map(|_| ())
-            {
-                if let Ok(updated_session) = sqlx::query_as::<_, crate::storage::Session>(
-                    "SELECT * FROM sessions WHERE id = ?",
-                )
-                .bind(&session_id)
-                .fetch_one(&*pool)
-                .await
-                {
-                    let event_name = format!("session_updated:{}", session_id);
-                    app.emit(&event_name, &updated_session).ok();
-                }
-            }
         }
     }
 
@@ -715,6 +694,10 @@ pub async fn send_message(
     let tracked_cancel_flag = cancel_flag.clone();
     let interjections = state.interjections.clone();
     let interjections_cleanup = state.interjections.clone();
+    let completion_title_job =
+        title_user_message.map(|message| (primary_route, is_low_information(&message), message));
+    let fallback_title_job = completion_title_job.clone();
+    let title_cancel_flag = tracked_cancel_flag.clone();
     tokio::spawn(async move {
         let db_for_error = db.clone();
         let session_for_error = session_id_clone.clone();
@@ -743,6 +726,56 @@ pub async fn send_message(
             agent.run(history).await
         })
         .await;
+        let mut deferred_title_job = None;
+        if loop_result.is_ok() && !title_cancel_flag.load(Ordering::SeqCst) {
+            if let Some((title_route, needs_summary, title_user_message)) = completion_title_job {
+                let assistant_summary = if needs_summary {
+                    match sqlx::query_scalar::<_, String>(
+                        "SELECT content FROM messages
+                         WHERE session_id = ? AND role = 'assistant'
+                           AND (completion_state IS NULL OR completion_state = '')
+                           AND TRIM(content) <> ''
+                         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    )
+                    .bind(&session_for_error)
+                    .fetch_optional(&db_for_error)
+                    .await
+                    {
+                        Ok(summary) => summary,
+                        Err(error) => {
+                            tracing::warn!(
+                                "session title assistant summary lookup failed: {error}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                if !needs_summary || assistant_summary.is_some() {
+                    deferred_title_job = Some((title_route, title_user_message, assistant_summary));
+                } else {
+                    tracing::debug!(
+                        "session title generation deferred: no_visible_assistant_summary"
+                    );
+                }
+            }
+        }
+        if loop_result.is_err() && !title_cancel_flag.load(Ordering::SeqCst) {
+            if let Some((title_route, needs_summary, title_user_message)) = fallback_title_job {
+                if !needs_summary {
+                    apply_local_title_fallback(
+                        &app_clone,
+                        &db_for_error,
+                        &session_for_error,
+                        &title_route,
+                        &title_user_message,
+                        "primary_turn_failed",
+                    )
+                    .await;
+                }
+            }
+        }
         if let Err(error_text) = loop_result {
             tracing::error!("Agent loop error: {error_text}");
             // Persist the failure so it survives reloads: the 2026-07-21
@@ -824,6 +857,24 @@ pub async fn send_message(
         }
         clear_chat_running_if_current(&chat_cancels, &session_for_error, &tracked_cancel_flag)
             .await;
+        if let Some((title_route, title_user_message, assistant_summary)) = deferred_title_job {
+            // The frontend drains an already-queued next message with a
+            // zero-delay timer. Give that primary turn time to register; if it
+            // does, leave the placeholder for that turn to repair when idle.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if chat_cancels.lock().await.contains_key(&session_for_error) {
+                tracing::debug!("session title generation deferred: next_turn_running");
+            } else {
+                spawn_title_generation(
+                    app_clone.clone(),
+                    db_for_error.clone(),
+                    session_for_error.clone(),
+                    title_route,
+                    title_user_message,
+                    assistant_summary,
+                );
+            }
+        }
         // A steer typed just as the turn ended was never drained. Drop it here
         // so a later, unrelated turn cannot pick it up at its first round
         // boundary; the frontend re-sends anything it never saw applied.

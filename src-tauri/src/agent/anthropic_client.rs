@@ -42,6 +42,10 @@ pub async fn stream_anthropic(
     messages: Vec<serde_json::Value>,
     tools: &[ToolDefinition],
     require_tool: bool,
+    max_output_tokens: u32,
+    temperature: Option<f64>,
+    retry_response_body: crate::http_util::RetryResponseBody,
+    sanitize_finalization: bool,
     cancel: Option<&Arc<AtomicBool>>,
     events: &dyn crate::agent::events::EventSink,
 ) -> Result<AnthropicResponse> {
@@ -56,11 +60,14 @@ pub async fn stream_anthropic(
 
     let mut body = serde_json::json!({
         "model": model,
-        "max_tokens": 8096,
+        "max_tokens": max_output_tokens,
         "system": system_prompt,
         "messages": messages,
         "stream": true,
     });
+    if let Some(temperature) = temperature {
+        body["temperature"] = serde_json::json!(temperature);
+    }
     if !anthropic_tools.is_empty() {
         body["tools"] = serde_json::Value::Array(anthropic_tools);
         if require_tool {
@@ -68,13 +75,18 @@ pub async fn stream_anthropic(
         }
     }
 
-    let response = crate::http_util::send_with_retry("Anthropic messages request", || {
-        http.post(&url)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-    })
+    let response = crate::http_util::send_with_retry_and_notify_policy(
+        "Anthropic messages request",
+        || {
+            http.post(&url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+        },
+        |_| {},
+        retry_response_body,
+    )
     .await?;
     let response = crate::http_util::check_status(response).await?;
 
@@ -90,6 +102,7 @@ pub async fn stream_anthropic(
     let mut input_tokens: i64 = 0;
     let mut output_tokens: i64 = 0;
     let mut cancelled = false;
+    let mut saw_message_stop = false;
 
     // SSE line buffering — see agent/mod.rs for full rationale.
     // TL;DR: SSE events split across TCP chunks must be reassembled, or
@@ -175,8 +188,8 @@ pub async fn stream_anthropic(
                             if !text.is_empty() {
                                 if !finalization_response {
                                     events.emit(StreamEvent::TextDelta {
-                                                content: text.clone(),
-                                            });
+                                        content: text.clone(),
+                                    });
                                 }
                                 text_buf.push_str(&text);
                             }
@@ -201,10 +214,10 @@ pub async fn stream_anthropic(
                             let args: serde_json::Value =
                                 serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
                             events.emit(StreamEvent::ToolCallStart {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        args,
-                                    });
+                                id: id.clone(),
+                                name: name.clone(),
+                                args,
+                            });
                         }
                     }
                 }
@@ -227,11 +240,17 @@ pub async fn stream_anthropic(
                     }
                 }
                 "message_stop" => {
-                    // Nothing extra needed.
+                    saw_message_stop = true;
                 }
                 _ => {}
             }
         }
+    }
+
+    if !cancelled && !saw_message_stop {
+        return Err(crate::errors::AppError::Other(
+            "Anthropic stream ended without message_stop".into(),
+        ));
     }
 
     // Build final tool_calls vec
@@ -249,11 +268,13 @@ pub async fn stream_anthropic(
         .collect();
     tool_calls.sort_by_key(|tc| tc.id.clone());
     if finalization_response {
-        text_buf = sanitize_completion_summary(&text_buf);
+        if sanitize_finalization {
+            text_buf = sanitize_completion_summary(&text_buf);
+        }
         tool_calls.clear();
         events.emit(StreamEvent::TextDelta {
-                    content: text_buf.clone(),
-                });
+            content: text_buf.clone(),
+        });
     }
 
     Ok(AnthropicResponse {

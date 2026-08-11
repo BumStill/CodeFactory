@@ -167,7 +167,7 @@ fn validate_usage_event(event: &UsageEventInput) -> crate::errors::Result<()> {
     }
     if !matches!(
         event.surface.as_str(),
-        "interactive" | "autonomous" | "subagent" | "eval"
+        "interactive" | "autonomous" | "subagent" | "eval" | "session_title"
     ) {
         return Err(AppError::Other(format!(
             "unsupported usage surface: {}",
@@ -992,4 +992,32 @@ pub async fn list_recent_cost_entries(
             },
         )
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_title_is_a_valid_usage_surface() {
+        let event = UsageEventInput {
+            request_id: "title-request".into(),
+            session_id: "session".into(),
+            task_id: None,
+            surface: "session_title".into(),
+            provider: "chatgpt".into(),
+            endpoint: "chatgpt".into(),
+            model: "gpt-test".into(),
+            input_tokens: 12,
+            output_tokens: 4,
+            reasoning_tokens: 0,
+            cached_tokens: 0,
+            actual_cost_usd: None,
+            estimated_cost_usd: None,
+            cost_source: "subscription".into(),
+            created_at: None,
+        };
+
+        validate_usage_event(&event).expect("session title usage must be accepted");
+    }
 }

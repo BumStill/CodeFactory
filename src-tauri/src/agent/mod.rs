@@ -13,6 +13,7 @@ pub mod events;
 mod fact_checker;
 pub mod failover;
 pub mod hooks;
+mod internal_text;
 pub mod journal;
 mod lifecycle_hooks;
 pub mod model_transport;
@@ -31,6 +32,7 @@ pub use dispatch::{
     proposal_capability, steer_capability_override, with_persisted_delivery_authorization,
     TurnGrants,
 };
+pub(crate) use internal_text::{generate_bounded_text, InternalTextOutput};
 
 #[cfg(test)]
 use codefactory_agent_core::CompletionEvidence;
@@ -621,15 +623,17 @@ pub enum UsageSurface {
     Autonomous,
     Subagent,
     Eval,
+    SessionTitle,
 }
 
 impl UsageSurface {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Interactive => "interactive",
             Self::Autonomous => "autonomous",
             Self::Subagent => "subagent",
             Self::Eval => "eval",
+            Self::SessionTitle => "session_title",
         }
     }
 }

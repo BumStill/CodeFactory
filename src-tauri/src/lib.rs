@@ -17,6 +17,7 @@ mod notify;
 mod panic_log;
 mod openrouter;
 mod secrets;
+mod session_title;
 mod storage;
 mod tools;
 mod trajectory;

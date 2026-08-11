@@ -2,10 +2,13 @@
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::HashSet;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 use crate::errors::AppError;
+use crate::session_title::{
+    PLACEHOLDER_TITLE, SESSION_TITLE_UPDATED_EVENT, TITLE_SOURCE_MANUAL, TITLE_SOURCE_PLACEHOLDER,
+};
 use crate::storage::{Message, Session};
 use crate::AppState;
 
@@ -43,24 +46,6 @@ fn resolve_new_session_model(
     settings.resolve_model_for_endpoint(&settings.default_endpoint, requested_model)
 }
 
-fn draft_title(first_message: &str) -> String {
-    let title: String = first_message
-        .split_whitespace()
-        .take(6)
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(40)
-        .collect::<String>()
-        .trim()
-        .to_string();
-    if title.is_empty() {
-        "新会话".into()
-    } else {
-        title
-    }
-}
-
 async fn materialize_session_and_first_message(
     pool: &sqlx::SqlitePool,
     draft_id: &str,
@@ -83,11 +68,12 @@ async fn materialize_session_and_first_message(
     let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO sessions
-         (id, title, cwd, endpoint_id, model_id, model_policy, created_at, updated_at, kind)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, title, title_source, cwd, endpoint_id, model_id, model_policy, created_at, updated_at, kind)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(draft_id)
-    .bind(draft_title(first_message))
+    .bind(PLACEHOLDER_TITLE)
+    .bind(TITLE_SOURCE_PLACEHOLDER)
     .bind(cwd)
     .bind(endpoint_id)
     .bind(model_id)
@@ -271,14 +257,18 @@ pub async fn create_session(
     let pool = state.db.read().await;
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp_millis();
+    // Keep the command argument for bridge compatibility, but all newly
+    // created sessions follow the same placeholder -> semantic title flow.
+    drop(title);
 
     sqlx::query(
         "INSERT INTO sessions
-         (id, title, cwd, endpoint_id, model_id, model_policy, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?)",
+         (id, title, title_source, cwd, endpoint_id, model_id, model_policy, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?)",
     )
     .bind(&id)
-    .bind(&title)
+    .bind(PLACEHOLDER_TITLE)
+    .bind(TITLE_SOURCE_PLACEHOLDER)
     .bind(&cwd)
     .bind(&settings.default_endpoint)
     .bind(&resolved_model)
@@ -423,12 +413,14 @@ pub async fn get_endpoint_active_model(
 pub async fn update_session_title(
     session_id: String,
     title: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Session, AppError> {
     let pool = state.db.read().await;
     let now = Utc::now().timestamp_millis();
-    sqlx::query("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE sessions SET title = ?, title_source = ?, updated_at = ? WHERE id = ?")
         .bind(&title)
+        .bind(TITLE_SOURCE_MANUAL)
         .bind(now)
         .bind(&session_id)
         .execute(&*pool)
@@ -438,6 +430,7 @@ pub async fn update_session_title(
         .bind(&session_id)
         .fetch_one(&*pool)
         .await?;
+    app.emit(SESSION_TITLE_UPDATED_EVENT, &session).ok();
     Ok(session)
 }
 
@@ -1057,6 +1050,11 @@ mod tests {
 
         assert_eq!(session.id, "draft-1");
         assert_eq!(session.kind, "quick");
+        assert_eq!(session.title_source, TITLE_SOURCE_PLACEHOLDER);
+        assert_eq!(
+            session.title, "新会话",
+            "草稿物化不能把首条用户消息直接复制成会话标题"
+        );
         let session_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
             .fetch_one(&pool)
             .await
@@ -1150,6 +1148,7 @@ mod tests {
             "CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
+                title_source TEXT NOT NULL DEFAULT 'legacy',
                 cwd TEXT NOT NULL,
                 endpoint_id TEXT,
                 model_id TEXT NOT NULL,

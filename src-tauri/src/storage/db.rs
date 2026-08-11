@@ -1178,6 +1178,53 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     // ephemeral one-off chats launched from the home page's Quick Task entry.
     // List-sessions excludes 'quick' from the Recent Projects card.
     ensure_column(pool, "sessions", "kind", "TEXT NOT NULL DEFAULT 'project'").await?;
+    // Titles that predate automatic semantic naming are stable legacy titles,
+    // never overwriteable placeholders. New sessions explicitly opt into the
+    // placeholder lifecycle at their INSERT sites.
+    ensure_column(
+        pool,
+        "sessions",
+        "title_source",
+        "TEXT NOT NULL DEFAULT 'legacy'",
+    )
+    .await?;
+    if table_exists(pool, "sessions").await? {
+        sqlx::query(
+            "UPDATE sessions SET title_source = 'legacy'
+             WHERE title_source IS NULL OR title_source = ''",
+        )
+        .execute(pool)
+        .await?;
+    }
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS session_title_jobs (
+            session_id TEXT PRIMARY KEY,
+            lease_id TEXT NOT NULL,
+            started_at INTEGER NOT NULL
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS session_title_attempts (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL,
+            failure_code TEXT,
+            duration_ms INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_session_title_attempts_session_created
+         ON session_title_attempts(session_id, created_at DESC)",
+    )
+    .execute(pool)
+    .await?;
     // Per-session reasoning effort override (NULL → use the global default).
     ensure_column(pool, "sessions", "reasoning_effort", "TEXT").await?;
     // Per-session delivery authorization (0/1). Survives app restarts so a
@@ -1883,6 +1930,104 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_sessions_gain_legacy_title_source_idempotently() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                total_input_tokens INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions
+             (id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('legacy-title', 'Existing title', '/tmp', 'gpt-5.5', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+
+        let cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('sessions')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            cols.iter()
+                .filter(|column| *column == "title_source")
+                .count(),
+            1,
+            "title_source must be added exactly once: {cols:?}"
+        );
+        let source: String =
+            sqlx::query_scalar("SELECT title_source FROM sessions WHERE id='legacy-title'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(source, "legacy");
+    }
+
+    #[tokio::test]
+    async fn session_auto_title_migration_marks_existing_rows_legacy() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sessions (id, title) VALUES ('old', 'Existing title')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(include_str!("../../migrations/0006_session_auto_title.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let source: String = sqlx::query_scalar("SELECT title_source FROM sessions WHERE id='old'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(source, "legacy");
+        let lease_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='session_title_jobs'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lease_table, 1);
+        let attempts_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='session_title_attempts'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts_table, 1);
     }
 
     /// Fresh-install path: ensure_schema must also create the satellite

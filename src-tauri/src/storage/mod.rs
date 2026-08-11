@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 pub struct Session {
     pub id: String,
     pub title: String,
+    /// placeholder | generated | fallback | manual | legacy.
+    /// Missing serialized values are legacy for backward compatibility; live
+    /// database connections add the column before any Session query runs.
+    #[serde(default = "default_title_source")]
+    #[sqlx(default)]
+    pub title_source: String,
     pub cwd: String,
     pub model_id: String,
     /// Per-session endpoint binding. Legacy rows can remain unresolved until
@@ -51,6 +57,9 @@ pub struct Session {
 
 fn default_session_kind() -> String {
     "project".into()
+}
+fn default_title_source() -> String {
+    "legacy".into()
 }
 fn default_model_policy() -> String {
     "fixed".into()
@@ -175,6 +184,23 @@ mod tests {
         .execute(db)
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn session_deserialization_defaults_missing_title_source_to_legacy() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "id": "legacy-session",
+            "title": "Existing title",
+            "cwd": "/tmp/project",
+            "model_id": "gpt-5.5",
+            "created_at": 1,
+            "updated_at": 1,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0
+        }))
+        .expect("deserialize legacy session payload");
+
+        assert_eq!(session.title_source, "legacy");
     }
 
     #[tokio::test]
