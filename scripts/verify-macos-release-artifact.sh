@@ -6,8 +6,8 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 2
 fi
 
-if [[ $# -lt 2 || $# -gt 4 ]]; then
-  echo "usage: $0 <CodeFactory.dmg> <expected-version> [expected-build-sha] [CodeFactory.app.tar.gz]" >&2
+if [[ $# -lt 2 || $# -gt 5 ]]; then
+  echo "usage: $0 <CodeFactory.dmg> <expected-version> [expected-build-sha] [CodeFactory.app.tar.gz] [latest.json]" >&2
   exit 2
 fi
 
@@ -15,6 +15,7 @@ DMG_PATH="$1"
 EXPECTED_VERSION="${2#v}"
 EXPECTED_BUILD_SHA="${3:-}"
 UPDATER_ARCHIVE="${4:-}"
+RELEASE_MANIFEST="${5:-}"
 if [[ ! -f "$DMG_PATH" ]]; then
   echo "macOS release artifact smoke failed: DMG not found: $DMG_PATH" >&2
   exit 1
@@ -26,6 +27,39 @@ fi
 if [[ -n "$UPDATER_ARCHIVE" && ! -f "$UPDATER_ARCHIVE" ]]; then
   echo "macOS release artifact smoke failed: updater archive not found: $UPDATER_ARCHIVE" >&2
   exit 1
+fi
+if [[ -n "$RELEASE_MANIFEST" && ! -f "$RELEASE_MANIFEST" ]]; then
+  echo "macOS release artifact smoke failed: latest.json not found: $RELEASE_MANIFEST" >&2
+  exit 1
+fi
+if [[ -n "$RELEASE_MANIFEST" && ( -z "$EXPECTED_BUILD_SHA" || -z "$UPDATER_ARCHIVE" ) ]]; then
+  echo "macOS release artifact smoke failed: latest.json verification requires expected build SHA and updater archive" >&2
+  exit 1
+fi
+
+MANIFEST_BUILD_SHA=""
+MANIFEST_VERSION=""
+if [[ -n "$RELEASE_MANIFEST" ]]; then
+  if ! MANIFEST_BUILD_SHA="$(/usr/bin/plutil -extract build_git_sha raw "$RELEASE_MANIFEST" 2>/dev/null)"; then
+    echo "macOS release artifact smoke failed: latest.json build_git_sha is missing or invalid" >&2
+    exit 1
+  fi
+  if ! MANIFEST_VERSION="$(/usr/bin/plutil -extract version raw "$RELEASE_MANIFEST" 2>/dev/null)"; then
+    echo "macOS release artifact smoke failed: latest.json version is missing or invalid" >&2
+    exit 1
+  fi
+  if [[ ! "$MANIFEST_BUILD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "macOS release artifact smoke failed: latest.json build_git_sha is not a full lowercase Git SHA" >&2
+    exit 1
+  fi
+  if [[ "$MANIFEST_BUILD_SHA" != "$EXPECTED_BUILD_SHA" ]]; then
+    echo "macOS release artifact smoke failed: latest.json build_git_sha is '$MANIFEST_BUILD_SHA', expected '$EXPECTED_BUILD_SHA'" >&2
+    exit 1
+  fi
+  if [[ "$MANIFEST_VERSION" != "$EXPECTED_VERSION" ]]; then
+    echo "macOS release artifact smoke failed: latest.json version is '$MANIFEST_VERSION', expected '$EXPECTED_VERSION'" >&2
+    exit 1
+  fi
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -206,6 +240,13 @@ if [[ -n "$EXPECTED_BUILD_SHA" ]]; then
     echo "macOS release artifact smoke failed: build Git SHA is '$ACTUAL_BUILD_SHA', expected '$EXPECTED_BUILD_SHA'" >&2
     exit 1
   fi
+fi
+if [[ -n "$RELEASE_MANIFEST" ]]; then
+  if [[ "$ACTUAL_BUILD_SHA" != "$MANIFEST_BUILD_SHA" ]]; then
+    echo "macOS release artifact smoke failed: binary and latest.json build identities differ" >&2
+    exit 1
+  fi
+  echo "release build identity matched: build_git_sha=$ACTUAL_BUILD_SHA executable_sha256=$DMG_EXECUTABLE_SHA256"
 fi
 cat "$EVOLUTION_RECEIPT"
 

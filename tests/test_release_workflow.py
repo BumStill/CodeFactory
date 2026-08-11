@@ -335,7 +335,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "Windows and macOS must share the same prerequisites",
         )
         self.assertIn(
-            "needs: [changelog, build-windows, build-macos]", workflow
+            "needs: [changelog, prepare-release, build-windows, build-macos]",
+            workflow,
         )
         self.assertIn("gh release create", workflow)
         self.assertIn("--draft", workflow)
@@ -356,6 +357,77 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("github.ref_name", workflow)
         self.assertNotIn("GITHUB_REF_NAME", workflow)
+
+    def test_latest_manifest_carries_the_binary_build_identity(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        build_identity = (
+            "CODEFACTORY_BUILD_GIT_SHA: "
+            "${{ needs.prepare-release.outputs.tag_sha }}"
+        )
+        self.assertEqual(
+            workflow.count(build_identity),
+            2,
+            "Windows and macOS binaries must embed the exact tag commit",
+        )
+
+        finalize = workflow.split("\n  finalize:\n", 1)[1].split(
+            "\n  verify-published-macos:\n", 1
+        )[0]
+        self.assertIn(
+            "needs: [changelog, prepare-release, build-windows, build-macos]",
+            finalize,
+        )
+        self.assertIn(
+            "BUILD_GIT_SHA: ${{ needs.prepare-release.outputs.tag_sha }}",
+            finalize,
+        )
+        self.assertIn('--arg build_git_sha "$BUILD_GIT_SHA"', finalize)
+        self.assertIn("build_git_sha:$build_git_sha", finalize)
+
+    def test_published_macos_verifier_matches_manifest_to_both_app_binaries(
+        self,
+    ) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        published_job = workflow.split("\n  verify-published-macos:\n", 1)[1]
+        artifact_smoke = (
+            REPO_ROOT / "scripts/verify-macos-release-artifact.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('LATEST_MANIFEST="$RELEASE_DIR/latest.json"', published_job)
+        self.assertIn('"$PUBLIC_BASE/latest.json"', published_job)
+        self.assertIn('"$UPDATER_ARCHIVE" "$LATEST_MANIFEST"', published_job)
+
+        self.assertIn("[CodeFactory.app.tar.gz] [latest.json]", artifact_smoke)
+        self.assertIn(
+            'MANIFEST_BUILD_SHA="$(/usr/bin/plutil -extract build_git_sha raw',
+            artifact_smoke,
+        )
+        self.assertIn(
+            'MANIFEST_VERSION="$(/usr/bin/plutil -extract version raw',
+            artifact_smoke,
+        )
+        self.assertIn(
+            '[[ "$MANIFEST_BUILD_SHA" != "$EXPECTED_BUILD_SHA" ]]', artifact_smoke
+        )
+        self.assertIn("DMG_EXECUTABLE_SHA256", artifact_smoke)
+        self.assertIn("UPDATER_EXECUTABLE_SHA256", artifact_smoke)
+        self.assertIn("release build identity matched", artifact_smoke)
+
+        manual_smoke = (
+            REPO_ROOT / ".github/workflows/macos-release-smoke.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ref: ${{ inputs.tag }}", manual_smoke)
+        self.assertIn("CodeFactory_aarch64.app.tar.gz", manual_smoke)
+        self.assertIn("latest.json", manual_smoke)
+        self.assertIn('EXPECTED_BUILD_SHA="$(git rev-parse HEAD)"', manual_smoke)
+        self.assertIn(
+            '"$UPDATER_ARCHIVE" "$DMG_DIR/latest.json"', manual_smoke
+        )
 
     def test_release_automatically_reverifies_the_published_macos_asset(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
