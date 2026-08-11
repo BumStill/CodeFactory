@@ -17,7 +17,7 @@
 
 use chrono::Utc;
 use codefactory_agent_loop::journal::{
-    PersistError, PersistResult, Persistence, TurnActivityUpdate, UsageRow,
+    PersistError, PersistResult, Persistence, RecoveryAttemptRow, TurnActivityUpdate, UsageRow,
 };
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -154,6 +154,73 @@ impl SqlitePersistence {
 
 #[async_trait::async_trait]
 impl Persistence for SqlitePersistence {
+    async fn record_recovery_attempt(&self, attempt: &RecoveryAttemptRow) -> PersistResult<()> {
+        if self.anonymous {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp_millis();
+        let process_instance = format!(
+            "{}:{}",
+            std::process::id(),
+            crate::storage::db::current_process_start_token()
+                .unwrap_or_else(|| "unknown-start".into())
+        );
+        let mut tx = self.db.begin().await.map_err(perr)?;
+        sqlx::query(
+            "UPDATE chat_turn_state
+             SET recovery_attempt=recovery_attempt+1, updated_at=?
+             WHERE root_turn_id=?",
+        )
+        .bind(now)
+        .bind(&attempt.root_turn_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(perr)?;
+        let objective_id = sqlx::query_scalar::<_, String>(
+            "WITH RECURSIVE objective_chain(id, previous_segment_id, depth) AS (
+                 SELECT segment.id, segment.previous_segment_id, 0
+                 FROM chat_task_segments segment
+                 JOIN chat_turn_state turn ON turn.task_segment_id=segment.id
+                 WHERE turn.root_turn_id=?
+                 UNION ALL
+                 SELECT prior.id, prior.previous_segment_id, objective_chain.depth+1
+                 FROM chat_task_segments prior
+                 JOIN objective_chain ON prior.id=objective_chain.previous_segment_id
+                 WHERE objective_chain.depth < 100
+             )
+             SELECT 'chat:' || id FROM objective_chain ORDER BY depth DESC LIMIT 1",
+        )
+        .bind(&attempt.root_turn_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(perr)?;
+        sqlx::query(
+            "INSERT INTO objective_recovery_attempts
+             (id, objective_id, root_turn_id, delivery_run_id, domain, attempt_index,
+              failure_code, failure_class, output_started, side_effect_started,
+              queue_wait_ms, runtime_ms, process_instance, resume_owner,
+              terminal_decision, created_at)
+             VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 'agent_loop', ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(objective_id)
+        .bind(&attempt.root_turn_id)
+        .bind(&attempt.domain)
+        .bind(attempt.attempt_index)
+        .bind(&attempt.failure_code)
+        .bind(&attempt.failure_class)
+        .bind(i64::from(attempt.output_started))
+        .bind(i64::from(attempt.side_effect_started))
+        .bind(&process_instance)
+        .bind(&attempt.terminal_decision)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(perr)?;
+        tx.commit().await.map_err(perr)?;
+        Ok(())
+    }
+
     async fn update_turn_activity(&self, update: &TurnActivityUpdate) -> PersistResult<i64> {
         if self.anonymous {
             return Ok(0);
@@ -581,7 +648,8 @@ mod tests {
         .unwrap();
         sqlx::query(
             "CREATE TABLE chat_task_segments (
-                id TEXT PRIMARY KEY, status TEXT NOT NULL, updated_at INTEGER NOT NULL
+                id TEXT PRIMARY KEY, previous_segment_id TEXT,
+                status TEXT NOT NULL, updated_at INTEGER NOT NULL
             )",
         )
         .execute(&db)
@@ -590,9 +658,24 @@ mod tests {
         sqlx::query(
             "CREATE TABLE chat_turn_state (
                 root_turn_id TEXT PRIMARY KEY, task_segment_id TEXT, revision INTEGER NOT NULL,
+                recovery_attempt INTEGER NOT NULL DEFAULT 0,
                 phase TEXT NOT NULL, status TEXT NOT NULL, recent_activity_kind TEXT,
                 recent_activity_label TEXT, waiting_reason TEXT, updated_at INTEGER NOT NULL,
                 completed_at INTEGER, terminal_reason TEXT
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE objective_recovery_attempts (
+                id TEXT PRIMARY KEY, objective_id TEXT, root_turn_id TEXT,
+                delivery_run_id TEXT, domain TEXT NOT NULL, attempt_index INTEGER NOT NULL,
+                failure_code TEXT NOT NULL, failure_class TEXT NOT NULL,
+                output_started INTEGER NOT NULL, side_effect_started INTEGER NOT NULL,
+                queue_wait_ms INTEGER, runtime_ms INTEGER, process_instance TEXT NOT NULL,
+                resume_owner TEXT NOT NULL, terminal_decision TEXT NOT NULL,
+                created_at INTEGER NOT NULL
             )",
         )
         .execute(&db)
@@ -1126,5 +1209,64 @@ mod tests {
             updated, 100,
             "anonymous sessions leave no trace by definition"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_recovery_attempt_persists_stable_code_and_objective_owner() {
+        let db = pool().await;
+        sqlx::query(
+            "INSERT INTO chat_task_segments(id, previous_segment_id, status, updated_at)
+             VALUES ('objective', NULL, 'active', 1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, task_segment_id, revision, recovery_attempt, phase, status, updated_at)
+             VALUES ('turn', 'objective', 1, 0, 'executing', 'active', 1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let persistence = SqlitePersistence {
+            db: db.clone(),
+            session_id: "session".into(),
+            anonymous: false,
+        };
+        persistence
+            .record_recovery_attempt(&RecoveryAttemptRow {
+                root_turn_id: "turn".into(),
+                domain: "provider".into(),
+                attempt_index: 1,
+                failure_code: "PROVIDER_OVERLOADED".into(),
+                failure_class: "transient_provider".into(),
+                output_started: false,
+                side_effect_started: false,
+                terminal_decision: "continue".into(),
+            })
+            .await
+            .unwrap();
+
+        let row: (String, String, String, i64, i64, String) = sqlx::query_as(
+            "SELECT objective_id, failure_code, failure_class,
+                    output_started, side_effect_started, terminal_decision
+             FROM objective_recovery_attempts",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "chat:objective");
+        assert_eq!(row.1, "PROVIDER_OVERLOADED");
+        assert_eq!(row.2, "transient_provider");
+        assert_eq!((row.3, row.4), (0, 0));
+        assert_eq!(row.5, "continue");
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT recovery_attempt FROM chat_turn_state WHERE root_turn_id='turn'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 1);
     }
 }

@@ -213,9 +213,10 @@ impl DesktopModelTransport {
                 self.call_chatgpt_model(messages, tool_defs, false, reasoning_effort)
                     .await
             }
-            _ => self
-                .call_openai_model(messages, tool_defs, false, reasoning_effort)
-                .await,
+            _ => {
+                self.call_openai_model(messages, tool_defs, false, reasoning_effort)
+                    .await
+            }
         }
     }
 
@@ -968,7 +969,9 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     return Err(TransportError::Fatal(reason));
                 }
                 Err(TransportError::Retryable(reason)) => {
-                    if self.turn_output_started.load(Ordering::SeqCst) {
+                    if self.turn_output_started.load(Ordering::SeqCst)
+                        || self.turn_side_effect_started.load(Ordering::SeqCst)
+                    {
                         self.route_state.record_current_failure(&reason);
                         return Err(TransportError::Retryable(reason));
                     }
@@ -1019,6 +1022,7 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     // intent, so fail visibly without switching.
                     if output_started.load(Ordering::SeqCst)
                         || self.turn_output_started.load(Ordering::SeqCst)
+                        || self.turn_side_effect_started.load(Ordering::SeqCst)
                     {
                         self.route_state.record_current_failure(&reason);
                         return Err(TransportError::Retryable(reason));
@@ -1204,21 +1208,27 @@ mod tests {
 
     #[test]
     fn deepseek_route_detection_covers_direct_and_openrouter_slugs() {
-        assert!(is_deepseek_route("https://api.deepseek.com", "deepseek-v4-pro"));
-        assert!(is_deepseek_route("https://openrouter.ai/api/v1", "deepseek/deepseek-v4-pro"));
+        assert!(is_deepseek_route(
+            "https://api.deepseek.com",
+            "deepseek-v4-pro"
+        ));
+        assert!(is_deepseek_route(
+            "https://openrouter.ai/api/v1",
+            "deepseek/deepseek-v4-pro"
+        ));
         // Non-DeepSeek OpenAI-compatible providers must NOT get the patch.
-        assert!(!is_deepseek_route("http://localhost:1234/v1", "qwen2.5-coder"));
+        assert!(!is_deepseek_route(
+            "http://localhost:1234/v1",
+            "qwen2.5-coder"
+        ));
         assert!(!is_deepseek_route("https://api.openai.com/v1", "gpt-5.6"));
     }
 
     #[test]
     fn deepseek_body_patch_enables_thinking_with_mapped_effort() {
-        let patch = deepseek_reasoning_body_patch(
-            "https://api.deepseek.com",
-            "deepseek-v4-pro",
-            "medium",
-        )
-        .expect("deepseek route gets a patch");
+        let patch =
+            deepseek_reasoning_body_patch("https://api.deepseek.com", "deepseek-v4-pro", "medium")
+                .expect("deepseek route gets a patch");
         assert_eq!(patch["thinking"]["type"], "enabled");
         assert_eq!(patch["reasoning_effort"], "high");
 
@@ -1230,12 +1240,10 @@ mod tests {
         .expect("openrouter deepseek slug gets a patch");
         assert_eq!(max_patch["reasoning_effort"], "max");
 
-        assert!(deepseek_reasoning_body_patch(
-            "http://localhost:1234/v1",
-            "qwen2.5-coder",
-            "high"
-        )
-        .is_none());
+        assert!(
+            deepseek_reasoning_body_patch("http://localhost:1234/v1", "qwen2.5-coder", "high")
+                .is_none()
+        );
     }
     fn tool_cm(id: &str, content: &str) -> ChatMessage {
         ChatMessage {
@@ -1695,5 +1703,50 @@ mod tests {
             transport.route_state.current().endpoint_name,
             "turn-primary"
         );
+    }
+
+    #[tokio::test]
+    async fn routed_transport_does_not_switch_after_a_prior_tool_side_effect_without_visible_text()
+    {
+        const DOWN: (&str, &str, &str) = (
+            "503 Service Unavailable",
+            "application/json",
+            r#"{"error":{"message":"Service Unavailable","code":"circuit_open"}}"#,
+        );
+        let (primary_url, primary_hits) = serve_responses(vec![DOWN, DOWN, DOWN]);
+        let (fallback_url, fallback_hits) = serve_responses(vec![(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"unsafe-replay\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )]);
+        let mut plan = super::super::failover::RouteCandidatePlan::new(openai_candidate(
+            "turn-primary",
+            "a",
+            primary_url,
+        ));
+        plan.push_fallback(openai_candidate("must-not-replay", "b", fallback_url));
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: "turn-side-effect-latch-test".into(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                plan,
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_output_started: Arc::new(AtomicBool::new(false)),
+            turn_side_effect_started: Arc::new(AtomicBool::new(true)),
+        };
+
+        let error = transport
+            .complete(&[], &[], &RoundOptions::default())
+            .await
+            .expect_err("unknown prior side effect must block provider replay");
+
+        assert!(matches!(error, TransportError::Retryable(_)));
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
     }
 }

@@ -158,6 +158,9 @@ pub fn classify_provider_failure(message: &str) -> ProviderFailureClass {
     {
         return ProviderFailureClass::RateLimited;
     }
+    if codefactory_agent_loop::context::is_provider_overloaded(message) {
+        return ProviderFailureClass::EndpointUnavailable;
+    }
     if lower.contains("biscuit_baker_service_me_circuit_open")
         || lower.contains("circuit_open")
         || lower.contains("http 408")
@@ -522,6 +525,16 @@ mod tests {
             classify_provider_failure("HTTP 400 Bad Request: max_tokens is unsupported"),
             ProviderFailureClass::FieldUnsupported
         );
+        for transient in [
+            "Our servers are currently overloaded. Please try again later.",
+            "upstream 529 overloaded",
+        ] {
+            assert_eq!(
+                classify_provider_failure(transient),
+                ProviderFailureClass::EndpointUnavailable,
+                "zero-output transient overload must enter the safe recovery policy"
+            );
+        }
     }
 
     #[test]

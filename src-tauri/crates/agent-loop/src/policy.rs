@@ -83,10 +83,80 @@ pub fn record_completion_outcome(
     .with_detected_semantic_failure();
     let succeeded = outcome.succeeded();
     gate.record(&outcome);
+    if result.command.starts_with("deliver_changes") {
+        if let Some(metadata) = result.metadata.as_ref() {
+            if let (Some(requested), Some(reached)) = (
+                metadata
+                    .get("requested_ceiling")
+                    .and_then(serde_json::Value::as_str),
+                metadata
+                    .get("reached_state")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                gate.record_delivery_completion(
+                    requested,
+                    reached,
+                    delivery_completion_satisfied(metadata),
+                );
+            }
+        }
+    }
     CompletionRecord {
         progress_prompt: progress.record(&outcome),
         succeeded,
     }
+}
+
+fn delivery_completion_satisfied(metadata: &serde_json::Value) -> bool {
+    if metadata
+        .get("delivery_state")
+        .and_then(serde_json::Value::as_str)
+        != Some("delivered")
+    {
+        return false;
+    }
+    let rank = |state: &str| match state {
+        "local" => Some(0),
+        "committed" => Some(1),
+        "pushed" => Some(2),
+        "pr_open" => Some(3),
+        "ci_green" => Some(4),
+        "merge_queued" => Some(5),
+        "merged" => Some(6),
+        "release_triggered" => Some(7),
+        "deployment_succeeded" => Some(8),
+        "live_verified" => Some(9),
+        _ => None,
+    };
+    let reached = metadata
+        .get("reached_state")
+        .and_then(serde_json::Value::as_str)
+        .and_then(rank);
+    let required = match metadata
+        .get("requested_ceiling")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("pr_only") => Some(3),
+        Some("through_ci_green") => Some(4),
+        Some("through_merge") => Some(6),
+        Some("through_release") => Some(9),
+        _ => None,
+    };
+    let remote_identity_present = required.is_some_and(|required| {
+        required < 3
+            || (metadata
+                .get("pr_number")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+                && metadata
+                    .get("commit_sha")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|sha| !sha.is_empty()))
+    });
+    reached
+        .zip(required)
+        .is_some_and(|(reached, required)| reached >= required)
+        && remote_identity_present
 }
 
 #[derive(Debug)]
@@ -982,6 +1052,62 @@ mod tests {
     }
 
     #[test]
+    fn delivery_metadata_is_arbitrated_instead_of_trusting_tool_done() {
+        let result = |delivery_state: &str, reached: &str, pr: Option<u64>, sha: Option<&str>| {
+            crate::tool::ToolInvocationResult {
+                content: "structured delivery result".into(),
+                is_error: false,
+                status: crate::tool::ToolExecutionStatus::Done,
+                command: "deliver_changes".into(),
+                kind: ToolKind::ReadOnly,
+                return_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+                metadata: Some(serde_json::json!({
+                    "delivery_state": delivery_state,
+                    "requested_ceiling": "through_release",
+                    "reached_state": reached,
+                    "pr_number": pr,
+                    "commit_sha": sha,
+                })),
+                next_working_directory: None,
+                duration_ms: 1,
+            }
+        };
+        let mut gate = CompletionGate::default();
+        let mut progress = ProgressTracker::new(8);
+        let mut sequence = 0;
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/tmp"),
+            "noop",
+            &result("noop", "local", None, None),
+        );
+        let incomplete = gate.evidence();
+        assert!(incomplete.delivery_completion_required);
+        assert!(!incomplete.delivery_completion_satisfied);
+        assert!(!incomplete.completed);
+
+        record_completion_outcome(
+            &mut gate,
+            &mut progress,
+            &mut sequence,
+            Path::new("/tmp"),
+            "live",
+            &result("delivered", "live_verified", Some(7), Some("abc")),
+        );
+        let complete = gate.evidence();
+        assert!(complete.delivery_completion_satisfied);
+        assert!(!complete
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("delivery completion arbitration")));
+    }
+
+    #[test]
     fn non_delivery_or_nonrecoverable_blockers_still_finalize() {
         let blocked = serde_json::json!({
             "recoverable": false,
@@ -1016,9 +1142,12 @@ mod tests {
 
     #[test]
     fn repair_continues_as_long_as_the_failure_signature_keeps_changing() {
-        let first =
-            recoverable_delivery_prompt("deliver_changes", &delivery_meta("ci_blocked", "aaa"), None)
-                .expect("first failure is recoverable");
+        let first = recoverable_delivery_prompt(
+            "deliver_changes",
+            &delivery_meta("ci_blocked", "aaa"),
+            None,
+        )
+        .expect("first failure is recoverable");
         // A different failure — the agent fixed the first one.
         let second = recoverable_delivery_prompt(
             "deliver_changes",
