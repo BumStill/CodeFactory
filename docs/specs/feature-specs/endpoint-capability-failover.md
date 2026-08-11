@@ -11,6 +11,10 @@
 `model-runtime-control-plane.md` 接管；发生冲突时以该新规格为准。跨进程恢复 route
 episode 和完整 attempt journal 仍是后续增强。
 
+route 内的安全切换与 replay latch 继续由本规格定义；候选耗尽、跨进程 ownership、
+用户回交与完成语义以 `objective-recovery-control-plane.md` 为准。旧“exhausted 后人工
+重试”只代表 approach 已耗尽，不能终止 objective。
+
 ## Requirements Traceability
 
 | Req ID | 要求 | 验证 |
@@ -26,7 +30,7 @@ episode 和完整 attempt journal 仍是后续增强。
 | CF-ECF-R9 | 自动切换只影响当前运行，不修改 `default_endpoint/default_model` | settings immutability assertion |
 | CF-ECF-R10 | 成功切换持久化一条自然中文 `turn_notice`；刷新后保持同样的无框低干扰表现 | loop persistence + component tests |
 | CF-ECF-R11 | 同端点重试折叠为一个 disclosure；不得堆叠多个醒目 amber 卡片 | reducer/component tests |
-| CF-ECF-R12 | 候选耗尽和发送前凭据失败均显示可行动中文说明，技术失败链默认折叠 | store/reducer/component tests |
+| CF-ECF-R12 | 候选耗尽和发送前凭据失败均产生 typed decision：技术耗尽进入 durable remediation；只有确认不可替代凭据/额度时聚合一次 core input。技术失败链默认折叠且无人工重试 CTA | store/router/reducer/component tests |
 | CF-ECF-R13 | 匿名会话、桌面会话和 subagent 使用同一候选解析与 routed transport；subagent 不设固定十分钟终止器 | adapter tests + code inspection |
 | CF-ECF-R14 | PR、CI、merge、正式 release 和公开产物验收完成前状态为 `not live` | Release Harness |
 
@@ -51,8 +55,8 @@ Keychain；只有真正前进到该候选时才读取。读取阻塞或被拒绝
 
 ### 可见输出后失败
 
-模型已经流出正文或工具意图后连接中断。系统不自动换模型重放，明确结束当前回合，避免
-把两个模型的内容拼在一起或重复副作用。
+模型已经流出正文或工具意图后连接中断。系统不自动换模型重放；stream 可以关闭，但
+objective 转入 receipt 对账/安全 checkpoint 续接，避免把两个模型的内容拼在一起或重复副作用。
 
 ### 用户取消
 
@@ -66,7 +70,7 @@ Keychain；只有真正前进到该候选时才读取。读取阻塞或被拒绝
   subagent。
 - Observation Harness：候选顺序、failure class、实际 effective route、usage attribution。
 - Payload Harness：凭据只在内存 route 中使用，Debug/事件/错误均不泄漏 secret。
-- Viewport Harness：重试、切换、耗尽信息保持自然聊天密度。
+- Viewport Harness：退避、切换、system-owned 耗尽信息保持自然聊天密度且无人工恢复 CTA。
 - AI Collaboration Harness：设计、后端、前端由独立角色实现/复核。
 - Release Harness：PR+CI、main、公开安装包、精确版本和真实 App。
 
@@ -78,10 +82,10 @@ Keychain；只有真正前进到该候选时才读取。读取阻塞或被拒绝
 | Keychain | 一个 lookup 永不及时返回 | 其它 lookup 并发完成；整体不冻结；坏候选被排除 |
 | Classifier | 503/429/401/400/context/vision/fatal | 只有安全可重放的 route failure 允许 failover |
 | Transport | A 503、B 429、C success | A/B/C 单调一次；C sticky；无 ping-pong |
-| Partial SSE | A 已输出后断线 | 不请求 B；回合可见失败 |
+| Partial SSE | A 已输出后断线 | 不请求 B；stream 关闭但 objective 显示正在对账/续接，不产生用户技术动作 |
 | Usage | A 无 usage、B success 有 usage | 成功用量记到 B 的 endpoint/model |
 | Persistence | B 接管成功后刷新 | `turn_notice` 与 final 顺序不变 |
-| Frontend | 两次 retry、一次 switch、一次 exhausted | 一条低对比 retry、一条 13px 自然 switch、技术详情折叠 |
+| Frontend | 两次 retry、一次 switch、一次 exhausted | 一条低对比 retry、一条 13px 自然 switch、system owner/下次观察可见、技术详情折叠且无 CTA |
 | Subagent | 长任务持续超过旧十分钟边界 | 无固定 wall-clock timeout；只受终态、取消及共享安全门禁约束 |
 | Release | 正式 macOS/Windows 产物 | 版本、公开资产、updater metadata 与发布记录一致 |
 
@@ -103,5 +107,5 @@ Keychain；只有真正前进到该候选时才读取。读取阻塞或被拒绝
   自动切换说明。
 - 不用 failover 绕过权限、取消、内容政策或工具确认。
 - mock、unit test、HTTP 200、PR 绿色或本地 Dev App 都不能单独证明上线。
-- 候选能力元数据、route episode 跨重启恢复、结构化修复按钮属于后续规格，不能在本次
-  发布说明中冒充已实现。
+- 候选能力元数据仍由模型控制面演进；route episode 必须接入 CF-ORC 的跨重启 supervisor。
+  结构化技术重试按钮已被取代，不得在发布说明或 UI 中作为恢复契约。

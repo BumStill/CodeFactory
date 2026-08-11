@@ -54,4 +54,37 @@ describe("MessageList ChatGPT authorization recovery", () => {
     expect(screen.getByRole("button", { name: "取消" })).toBeInTheDocument();
     expect(mocks.start).toHaveBeenCalledTimes(1);
   });
+
+  it("automatically resumes from the safe checkpoint after authorization succeeds", async () => {
+    mocks.start.mockResolvedValue({
+      flow_id: "shared-flow",
+      authorization_url: "https://auth.openai.test/flow",
+      status: "succeeded",
+      expires_at: Date.now() + 300_000,
+      browser_open_error: null,
+    });
+    const user = userEvent.setup();
+    render(
+      <MessageList
+        streaming={false}
+        messages={[
+          {
+            id: "auth-expired",
+            role: "user",
+            content: "HTTP 401 Unauthorized",
+            completionState: "auth_expired",
+            createdAt: Date.now(),
+          },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "重新验证" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "ChatGPT 已重新连接，正在从安全检查点继续",
+    );
+    expect(screen.queryByText(/重新发送需要继续的内容/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/当前失败回合不会自动重放/)).not.toBeInTheDocument();
+  });
 });

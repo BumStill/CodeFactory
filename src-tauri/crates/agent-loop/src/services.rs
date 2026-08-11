@@ -63,6 +63,13 @@ impl PermissionDenialReason {
     pub fn stops_tool_chain(self) -> bool {
         !matches!(self, Self::PolicyDenied)
     }
+
+    /// A lost/expired prompt channel is a transport interruption, not a user
+    /// decision. The current batch still stops before any side effect, while
+    /// the durable objective remains owned by the recovery supervisor.
+    pub fn is_system_owned_interruption(self) -> bool {
+        matches!(self, Self::TimedOut | Self::ChannelClosed)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

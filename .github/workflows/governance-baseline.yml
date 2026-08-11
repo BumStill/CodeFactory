@@ -20,5 +20,5 @@ jobs:
       - run: python tools/governance/validate_repo_governance_baseline.py
       - name: Enforce governance rules manifest (docs/governance/rules.yml)
         env:
-          GOVERNANCE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GOVERNANCE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python tools/governance/check_governance_rules.py

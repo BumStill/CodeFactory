@@ -10,12 +10,23 @@
 - Evidence Pack Requirements
 - 兼容性和发布边界
 
+## 跨规格权威顺序
+
+- `objective-recovery-control-plane.md` 是 objective ownership、阻断归属、完成语义、自动恢复和用户回交边界的最高产品契约。
+- 其它领域规格继续定义各自的分类、协议、安全边界和领域证据；当其旧文案把 provider、permission timeout、task attempt、CI、进程重启等 system-owned 技术状态变成人工“继续/重试/重新发送”动作时，以 CF-ORC 为准。
+- 明确用户拒绝/取消、不可替代核心输入、无安全默认的不可逆业务决定，以及 hard deny/不可逆副作用门禁不受自动恢复覆盖；但必须使用 CF-ORC 的 typed decision，而不能从错误字符串或旧 `blocked` 状态推断用户责任。
+- `completed` 只能由满足 CF-ORC Completion Predicate 的 `CompletionArbiter` 写入；turn、task、tool、delivery 和 stream 的局部终态只是 projection。
+
 ## 当前规格
 - `mvp-agent-client.md`: CodeFactory MVP AI 编程 Agent 主路径规格。
 - `personal-knowledge-office-assistant.md`: 个人知识库、PowerPoint 插件和通用助手化规格。
 - `terminal-bench-21-evaluation.md`: Terminal-Bench 2.1 能力评估、Harbor 接入、失败分类和回归闭环规格。
 - `evolution-agent-closed-loop.md`: Session 真实轨迹、信号提取、人工审核、受控改进与 Evals 门禁规格。
 - `task-failure-attribution-repair-loop.md`: Workspace 任务失败归因、修复建议和主产品闭环规格。
+- `objective-recovery-control-plane.md`: 跨 chat、task、permission、provider、browser、delivery、release 与进程重启的 objective 真相源、自动恢复和必要用户回交规格。
+- `durable-delivery-recovery.md`: 同一 objective/repo/change-set/PR 的持久交付、恢复分类和 Completion Arbiter 领域规格。
+- `session-control-convergence.md`: turn capability、permission outcome、segment guard 与会话恢复投影规格。
+- `model-runtime-control-plane.md`: 会话模型策略、OAuth、CredentialBroker、route replay fence 与安全续接规格。
 - `repository-owned-specifications.md`: 仓库归属的长期规范、会话内计划与旧 Specs 产品模块退场合同。
 - `chat-continuity-conversational-evidence.md`: 用户目标跨内部执行分段连续完成、异常可恢复终态、自然对话式工具证据与历史密度规格。
 - `endpoint-capability-failover.md`: 首选模型服务不可用时，基于本机已配置端点、凭据与本轮能力做有界自动接管，保持上下文和工具连续性并提供可行动失败说明。

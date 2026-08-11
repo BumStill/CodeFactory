@@ -8,13 +8,13 @@
 | CF-WB-R2 | 普通会话正文居中且不超过 880px；用户消息、助手正文和结果 footer 对齐同一阅读列 | MessageList | component geometry + real app |
 | CF-WB-R3 | 正文/操作/辅助信息采用 15/13/11px 层级；9–10px 不得承载正文、关键动作、失败原因或验收结果 | Workspace components | static audit + screenshots |
 | CF-WB-R4 | normal/progress/success/warning/danger/info 使用统一语义 token；状态不能只靠颜色 | theme + status surfaces | unit + contrast + real app |
-| CF-WB-R5 | 结果 footer 明确区分已完成、未完成、需要处理；未完成不得使用成功图标/绿色完成语义 | TurnResultSnapshot | component |
+| CF-WB-R5 | 结果 footer 明确区分 objective completed、system-owned 未完成、必要输入/业务决定与 cancelled；未完成不得使用成功图标/绿色完成语义，技术状态不得显示用户恢复 CTA | TurnResultSnapshot | component |
 | CF-WB-R6 | 正常 context 使用中性/progress 色，70–85% warning，≥85% danger，并暴露 accessible meter | ContextUsageBar | pure function + component |
 | CF-WB-R7 | composer、queue、draft scope 与 context 收敛成一个 raised 操作表面；用量/context 位于输入框上方；曲别针、单行文本与发送按钮共享 32px 垂直基准；placeholder 不列文件格式 | Workspace + MessageInput | component geometry + real app |
 | CF-WB-R8 | queue chip 的展开方向、`aria-expanded`、逐条移除名称和键盘 focus 正确 | QueueBadge | component |
 | CF-WB-R9 | 会话侧栏支持按标题/项目路径搜索，完整标题可读，关键辅助文字不小于 11px；收起入口归属于“会话”栏头且使用简单方向图标，隐藏后由顶栏带“会话”文字的入口恢复 | SessionSidebar | interaction component + real app |
 | CF-WB-R10 | 当前回合、后台作业、交付、队列保持独立真相源，但共享用户可理解的状态语义 | Workspace | integration + adversarial fixture |
-| CF-WB-R11 | 任务抽屉中的任务标题、恢复动作、失败归因和验收结果可读；不可修复阻塞与可恢复失败不同语义 | task activity | component + real app |
+| CF-WB-R11 | 任务抽屉中的任务标题、recovery owner、失败归因、最近进展、下一次观察和验收结果可读；system-owned remediation 与 core input/business decision 使用不同 typed 语义 | task activity | component + real app |
 | CF-WB-R12 | 交付链固定区分 PR、CI、合并、正式发布和线上验证；release 不能显示成 live | delivery + Settings + onboarding | component + copy audit |
 | CF-WB-R13 | Workspace 用户可见残留英文收敛为中文，代码、命令、API 名称除外 | Workspace | copy audit |
 | CF-WB-R14 | 1366×768、800×600、375×812 和 200% zoom 无整页横向溢出，composer 与关键状态可达 | desktop UI | viewport + real app |
@@ -39,11 +39,11 @@
 
 | 场景 | 正常路径 | 边界路径 |
 | --- | --- | --- |
-| Result | plan 全完成且无失败显示已完成 | 4/6、等待或失败显示需要处理/未完成 |
+| Result | CompletionArbiter 通过且 evidence 完整才显示已完成 | 4/6、system wait 显示系统继续处理；只有 typed input/decision 显示用户动作 |
 | Context | 58% 为中性/progress | 75% warning、90% danger |
 | Composer | 正常发送、附件、context footer | streaming steer、queue、stop、错误 |
 | Sidebar | 标题/路径搜索并打开会话 | 空结果、长标题、等待批准、运行中 |
-| Tasks | running → completed + verification | repairable failure、blocked failure |
+| Tasks | running → verified → objective completed | approach exhausted → remediation；core input/decision；explicit cancel |
 | Delivery | PR → CI → merge → release | remote unavailable、release 未 live |
 | Viewport | 1366×768 light/dark | 800×600、375×812、200% zoom |
 | Motion | 正常展开/状态过渡 | reduced motion |

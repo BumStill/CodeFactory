@@ -77,17 +77,46 @@ interface ControlPlaneSnapshot {
   risks: ControlPlaneRisk[];
 }
 
+type ObjectiveHealthAvailability = "available" | "unavailable";
+
+interface ObjectiveHealthMetrics {
+  open: number;
+  system_owned: number;
+  typed_user_attention: number;
+  technical_user_handoff_violations: number;
+  overdue_ownerless_remediations: number;
+  invalid_completions: number;
+  duplicate_committed_side_effect_receipts: number;
+  recovery_decisions: number;
+  recovered_objectives: number;
+  recovery_latency_p50_ms: number | null;
+  recovery_latency_p95_ms: number | null;
+  recovery_decisions_24h: number;
+  recovered_objectives_24h: number;
+  recovery_latency_p50_ms_24h: number | null;
+  recovery_latency_p95_ms_24h: number | null;
+}
+
+interface ObjectiveHealthSnapshot {
+  generated_at_ms: number;
+  window_start_ms: number;
+  availability: ObjectiveHealthAvailability;
+  unavailable_reason: string | null;
+  metrics: ObjectiveHealthMetrics | null;
+}
+
 interface ControlPlanePageProps {
   onBack: () => void;
 }
 
 const CONTROL_PLANE_REQUEST_TIMEOUT_MS = 8_000;
+const CONTROL_PLANE_RECOVERY_DELAY_MS = 3_000;
 
 async function requestControlPlaneSnapshot(cwd: string | null): Promise<ControlPlaneSnapshot> {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const watchdog = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(
-      () => reject(new Error("控制面请求超过 8 秒，请重试。")),
+      () => reject(new Error("控制面请求超过 8 秒；观测状态已保留，系统将在 3 秒后自动重新观测。")),
       CONTROL_PLANE_REQUEST_TIMEOUT_MS,
     );
   });
@@ -97,6 +126,40 @@ async function requestControlPlaneSnapshot(cwd: string | null): Promise<ControlP
       invoke<ControlPlaneSnapshot>("get_control_plane_snapshot", { cwd }),
       watchdog,
     ]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
+}
+
+async function requestObjectiveHealthSnapshot(): Promise<ObjectiveHealthSnapshot> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const watchdog = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(
+      () => reject(new Error("Objective health observation exceeded 8 seconds")),
+      CONTROL_PLANE_REQUEST_TIMEOUT_MS,
+    );
+  });
+
+  try {
+    const next = await Promise.race([
+      invoke<ObjectiveHealthSnapshot>("get_objective_health"),
+      watchdog,
+    ]);
+    if (!next || (next.availability !== "available" && next.availability !== "unavailable")) {
+      throw new Error("Objective health command returned an invalid snapshot");
+    }
+    return next;
+  } catch (error) {
+    const now = Date.now();
+    return {
+      generated_at_ms: now,
+      window_start_ms: now - 86_400_000,
+      availability: "unavailable",
+      unavailable_reason: `Objective health observation unavailable: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      metrics: null,
+    };
   } finally {
     if (timeoutId !== undefined) clearTimeout(timeoutId);
   }
@@ -328,10 +391,163 @@ function RiskList({ risks }: { risks: ControlPlaneRisk[] }) {
   );
 }
 
+function formatObjectiveLatency(value: number | null): string {
+  if (value === null) return "No sample";
+  if (value < 100) return `${value}ms`;
+  return `${(value / 1000).toFixed(1)}s`;
+}
+
+function ObjectiveHealthMetric({
+  testId,
+  label,
+  value,
+  risk = false,
+  detail,
+}: {
+  testId: string;
+  label: string;
+  value: number | string;
+  risk?: boolean;
+  detail?: string;
+}) {
+  return (
+    <div
+      data-testid={testId}
+      data-severity={risk ? "risk" : "normal"}
+      className={`rounded border p-3 ${
+        risk
+          ? "border-red-500/40 bg-red-500/10"
+          : "border-border bg-surface-1"
+      }`}
+    >
+      <div
+        className={`text-[10px] uppercase tracking-wider ${
+          risk ? "text-red-700 dark:text-red-300" : "text-gray-600"
+        }`}
+      >
+        {label}
+      </div>
+      <div
+        className={`mt-1 text-xl font-semibold ${
+          risk ? "text-red-800 dark:text-red-200" : "text-gray-100"
+        }`}
+      >
+        {value}
+      </div>
+      {detail && <p className="mt-1 text-[10px] leading-relaxed text-gray-600">{detail}</p>}
+    </div>
+  );
+}
+
+function ObjectiveHealthPanel({ health }: { health: ObjectiveHealthSnapshot | null }) {
+  if (!health || health.availability === "unavailable" || !health.metrics) {
+    return (
+      <div className="rounded border border-red-500/40 bg-red-500/10 p-4 text-red-800 dark:text-red-200">
+        <div className="flex items-center gap-2 text-sm font-semibold">
+          <AlertTriangle size={16} />
+          Unavailable
+        </div>
+        <p className="mt-2 text-xs leading-relaxed text-gray-400">
+          {health?.unavailable_reason ?? "Objective health has not produced an observable snapshot."}
+        </p>
+        <p className="mt-2 text-[10px] text-red-700 dark:text-red-300">
+          Metrics are intentionally hidden: unavailable is not a healthy zero.
+        </p>
+      </div>
+    );
+  }
+
+  const metrics = health.metrics;
+  const guardrails = [
+    {
+      testId: "objective-technical-handoffs",
+      label: "Technical handoff violations",
+      value: metrics.technical_user_handoff_violations,
+      detail: "Technical recovery incorrectly projected to the user.",
+    },
+    {
+      testId: "objective-ownerless-remediations",
+      label: "Overdue ownerless remediation",
+      value: metrics.overdue_ownerless_remediations,
+      detail: "Due system work without a valid owner lease.",
+    },
+    {
+      testId: "objective-invalid-completions",
+      label: "Invalid completion",
+      value: metrics.invalid_completions,
+      detail: "Completed without retaining its acceptance predicate.",
+    },
+    {
+      testId: "objective-duplicate-receipts",
+      label: "Duplicate committed receipts",
+      value: metrics.duplicate_committed_side_effect_receipts,
+      detail: "More than one committed receipt for one action fingerprint.",
+    },
+  ];
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-emerald-500/20 bg-emerald-500/5 px-3 py-2">
+        <div className="inline-flex items-center gap-2 text-xs font-medium text-emerald-800 dark:text-emerald-300">
+          <CircleCheck size={14} />
+          Available
+        </div>
+        <div className="text-[10px] text-gray-600">
+          Observed {new Date(health.generated_at_ms).toLocaleString()}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
+        <ObjectiveHealthMetric testId="objective-open" label="Open Objectives" value={metrics.open} />
+        <ObjectiveHealthMetric
+          testId="objective-system-owned"
+          label="System-owned"
+          value={metrics.system_owned}
+        />
+        <ObjectiveHealthMetric
+          testId="objective-typed-attention"
+          label="Typed user attention"
+          value={metrics.typed_user_attention}
+        />
+      </div>
+
+      <div className="grid grid-cols-1 gap-2 md:grid-cols-4">
+        {guardrails.map((metric) => (
+          <ObjectiveHealthMetric
+            key={metric.testId}
+            {...metric}
+            risk={metric.value > 0}
+          />
+        ))}
+      </div>
+
+      <div className="grid grid-cols-1 gap-2 md:grid-cols-[1.5fr_1fr_1fr]">
+        <ObjectiveHealthMetric
+          testId="objective-recovery-24h"
+          label="24h recovered / decisions"
+          value={`${metrics.recovered_objectives_24h} / ${metrics.recovery_decisions_24h}`}
+          detail={`Lifetime: ${metrics.recovered_objectives} recovered / ${metrics.recovery_decisions} decisions`}
+        />
+        <ObjectiveHealthMetric
+          testId="objective-recovery-p50"
+          label="24h recovery P50"
+          value={formatObjectiveLatency(metrics.recovery_latency_p50_ms_24h)}
+        />
+        <ObjectiveHealthMetric
+          testId="objective-recovery-p95"
+          label="24h recovery P95"
+          value={formatObjectiveLatency(metrics.recovery_latency_p95_ms_24h)}
+        />
+      </div>
+    </div>
+  );
+}
+
 export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
   const activeSession = useChatStore((s) => s.activeSession);
   const cwd = activeSession?.cwd ?? null;
   const [snapshot, setSnapshot] = useState<ControlPlaneSnapshot | null>(null);
+  const [objectiveHealth, setObjectiveHealth] = useState<ObjectiveHealthSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestSequence = useRef(0);
@@ -348,7 +564,10 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
     try {
       const next = await requestControlPlaneSnapshot(cwd);
       if (requestId !== requestSequence.current) return;
+      const nextObjectiveHealth = await requestObjectiveHealthSnapshot();
+      if (requestId !== requestSequence.current) return;
       setSnapshot(next);
+      setObjectiveHealth(nextObjectiveHealth);
     } catch (e) {
       if (requestId !== requestSequence.current) return;
       setError(e instanceof Error ? e.message : String(e));
@@ -364,6 +583,14 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
       requestSequence.current += 1;
     };
   }, [load]);
+
+  useEffect(() => {
+    if (!error) return;
+    const recoveryId = window.setTimeout(() => {
+      void load();
+    }, CONTROL_PLANE_RECOVERY_DELAY_MS);
+    return () => window.clearTimeout(recoveryId);
+  }, [error, load]);
 
   return (
     <div className="flex h-full flex-col bg-surface-0">
@@ -418,6 +645,10 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
 
               <Section title="Risks">
                 <RiskList risks={snapshot.risks} />
+              </Section>
+
+              <Section title="Objective Continuity">
+                <ObjectiveHealthPanel health={objectiveHealth} />
               </Section>
 
               <Section title="Authority Surfaces">

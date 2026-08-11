@@ -1,5 +1,7 @@
 # 会话连续执行与自然工具证据
 
+本规格定义 segment、timeline 与 hydration；跨 segment/process 的 objective 真相、恢复 owner、用户回交和完成语义以 `objective-recovery-control-plane.md` 为准。turn/stream 的 settled、error 或 interrupted 只能是局部投影，不能把 system-owned objective 写成 blocked/failed/completed。
+
 ## Requirements Traceability
 
 | Req ID | 要求 | 验证 |
@@ -8,12 +10,12 @@
 | CF-CCE-R2 | segment 边界必须先持久化最后工具 outcome 和 continuity checkpoint，再自动调度下一 segment；未完成时不得发成功 `Done` | Rust journal ordering + event assertions |
 | CF-CCE-R3 | 自动续段沿用同一 session、root turn、目标、权限、累计 recovery、失败签名、wall-clock 和取消状态，不把续跑伪装成新用户请求 | Rust integration + SQLite assertions |
 | CF-CCE-R4 | 连续无材料进展必须换策略并最终收敛为有证据的 Blocked；不得以“30/80 轮上限”作为用户可见阻塞 | policy unit + user-visible copy negative assertion |
-| CF-CCE-R5 | transport 异常、工具异常、spawned agent panic、abort、应用退出和续段调度失败必须落库为 completed/blocked/cancelled/failed/interrupted 之一，不得留下永久 running | panic/restart integration |
-| CF-CCE-R6 | watcher 捕获后台 task panic 后 2 秒内发送可见中断事件、释放 running/cancel owner，并保留诊断日志 | Rust async test + real app |
-| CF-CCE-R7 | 重启 hydration 遇到无活跃 owner 的悬空工具尾部时，5 秒内显示可恢复中断；不得继续显示旧计时或假运行 | SQLite fixture + real app |
-| CF-CCE-R8 | “继续执行”复用原 root goal 和检查点，从最后确认边界继续，不重复执行已成功的非幂等工具 | resume integration + side-effect counter |
+| CF-CCE-R5 | transport 异常、工具异常、spawned agent panic、abort、应用退出和续段调度失败必须关闭局部 owner 并落库为 settled/interrupted projection，同时把未完成 objective 转入 waiting_system/remediation；不得留下永久 running 或技术 blocked | panic/restart integration |
+| CF-CCE-R6 | watcher 捕获后台 task panic 后 2 秒内发送可见系统恢复事件、释放失效 running/cancel owner、排队 remediation 并保留诊断日志 | Rust async + supervisor + real app |
+| CF-CCE-R7 | 重启 hydration 遇到无活跃 owner 的悬空工具尾部时，5 秒内显示 system-owned 恢复状态；30 秒内 claim identity 完整的 objective，不继续显示旧计时、假运行或人工恢复动作 | SQLite fixture + real app |
+| CF-CCE-R8 | supervisor 自动复用原 root goal 和检查点，从最后确认边界继续，不重复执行已成功的非幂等工具；用户主动“继续”只用于批准方案/新 steer，不是技术恢复依赖 | resume integration + forbidden-CTA + side-effect counter |
 | CF-CCE-R9 | 助手正文是主阅读线；成功工具默认为无全周边框、无阴影的行内证据，运行/权限/失败使用轻背景或左侧状态线 | component + compiled CSS + real app |
-| CF-CCE-R10 | 相邻三个及以上例行成功工具可原位聚合，但当前运行中的 root turn 不得按固定 segment 阈值整体折叠；只有进入 completed、blocked、cancelled 或 failed 终态后才可收束较早过程。不得跨助手正文、失败、权限或用户消息分组，展开后顺序与审计内容不变 | timeline component tests + terminal transition real app |
+| CF-CCE-R10 | 相邻三个及以上例行成功工具可原位聚合，但当前 objective 未 completed/cancelled 时不得按固定 segment 阈值整体折叠；turn error、waiting_system 或 platform incident 都仍显示恢复状态。只有业务 completed 或显式 cancelled 后才可收束较早过程。不得跨助手正文、失败、权限或用户消息分组，展开后顺序与审计内容不变 | timeline component tests + objective transition real app |
 | CF-CCE-R11 | 工具折叠态不解析大 diff/完整输出，摘要有界且不泄漏 prompt、凭据或未脱敏参数 | lazy/payload tests |
 | CF-CCE-R12 | 主题 token 支持 Tailwind `<alpha-value>`；生产 CSS 必须真实生成工具证据使用的 border/background opacity 类 | production CSS assertion |
 | CF-CCE-R13 | 历史 hydration 按真实用户回合重组 narration、tool replay、continuity 和 final；同一回合密度与 live timeline 一致 | hydration/store + component fixture |
@@ -38,7 +40,7 @@
 
 ### 中断恢复路径
 
-Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 outcome；重启后 CodeFactory 识别该 root turn 没有活跃 owner 和合法终态，在原位置显示“执行意外中断，已保留完成内容”。安全条件满足时自动恢复，否则提供“继续执行”。恢复从最后确认边界开始，不重复编辑或重复外部写操作。
+Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 outcome；重启后 CodeFactory 识别该 root turn 没有活跃 owner 和合法终态，在原位置显示“已保留完成内容，系统正在恢复”。身份和 receipt 可证明时自动恢复；外部副作用未知时先只读对账；平台暂不可用时保持 remediation owner 和下一次观察。恢复从最后确认边界开始，不重复编辑或外部写操作，也不要求用户发送技术恢复消息。
 
 ### 自然对话路径
 
@@ -50,7 +52,7 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 
 ## Applicable Harnesses
 
-- Spec Harness：CF-CCE-R1..R18 逐项追踪。
+- Spec Harness：CF-CCE-R1..R25 与 CF-ORC-R1..R21 联合追踪。
 - Compatibility Harness：旧 SQLite、旧 completion state、Interactive/Execute/Autonomous、匿名会话、队列与 recovery。
 - Observation Harness：segment 接管耗时、panic 反馈、重启恢复、stream 终态和进程 owner。
 - Payload Harness：大 diff、长 stdout、文件参数、凭据和 continuity 摘要脱敏。
@@ -64,14 +66,14 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 | --- | --- | --- | --- |
 | Rust policy | transport 连续 30 轮都返回工具调用且 completion 未满足 | `npm run cargo:shared -- test --manifest-path src-tauri/crates/agent-loop/Cargo.toml iteration_boundary -- --nocapture` | 第 30 轮后为 checkpoint/continue，不是空 `Done`；第 31 轮可继续 |
 | Rust journal | 最后一轮工具成功后触发 segment 边界 | `npm run cargo:shared -- test --manifest-path src-tauri/Cargo.toml continuity_checkpoint -- --nocapture` | tool outcome row 先于 checkpoint；root turn/segment 游标正确 |
-| Rust panic | spawned chat future 在工具完成后 panic | `npm run cargo:shared -- test --manifest-path src-tauri/Cargo.toml chat_task_panic -- --nocapture` | 2 秒内 interrupted 落库与事件；running/cancel owner 清理 |
+| Rust panic | spawned chat future 在工具完成后 panic | `npm run cargo:shared -- test --manifest-path src-tauri/Cargo.toml chat_task_panic -- --nocapture` | 2 秒内 waiting_system/remediation 落库与事件；失效 owner 清理；同 objective 自动接管 |
 | Rust resume | 非幂等 fake tool 计数后模拟进程重启 | `npm run cargo:shared -- test --manifest-path src-tauri/Cargo.toml continuity_resume -- --nocapture` | 计数保持 1；从 tool outcome 后续跑；最终终态唯一 |
 | Frontend event | checkpoint/resumed/interrupted/terminal 乱序与迟到尾页 | `npm test -- --run src/stores/chatEvents.test.ts src/stores/chatEvents.gate.test.ts src/stores/chatEvents.longSession.test.ts` | 同一 root turn 定点更新；迟到 hydration 不覆盖 live segment |
-| Tool UI | success/running/permission/error、6 个连续成功项与超过 10 个 segment 的 active→terminal 回合 | `pnpm exec vitest run src/components/ToolCallCard.test.tsx src/components/ToolCallCard.error.test.tsx src/components/ToolCallCard.lazy.test.tsx src/components/MessageList.timeline.test.tsx` | success 无全边框；attention 有文字；分组边界正确；active 全量可见且无整体折叠入口；terminal 才收束；折叠不解析 diff |
+| Tool UI | success/running/permission/error、6 个连续成功项与超过 10 个 segment 的 active→system-wait→completed 回合 | `pnpm exec vitest run src/components/ToolCallCard.test.tsx src/components/ToolCallCard.error.test.tsx src/components/ToolCallCard.lazy.test.tsx src/components/MessageList.timeline.test.tsx` | success 无全边框；attention 有文字；分组边界正确；system wait 仍显示且无整体折叠入口；objective completed 才收束；折叠不解析 diff |
 | History/Memory | 一个回合被持久化为多条 assistant/tool/notice 行；postmortem 生成安全 memory 候选 | `npm test -- --run src/components/MessageList.gate.test.tsx src/components/MessageList.renderIsolation.test.tsx src/stores/chatEvents.segments.test.ts` + Rust learning materialization tests | hydration 后仍是一条自然流；气泡无 Remember；安全 memory 自动写入且 marker 去重 |
 | Theme build | `border-border/25`、`bg-surface-1/30` 等 opacity token | `npm run build` 后检查 `dist/assets/*.css` | 生产 CSS 含 alpha 规则；浅色不回退为不透明 `#1e293b` 黑框 |
 | Browser | 20-tool fixture，短流、长流、active→terminal、失败、用户上翻 | `pnpm dev`，用真实浏览器执行 1366×768 与 800×600 | 无横向溢出；正文优先；active 长回合不整体折叠；terminal 后才收束；上翻不强拉回 |
-| Dev App | 低 segment budget、panic hook、强制退出/重启 fixture | `pnpm tauri dev` 或 `scripts/install-dev-app-wrapper.sh` 启动 `CodeFactoryDev.app` | 自动续段、panic 可见、重启 5 秒内可恢复；成功/边界路径各一次 |
+| Dev App | 低 segment budget、panic hook、强制退出/重启 fixture | `pnpm tauri dev` 或 `scripts/install-dev-app-wrapper.sh` 启动 `CodeFactoryDev.app` | 自动续段、panic system-owned 可见、重启 30 秒内自动 claim；无人工继续 CTA；成功/边界路径各一次 |
 | Release App | 从公开 macOS/Windows 产物安装精确版本 | 标准 release workflow 后在产物上重走 Dev App 路径 | 版本匹配；真实 app 四视口/主题和连续性全部通过 |
 | Structured plan | 首次计划、步骤推进、等待、增删步骤无 change reason | `pnpm test -- --run src/stores/chatPlan.test.ts src/components/TurnProgress.test.tsx` | revision 有序；当前/下一步正确；计划变化有理由；百分比来源明确 |
 | Result snapshot | completed/partial/failed 与 1000-event turn | `pnpm test -- --run src/components/TurnResultSnapshot.test.tsx` | 5 秒内本地形成；完整过程可切；重新总结不调用模型；证据有界 |
@@ -83,7 +85,7 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 
 | 优先级 | Req IDs | 完成定义 |
 | --- | --- | --- |
-| P0 | R10 | 运行中平铺，终态才收束（PR #235） |
+| P0 | R10 | objective active/system-wait 平铺，completed/cancelled 才收束（PR #235 的 turn 终态语义由 CF-ORC 扩展） |
 | P1 | R19、R22 | 结构化执行路线、紧凑进度、等待/变更 |
 | P2 | R10、R13、R20、R22 | 结果快照、结果/过程切换、证据化重新总结 |
 | P3 | R21 | 有来源的时间区间；数据不足不展示 |
@@ -93,7 +95,7 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 证据包至少包含：
 
 - 30 轮边界 fixture 的事件序列、root turn、segment index 和最终终态；
-- panic/abort 后数据库 continuity 记录、用户可见提示与 owner 清理证据；
+- panic/abort 后数据库 continuity/objective remediation 记录、用户可见 system owner 与自动 claim 证据；
 - 非幂等 fake tool 在重启恢复前后只执行一次的计数；
 - live 与 hydration 的同一 20-tool fixture 对比；
 - 浅色/深色 × 1366×768/800×600 截图，包含成功、运行、失败和中断；

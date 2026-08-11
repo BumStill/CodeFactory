@@ -15,7 +15,7 @@
 | CF-EVO-R9 | 用户补充 | Home 提供一级「进化审查」入口和准确待审数量 | home + app navigation | component test + real home path | product + frontend + QA |
 | CF-EVO-R10 | 用户补充 | Workspace 待审提示深链到当前 project scope，不能回落到最近项目或串 scope | workspace + review routing | routing test + real project deep link | frontend + QA |
 | CF-EVO-R11 | 用户补充 | 待审页使用队列/详情主从布局，展示准确去向、脱敏证据、来源和精确人工动作 | evolution-review + learning | component/action tests + real review path | product + frontend + QA |
-| CF-EVO-R12 | 用户补充 | 分析、审核与有限物化作业及节点日志持久化；人工决定幂等；进程重启后死亡 owner 的旧运行中作业必须有明确失败终态且可重新运行，存活 owner 不得被误杀 | evolution jobs + sqlite + review UI | storage integration + liveness/restart path | architecture + development + QA |
+| CF-EVO-R12 | 用户补充 | 分析、审核与有限物化作业及节点日志持久化；人工决定幂等；进程重启后死亡 owner 的旧运行中作业必须保留记录与节点证据，兼容投影可标记 `failed`，但恢复责任归系统 remediation；存活 owner 不得被误杀 | evolution jobs + objective remediation + sqlite + review UI | storage integration + recovery ownership + liveness/restart path | architecture + development + QA |
 | CF-EVO-R13 | 用户补充 | 页面如实区分 proposed/approved/materialized/eval/active；Phase 0/1 不得假装已接 Evals 或 activation | review UI + governance | state contract review + negative UI assertion | planning + QA |
 | CF-EVO-R14 | 仓库规则 | 工作台完成声明同时满足成功、边界、重启、viewport 与 release 分层验收 | desktop-ui + sqlite + release | real app matrix + PR/CI + installer evidence | QA + release |
 | CF-EVO-R15 | 用户补充 | 本机锁屏不能阻断验证、合并或上线；不得绕过锁屏，改由不依赖交互桌面的 headless 浏览器 viewport/keyboard gate 与远端 macOS DMG smoke 继续执行；receipt 不得伪造 OS 锁屏观测 | browser harness + CI + release | 1366/390 headless receipt + PR checks + macOS artifact smoke | QA + release |
@@ -42,7 +42,7 @@
 - Payload Harness：arguments/result/error 截断、脱敏、Evidence 导出。
 - Viewport Harness：进化审查的队列/详情在 1366×768 和窄窗口可操作。
 - Lock-safe Harness：本机锁屏时继续执行系统 Chrome/Edge headless viewport/keyboard 验收；发布壳由 GitHub macOS runner 的 DMG smoke 独立证明。
-- Observation / Compatibility Harness 的 job lifecycle 验收维度：scope、结构化节点状态、人工决定幂等、失败记录与进程重启后的明确终态。分析窗口幂等、partial/dropped 和失败节点续跑是后续扩展，不纳入本轮已有能力声明。
+- Observation / Compatibility Harness 的 job lifecycle 验收维度：scope、结构化节点状态、人工决定幂等、失败记录、兼容终态投影与进程重启后的系统恢复责任。领域内断点恢复仍是后续扩展；当前由统一 objective remediation 保留目标并编排恢复，不能把技术恢复交给用户。
 - AI Collaboration Harness：规划、架构、QA 独立审查；明确当前实现与建议。
 
 ## 4. 测试矩阵
@@ -73,8 +73,8 @@
 | Review action | 采纳/拒绝 | 动作前无副作用；采纳只改变明确目标；拒绝不改 memory/settings | DB + filesystem/settings before/after |
 | Job | 运行分析 | 同一项目仅一个 running 分析；候选、最终节点和 job 终态原子提交，节点按真实顺序记录输入/输出计数 | storage integration + rollback fault injection + real job UI |
 | Job boundary | 样本不足/无候选 | 显示 current/threshold 或抑制数量，不显示“系统健康” | state test + real empty state |
-| Job failure | query/detector 或终态写入失败 | failure event 与 job failed 原子提交，任一被拒绝时一起回滚；显示准确失败节点；重新运行创建新 job，旧日志保留 | event-insert + terminal-update 双向 fault injection + retry assertion |
-| Job restart | 分析中或终态重启 app | 死亡、PID 已重用或旧版无 owner 的 queued/running 被关闭为 failed 并追加 `process_restart`；PID 与启动标识均匹配的存活 owner 保持 running；重新运行不重复 candidate | real dead child + PID reuse + live identity + restart DB assertion |
+| Job failure | query/detector 或终态写入失败 | failure event 与 job failed 原子提交，任一被拒绝时一起回滚；显示准确失败节点；统一 remediation 编排有 lineage 的后续 job，旧日志保留 | event-insert + terminal-update 双向 fault injection + recovery assertion |
+| Job restart | 分析中或终态重启 app | 死亡、PID 已重用或旧版无 owner 的 queued/running 被关闭为 `failed` 兼容投影、追加 `process_restart` 并交由统一 remediation；PID 与启动标识均匹配的存活 owner 保持 running；系统恢复不得重复 candidate | real dead child + PID reuse + live identity + restart DB + recovery-owner assertion |
 | Job audit | 来源作业很旧或日志超过 500 条 | 按 id 精确打开，不回退最新 job；事件保留最近 500 条与最新终态并提示上限 | query boundary + component test |
 | Workbench failure | 分析、采纳、拒绝或 ledger 读取失败 | 刷新并显式展示持久失败作业；采纳失败重读 current value；ledger 读取失败不显示空记录 | component failure-path tests + real app boundary path |
 | Decision focus | 窄屏/桌面处理最后或中间候选 | 成功后聚焦下一候选，最后一条聚焦“查看决定历史”；取消确认恢复原动作 | focus assertions + 390px real app keyboard path |
@@ -92,6 +92,6 @@
 
 ## 5. 完成边界
 
-单元测试、构建、UI 空态或一条非空数组都不是完成。Phase 0 仅在真实 app 主路径、边界路径、持久化、匿名、脱敏、Evidence、一级入口、project 深链和人工审核全部有证据后完成。本轮持久 job slice 还必须证明结构化日志、人工决定幂等、失败可追溯和重启中断明确终态；partial/dropped 与失败节点续跑属于后续 Phase 1 扩展。
+单元测试、构建、UI 空态或一条非空数组都不是完成。Phase 0 仅在真实 app 主路径、边界路径、持久化、匿名、脱敏、Evidence、一级入口、project 深链和人工审核全部有证据后完成。本轮持久 job slice 还必须证明结构化日志、人工决定幂等、失败可追溯，以及重启中断后的兼容投影和系统恢复责任；partial/dropped 与领域内断点恢复属于后续 Phase 1 扩展。
 
 R9-R15 的 v1.44.0 工作台仍是对 `learning_events` 的可信审核投影。R16-R25 开始把新批准 lazy-adopt 为独立 immutable candidate revision；`learning_events` 只保留来源与 legacy 决定，不能再承载 Eval/activation 真相。首版 Evals 是“激活安全回归”，证明变更可被安全、隔离、幂等地生效和回滚，不证明任务成功率提升。Dev app 验证、PR 或 CI 通过仍是 `not live`，必须经过刻意发版、精确发布二进制功能 smoke 和公开产物验证才可声明 live。

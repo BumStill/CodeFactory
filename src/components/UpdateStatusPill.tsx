@@ -75,7 +75,7 @@ export function UpdateStatusPill() {
       }`}
       title={
         errored
-          ? `上次检查失败：${phase.message}\n点击重试。`
+          ? `上次检查失败：${phase.message}\n系统会按计划自动再次检查；点击仅用于立即检查。`
           : phase.kind === "up_to_date"
           ? `已是最新版本。\n上次检查于 ${new Date(phase.checkedAt).toLocaleTimeString()}。\n点击再次检查。`
           : phase.kind === "checking"

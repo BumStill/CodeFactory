@@ -124,7 +124,13 @@ ROUTE_EXHAUSTED
 
 Stream error 事件增加 `code`、`endpoint_id`、`recoverable`，保留兼容的 `message`。
 `AUTH_EXPIRED` 触发会话内重新验证动作并同步 Settings 的账号状态；不得被归入 quota，
-不得自动切换到其它供应商掩盖账号失效。
+不得自动切换到其它供应商掩盖账号失效。runtime adapter 同时保存 `objective_id`、
+`resume_cursor`、`output_started`、`side_effect_started` 与 receipt 引用；授权完成后由
+RemediationSupervisor 先对账再续接，不能依赖新的用户消息。
+
+授权成功只解除 auth wait，不等于允许整回合 replay：零输出/零副作用可继续当前模型请求；
+已有 tool outcome 从其后的 cursor 继续；副作用未知先进入只读 reconcile。三条路径都保持
+同一 root turn/objective，并由 replay fence 保证副作用至多一次。
 
 ## CredentialBroker
 

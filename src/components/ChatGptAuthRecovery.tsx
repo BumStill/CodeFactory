@@ -69,7 +69,7 @@ export function ChatGptAuthRecovery() {
   if (flow.status === "succeeded") {
     return (
       <p role="status" className="text-xs leading-5 text-emerald-700 dark:text-emerald-300">
-        ChatGPT 已重新连接。为避免重复工具或副作用，请在输入框中明确重新发送需要继续的内容。
+        ChatGPT 已重新连接，正在从安全检查点继续。
       </p>
     );
   }

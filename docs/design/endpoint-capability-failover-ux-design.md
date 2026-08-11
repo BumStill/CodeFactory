@@ -1,13 +1,13 @@
 # 端点能力感知自动切换 UX 设计
 
-> 本次上线切片：单行折叠重试、13px 无框切换提示、候选耗尽的自然中文说明与折叠技术
-> 详情。结构化“重试原端点/打开端点设置”按钮和“以后默认使用”动作是后续增强；本次
-> 不以文字假按钮冒充完成。
+> 本次上线切片：单行折叠退避、13px 无框切换提示、候选耗尽的自然中文说明与折叠技术
+> 详情。候选耗尽后的恢复由 CF-ORC supervisor 持有；不再设计人工技术恢复按钮。
 
 ## 1. 设计目标
 
 端点故障恢复是对话的一部分，不把页面变成网络诊断台。用户首先需要知道任务仍在
-继续；只有恢复失败时，才需要看到端点排除原因和设置入口。
+继续；route approach 耗尽时，用户看到端点排除原因、系统 owner 和下一次观察。只有
+确认不可替代凭据/额度时才出现一次输入入口。
 
 信息优先级：
 
@@ -64,7 +64,7 @@ DeepSeek Flash 未尝试：当前回合包含图片，该模型未配置图片�
 
 ## 5. 候选耗尽
 
-最终状态保持普通助手回复，而不是原始错误 dump：
+候选耗尽保持同一 objective 状态，而不是原始错误 dump 或终态助手回复：
 
 ```text
 当前可用端点都无法接管这次任务。已经完成的修改和工具结果已保留。
@@ -73,21 +73,19 @@ ChatGPT：服务暂时不可用（503）
 DeepSeek：本机没有可读取的 API Key
 Local：当前回合包含图片，此模型不支持图片
 
-[重试 ChatGPT]  [打开端点设置]
+系统正在等待退避并继续核对 · 下次观察 14:32
 ```
 
 - 首行给结论和 preserved work；
 - 每个本机候选只给一行可读排除原因；
-- “重试原端点”与“打开端点设置”是结构化按钮，支持键盘操作；
+- 显示 recovery owner、最近真实进展和下一次观察，不提供技术恢复按钮；
 - 不显示“请稍后再试”作为唯一解决办法；
 - API Key 问题定位到对应 endpoint；ChatGPT OAuth 问题使用“重新登录”文案；
 - 展开“技术详情”后才显示脱敏 status、provider code 和 request id。
 
-按钮行为：
-
-- `重试原端点`：创建新的恢复 episode，保持同一 root goal 和已完成 tool outcome；
-- `打开端点设置`：打开 Settings/Endpoints 并聚焦故障端点，不自动修改配置；
-- 设置修复完成返回会话后，清楚显示“配置已更新，可继续”，不自动重放副作用。
+确实缺少不可替代凭据/额度时，core-input 卡只显示对应登录/凭据动作；完成事件到达后
+自动创建安全 episode 并从 checkpoint 续接。配置页可作为只读详情入口，但不能成为
+当前 objective 必须由用户返回并触发的恢复动作。
 
 ## 6. 不静默修改默认端点
 
@@ -131,7 +129,7 @@ ChatGPT 暂时不可用，已切换到 DeepSeek v4 Pro，继续处理。
 | retrying | 中性小圆点 + 单行更新 | 多张重试卡、暴露 1/3 |
 | switching | 13px 中性状态行 | 红色错误框、全屏 toast |
 | switched | 低对比历史步骤，可展开 | 静默切换、伪装成用户选择 |
-| exhausted | 普通正文 + 两个明确动作 | 只抛原始 JSON、“未知错误” |
+| exhausted | objective 状态 + owner/下次观察；必要时一个 core-input 动作 | 人工技术重试、只抛原始 JSON、“未知错误” |
 | auth issue | endpoint 名称 + 登录/Key 动作 | 展示 key_ref、token 或 secret |
 | capability mismatch | 人类可读能力原因 | 只写“模型不兼容” |
 
@@ -141,8 +139,7 @@ ChatGPT 暂时不可用，已切换到 DeepSeek v4 Pro，继续处理。
 ## 9. 可访问性
 
 - retry/switch 状态使用 `role="status"` 与 `aria-live="polite"`，同一状态只播报变化；
-- exhausted 终态使用可读标题，按钮有完整 accessible name，例如“重试 ChatGPT
-  端点”；
+- exhausted system state 使用可读标题和 `role=status`；必要 core-input 动作有完整 accessible name；
 - 技术详情用标准 disclosure，展开后焦点不丢失；
 - provider 图标必须配文字，不能只靠品牌颜色；
 - `prefers-reduced-motion` 下取消脉冲和淡出，状态文案保留。
@@ -150,10 +147,10 @@ ChatGPT 暂时不可用，已切换到 DeepSeek v4 Pro，继续处理。
 ## 10. 真实 App 验收
 
 - 1366×768 浅色/深色：两次短重试只占一行，切换成功后正文仍为视觉主体；
-- 800×600 浅色/深色：source/target 长名称截断但 accessible name 完整，两个失败动作
+- 800×600 浅色/深色：source/target 长名称截断但 accessible name 完整，owner 与必要输入
   不被输入框遮挡；
 - ChatGPT 503 → DeepSeek 成功：同一回合自然续写，状态不制造新气泡；
-- 全部 route 耗尽：首屏看到 preserved work、候选原因和两个动作，技术 JSON 默认折叠；
+- 全部 route 耗尽：首屏看到 preserved work、候选原因、system owner 和下次观察，无技术恢复 CTA；技术 JSON 默认折叠；
 - 带图片回合：无 vision 候选从未显示“正在尝试”；
 - 工具成功后切换：工具只显示一次，历史 reload 后顺序不变；
 - 用户取消：不再产生 route attempt，状态立即停止；

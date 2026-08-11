@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::config::settings::{
     self as settings_config, ApiStyle, CustomModel, Endpoint, ReasoningEffort, Settings,
@@ -884,6 +884,7 @@ async fn start_login_flow(app: tauri::AppHandle) -> Result<CodexLoginFlow> {
     }
 
     let task_flow_id = flow_id.clone();
+    let recovery_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let expected = state;
         let callback_result = tokio::time::timeout(
@@ -962,6 +963,26 @@ async fn start_login_flow(app: tauri::AppHandle) -> Result<CodexLoginFlow> {
                             flow.error_message = None;
                         })
                         .await;
+                        let state = recovery_app.state::<AppState>();
+                        let pool = state.db.read().await.clone();
+                        drop(state);
+                        match crate::agent::objective::ObjectiveStore::new(pool)
+                            .resume_waiting_authorizations(
+                                crate::agent::objective::RecoveryDomain::Auth,
+                                "chatgpt-auth:",
+                            )
+                            .await
+                        {
+                            Ok(count) if count > 0 => tracing::info!(
+                                count,
+                                "ChatGPT authorization restored; objectives queued for automatic resume"
+                            ),
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "failed to queue authorized objectives for resume"
+                            ),
+                        }
                     }
                     Err(error) => {
                         update_login_flow(&task_flow_id, |flow| {

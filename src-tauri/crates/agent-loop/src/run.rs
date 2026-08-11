@@ -371,6 +371,11 @@ async fn publish_turn_activity(
         waiting_reason: update.waiting_reason,
         updated_at,
         terminal_reason: update.terminal_reason,
+        objective_id: None,
+        objective_status: None,
+        recovery_owner: None,
+        next_observation_at: None,
+        last_progress_at: None,
     });
     Ok(())
 }
@@ -1427,6 +1432,7 @@ pub async fn run_agent_loop(
                 let mut permission_denial_duration_ms = 0_u64;
                 let mut permission_denial_stops_chain = false;
                 let mut permission_denial_terminal_reason: Option<&'static str> = None;
+                let mut permission_denial_waits_system = false;
                 let denial_content = if let Some(content) = capability_denial {
                     Some(content)
                 } else if let Some(denial) = inspection_denial.or_else(|| {
@@ -1452,6 +1458,8 @@ pub async fn run_agent_loop(
                         PermissionOutcome::Deny(denial) => {
                             permission_denial_duration_ms = denial.duration_ms;
                             permission_denial_stops_chain = denial.reason.stops_tool_chain();
+                            permission_denial_waits_system =
+                                denial.reason.is_system_owned_interruption();
                             permission_denial_terminal_reason =
                                 Some(denial.reason.terminal_reason());
                             Some(denial.content)
@@ -1477,12 +1485,16 @@ pub async fn run_agent_loop(
                     if capability_denied {
                         structural_denial_seen = true;
                     }
-                    if permission_denial_stops_chain {
+                    if permission_denial_stops_chain && !permission_denial_waits_system {
                         blocked_tool_result = true;
                         if blocker_terminal_reason.is_none() {
                             blocker_terminal_reason =
                                 permission_denial_terminal_reason.map(str::to_owned);
                         }
+                    }
+                    if permission_denial_waits_system {
+                        blocker_terminal_reason =
+                            permission_denial_terminal_reason.map(str::to_owned);
                     }
                     persistence
                         .record_tool_call_outcome(
@@ -1853,6 +1865,36 @@ pub async fn run_agent_loop(
                 reasoning_content: reasoning,
             });
             messages.extend(result_messages);
+            if blocker_terminal_reason
+                .as_deref()
+                .is_some_and(|reason| {
+                    matches!(reason, "permission_timed_out" | "permission_channel_closed")
+                })
+                && !blocked_tool_result
+            {
+                publish_turn_activity(
+                    persistence.as_ref(),
+                    events.as_ref(),
+                    root_turn_id.as_deref(),
+                    "recovering",
+                    "waiting",
+                    "permission_waiting",
+                    "授权通道暂时中断，系统将自动续接",
+                    Some("等待安全授权通道恢复"),
+                    blocker_terminal_reason.as_deref(),
+                )
+                .await?;
+                events.emit(crate::types::StreamEvent::Done {
+                    input_tokens: total_input_tokens.min(u32::MAX as u64) as u32,
+                    output_tokens: total_output_tokens.min(u32::MAX as u64) as u32,
+                });
+                return Ok(run_outcome_for_terminal(
+                    &completion_gate,
+                    StopReason::PlatformIncident,
+                    (total_input_tokens, total_output_tokens),
+                    &last_final_text,
+                ));
+            }
             if let Some(summary) = structured_delivery_blocker {
                 persistence
                     .persist_gate_message(&summary, "gate_blocked")
@@ -2774,13 +2816,22 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct TimedOutPermission {
+    struct FixedDenialPermission {
         calls: AtomicUsize,
+        reason: PermissionDenialReason,
+    }
+
+    impl FixedDenialPermission {
+        fn new(reason: PermissionDenialReason) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                reason,
+            }
+        }
     }
 
     #[async_trait::async_trait]
-    impl PermissionGateway for TimedOutPermission {
+    impl PermissionGateway for FixedDenialPermission {
         async fn authorize(
             &self,
             _tool_call: &ToolCall,
@@ -2789,8 +2840,8 @@ mod tests {
         ) -> PermissionOutcome {
             self.calls.fetch_add(1, Ordering::SeqCst);
             PermissionOutcome::Deny(PermissionDenial {
-                content: "permission expired without a user decision".into(),
-                reason: PermissionDenialReason::TimedOut,
+                content: format!("permission outcome: {}", self.reason.terminal_reason()),
+                reason: self.reason,
                 duration_ms: 60_000,
             })
         }
@@ -3770,43 +3821,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_timeout_stops_the_tool_chain_and_preserves_its_terminal_reason() {
+    async fn permission_transport_interruptions_wait_for_system_recovery() {
+        for reason in [
+            PermissionDenialReason::TimedOut,
+            PermissionDenialReason::ChannelClosed,
+        ] {
+            let transport = Arc::new(ScriptedTransport::new(vec![
+                response(
+                    "执行同一目标中的两个等价操作",
+                    vec![
+                        call("t1", "scripted", serde_json::json!({})),
+                        call("t2", "scripted", serde_json::json!({})),
+                    ],
+                    0,
+                ),
+                response("授权通道暂不可用。", vec![], 1),
+            ]));
+            let persistence = Arc::new(RecordingPersistence::default());
+            let events = Arc::new(CollectingEventSink::new());
+            let tools = Arc::new(CountingTools::default());
+            let permission = Arc::new(FixedDenialPermission::new(reason));
+            let mut svc = services(transport, persistence, events.clone());
+            svc.tools = tools.clone();
+            svc.permission = permission.clone();
+
+            let outcome = run_agent_loop(inputs(), config(), svc)
+                .await
+                .expect("permission transport interruption remains a settled turn");
+
+            assert!(
+                tools.executed().is_empty(),
+                "an unresolved permission must not execute either side effect"
+            );
+            assert_eq!(
+                permission.calls.load(Ordering::SeqCst),
+                1,
+                "the current batch stops safely while the objective moves to system-owned waiting"
+            );
+            assert!(events.events().iter().any(|event| matches!(
+                event,
+                StreamEvent::ToolResult {
+                    tool_call_id,
+                    status,
+                    ..
+                } if tool_call_id == "t2" && status == "cancelled"
+            )));
+            assert!(
+                events.events().iter().any(|event| matches!(
+                    event,
+                    StreamEvent::TurnActivityUpdated {
+                        status,
+                        terminal_reason: Some(observed_reason),
+                        ..
+                    } if status == "waiting" && observed_reason == reason.terminal_reason()
+                )),
+                "{:?} is a system-owned wait, not a user-owned blocker",
+                reason
+            );
+            assert!(!events.events().iter().any(|event| matches!(
+                event,
+                StreamEvent::TurnActivityUpdated { status, .. } if status == "blocked"
+            )));
+            assert_eq!(
+                outcome.stop_reason,
+                StopReason::PlatformIncident,
+                "the transport turn may settle, but the objective remains owned by recovery"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_permission_denial_stops_equivalent_side_effects() {
         let transport = Arc::new(ScriptedTransport::new(vec![
             response(
-                "读取页面",
+                "执行同一目标中的两个等价操作",
                 vec![
                     call("t1", "scripted", serde_json::json!({})),
-                    call(
-                        "t2",
-                        "bash",
-                        serde_json::json!({"command":"curl https://example.com"}),
-                    ),
+                    call("t2", "scripted", serde_json::json!({})),
                 ],
                 0,
             ),
-            response("授权已过期，页面未读取。", vec![], 1),
+            response("用户明确拒绝了该授权。", vec![], 1),
         ]));
         let persistence = Arc::new(RecordingPersistence::default());
         let events = Arc::new(CollectingEventSink::new());
         let tools = Arc::new(CountingTools::default());
-        let permission = Arc::new(TimedOutPermission::default());
+        let permission = Arc::new(FixedDenialPermission::new(
+            PermissionDenialReason::DeniedByUser,
+        ));
         let mut svc = services(transport, persistence, events.clone());
         svc.tools = tools.clone();
-        svc.permission = permission.clone();
+        svc.permission = permission;
 
-        run_agent_loop(inputs(), config(), svc)
+        let outcome = run_agent_loop(inputs(), config(), svc)
             .await
-            .expect("loop runs");
+            .expect("explicit denial settles normally");
 
-        assert!(
-            tools.executed().is_empty(),
-            "timed-out tool must not execute"
-        );
-        assert_eq!(
-            permission.calls.load(Ordering::SeqCst),
-            1,
-            "remaining tools in the provider batch must be cancelled without another authorization attempt"
-        );
+        assert!(tools.executed().is_empty());
         assert!(events.events().iter().any(|event| matches!(
             event,
             StreamEvent::ToolResult {
@@ -3821,16 +3932,9 @@ mod tests {
                 status,
                 terminal_reason: Some(reason),
                 ..
-            } if status == "blocked" && reason == "permission_timed_out"
+            } if status == "blocked" && reason == "permission_denied_by_user"
         )));
-        assert!(!events.events().iter().any(|event| matches!(
-            event,
-            StreamEvent::TurnActivityUpdated {
-                status,
-                terminal_reason: Some(reason),
-                ..
-            } if status == "blocked" && reason == "capability_denied"
-        )));
+        assert_eq!(outcome.stop_reason, StopReason::Blocked);
     }
 
     #[tokio::test]

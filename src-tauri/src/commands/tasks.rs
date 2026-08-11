@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::agent::objective::{ObjectiveSnapshot, ObjectiveStatus};
 use crate::agent::scheduler::TaskScheduler;
 use crate::agent::verification::{self, VerificationResult};
 use crate::commands::evidence;
@@ -33,7 +34,6 @@ pub type SchedulerHandles = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 /// the task module prevents the session-native delegation tool from embedding
 /// `run_session`'s opaque future back into the AgentLoop tool future (which
 /// would otherwise create a recursive async type through subagents).
-#[cfg(not(test))]
 pub fn spawn_delegated_session(
     scheduler: Arc<TaskScheduler>,
     session_id: String,
@@ -62,6 +62,113 @@ pub fn spawn_delegated_session(
         }
         handles.lock().await.remove(&session_id);
     });
+}
+
+/// Resume one due task Objective without bypassing the scheduler's durable
+/// pending→running claim. The process-local handle map deduplicates runners;
+/// the task CAS remains the cross-process execution owner.
+pub(crate) async fn resume_task_objective(
+    app: AppHandle,
+    objective: ObjectiveSnapshot,
+) -> Result<(), AppError> {
+    if objective.status != ObjectiveStatus::WaitingSystem {
+        return Err(AppError::Other(format!(
+            "task objective {} is not waiting_system",
+            objective.id
+        )));
+    }
+    let task_id = objective
+        .task_id
+        .as_deref()
+        .ok_or_else(|| AppError::Other("task objective is missing task_id".into()))?;
+    let session_id = objective
+        .session_id
+        .as_deref()
+        .ok_or_else(|| AppError::Other("task objective is missing session_id".into()))?;
+
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| AppError::Other("application state is not ready".into()))?;
+    if state
+        .update_restart_reserved
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(AppError::Other(
+            "应用更新已进入安全重启阶段，请等待自动恢复工作区".into(),
+        ));
+    }
+    let handles = app
+        .try_state::<SchedulerHandles>()
+        .ok_or_else(|| AppError::Other("task scheduler handles are not ready".into()))?
+        .inner()
+        .clone();
+    let pool = state.db.read().await.clone();
+    let task = tasks::get_task(&pool, task_id)
+        .await?
+        .ok_or_else(|| AppError::Other(format!("task {task_id} no longer exists")))?;
+    if task.session_id != session_id {
+        return Err(AppError::Other(format!(
+            "task {task_id} does not belong to objective session {session_id}"
+        )));
+    }
+    if tasks::task_objective_id(&pool, task_id).await?.as_deref() != Some(objective.id.as_str()) {
+        return Err(AppError::Other(format!(
+            "task {task_id} is not bound to objective {}",
+            objective.id
+        )));
+    }
+    match task.status.as_str() {
+        "running" => return Ok(()),
+        "completed" | "cancelled" => {
+            return Err(AppError::Other(format!(
+                "task {task_id} is terminal while objective {} still waits",
+                objective.id
+            )))
+        }
+        "pending" => {
+            if !tasks::make_task_due_for_objective(&pool, task_id, &objective.id).await? {
+                return Err(AppError::Other(format!(
+                    "task {task_id} changed before objective resume"
+                )));
+            }
+        }
+        status => {
+            return Err(AppError::Other(format!(
+                "task {task_id} cannot resume from status {status}"
+            )))
+        }
+    }
+
+    let settings = state.settings.read().await.clone();
+    let pending_permissions = state.pending_permissions.clone();
+    let interjections = state.interjections.clone();
+    let scheduler = Arc::new(TaskScheduler::new(pool));
+    let cancel = scheduler.cancel_handle();
+    {
+        let mut active = handles.lock().await;
+        if active.contains_key(session_id) {
+            return Ok(());
+        }
+        if state
+            .update_restart_reserved
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AppError::Other(
+                "应用更新已进入安全重启阶段，请等待自动恢复工作区".into(),
+            ));
+        }
+        active.insert(session_id.to_string(), cancel);
+    }
+    spawn_delegated_session(
+        scheduler,
+        session_id.to_string(),
+        settings,
+        app,
+        pending_permissions,
+        interjections,
+        handles,
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

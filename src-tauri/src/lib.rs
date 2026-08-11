@@ -517,7 +517,7 @@ pub fn run() {
             );
             let app_version = app.package_info().version.to_string();
             let process_identity = agent::delivery_run::ProcessIdentity::new(
-                process_instance,
+                process_instance.clone(),
                 &app_version,
                 option_env!("CODEFACTORY_BUILD_NUMBER").unwrap_or(&app_version),
             );
@@ -549,6 +549,7 @@ pub fn run() {
                 });
             }
 
+            let objective_pool = pool.clone();
             app.manage(AppState {
                 db: Arc::new(RwLock::new(pool)),
                 settings: Arc::new(RwLock::new(settings)),
@@ -559,11 +560,27 @@ pub fn run() {
             });
             // Manage the Arc so all commands share the same McpManager instance.
             app.manage(mcp_manager);
-            app.manage(commands::terminal::TerminalState::new());
-            // Phase 2: per-session scheduler cancel flags.
+            // Recovery adapters can run as soon as the first supervisor poll
+            // fires, so every process-local dependency must already be
+            // managed before stale Objectives are made due.
             let scheduler_handles: commands::tasks::SchedulerHandles =
                 Arc::new(Mutex::new(HashMap::new()));
             app.manage(scheduler_handles);
+            let stale_objectives = tauri::async_runtime::block_on(
+                agent::objective::ObjectiveStore::new(objective_pool.clone())
+                    .reconcile_stale_active_objectives(&process_instance),
+            )?;
+            if stale_objectives > 0 {
+                tracing::info!(
+                    count = stale_objectives,
+                    "startup: active objectives moved to system-owned recovery"
+                );
+            }
+            agent::objective_supervisor::spawn_objective_recovery_supervisor(
+                app.handle().clone(),
+                objective_pool,
+            );
+            app.manage(commands::terminal::TerminalState::new());
 
             tauri::async_runtime::spawn(async {
                 let reclaimed = tools::browser_session::reclaim_on_startup().await;
@@ -637,6 +654,7 @@ pub fn run() {
             commands::checkpoints::checkpoint_changeset,
             commands::checkpoints::revert_checkpoint,
             commands::control_plane::get_control_plane_snapshot,
+            commands::objective_health::get_objective_health,
             commands::document::read_document,
             commands::memory::read_project_memory,
             commands::memory::write_project_memory,

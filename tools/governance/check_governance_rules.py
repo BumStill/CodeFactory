@@ -8,8 +8,8 @@ docs/governance/agent-conformance.md). It:
   2. verifies every rule's `doc` and `enforcer` artifact actually exists
      (catches governance drift — a rule that claims enforcement it doesn't
      have), and
-  3. runs `enforcement: check` rules — currently `design-doc-for-major`,
-     which flags a major change that lands without a design doc.
+  3. runs `enforcement: check` rules, including major-change design evidence
+     and the objective non-interruption semantic contract.
 
 Blockers exit non-zero; warnings are emitted as GitHub annotations but do not
 fail the run (so a rule can ramp `warn -> error`). Output mirrors the contract
@@ -28,6 +28,15 @@ try:
 except ImportError:  # pragma: no cover - environment guard
     print("::error::PyYAML not available; cannot read docs/governance/rules.yml")
     sys.exit(2)
+
+try:
+    from tools.governance.validate_objective_non_interruption_contract import (
+        validate_changed_paths as validate_objective_non_interruption_changes,
+    )
+except ModuleNotFoundError:  # direct `python tools/governance/...` execution
+    from validate_objective_non_interruption_contract import (  # type: ignore[no-redef]
+        validate_changed_paths as validate_objective_non_interruption_changes,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RULES_PATH = REPO_ROOT / "docs" / "governance" / "rules.yml"
@@ -185,6 +194,51 @@ def check_evidence_pack_retention(level: str) -> list[dict]:
     return []
 
 
+def check_objective_non_interruption_contract(level: str) -> list[dict]:
+    """Reject changed product/spec copy that hands technical recovery to users."""
+
+    changed = changed_files()
+    if changed is None:
+        msg = (
+            "objective-non-interruption-contract: base unknown; cannot determine "
+            "which product/spec files require semantic validation"
+        )
+        if level == "error":
+            return [blocker(msg)]
+        annotate_warning(msg)
+        return []
+
+    violations = validate_objective_non_interruption_changes(REPO_ROOT)
+    if violations is None:
+        msg = "objective-non-interruption-contract: unable to read the changed-line diff"
+        if level == "error":
+            return [blocker(msg)]
+        annotate_warning(msg)
+        return []
+    if not violations:
+        checked = sum(
+            1
+            for path in changed
+            if path.startswith(("docs/specs/", "docs/design/", "src/", "src-tauri/src/"))
+        )
+        print(
+            "::notice::objective-non-interruption-contract: "
+            f"OK ({checked} candidate changed file(s))"
+        )
+        return []
+
+    messages = [
+        f"{violation.code} at {violation.path}:{violation.line}: "
+        f"{violation.message} [{violation.excerpt}]"
+        for violation in violations
+    ]
+    if level == "error":
+        return [blocker(message) for message in messages]
+    for message in messages:
+        annotate_warning(message)
+    return []
+
+
 def main() -> int:
     failures: list[dict] = []
 
@@ -230,6 +284,8 @@ def main() -> int:
             failures.extend(check_design_doc_for_major(rule.get("level", "warn")))
         if enf == "check" and rid == "evidence-pack-retention":
             failures.extend(check_evidence_pack_retention(rule.get("level", "warn")))
+        if enf == "check" and rid == "objective-non-interruption-contract":
+            failures.extend(check_objective_non_interruption_contract(rule.get("level", "error")))
 
     if failures:
         print(f"governance-rules: {len(failures)} blocker(s)")

@@ -22,6 +22,7 @@ pub struct UpdateSafetyStatus {
     pub active_chat_turns: usize,
     pub active_task_schedulers: usize,
     pub active_delivery_leases: i64,
+    pub nonterminal_objectives: i64,
     pub pending_permissions: usize,
     pub managed_browser_sessions: usize,
     pub terminal_sessions: usize,
@@ -32,11 +33,23 @@ impl UpdateSafetyStatus {
         self.safe_to_restart = self.active_chat_turns == 0
             && self.active_task_schedulers == 0
             && self.active_delivery_leases == 0
+            && self.nonterminal_objectives == 0
             && self.pending_permissions == 0
             && self.managed_browser_sessions == 0
             && self.terminal_sessions == 0;
         self
     }
+}
+
+async fn count_nonterminal_objectives(pool: &sqlx::SqlitePool) -> Result<i64, sqlx::Error> {
+    // Keep this aligned with ObjectiveStatus::is_terminal: waiting states are
+    // durable resumable work, not completion, and must survive before restart.
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objectives
+         WHERE status NOT IN ('completed', 'cancelled')",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 async fn count_active_delivery_leases(
@@ -79,6 +92,7 @@ pub async fn reserve_update_install(
     let now = chrono::Utc::now().timestamp_millis();
     let pool = state.db.read().await;
     let active_delivery_leases = count_active_delivery_leases(&pool, now).await?;
+    let nonterminal_objectives = count_nonterminal_objectives(&pool).await?;
 
     let mut status = UpdateSafetyStatus {
         safe_to_restart: false,
@@ -86,6 +100,7 @@ pub async fn reserve_update_install(
         active_chat_turns,
         active_task_schedulers,
         active_delivery_leases,
+        nonterminal_objectives,
         pending_permissions,
         managed_browser_sessions,
         terminal_sessions,
@@ -111,7 +126,7 @@ pub async fn release_update_install_reservation(
 
 #[cfg(test)]
 mod tests {
-    use super::{count_active_delivery_leases, UpdateSafetyStatus};
+    use super::{count_active_delivery_leases, count_nonterminal_objectives, UpdateSafetyStatus};
 
     #[test]
     fn restart_is_safe_only_when_every_runtime_owner_is_idle() {
@@ -128,6 +143,10 @@ mod tests {
             },
             UpdateSafetyStatus {
                 active_delivery_leases: 1,
+                ..UpdateSafetyStatus::default()
+            },
+            UpdateSafetyStatus {
+                nonterminal_objectives: 1,
                 ..UpdateSafetyStatus::default()
             },
             UpdateSafetyStatus {
@@ -185,5 +204,70 @@ mod tests {
         }
 
         assert_eq!(count_active_delivery_leases(&pool, 1_000).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_terminal_objectives_allow_restart() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (id, status) in [
+            ("active", "active"),
+            ("waiting-system", "waiting_system"),
+            ("waiting-core-input", "waiting_core_input"),
+            ("waiting-authorization", "waiting_authorization"),
+            ("waiting-business", "waiting_business_decision"),
+            ("legacy-orphan", "legacy_orphan"),
+            ("completed", "completed"),
+            ("cancelled", "cancelled"),
+        ] {
+            sqlx::query("INSERT INTO objectives (id, status) VALUES (?, ?)")
+                .bind(id)
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let nonterminal_objectives = count_nonterminal_objectives(&pool).await.unwrap();
+        assert_eq!(nonterminal_objectives, 6);
+        assert!(
+            !UpdateSafetyStatus {
+                nonterminal_objectives,
+                ..UpdateSafetyStatus::default()
+            }
+            .evaluate()
+            .safe_to_restart
+        );
+
+        sqlx::query(
+            "UPDATE objectives SET status = 'completed'
+             WHERE status NOT IN ('completed', 'cancelled')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let nonterminal_objectives = count_nonterminal_objectives(&pool).await.unwrap();
+        assert_eq!(nonterminal_objectives, 0);
+        assert!(
+            UpdateSafetyStatus {
+                nonterminal_objectives,
+                ..UpdateSafetyStatus::default()
+            }
+            .evaluate()
+            .safe_to_restart
+        );
     }
 }

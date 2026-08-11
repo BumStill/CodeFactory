@@ -1,19 +1,21 @@
 # 会话控制收敛与可见恢复
 
+本规格负责 turn capability、permission 分类、segment guard 与可见活动；跨 turn/process 的 objective ownership、自动恢复和完成语义以 `objective-recovery-control-plane.md` 为准。用户主动发送“继续/批准方案”仍可表达新授权，但 system-owned 技术恢复不得依赖该消息或同名 UI 动作。
+
 ## Requirements Traceability
 
 | Req ID | 要求 | 验证 |
 | --- | --- | --- |
 | CF-SCC-R1 | `permissions.full_access` 只影响工具权限决策，不得直接选择 `AgentMode::Execute` | Rust dispatch unit + settings compatibility |
 | CF-SCC-R2 | 分析、解释、状态查询和诊断请求在 Full access 下仍按普通交互回合处理；除非用户明确要求修改/实施，否则不得因为权限配置扩大成代码交付任务 | Rust command contract + real app |
-| CF-SCC-R3 | 明确批准的实施请求和结构化「继续执行」动作仍进入 Execute，不得因 R1 退回重复确认 | Rust dispatch unit + real app |
-| CF-SCC-R4 | Interactive/Execute 单个 root turn 最多允许 1 次定向 completion recovery；恢复提示只列尚缺 evidence，累计次数不得因普通读取或跨 segment 清零。第二次仍不足必须形成唯一的 `verification_incomplete` 终态，不得再次生成候选回复 | Rust failure-first unit + continuity integration |
+| CF-SCC-R3 | 明确批准的实施请求和用户主动表达的“继续已批准方案”仍进入 Execute，不得因 R1 退回重复确认；该语义不能被 system-owned 恢复按钮或伪用户消息代用 | Rust dispatch unit + forbidden-CTA + real app |
+| CF-SCC-R4 | Interactive/Execute 单个 segment 最多允许 1 次同策略定向 completion recovery；恢复提示只列尚缺 evidence，累计次数不得因普通读取或跨 segment 清零。仍不足时写 checkpoint 并由 objective supervisor 换策略/续段，禁止 `verification_incomplete` 人工终态或重复候选循环 | Rust failure-first unit + continuity/objective integration |
 | CF-SCC-R5 | 连续无进展计数可以在证据进展后清零，但必须与不可重置的累计恢复次数分离 | Rust state-machine unit |
 | CF-SCC-R6 | recovery/ready 的内部 prompt 和被拒绝候选回复继续不进入聊天正文；用户必须看到脱敏的恢复状态卡，而不是只看到 `Thinking` | reducer + component + real app |
 | CF-SCC-R7 | 恢复状态卡至少显示阶段、恢复次数、继续原因、当前步骤、最近活动时间和累计耗时；不得泄漏内部 prompt 或未脱敏的命令参数 | component + privacy negative assertions |
 | CF-SCC-R8 | `tool_call_start`/`tool_result` 在内部恢复期间更新状态卡；失败和等待权限保持可见，完成门禁不能删除整个用户回合的活动证据 | reducer + hydration regression |
 | CF-SCC-R9 | 历史加载后应从持久化的 completion state 与 tool call 记录重建简洁恢复摘要；旧数据库无新增字段时保持兼容 | hydration unit + SQLite compatibility |
-| CF-SCC-R10 | 当前 segment 恢复耗尽后必须 checkpoint 并自动续段，或形成带具体 blocker 的可恢复终态；未完成时不得发成功/空 `Done`，也不得把第 4 次拒绝变成隐藏循环 | Rust event sequence + continuity integration + frontend stream unit |
+| CF-SCC-R10 | 当前 segment 恢复耗尽后必须 checkpoint 并自动续段，或形成 typed `waiting_system/core_input/business_decision`；未完成时不得发成功/空 `Done`，也不得把第 4 次拒绝变成隐藏循环或人工技术终态 | Rust event sequence + continuity/objective integration + frontend stream unit |
 | CF-SCC-R11 | 取消文案明确表示停止后续生成，不自动回滚已提交、已推送或已执行的外部状态 | component + real app |
 | CF-SCC-R12 | PR+CI、真实 CodeFactory App 和精确发布产物验证前保持 `not live` | evidence pack |
 | CF-SCC-R13 | 自动事实纠偏只允许进入执行型回合；交付类纠偏还必须核对当前用户明确要求的交付动作。检测不得跨段拼接示例、引用或假设中的关键词，不得把分析/设计回答改写成 `deliver_changes` 等无关执行。内部 `turn_notice` 必须保留可审计的 system 来源，不能冒充新的用户目标 | Rust failure-first regression + exact field-session replay + real app |
@@ -22,16 +24,16 @@
 | CF-SCC-R16 | 每个用户 root turn 必须在模型调用前形成独立于权限设置的 `review_only / implement / deliver` capability。Full access 只能放宽已允许工具的审批，不能扩大 capability | Rust dispatch + settings compatibility |
 | CF-SCC-R17 | `review_only` 只能看到并执行读取、搜索、状态探测和无副作用验证；`write/edit`、变更型 shell、交付、并行/委派以及未知 MCP 工具必须在 AgentLoop 结构层拒绝，不能依赖模型自律 | scripted transport + backend call counter + temp repo |
 | CF-SCC-R18 | `implement` 允许本地实现和验证但不允许 commit/push/PR/merge/release/deploy；只有当前用户明确要求交付，或明确批准包含交付的上一方案时，才进入 `deliver` | dispatch inheritance + bash/tool policy + real app |
-| CF-SCC-R19 | 结构门禁拒绝必须落为 `denied` 工具 outcome 并继续形成一次正常用户答复；内部拒绝原因不能冒充新的用户目标或触发隐藏交付纠偏 | event sequence + persistence + hydration |
+| CF-SCC-R19 | 结构门禁拒绝必须落为 `denied` 工具 outcome；policy/hard deny 由系统选择安全替代或形成 system-owned remediation，显式用户拒绝/取消才停止绑定 action/objective。内部拒绝原因不能冒充新的用户目标或触发隐藏交付纠偏 | event sequence + persistence + hydration |
 | CF-SCC-R20 | 「继续/可以继续」是显式状态转换，不依赖上一条助手回复是否以问号结尾。它必须继承最近的可执行方案；没有可执行方案时至少进入 Implement，除非当前文本明确要求继续分析/审视或停止修改 | dispatch matrix + real app |
 | CF-SCC-R21 | 运行中的真实用户 steer 必须在下一安全轮次边界重算 capability：可由 ReviewOnly 升为 Implement/Deliver，也可按“停止修改，只分析”收紧为 ReviewOnly。模型和权限设置均无权自行改变 capability | scripted loop + real app |
 | CF-SCC-R22 | capability 变化后必须重新按新 capability 暴露工具；先前一次性过滤的 tool schema 不得造成整条 root turn 永久锁死 | scripted tool-schema regression |
-| CF-SCC-R23 | steer 不得清零 root turn 的累计 recovery 次数；结构门禁拒绝后的终态必须为 blocked，不得写 `completed/任务已完成`，用户也不得被要求重复授权 | state-machine unit + SQLite truth |
+| CF-SCC-R23 | steer 不得清零 root turn 的累计 recovery 次数；结构门禁拒绝后必须通过 DecisionEnvelope 区分 waiting_system、显式 deny/cancel 或必要输入，不得写 `completed/任务已完成`，也不得把 policy/timeout 冒充用户阻断 | state-machine unit + SQLite truth |
 | CF-SCC-R24 | ReviewOnly 只允许显式登记的只读工具；未知 MCP 即使名称以 `read_/get_/list_` 开头也必须 fail closed。Git branch/switch/checkout/fetch/pull/stash 均属于本地仓库状态变更 | backend counter + command classification |
 | CF-SCC-R25 | 浏览器权限必须按 action 和数据范围判定，不能再按 `browser_session` 工具名一刀切。Standard 下公开页面 `open/snapshot/close` 不重复询问；用户当前消息明确要求读取本机 Chrome 时，该 root turn 可连接现有 Chrome，Chrome 自身的远程调试确认仍是最终边界 | dispatch + permission unit + real app |
 | CF-SCC-R26 | `click/fill/press` 属于浏览器 Act，即使 Trusted 也必须逐次询问；`screenshot(path)` 会写工作区，必须分类为 Mutation，ReviewOnly 下不得执行 | permission + capability classifier |
 | CF-SCC-R27 | 权限结果必须区分 `denied_by_user / timed_out / channel_closed / cancelled / policy_denied`。只有用户明确点拒绝才可归因用户；等待时长必须进入工具证据，首个权限阻断不得被后续 fallback 的结构拒绝覆盖 | fake-clock unit + scripted loop + SQLite truth |
-| CF-SCC-R28 | 权限等待采用有界且可见的 60 秒窗口；前端显示到期时间，后台会话在侧边栏标记“等待批准”。超时后停止当前工具链并形成一次阻断总结，不得再提示模型“换一种方式”造成重复尝试 | reducer + component + real app |
+| CF-SCC-R28 | 权限等待采用有界且可见的 60 秒 channel 窗口；前端显示到期时间，后台会话在侧边栏标记“等待批准”。timeout/channel close 只结束当前工具等待并转为 `waiting_system`，objective 保持 owner/lease 并在通道可用后自动续接；不得生成阻断总结或诱发模型盲目重复 | reducer + fake-clock + restart + real app |
 | CF-SCC-R29 | 普通 Chrome 连接使用官方 CDP attach，并复用用户现有登录态；关闭 CodeFactory 会话只能 detach，绝不关闭普通 Chrome。工具输出必须明确区分受管浏览器和用户 Chrome，页面内容始终标为不可信数据 | native tool unit + authenticated fixture + process proof |
 | CF-SCC-R30 | 当前能力或授权无法满足“读取真实现网页面”时，不得把本地源码、匿名 HTTP 或另一份浏览器冒充等价证据；Python/Node 等可执行 heredoc 继续 fail closed 为 Mutation | scripted trajectory + shell classifier regression |
 | CF-SCC-R31 | 单个工具实际执行超过 30 秒时必须周期更新同一条 turn activity；60 秒后用户在折叠前直接看到脱敏工具类别与长等待原因。心跳不得创建聊天消息、不得包含参数/路径/输出，工具终态后不得继续更新 | fake-clock loop + reducer/component + real app |
@@ -47,7 +49,7 @@
 
 ### 执行与恢复路径
 
-用户明确要求实施，或点击结构化「继续执行」后进入 Execute。仅实施请求得到 `implement`，包含提交、PR、合并、发布或上线的明确请求得到 `deliver`。模型尝试结束但验证证据不足时，正文中的候选草稿和内部 recovery prompt 保持隐藏；同一位置显示一句紧凑状态，说明正在补充哪一项证据。每个 root turn 只允许一次定向恢复；仍不足时形成唯一的 `verification_incomplete` 结果，不能继续生成候选—拒绝—重试循环。
+用户明确要求实施，或主动批准已有可执行方案后进入 Execute。仅实施请求得到 `implement`，包含提交、PR、合并、发布或上线的明确请求得到 `deliver`。模型尝试结束但验证证据不足时，正文中的候选草稿和内部 recovery prompt 保持隐藏；同一位置显示一句紧凑状态，说明正在补充哪一项证据。每个 segment 只允许一次同策略定向恢复；仍不足时持久化 checkpoint 并由 supervisor 续段或换策略，不能生成候选—拒绝—重试循环，也不能要求用户推动。
 
 运行中发送的新消息属于 steer revision，不是普通模型上下文附注。框架先根据用户原文更新结构 capability，再进入下一次模型调用；升级后重新开放对应工具，降级后下一次 mutation 必须在 permission 之前被拒绝。任何 steer 都不能补充 recovery 配额。
 
@@ -60,15 +62,17 @@
 | terminal/idle | 明确分析、不要修改 | 新 ReviewOnly root |
 | terminal/idle | 明确修复/实施 | 新 Implement root |
 | terminal/idle | 明确 PR/发布/上线 | 新 Deliver root |
-| terminal/idle | 继续/可以继续 | 继承最近可执行方案；无可执行方案时 Implement |
+| terminal/idle | 用户主动发送继续/可以继续 | 继承最近可执行方案；无可执行方案时 Implement；这是新的用户 steer，不是技术恢复依赖 |
 | Active ReviewOnly | 明确开始实施/执行批准方案 | 下一安全边界升级 Implement |
 | Active ReviewOnly/Implement | 明确发布交付 | 下一安全边界升级 Deliver |
 | Active Implement/Deliver | 停止修改、继续分析 | 下一安全边界收紧 ReviewOnly |
-| 任意 active | capability/permission 拒绝且无法继续 | blocked，绝不 completed |
+| 任意 active | permission timeout/channel close 或 policy deny | waiting_system/安全替代；绝不 completed 或 user blocked |
+| 任意 active | 用户明确拒绝绑定动作或取消目标 | cancelled/denied；不得绕过等价副作用 |
+| 任意 active | 必要核心输入或不可代选业务决定 | typed wait；输入/选择后同 objective 自动续接 |
 
 ### 历史恢复路径
 
-用户切换会话或重启 App 后，进行中的会话不把内部 prompt 当成用户消息，也不重新展示被拒绝草稿；历史活动被折叠为简洁恢复摘要，最终回答与警告保持可读。
+用户切换会话或重启 App 后，进行中的会话不把内部 prompt 当成用户消息，也不重新展示被拒绝草稿；历史活动被折叠为简洁恢复摘要，startup supervisor 在租约过期后自动 claim 同一 objective，不显示技术恢复 CTA。
 
 ### 自纠偏边界
 
@@ -83,7 +87,7 @@
 
 ## Applicable Harnesses
 
-- Spec Harness：CF-SCC-R1..R19，并与 CF-CCE-R1..R25 的连续性契约联合验证。
+- Spec Harness：CF-SCC-R1..R34，并与 CF-CCE-R1..R25、CF-ORC-R1..R21 的连续性与 ownership 契约联合验证。
 - Compatibility Harness：旧 settings、旧 completion state、旧会话 hydration。
 - Viewport Harness：1366×768、800×600 下状态卡与输入区不重叠。
 - Observation Harness：真实 App 中 Full access 诊断、Execute 恢复和取消路径。
@@ -94,4 +98,4 @@
 
 ## 完成边界
 
-只通过 Rust 或 React 单测不算完成。必须证明 Full access 不再改变回合意图、segment 内恢复 guard 真实生效但不会终止用户目标、内部恢复与跨段续跑期间用户可见进度、历史兼容，以及发布 App 的真实会话行为。
+只通过 Rust 或 React 单测不算完成。必须证明 Full access 不再改变回合意图、segment 内恢复 guard 真实生效但不会终止用户目标、permission timeout/channel close 自动续接、内部恢复与跨段/跨进程续跑期间用户可见进度、历史兼容，以及正式发布 App 的真实会话行为。

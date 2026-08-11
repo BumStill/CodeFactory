@@ -812,6 +812,12 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     }
     ensure_column(pool, "chat_turn_state", "user_reprompt_driver", "TEXT").await?;
 
+    // Unified business objectives are the cross-domain truth; turn/task/tool
+    // tables above remain compatibility projections. This runs before orphan
+    // recovery so startup never converts a recoverable objective into a user
+    // terminal merely because a prior process died.
+    crate::agent::objective::ensure_schema(pool).await?;
+
     // ── task_runs has a verification_results JSON column referenced by
     //    the verification engine. Some older DBs and all fresh installs
     //    miss it.
@@ -1143,7 +1149,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         .await?;
         sqlx::query(
             "UPDATE evolution_jobs
-             SET status='failed', completed_at=?, error='应用在作业完成前中断，请重新运行'
+             SET status='failed', completed_at=?, error='应用在作业完成前中断；作业记录与失败证据已保留，后续恢复由系统接管'
              WHERE id=? AND status IN ('queued', 'running')",
         )
         .bind(&interrupted_at)
@@ -2053,7 +2059,11 @@ mod tests {
         .unwrap();
         assert_eq!(job.0, "failed");
         assert!(job.1.is_some());
-        assert_eq!(job.2.as_deref(), Some("应用在作业完成前中断，请重新运行"));
+        assert_eq!(
+            job.2.as_deref(),
+            Some("应用在作业完成前中断；作业记录与失败证据已保留，后续恢复由系统接管")
+        );
+        assert!(!job.2.as_deref().unwrap_or_default().contains("重新运行"));
         let event: (String, String, String) = sqlx::query_as(
             "SELECT stage, status, detail_json FROM evolution_job_events
              WHERE job_id='interrupted' ORDER BY created_at DESC, rowid DESC LIMIT 1",
@@ -2273,6 +2283,97 @@ mod tests {
             .unwrap();
             assert_eq!(exists, 1, "missing additive table {table}");
         }
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_adds_unified_objective_control_plane_idempotently() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE messages (id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+
+        for table in [
+            "objectives",
+            "objective_bindings",
+            "objective_events",
+            "objective_decisions",
+            "objective_remediations",
+            "side_effect_receipts",
+            "objective_evidence",
+        ] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(exists, 1, "missing unified objective table {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn objective_schema_rejects_false_completion_and_system_owned_user_handoff() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE messages (id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        ensure_schema(&pool).await.unwrap();
+        sqlx::query("SELECT 1 FROM objectives LIMIT 1")
+            .execute(&pool)
+            .await
+            .expect("objective table must exist before constraint assertions");
+
+        let now = 1_723_000_000_000_i64;
+        let false_complete = sqlx::query(
+            "INSERT INTO objectives
+             (id, revision, kind, status, decision_type, domain,
+              requested_acceptance, reached_acceptance, requires_user_action,
+              created_at, updated_at, completed_at)
+             VALUES ('false-complete', 1, 'informational', 'completed', 'complete', 'chat',
+                     'answer', 'answer', 0, ?, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await;
+        assert!(
+            false_complete.is_err(),
+            "completed without arbiter evidence must fail closed"
+        );
+
+        let system_handoff = sqlx::query(
+            "INSERT INTO objectives
+             (id, revision, kind, status, decision_type, domain,
+              requested_acceptance, requires_user_action,
+              recovery_owner, remediation_id, next_observation_at,
+              created_at, updated_at)
+             VALUES ('system-handoff', 1, 'local_mutation', 'waiting_system', 'waiting', 'tool',
+                     'local_validation', 1, 'remediation-supervisor', 'repair-1', ?, ?, ?)",
+        )
+        .bind(now + 30_000)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await;
+        assert!(
+            system_handoff.is_err(),
+            "system-owned technical recovery must never require a user CTA"
+        );
     }
 
     /// The backfill is what makes the fix visible on existing data — and it

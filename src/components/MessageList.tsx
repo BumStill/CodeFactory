@@ -379,15 +379,18 @@ export function MessageList({
   );
   const lastAssistantId =
     [...visible].reverse().find((m) => m.role === "assistant")?.id ?? null;
-  const activeProgressMessage = streaming
-    ? [...visible]
-        .reverse()
-        .find(
-          (message) =>
-            message.role === "assistant" &&
-            (message.plan || message.turnActivity),
-        )
-    : undefined;
+  const activeProgressMessage = [...visible]
+    .reverse()
+    .find((message) => {
+      if (streaming) {
+        return message.role === "assistant" && Boolean(message.plan || message.turnActivity);
+      }
+      const objectiveStatus = message.turnActivity?.objectiveStatus;
+      return Boolean(
+        objectiveStatus &&
+        !["completed", "cancelled", "legacy_orphan"].includes(objectiveStatus),
+      );
+    });
   const lastAssistantIdsByUserTurn = new Set<string>();
   let pendingLastAssistantId: string | null = null;
   for (const message of visible) {
@@ -534,6 +537,10 @@ function ActiveTurnProgress({
   const nowMs = useNowTick(true);
   if (!plan) {
     const waitingReason = activity?.waitingReason;
+    const systemOwned = activity?.objectiveStatus === "active" || activity?.objectiveStatus === "waiting_system";
+    const nextObservation = activity?.nextObservationAt
+      ? Math.max(0, activity.nextObservationAt - nowMs)
+      : null;
     return (
       <div
         role="status"
@@ -550,10 +557,27 @@ function ActiveTurnProgress({
         ) : (
           <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-status-progress motion-reduce:animate-none" />
         )}
-        <span className="truncate">{activity?.label || "正在处理任务"}</span>
+        <span className="truncate">
+          {systemOwned ? "系统仍在处理 · 恢复中" : activity?.label || "正在处理任务"}
+        </span>
+        {systemOwned && activity?.recoveryOwner && (
+          <span className="max-w-[12rem] truncate text-gray-400">
+            · {activity.recoveryOwner}
+          </span>
+        )}
+        {systemOwned && activity?.label && (
+          <span className="max-w-[16rem] truncate text-gray-400">
+            · {activity.label}
+          </span>
+        )}
         {waitingReason && (
           <span className="max-w-[18rem] truncate text-status-warning/80">
             · {waitingReason}
+          </span>
+        )}
+        {systemOwned && nextObservation !== null && (
+          <span className="shrink-0 text-gray-500">
+            · 下次观察 {formatDuration(nextObservation)} 后
           </span>
         )}
         <span className="shrink-0 text-gray-600">
@@ -670,7 +694,7 @@ const MessageRow = memo(function MessageRow({
       <div className="max-w-[72ch] space-y-2 rounded-lg border border-status-warning/30 bg-status-warning-soft/55 p-3">
         <p className="text-sm font-medium text-gray-200">ChatGPT 授权已过期</p>
         <p className="text-xs leading-5 text-gray-500">
-          重新验证后可以回到这个会话继续；当前失败回合不会自动重放。
+          重新验证后系统会从已持久化的安全检查点自动继续，不会重复已确认的工具副作用。
         </p>
         <ChatGptAuthRecovery />
       </div>

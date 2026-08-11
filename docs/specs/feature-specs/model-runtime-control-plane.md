@@ -1,5 +1,7 @@
 # 模型运行时控制面
 
+本规格定义 route/auth/credential 领域契约；objective ownership、用户回交与完成语义以 `objective-recovery-control-plane.md` 为准。“禁止重放”指禁止整回合或未知副作用的盲重放，不禁止凭 receipt/resume cursor 从安全 checkpoint 自动续接。
+
 ## Requirements Traceability
 
 | Req ID | 要求 | 验证 |
@@ -10,8 +12,8 @@
 | CF-MRC-R4 | 回合开始冻结不可变计划，当前运行不受设置或会话修改影响 | concurrency regression |
 | CF-MRC-R5 | OAuth start 立即返回共享 flow/auth URL；自动打开失败不丢流程 | coordinator tests |
 | CF-MRC-R6 | Settings 与历史会话提供打开、复制、取消、过期重建入口 | component + real App |
-| CF-MRC-R7 | ChatGPT 401 映射 `AUTH_EXPIRED`，同步账号状态并显示会话恢复动作 | classifier/reducer/component |
-| CF-MRC-R8 | 授权成功不自动重放有输出、工具意图或副作用不明的回合 | replay guard tests |
+| CF-MRC-R7 | ChatGPT 401 映射 `AUTH_EXPIRED`，同步账号状态并在同一 objective 聚合一次必要输入；授权完成事件触发安全续接 | classifier/reducer/component + objective adapter |
+| CF-MRC-R8 | 授权成功不得盲重放已有输出、工具意图或副作用不明的整回合；必须先对账 receipt，再从持久 resume cursor 自动续接 | replay fence + resume tests |
 | CF-MRC-R9 | 凭据按候选惰性读取；未使用 DeepSeek 不触发其 Keychain lookup | broker call-count tests |
 | CF-MRC-R10 | 同一 key_ref singleflight/cache；超时后不立刻产生第二个 OS prompt | broker concurrency tests |
 | CF-MRC-R11 | legacy Keychain 成功授权读取后单次迁移；删除清理所有副本 | secrets migration tests |
@@ -21,7 +23,7 @@
 | CF-MRC-R15 | Quick/Project/Anonymous/subagent 使用同一策略契约 | adapter tests |
 | CF-MRC-R16 | PR、CI、merge、正式 release、公开安装包真实路径前保持 `not live` | Release Harness |
 | CF-MRC-R17 | root turn 产生工具或可见输出后，后续模型 round 也禁止跨供应商 | routed transport integration |
-| CF-MRC-R18 | 历史 `auth_expired` 回合重载后仍可原地重新验证；恢复后只提示用户明确重发，不自动或一键重放 | hydration + recovery component tests |
+| CF-MRC-R18 | 历史 `auth_expired` 回合重载后仍绑定原 objective/checkpoint；重新验证完成后自动安全续接，不要求重发、重试或新建 user message | hydration + auth-completion + restart tests |
 
 ## Primary User Paths
 
@@ -33,7 +35,7 @@
 ### 历史会话中恢复
 
 ChatGPT 回合返回 401。会话显示 `AUTH_EXPIRED` 恢复提示，而非“凭据、余额或端点均不可用”。
-用户在会话内重新验证，成功后明确点击重试；历史和附件不丢失。
+用户在会话内重新验证；成功事件到达后，系统先对账已有输出/工具 receipt，再从安全 checkpoint 自动续接。历史和附件不丢失，也不要求用户再次发送目标。
 
 ### 会话策略切换
 
@@ -73,7 +75,8 @@ ChatGPT 固定会话发送消息时，route planner 不读取 DeepSeek key。只
 | Broker | fixed ChatGPT + DeepSeek configured | DeepSeek lookup count = 0 |
 | Broker | 两个并发 DeepSeek turn | OS lookup count = 1 |
 | Capability | image + no-vision fixed model | 请求数 = 0；附件不变 |
-| Replay | auth 恢复前已有 tool call | 无自动重放；显示显式动作 |
+| Replay | auth 恢复前已有 tool call/result | 工具不重复；receipt 对账后从 result 后的 resume cursor 自动续接 |
+| Replay | auth 恢复前 side effect 状态未知 | 只读 reconcile；结果明确前不重放、不要求用户推动 |
 | Replay | 上一 round 已有 tool result、下一 round pre-output 503 | fallback hit = 0 |
 | UI | 390px 授权卡和模型弹层 | 无横向溢出；动作可见；正文不低于 12px |
 | Release | 发布安装包 | 精确版本、账号恢复、策略隔离、Keychain 路径实测 |
