@@ -76,6 +76,53 @@ class ReleaseWorkflowTests(unittest.TestCase):
             principle,
         )
 
+    def test_guarded_version_pr_uses_auto_merge_under_main_ruleset(self) -> None:
+        """A green version PR must enter the protected auto-merge path.
+
+        Direct ``gh pr merge --squash`` is still rejected by the active main
+        ruleset even after every required check is green. Run 31475705615 hit
+        that exact failure on version PR #358 and stranded the release batch.
+        """
+        workflow = (REPO_ROOT / ".github/workflows/auto-release.yml").read_text(
+            encoding="utf-8"
+        )
+        guarded_merge = workflow.split(
+            "- name: Wait for guarded version bump merge", 1
+        )[1].split("- name: Tag guarded merge", 1)[0]
+        self.assertRegex(
+            guarded_merge,
+            r'gh pr merge "\$PR"[^\n]*--squash[\s\\]*\n\s*--auto\s+--match-head-commit',
+        )
+
+    def test_versioned_ruleset_requires_the_ci_jobs_that_exist(self) -> None:
+        """The audited ruleset and workflow may not drift by check name."""
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        ruleset = json.loads(
+            (REPO_ROOT / ".github/rulesets/main.json").read_text(encoding="utf-8")
+        )
+        required_rule = next(
+            rule
+            for rule in ruleset["ruleset"]["rules"]
+            if rule["type"] == "required_status_checks"
+        )
+        required = {
+            item["context"]
+            for item in required_rule["parameters"]["required_status_checks"]
+        }
+        for job in ("check-frontend", "check-rust"):
+            self.assertIn(f"\n  {job}:\n", workflow)
+            self.assertIn(job, required)
+        self.assertNotIn("check", required)
+        auto_release = (
+            REPO_ROOT / ".github/workflows/auto-release.yml"
+        ).read_text(encoding="utf-8")
+        guarded_merge = auto_release.split(
+            "- name: Wait for guarded version bump merge", 1
+        )[1].split("- name: Tag guarded merge", 1)[0]
+        for context in required:
+            self.assertIn(context, guarded_merge)
+        self.assertIn(f'if [ "$SUCCESSES" -eq {len(required)} ]', guarded_merge)
+
     def test_force_cannot_bypass_a_guarded_batch(self) -> None:
         repo = self._new_release_history()
         self._commit(

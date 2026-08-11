@@ -23,7 +23,8 @@ EXPECTED_REPOSITORY = "BumStill/CodeFactory"
 GITHUB_ACTIONS_APP_ID = 15368
 EXPECTED_CHECKS = {
     "agent-bridge-linux",
-    "check",
+    "check-frontend",
+    "check-rust",
     "governance-baseline",
     "remote-real-app-gui",
 }

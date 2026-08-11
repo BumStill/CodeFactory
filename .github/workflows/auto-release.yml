@@ -441,7 +441,7 @@ jobs:
             fi
 
             SUCCESSES=0
-            for CHECK in governance-baseline agent-bridge-linux check remote-real-app-gui; do
+            for CHECK in governance-baseline agent-bridge-linux check-frontend check-rust remote-real-app-gui; do
               CONCLUSIONS=$(jq -r --arg check "$CHECK" \
                 '.statusCheckRollup[]? | select(.name == $check) | .conclusion' <<< "$DATA")
               if grep -Eq '^(FAILURE|CANCELLED|TIMED_OUT|ACTION_REQUIRED)$' \
@@ -463,9 +463,9 @@ jobs:
               echo "::error::Version PR #$PR is behind main; refusing to expand an already planned release batch. Rerun Auto Release to replan from latest main."
               exit 1
             fi
-            if [ "$SUCCESSES" -eq 4 ]; then
+            if [ "$SUCCESSES" -eq 5 ]; then
               gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash \
-                --match-head-commit "$EXPECTED_HEAD"
+                --auto --match-head-commit "$EXPECTED_HEAD"
               echo "All required checks passed; submitted guarded merge for version PR #$PR"
               sleep 5
               continue
