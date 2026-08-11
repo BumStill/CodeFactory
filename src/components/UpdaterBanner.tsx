@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect } from "react";
 import { Download, X, RefreshCw, CheckCircle, AlertCircle } from "lucide-react";
-import { countUpdateBlockers, useUpdaterStore } from "../stores/updater";
+import {
+  countUpdateBlockers,
+  describeUpdateObjectiveBlockers,
+  useUpdaterStore,
+} from "../stores/updater";
 
 /**
  * Floating update banner — appears top-right when a new version is
@@ -104,11 +108,29 @@ export function UpdaterBanner() {
         <div className="p-3 space-y-1 text-xs text-amber-700 dark:text-amber-300">
           <div className="flex items-center gap-2">
             <RefreshCw size={12} />
-            <span>更新已下载，等待执行中的 session 到达安全点…</span>
+            <span>
+              {phase.blockers?.update_install_state === "observe_only"
+                ? "正在核对上次安装结果…"
+                : "更新已下载，等待执行中的 session 到达安全点…"}
+            </span>
           </div>
-          <p className="text-[11px] text-gray-500">
-            当前 {countUpdateBlockers(phase.blockers)} 项本地工作仍在运行；归零后会自动安装，无需再次操作。
-          </p>
+          {phase.blockers?.update_install_state === "observe_only" ? (
+            <p className="text-[11px] text-gray-500">
+              当前仅观察目标版本与 build_git_sha，不会重复安装未知结果。
+            </p>
+          ) : (
+            <p className="text-[11px] text-gray-500">
+              当前 {countUpdateBlockers(phase.blockers)} 项本地工作仍在运行；归零后会自动安装，无需再次操作。
+            </p>
+          )}
+          {describeUpdateObjectiveBlockers(phase.blockers) && (
+            <p className="text-[11px] text-gray-500">
+              {describeUpdateObjectiveBlockers(phase.blockers)}。
+            </p>
+          )}
+          {phase.safetyCheckError && (
+            <p className="text-[11px] text-gray-500">{phase.safetyCheckError}</p>
+          )}
         </div>
       )}
 

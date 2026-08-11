@@ -7,7 +7,11 @@
 // flow directly — no need to navigate anywhere.
 
 import { Download, RefreshCw, Check, AlertCircle } from "lucide-react";
-import { countUpdateBlockers, useUpdaterStore } from "../stores/updater";
+import {
+  countUpdateBlockers,
+  describeUpdateObjectiveBlockers,
+  useUpdaterStore,
+} from "../stores/updater";
 
 export function UpdateStatusPill() {
   const phase = useUpdaterStore((s) => s.phase);
@@ -40,13 +44,23 @@ export function UpdateStatusPill() {
   }
 
   if (phase.kind === "waiting_for_safe_restart") {
+    const objectiveBlockers = describeUpdateObjectiveBlockers(phase.blockers);
+    const observingUnknownInstall = phase.blockers?.update_install_state === "observe_only";
     return (
       <span
         className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-amber-500/15 text-[11px] text-amber-800 dark:text-amber-300"
-        title="执行中的本地 session 结束后会自动安装，不会直接重启。"
+        title={[
+          observingUnknownInstall
+            ? "上次安装结果尚未确认；系统只读核对，不会重复安装。"
+            : "执行中的本地 session 结束后会自动安装，不会直接重启。",
+          objectiveBlockers,
+          phase.safetyCheckError,
+        ].filter(Boolean).join(" ")}
       >
         <RefreshCw size={11} />
-        等待安全更新 · {countUpdateBlockers(phase.blockers)}
+        {observingUnknownInstall
+          ? "正在核对更新结果"
+          : `等待安全更新 · ${countUpdateBlockers(phase.blockers)}`}
       </span>
     );
   }

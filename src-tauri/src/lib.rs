@@ -620,6 +620,7 @@ pub fn run() {
             commands::settings::save_api_key,
             commands::settings::delete_api_key,
             commands::update_safety::reserve_update_install,
+            commands::update_safety::observe_update_install,
             commands::update_safety::release_update_install_reservation,
             codex_auth::codex_login,
             codex_auth::codex_login_start,
