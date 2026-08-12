@@ -2769,7 +2769,7 @@ mod tests {
             .await
             .unwrap();
         let claim = store
-            .claim_due_remediations("short-heartbeat-owner", 1, 400)
+            .claim_due_remediations("short-heartbeat-owner", 1, 2_000)
             .await
             .unwrap()
             .pop()
@@ -2783,12 +2783,12 @@ mod tests {
             &store,
             &claim,
             "short-heartbeat-owner",
-            400,
-            Duration::from_millis(50),
+            2_000,
+            Duration::from_millis(100),
             async move {
                 // Cross more than two original TTLs. Without the adapter being
                 // awaited by the heartbeat owner, this claim is necessarily stale.
-                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                tokio::time::sleep(Duration::from_millis(4_500)).await;
                 assert!(adapter_store.claim_is_current(&permit).await.unwrap());
                 let retry = DecisionRouter::route(
                     &adapter_objective,

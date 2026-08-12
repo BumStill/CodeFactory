@@ -117,15 +117,17 @@ impl ToolRecoveryStore {
                     .get("command")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
-                if !observable_workspace_command(command) {
-                    None
-                } else {
+                if let Some(relative) = exact_local_append_target(command) {
+                    file_plan(cwd, Some(&relative)).await?
+                } else if known_local_workspace_command(command) {
                     Some(ToolRecoveryPlan {
                         resource_kind: "workspace_git",
-                        replay_policy: "exact_if_unchanged",
+                        replay_policy: "never_after_dispatch",
                         safe_locator_json: "{}".into(),
                         precondition_digest: workspace_git_digest(cwd).await?,
                     })
+                } else {
+                    None
                 }
             }
             // Every future native mutation fails closed until it names a
@@ -321,7 +323,7 @@ impl ToolRecoveryStore {
         let rows = sqlx::query(
             "SELECT receipt.id, receipt.status,
                     generic.resource_kind, generic.safe_locator_json,
-                    generic.precondition_digest,
+                    generic.precondition_digest, generic.replay_policy,
                     file.safe_locator_json AS file_locator,
                     file.precondition_digest AS file_precondition,
                     file.expected_postcondition_digest AS file_expected
@@ -349,9 +351,11 @@ impl ToolRecoveryStore {
         let row = &rows[0];
         let receipt_id: String = row.try_get("id")?;
         let cwd = working_directory_for_claim(&self.pool, claim).await?;
+        let mut generic_replay_policy = None;
         let observation = if let Ok(kind) = row.try_get::<String, _>("resource_kind") {
             let locator: String = row.try_get("safe_locator_json")?;
             let pre: String = row.try_get("precondition_digest")?;
+            generic_replay_policy = row.try_get::<String, _>("replay_policy").ok();
             match snapshot_digest(&self.pool, &cwd, &kind, &locator).await? {
                 Some(current) if current == pre => SnapshotObservation::Unchanged,
                 Some(_) => SnapshotObservation::Changed,
@@ -372,6 +376,9 @@ impl ToolRecoveryStore {
         match observation {
             SnapshotObservation::Unknown => Ok(ToolRecoveryDisposition::ObserveOnly),
             SnapshotObservation::Unchanged => {
+                if generic_replay_policy.as_deref() == Some("never_after_dispatch") {
+                    return Ok(ToolRecoveryDisposition::ObserveOnly);
+                }
                 self.mark_retryable(&receipt_id, claim, permit).await?;
                 Ok(ToolRecoveryDisposition::RetryExact)
             }
@@ -587,7 +594,15 @@ async fn file_plan(cwd: &Path, requested: Option<&str>) -> Result<Option<ToolRec
 }
 
 fn safe_relative(path: &Path) -> bool {
-    !path.as_os_str().is_empty()
+    let raw = path.to_string_lossy();
+    let windows_absolute = raw.starts_with("\\\\")
+        || raw.starts_with("//")
+        || raw
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':');
+    !raw.is_empty()
+        && !windows_absolute
         && !path.is_absolute()
         && path
             .components()
@@ -748,15 +763,52 @@ async fn snapshot_digest(
     Ok(Some(value))
 }
 
-fn observable_workspace_command(command: &str) -> bool {
+fn exact_local_append_target(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.is_empty()
+        || trimmed.contains(['\n', '\r', ';', '|', '&', '`'])
+        || trimmed.contains("$(")
+        || trimmed.contains("${")
+        || lower.contains("$env:")
+        || lower.contains("%userprofile%")
+    {
+        return None;
+    }
+    let candidate = if lower.starts_with("add-content ") {
+        let words = trimmed.split_whitespace().collect::<Vec<_>>();
+        if words.len() != 5
+            || !words[1].eq_ignore_ascii_case("-path")
+            || !words[3].eq_ignore_ascii_case("-value")
+            || words[4].contains(['(', ')', '{', '}', '[', ']'])
+        {
+            return None;
+        }
+        words[2].trim_matches(['\'', '"']).to_owned()
+    } else if lower.starts_with("printf ") || lower.starts_with("echo ") {
+        let (prefix, target) = trimmed.rsplit_once(">>")?;
+        if prefix.contains(['<', '>']) || target.contains(['<', '>']) {
+            return None;
+        }
+        target.trim().trim_matches(['\'', '"']).to_owned()
+    } else {
+        return None;
+    };
+    safe_relative(Path::new(&candidate)).then_some(candidate)
+}
+
+fn known_local_workspace_command(command: &str) -> bool {
     let lower = command.trim_start().to_ascii_lowercase();
     if lower.is_empty()
         || lower.contains("nohup ")
         || lower.contains("start-process ")
+        || lower.contains("start-job ")
         || lower.trim_end().ends_with('&')
         || [
             "curl ",
             "wget ",
+            "invoke-webrequest ",
+            "invoke-restmethod ",
             "kubectl ",
             "helm ",
             "ssh ",
@@ -781,37 +833,54 @@ fn observable_workspace_command(command: &str) -> bool {
     {
         return false;
     }
-    [
-        "apply_patch",
-        "sed -i",
-        "perl -pi",
-        "tee ",
-        "cat >",
-        "cat >>",
-        "touch ",
-        "mkdir ",
-        "rm ",
-        "mv ",
-        "cp ",
-        "install ",
-        "git add",
-        "git commit",
-        "git apply",
-        "git branch",
-        "git switch",
-        "git checkout",
-        "git fetch",
-        "git pull",
-        "git stash",
-        "cargo fmt",
-        "rustfmt ",
-        "prettier ",
-        "eslint ",
-        "biome ",
-        ">",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    if lower.contains(['\n', '\r', ';', '|', '&', '>', '<', '`'])
+        || lower.contains("$(")
+        || lower.contains("${")
+    {
+        return false;
+    }
+    if lower.contains("../")
+        || lower.contains("..\\")
+        || lower.contains(" $")
+        || lower.contains("%userprofile%")
+        || lower.contains("%temp%")
+        || lower.contains("\\\\")
+        || lower.split_whitespace().any(|word| {
+            let word = word.trim_matches(['\'', '"']);
+            (word.starts_with('/') && !word.starts_with("--"))
+                || word.starts_with("~/")
+                || word.starts_with("~\\")
+                || word
+                    .as_bytes()
+                    .get(1)
+                    .is_some_and(|separator| *separator == b':')
+        })
+    {
+        return false;
+    }
+    let first = lower.split_whitespace().next().unwrap_or_default();
+    match first {
+        "apply_patch" | "touch" | "mkdir" | "rm" | "mv" | "cp" | "install" | "rustfmt"
+        | "prettier" | "eslint" | "biome" => true,
+        "sed" => lower.split_whitespace().any(|arg| arg == "-i"),
+        "perl" => lower.split_whitespace().any(|arg| arg == "-pi"),
+        "cargo" => lower.split_whitespace().nth(1) == Some("fmt"),
+        "git" => matches!(
+            lower.split_whitespace().nth(1),
+            Some(
+                "add"
+                    | "commit"
+                    | "apply"
+                    | "branch"
+                    | "switch"
+                    | "checkout"
+                    | "fetch"
+                    | "pull"
+                    | "stash"
+            )
+        ),
+        _ => false,
+    }
 }
 
 async fn workspace_git_digest(cwd: &Path) -> Result<String> {

@@ -2355,6 +2355,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn powershell_local_file_mutation_gets_a_workspace_observer() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        sqlx::query("UPDATE sessions SET cwd=? WHERE id=?")
+            .bind(dir.path().to_string_lossy().as_ref())
+            .bind(TEST_SESSION_ID)
+            .execute(&backend.db)
+            .await
+            .unwrap();
+        let args = serde_json::json!({
+            "command": "Add-Content -Path effect.log -Value once"
+        });
+        let call = call_with_args("powershell-local-mutation", "bash", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+        let admission = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(dir.path()),
+                &command,
+                kind,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(admission, MutationAdmission::Dispatch { .. }));
+        let resource_kind: String =
+            sqlx::query_scalar("SELECT resource_kind FROM tool_recovery_contracts")
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(resource_kind, "workspace_file");
+    }
+
+    #[tokio::test]
+    async fn append_retry_contract_rejects_absolute_and_compound_external_commands() {
+        for (call_id, command) in [
+            (
+                "powershell-absolute-append",
+                "Add-Content -Path C:\\Temp\\effect.log -Value once",
+            ),
+            (
+                "powershell-compound-external",
+                "Add-Content -Path effect.log -Value once; Invoke-WebRequest https://example.invalid/hook",
+            ),
+            (
+                "powershell-nested-external",
+                "Add-Content -Path effect.log -Value (Invoke-WebRequest https://example.invalid/hook)",
+            ),
+            (
+                "shell-compound-external",
+                "printf 'once\\n' >> effect.log && curl -X POST https://example.invalid/hook",
+            ),
+            ("shell-parent-escape", "rm ../outside.txt"),
+            ("shell-absolute-path", "rm /tmp/outside.txt"),
+        ] {
+            let backend = objective_backend(false).await;
+            let dir = tempfile::tempdir().unwrap();
+            let args = serde_json::json!({"command": command});
+            let call = call_with_args(call_id, "bash", &args);
+            register_tool_call(&backend, &call, &args).await;
+            let (classified, kind) = backend.classify(&call, &args);
+            let admission = backend
+                .mutation_preflight(
+                    &call,
+                    &args,
+                    &objective_ctx(dir.path()),
+                    &classified,
+                    kind,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(admission, MutationAdmission::Waiting(_)),
+                "{call_id} unexpectedly reached dispatch"
+            );
+            let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+            assert_eq!(receipts, 0, "{call_id} must fail before dispatch");
+        }
+    }
+
+    #[tokio::test]
     async fn skill_mutation_has_a_redacted_tree_observer_before_dispatch() {
         let backend = objective_backend(false).await;
         let args = serde_json::json!({"name": "workspace-maintenance"});
