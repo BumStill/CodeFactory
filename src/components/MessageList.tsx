@@ -311,7 +311,11 @@ const TimelineMarkdownSegment = memo(function TimelineMarkdownSegment({
       data-segment={isFinal ? "final" : "step"}
       className={
         isFinal
-          ? "prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
+          // The final answer is the reading stream — it must not be smaller
+          // than the step narration above it. It used to carry no font size at
+          // all and inherited the row's 14px, so a turn with tool calls showed
+          // its mid-turn narration at 15px and its actual answer at 14px.
+          ? "prose dark:prose-invert prose-sm max-w-none text-reading leading-6 [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
           : "prose dark:prose-invert prose-sm max-w-none py-0.5 text-reading leading-6 text-gray-300 [&_pre]:!p-0 [&_pre]:!bg-transparent [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1 [&_h1]:mt-2 [&_h2]:mt-2 [&_h3]:mt-1.5 [&_h4]:mt-1.5 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
       }
     >
@@ -976,7 +980,7 @@ const MessageRow = memo(function MessageRow({
           </div>
         ))}
       {!timeline && msg.content ? (
-        <div className="prose dark:prose-invert prose-sm max-w-none [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+        <div className="prose dark:prose-invert prose-sm max-w-none text-reading leading-6 [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
           <MarkdownContent content={msg.content} />
           {isStreamingTail && <TypingDots />}
         </div>
