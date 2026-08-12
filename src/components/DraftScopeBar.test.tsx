@@ -81,6 +81,42 @@ describe("DraftScopeBar project picker", () => {
     expect(onPickProject).toHaveBeenCalledWith("/Users/leo/Projects/CodeFactory");
   });
 
+  it("positions the measured project menu above the whole composer card", () => {
+    const rect = (left: number, top: number, width: number, height: number) => ({
+      left,
+      top,
+      width,
+      height,
+      right: left + width,
+      bottom: top + height,
+      x: left,
+      y: top,
+      toJSON: () => ({}),
+    }) as DOMRect;
+    const geometry = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.getAttribute("data-testid") === "message-input-control-row") return rect(8, 500, 359, 116);
+      if (this.getAttribute("role") === "menu") return rect(12, 0, 256, 240);
+      if (this.getAttribute("aria-label")?.startsWith("选择项目：")) return rect(16, 560, 88, 44);
+      return rect(0, 0, 0, 0);
+    });
+
+    render(
+      <div data-testid="message-input-control-row">
+        <DraftScopeBar
+          cwd={null}
+          anonymous={false}
+          projects={projects}
+          onPickProject={() => {}}
+          onToggleAnonymous={() => {}}
+        />
+      </div>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "选择项目：独立任务" }));
+
+    expect(screen.getByRole("menu", { name: "项目选择" })).toHaveStyle({ top: "256px" });
+    geometry.mockRestore();
+  });
+
   it("moves focus through the project menu and restores it after selection", async () => {
     const user = userEvent.setup();
     const onPickProject = vi.fn();

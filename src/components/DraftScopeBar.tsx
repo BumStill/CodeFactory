@@ -52,6 +52,9 @@ export function DraftScopeBar({
     const button = openMenu === "more" ? moreButtonRef.current : projectButtonRef.current;
     const rect = button?.getBoundingClientRect();
     if (!rect) return;
+    const composerTop = button
+      ?.closest<HTMLElement>('[data-testid="message-input-control-row"]')
+      ?.getBoundingClientRect().top;
     const menuWidth = 256;
     const gutter = 8;
     const menuHeight = Math.min(
@@ -59,7 +62,10 @@ export function DraftScopeBar({
       window.innerHeight - gutter * 2,
     );
     const maxLeft = Math.max(gutter, window.innerWidth - menuWidth - gutter);
-    const aboveTop = rect.top - menuHeight - 4;
+    // The portal belongs above the whole composer card, not merely above its
+    // trigger in the bottom toolbar. Anchoring to the trigger lets a taller
+    // project menu cover the input row once 44px touch targets are applied.
+    const aboveTop = (composerTop ?? rect.top) - menuHeight - 4;
     setMenuPosition({
       left: Math.min(Math.max(gutter, rect.left + 4), maxLeft),
       top: Math.max(gutter, aboveTop),
