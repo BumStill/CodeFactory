@@ -1399,9 +1399,16 @@ pub fn normalize_model_id(model_id: &str, base_url: &str) -> String {
 /// the caller applies this and resends, so the fix never depends on guessing
 /// model names.
 pub fn force_max_completion_tokens(body: &mut serde_json::Value) {
+    force_max_completion_tokens_with_minimum(body, 8192);
+}
+
+/// Convert the field while preserving a caller-specific lower bound. Internal
+/// metadata requests use their strict output ceiling here; interactive chat
+/// continues to use [`force_max_completion_tokens`] and its historic floor.
+pub fn force_max_completion_tokens_with_minimum(body: &mut serde_json::Value, minimum_tokens: u64) {
     if let Some(obj) = body.as_object_mut() {
         if let Some(cap) = obj.remove("max_tokens") {
-            let floored = cap.as_u64().unwrap_or(8192).max(8192);
+            let floored = cap.as_u64().unwrap_or(minimum_tokens).max(minimum_tokens);
             obj.entry("max_completion_tokens")
                 .or_insert_with(|| serde_json::json!(floored));
         }
@@ -1440,6 +1447,16 @@ mod reasoning_model_adaptation_tests {
         assert!(!obj.contains_key("max_tokens"));
         assert!(!obj.contains_key("temperature"));
         assert_eq!(obj["max_completion_tokens"], json!(8192)); // floored
+    }
+
+    #[test]
+    fn bounded_conversion_never_expands_metadata_ceiling() {
+        let mut body = json!({ "temperature": 0.2, "max_tokens": 256 });
+        force_max_completion_tokens_with_minimum(&mut body, 256);
+        let obj = body.as_object().unwrap();
+        assert!(!obj.contains_key("max_tokens"));
+        assert!(!obj.contains_key("temperature"));
+        assert_eq!(obj["max_completion_tokens"], json!(256));
     }
 }
 

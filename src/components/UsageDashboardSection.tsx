@@ -80,6 +80,7 @@ const SURFACE_LABELS: Record<string, string> = {
   autonomous: "自主任务",
   subagent: "子 Agent",
   eval: "Evals",
+  session_title: "会话命名",
 };
 
 export function usageCostLabel(summary: UsageSummary): string {
@@ -173,11 +174,16 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
   useEffect(() => {
     if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
     let disposed = false;
-    let stop: (() => void) | undefined;
-    void listen("model-usage-recorded", () => { if (!disposed) void reload(); }).then((unlisten) => {
-      if (disposed) unlisten(); else stop = unlisten;
-    });
-    return () => { disposed = true; stop?.(); };
+    const stops = new Set<() => void>();
+    for (const eventName of ["model-usage-recorded", "session-title-updated"]) {
+      void listen(eventName, () => { if (!disposed) void reload(); }).then((unlisten) => {
+        if (disposed) unlisten(); else stops.add(unlisten);
+      });
+    }
+    return () => {
+      disposed = true;
+      stops.forEach((stop) => stop());
+    };
   }, [reload]);
 
   const selectDay = async (localDate: string | null) => {

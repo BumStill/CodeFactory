@@ -145,6 +145,8 @@ export type StreamEvent =
 export interface Session {
   id: string;
   title: string;
+  /** Origin of the title lifecycle. Missing values are legacy rows. */
+  title_source?: "placeholder" | "generated" | "fallback" | "manual" | "legacy";
   cwd: string;
   model_id: string;
   /** Endpoint owned by this session. Null on unresolved legacy rows only. */

@@ -559,11 +559,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   renameSession: async (id, title) => {
-    await invoke("update_session_title", { sessionId: id, title });
+    const session = await invoke<Session>("update_session_title", { sessionId: id, title });
     set((s) => ({
-      sessions: s.sessions.map((x) => (x.id === id ? { ...x, title } : x)),
+      sessions: s.sessions.map((existing) => (existing.id === id ? session : existing)),
       ...(s.activeSession?.id === id
-        ? { activeSession: { ...s.activeSession, title } }
+        ? { activeSession: session, activeModel: session.model_id }
         : {}),
     }));
   },

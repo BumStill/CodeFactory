@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Session } from "../lib/tauri";
 import { freshRuntime, useChatStore } from "./chat";
 
 const mocks = vi.hoisted(() => ({
@@ -17,7 +18,8 @@ vi.mock("../lib/tauri", () => ({
 
 const materialized = {
   id: "draft-1",
-  title: "第一条真实消息",
+  title: "新会话",
+  title_source: "placeholder" as const,
   cwd: "/tmp/quick/draft-1",
   model_id: "deepseek-v4",
   created_at: 1,
@@ -125,6 +127,60 @@ describe("lazy draft session", () => {
     expect(useChatStore.getState().runtime["draft-1"] ?? freshRuntime()).toEqual(
       expect.objectContaining({ streaming: true }),
     );
+  });
+
+  it("applies an asynchronous semantic title to the open session and sidebar", async () => {
+    useChatStore.setState({
+      sessions: [materialized],
+      activeSession: materialized,
+      draftSession: null,
+      runtime: { "draft-1": freshRuntime() },
+    });
+    mocks.invoke.mockResolvedValue(undefined);
+
+    await useChatStore.getState().sendMessage("请优化会话自动命名", "draft-1");
+    const handler = mocks.onSessionUpdated.mock.calls[0]?.[1] as
+      | ((session: Session) => void)
+      | undefined;
+    expect(handler).toBeTypeOf("function");
+
+    const generated = {
+      ...materialized,
+      title: "会话自动命名优化",
+      title_source: "generated" as const,
+    };
+    handler?.(generated);
+
+    expect(useChatStore.getState().activeSession).toEqual(generated);
+    expect(useChatStore.getState().sessions[0]).toEqual(generated);
+  });
+
+  it("uses the complete backend Session after a manual rename", async () => {
+    const generated = {
+      ...materialized,
+      title: "会话自动命名优化",
+      title_source: "generated" as const,
+    };
+    const manual = {
+      ...generated,
+      title: "我的会话标题",
+      title_source: "manual" as const,
+      updated_at: 9,
+    };
+    useChatStore.setState({
+      sessions: [generated],
+      activeSession: generated,
+    });
+    mocks.invoke.mockResolvedValue(manual);
+
+    await useChatStore.getState().renameSession(generated.id, manual.title);
+
+    expect(mocks.invoke).toHaveBeenCalledWith("update_session_title", {
+      sessionId: generated.id,
+      title: manual.title,
+    });
+    expect(useChatStore.getState().activeSession).toEqual(manual);
+    expect(useChatStore.getState().sessions[0]).toEqual(manual);
   });
 
   it("lands on a blank draft in the same project after deleting the open conversation", async () => {

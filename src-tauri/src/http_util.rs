@@ -19,6 +19,12 @@ use std::time::Duration;
 
 const MODEL_HTTP_MAX_ATTEMPTS: usize = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryResponseBody {
+    Include,
+    Redact,
+}
+
 #[derive(Debug, Clone)]
 pub struct RetryNotice {
     pub label: String,
@@ -66,6 +72,25 @@ where
     F: FnMut() -> RequestBuilder,
     N: FnMut(RetryNotice),
 {
+    send_with_retry_and_notify_policy(
+        label,
+        || build_request(),
+        |notice| notify_retry(notice),
+        RetryResponseBody::Include,
+    )
+    .await
+}
+
+pub async fn send_with_retry_and_notify_policy<F, N>(
+    label: &str,
+    mut build_request: F,
+    mut notify_retry: N,
+    response_body: RetryResponseBody,
+) -> Result<Response>
+where
+    F: FnMut() -> RequestBuilder,
+    N: FnMut(RetryNotice),
+{
     for attempt in 1..=MODEL_HTTP_MAX_ATTEMPTS {
         match build_request()
             .header(reqwest::header::ACCEPT_ENCODING, "identity")
@@ -77,24 +102,39 @@ where
                 if attempt < MODEL_HTTP_MAX_ATTEMPTS && is_retryable_status(status) {
                     let detail = response.text().await.unwrap_or_default();
                     let delay = retry_delay(attempt);
+                    let visible_detail = match response_body {
+                        RetryResponseBody::Include => detail.chars().take(240).collect::<String>(),
+                        RetryResponseBody::Redact => String::new(),
+                    };
                     let reason = format!(
                         "HTTP {}{}",
                         status,
-                        if detail.trim().is_empty() {
+                        if visible_detail.trim().is_empty() {
                             String::new()
                         } else {
-                            format!(": {}", detail.chars().take(240).collect::<String>())
+                            format!(": {visible_detail}")
                         }
                     );
-                    tracing::warn!(
-                        "{} returned transient HTTP {} on attempt {}/{}; retrying in {:?}: {}",
-                        label,
-                        status,
-                        attempt,
-                        MODEL_HTTP_MAX_ATTEMPTS,
-                        delay,
-                        detail.chars().take(240).collect::<String>()
-                    );
+                    if response_body == RetryResponseBody::Redact {
+                        tracing::warn!(
+                            "{} returned transient HTTP {} on attempt {}/{}; retrying in {:?}; response body redacted",
+                            label,
+                            status,
+                            attempt,
+                            MODEL_HTTP_MAX_ATTEMPTS,
+                            delay,
+                        );
+                    } else {
+                        tracing::warn!(
+                            "{} returned transient HTTP {} on attempt {}/{}; retrying in {:?}: {}",
+                            label,
+                            status,
+                            attempt,
+                            MODEL_HTTP_MAX_ATTEMPTS,
+                            delay,
+                            visible_detail
+                        );
+                    }
                     notify_retry(RetryNotice {
                         label: label.to_string(),
                         attempt,
@@ -309,6 +349,49 @@ mod tests {
         assert_eq!(notices[0].attempt, 1);
         assert_eq!(notices[0].max_attempts, 3);
         assert!(notices[0].reason.contains("HTTP 503"));
+    }
+
+    #[tokio::test]
+    async fn redacted_retry_policy_never_exposes_provider_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (status, body) in [
+                ("503 Service Unavailable", "echoed-private-title-input"),
+                ("200 OK", "{}"),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut buf = [0_u8; 4096];
+                let _ = stream.read(&mut buf);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write response");
+            }
+        });
+        // Keep the loopback fixture independent from the developer machine's
+        // HTTP(S)_PROXY settings so the first response is always our 503 body.
+        let client = Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build direct test client");
+        let mut notices = Vec::new();
+
+        let response = send_with_retry_and_notify_policy(
+            "private metadata request",
+            || client.post(&url).json(&json!({"ok": true})),
+            |notice| notices.push(notice),
+            RetryResponseBody::Redact,
+        )
+        .await
+        .expect("retry should succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].reason.starts_with("HTTP "));
+        assert!(!notices[0].reason.contains("private-title-input"));
     }
 
     #[tokio::test]
