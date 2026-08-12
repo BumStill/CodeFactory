@@ -145,7 +145,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let bytes = build_docx_bytes(&a.blocks).map_err(|e| {
         crate::errors::AppError::Other(format!("docx build failed: {e}"))
     })?;
-    std::fs::write(&abs_path, &bytes)
+    super::file_lock::atomic_write(&abs_path, &bytes).await
         .map_err(|e| crate::errors::AppError::Other(format!("write failed: {e}")))?;
 
     Ok(ToolOutput::ok(format!(

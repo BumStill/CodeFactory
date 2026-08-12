@@ -162,7 +162,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let bytes = build_pptx_bytes(&a.slides).map_err(|e| {
         crate::errors::AppError::Other(format!("pptx build failed: {e}"))
     })?;
-    std::fs::write(&abs_path, &bytes)
+    super::file_lock::atomic_write(&abs_path, &bytes).await
         .map_err(|e| crate::errors::AppError::Other(format!("write failed: {e}")))?;
 
     Ok(ToolOutput::ok(format!(
