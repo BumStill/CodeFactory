@@ -26,6 +26,7 @@ enum AdapterExecutor {
     Permission,
     Provider,
     Auth,
+    Browser,
     Update,
 }
 
@@ -37,6 +38,7 @@ enum AdapterCapability {
     PermissionResume,
     ProviderResume,
     AuthResume,
+    BrowserResume,
     UpdateResume,
     /// The domain is deliberately registered, but its domain-specific
     /// observer/reconciler has not yet proved a safe mutation path. Keeping a
@@ -155,6 +157,18 @@ impl ObjectiveDomainAdapter for RegisteredDomainAdapter {
             AdapterCapability::AuthResume => {
                 DomainObservation::IdentityIncomplete("auth_identity_incomplete")
             }
+            AdapterCapability::BrowserResume
+                if claim.objective.session_id.is_some()
+                    && (claim.objective.root_turn_id.is_some()
+                        || claim.objective.task_id.is_some())
+                    && claim.binding_id.is_some()
+                    && claim.resource_generation.is_some() =>
+            {
+                DomainObservation::Ready(AdapterExecutor::Browser)
+            }
+            AdapterCapability::BrowserResume => {
+                DomainObservation::IdentityIncomplete("browser_identity_incomplete")
+            }
             AdapterCapability::UpdateResume
                 if claim.binding_id.is_some()
                     && claim.resource_generation.is_some()
@@ -266,7 +280,7 @@ static DOMAIN_ADAPTERS: [RegisteredDomainAdapter; 12] = [
     },
     RegisteredDomainAdapter {
         domain: RecoveryDomain::Browser,
-        capability: AdapterCapability::ObserveOnly,
+        capability: AdapterCapability::BrowserResume,
     },
     RegisteredDomainAdapter {
         domain: RecoveryDomain::Terminal,
@@ -326,6 +340,65 @@ pub(crate) async fn reconcile_provider_recovery_on_startup(
                 failure_signature: signature,
                 next_observation_at: candidate.next_observation_at,
                 resume_cursor: Some(candidate.root_turn_id),
+            },
+        )?;
+        match store.apply_decision(current.revision, decision).await {
+            Ok(_) => reconciled += 1,
+            Err(error) if error.to_string().contains("revision") => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(reconciled)
+}
+
+/// Move crash-left active Browser operations into the Browser domain before
+/// the generic stale-active sweep can classify them as Chat recovery. This is
+/// routing only; the Browser adapter remains responsible for read-only
+/// observation and never treats a contract row as proof of success.
+pub(crate) async fn reconcile_browser_recovery_on_startup(
+    pool: &SqlitePool,
+) -> anyhow::Result<usize> {
+    use super::objective::{DecisionRouter, ObjectiveStatus, RouteSignal};
+
+    let candidates: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT contract.objective_id
+         FROM browser_recovery_contracts contract
+         JOIN objectives objective ON objective.id=contract.objective_id
+         WHERE objective.status='active'
+           AND contract.state NOT IN (
+                 'settled_committed','settled_reconciled','cancelled'
+               )",
+    )
+    .fetch_all(pool)
+    .await?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let store = ObjectiveStore::new(pool.clone());
+    let mut reconciled = 0;
+    for objective_id in candidates {
+        let Some(current) = store.get(&objective_id).await? else {
+            continue;
+        };
+        if current.status != ObjectiveStatus::Active {
+            continue;
+        }
+        let signature = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                format!("browser-startup\0{}\0{}", current.id, current.revision).as_bytes()
+            )
+        );
+        let decision = DecisionRouter::route(
+            &current,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Browser,
+                failure_code: "browser_external_state_uncertain".into(),
+                failure_signature: signature,
+                next_observation_at: now,
+                resume_cursor: current
+                    .resume_cursor
+                    .clone()
+                    .or_else(|| current.root_turn_id.clone())
+                    .or_else(|| current.task_id.clone()),
             },
         )?;
         match store.apply_decision(current.revision, decision).await {
@@ -566,6 +639,16 @@ async fn process_claim(
                                 )
                                 .await
                             }
+                            AdapterExecutor::Browser => {
+                                resume_browser_objective(
+                                    app,
+                                    pool,
+                                    execution_claim,
+                                    objective,
+                                    execution_permit,
+                                )
+                                .await
+                            }
                             AdapterExecutor::Update => {
                                 super::update_recovery::resume_update_objective(
                                     app,
@@ -633,6 +716,97 @@ async fn reserve_context_resume_authorization(
         reservation => Err(crate::errors::AppError::Other(format!(
             "context recovery remains observe-only: {reservation:?}"
         ))),
+    }
+}
+
+async fn resume_browser_objective(
+    app: AppHandle,
+    pool: SqlitePool,
+    claim: ClaimedRemediation,
+    objective: super::objective::ObjectiveSnapshot,
+    permit: codefactory_agent_loop::tool::MutationPermit,
+) -> Result<(), crate::errors::AppError> {
+    use super::browser_recovery::{BrowserRecoveryDisposition as Disposition, BrowserSettlement};
+
+    let binding_id = claim.binding_id.as_deref().ok_or_else(|| {
+        crate::errors::AppError::Other("browser recovery lacks binding identity".into())
+    })?;
+    let generation = claim.resource_generation.ok_or_else(|| {
+        crate::errors::AppError::Other("browser recovery lacks resource generation".into())
+    })?;
+    let observer_pool = pool.clone();
+    let store = super::browser_recovery::BrowserRecoveryStore::new(pool);
+    let receipt = store
+        .receipt_for_scope(&objective.id, objective.revision, binding_id, generation)
+        .await
+        .map_err(|error| {
+            crate::errors::AppError::Other(format!("browser recovery lookup failed: {error}"))
+        })?;
+
+    match receipt {
+        Some(receipt_id) => match {
+            let initial = store.disposition(&receipt_id).await.map_err(|error| {
+                crate::errors::AppError::Other(format!(
+                    "browser recovery observation failed: {error}"
+                ))
+            })?;
+            if matches!(
+                initial,
+                Disposition::ObserveOnlyUncertain | Disposition::Conflict
+            ) {
+                crate::tools::browser_session::observe_browser_receipt(observer_pool, &receipt_id)
+                    .await
+                    .map_err(|error| {
+                        crate::errors::AppError::Other(format!(
+                            "browser runtime observation failed: {error}"
+                        ))
+                    })?
+            } else {
+                initial
+            }
+        } {
+            Disposition::AwaitingSettlement | Disposition::ObservedApplied => {
+                let settlement = store
+                    .settle(&receipt_id, chrono::Utc::now().timestamp_millis())
+                    .await
+                    .map_err(|error| {
+                        crate::errors::AppError::Other(format!(
+                            "browser recovery settlement failed: {error}"
+                        ))
+                    })?;
+                if !matches!(
+                    settlement,
+                    BrowserSettlement::Committed | BrowserSettlement::Reconciled
+                ) {
+                    return Err(crate::errors::AppError::Other(format!(
+                        "browser recovery remains system-owned: {settlement:?}"
+                    )));
+                }
+            }
+            Disposition::Prepared
+            | Disposition::ReplayableExactGeneration
+            | Disposition::ReplayableDigestCas
+            | Disposition::SettledCommitted
+            | Disposition::SettledReconciled => {}
+            disposition => {
+                return Err(crate::errors::AppError::Other(format!(
+                    "browser recovery remains observe-only: {disposition:?}"
+                )))
+            }
+        },
+        None if objective.failure_code.as_deref()
+            == Some("browser_observation_contract_required") => {}
+        None => {
+            return Err(crate::errors::AppError::Other(
+                "browser recovery has no exact durable operation contract".into(),
+            ))
+        }
+    }
+
+    if objective.task_id.is_some() {
+        crate::commands::tasks::resume_task_objective(app, objective, permit).await
+    } else {
+        crate::commands::chat::resume_chat_objective(app, objective, permit).await
     }
 }
 
@@ -1625,6 +1799,19 @@ mod tests {
         assert_eq!(adapter.capability, AdapterCapability::ContextResume);
     }
 
+    #[test]
+    fn browser_recovery_is_an_executable_domain_specific_capability() {
+        assert!(domain_has_executable_adapter(RecoveryDomain::Browser));
+        let adapter = DEFAULT_ADAPTER_REGISTRY
+            .adapter_for(RecoveryDomain::Browser)
+            .unwrap();
+        assert_ne!(
+            adapter.capability,
+            AdapterCapability::ChatResume,
+            "Browser recovery must inspect its exact durable operation before resuming Chat",
+        );
+    }
+
     #[tokio::test]
     async fn missing_domain_capability_stays_system_owned_and_reobserves_without_cta() {
         let pool = SqlitePoolOptions::new()
@@ -1640,7 +1827,7 @@ mod tests {
                 kind: ObjectiveKind::LocalMutation,
                 session_id: Some("session-provider-observe-only".into()),
                 root_turn_id: Some("turn-provider-observe-only".into()),
-                domain: RecoveryDomain::Browser,
+                domain: RecoveryDomain::Terminal,
                 requested_acceptance: "validated_change".into(),
                 created_surface: "test".into(),
             })
@@ -1649,7 +1836,7 @@ mod tests {
         let waiting = DecisionRouter::route(
             &objective,
             RouteSignal::TechnicalFailure {
-                domain: RecoveryDomain::Browser,
+                domain: RecoveryDomain::Terminal,
                 failure_code: "provider_unavailable".into(),
                 failure_signature: "sha256:provider-observe-only".into(),
                 next_observation_at: chrono::Utc::now().timestamp_millis() - 1,
@@ -1669,7 +1856,7 @@ mod tests {
             .unwrap();
         let permit = mutation_permit(&claim, "provider-owner");
         let adapter = DEFAULT_ADAPTER_REGISTRY
-            .adapter_for(RecoveryDomain::Browser)
+            .adapter_for(RecoveryDomain::Terminal)
             .unwrap();
         let execute_count = Arc::new(AtomicUsize::new(0));
         let attempt_count = execute_count.clone();

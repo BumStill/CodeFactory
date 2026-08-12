@@ -970,12 +970,12 @@ mod tests {
 
         insert_objective(
             &pool,
-            "stalled-browser",
+            "stalled-terminal",
             2,
             "waiting_system",
             "platform_incident",
             false,
-            Some("objective-supervisor:browser"),
+            Some("objective-supervisor:terminal"),
             Some("remediation-stalled"),
             None,
             None,
@@ -984,8 +984,8 @@ mod tests {
         .await;
         sqlx::query(
             "UPDATE objectives
-             SET domain='browser', last_progress_at=?, created_at=?
-             WHERE id='stalled-browser'",
+             SET domain='terminal', last_progress_at=?, created_at=?
+             WHERE id='stalled-terminal'",
         )
         .bind(NOW_MS - 300_001)
         .bind(NOW_MS - 300_001)

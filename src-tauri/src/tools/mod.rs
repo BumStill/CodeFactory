@@ -97,6 +97,11 @@ pub struct ExecCtx {
     pub session_id: Option<String>,
     pub root_turn_id: Option<String>,
     pub task_id: Option<String>,
+    /// The outer durable side-effect receipt for a domain tool. Browser
+    /// actions use it to load their one-to-one operation contract.
+    pub outer_receipt_id: Option<String>,
+    /// Recovery authority is revalidated at the native browser event rung.
+    pub mutation_permit: Option<codefactory_agent_loop::tool::MutationPermit>,
     pub knowledge_library_ids: Option<Vec<String>>,
     /// A snapshot of settings for tools that need policy/config (the delivery
     /// tool reads the configured delivery ceiling + git remote tokens). None
@@ -113,6 +118,8 @@ impl ExecCtx {
             session_id: None,
             root_turn_id: None,
             task_id: None,
+            outer_receipt_id: None,
+            mutation_permit: None,
             knowledge_library_ids: None,
             settings: None,
         }

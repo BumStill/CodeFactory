@@ -25,12 +25,13 @@ use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::Page;
 use futures::StreamExt;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use super::install::{self, InstallState};
 use super::page as page_script;
 use super::profile::{self, LockOutcome, ProfileScope};
-use super::{BrowserDriver, PageContent};
+use super::{AllowBrowserMutation, BrowserDriver, BrowserMutationAuthorizer, PageContent};
 use crate::errors::{AppError, Result};
 
 /// How long the browser process gets to print its DevTools endpoint.
@@ -127,7 +128,9 @@ pub fn system_chrome() -> Option<PathBuf> {
     if let Some(path) = override_executable(std::env::var_os("CODEFACTORY_CHROME")) {
         return Some(path);
     }
-    system_chrome_candidates().into_iter().find(|path| path.is_file())
+    system_chrome_candidates()
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 #[cfg(target_os = "macos")]
@@ -188,7 +191,11 @@ fn system_chrome_candidates() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
-    roots.extend([PathBuf::from("/usr/bin"), PathBuf::from("/usr/local/bin"), PathBuf::from("/snap/bin")]);
+    roots.extend([
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/snap/bin"),
+    ]);
     roots
         .iter()
         .flat_map(|root| names.iter().map(move |name| root.join(name)))
@@ -198,6 +205,51 @@ fn system_chrome_candidates() -> Vec<PathBuf> {
 impl ChromiumDriver {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reconnect to the exact CodeFactory-launched Chromium after the desktop
+    /// process restarted. The endpoint is loopback-only and persisted in the
+    /// owner-only lease before any navigation is dispatched.
+    pub(crate) async fn reconnect(&self, session_id: &str, endpoint: &str) -> Result<()> {
+        if self.sessions.lock().await.contains_key(session_id) {
+            return Ok(());
+        }
+        let (browser, mut handler) = timeout(Browser::connect(endpoint.to_string())).await?;
+        let pages = timeout(browser.pages()).await?;
+        let page = pages
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Other("reconnected browser has no page".into()))?;
+        let handler = tokio::spawn(async move {
+            while let Some(event) = handler.next().await {
+                if event.is_err() {
+                    break;
+                }
+            }
+        });
+        self.sessions.lock().await.insert(
+            session_id.to_string(),
+            LiveSession {
+                browser,
+                page,
+                handler,
+                _scratch: None,
+                profile_dir: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn element_value(&self, session_id: &str, target: &str) -> Result<String> {
+        let target = target.to_string();
+        self.with_page(session_id, |page| async move {
+            let element = Self::element(&page, &target).await?;
+            let value = timeout(element.property("value")).await?;
+            Ok(value
+                .and_then(|value| value.as_str().map(ToString::to_string))
+                .unwrap_or_default())
+        })
+        .await
     }
 
     /// Resolve a browser to drive, or explain what to do about it.
@@ -327,7 +379,9 @@ async fn timeout<T, E: std::fmt::Display>(
 ) -> Result<T> {
     match tokio::time::timeout(OP_TIMEOUT, future).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(AppError::Other(format!("Browser operation failed: {error}"))),
+        Ok(Err(error)) => Err(AppError::Other(format!(
+            "Browser operation failed: {error}"
+        ))),
         Err(_) => Err(AppError::Other(format!(
             "Browser operation timed out after {}s",
             OP_TIMEOUT.as_secs()
@@ -337,11 +391,17 @@ async fn timeout<T, E: std::fmt::Display>(
 
 #[async_trait]
 impl BrowserDriver for ChromiumDriver {
-    async fn open(
+    async fn open(&self, session_id: &str, url: &str, scope: &ProfileScope) -> Result<PageContent> {
+        self.open_authorized(session_id, url, scope, &AllowBrowserMutation)
+            .await
+    }
+
+    async fn open_authorized(
         &self,
         session_id: &str,
         url: &str,
         scope: &ProfileScope,
+        authorizer: &dyn BrowserMutationAuthorizer,
     ) -> Result<PageContent> {
         if self.sessions.lock().await.contains_key(session_id) {
             return Err(AppError::Other(format!(
@@ -375,9 +435,12 @@ impl BrowserDriver for ChromiumDriver {
             }
         };
 
+        let debugging_port = reserve_loopback_port()?;
+        let reconnect_endpoint = format!("http://127.0.0.1:{debugging_port}");
         let builder = BrowserConfig::builder()
             .chrome_executable(&executable)
             .user_data_dir(&user_data_dir)
+            .port(debugging_port)
             // Without this the crate's 20s default applies, not ours.
             .launch_timeout(LAUNCH_TIMEOUT);
         // Headed by default: the user has to be able to complete a sign-in,
@@ -405,14 +468,23 @@ impl BrowserDriver for ChromiumDriver {
             .build()
             .map_err(|error| AppError::Other(format!("Invalid browser configuration: {error}")))?;
 
+        // Starting Chromium itself is an external process mutation. Persist
+        // the write-ahead browser intent before launch, not only before the
+        // later navigation request.
+        authorizer.authorize().await?;
+        authorizer
+            .record_connection_endpoint(&reconnect_endpoint, None)
+            .await?;
         let launched = tokio::time::timeout(LAUNCH_WATCHDOG, Browser::launch(config)).await;
         let (mut browser, mut handler) = match launched {
             Ok(Ok(pair)) => pair,
             Ok(Err(error)) => {
+                let _ = authorizer.unknown().await;
                 release_profile(&profile_dir, session_id);
                 return Err(launch_failure(&executable, error));
             }
             Err(_) => {
+                let _ = authorizer.unknown().await;
                 release_profile(&profile_dir, session_id);
                 return Err(launch_failure(
                     &executable,
@@ -420,6 +492,17 @@ impl BrowserDriver for ChromiumDriver {
                 ));
             }
         };
+        let browser_pid = browser
+            .get_mut_child()
+            .and_then(|child| child.as_mut_inner().id());
+        if let Err(error) = authorizer
+            .record_connection_endpoint(&reconnect_endpoint, browser_pid)
+            .await
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(5), browser.kill()).await;
+            release_profile(&profile_dir, session_id);
+            return Err(error);
+        }
 
         let handler = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
@@ -431,9 +514,19 @@ impl BrowserDriver for ChromiumDriver {
 
         // From here on, every failure path must stop the process we just
         // started — this is exactly where a leaked browser would come from.
+        // Launching awaited; ownership may have changed meanwhile. Re-read
+        // the exact durable claim immediately before the first page request.
+        if let Err(error) = authorizer.verify_current().await {
+            let _ = tokio::time::timeout(OP_TIMEOUT, browser.close()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), browser.kill()).await;
+            handler.abort();
+            release_profile(&profile_dir, session_id);
+            return Err(error);
+        }
         let page = match timeout(browser.new_page(url)).await {
             Ok(page) => page,
             Err(error) => {
+                let _ = authorizer.unknown().await;
                 let _ = tokio::time::timeout(OP_TIMEOUT, browser.close()).await;
                 let _ = tokio::time::timeout(Duration::from_secs(5), browser.kill()).await;
                 handler.abort();
@@ -459,7 +552,8 @@ impl BrowserDriver for ChromiumDriver {
             }) {
             Ok(content) => content,
             Err(error) => {
-                teardown(&mut live, session_id).await;
+                let _ = authorizer.unknown().await;
+                let _ = teardown(&mut live, session_id).await;
                 return Err(error);
             }
         };
@@ -468,6 +562,7 @@ impl BrowserDriver for ChromiumDriver {
             .lock()
             .await
             .insert(session_id.to_string(), live);
+        authorizer.acknowledge(None).await?;
         Ok(content)
     }
 
@@ -499,67 +594,180 @@ impl BrowserDriver for ChromiumDriver {
     }
 
     async fn click(&self, session_id: &str, target: &str) -> Result<String> {
+        self.click_authorized(session_id, target, &AllowBrowserMutation)
+            .await
+    }
+
+    async fn click_authorized(
+        &self,
+        session_id: &str,
+        target: &str,
+        authorizer: &dyn BrowserMutationAuthorizer,
+    ) -> Result<String> {
         let target = target.to_string();
         self.with_page(session_id, |page| async move {
             let element = Self::element(&page, &target).await?;
-            timeout(element.click()).await?;
+            let before_url = timeout(page.url())
+                .await?
+                .ok_or_else(|| AppError::Other("browser page URL is unavailable".into()))?;
+            let before_digest = browser_state_digest(&["page_url", &before_url]);
+            authorizer.prepare_precondition(&before_digest).await?;
+            authorizer.authorize().await?;
+            if let Err(error) = timeout(element.click()).await {
+                let _ = authorizer.unknown().await;
+                return Err(error);
+            }
+            authorizer.acknowledge(None).await?;
             Ok(format!("Clicked {target}."))
         })
         .await
     }
 
     async fn fill(&self, session_id: &str, target: &str, text: &str) -> Result<String> {
+        self.fill_authorized(session_id, target, text, &AllowBrowserMutation)
+            .await
+    }
+
+    async fn fill_authorized(
+        &self,
+        session_id: &str,
+        target: &str,
+        text: &str,
+        authorizer: &dyn BrowserMutationAuthorizer,
+    ) -> Result<String> {
         let (target, text) = (target.to_string(), text.to_string());
         self.with_page(session_id, |page| async move {
             let element = Self::element(&page, &target).await?;
-            timeout(element.click()).await?;
-            timeout(element.type_str(&text)).await?;
+            authorizer.authorize().await?;
+            if let Err(error) = timeout(element.click()).await {
+                let _ = authorizer.unknown().await;
+                return Err(error);
+            }
+            if let Err(error) = timeout(element.type_str(&text)).await {
+                let _ = authorizer.unknown().await;
+                return Err(error);
+            }
+            authorizer.acknowledge(None).await?;
             Ok(format!("Typed into {target}."))
         })
         .await
     }
 
     async fn press(&self, session_id: &str, key: &str) -> Result<String> {
+        self.press_authorized(session_id, key, &AllowBrowserMutation)
+            .await
+    }
+
+    async fn press_authorized(
+        &self,
+        session_id: &str,
+        key: &str,
+        authorizer: &dyn BrowserMutationAuthorizer,
+    ) -> Result<String> {
         let key = key.to_string();
         self.with_page(session_id, |page| async move {
             // Keys go to whatever holds focus, which is what a user pressing a
             // key does; no element reference is involved.
             let element = timeout(page.find_element("body")).await?;
-            timeout(element.press_key(&key)).await?;
+            let before_url = timeout(page.url())
+                .await?
+                .ok_or_else(|| AppError::Other("browser page URL is unavailable".into()))?;
+            let before_digest = browser_state_digest(&["page_url", &before_url]);
+            authorizer.prepare_precondition(&before_digest).await?;
+            authorizer.authorize().await?;
+            if let Err(error) = timeout(element.press_key(&key)).await {
+                let _ = authorizer.unknown().await;
+                return Err(error);
+            }
+            authorizer.acknowledge(None).await?;
             Ok(format!("Pressed {key}."))
         })
         .await
     }
 
     async fn screenshot(&self, session_id: &str, path: &Path) -> Result<String> {
+        self.screenshot_authorized(session_id, path, &AllowBrowserMutation)
+            .await
+    }
+
+    async fn screenshot_authorized(
+        &self,
+        session_id: &str,
+        path: &Path,
+        authorizer: &dyn BrowserMutationAuthorizer,
+    ) -> Result<String> {
         let path = path.to_path_buf();
         self.with_page(session_id, |page| async move {
-            let bytes = timeout(page.screenshot(
-                chromiumoxide::page::ScreenshotParams::builder().build(),
-            ))
-            .await?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| {
-                    AppError::Other(format!("Could not create screenshot directory: {error}"))
-                })?;
+            authorizer.authorize().await?;
+            let bytes = match timeout(
+                page.screenshot(chromiumoxide::page::ScreenshotParams::builder().build()),
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = authorizer.unknown().await;
+                    return Err(error);
+                }
+            };
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            authorizer.prepare_postcondition(&digest).await?;
+            authorizer.verify_current().await?;
+            if let Err(error) = crate::tools::file_lock::atomic_write(&path, &bytes).await {
+                let _ = authorizer.unknown().await;
+                return Err(AppError::Other(format!(
+                    "Could not write the screenshot: {error}"
+                )));
             }
-            std::fs::write(&path, bytes).map_err(|error| {
-                AppError::Other(format!("Could not write the screenshot: {error}"))
-            })?;
+            authorizer.acknowledge(Some(&digest)).await?;
             Ok(format!("Saved a screenshot to {}", path.display()))
         })
         .await
     }
 
     async fn close(&self, session_id: &str) -> Result<()> {
+        self.close_authorized(session_id, &AllowBrowserMutation)
+            .await
+    }
+
+    async fn close_authorized(
+        &self,
+        session_id: &str,
+        authorizer: &dyn BrowserMutationAuthorizer,
+    ) -> Result<()> {
+        authorizer.authorize().await?;
         // Safe to call twice: an already-closed session is a no-op, not an
         // error, so a cleanup path can always call it.
         let Some(mut live) = self.sessions.lock().await.remove(session_id) else {
+            authorizer.acknowledge(None).await?;
             return Ok(());
         };
-        teardown(&mut live, session_id).await;
+        teardown(&mut live, session_id).await?;
+        authorizer.acknowledge(None).await?;
         Ok(())
     }
+}
+
+fn browser_state_digest(parts: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update(part.as_bytes());
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn reserve_loopback_port() -> Result<u16> {
+    let listener =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(|error| {
+            AppError::Other(format!("could not reserve browser loopback port: {error}"))
+        })?;
+    listener
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|error| {
+            AppError::Other(format!("could not inspect browser loopback port: {error}"))
+        })
 }
 
 /// Stop the browser and give back the profile.
@@ -567,11 +775,30 @@ impl BrowserDriver for ChromiumDriver {
 /// Kill is explicit rather than left to `Drop`: the crate only sets
 /// `kill_on_drop`, and the reaping time is not guaranteed — which is how a
 /// browser survived a crashed owner here for five days.
-async fn teardown(live: &mut LiveSession, session_id: &str) {
-    let _ = tokio::time::timeout(OP_TIMEOUT, live.browser.close()).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), live.browser.kill()).await;
+async fn teardown(live: &mut LiveSession, session_id: &str) -> Result<()> {
+    let graceful = tokio::time::timeout(OP_TIMEOUT, live.browser.close()).await;
+    let graceful_proven = if matches!(graceful, Ok(Ok(_))) {
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), live.browser.wait()).await,
+            Ok(Ok(_))
+        )
+    } else {
+        false
+    };
+    let forced = if graceful_proven {
+        None
+    } else {
+        Some(tokio::time::timeout(Duration::from_secs(5), live.browser.kill()).await)
+    };
     live.handler.abort();
+    let stopped = graceful_proven || matches!(forced, Some(Ok(Some(Ok(())))));
+    if !stopped {
+        return Err(AppError::Other(
+            "browser close and forced kill could not prove process exit".into(),
+        ));
+    }
     release_profile(&live.profile_dir, session_id);
+    Ok(())
 }
 
 fn release_profile(dir: &Option<PathBuf>, session_id: &str) {

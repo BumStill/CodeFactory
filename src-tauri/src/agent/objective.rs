@@ -757,6 +757,25 @@ pub fn decision_for_run_outcome_with_reason(
         }
     }
 
+    if outcome.stop_reason == StopReason::Blocked
+        && terminal_reason == Some("browser_pairing_required")
+    {
+        return DecisionRouter::route(
+            objective,
+            RouteSignal::CoreInputRequired {
+                domain: RecoveryDomain::Browser,
+                request_key: format!("browser-pairing:{}", objective.id),
+                missing_inputs: vec!["load_and_pair_browser_extension".into()],
+                attempted_routes: vec!["browser_extension_bridge".into()],
+                resume_cursor: objective
+                    .resume_cursor
+                    .clone()
+                    .or_else(|| objective.root_turn_id.clone())
+                    .or_else(|| objective.task_id.clone()),
+            },
+        );
+    }
+
     let (failure_code, domain) = match outcome.stop_reason {
         StopReason::PlatformIncident
             if matches!(
@@ -784,6 +803,14 @@ pub fn decision_for_run_outcome_with_reason(
                 RecoveryDomain::Context,
             )
         }
+        StopReason::PlatformIncident
+            if terminal_reason.is_some_and(|reason| reason.starts_with("browser_")) =>
+        {
+            (
+                terminal_reason.expect("matched typed browser recovery outcome"),
+                RecoveryDomain::Browser,
+            )
+        }
         StopReason::PlatformIncident => ("platform_incident", RecoveryDomain::Tool),
         StopReason::FailedInternal => ("failed_internal", RecoveryDomain::Chat),
         StopReason::BudgetExhausted => ("run_budget_exhausted", RecoveryDomain::Chat),
@@ -805,7 +832,7 @@ pub fn decision_for_run_outcome_with_reason(
                 terminal_reason.unwrap_or("none")
             ),
             next_observation_at: Utc::now().timestamp_millis() + 5_000,
-            resume_cursor: if domain == RecoveryDomain::Context {
+            resume_cursor: if matches!(domain, RecoveryDomain::Context | RecoveryDomain::Browser) {
                 objective
                     .resume_cursor
                     .clone()
@@ -1971,6 +1998,42 @@ impl ObjectiveStore {
                 RouteSignal::CapabilityRestored {
                     domain,
                     reason: "authorization_restored".into(),
+                    next_observation_at: Utc::now().timestamp_millis(),
+                    resume_cursor: objective.resume_cursor.clone(),
+                },
+            )?;
+            match self.apply_decision(objective.revision, decision).await {
+                Ok(_) => resumed += 1,
+                Err(error) if error.to_string().contains("revision") => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(resumed)
+    }
+
+    pub async fn resume_waiting_core_inputs(
+        &self,
+        domain: RecoveryDomain,
+        request_key_prefix: &str,
+        reason: &str,
+    ) -> anyhow::Result<usize> {
+        let rows = sqlx::query(
+            "SELECT * FROM objectives
+             WHERE status='waiting_core_input' AND domain=?
+               AND request_key LIKE ? ORDER BY created_at",
+        )
+        .bind(domain.as_str())
+        .bind(format!("{request_key_prefix}%"))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut resumed = 0;
+        for row in rows {
+            let objective = ObjectiveSnapshot::from_row(&row)?;
+            let decision = DecisionRouter::route(
+                &objective,
+                RouteSignal::CapabilityRestored {
+                    domain,
+                    reason: reason.into(),
                     next_observation_at: Utc::now().timestamp_millis(),
                     resume_cursor: objective.resume_cursor.clone(),
                 },
@@ -3336,6 +3399,11 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     .await?;
     sqlx::raw_sql(include_str!(
         "../../migrations/0013_context_recovery_intents.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0014_browser_recovery_contracts.sql"
     ))
     .execute(pool)
     .await?;
@@ -6237,6 +6305,120 @@ mod tests {
             );
             assert!(!decision.requires_user_action);
         }
+    }
+
+    #[test]
+    fn typed_browser_transport_outcomes_keep_the_browser_recovery_domain() {
+        let mut objective = ObjectiveSnapshot::new(
+            "objective-browser-interruption",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Chat,
+            "validated_change",
+        );
+        objective.root_turn_id = Some("turn-browser-anchor".into());
+        objective.resume_cursor = Some("turn-browser-active".into());
+        let outcome = RunOutcome {
+            final_text: String::new(),
+            completion_evidence: CompletionEvidence::default(),
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: StopReason::PlatformIncident,
+        };
+
+        for reason in [
+            "browser_observation_contract_required",
+            "browser_external_state_uncertain",
+            "browser_observation_conflict",
+        ] {
+            let decision =
+                decision_for_run_outcome_with_reason(&objective, &outcome, Some(reason)).unwrap();
+            assert_eq!(decision.domain, RecoveryDomain::Browser);
+            assert_eq!(decision.status, ObjectiveStatus::WaitingSystem);
+            assert_eq!(decision.failure_code.as_deref(), Some(reason));
+            assert_eq!(
+                decision.resume_cursor.as_deref(),
+                Some("turn-browser-active")
+            );
+            assert!(!decision.requires_user_action);
+        }
+
+        let pairing = decision_for_run_outcome_with_reason(
+            &objective,
+            &RunOutcome {
+                stop_reason: StopReason::Blocked,
+                ..outcome
+            },
+            Some("browser_pairing_required"),
+        )
+        .unwrap();
+        assert_eq!(pairing.domain, RecoveryDomain::Browser);
+        assert_eq!(pairing.status, ObjectiveStatus::WaitingCoreInput);
+        assert_eq!(pairing.decision_type, DecisionType::CoreInputRequired);
+        assert!(pairing.requires_user_action);
+        assert_eq!(
+            pairing.resume_cursor.as_deref(),
+            Some("turn-browser-active")
+        );
+        assert!(pairing
+            .request_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("browser-pairing:")));
+    }
+
+    #[tokio::test]
+    async fn browser_pairing_capability_restores_the_same_objective_without_reprompt() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool);
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-browser-pairing".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-browser-pairing".into()),
+                root_turn_id: Some("turn-browser-pairing".into()),
+                domain: RecoveryDomain::Browser,
+                requested_acceptance: "browser_attached".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let waiting = DecisionRouter::route(
+            &objective,
+            RouteSignal::CoreInputRequired {
+                domain: RecoveryDomain::Browser,
+                request_key: format!("browser-pairing:{}", objective.id),
+                missing_inputs: vec!["load_and_pair_browser_extension".into()],
+                attempted_routes: vec!["browser_extension_bridge".into()],
+                resume_cursor: objective.root_turn_id.clone(),
+            },
+        )
+        .unwrap();
+        let waiting = store
+            .apply_decision(objective.revision, waiting)
+            .await
+            .unwrap();
+        assert_eq!(waiting.status, ObjectiveStatus::WaitingCoreInput);
+
+        assert_eq!(
+            store
+                .resume_waiting_core_inputs(
+                    RecoveryDomain::Browser,
+                    "browser-pairing:",
+                    "browser_pairing_restored",
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        let resumed = store.get(&objective.id).await.unwrap().unwrap();
+        assert_eq!(resumed.id, objective.id);
+        assert_eq!(resumed.root_turn_id, objective.root_turn_id);
+        assert_eq!(resumed.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(resumed.domain, RecoveryDomain::Browser);
+        assert!(!resumed.requires_user_action);
+        assert_eq!(
+            resumed.failure_code.as_deref(),
+            Some("browser_pairing_restored")
+        );
     }
 
     #[tokio::test]
