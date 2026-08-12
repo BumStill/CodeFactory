@@ -425,7 +425,7 @@ export function MessageList({
       >
         <div
           data-testid="conversation-reading-column"
-          className="mx-auto w-full max-w-[880px] pb-2"
+          className="mx-auto w-full max-w-[var(--reading-column)] pb-2"
         >
         {activeProgressMessage && (
           <div className="sticky top-0 z-20 mb-3 flex justify-center">

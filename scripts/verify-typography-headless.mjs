@@ -51,6 +51,19 @@ const GRID = {
 /** Nothing readable may render below this. */
 const MIN_TEXT_PX = 11;
 
+/**
+ * CJK characters per line at the column's cap, at every font setting.
+ *
+ * What this pins is that the measure no longer drifts with the font slider: the
+ * column was a flat 880px while the text scaled, so a line held 68 characters
+ * at the 12px setting and 41 at the 20px one.
+ *
+ * 80 is deliberately wide. This column carries technical output — env var
+ * names, repository paths, full ssh URLs — and a prose-tuned measure of ~50
+ * forced those to wrap mid-token while the screen sat empty beside them.
+ */
+const READING_MEASURE_CJK = 80;
+
 function waitForHttp(url, timeoutMs = 15_000) {
   const start = Date.now();
   return new Promise((resolve, reject) => {
@@ -100,6 +113,11 @@ async function main() {
 
   const browser = await chromium.launch({ headless: true, channel: 'chrome' });
   const page = await browser.newPage();
+  // Wide enough that the column's `vw` term never binds even at the largest
+  // font setting, so [7] measures the cap rather than the viewport. On a
+  // narrower window the viewport legitimately constrains the column and the
+  // measure shortens — that is layout responding to space, not drift.
+  await page.setViewportSize({ width: 3000, height: 900 });
 
   try {
     await page.goto(`${VITE_URL}/usage-acceptance.html`, { waitUntil: 'domcontentloaded', timeout: 15_000 });
@@ -184,6 +202,38 @@ async function main() {
     else {
       for (const item of inverted) console.error(`  FAIL 「${item.heading}」${item.headingSize}px < 同容器正文 ${item.siblingSize}px`);
       failures.push(`${inverted.length} 处层级倒挂`);
+    }
+    console.log('\n[7] 阅读列锁定每行字数，不随字号漂移');
+    for (const setting of [12, 14, 20]) {
+      const measured = await page.evaluate((size) => {
+        document.documentElement.style.setProperty('--font-scale', String(size / 14));
+        const host = document.createElement('div');
+        host.style.width = '4000px'; // wider than any column, so the cap decides
+        const column = document.createElement('div');
+        column.className = 'w-full max-w-[var(--reading-column)]';
+        host.appendChild(column);
+        document.body.appendChild(host);
+
+        const sample = document.createElement('span');
+        sample.className = 'text-reading';
+        sample.style.whiteSpace = 'pre';
+        sample.textContent = '中文字符测量样本文字';
+        document.body.appendChild(sample);
+
+        const columnWidth = column.getBoundingClientRect().width;
+        const charWidth = sample.getBoundingClientRect().width / sample.textContent.length;
+        host.remove();
+        sample.remove();
+        document.documentElement.style.removeProperty('--font-scale');
+        return Math.round(columnWidth / charWidth);
+      }, setting);
+      // A measure this stable is the whole point; ±2 covers rounding only.
+      if (Math.abs(measured - READING_MEASURE_CJK) <= 2) {
+        console.log(`  ok   字号 ${setting}px: 每行 ${measured} 个中文字`);
+      } else {
+        console.error(`  FAIL 字号 ${setting}px: 每行 ${measured} 字，期望 ${READING_MEASURE_CJK}±2`);
+        failures.push(`阅读列 @${setting}px: ${measured} != ${READING_MEASURE_CJK}`);
+      }
     }
   } finally {
     // Always close. A verify run that threw before this line once left a

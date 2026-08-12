@@ -301,6 +301,44 @@ Mono: "JetBrains Mono", "SF Mono", Consolas, Menlo, monospace
 
 ---
 
+## 五之二、会话列宽度
+
+会话列（`--reading-column`，由 `globals.css` 定义，`WorkspacePage` 与 `MessageList`
+两处引用）：
+
+```css
+--reading-column: min(calc(1200px * var(--font-scale, 1)), 64vw);
+```
+
+两条约束各修一个问题。
+
+### 跟字号走：修的是「每行字数漂移」
+
+原先是写死的 `max-w-[880px]`，而文字随 `--font-scale` 缩放，列不缩放。
+结果每行中文字数在滑块上从 **68 字（12px 设置）荡到 41 字（20px 设置）**——
+用户每动一次字号，行长就变一次。乘上同一个系数就钉住了。
+
+### 跟窗口走：修的是「大屏留白过多」
+
+| 全屏宽度 | 改前（880 写死） | 改后 |
+|---|---|---|
+| 1920 | 两侧各 384px，占可用宽 53% | 两侧各 224px，**72%** |
+| 2560 | 两侧各 **704px**，占 38% | 两侧各 544px，**52%** |
+
+### 为什么上限是 80 字而不是 50 字
+
+初审时按「中文长文舒适区 30–45 字」判定 880px（58 字）已经偏宽，据此把列收窄到
+750px。**这个判断是错的，已作废**——它衡量的是这个列里并不存在的内容。
+
+真实内容是技术输出：环境变量名、仓库路径、完整 ssh URL、内联代码。
+一张 Windows 2560 全屏截图上，`ssh://git@codehub-dg-g.huawei.com:2222/NIS_Pre-` 被迫
+从中间断成两行，而右侧空着 700px。长文的度量标准套在这种内容上只会制造这种断行。
+
+**教训**：定行长之前先看这个容器实际装的是什么。拿错了参照系，再精确的测量也是错的。
+
+上限之外还想填满屏幕，正解是右侧辅助面板（≥1440px 自动 dock）——
+2560 全屏开着面板时，会话列两侧只剩约 284px。
+
 ## 六、点击目标最小尺寸
 
 实测到的过小目标：
@@ -479,12 +517,14 @@ Token 消耗地图的日历格子）无法在不破坏可视化的前提下让�
 | `themeBootstrapAudit.test.ts` | `index.html` 首帧带 `data-theme`、无失效 `class="dark"`；`:root` 有变量兜底 |
 | `iconScaleAudit.test.ts` | `size={N}` 只允许 14/16/20/24；`globals.css` 有统一描边规则 |
 | `radiusScaleAudit.test.ts` | 不出现被淘汰的 `rounded-md` / `rounded-sm` / `rounded-3xl` |
+| `MessageList.theme.test.tsx` | 会话列用 `max-w-[var(--reading-column)]`，不是写死 px |
 | `fontStackAudit.test.ts` | 字体栈含中文族；被提供的选项确实随应用打包；界面字体不是等宽族 |
 
 真实渲染值只有真浏览器能给，补了两个 headless 脚本（都需先起 dev server）：
 
 - `pnpm test:typography:headless`——根字号、8 档 token 实际 px、4px 网格、
-  `--font-scale` 只缩放文字不缩放布局、页面上无 11px 以下文字、无层级倒挂。
+  `--font-scale` 只缩放文字不缩放布局、页面上无 11px 以下文字、无层级倒挂、
+  会话列每行字数在各字号下恒定（视口取 3000px，避开 `vw` 项）。
 - `pnpm test:hit-target:headless`——遍历 `button/a/[role=button]/input/select`，
   命中区宽高均 ≥ 24px，Essential 例外按轴登记。
 

@@ -20,6 +20,39 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── Layout metrics (theme-independent) ─────────────────────────────────────── */
+
+/*
+ * Conversation column width, locked to line length rather than to pixels.
+ *
+ * It used to be a flat `max-w-[880px]`. The text scales with `--font-scale` and
+ * the column did not, so a line held 68 CJK characters at the 12px setting and
+ * 41 at the 20px one — the measure drifted every time the user touched the font
+ * slider. Scaling the column by the same factor pins it wherever it is set.
+ *
+ * 880px stays the base on purpose. The prose-measure guidance that would argue
+ * for ~50 characters is measuring the wrong content: this column carries
+ * technical output — env var names, repository paths, full ssh URLs, inline
+ * code — where narrowing forces long unbreakable tokens to wrap mid-token while
+ * screen sits empty beside them. Narrowing it to 750px was tried and reverted
+ * against a real Windows screenshot showing exactly that.
+ *
+ * Deliberately NOT inside the theme blocks: it has nothing to do with light or
+ * dark, and a copy that only exists under one theme is a copy waiting to be
+ * dropped by the other.
+ */
+:root {
+  /*
+   * Grows with the window, capped so a line never runs away. On a 1920 screen
+   * the column reads 1190px instead of 880 (72% of the space beside the
+   * sidebar rather than 53%); on 2560 it reaches the 1200px cap.
+   *
+   * One line to retune: raise the cap for longer lines, lower the vw factor
+   * for more breathing room.
+   */
+  --reading-column: min(calc(1200px * var(--font-scale, 1)), 64vw);
+}
+
 /* ── Theme variables ────────────────────────────────────────────────────────── */
 
 /*
