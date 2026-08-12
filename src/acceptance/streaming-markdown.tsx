@@ -58,17 +58,17 @@ function AcceptanceApp() {
       aria-label="Streaming Markdown acceptance"
     >
       <header className="mx-auto mb-4 flex max-w-4xl flex-wrap items-center gap-2">
-        <h1 className="mr-auto text-lg font-semibold">流式时间线 Markdown 验收</h1>
+        <h1 className="mr-auto text-heading font-semibold">流式时间线 Markdown 验收</h1>
         <button
           type="button"
-          className="rounded bg-accent px-3 py-1.5 text-xs text-white"
+          className="rounded bg-accent px-3 py-1.5 text-label text-white"
           onClick={() => setContinued(true)}
         >
           模拟工具与后续文本
         </button>
         <button
           type="button"
-          className="rounded border border-border px-3 py-1.5 text-xs"
+          className="rounded border border-border px-3 py-1.5 text-label"
           onClick={() => {
             setLongTimeline(true);
             setContinued(true);

@@ -30,6 +30,7 @@
     "test:draft-project-picker:headless": "node scripts/verify-draft-project-picker-headless.mjs",
     "test:watch": "vitest",
     "test:scrollbar:headless": "node scripts/verify-scrollbar-auto-hide-headless.mjs",
+    "test:typography:headless": "node scripts/verify-typography-headless.mjs",
     "ext:build": "node scripts/build-extension.mjs",
     "verify:extension": "node scripts/verify-extension-bridge.mjs"
   },

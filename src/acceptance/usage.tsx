@@ -136,8 +136,8 @@ function AcceptancePage() {
   return (
     <main className="min-h-screen bg-surface-0 p-4 text-gray-200">
       <nav aria-label="验收界面" className="mx-auto mb-4 flex max-w-6xl gap-2">
-        <button type="button" onClick={() => setSurface("welcome")} className="rounded border border-border px-3 py-1.5 text-xs">新会话</button>
-        <button type="button" onClick={() => setSurface("settings")} className="rounded border border-border px-3 py-1.5 text-xs">设置 / 用量与预算</button>
+        <button type="button" onClick={() => setSurface("welcome")} className="rounded border border-border px-3 py-1.5 text-label">新会话</button>
+        <button type="button" onClick={() => setSurface("settings")} className="rounded border border-border px-3 py-1.5 text-label">设置 / 用量与预算</button>
       </nav>
       {surface === "welcome" ? (
         <div className="mx-auto flex min-h-[calc(100vh-72px)] max-w-6xl">
@@ -149,8 +149,8 @@ function AcceptancePage() {
           onOpenJobLog={(sessionId, taskId) => setOpenedJobLog(`${sessionId}/${taskId}`)}
         />
       )}
-      {openedSession && <p role="status" className="mx-auto mt-4 max-w-6xl text-xs text-accent">已打开会话：{openedSession}</p>}
-      {openedJobLog && <p role="status" className="mx-auto mt-4 max-w-6xl text-xs text-accent">已打开作业日志：{openedJobLog}</p>}
+      {openedSession && <p role="status" className="mx-auto mt-4 max-w-6xl text-label text-accent">已打开会话：{openedSession}</p>}
+      {openedJobLog && <p role="status" className="mx-auto mt-4 max-w-6xl text-label text-accent">已打开作业日志：{openedJobLog}</p>}
     </main>
   );
 }

@@ -18,10 +18,10 @@ function ToastItem({ notification, onView }: ToastProps) {
         <Package size={14} className="text-green-400" />
       </div>
       <div className="flex-1 min-w-0">
-        <div className="text-xs font-semibold text-gray-200">
+        <div className="text-label font-semibold text-gray-200">
           Evidence pack ready
         </div>
-        <div className="text-[11px] text-gray-400 truncate mt-0.5">
+        <div className="text-caption text-gray-400 truncate mt-0.5">
           {notification.spec_req_id} — {notification.spec_title}
         </div>
         <button
@@ -29,7 +29,7 @@ function ToastItem({ notification, onView }: ToastProps) {
             onView(notification.path);
             dismissNotification(notification.id);
           }}
-          className="mt-1.5 text-[11px] text-accent hover:text-accent-hover transition-colors"
+          className="mt-1.5 text-caption text-accent hover:text-accent-hover transition-colors"
         >
           View Evidence Pack →
         </button>

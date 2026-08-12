@@ -95,7 +95,7 @@ export function ReasoningEffortPicker() {
       value={effort}
       onChange={(e) => void setEffort(e.target.value as ReasoningEffort)}
       title="思考强度 (reasoning effort) — 仅作用于当前会话，从下一回合开始生效"
-      className="min-h-11 rounded-lg border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9"
+      className="min-h-11 rounded-lg border border-border bg-surface-2 px-2 py-1 text-label text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9"
     >
       {efforts.map((v) => (
         <option key={v} value={v}>

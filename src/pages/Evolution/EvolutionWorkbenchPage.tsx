@@ -559,10 +559,10 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
             <ArrowLeft size={16} />
           </button>
           <div className="min-w-0 flex-1">
-            <h1 className="text-lg font-semibold">进化审查</h1>
-            <p className="text-xs text-gray-500">审核真实轨迹候选，追溯当前项目最近 100 条决定</p>
+            <h1 className="text-heading font-semibold">进化审查</h1>
+            <p className="text-label text-gray-500">审核真实轨迹候选，追溯当前项目最近 100 条决定</p>
           </div>
-          <label className="min-w-0 max-w-full text-[10px] text-gray-500">
+          <label className="min-w-0 max-w-full text-caption text-gray-500">
             项目范围
             <select
               value={cwd ?? ""}
@@ -584,7 +584,7 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
                 setCwd(event.target.value || null);
               }}
               disabled={mining || analysisRunning || busyId != null}
-              className="ml-2 max-w-[min(52vw,360px)] rounded border border-border bg-surface-2 px-2 py-1.5 text-xs text-gray-300"
+              className="ml-2 max-w-[min(52vw,360px)] rounded border border-border bg-surface-2 px-2 py-1.5 text-label text-gray-300"
               aria-label="项目范围"
             >
               {scopes.length === 0 && <option value="">暂无项目</option>}
@@ -593,14 +593,14 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
               ))}
             </select>
           </label>
-          <div className="text-right text-[10px] text-gray-500">
+          <div className="text-right text-caption text-gray-500">
             <div>{pending.length} 条待审</div>
             <div>最近分析 {shortTime(latestAnalysisJob?.completed_at ?? latestAnalysisJob?.started_at)}</div>
           </div>
           <button
             onClick={() => void runAnalysis()}
             disabled={!cwdIsValid || mining || analysisRunning}
-            className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
+            className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-label font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
           >
             {mining ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
             {mining || analysisRunning ? "分析中" : "运行分析"}
@@ -619,7 +619,7 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
             <StageCard icon={Zap} title="自动激活" detail={`${candidateStates.filter((candidate) => candidate.state === "active").length} 已激活 · ${candidateStates.filter((candidate) => candidate.state === "pending_activation").length} 待激活`} active={candidateStates.some((candidate) => candidate.state === "active")} />
           </section>
 
-          <div className="rounded-lg border border-accent/30 bg-accent/5 px-3 py-2 text-xs text-gray-400">
+          <div className="rounded-lg border border-accent/30 bg-accent/5 px-3 py-2 text-label text-gray-400">
             人工批准会先冻结 revision 并运行激活安全 Evals；只有 exact revision 全部通过且本次显式选择自动激活时才影响下一次 Agent 调用。不会自动修改代码、合并、部署或发布。
           </div>
 
@@ -645,7 +645,7 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
                 aria-selected={tab === value}
                 aria-controls={`evolution-panel-${value}`}
                 tabIndex={tab === value ? 0 : -1}
-                className={`whitespace-nowrap rounded px-3 py-1.5 text-xs transition-colors ${
+                className={`whitespace-nowrap rounded px-3 py-1.5 text-label transition-colors ${
                   tab === value ? "bg-surface-3 text-accent" : "text-gray-500 hover:text-gray-200"
                 }`}
               >
@@ -655,7 +655,7 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
           </nav>
 
           {error && (
-            <div role="alert" className="rounded border border-red-900/60 bg-red-950/20 px-3 py-2 text-xs text-red-700 dark:text-red-300 break-words">
+            <div role="alert" className="rounded border border-red-900/60 bg-red-950/20 px-3 py-2 text-label text-red-700 dark:text-red-300 break-words">
               {error}
             </div>
           )}
@@ -803,9 +803,9 @@ function StageCard({
     }`}>
       <div className="mb-1 flex items-center gap-1.5">
         <Icon size={12} className={active ? "text-accent" : "text-gray-600"} />
-        <span className="text-[11px] font-medium text-gray-300">{title}</span>
+        <span className="text-caption font-medium text-gray-300">{title}</span>
       </div>
-      <p className="text-[10px] text-gray-500">{detail}</p>
+      <p className="text-caption text-gray-500">{detail}</p>
     </div>
   );
 }
@@ -929,7 +929,7 @@ function ReviewPanel({
         <button
           ref={completionActionRef}
           onClick={onOpenHistory}
-          className="mt-4 rounded border border-border px-3 py-1.5 text-xs text-accent hover:bg-surface-3"
+          className="mt-4 rounded border border-border px-3 py-1.5 text-label text-accent hover:bg-surface-3"
         >
           查看决定历史
         </button>
@@ -946,7 +946,7 @@ function ReviewPanel({
   return (
     <section className="grid min-w-0 grid-cols-1 gap-3 lg:grid-cols-[minmax(240px,0.8fr)_minmax(0,1.5fr)]">
       <div className={`${mobileDetail ? "hidden lg:block" : "block"} min-w-0 max-h-[calc(100vh-280px)] overflow-y-auto rounded-lg border border-border bg-surface-1 p-2 lg:max-h-none lg:overflow-visible`}>
-        <div className="px-2 pb-2 text-[10px] font-semibold uppercase tracking-wider text-gray-500">候选队列</div>
+        <div className="px-2 pb-2 text-caption font-semibold text-gray-500">候选队列</div>
         <div ref={listRef} className="space-y-1.5">
           {pending.map((event) => (
             <button
@@ -963,11 +963,11 @@ function ReviewPanel({
               }`}
             >
               <div className="mb-1 flex items-center justify-between gap-2">
-                <span className="text-[10px] text-accent">{targetLabel(event)}</span>
+                <span className="text-caption text-accent">{targetLabel(event)}</span>
                 <ChevronRight size={12} className="shrink-0 text-gray-600" />
               </div>
-              <p className="break-words text-xs font-medium leading-relaxed text-gray-200">{event.observation}</p>
-              <p className="mt-1 text-[10px] text-gray-600">{evidenceSummary(event)}</p>
+              <p className="break-words text-label font-medium leading-relaxed text-gray-200">{event.observation}</p>
+              <p className="mt-1 text-caption text-gray-600">{evidenceSummary(event)}</p>
             </button>
           ))}
         </div>
@@ -975,26 +975,26 @@ function ReviewPanel({
 
       <article className={`${mobileDetail ? "block" : "hidden lg:block"} min-w-0 rounded-lg border border-border bg-surface-1`}>
         <div className="border-b border-border p-4">
-          <button ref={backButtonRef} onClick={onCloseMobileDetail} className="mb-3 flex items-center gap-1 text-[11px] text-gray-500 hover:text-gray-300 lg:hidden">
+          <button ref={backButtonRef} onClick={onCloseMobileDetail} className="mb-3 flex items-center gap-1 text-caption text-gray-500 hover:text-gray-300 lg:hidden">
             <ArrowLeft size={11} /> 返回候选队列
           </button>
-          <div className="mb-2 flex flex-wrap items-center gap-2 text-[10px]">
+          <div className="mb-2 flex flex-wrap items-center gap-2 text-caption">
             <span className="rounded bg-accent/10 px-2 py-0.5 text-accent">待人工批准</span>
             <span className="text-gray-600">{shortTime(selected.created_at)}</span>
           </div>
-          <h2 className="break-words text-base font-semibold leading-relaxed">{selected.observation}</h2>
+          <h2 className="break-words text-title font-semibold leading-relaxed">{selected.observation}</h2>
         </div>
         <div className="space-y-4 p-4 pb-24 lg:pb-4">
           <DetailBlock title="建议变更">
-            <p className="break-words text-sm leading-relaxed text-gray-300">{selected.suggestion}</p>
+            <p className="break-words text-body leading-relaxed text-gray-300">{selected.suggestion}</p>
           </DetailBlock>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <DetailBlock title="作用范围"><p className="break-all font-mono text-xs text-gray-400">{cwd}</p></DetailBlock>
-            <DetailBlock title="明确去向"><p className="text-xs text-gray-400">{targetLabel(selected)}</p></DetailBlock>
+            <DetailBlock title="作用范围"><p className="break-all font-mono text-label text-gray-400">{cwd}</p></DetailBlock>
+            <DetailBlock title="明确去向"><p className="text-label text-gray-400">{targetLabel(selected)}</p></DetailBlock>
           </div>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <DetailBlock title="来源与时间">
-              <p className="break-all text-xs text-gray-400">
+              <p className="break-all text-label text-gray-400">
                 {selected.session_id
                   ? sourceSessionAvailable ? `session ${selected.session_id}` : "来源 session 已不可用"
                   : "跨会话聚合"} · {shortTime(selected.created_at)}
@@ -1002,27 +1002,27 @@ function ReviewPanel({
               {selected.job_id && (
                 <button
                   onClick={() => onOpenJob(selected.job_id as string)}
-                  className="mt-2 rounded border border-border px-2 py-1 text-[10px] text-accent hover:bg-surface-3"
+                  className="mt-2 rounded border border-border px-2 py-1 text-caption text-accent hover:bg-surface-3"
                 >
                   查看来源作业
                 </button>
               )}
             </DetailBlock>
             <DetailBlock title="风险与可逆性">
-              <p className="text-xs leading-relaxed text-gray-400">只影响当前项目后续会话；项目记忆和偏好可在“我的画像”中查看并撤销。</p>
+              <p className="text-label leading-relaxed text-gray-400">只影响当前项目后续会话；项目记忆和偏好可在“我的画像”中查看并撤销。</p>
             </DetailBlock>
           </div>
           <DetailBlock title="当前值 → 候选 revision">
-            <div className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
+            <div className="grid grid-cols-1 gap-2 text-label sm:grid-cols-2">
               <div className="rounded border border-border bg-surface-2 p-2 text-gray-500">
                 当前：{currentValueLoading ? "正在读取…" : currentValue ?? "无法确认"}
               </div>
               <div className="break-words rounded border border-accent/30 bg-accent/5 p-2 text-gray-300">候选：{proposedValue}</div>
             </div>
-            {currentValueError && <p role="alert" className="mt-2 text-[11px] text-red-700 dark:text-red-300">{currentValueError}；在确认真实当前值前不能采纳。</p>}
+            {currentValueError && <p role="alert" className="mt-2 text-caption text-red-700 dark:text-red-300">{currentValueError}；在确认真实当前值前不能采纳。</p>}
           </DetailBlock>
           <DetailBlock title="脱敏证据">
-            <div className="rounded border border-border bg-surface-2 px-3 py-2 text-xs text-gray-400">
+            <div className="rounded border border-border bg-surface-2 px-3 py-2 text-label text-gray-400">
               {evidenceSummary(selected)}
             </div>
           </DetailBlock>
@@ -1037,10 +1037,10 @@ function ReviewPanel({
               }}
               className="fixed inset-x-3 bottom-3 z-30 max-h-[calc(100dvh-1.5rem)] overflow-y-auto rounded-lg border border-amber-700/50 bg-surface-1 p-3 shadow-2xl lg:static lg:inset-auto lg:z-auto lg:max-h-none lg:overflow-visible lg:bg-amber-950/20 lg:shadow-none"
             >
-              <p id="evolution-decision-title" className="text-xs font-medium text-amber-700 dark:text-amber-200">
+              <p id="evolution-decision-title" className="text-label font-medium text-amber-700 dark:text-amber-200">
                 {confirmation === "accept" ? "确认批准并运行 Evals" : "确认拒绝这个候选"}
               </p>
-              <div id="evolution-decision-description" className="mt-2 space-y-1.5 text-[11px] text-gray-400">
+              <div id="evolution-decision-description" className="mt-2 space-y-1.5 text-caption text-gray-400">
                 <p className="break-all">范围：{cwd} · 目标：{targetLabel(selected)}</p>
                 <p>当前：{currentValueLoading ? "正在读取…" : currentValue ?? "无法确认"}</p>
                 <p className="break-words">
@@ -1071,20 +1071,20 @@ function ReviewPanel({
                   onClick={confirmation === "accept" ? onAccept : onReject}
                   autoFocus
                   disabled={busy || (confirmation === "accept" && (currentValueLoading || currentValueError != null))}
-                  className={`flex items-center gap-1.5 rounded px-3 py-1.5 text-xs text-white disabled:opacity-50 ${confirmation === "accept" ? "bg-accent" : "bg-red-700"}`}
+                  className={`flex items-center gap-1.5 rounded px-3 py-1.5 text-label text-white disabled:opacity-50 ${confirmation === "accept" ? "bg-accent" : "bg-red-700"}`}
                 >
                   {busy ? <Loader2 size={12} className="animate-spin" /> : confirmation === "accept" ? <Check size={12} /> : <X size={12} />}
                   {confirmation === "accept" ? "确认批准并运行 Evals" : "确认拒绝"}
                 </button>
-                <button onClick={onCancelConfirm} disabled={busy} className="rounded border border-border px-3 py-1.5 text-xs text-gray-400 hover:bg-surface-3">取消</button>
+                <button onClick={onCancelConfirm} disabled={busy} className="rounded border border-border px-3 py-1.5 text-label text-gray-400 hover:bg-surface-3">取消</button>
               </div>
             </div>
           ) : (
             <div className="fixed inset-x-3 bottom-3 z-20 flex flex-wrap gap-2 rounded-lg border border-border bg-surface-1 p-3 shadow-2xl lg:static lg:inset-auto lg:z-auto lg:rounded-none lg:border-x-0 lg:border-b-0 lg:bg-transparent lg:p-0 lg:pt-4 lg:shadow-none">
-              <button ref={acceptTriggerRef} onClick={onAskAccept} disabled={busy || currentValueLoading || currentValueError != null} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover disabled:cursor-wait disabled:opacity-50">
+              <button ref={acceptTriggerRef} onClick={onAskAccept} disabled={busy || currentValueLoading || currentValueError != null} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-label text-white hover:bg-accent-hover disabled:cursor-wait disabled:opacity-50">
                 <Check size={12} /> 批准并运行 Evals
               </button>
-              <button ref={rejectTriggerRef} onClick={onAskReject} disabled={busy} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-xs text-gray-400 hover:bg-surface-3 disabled:opacity-50">
+              <button ref={rejectTriggerRef} onClick={onAskReject} disabled={busy} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-label text-gray-400 hover:bg-surface-3 disabled:opacity-50">
                 <X size={12} /> 拒绝
               </button>
             </div>
@@ -1114,7 +1114,7 @@ function EvaluationActivationPanel({ candidates, casesByRun, jobIdsByCandidate, 
   return (
     <section className="space-y-3" aria-label="评测与激活记录">
       {error && (
-        <p role="alert" className="rounded border border-red-900/50 bg-red-950/20 p-3 text-xs text-red-700 dark:text-red-300">
+        <p role="alert" className="rounded border border-red-900/50 bg-red-950/20 p-3 text-label text-red-700 dark:text-red-300">
           操作未完成：{error}。候选状态与作业日志已刷新。
         </p>
       )}
@@ -1125,15 +1125,15 @@ function EvaluationActivationPanel({ candidates, casesByRun, jobIdsByCandidate, 
           <article key={candidate.candidate_id} className="rounded-lg border border-border bg-surface-1 p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-2 text-[10px]">
+                <div className="flex flex-wrap items-center gap-2 text-caption">
                   <span className="rounded bg-accent/10 px-2 py-0.5 text-accent">revision {candidate.revision}</span>
                   <span className="rounded bg-surface-3 px-2 py-0.5 text-gray-400">{statusLabel(candidate.state)}</span>
                   <span className="text-gray-600">{candidate.kind === "preference" ? "项目偏好" : "项目记忆"}</span>
                 </div>
-                <h2 className="mt-2 break-words text-sm font-medium text-gray-200">{candidate.suggestion}</h2>
-                <p className="mt-1 break-all font-mono text-[10px] text-gray-600">candidate {candidate.candidate_id}</p>
+                <h2 className="mt-2 break-words text-body font-medium text-gray-200">{candidate.suggestion}</h2>
+                <p className="mt-1 break-all font-mono text-caption text-gray-600">candidate {candidate.candidate_id}</p>
               </div>
-              <div className="text-right text-[10px] text-gray-500">
+              <div className="text-right text-caption text-gray-500">
                 <p>{candidate.auto_activate ? "已选择 auto-if-pass" : "人工激活"}</p>
                 <p>{shortTime(candidate.updated_at)}</p>
               </div>
@@ -1142,17 +1142,17 @@ function EvaluationActivationPanel({ candidates, casesByRun, jobIdsByCandidate, 
             <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
               <div className="rounded border border-border bg-surface-2 p-3">
                 <div className="flex items-center justify-between gap-2">
-                  <h3 className="text-xs font-medium text-gray-300">激活安全 Evals</h3>
-                  <span className={`text-[10px] ${candidate.eval_status === "passed" ? "text-green-500" : candidate.eval_status === "failed" || candidate.eval_status === "error" ? "text-red-500" : "text-gray-500"}`}>
+                  <h3 className="text-label font-medium text-gray-300">激活安全 Evals</h3>
+                  <span className={`text-caption ${candidate.eval_status === "passed" ? "text-green-500" : candidate.eval_status === "failed" || candidate.eval_status === "error" ? "text-red-500" : "text-gray-500"}`}>
                     {candidate.eval_status ? statusLabel(candidate.eval_status) : "等待运行"}
                   </span>
                 </div>
-                <p className="mt-2 text-xs text-gray-400">{candidate.eval_passed_count}/{candidate.eval_required_count} required cases 通过</p>
-                <p className="mt-1 break-all font-mono text-[10px] text-gray-600">run {candidate.eval_run_id ?? "—"}</p>
-                <p className="mt-1 break-all font-mono text-[10px] text-gray-600">manifest {candidate.eval_manifest_hash?.slice(0, 16) ?? "—"}</p>
+                <p className="mt-2 text-label text-gray-400">{candidate.eval_passed_count}/{candidate.eval_required_count} required cases 通过</p>
+                <p className="mt-1 break-all font-mono text-caption text-gray-600">run {candidate.eval_run_id ?? "—"}</p>
+                <p className="mt-1 break-all font-mono text-caption text-gray-600">manifest {candidate.eval_manifest_hash?.slice(0, 16) ?? "—"}</p>
                 <ul className="mt-3 grid grid-cols-1 gap-1 sm:grid-cols-2">
                   {cases.map((testCase) => (
-                    <li key={testCase.id} className="flex min-w-0 items-center gap-1.5 text-[10px] text-gray-400">
+                    <li key={testCase.id} className="flex min-w-0 items-center gap-1.5 text-caption text-gray-400">
                       {testCase.status === "passed" ? <CheckCircle2 size={11} className="shrink-0 text-green-500" /> : <XCircle size={11} className="shrink-0 text-red-500" />}
                       <span className="break-words">{testCase.title}</span>
                     </li>
@@ -1162,10 +1162,10 @@ function EvaluationActivationPanel({ candidates, casesByRun, jobIdsByCandidate, 
 
               <div className="rounded border border-border bg-surface-2 p-3">
                 <div className="flex items-center justify-between gap-2">
-                  <h3 className="text-xs font-medium text-gray-300">Activation receipt</h3>
-                  <span className="text-[10px] text-gray-500">{candidate.activation_status ? statusLabel(candidate.activation_status) : "尚未激活"}</span>
+                  <h3 className="text-label font-medium text-gray-300">Activation receipt</h3>
+                  <span className="text-caption text-gray-500">{candidate.activation_status ? statusLabel(candidate.activation_status) : "尚未激活"}</span>
                 </div>
-                <p className="mt-2 text-xs leading-relaxed text-gray-400">
+                <p className="mt-2 text-label leading-relaxed text-gray-400">
                   {candidate.state === "active"
                     ? "已对 exact revision 生效；下一次 Agent 调用读取该 active source。"
                     : candidate.state === "rolled_back"
@@ -1178,36 +1178,36 @@ function EvaluationActivationPanel({ candidates, casesByRun, jobIdsByCandidate, 
                           ? "Evals 已通过，等待人工激活。"
                           : "未生成成功 activation receipt，live target 保持不变。"}
                 </p>
-                <p className="mt-2 break-all font-mono text-[10px] text-gray-600">receipt {candidate.activation_id ?? "—"}</p>
-                <p className="mt-1 text-[10px] text-gray-600">激活 {shortTime(candidate.activated_at)} · 回滚 {shortTime(candidate.rolled_back_at)}</p>
+                <p className="mt-2 break-all font-mono text-caption text-gray-600">receipt {candidate.activation_id ?? "—"}</p>
+                <p className="mt-1 text-caption text-gray-600">激活 {shortTime(candidate.activated_at)} · 回滚 {shortTime(candidate.rolled_back_at)}</p>
               </div>
             </div>
 
             <div className="sticky bottom-3 z-10 mt-3 flex flex-wrap gap-2 rounded-lg border border-border bg-surface-1/95 p-2 shadow-lg backdrop-blur lg:static lg:border-0 lg:bg-transparent lg:p-0 lg:shadow-none">
               {jobIdsByCandidate[candidate.candidate_id] && (
-                <button onClick={() => onOpenJob(jobIdsByCandidate[candidate.candidate_id])} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-3">
+                <button onClick={() => onOpenJob(jobIdsByCandidate[candidate.candidate_id])} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-label text-gray-300 hover:bg-surface-3">
                   <FileCheck2 size={12} /> 查看端到端作业日志
                 </button>
               )}
               {(candidate.state === "eval_failed" || candidate.state === "eval_error" || candidate.state === "eval_stale") && (
-                <button onClick={() => void onRetry(candidate)} disabled={busy} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-3 disabled:opacity-50">
+                <button onClick={() => void onRetry(candidate)} disabled={busy} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-label text-gray-300 hover:bg-surface-3 disabled:opacity-50">
                   {busy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} 重跑 exact revision
                 </button>
               )}
               {candidate.state === "pending_activation" && (
-                <button onClick={() => void onActivate(candidate)} disabled={busy} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover disabled:opacity-50">
+                <button onClick={() => void onActivate(candidate)} disabled={busy} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-label text-white hover:bg-accent-hover disabled:opacity-50">
                   {busy ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} 激活此 revision
                 </button>
               )}
               {candidate.state === "active" && candidate.activation_id && (
                 confirming === candidate.candidate_id ? (
                   <div role="region" aria-label="确认回滚" className="flex flex-wrap items-center gap-2 rounded border border-amber-700/50 bg-amber-950/20 p-2">
-                    <span className="text-[11px] text-amber-700 dark:text-amber-200">只回滚 receipt {candidate.activation_id.slice(0, 8)}，确认？</span>
-                    <button autoFocus onClick={() => { setConfirming(null); void onRollback(candidate); }} disabled={busy} className="rounded bg-red-700 px-2 py-1 text-[11px] text-white">确认回滚</button>
-                    <button onClick={() => setConfirming(null)} disabled={busy} className="rounded border border-border px-2 py-1 text-[11px] text-gray-400">取消</button>
+                    <span className="text-caption text-amber-700 dark:text-amber-200">只回滚 receipt {candidate.activation_id.slice(0, 8)}，确认？</span>
+                    <button autoFocus onClick={() => { setConfirming(null); void onRollback(candidate); }} disabled={busy} className="rounded bg-red-700 px-2 py-1 text-caption text-white">确认回滚</button>
+                    <button onClick={() => setConfirming(null)} disabled={busy} className="rounded border border-border px-2 py-1 text-caption text-gray-400">取消</button>
                   </div>
                 ) : (
-                  <button onClick={() => setConfirming(candidate.candidate_id)} disabled={busy} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-3 disabled:opacity-50">
+                  <button onClick={() => setConfirming(candidate.candidate_id)} disabled={busy} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-label text-gray-300 hover:bg-surface-3 disabled:opacity-50">
                     <RotateCcw size={12} /> 回滚
                   </button>
                 )
@@ -1238,7 +1238,7 @@ function JobsPanel({ jobs, selectedJob, selectedJobId, onSelectJob, events, load
   return (
     <section className="grid min-w-0 grid-cols-1 gap-3 lg:grid-cols-[minmax(240px,0.75fr)_minmax(0,1.5fr)]">
       <div className="rounded-lg border border-border bg-surface-1 p-2">
-        <p className="px-2 pb-2 text-[10px] font-semibold uppercase tracking-wider text-gray-500">最近作业</p>
+        <p className="px-2 pb-2 text-caption font-semibold text-gray-500">最近作业</p>
         <div className="max-h-64 space-y-1.5 overflow-y-auto">
           {jobs.map((item) => (
             <button
@@ -1247,38 +1247,38 @@ function JobsPanel({ jobs, selectedJob, selectedJobId, onSelectJob, events, load
               aria-pressed={item.id === job.id}
               className={`w-full rounded border p-2 text-left ${item.id === job.id ? "border-accent/40 bg-accent/5" : "border-border bg-surface-2 hover:border-gray-500"}`}
             >
-              <span className="block text-xs text-gray-300">{triggerLabel(item.trigger)}</span>
-              <span className="mt-1 block text-[10px] text-gray-600">{statusLabel(item.status)} · {shortTime(item.started_at)}</span>
+              <span className="block text-label text-gray-300">{triggerLabel(item.trigger)}</span>
+              <span className="mt-1 block text-caption text-gray-600">{statusLabel(item.status)} · {shortTime(item.started_at)}</span>
             </button>
           ))}
         </div>
         <div className="mt-3 border-t border-border p-2">
         <div className="mb-3 flex items-start justify-between gap-3">
           <div>
-            <h2 className="text-sm font-semibold">{triggerLabel(job.trigger)}</h2>
-            <p className="mt-1 font-mono text-[10px] text-gray-600 break-all">{job.id}</p>
+            <h2 className="text-body font-semibold">{triggerLabel(job.trigger)}</h2>
+            <p className="mt-1 font-mono text-caption text-gray-600 break-all">{job.id}</p>
           </div>
           <div className="flex items-center gap-2">
-            <span className="rounded bg-accent/10 px-2 py-0.5 text-[10px] text-accent">{statusLabel(job.status)}</span>
+            <span className="rounded bg-accent/10 px-2 py-0.5 text-caption text-accent">{statusLabel(job.status)}</span>
             <button onClick={onRefresh} aria-label="刷新作业日志" className="rounded p-1 text-gray-600 hover:bg-surface-3 hover:text-gray-300">
               <RefreshCw size={11} className={loading ? "animate-spin" : ""} />
             </button>
           </div>
         </div>
-        <p className="text-xs text-gray-400">{job.input_session_count} 个 session · {job.input_trace_count} 条轨迹 · {job.candidate_count} 个候选</p>
-        <p className="mt-2 text-[10px] text-gray-600">{shortTime(job.started_at)} → {shortTime(job.completed_at)}</p>
-        {job.error && <p className="mt-3 break-words rounded border border-red-900/50 bg-red-950/20 p-2 text-xs text-red-700 dark:text-red-300">{job.error}</p>}
+        <p className="text-label text-gray-400">{job.input_session_count} 个 session · {job.input_trace_count} 条轨迹 · {job.candidate_count} 个候选</p>
+        <p className="mt-2 text-caption text-gray-600">{shortTime(job.started_at)} → {shortTime(job.completed_at)}</p>
+        {job.error && <p className="mt-3 break-words rounded border border-red-900/50 bg-red-950/20 p-2 text-label text-red-700 dark:text-red-300">{job.error}</p>}
         </div>
       </div>
       <div className="rounded-lg border border-border bg-surface-1 p-4">
-        <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-500">结构化作业日志</h2>
+        <h2 className="mb-3 text-label font-semibold text-gray-500">结构化作业日志</h2>
         {loading && events.length === 0 ? (
           <EmptyState title="正在加载阶段日志" detail="按当前作业读取最近阶段日志，并保留最新终态。" loading />
         ) : events.length === 0 ? (
           <EmptyState title="该作业没有阶段日志" detail="旧记录可能没有阶段日志；系统不会为它补造时间线。" />
         ) : <>
           {events.length === 500 && (
-            <p className="mb-3 rounded border border-amber-800/50 bg-amber-950/20 px-2 py-1.5 text-[10px] text-amber-700 dark:text-amber-200">
+            <p className="mb-3 rounded border border-amber-800/50 bg-amber-950/20 px-2 py-1.5 text-caption text-amber-700 dark:text-amber-200">
               当前已达显示上限，仅展示最近 500 条阶段日志并保留最新终态。
             </p>
           )}
@@ -1290,8 +1290,8 @@ function JobsPanel({ jobs, selectedJob, selectedJobId, onSelectJob, events, load
               </div>
               <div className="min-w-0 flex-1 border-b border-border pb-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <p className="break-words text-xs font-medium text-gray-300">{event.title}</p>
-                  <span className="text-[10px] text-gray-600">{statusLabel(event.status)} · {shortTime(event.created_at)}</span>
+                  <p className="break-words text-label font-medium text-gray-300">{event.title}</p>
+                  <span className="text-caption text-gray-600">{statusLabel(event.status)} · {shortTime(event.created_at)}</span>
                 </div>
                 <EventDetails value={event.detail_json} />
               </div>
@@ -1388,7 +1388,7 @@ function EventDetails({ value }: { value: string }) {
     rejected: "已拒绝",
   };
   return (
-    <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-gray-600">
+    <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-caption text-gray-600">
       {entries.map(([key, raw]) => {
         const primitive = typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean" ? String(raw).slice(0, 160) : "已记录";
         const rendered = typeof raw === "boolean"
@@ -1418,23 +1418,23 @@ function HistoryPanel({ events, jobs, onOpenJob }: {
           return <li key={event.id} className="flex min-w-0 items-start gap-3 p-4">
             {event.status === "accepted" ? <CheckCircle2 size={14} className="mt-0.5 shrink-0 text-green-500" /> : <XCircle size={14} className="mt-0.5 shrink-0 text-gray-600" />}
             <div className="min-w-0 flex-1">
-              <p className="break-words text-xs text-gray-300">{event.observation}</p>
-              <p className="mt-1 text-[10px] text-gray-600">{event.status === "accepted" ? `历史已生效（未评测） · ${targetLabel(event)}` : "已拒绝"} · {shortTime(event.decided_at)}</p>
-              <p className="mt-2 break-words text-xs leading-relaxed text-gray-500">{event.suggestion}</p>
-              <p className="mt-1 text-[10px] text-gray-600">{evidenceSummary(event)}</p>
+              <p className="break-words text-label text-gray-300">{event.observation}</p>
+              <p className="mt-1 text-caption text-gray-600">{event.status === "accepted" ? `历史已生效（未评测） · ${targetLabel(event)}` : "已拒绝"} · {shortTime(event.decided_at)}</p>
+              <p className="mt-2 break-words text-label leading-relaxed text-gray-500">{event.suggestion}</p>
+              <p className="mt-1 text-caption text-gray-600">{evidenceSummary(event)}</p>
               <div className="mt-2 flex flex-wrap gap-2">
                 {event.job_id && (
-                  <button onClick={() => onOpenJob(event.job_id as string)} className="rounded border border-border px-2 py-1 text-[10px] text-accent hover:bg-surface-3">
+                  <button onClick={() => onOpenJob(event.job_id as string)} className="rounded border border-border px-2 py-1 text-caption text-accent hover:bg-surface-3">
                     查看来源作业
                   </button>
                 )}
                 {decisionJob && (
-                  <button onClick={() => onOpenJob(decisionJob.id)} className="rounded border border-border px-2 py-1 text-[10px] text-accent hover:bg-surface-3">
+                  <button onClick={() => onOpenJob(decisionJob.id)} className="rounded border border-border px-2 py-1 text-caption text-accent hover:bg-surface-3">
                     {event.status === "accepted" ? "查看历史审核与物化日志" : "查看拒绝审核日志"}
                   </button>
                 )}
                 {!event.job_id && !decisionJob && (
-                  <span className="text-[10px] text-gray-600">历史记录，无阶段日志</span>
+                  <span className="text-caption text-gray-600">历史记录，无阶段日志</span>
                 )}
               </div>
             </div>
@@ -1446,7 +1446,7 @@ function HistoryPanel({ events, jobs, onOpenJob }: {
 }
 
 function DetailBlock({ title, children }: { title: string; children: React.ReactNode }) {
-  return <div className="min-w-0"><h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-500">{title}</h3>{children}</div>;
+  return <div className="min-w-0"><h3 className="mb-1.5 text-caption font-semibold text-gray-500">{title}</h3>{children}</div>;
 }
 
 function EmptyState({ title, detail, loading = false, action }: {
@@ -1458,8 +1458,8 @@ function EmptyState({ title, detail, loading = false, action }: {
   return (
     <div className="rounded-lg border border-dashed border-border bg-surface-1 px-6 py-12 text-center">
       {loading ? <Loader2 size={22} className="mx-auto mb-3 animate-spin text-accent" /> : <BrainCircuit size={22} className="mx-auto mb-3 text-gray-600" />}
-      <p className="text-sm font-medium text-gray-300">{title}</p>
-      <p className="mx-auto mt-1 max-w-lg text-xs leading-relaxed text-gray-500">{detail}</p>
+      <p className="text-body font-medium text-gray-300">{title}</p>
+      <p className="mx-auto mt-1 max-w-lg text-label leading-relaxed text-gray-500">{detail}</p>
       {action}
     </div>
   );

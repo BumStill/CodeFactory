@@ -62,7 +62,7 @@ function StatusBadge({ status }: { status: BenchmarkProbeStatus | "blocked" | "f
         ? "border-amber-500/30 bg-amber-500/10 text-amber-800 dark:text-amber-300"
         : "border-red-500/30 bg-red-500/10 text-red-800 dark:text-red-300";
   return (
-    <span className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-medium ${tone}`}>
+    <span className={`inline-flex items-center rounded border px-1.5 py-0.5 text-caption font-medium ${tone}`}>
       {status}
     </span>
   );
@@ -90,26 +90,26 @@ function ScorePanel({ imported }: { imported: ImportedBenchmarkRun | null }) {
   }, [imported]);
 
   if (!score) {
-    return <p className="text-xs text-gray-600">No imported benchmark result selected.</p>;
+    return <p className="text-label text-gray-600">No imported benchmark result selected.</p>;
   }
 
   return (
     <div className="grid grid-cols-1 gap-3 lg:grid-cols-[260px_1fr]">
       <div className="rounded border border-border bg-surface-1 p-3">
-        <div className="text-[10px] uppercase tracking-wider text-gray-600">Score</div>
-        <div className="mt-1 text-2xl font-semibold text-gray-100">
+        <div className="text-caption uppercase tracking-wider text-gray-600">Score</div>
+        <div className="mt-1 text-display font-semibold text-gray-100">
           {score.pass}
-          <span className="text-sm font-normal text-gray-600"> / {score.total}</span>
+          <span className="text-body font-normal text-gray-600"> / {score.total}</span>
         </div>
-        <p className="mt-1 text-xs text-gray-500">mean reward {score.mean.toFixed(6)}</p>
+        <p className="mt-1 text-label text-gray-500">mean reward {score.mean.toFixed(6)}</p>
       </div>
       <div className="rounded border border-border bg-surface-1 p-3">
-        <div className="mb-2 text-xs font-medium text-gray-400">Failure reasons</div>
+        <div className="mb-2 text-label font-medium text-gray-400">Failure reasons</div>
         <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
           {score.failureCounts.map(([name, count]) => (
             <div key={name} className="rounded border border-border bg-surface-0 px-2 py-1.5">
-              <div className="truncate text-[10px] text-gray-500" title={name}>{name}</div>
-              <div className="text-sm font-semibold text-gray-200">{count}</div>
+              <div className="truncate text-caption text-gray-500" title={name}>{name}</div>
+              <div className="text-body font-semibold text-gray-200">{count}</div>
             </div>
           ))}
         </div>
@@ -122,7 +122,7 @@ function TrialTable({ trials }: { trials: BenchmarkTrialRecord[] }) {
   if (trials.length === 0) return null;
   return (
     <div className="overflow-x-auto rounded border border-border">
-      <table className="min-w-full text-left text-xs">
+      <table className="min-w-full text-left text-label">
         <thead className="bg-surface-1 text-gray-500">
           <tr>
             <th className="px-3 py-2 font-medium">Task</th>
@@ -240,14 +240,14 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
             <ChevronLeft size={16} />
           </button>
           <div className="min-w-0">
-            <h1 className="text-base font-semibold text-gray-200">Terminal-Bench 2.1</h1>
-            <p className="truncate text-xs text-gray-500">CodeFactory agent capability evaluation</p>
+            <h1 className="text-title font-semibold text-gray-200">Terminal-Bench 2.1</h1>
+            <p className="truncate text-label text-gray-500">CodeFactory agent capability evaluation</p>
           </div>
         </div>
         <button
           onClick={refresh}
           disabled={busy}
-          className="inline-flex items-center gap-2 rounded border border-border px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-2 disabled:opacity-50"
+          className="inline-flex items-center gap-2 rounded border border-border px-3 py-1.5 text-label text-gray-300 hover:bg-surface-2 disabled:opacity-50"
         >
           <RefreshCcw size={13} />
           Refresh
@@ -256,7 +256,7 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
 
       <main className="mx-auto max-w-6xl space-y-5 px-6 py-6">
         {blocker && (
-          <div className="flex items-start gap-2 rounded border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-300">
+          <div className="flex items-start gap-2 rounded border border-amber-500/30 bg-amber-500/10 p-3 text-label text-amber-800 dark:text-amber-300">
             <AlertTriangle size={14} className="mt-0.5 shrink-0" />
             <div className="min-w-0">
               <div className="font-medium">Benchmark blocker</div>
@@ -268,15 +268,15 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
         <section className="grid grid-cols-1 gap-3 lg:grid-cols-3">
           <div className="rounded border border-border bg-surface-1 p-3">
             <div className="mb-2 flex items-center justify-between">
-              <div className="text-xs font-medium text-gray-300">Environment</div>
+              <div className="text-label font-medium text-gray-300">Environment</div>
               {probe && <StatusBadge status={probe.ready ? "ok" : "missing"} />}
             </div>
             <div className="space-y-2">
               {probe?.items.map((item) => (
-                <div key={item.id} className="flex items-start justify-between gap-2 text-xs">
+                <div key={item.id} className="flex items-start justify-between gap-2 text-label">
                   <div className="min-w-0">
                     <div className="text-gray-300">{item.label}</div>
-                    <div className="break-words text-[10px] text-gray-600">{item.detail}</div>
+                    <div className="break-words text-caption text-gray-600">{item.detail}</div>
                   </div>
                   <StatusBadge status={item.status} />
                 </div>
@@ -286,11 +286,11 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
 
           <div className="rounded border border-border bg-surface-1 p-3 lg:col-span-2">
             <div className="mb-2 flex items-center justify-between">
-              <div className="text-xs font-medium text-gray-300">Provider bridge</div>
+              <div className="text-label font-medium text-gray-300">Provider bridge</div>
               {preview && <StatusBadge status={preview.ready ? "ok" : "missing"} />}
             </div>
             {preview && (
-              <div className="grid grid-cols-2 gap-2 text-xs md:grid-cols-4">
+              <div className="grid grid-cols-2 gap-2 text-label md:grid-cols-4">
                 <Metric label="endpoint" value={preview.endpoint_name} />
                 <Metric label="model" value={preview.model} />
                 <Metric label="tasks" value={String(preview.task_limit)} />
@@ -301,7 +301,7 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
               </div>
             )}
             {preview && (
-              <pre className="mt-3 max-h-28 overflow-auto rounded border border-border bg-surface-0 p-2 text-[10px] text-gray-500">
+              <pre className="mt-3 max-h-28 overflow-auto rounded border border-border bg-surface-0 p-2 text-caption text-gray-500">
                 {preview.command_preview}
               </pre>
             )}
@@ -310,26 +310,26 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
 
         <section className="grid grid-cols-1 gap-3 lg:grid-cols-2">
           <div className="rounded border border-border bg-surface-1 p-3">
-            <div className="mb-3 text-xs font-medium text-gray-300">Start fixed subset</div>
-            <label className="block text-[10px] uppercase tracking-wider text-gray-600">
+            <div className="mb-3 text-label font-medium text-gray-300">Start fixed subset</div>
+            <label className="block text-caption uppercase tracking-wider text-gray-600">
               Authorization phrase
             </label>
             <input
               value={authorizationPhrase}
               onChange={(event) => setAuthorizationPhrase(event.target.value)}
               placeholder={preview?.authorization_phrase || ""}
-              className="mt-1 w-full rounded border border-border bg-surface-0 px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-accent"
+              className="mt-1 w-full rounded border border-border bg-surface-0 px-2 py-1.5 text-label text-gray-200 outline-none focus:border-accent"
             />
             <button
               onClick={startRun}
               disabled={busy || !preview?.ready || authorizationPhrase.trim() !== preview.authorization_phrase}
-              className="mt-3 inline-flex items-center gap-2 rounded border border-border px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-2 disabled:opacity-50"
+              className="mt-3 inline-flex items-center gap-2 rounded border border-border px-3 py-1.5 text-label text-gray-300 hover:bg-surface-2 disabled:opacity-50"
             >
               <Play size={13} />
               Run 18-task subset
             </button>
             {runResult && (
-              <div className="mt-3 rounded border border-border bg-surface-0 p-2 text-xs">
+              <div className="mt-3 rounded border border-border bg-surface-0 p-2 text-label">
                 <div className="flex items-center justify-between">
                   <span className="text-gray-400">Run status</span>
                   <StatusBadge status={runResult.status as "blocked" | "failed" | "completed"} />
@@ -340,16 +340,16 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
           </div>
 
           <div className="rounded border border-border bg-surface-1 p-3">
-            <div className="mb-3 text-xs font-medium text-gray-300">Import Harbor job</div>
+            <div className="mb-3 text-label font-medium text-gray-300">Import Harbor job</div>
             <input
               value={importPath}
               onChange={(event) => setImportPath(event.target.value)}
-              className="w-full rounded border border-border bg-surface-0 px-2 py-1.5 font-mono text-xs text-gray-200 outline-none focus:border-accent"
+              className="w-full rounded border border-border bg-surface-0 px-2 py-1.5 font-mono text-label text-gray-200 outline-none focus:border-accent"
             />
             <button
               onClick={importJob}
               disabled={busy || !importPath.trim()}
-              className="mt-3 inline-flex items-center gap-2 rounded border border-border px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-2 disabled:opacity-50"
+              className="mt-3 inline-flex items-center gap-2 rounded border border-border px-3 py-1.5 text-label text-gray-300 hover:bg-surface-2 disabled:opacity-50"
             >
               <FileSearch size={13} />
               Import result
@@ -359,14 +359,14 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
 
         <section className="space-y-3 border-t border-border pt-4">
           <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 text-xs font-medium text-gray-300">
+            <div className="flex items-center gap-2 text-label font-medium text-gray-300">
               <GitCompareArrows size={14} />
               跨模型一致性 &amp; 失败分布(只读,基于已有基准数据)
             </div>
             <button
               onClick={() => void loadConsistency()}
               disabled={busy}
-              className="flex items-center gap-1 rounded border border-border px-2 py-1 text-[11px] text-gray-400 hover:text-gray-200 disabled:opacity-50"
+              className="flex items-center gap-1 rounded border border-border px-2 py-1 text-caption text-gray-400 hover:text-gray-200 disabled:opacity-50"
             >
               <RefreshCcw size={12} /> 生成报告
             </button>
@@ -375,7 +375,7 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
         </section>
 
         <section className="space-y-3 border-t border-border pt-4">
-          <div className="flex items-center gap-2 text-xs font-medium text-gray-300">
+          <div className="flex items-center gap-2 text-label font-medium text-gray-300">
             <CircleCheck size={14} />
             Latest result
           </div>
@@ -390,20 +390,20 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
 function ConsistencyPanel({ report }: { report: ConsistencyReport | null }) {
   if (!report) {
     return (
-      <div className="rounded border border-border bg-surface-0 px-3 py-4 text-center text-[11px] text-gray-600">
+      <div className="rounded border border-border bg-surface-0 px-3 py-4 text-center text-caption text-gray-600">
         点击「生成报告」——对比同一数据集下不同模型的通过集合、失败分布与分歧任务。仅使用已导入的基准数据。
       </div>
     );
   }
   if (report.models.length === 0) {
     return (
-      <div className="rounded border border-border bg-surface-0 px-3 py-4 text-center text-[11px] text-gray-600">
+      <div className="rounded border border-border bg-surface-0 px-3 py-4 text-center text-caption text-gray-600">
         暂无可比较的基准数据(需要 comparable 标记的 {report.dataset} 运行)。{report.comparability_note}
       </div>
     );
   }
   return (
-    <div className="space-y-3 text-[11px]">
+    <div className="space-y-3 text-caption">
       <div className="flex flex-wrap gap-2">
         {report.models.map((m) => (
           <div key={m.model} className="rounded border border-border bg-surface-0 px-2 py-1.5">
@@ -456,7 +456,7 @@ function ConsistencyPanel({ report }: { report: ConsistencyReport | null }) {
         </div>
       )}
       {report.comparability_note && (
-        <div className="text-[10px] text-gray-600">{report.comparability_note}</div>
+        <div className="text-caption text-gray-600">{report.comparability_note}</div>
       )}
     </div>
   );
@@ -465,8 +465,8 @@ function ConsistencyPanel({ report }: { report: ConsistencyReport | null }) {
 function Metric({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0 rounded border border-border bg-surface-0 px-2 py-1.5">
-      <div className="text-[10px] uppercase tracking-wider text-gray-600">{label}</div>
-      <div className="truncate text-xs font-medium text-gray-200" title={value}>{value}</div>
+      <div className="text-caption uppercase tracking-wider text-gray-600">{label}</div>
+      <div className="truncate text-label font-medium text-gray-200" title={value}>{value}</div>
     </div>
   );
 }

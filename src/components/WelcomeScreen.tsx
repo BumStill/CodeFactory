@@ -102,11 +102,11 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
             <GemMark size={23} />
           </div>
           <div className="min-w-0">
-            <h1 className="text-xl font-semibold leading-tight text-gray-100">CodeFactory</h1>
-            <p className="mt-0.5 text-xs text-gray-400">带上代码库，说明目标，直接交付。</p>
+            <h1 className="text-heading font-semibold leading-tight text-gray-100">CodeFactory</h1>
+            <p className="mt-0.5 text-label text-gray-400">带上代码库，说明目标，直接交付。</p>
           </div>
           {activeSession && (
-            <div className="flex min-w-0 flex-1 basis-full items-center gap-2 rounded-lg border border-border bg-surface-1 px-3 py-2 text-[11px] sm:ml-auto sm:basis-auto sm:max-w-[360px]">
+            <div className="flex min-w-0 flex-1 basis-full items-center gap-2 rounded-lg border border-border bg-surface-1 px-3 py-2 text-caption sm:ml-auto sm:basis-auto sm:max-w-[360px]">
               <FolderOpen size={12} className="shrink-0 text-gray-400" />
               <span className="min-w-0 flex-1 truncate font-mono text-gray-400" title={activeSession.cwd}>{activeSession.cwd}</span>
               <span aria-hidden className="text-gray-500">·</span>
@@ -124,7 +124,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
             conversation is always valid; attaching a folder is an option the
             user reaches for when they happen to need one. */}
         {draftSession && onPickProject && (
-          <div className="flex flex-wrap items-center gap-2 px-1 text-[11px] text-gray-500">
+          <div className="flex flex-wrap items-center gap-2 px-1 text-caption text-gray-500">
             <span>{scopeCwd ? "这次在" : "没有指定目录，不会碰任何代码。"}</span>
             {scopeCwd && (
               <span className="inline-flex items-center gap-1 text-gray-300">
@@ -153,7 +153,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
 
         {/* Example prompts */}
         <section className="space-y-2" aria-labelledby="welcome-suggestions-title">
-          <h2 id="welcome-suggestions-title" className="px-1 text-[11px] font-semibold tracking-wide text-gray-400">可以试试</h2>
+          <h2 id="welcome-suggestions-title" className="px-1 text-body font-semibold text-gray-400">可以试试</h2>
           <div className="grid grid-cols-1 gap-2 min-[520px]:grid-cols-2">
             {EXAMPLES.map((ex) => (
               <button
@@ -162,13 +162,13 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
                 className="group rounded-lg border border-border bg-surface-1 px-3 py-2.5 text-left transition-colors hover:border-accent/40 hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-accent/50"
               >
                 <div className="flex items-center justify-between gap-2">
-                  <div className="text-xs font-medium text-gray-100">{ex.title}</div>
+                  <div className="text-body font-medium text-gray-100">{ex.title}</div>
                   <ArrowRight
                     size={12}
                     className="text-gray-600 group-hover:text-accent transition-colors shrink-0"
                   />
                 </div>
-                <div className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-gray-400">
+                <div className="mt-1 line-clamp-2 text-caption leading-relaxed text-gray-400">
                   {ex.prompt}
                 </div>
               </button>
@@ -180,8 +180,8 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
             says so. Everything above starts something new. */}
         {onOpenSession && (scopedSessions.length > 0 || recentSessions.length > 0) && (
           <div className="space-y-2">
-            <div className="text-[11px] uppercase tracking-wider text-gray-600 font-semibold px-1 flex items-center gap-1.5">
-              <Clock size={11} />
+            <div className="text-body text-gray-600 font-semibold px-1 flex items-center gap-1.5">
+              <Clock size={14} />
               继续之前的会话
             </div>
             {scopedSessions.length > 0 && (
@@ -191,10 +191,10 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
               >
                 <div className="flex items-center gap-2">
                   <RotateCcw size={11} className="shrink-0 text-accent" />
-                  <span className="min-w-0 flex-1 truncate text-xs text-gray-200">
+                  <span className="min-w-0 flex-1 truncate text-label text-gray-200">
                     接着上次说：{scopedSessions[0].title || "未命名会话"}
                   </span>
-                  <span className="shrink-0 text-[11px] text-gray-600">
+                  <span className="shrink-0 text-caption text-gray-600">
                     {folderName(scopedSessions[0].cwd)}
                   </span>
                 </div>
@@ -208,8 +208,8 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
                   className="w-full text-left rounded border border-border bg-surface-1 hover:bg-surface-2 px-3 py-1.5 transition-colors"
                 >
                   <div className="flex items-center gap-2">
-                    <span className="text-xs text-gray-300 truncate flex-1">{s.title || "未命名"}</span>
-                    <span className="max-w-[140px] truncate font-mono text-[11px] text-gray-600" title={s.cwd}>
+                    <span className="text-label text-gray-300 truncate flex-1">{s.title || "未命名"}</span>
+                    <span className="max-w-[140px] truncate font-mono text-caption text-gray-600" title={s.cwd}>
                       {s.kind === "quick" ? "独立任务" : folderName(s.cwd)}
                     </span>
                   </div>

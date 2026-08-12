@@ -57,12 +57,12 @@ export function ExecutionStream({ sessionId, hideWhenEmpty = true }: Props) {
       <div className="sticky top-0 z-10 flex items-center justify-between gap-2 px-3 py-1.5 border-b border-border bg-surface-1">
         <div className="flex items-center gap-1.5">
           <Activity size={11} className={running ? "text-accent animate-pulse" : "text-gray-500"} />
-          <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">
+          <span className="text-caption font-semibold text-gray-500">
             执行流
           </span>
-          {running && <span className="text-[10px] text-accent">运行中</span>}
+          {running && <span className="text-caption text-accent">运行中</span>}
         </div>
-        <span className="text-[10px] text-gray-600">{log.length} 条事件</span>
+        <span className="text-caption text-gray-600">{log.length} 条事件</span>
       </div>
       <ol className="px-3 py-2 space-y-2">
         {byTask.map(({ taskId, events }) => (
@@ -116,8 +116,8 @@ function TaskBlock({ taskId, events }: { taskId: string; events: ExecutionEvent[
     <li className="border border-border rounded bg-surface-2 overflow-hidden">
       <div className="flex items-center gap-1.5 px-2 py-1 border-b border-border bg-surface-3">
         <Icon size={10} className={`shrink-0 ${iconColor}`} />
-        <span className="text-[11px] font-medium text-gray-200 truncate flex-1">{title}</span>
-        <span className="text-[10px] text-gray-600 shrink-0">{events.length}</span>
+        <span className="text-caption font-medium text-gray-200 truncate flex-1">{title}</span>
+        <span className="text-caption text-gray-600 shrink-0">{events.length}</span>
       </div>
       <ul className="px-2 py-1 space-y-0.5">
         {events.map((e) => (
@@ -171,7 +171,7 @@ function ChangedFilesPanel({ files, cwd }: { files: string[]; cwd: string }) {
     <div className="border-t border-border bg-surface-1">
       <button
         onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center gap-1.5 px-2 py-1 text-[10px] text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
+        className="w-full flex items-center gap-1.5 px-2 py-1 text-caption text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
       >
         <FileDiff size={10} />
         <span>改动 {files.length} 个文件</span>
@@ -183,24 +183,24 @@ function ChangedFilesPanel({ files, cwd }: { files: string[]; cwd: string }) {
             <div key={f}>
               <button
                 onClick={() => void loadDiff(f)}
-                className={`w-full flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded transition-colors text-left ${
+                className={`w-full flex items-center gap-1 px-1.5 py-0.5 text-caption rounded transition-colors text-left ${
                   activeFile === f
                     ? "bg-surface-3 text-accent"
                     : "text-gray-400 hover:text-gray-200 hover:bg-surface-3"
                 }`}
               >
                 <span className="font-mono truncate flex-1">{f}</span>
-                {loadingFile === f && <span className="text-[9px] text-gray-600">读取中...</span>}
+                {loadingFile === f && <span className="text-caption text-gray-600">读取中…</span>}
               </button>
               {activeFile === f && (
-                <pre className="mt-1 mx-1 p-2 bg-surface-2 border border-border rounded text-[10px] font-mono text-gray-300 whitespace-pre-wrap break-all max-h-60 overflow-y-auto">
+                <pre className="mt-1 mx-1 p-2 bg-surface-2 border border-border rounded text-caption font-mono text-gray-300 whitespace-pre-wrap break-all max-h-60 overflow-y-auto">
                   {diff}
                 </pre>
               )}
             </div>
           ))}
           {error && (
-            <p className="text-[10px] text-red-700 dark:text-red-300 px-1">{error}</p>
+            <p className="text-caption text-red-700 dark:text-red-300 px-1">{error}</p>
           )}
         </div>
       )}
@@ -211,10 +211,10 @@ function ChangedFilesPanel({ files, cwd }: { files: string[]; cwd: string }) {
 function EventRow({ event }: { event: ExecutionEvent }) {
   const { Icon, color, text } = renderEvent(event);
   return (
-    <li className="flex items-start gap-1.5 text-[11px] leading-snug">
+    <li className="flex items-start gap-1.5 text-caption leading-snug">
       <Icon size={9} className={`mt-1 shrink-0 ${color}`} />
       <span className="text-gray-400 break-all">{text}</span>
-      <span className="text-gray-600 shrink-0 text-[10px] ml-auto">
+      <span className="text-gray-600 shrink-0 text-caption ml-auto">
         {timeOnly(event.at)}
       </span>
     </li>

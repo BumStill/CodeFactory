@@ -64,7 +64,7 @@ export function GitStatusBar({ cwd, onOpenChanges, detailsId, detailsOpen = fals
       aria-expanded={detailsOpen}
       data-status-tone={statusTone}
       onClick={onOpenChanges}
-      className={`inline-flex h-11 shrink-0 items-center justify-center gap-1 rounded-lg px-2 text-[11px] transition-colors hover:bg-surface-3 lg:h-9 ${
+      className={`inline-flex h-11 shrink-0 items-center justify-center gap-1 rounded-lg px-2 text-caption transition-colors hover:bg-surface-3 lg:h-9 ${
         statusTone === "warning" ? "text-status-warning" : "text-gray-500 hover:text-gray-200"
       }`}
       title={accessibleStatus}
