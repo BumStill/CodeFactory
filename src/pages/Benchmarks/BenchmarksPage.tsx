@@ -249,7 +249,7 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
           disabled={busy}
           className="inline-flex items-center gap-2 rounded border border-border px-3 py-1.5 text-label text-gray-300 hover:bg-surface-2 disabled:opacity-50"
         >
-          <RefreshCcw size={13} />
+          <RefreshCcw size={14} />
           Refresh
         </button>
       </header>
@@ -325,7 +325,7 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
               disabled={busy || !preview?.ready || authorizationPhrase.trim() !== preview.authorization_phrase}
               className="mt-3 inline-flex items-center gap-2 rounded border border-border px-3 py-1.5 text-label text-gray-300 hover:bg-surface-2 disabled:opacity-50"
             >
-              <Play size={13} />
+              <Play size={14} />
               Run 18-task subset
             </button>
             {runResult && (
@@ -351,7 +351,7 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
               disabled={busy || !importPath.trim()}
               className="mt-3 inline-flex items-center gap-2 rounded border border-border px-3 py-1.5 text-label text-gray-300 hover:bg-surface-2 disabled:opacity-50"
             >
-              <FileSearch size={13} />
+              <FileSearch size={14} />
               Import result
             </button>
           </div>
@@ -368,7 +368,7 @@ export function BenchmarksPage({ onBack }: BenchmarksPageProps) {
               disabled={busy}
               className="flex items-center gap-1 rounded border border-border px-2 py-1 text-caption text-gray-400 hover:text-gray-200 disabled:opacity-50"
             >
-              <RefreshCcw size={12} /> 生成报告
+              <RefreshCcw size={14} /> 生成报告
             </button>
           </div>
           <ConsistencyPanel report={consistency} />

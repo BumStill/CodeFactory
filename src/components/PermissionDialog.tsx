@@ -196,21 +196,21 @@ export function PermissionDialog({
             onClick={onDeny}
             className="inline-flex min-h-11 items-center gap-1.5 rounded border border-border px-3 text-label text-gray-400 hover:bg-surface-3 hover:text-gray-100 lg:min-h-9"
           >
-            <X size={13} />
+            <X size={14} />
             拒绝
           </button>
           <button
             onClick={onAllow}
             className="inline-flex min-h-11 items-center gap-1.5 rounded bg-accent px-3 text-label text-white hover:bg-accent-hover lg:min-h-9"
           >
-            <Check size={13} />
+            <Check size={14} />
             仅允许一次
           </button>
           <button
             onClick={onAllowFullAccess}
             className="inline-flex min-h-11 items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-3 text-label text-amber-900 dark:text-amber-100 hover:bg-amber-500/20 lg:min-h-9"
           >
-            <Unlock size={13} />
+            <Unlock size={14} />
             信任本会话并允许
           </button>
         </div>

@@ -98,7 +98,7 @@ export function TurnProgress({
               来自 {progress.total} 个计划步骤
             </span>
             <span className="ml-auto inline-flex shrink-0 items-center gap-1 text-caption text-gray-500 tabular-nums">
-              <Clock3 size={11} aria-hidden="true" />
+              <Clock3 size={14} aria-hidden="true" />
               {formatDuration(elapsedMs)}
             </span>
           </div>
@@ -201,7 +201,7 @@ export function TurnProgress({
           </div>
           {plan.changeReason && (
             <p className="flex items-start gap-1.5 text-gray-400">
-              <GitBranch size={12} aria-hidden="true" className="mt-0.5 shrink-0" />
+              <GitBranch size={14} aria-hidden="true" className="mt-0.5 shrink-0" />
               计划已调整 · {plan.changeReason}
             </p>
           )}

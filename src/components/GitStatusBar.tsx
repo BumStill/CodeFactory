@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect } from "react";
-import { ArrowDown, ArrowUp, Circle, GitBranch } from "lucide-react";
+import { ArrowDown, ArrowUp, GitBranch } from "lucide-react";
 import { useGitStore } from "../stores/git";
 
 interface Props {
@@ -72,12 +72,15 @@ export function GitStatusBar({ cwd, onOpenChanges, detailsId, detailsOpen = fals
       <GitBranch size={14} aria-hidden="true" className={refreshing ? "animate-pulse motion-reduce:animate-none" : ""} />
       {dirty > 0 && (
         <span className="inline-flex items-center gap-1 whitespace-nowrap tabular-nums" aria-hidden="true">
-          <Circle size={6} className="fill-current" />
+          {/* A status dot is a shape, not an icon — drawing it as a shrunk-down
+              6px lucide glyph put it two steps below the icon scale and gave it
+              a hairline stroke to antialias. */}
+          <span className="h-1.5 w-1.5 rounded-full bg-current" />
           {dirty}
         </span>
       )}
-      {status && status.ahead > 0 && <span aria-hidden="true" className="inline-flex items-center gap-0.5 whitespace-nowrap"><ArrowUp size={10} />{status.ahead}</span>}
-      {status && status.behind > 0 && <span aria-hidden="true" className="inline-flex items-center gap-0.5 whitespace-nowrap"><ArrowDown size={10} />落后 {status.behind}</span>}
+      {status && status.ahead > 0 && <span aria-hidden="true" className="inline-flex items-center gap-0.5 whitespace-nowrap"><ArrowUp size={14} />{status.ahead}</span>}
+      {status && status.behind > 0 && <span aria-hidden="true" className="inline-flex items-center gap-0.5 whitespace-nowrap"><ArrowDown size={14} />落后 {status.behind}</span>}
     </button>
   );
 }

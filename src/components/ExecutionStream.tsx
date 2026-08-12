@@ -56,7 +56,7 @@ export function ExecutionStream({ sessionId, hideWhenEmpty = true }: Props) {
     <div className="border-b border-border bg-surface-1 max-h-64 overflow-y-auto shrink-0">
       <div className="sticky top-0 z-10 flex items-center justify-between gap-2 px-3 py-1.5 border-b border-border bg-surface-1">
         <div className="flex items-center gap-1.5">
-          <Activity size={11} className={running ? "text-accent animate-pulse" : "text-gray-500"} />
+          <Activity size={14} className={running ? "text-accent animate-pulse" : "text-gray-500"} />
           <span className="text-caption font-semibold text-gray-500">
             执行流
           </span>
@@ -115,7 +115,7 @@ function TaskBlock({ taskId, events }: { taskId: string; events: ExecutionEvent[
   return (
     <li className="border border-border rounded bg-surface-2 overflow-hidden">
       <div className="flex items-center gap-1.5 px-2 py-1 border-b border-border bg-surface-3">
-        <Icon size={10} className={`shrink-0 ${iconColor}`} />
+        <Icon size={14} className={`shrink-0 ${iconColor}`} />
         <span className="text-caption font-medium text-gray-200 truncate flex-1">{title}</span>
         <span className="text-caption text-gray-600 shrink-0">{events.length}</span>
       </div>
@@ -173,7 +173,7 @@ function ChangedFilesPanel({ files, cwd }: { files: string[]; cwd: string }) {
         onClick={() => setOpen((o) => !o)}
         className="w-full flex items-center gap-1.5 px-2 py-1 text-caption text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors"
       >
-        <FileDiff size={10} />
+        <FileDiff size={14} />
         <span>改动 {files.length} 个文件</span>
         <span className="ml-auto">{open ? "收起" : "展开"}</span>
       </button>
@@ -212,7 +212,7 @@ function EventRow({ event }: { event: ExecutionEvent }) {
   const { Icon, color, text } = renderEvent(event);
   return (
     <li className="flex items-start gap-1.5 text-caption leading-snug">
-      <Icon size={9} className={`mt-1 shrink-0 ${color}`} />
+      <Icon size={14} className={`mt-1 shrink-0 ${color}`} />
       <span className="text-gray-400 break-all">{text}</span>
       <span className="text-gray-600 shrink-0 text-caption ml-auto">
         {timeOnly(event.at)}

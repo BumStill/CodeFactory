@@ -28,13 +28,13 @@ export function QueueBadge({ queue, onRemove }: Props) {
         aria-expanded={expanded}
         className="flex min-h-8 max-w-full items-center gap-2 rounded-lg bg-status-progress-soft px-2.5 text-note text-status-progress transition-colors hover:brightness-95"
       >
-        <Clock size={13} aria-hidden="true" />
+        <Clock size={14} aria-hidden="true" />
         <span className="truncate">
           {queue.length} 条待发消息 · 当前执行结束后发送
         </span>
         {expanded
-          ? <ChevronUp size={13} aria-hidden="true" className="ml-auto shrink-0" />
-          : <ChevronDown size={13} aria-hidden="true" className="ml-auto shrink-0" />}
+          ? <ChevronUp size={14} aria-hidden="true" className="ml-auto shrink-0" />
+          : <ChevronDown size={14} aria-hidden="true" className="ml-auto shrink-0" />}
       </button>
       {expanded && (
         <ul className="mt-2 space-y-1.5">

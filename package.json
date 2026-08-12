@@ -31,6 +31,7 @@
     "test:watch": "vitest",
     "test:scrollbar:headless": "node scripts/verify-scrollbar-auto-hide-headless.mjs",
     "test:typography:headless": "node scripts/verify-typography-headless.mjs",
+    "test:hit-target:headless": "node scripts/verify-hit-target-headless.mjs",
     "ext:build": "node scripts/build-extension.mjs",
     "verify:extension": "node scripts/verify-extension-bridge.mjs"
   },

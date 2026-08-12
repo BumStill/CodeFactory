@@ -68,7 +68,7 @@ export function ImagePreview({
               setOpen(false);
             }}
           >
-            <X size={18} />
+            <X size={20} />
           </button>
           <figure
             className="flex max-h-full max-w-full flex-col items-center gap-3"

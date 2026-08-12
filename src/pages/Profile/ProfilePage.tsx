@@ -395,7 +395,7 @@ function ProjectMemorySection({
 
         {/* Project picker */}
         <div className="px-4 py-3 border-b border-border bg-surface-2 flex items-center gap-2">
-          <FolderOpen size={12} className="text-gray-500 shrink-0" />
+          <FolderOpen size={14} className="text-gray-500 shrink-0" />
           <select
             value={selectedCwd ?? ""}
             onChange={(e) => onSelectCwd(e.target.value)}
@@ -448,7 +448,7 @@ function ProjectMemorySection({
           <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-border bg-surface-2">
             {savedAt > 0 && !dirty && (
               <span className="text-caption text-green-700 dark:text-green-400 flex items-center gap-1">
-                <Check size={11} /> 已保存
+                <Check size={14} /> 已保存
               </span>
             )}
             <button
@@ -456,7 +456,7 @@ function ProjectMemorySection({
               disabled={!dirty || saving}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-accent hover:bg-accent-hover text-white text-label disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              <Save size={11} />
+              <Save size={14} />
               {saving ? "保存中…" : "保存记忆"}
             </button>
           </div>
@@ -583,9 +583,9 @@ export function LearningLogSection({ selectedCwd }: { selectedCwd: string | null
             className="flex items-center gap-1 rounded border border-border px-2 py-0.5 text-caption text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
           >
             {mining ? (
-              <Loader2 size={11} className="animate-spin" />
+              <Loader2 size={14} className="animate-spin" />
             ) : (
-              <Sparkles size={11} className="text-accent" />
+              <Sparkles size={14} className="text-accent" />
             )}
             分析跨会话模式
           </button>
@@ -611,7 +611,7 @@ export function LearningLogSection({ selectedCwd }: { selectedCwd: string | null
         <p className="text-label text-gray-500 text-center py-6">选一个项目以查看学习记录</p>
       ) : loading ? (
         <p className="text-label text-gray-500 text-center py-6 flex items-center justify-center gap-2">
-          <Loader2 size={12} className="animate-spin" /> 加载中…
+          <Loader2 size={14} className="animate-spin" /> 加载中…
         </p>
       ) : filtered.length === 0 ? (
         <div className="rounded-lg border border-dashed border-border bg-surface-1 px-6 py-10 text-center">
@@ -736,9 +736,9 @@ export function SelfImprovementSection() {
           className="flex items-center gap-1 rounded border border-border px-2 py-0.5 text-caption text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
         >
           {loading ? (
-            <Loader2 size={11} className="animate-spin" />
+            <Loader2 size={14} className="animate-spin" />
           ) : (
-            <Lightbulb size={11} className="text-accent" />
+            <Lightbulb size={14} className="text-accent" />
           )}
           {proposal === null ? "生成改进提案" : "重新生成"}
         </button>
@@ -834,9 +834,9 @@ export function ToolGateSection() {
           className="flex items-center gap-1 rounded border border-border px-2 py-0.5 text-caption text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
         >
           {loading ? (
-            <Loader2 size={11} className="animate-spin" />
+            <Loader2 size={14} className="animate-spin" />
           ) : (
-            <ShieldAlert size={11} className="text-accent" />
+            <ShieldAlert size={14} className="text-accent" />
           )}
           扫描易错工具
         </button>
@@ -857,7 +857,7 @@ export function ToolGateSection() {
         </div>
       ) : proposals.length === 0 ? (
         <div className="rounded-lg border border-border bg-surface-1 px-6 py-8 text-center">
-          <Check size={18} className="text-green-600 mx-auto mb-2" />
+          <Check size={20} className="text-green-600 mx-auto mb-2" />
           <p className="text-label text-gray-400">
             {gated.length > 0
               ? `已门控:${gated.join("、")}——已写入设置的「询问」清单,随时可改回。`
@@ -872,7 +872,7 @@ export function ToolGateSection() {
               className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-4"
             >
               <div className="flex items-start gap-2">
-                <ShieldAlert size={12} className="text-amber-500 mt-0.5 shrink-0" />
+                <ShieldAlert size={14} className="text-amber-500 mt-0.5 shrink-0" />
                 <div className="flex-1 min-w-0">
                   <p className="text-label text-gray-300 leading-relaxed">
                     <span className="font-mono text-amber-700 dark:text-amber-300">
@@ -891,9 +891,9 @@ export function ToolGateSection() {
                   className="flex items-center gap-1 px-3 py-1 rounded bg-accent hover:bg-accent-hover text-white text-label disabled:opacity-40 shrink-0"
                 >
                   {busyTool === p.tool ? (
-                    <Loader2 size={11} className="animate-spin" />
+                    <Loader2 size={14} className="animate-spin" />
                   ) : (
-                    <ShieldAlert size={11} />
+                    <ShieldAlert size={14} />
                   )}
                   启用门控
                 </button>
@@ -902,7 +902,7 @@ export function ToolGateSection() {
           ))}
           {gated.length > 0 && (
             <p className="text-caption text-green-700 dark:text-green-400 flex items-center gap-1 pl-1">
-              <Check size={11} /> 已门控:{gated.join("、")}(已写入设置的「询问」清单)
+              <Check size={14} /> 已门控:{gated.join("、")}(已写入设置的「询问」清单)
             </p>
           )}
         </div>
@@ -968,7 +968,7 @@ export function LearningEventCard({
   return (
     <div className="rounded-lg border border-accent/40 bg-accent/5 p-4">
       <div className="flex items-start gap-2 mb-2">
-        <Sparkles size={12} className="text-accent mt-0.5 shrink-0" />
+        <Sparkles size={14} className="text-accent mt-0.5 shrink-0" />
         <p className="text-label text-gray-300 leading-relaxed flex-1">{event.observation}</p>
         <span
           className={`text-caption px-1.5 py-0.5 rounded shrink-0 ${
@@ -1011,14 +1011,14 @@ export function LearningEventCard({
           disabled={busy}
           className="flex items-center gap-1 px-3 py-1 rounded text-label text-gray-400 hover:bg-surface-3 disabled:opacity-40"
         >
-          <X size={11} /> 拒绝
+          <X size={14} /> 拒绝
         </button>
         <button
           onClick={onAccept}
           disabled={busy}
           className="flex items-center gap-1 px-3 py-1 rounded bg-accent hover:bg-accent-hover text-white text-label disabled:opacity-40"
         >
-          {busy ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />}
+          {busy ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
           {isPref ? "采纳并更新偏好" : "采纳并写入记忆"}
         </button>
       </div>

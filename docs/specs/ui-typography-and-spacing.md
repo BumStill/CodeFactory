@@ -204,9 +204,21 @@ Mono: "JetBrains Mono", "SF Mono", Consolas, Menlo, monospace
 | 20 | `text-title` / `text-heading` | 面板标题、次级空状态 |
 | 24 | `text-display` | 空状态主图、引导页 |
 
-- 所有 lucide 图标通过统一封装引入，集中设置 `strokeWidth={1.5}` 与 `absoluteStrokeWidth`，
-  保证不同尺寸下描边视觉粗细一致。
-- 业务代码不得直接写 `size={N}`，改为 `<Icon name="..." size="sm|md|lg|xl" />` 或等价约束。
+描边一致性用一条 CSS 规则解决，不做组件封装：
+
+```css
+.lucide { vector-effect: non-scaling-stroke; stroke-width: 1.5; }
+```
+
+`non-scaling-stroke` 让描边在**最终坐标系**里度量而不是 viewBox 单位，
+于是任何尺寸下都恰好是 1.5px。**这里刻意没有引入 `<Icon>` 封装**——
+封装要改约 350 个调用点、每个都得换 import，而它解决的问题（描边不一致）
+一行 CSS 就够；尺寸档位由静态门禁约束即可。等到需要按尺寸切换图标线条粗细
+或做图标名注册表时，再考虑封装。
+
+**状态点不是图标。** 用 `<span className="h-1.5 w-1.5 rounded-full bg-current" />`
+这类 CSS 图形，不要把图标缩到 6px 去当圆点——那既落在比例尺之外，又会得到一条
+需要抗锯齿的发丝描边。
 
 ### 4.3 图标与文字的间距
 
@@ -254,18 +266,24 @@ Mono: "JetBrains Mono", "SF Mono", Consolas, Menlo, monospace
 
 ### 5.3 圆角
 
-现状四档混用：`rounded` 381（3.5px）、`rounded-lg` 141（7px）、`rounded-md` 25（5.25px）、`rounded-xl` 22（10.5px）。
-`rounded` 与 `rounded-md` 之间差 1.75px，肉眼无法区分，只是噪音。
+原先 `rounded` 381 处、`rounded-lg` 141、`rounded-md` 25、`rounded-xl` 22。
+`rounded`(4px) 与 `rounded-md`(6px) 只差 2px，肉眼无法区分，纯属噪音。
 
-规范三档：
+规范四档：
 
 | Token | 半径 | 用途 |
 |---|---|---|
 | `rounded` | 4 | 徽章、内联代码、小控件 |
 | `rounded-lg` | 8 | 按钮、输入框、列表项、卡片 |
 | `rounded-xl` | 12 | 面板、对话框、大容器 |
+| `rounded-2xl` | 16 | 消息气泡、输入框外壳 |
 
-`rounded-full` 保留给纯圆形（头像、状态点、胶囊按钮）。删除 `rounded-md` 与 `rounded-2xl` 的用法。
+`rounded-full` 保留给纯圆形（头像、状态点、胶囊按钮），方向性变体
+（`rounded-br-sm` 之类，用于气泡尖角）不在收敛范围内。
+
+**`rounded-2xl` 保留是对初审结论的修正。** 初审把它和 `rounded-md` 一并划入删除，
+理由不成立：12px 与 16px 差 4px 是能分辨的，而消息气泡和输入框外壳合理需要更大的圆角。
+被删掉的只有 `rounded-md`（25 处并入 `rounded-lg`）。
 
 ---
 
@@ -283,9 +301,20 @@ Mono: "JetBrains Mono", "SF Mono", Consolas, Menlo, monospace
 规范（对齐 WCAG 2.2 SC 2.5.8 Target Size Minimum）：
 
 - **任何交互元素的可点击区域不小于 24 × 24px**，图标按钮建议 28 × 28px。
-- 视觉尺寸可以更小，但必须用透明的 padding 或 `::after` 伪元素把**命中区**撑到 24px。
-  趋势柱和热力图单元格的正确做法是：柱子保持 4px 视觉高度，外层包一个整列高度的透明命中区。
+- 视觉尺寸可以更小，但必须把**命中区**撑到 24px。趋势柱的做法是：
+  按钮撑满整列高度做命中区，柱子降级为内部 `<span>` 只负责视觉。
+- 输入框要 `h-full` 撑满它的 label 外壳，否则用户看到的是 32px 控件、
+  实际 `<input>` 只有 20px。
 - 相邻交互元素的命中区之间至少留 4px，避免误触。
+
+**Essential 例外必须登记。** 密集数据网格（4 周趋势图 28 列排在约 280px 内、
+Token 消耗地图的日历格子）无法在不破坏可视化的前提下让每格达到 24px，
+属于 SC 2.5.8 的 Essential 例外。它们保留等价可达路径：完整方向键导航 + 逐日 aria-label。
+
+例外**按轴登记**在 `scripts/verify-hit-target-headless.mjs` 里，不是整体豁免——
+趋势图只豁免宽度，高度仍然强制 24px。第一版写成整体豁免，等于把「柱子只有 4px 高」
+这个本该被抓住的缺陷一起放过了。一个要写下来并说明理由的例外才会被复查；
+一个被悄悄调低的阈值不会。
 
 ---
 
@@ -380,15 +409,23 @@ Mono: "JetBrains Mono", "SF Mono", Consolas, Menlo, monospace
 2. 术语统一：`Token` 单一写法（原先 Token/token/Tokens/TOKENS 四种并存）、
    省略号统一 `…`。
 
-### P2 — 尚未做
+### P2 — 图标、命中区、圆角 ✅ 已完成
 
-1. **点击目标补齐到 24px**：趋势柱（实测 4 × 11px）、热力图格子（7px）、
-   侧边栏图标按钮（16.5px）、「查看详情」（23.5px）。
-2. **图标收敛**：18 种尺寸收敛到 4 档 + 统一封装设 `strokeWidth`。
-3. **字体**：打包 Inter/JetBrains Mono，或移除 Inter 选项；
-   字体栈补中文族；UI 字体与等宽字体设置拆分。
-4. 圆角收敛（删除 `rounded-md` / `rounded-2xl`）、间距档位收敛（并掉 `*-2.5`）。
-5. 热力图的 `text-[7px]` / `text-[6px]` 状态记号改为图形。
+1. **图标收敛**：322 处收敛到 14/16/20/24 四档；描边用 `.lucide` 的
+   `non-scaling-stroke` 统一到 1.5px（实测每个图标都是 1.5px，不再随尺寸漂移）；
+   Git 状态点从 `Circle size={6}` 改为 CSS 圆点。
+2. **命中区补齐到 24px**：趋势柱从 4 × 11px 改为整列高度（40px）命中区、
+   侧边栏「更多操作」从 18px 改为 24 × 24、搜索框 `<input>` 从 20px 撑满到 30px。
+   趋势图与热力图的宽度按 Essential 例外登记在案。
+3. **圆角**：`rounded-md` 25 处并入 `rounded-lg`；`rounded-2xl` 经复核后保留。
+
+### P3 — 尚未做
+
+1. **字体**（需要产品决策，见第三节）：打包 Inter / JetBrains Mono，
+   或移除 Inter 选项只留 System UI；字体栈补中文族；
+   UI 字体与等宽字体设置拆分。
+2. 间距档位收敛（并掉 `px-2.5` / `py-2.5` 等 10px 档）。
+3. 热力图的 `text-[7px]` / `text-[6px]` 状态记号改为图形。
 
 ---
 
@@ -406,10 +443,15 @@ Mono: "JetBrains Mono", "SF Mono", Consolas, Menlo, monospace
 | `typographyScaleAudit.test.ts` | 不出现 Tailwind 原生字号档位与 `text-[Npx]`，token 在 config 里有定义 |
 | `cjkTypographyAudit.test.ts` | 元素内出现中文时，className 不得含 `uppercase` 或 `tracking-` |
 | `themeBootstrapAudit.test.ts` | `index.html` 首帧带 `data-theme`、无失效 `class="dark"`；`:root` 有变量兜底 |
+| `iconScaleAudit.test.ts` | `size={N}` 只允许 14/16/20/24；`globals.css` 有统一描边规则 |
+| `radiusScaleAudit.test.ts` | 不出现被淘汰的 `rounded-md` / `rounded-sm` / `rounded-3xl` |
 
-真实渲染值只有真浏览器能给，补了 `scripts/verify-typography-headless.mjs`
-（`pnpm test:typography:headless`，需先起 dev server）：验根字号、8 档 token 实际 px、
-4px 网格、`--font-scale` 只缩放文字不缩放布局、页面上无 11px 以下文字、无层级倒挂。
+真实渲染值只有真浏览器能给，补了两个 headless 脚本（都需先起 dev server）：
+
+- `pnpm test:typography:headless`——根字号、8 档 token 实际 px、4px 网格、
+  `--font-scale` 只缩放文字不缩放布局、页面上无 11px 以下文字、无层级倒挂。
+- `pnpm test:hit-target:headless`——遍历 `button/a/[role=button]/input/select`，
+  命中区宽高均 ≥ 24px，Essential 例外按轴登记。
 
 **两个必须记住的坑**：
 
@@ -423,9 +465,8 @@ Mono: "JetBrains Mono", "SF Mono", Consolas, Menlo, monospace
 
 | 测试 | 断言 |
 |---|---|
-| `iconSizeAudit.test.ts` | lucide `size={N}` 只允许 `{14,16,20,24}`；或强制走统一封装 |
-| `radiusAudit.test.ts` | 不出现 `rounded-md` / `rounded-2xl` |
-| `verify-hit-target-headless.mjs` | 遍历 `button/a/[role=button]`，命中区宽高均 ≥ 24px |
+| `spacingScaleAudit.test.ts` | 不出现 `*-2.5` 这类 10px 档 |
+| `fontStackAudit.test.ts` | 字体栈含中文族；被提供的字体选项确实随应用打包 |
 
 ### 实地验证的边界
 
