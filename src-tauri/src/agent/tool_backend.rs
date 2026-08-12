@@ -22,6 +22,8 @@ use std::collections::HashSet;
 use std::path::{Component, Path};
 
 use crate::openrouter::types::{ToolCall, ToolDefinition};
+#[cfg(test)]
+use crate::util::no_window::NoWindow;
 
 enum MutationAdmission {
     Unbound,
@@ -2734,6 +2736,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let run = |args: &[&str]| {
                 let output = std::process::Command::new("git")
+                    .no_window()
                     .args(args)
                     .current_dir(dir.path())
                     .output()
@@ -2780,6 +2783,7 @@ mod tests {
                 MutationAdmission::Dispatch { .. }
             ));
             let effect = std::process::Command::new("sh")
+                .no_window()
                 .args(["-c", mutate])
                 .current_dir(dir.path())
                 .output()

@@ -12,6 +12,7 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::path::{Component, Path, PathBuf};
 
 use super::objective::{ClaimedRemediation, ObjectiveStore};
+use crate::util::no_window::NoWindow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolRecoveryDisposition {
@@ -887,6 +888,7 @@ async fn workspace_git_digest(cwd: &Path) -> Result<String> {
     let cwd = cwd.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<String> {
         let root = std::process::Command::new("git")
+            .no_window()
             .args([
                 "-C",
                 cwd.to_string_lossy().as_ref(),
@@ -899,6 +901,7 @@ async fn workspace_git_digest(cwd: &Path) -> Result<String> {
         }
         let root = PathBuf::from(String::from_utf8(root.stdout)?.trim());
         let listed = std::process::Command::new("git")
+            .no_window()
             .args([
                 "-C",
                 root.to_string_lossy().as_ref(),
@@ -912,6 +915,7 @@ async fn workspace_git_digest(cwd: &Path) -> Result<String> {
             bail!("unable to enumerate observable workspace files");
         }
         let head = std::process::Command::new("git")
+            .no_window()
             .args([
                 "-C",
                 root.to_string_lossy().as_ref(),
@@ -926,6 +930,7 @@ async fn workspace_git_digest(cwd: &Path) -> Result<String> {
             hasher.update(head.stdout);
         }
         let index = std::process::Command::new("git")
+            .no_window()
             .args([
                 "-C",
                 root.to_string_lossy().as_ref(),
