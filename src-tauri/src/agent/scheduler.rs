@@ -1688,6 +1688,7 @@ mod tests {
     use crate::agent::objective::ObjectiveKind;
     use crate::agent::subagent::{SubagentResult, SubagentRunOutcome, SubagentStopReason};
     use crate::agent::verification::VerificationResult;
+    use crate::util::no_window::NoWindow;
     use codefactory_agent_core::CompletionEvidence;
     use sqlx::sqlite::SqlitePoolOptions;
 
@@ -1803,6 +1804,7 @@ mod tests {
 
     fn test_git(cwd: &std::path::Path, args: &[&str]) {
         let output = std::process::Command::new("git")
+            .no_window()
             .arg("-C")
             .arg(cwd)
             .args(args)
