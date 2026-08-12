@@ -54,7 +54,7 @@
 命名请求绑定物化后 session 的 `endpoint_id`、`model_id` 和实际 `api_style`，不能重新读取可能已变化的全局默认值。这样，新会话草稿中已选择的模型与实际命名 Provider 保持一致。
 
 - 只允许调用同一已选 Provider；失败后不得自动切换 OpenRouter、DeepSeek、Anthropic、ChatGPT 或其他 endpoint。
-- OpenAI-compatible、Anthropic 和 ChatGPT subscription 三种 `ApiStyle` 均复用桌面完整 transport，并使用各自正确的短输出字段；不得用某种 dialect 假装兼容另一种。
+- OpenAI-compatible、Anthropic 和 ChatGPT subscription 三种 `ApiStyle` 均复用桌面完整 transport；OpenAI-compatible 与 Anthropic 使用各自的短输出字段，ChatGPT subscription 的 Codex Responses 路由必须省略其不接受的 `max_output_tokens`，并由短标题 prompt、12 秒 deadline 与本地输出校验共同约束；不得用某种 dialect 假装兼容另一种。
 - 一个逻辑命名任务受独立 12 秒 deadline 约束，可在同一 Provider 内使用共享 transport 的瞬时错误重试和协议适配，但绝不跨 Provider；正文回合结束并确认没有已排队的下一回合后才允许启动。
 - 命名调用不进入聊天 history，不产生用户/助手 message，也不触发工具、交付或学习流程。
 
