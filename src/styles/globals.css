@@ -12,6 +12,8 @@
   --surface-3: 24 33 48;
   --surface-4: 34 45 63;
   --border-color: 46 59 78;
+  /* Interactive control boundary: >=3:1 against surface-2 in both themes. */
+  --control-border-color: 100 116 139;
   --accent-color: 96 165 250;
   --accent-hover-color: 59 130 246;
 
@@ -56,6 +58,8 @@
   --surface-3: 232 238 246;
   --surface-4: 220 228 239;
   --border-color: 203 213 225;
+  /* Interactive control boundary: >=3:1 against surface-2 in both themes. */
+  --control-border-color: 100 116 139;
   --accent-color: 37 99 235;
   --accent-hover-color: 29 78 216;
 

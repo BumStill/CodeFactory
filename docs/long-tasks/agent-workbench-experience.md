@@ -5,19 +5,19 @@
 - Task ID: CF-WB-20260730
 - Title: Workspace 现代视觉与作业流演进
 - Feature spec: `docs/specs/feature-specs/agent-workbench-experience.md`
-- Related Req IDs: CF-WB-R1..R31
+- Related Req IDs: CF-WB-R1..R32
 
 ## Completion Standard
 
-- Done means: CF-WB-R1..R31 均有实现与证据；PR+CI 合并；按刻意发版节奏进入公开安装产物；真实 CodeFactoryDev 与公开产物主路径通过。
+- Done means: CF-WB-R1..R32 均有实现与证据；PR+CI 合并；按刻意发版节奏进入公开安装产物；真实 CodeFactoryDev 与公开产物主路径通过。
 - Blocked means: 同一外部阻塞连续三个 goal turn 无法推进，且已记录阻塞证据、责任人和下一步。
 
 ## Current State
 
-- Current phase: 第二批已上线；后续无障碍与任务验收面收敛
-- Current checkpoint: PR #362 已 squash merge 为 `defbc350`，Auto Release run `31489599245` 生成 v1.80.0，Release run `31490295360` 全绿；公开 DMG、Windows installer、updater 签名、`latest.json` 与匿名重新下载 DMG 的 released-artifact GUI 均已验收。该批统一控制面已 live。
-- Next owner: 后续独立完成 R18 共用任务验收面、R30 本机 VoiceOver/200% zoom 证据及既有 P2 可访问性 backlog；browser child WebView 仍只按 Phase 1 同 URL 预览，EBP-R3/R9 保持 `not live`。
-- Updated at: 2026-08-11
+- Current phase: 第三批 composer 密度与可访问性实现完成，等待 PR、CI、release 与公开产物验收
+- Current checkpoint: R32 已实现单一内嵌工具栏、默认值渐进隐藏、思考并入模型面板和高对比 control/focus token；失败优先测试、577 项全量前端回归、production build、治理门禁均通过。真实 CodeFactoryDev 已验证草稿/活跃会话、最小约 800px 窗口、项目/匿名/模型弹层和键盘回焦；仍保持 `not live`。
+- Next owner: 在 PR CI 运行新增的 375px compact-composer headless viewport gate，随后按 `merge → release → public artifact → installed-app` 完成交付；再继续 R18、R30 的其余 VoiceOver 路径与既有 P2 backlog。
+- Updated at: 2026-08-12
 
 ## Completed Items
 
@@ -56,6 +56,7 @@
 - [x] 第二批：R29 正文/composer 同一 880px 网格，多视口无页面级横向溢出。
 - [ ] 第二批：R30 图标命中区、VoiceOver、200% zoom 和 reduced-motion 放行。
 - [x] 第二批：R31 PR/CI/merge/release/public artifact/正式 App 完整上线证据。
+- [ ] 第三批：R32 composer 单一内嵌工具栏、默认值渐进隐藏、思考并入模型面板，以及 375px/200% zoom 密度放行。
 - [ ] 无障碍 P2：补齐消息/工具/任务 disclosure 的 `aria-controls`，项目选择与会话菜单键盘模式，以及 ImagePreview 初始聚焦、focus trap、回焦和最小 11px 说明。
 - [ ] 测试/性能 P2：清理 Workspace `act(...)` 警告，并单独治理 Vite 既存大 chunk 提示。
 
@@ -97,7 +98,7 @@
 - context scope: Workspace theme、session rail、conversation、result、composer、context、task activity、delivery、Settings/Onboarding delivery copy。
 - assumptions: 第一批不修改持久化 schema；release snapshot 当前没有 live verifier 字段；外部机器人不属于产品。
 - review point: 独立 QA 先后阻止低对比 muted/status 色、嵌套交互、抽屉焦点、窄屏、9–10px、hardcoded 状态色和 reduced-motion 缺口进入交付；逐项修复后复审。
-- validation result: 第一批与两轮用户反馈均已公开发布；第二批 R17、R19–R29 已由 PR #362 合并并随 v1.80.0 上线，PR/CI、远端真实 App、双平台构建、公开元数据与 released-artifact GUI 均通过。R18、R30 的本机 VoiceOver/200% zoom 与既有 P2 backlog 仍明确留在后续，不冒充本次已完成。
+- validation result: 第一批与两轮用户反馈均已公开发布；第二批 R17、R19–R29 已由 PR #362 合并并随 v1.80.0 上线。R32 因用户对 v1.80.0 实际 composer 密度反馈重新打开；本地失败优先测试、全量前端、build、治理与真实 CodeFactoryDev 多状态/最小窗口路径已通过，并新增 375px 浏览器几何门禁，但当前仍保持 `not live`，直到本批 PR/CI/release/public artifact 验收完成。
 
 ## Stop Boundary
 

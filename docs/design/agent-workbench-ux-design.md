@@ -55,7 +55,7 @@ CodeFactory 的现代感定义为：安静、精确、可信、响应及时。�
 │ attention    │             readable 760–880px column          │ one pane only  │
 │ running      │     answer → evidence → compact result footer  │ task/git/...   │
 │ recent       ├────────────────────────────────────────────────┴───────────────┤
-│              │ raised composer: scope/queue · input · model/safety · ◔ context│
+│              │ raised composer: queue · input · one compact utility toolbar   │
 └──────────────┴────────────────────────────────────────────────────────────────┘
 ```
 
@@ -157,12 +157,15 @@ PR → CI → 合并 → 正式发布 → 线上验证
 - placeholder 简化为“描述任务或继续对话…”；
 - 支持格式只在附件按钮 tooltip/menu 展示；
 - 附件 chips 和错误在输入框上方；
-- 模型/思考合并为一个紧凑入口，权限使用盾牌入口；两者位于输入框 footer，并明确下一回合/当前会话作用域；
+- 输入框内部只保留一条紧凑 utility toolbar：草稿态为项目范围 + 模型 + 更多，活跃会话为模型 + 权限盾牌 + context 圆环；不再渲染独立 scope 说明行、快捷键行或只有模型的 footer；
+- 模型/思考合并为一个入口，思考强度在模型面板内选择；单一/default endpoint 与“首选”不重复显示，只有固定/自动等非默认策略升格为短文字；
+- standard 权限只显示可访问的盾牌入口，safe/trusted 显示文字；匿名关闭进入“更多”，匿名开启显示警示 chip，风险状态不能只靠图标或颜色；
+- 快捷键提示仅在宽屏且 composer 聚焦时出现；窄屏与 200% zoom 隐藏，不能为它保留空行；
 - context 使用 20–24px 圆环视觉、36px 桌面命中区域；圆环表示当前窗口已用比例，不表示会话或今日累计 Token；
 - 会话/今日累计 Token、当前窗口 used/limit、压缩信息在点击圆环后的详情中渐进披露，不常驻占一行；
 - 曲别针、单行 textarea 和发送/停止按钮使用同一 32px 垂直盒；textarea 以 24px 行高 + 上下各 4px 内边距对齐图标视觉中心，多行时控制继续贴底；
 - send 在可发送时为清晰主动作，stop 使用 danger 语义；
-- queue、draft scope、context 都属于同一 raised surface；
+- queue、draft scope、context 都属于同一 raised surface；静止态最多为输入层 + 单条工具层，条件错误/队列才临时增加状态层；
 - context <75% 只显示 neutral/progress 圆环，75–89% 追加百分比，≥90% 追加“接近上限”；未知值使用虚线圆环且不伪造百分比；meter 提供 accessible name/value。
 
 ### 5.5 顶栏状态

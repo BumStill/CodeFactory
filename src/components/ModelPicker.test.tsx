@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ModelPicker } from "./ModelPicker";
 
@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   setModel: vi.fn(),
   updateActiveSessionModel: vi.fn(),
   updateActiveSessionModelConfig: vi.fn(),
+  updateActiveSessionReasoningEffort: vi.fn(),
   reloadSettings: vi.fn(),
   saveSettings: vi.fn(),
 }));
@@ -23,17 +24,20 @@ const chatState = vi.hoisted(() => ({
   setModel: mocks.setModel,
   updateActiveSessionModel: mocks.updateActiveSessionModel,
   updateActiveSessionModelConfig: mocks.updateActiveSessionModelConfig,
+  updateActiveSessionReasoningEffort: mocks.updateActiveSessionReasoningEffort,
   activeSession: {
     id: "session-a",
     endpoint_id: "chatgpt",
     model_id: "gpt-5.5",
     model_policy: "prefer",
+    reasoning_effort: "medium",
   },
 }));
 
 const settingsState = vi.hoisted(() => ({
   settings: {
     default_endpoint: "chatgpt",
+    reasoning_effort: "medium" as const,
     endpoints: {
       chatgpt: {
         base_url: "https://chatgpt.invalid",
@@ -58,11 +62,13 @@ vi.mock("../lib/tauri", () => ({
 }));
 
 vi.mock("../stores/chat", () => ({
-  useChatStore: () => chatState,
+  useChatStore: <T,>(selector?: (state: typeof chatState) => T) =>
+    selector ? selector(chatState) : chatState,
 }));
 
 vi.mock("../stores/settings", () => ({
-  useSettingsStore: () => settingsState,
+  useSettingsStore: <T,>(selector?: (state: typeof settingsState) => T) =>
+    selector ? selector(settingsState) : settingsState,
 }));
 
 describe("ModelPicker", () => {
@@ -72,18 +78,56 @@ describe("ModelPicker", () => {
     mocks.setModel.mockReset();
     mocks.updateActiveSessionModel.mockReset();
     mocks.updateActiveSessionModelConfig.mockReset();
+    mocks.updateActiveSessionReasoningEffort.mockReset();
     mocks.reloadSettings.mockReset();
     mocks.saveSettings.mockReset();
     mocks.saveSettings.mockResolvedValue(undefined);
     mocks.reloadSettings.mockResolvedValue(undefined);
     mocks.updateActiveSessionModel.mockResolvedValue(undefined);
     mocks.updateActiveSessionModelConfig.mockResolvedValue(undefined);
+    mocks.updateActiveSessionReasoningEffort.mockResolvedValue(undefined);
+    chatState.activeSession.model_policy = "prefer";
+    chatState.activeSession.reasoning_effort = "medium";
     mocks.invoke.mockImplementation((cmd: string, args: { endpointName?: string }) => {
       if (cmd === "get_endpoint_active_model") {
         return Promise.resolve(args.endpointName === "deepseek" ? "deepseek-v4-pro" : "gpt-5.5");
       }
       return Promise.resolve(undefined);
     });
+  });
+
+  it("shows only the model on the default trigger and keeps reasoning inside the model panel", async () => {
+    const user = userEvent.setup();
+    mocks.loadModels.mockResolvedValue(undefined);
+    render(<ModelPicker />);
+
+    const trigger = screen.getByRole("button", { name: /选择下一回合模型/ });
+    expect(trigger).toHaveTextContent(/^gpt-5\.5$/);
+    expect(trigger).not.toHaveTextContent("chatgpt");
+    expect(trigger).not.toHaveTextContent("首选");
+    expect(screen.queryByRole("combobox", { name: "下一回合思考强度" })).not.toBeInTheDocument();
+
+    await user.click(trigger);
+    const panel = screen.getByRole("dialog", { name: "选择下一回合模型" });
+    expect(panel).toContainElement(screen.getByRole("combobox", { name: "下一回合思考强度" }));
+    expect(screen.getByRole("combobox", { name: "模型策略" })).toHaveClass(
+      "focus-visible:ring-accent",
+    );
+    expect(screen.getByRole("textbox", { name: "搜索模型" })).toHaveClass(
+      "focus-visible:ring-accent",
+    );
+  });
+
+  it("promotes a non-default fixed policy beside the model", async () => {
+    mocks.loadModels.mockResolvedValue(undefined);
+    chatState.activeSession.model_policy = "fixed";
+    render(<ModelPicker />);
+
+    const trigger = screen.getByRole("button", { name: /选择下一回合模型/ });
+    expect(trigger).toHaveTextContent("gpt-5.5");
+    expect(trigger).toHaveTextContent("固定");
+    expect(trigger).not.toHaveTextContent("chatgpt");
+    await waitFor(() => expect(mocks.loadModels).toHaveBeenCalledWith("chatgpt"));
   });
 
   it("hides stale model rows while the newly selected endpoint loads", async () => {
@@ -98,7 +142,8 @@ describe("ModelPicker", () => {
     render(<ModelPicker />);
 
     await user.click(screen.getByRole("button", { name: /chatgpt/ }));
-    expect(screen.getByText("gpt-5.5")).toBeInTheDocument();
+    const panel = screen.getByRole("dialog", { name: "选择下一回合模型" });
+    expect(within(panel).getByRole("button", { name: "gpt-5.5" })).toBeInTheDocument();
 
     await user.selectOptions(screen.getByLabelText("模型端点"), "deepseek");
 
@@ -110,8 +155,8 @@ describe("ModelPicker", () => {
       }),
     );
     expect(mocks.saveSettings).not.toHaveBeenCalled();
-    expect(screen.queryByText("gpt-5.5")).not.toBeInTheDocument();
-    expect(screen.getByText("正在加载模型…")).toBeInTheDocument();
+    expect(within(panel).queryByRole("button", { name: "gpt-5.5" })).not.toBeInTheDocument();
+    expect(within(panel).getByText("正在加载模型…")).toBeInTheDocument();
   });
 
   it("changes only the active session policy and explains next-turn semantics", async () => {

@@ -24,7 +24,6 @@ import { MessageInput } from "../../components/MessageInput";
 import { SessionSidebar } from "../../components/SessionSidebar";
 import { DraftScopeBar } from "../../components/DraftScopeBar";
 import { ModelPicker } from "../../components/ModelPicker";
-import { ReasoningEffortPicker } from "../../components/ReasoningEffortPicker";
 import { PermissionModePicker } from "../../components/PermissionModePicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
@@ -832,21 +831,9 @@ export function WorkspacePage({
             externalJobs={externalJobs}
           />
           <div data-testid="workspace-composer-shell" className="shrink-0 bg-surface-2 px-3 pb-3 pt-2">
-            <div className="mx-auto w-full max-w-[880px] overflow-hidden rounded-2xl border border-border/80 bg-surface-2 shadow-lg">
+            <div className="mx-auto w-full max-w-[880px]">
               {queue.length > 0 && (
                 <QueueBadge queue={queue} onRemove={removeFromQueue} />
-              )}
-              {/* A draft's two remaining choices — where it works, and whether it
-                  leaves a trace — live inside the composer surface because they
-                  stop being editable the moment the first message is sent. */}
-              {activeDraft && (
-                <DraftScopeBar
-                  cwd={activeDraft.cwd}
-                  anonymous={activeDraft.anonymous}
-                  projects={draftProjects}
-                  onPickProject={setDraftProject}
-                  onToggleAnonymous={setDraftAnonymous}
-                />
               )}
               <MessageInput
                 key={activeSession?.id ?? activeDraft?.id ?? sessionId}
@@ -860,24 +847,28 @@ export function WorkspacePage({
                 pendingInsert={pendingInsert}
                 onInsertConsumed={() => setPendingInsert(undefined)}
                 cwd={activeCwd}
-              />
-              <div
-                role="group"
-                aria-label="下一回合控制"
-                className="flex min-h-10 flex-wrap items-center gap-1.5 border-t border-border/60 bg-surface-1/35 px-3 py-1.5"
-              >
-                <ModelPicker portal />
-                {!activeDraft && !isAnonymous && <ReasoningEffortPicker />}
-                {!activeDraft && !isAnonymous && <PermissionModePicker />}
-                {!activeDraft && (
-                  <div className="ml-auto">
-                    <ContextUsageBar
-                      sessionId={activeSession?.id}
-                      onOpenUsage={onOpenUsage ? () => onOpenUsage() : undefined}
-                    />
-                  </div>
+                toolbar={activeDraft ? (
+                  <DraftScopeBar
+                    cwd={activeDraft.cwd}
+                    anonymous={activeDraft.anonymous}
+                    projects={draftProjects}
+                    modelPicker={<ModelPicker portal />}
+                    onPickProject={setDraftProject}
+                    onToggleAnonymous={setDraftAnonymous}
+                  />
+                ) : (
+                  <>
+                    <ModelPicker portal />
+                    {!isAnonymous && <PermissionModePicker />}
+                    <div className="ml-auto shrink-0">
+                      <ContextUsageBar
+                        sessionId={activeSession?.id}
+                        onOpenUsage={onOpenUsage ? () => onOpenUsage() : undefined}
+                      />
+                    </div>
+                  </>
                 )}
-              </div>
+              />
             </div>
           </div>
         </main>

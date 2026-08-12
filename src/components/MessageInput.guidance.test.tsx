@@ -29,6 +29,20 @@ function setup(onGuide = vi.fn()) {
 }
 
 describe("MessageInput guidance mode", () => {
+  it("shows shortcut help only for a focused desktop composer and keeps controls 44/36px", () => {
+    const { onSend } = setup();
+    const shortcut = screen.getByTestId("composer-shortcut-hint");
+    expect(shortcut).toHaveClass("hidden", "lg:group-focus-within:block");
+    expect(screen.getByTestId("message-input-control-row")).toHaveClass("border-control-border");
+
+    const attach = screen.getByRole("button", { name: "附加文件" });
+    const send = screen.getByRole("button", { name: "引导当前执行" });
+    for (const target of [attach, send]) {
+      expect(target).toHaveClass("h-11", "w-11", "lg:h-9", "lg:w-9");
+    }
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it("routes Enter submissions to onGuide instead of normal chat send", async () => {
     const user = userEvent.setup();
     const { onSend, onGuide } = setup();

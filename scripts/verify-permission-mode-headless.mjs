@@ -81,12 +81,21 @@ async function main() {
     await page.goto(baseUrl, { waitUntil: "networkidle" });
     await page.getByRole("main", { name: "Permission mode acceptance" }).waitFor({ timeout: 10_000 });
 
-    const modeSelect = page.getByLabel("会话权限");
-    await modeSelect.waitFor();
-    assert(await modeSelect.inputValue() === "standard", "default session mode should be standard");
-    await modeSelect.selectOption("trusted");
+    const modeTrigger = page.getByRole("button", { name: /会话权限：标准/ });
+    await modeTrigger.waitFor();
+    assert(await modeTrigger.getAttribute("aria-expanded") === "false", "permission menu should start closed");
+    await modeTrigger.focus();
+    await page.keyboard.press("Enter");
+    const standardItem = page.getByRole("menuitemradio", { name: /标准/ });
+    await standardItem.waitFor();
+    assert(await standardItem.getAttribute("aria-checked") === "true", "default session mode should be standard");
+    await page.keyboard.press("ArrowDown");
+    const trustedItem = page.getByRole("menuitemradio", { name: /信任/ });
+    assert(await trustedItem.evaluate((element) => element === document.activeElement), "ArrowDown should focus trusted mode");
+    await page.keyboard.press("Enter");
     await page.getByTestId("current-permission-mode").waitFor({ state: "visible" });
     assert((await page.getByTestId("current-permission-mode").innerText()).includes("mode:trusted"), "mode switch should update only the session");
+    await page.getByRole("button", { name: /会话权限：信任/ }).waitFor();
 
     await page.getByRole("button", { name: "打开设置" }).click();
     await page.getByRole("button", { name: "端点", exact: true }).waitFor();
@@ -100,6 +109,7 @@ async function main() {
       checks: {
         sessionPermissionModeVisible: true,
         sessionPermissionModeSwitches: true,
+        sessionPermissionModeKeyboardPath: true,
         settingsPermissionTabHidden: true,
       },
     }, null, 2));

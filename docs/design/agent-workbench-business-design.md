@@ -53,7 +53,7 @@ CodeFactory 已具备会话、结构化计划、后台委派任务、Git 交付�
 
 ### 4.4 输入区是控制面
 
-附件、队列、模型、思考强度、会话权限、上下文与项目范围围绕 composer 渐进披露，因为这些控制共同决定“下一回合怎样执行”。文件类型不占用 placeholder；正常 context 使用中性色圆环，达到风险阈值后才升级为 warning/danger。会话/今日累计 Token 进入圆环详情，不与当前 context 百分比混为一谈。
+附件、队列、模型、思考强度、会话权限、上下文与项目范围围绕 composer 渐进披露，因为这些控制共同决定“下一回合怎样执行”。但“属于 composer”不等于“每项各占一层”：默认态只保留一条内嵌工具栏，草稿显示项目范围与模型，活跃会话显示模型、权限与 context；思考强度进入模型面板。匿名开启、safe/trusted、异常与用户动作升格为文字，默认 endpoint、首选策略、standard 权限与匿名关闭不重复解释。文件类型不占用 placeholder；正常 context 使用中性色圆环，达到风险阈值后才升级为 warning/danger。会话/今日累计 Token 进入圆环详情，不与当前 context 百分比混为一谈。
 
 ### 4.5 右侧工作面需要仲裁
 
@@ -71,7 +71,7 @@ CodeFactory 已具备会话、结构化计划、后台委派任务、Git 交付�
 - 收敛正文阅读宽度与 15/13/11px 字级；
 - 结果快照分开表达步骤执行、证据健康与下一动作责任人；
 - 正常 context 改为中性进度，阈值才告警；
-- composer、queue、context 收敛为一个操作表面；
+- composer、queue、context 收敛为一个操作表面，输入区默认只有输入层与一条工具层；
 - 任务抽屉提升可读性，统一状态语义；
 - 交付链明确 `release ≠ live`；
 - 修正 Workspace 内残留英文和无障碍缺口。
@@ -81,7 +81,7 @@ CodeFactory 已具备会话、结构化计划、后台委派任务、Git 交付�
 - 会话侧栏增加搜索、Pin 和 `需要处理 / 运行中 / 待审核 / 最近` 组织；
 - 抽取真实 `TaskActivityDrawer`，让 Workspace 与 acceptance 共用；
 - 建立右侧 pane arbiter，承载任务、Git、diff、验证、交付与按需浏览器；
-- 把模型、思考与权限迁移到 composer，将 context 收敛为圆环详情；
+- 把模型、思考与权限迁移到 composer，将思考合并进模型面板，并把 context 收敛为圆环详情；
 - 顶栏收敛为图标优先的会话/工程/交付/作业状态；
 - 清理或迁移 `TaskDashboard`、`ExecutionStream` 等旧 surface。
 
@@ -98,6 +98,7 @@ CodeFactory 已具备会话、结构化计划、后台委派任务、Git 交付�
 - 一次点击到达修改与验证证据；
 - 正常顶栏不再出现模型/思考/权限三个并列控件，1366px 不换行；
 - context 正常时只占一个紧凑圆环入口，累计 Token 一次点击可达；
+- composer 静止态不出现 scope 说明行、快捷键专用行或模型专用 footer；匿名/高风险状态仍可见；
 - 同一时刻最多一个辅助 pane，空内容不占用右侧宽度；
 - 未完成结果不出现成功图标或绿色完成语义；
 - release 状态不出现“上线”字样，live 未验证时明确显示；

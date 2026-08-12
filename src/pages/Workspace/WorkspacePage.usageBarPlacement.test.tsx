@@ -60,7 +60,12 @@ vi.mock("../../stores/chat", () => ({
 }));
 
 vi.mock("../../components/ModelPicker", () => ({
-  ModelPicker: () => <button aria-label="选择下一回合模型">模型</button>,
+  ModelPicker: () => (
+    <div>
+      <button aria-label="选择下一回合模型">模型</button>
+      <span data-testid="model-panel-reasoning-owner" />
+    </div>
+  ),
 }));
 vi.mock("../../components/ReasoningEffortPicker", () => ({
   ReasoningEffortPicker: () => (
@@ -83,7 +88,13 @@ vi.mock("../../components/CheckpointsPanel", () => ({ CheckpointsPanel: () => nu
 vi.mock("../../components/WorkspaceDeliveryStatus", () => ({ WorkspaceDeliveryStatus: () => null }));
 vi.mock("../../components/MessageList", () => ({ MessageList: () => null }));
 vi.mock("../../components/MessageInput", () => ({
-  MessageInput: () => <div data-testid="message-input" />,
+  MessageInput: ({ toolbar }: { toolbar?: React.ReactNode }) => (
+    <div data-testid="message-input">
+      <div role="toolbar" aria-label="输入工具" className="flex min-w-0 max-w-full flex-wrap overflow-x-clip">
+        {toolbar}
+      </div>
+    </div>
+  ),
 }));
 vi.mock("../../components/PermissionDialog", () => ({ PermissionDialog: () => null }));
 vi.mock("../../components/ContextUsageBar", () => ({
@@ -154,7 +165,7 @@ describe("composer runtime control ownership", () => {
     mocks.subscribe.mockReset().mockResolvedValue(() => {});
   });
 
-  it("keeps model, reasoning, permission and context in one composer surface, not the header", async () => {
+  it("keeps one compact utility toolbar and does not mount a standalone reasoning trigger", async () => {
     const { WorkspacePage } = await import("./WorkspacePage");
     const { container } = render(
       <WorkspacePage
@@ -169,8 +180,13 @@ describe("composer runtime control ownership", () => {
     const composer = within(shell as HTMLElement);
     const header = within(container.querySelector('header[aria-label="会话工具栏"]') as HTMLElement);
 
-    expect(composer.getByRole("button", { name: "选择下一回合模型" })).toBeInTheDocument();
-    expect(composer.getByRole("combobox", { name: "下一回合思考强度" })).toBeInTheDocument();
+    const toolbar = composer.getByRole("toolbar", { name: "输入工具" });
+    expect(composer.getAllByRole("toolbar", { name: "输入工具" })).toHaveLength(1);
+    expect(toolbar).toHaveClass("min-w-0", "max-w-full", "flex-wrap");
+    expect(toolbar.className).toMatch(/overflow-(?:x-)?(?:hidden|clip)/);
+    expect(within(toolbar).getByRole("button", { name: "选择下一回合模型" })).toBeInTheDocument();
+    expect(composer.queryByRole("combobox", { name: "下一回合思考强度" })).not.toBeInTheDocument();
+    expect(composer.getByTestId("model-panel-reasoning-owner")).toBeInTheDocument();
     expect(composer.getByRole("combobox", { name: "会话权限" })).toBeInTheDocument();
     expect(composer.getByRole("button", { name: "打开上下文与用量详情" })).toBeInTheDocument();
 
@@ -178,7 +194,7 @@ describe("composer runtime control ownership", () => {
     expect(header.queryByRole("combobox", { name: "下一回合思考强度" })).not.toBeInTheDocument();
     expect(header.queryByRole("combobox", { name: "会话权限" })).not.toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "选择下一回合模型" })).toHaveLength(1);
-    expect(screen.getAllByRole("combobox", { name: "下一回合思考强度" })).toHaveLength(1);
+    expect(screen.queryByRole("combobox", { name: "下一回合思考强度" })).not.toBeInTheDocument();
     expect(screen.getAllByRole("combobox", { name: "会话权限" })).toHaveLength(1);
   });
 });

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useRef, useState, useEffect, ChangeEvent, KeyboardEvent, ClipboardEvent, DragEvent } from "react";
+import { useRef, useState, useEffect, ChangeEvent, KeyboardEvent, ClipboardEvent, DragEvent, type ReactNode } from "react";
 import { recallHistory, pushHistory } from "./messageHistory";
 import { Send, Square, Paperclip, X, Loader2, Check } from "lucide-react";
 import {
@@ -10,6 +10,7 @@ import {
 import { invoke } from "../lib/tauri";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { ImagePreview } from "./ImagePreview";
+import { ComposerControlBar } from "./ComposerControlBar";
 
 interface SkillSlashCommand {
   name: string;
@@ -74,6 +75,8 @@ interface Props {
   /** Seed ↑/↓ recall with this session's already-sent user messages (oldest
    *  first). Combined with a per-session `key`, recall is scoped per session. */
   initialHistory?: string[];
+  /** Controls for project/model/permission/context inside the input surface. */
+  toolbar?: ReactNode;
 }
 
 /** How long after compositionend an Enter keydown is still treated as the
@@ -81,7 +84,7 @@ interface Props {
  *  human "commit then send" double-Enters measure well above this. */
 const IME_COMMIT_GRACE_MS = 100;
 
-export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, guidanceActive = false, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd, initialHistory }: Props) {
+export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, guidanceActive = false, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd, initialHistory, toolbar }: Props) {
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
   const [attachments, setAttachments] = useState<AttachmentChip[]>([]);
@@ -343,7 +346,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
 
   return (
     <div
-      className={`px-3 pb-2 pt-1 transition-colors ${
+      className={`transition-colors ${
         dragOver ? "rounded-xl bg-status-progress-soft" : ""
       }`}
       onDragOver={onDragOver}
@@ -391,7 +394,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
                 <button
                   type="button"
                   onClick={() => removeAttachment(a.id)}
-                  className="absolute right-0 top-0 flex h-11 w-11 items-center justify-center rounded-full bg-surface-0/80 text-gray-400 opacity-90 transition-colors hover:bg-status-danger-soft hover:text-status-danger lg:right-1 lg:top-1 lg:h-8 lg:w-8"
+                  className="absolute right-0 top-0 flex h-11 w-11 items-center justify-center rounded-full bg-surface-0/80 text-gray-400 opacity-90 transition-colors hover:bg-status-danger-soft hover:text-status-danger lg:right-1 lg:top-1 lg:h-9 lg:w-9"
                   title="移除"
                   aria-label={`移除 ${a.name}`}
                 >
@@ -412,7 +415,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
                 <button
                   type="button"
                   onClick={() => removeAttachment(a.id)}
-                  className="flex h-11 w-11 items-center justify-center rounded-full text-gray-500 hover:bg-status-danger-soft hover:text-status-danger lg:h-8 lg:w-8"
+                  className="flex h-11 w-11 items-center justify-center rounded-full text-gray-500 hover:bg-status-danger-soft hover:text-status-danger lg:h-9 lg:w-9"
                   title="移除"
                   aria-label={`移除 ${a.name}`}
                 >
@@ -433,8 +436,9 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
       )}
       <div
         data-testid="message-input-control-row"
-        className="flex items-end gap-2 rounded-2xl border border-border/80 bg-surface-2 px-3 py-2.5 shadow-sm transition-colors focus-within:border-accent/60 focus-within:shadow-md"
+        className="group rounded-2xl border border-control-border bg-surface-2 shadow-sm transition-colors focus-within:border-accent focus-within:shadow-md"
       >
+        <div className="flex items-end gap-2 px-3 py-2.5">
         <input
           ref={fileInputRef}
           type="file"
@@ -448,7 +452,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
           onClick={() => fileInputRef.current?.click()}
           disabled={!cwd || uploading}
           aria-label="附加文件"
-          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-gray-500 transition-colors enabled:hover:bg-surface-4 disabled:opacity-30 lg:h-8 lg:w-8"
+          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-gray-500 transition-colors enabled:hover:bg-surface-4 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-30 lg:h-9 lg:w-9"
           title={cwd ? "附加文件（图片 / pptx / docx / pdf / xlsx）" : "打开项目后可附加文件"}
         >
           <Paperclip size={16} />
@@ -492,7 +496,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
             onClick={() => void submit({ forceQueue: true })}
             disabled={!submitReady}
             aria-label="排到当前执行之后"
-            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-status-progress-soft text-status-progress transition-colors enabled:hover:brightness-95 lg:h-8 lg:w-8"
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-status-progress-soft text-status-progress transition-colors enabled:hover:brightness-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:h-9 lg:w-9"
             title="排到当前执行之后"
           >
             <Send size={16} />
@@ -503,7 +507,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
           onClick={streaming ? onCancel : () => void submit()}
           disabled={!streaming && !submitReady}
           aria-label={streaming ? "停止后续生成" : guidanceActive ? "引导当前执行" : "发送"}
-          className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-lg transition-colors disabled:opacity-30 lg:h-8 lg:w-8 ${
+          className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-lg transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-30 lg:h-9 lg:w-9 ${
             streaming
               ? "bg-status-danger-soft text-status-danger hover:brightness-95"
               : submitReady
@@ -520,7 +524,16 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
             <Send size={16} />
           )}
         </button>
+        </div>
+        <ComposerControlBar
+          shortcutHint={guidanceActive
+            ? "Enter 引导当前执行 · ⌘Enter 等这轮结束再发 · Shift+Enter 换行"
+            : "Enter 发送 · Shift+Enter 换行"}
+        >
+          {toolbar}
+        </ComposerControlBar>
       </div>
+      {(streaming || guidanceState.kind !== "idle") && (
       <div className="mt-1 flex min-h-4 items-center gap-2 text-[11px] text-gray-600 select-none">
         {streaming && (
           <span>停止后续生成不会撤销已经完成的修改、提交或推送</span>
@@ -535,12 +548,8 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
             引导发送失败：{guidanceState.message}
           </span>
         )}
-        <span className="ml-auto">
-          {guidanceActive
-            ? "Enter 引导当前执行 · ⌘Enter 等这轮结束再发 · Shift+Enter 换行"
-            : "Enter 发送 · Shift+Enter 换行"}
-        </span>
       </div>
+      )}
     </div>
   );
 }

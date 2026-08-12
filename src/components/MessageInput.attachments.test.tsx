@@ -79,8 +79,8 @@ describe("MessageInput attachments", () => {
     expect(screen.getByRole("button", { name: "移除 screenshot.png" })).toHaveClass(
       "h-11",
       "w-11",
-      "lg:h-8",
-      "lg:w-8",
+      "lg:h-9",
+      "lg:w-9",
     );
   });
 

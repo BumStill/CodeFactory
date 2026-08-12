@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 
 import "../styles/globals.css";
 import { DraftScopeBar } from "../components/DraftScopeBar";
+import { MessageInput } from "../components/MessageInput";
 import type { ProjectGroup } from "../lib/projects";
 
 const projects: ProjectGroup[] = [
@@ -16,21 +17,37 @@ const projects: ProjectGroup[] = [
 function DraftProjectPickerAcceptance() {
   const [cwd, setCwd] = useState<string | null>(null);
   return (
-    <main aria-label="Draft project picker acceptance" className="flex h-screen flex-col bg-surface-0 p-8 text-gray-200">
+    <main aria-label="Draft project picker acceptance" className="flex h-screen flex-col bg-surface-0 p-2 text-gray-200 sm:p-8">
       <div className="flex min-h-0 flex-1 items-end justify-center">
         <div
           data-testid="clipped-composer"
-          className="h-[70px] w-[640px] overflow-hidden rounded-2xl border border-border/80 bg-surface-2 shadow-lg"
+          className="w-full max-w-[880px] overflow-hidden"
         >
-          <DraftScopeBar
+          <MessageInput
+            onSend={() => {}}
+            onCancel={() => {}}
+            streaming={false}
+            disabled={false}
             cwd={cwd}
-            anonymous={false}
-            projects={projects}
-            modelPicker={<span className="text-[11px] text-gray-300">模型</span>}
-            onPickProject={setCwd}
-            onToggleAnonymous={() => {}}
+            toolbar={(
+              <DraftScopeBar
+                cwd={cwd}
+                anonymous={false}
+                projects={projects}
+                modelPicker={(
+                  <button
+                    type="button"
+                    aria-label="选择下一回合模型：gpt-5.6-sol"
+                    className="min-h-11 max-w-[132px] truncate rounded-lg px-2 text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-9"
+                  >
+                    gpt-5.6-sol
+                  </button>
+                )}
+                onPickProject={setCwd}
+                onToggleAnonymous={() => {}}
+              />
+            )}
           />
-          <div className="px-4 pb-4 text-xs text-gray-600">模拟聊天输入框外壳：overflow-hidden</div>
         </div>
       </div>
       <div aria-label="Draft project picker probe" data-selected-cwd={cwd ?? ""} />

@@ -20,6 +20,7 @@ export default {
           4: themeColor("--surface-4"),
         },
         border: themeColor("--border-color"),
+        "control-border": themeColor("--control-border-color"),
         accent: themeColor("--accent-color"),
         "accent-hover": themeColor("--accent-hover-color"),
         // Semantic roles keep workflow meaning consistent across every surface.

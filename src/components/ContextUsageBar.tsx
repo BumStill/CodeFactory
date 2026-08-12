@@ -257,7 +257,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
         ref={triggerRef}
         type="button"
         data-testid="context-usage-ring"
-        className={`inline-flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-lg px-2 text-xs transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9 lg:min-w-9 ${
+        className={`inline-flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-lg px-2 text-xs transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-9 lg:min-w-9 ${
           percent == null ? "text-gray-500" : presentation.textClass
         }`}
         aria-label={`打开上下文与用量详情，${meterText}`}
@@ -349,7 +349,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
             <button
               type="button"
               aria-label="关闭上下文与用量详情"
-              className="flex h-11 w-11 items-center justify-center rounded-lg text-gray-500 hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:h-9 lg:w-9"
+              className="flex h-11 w-11 items-center justify-center rounded-lg text-gray-500 hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:h-9 lg:w-9"
               onClick={() => closeDetail()}
             >
               <X size={14} aria-hidden="true" />
@@ -378,7 +378,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
               {sessionId && (
                 <button
                   type="button"
-                  className="min-h-11 rounded-lg px-2 text-gray-400 hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9"
+                  className="min-h-11 rounded-lg px-2 text-gray-400 hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-9"
                   onClick={() => onOpenUsage("session")}
                 >
                   查看会话统计
@@ -386,7 +386,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
               )}
               <button
                 type="button"
-                className="min-h-11 rounded-lg px-2 text-gray-400 hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9"
+                className="min-h-11 rounded-lg px-2 text-gray-400 hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-9"
                 onClick={() => onOpenUsage("today")}
               >
                 查看今日统计
