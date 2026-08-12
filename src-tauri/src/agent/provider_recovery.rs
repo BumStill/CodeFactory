@@ -292,7 +292,9 @@ impl ProviderRecoveryStore {
         }
 
         let objective = sqlx::query(
-            "SELECT session_id, root_turn_id FROM objectives
+            "SELECT session_id,
+                    COALESCE(NULLIF(resume_cursor, ''), root_turn_id) AS active_root_turn_id
+             FROM objectives
              WHERE id=? AND revision=?",
         )
         .bind(&permit.objective_id)
@@ -300,7 +302,7 @@ impl ProviderRecoveryStore {
         .fetch_one(&mut *tx)
         .await?;
         let session_id: Option<String> = objective.get("session_id");
-        let root_turn_id: Option<String> = objective.get("root_turn_id");
+        let root_turn_id: Option<String> = objective.get("active_root_turn_id");
         if session_id.as_deref() != Some(spec.session_id.as_str())
             || root_turn_id.as_deref() != Some(spec.root_turn_id.as_str())
         {

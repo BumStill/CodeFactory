@@ -21,6 +21,7 @@ const UNHANDLED_REOBSERVE_MS: i64 = 15_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterExecutor {
     Chat,
+    Context,
     Task,
     Permission,
     Provider,
@@ -31,6 +32,7 @@ enum AdapterExecutor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterCapability {
     ChatResume,
+    ContextResume,
     TaskResume,
     PermissionResume,
     ProviderResume,
@@ -93,6 +95,22 @@ impl ObjectiveDomainAdapter for RegisteredDomainAdapter {
             }
             AdapterCapability::ChatResume => {
                 DomainObservation::IdentityIncomplete("chat_identity_incomplete")
+            }
+            AdapterCapability::ContextResume
+                if claim.objective.session_id.is_some()
+                    && claim.objective.root_turn_id.is_some()
+                    && claim
+                        .objective
+                        .resume_cursor
+                        .as_deref()
+                        .is_some_and(|cursor| !cursor.trim().is_empty())
+                    && claim.binding_id.is_some()
+                    && claim.resource_generation.is_some() =>
+            {
+                DomainObservation::Ready(AdapterExecutor::Context)
+            }
+            AdapterCapability::ContextResume => {
+                DomainObservation::IdentityIncomplete("context_identity_incomplete")
             }
             AdapterCapability::TaskResume
                 if claim.objective.session_id.is_some() && claim.objective.task_id.is_some() =>
@@ -224,7 +242,7 @@ static DOMAIN_ADAPTERS: [RegisteredDomainAdapter; 12] = [
     },
     RegisteredDomainAdapter {
         domain: RecoveryDomain::Context,
-        capability: AdapterCapability::ObserveOnly,
+        capability: AdapterCapability::ContextResume,
     },
     RegisteredDomainAdapter {
         domain: RecoveryDomain::Tool,
@@ -475,6 +493,7 @@ async fn process_claim(
     let result = match adapter {
         Ok(adapter) => {
             let objective = claim.objective.clone();
+            let execution_claim = claim.clone();
             let execution_permit = permit.clone();
             run_with_claim_lease(
                 &store,
@@ -492,6 +511,21 @@ async fn process_claim(
                                     app,
                                     objective,
                                     execution_permit,
+                                )
+                                .await
+                            }
+                            AdapterExecutor::Context => {
+                                let authorization = reserve_context_resume_authorization(
+                                    &pool,
+                                    &execution_claim,
+                                    &execution_permit,
+                                )
+                                .await?;
+                                crate::commands::chat::resume_context_objective(
+                                    app,
+                                    objective,
+                                    execution_permit,
+                                    authorization,
                                 )
                                 .await
                             }
@@ -575,6 +609,30 @@ async fn process_claim(
                 "remediation was advanced before defer"
             );
         }
+    }
+}
+
+/// Context recovery may construct a fresh agent only after the domain store
+/// proves that the exact current chat binding has one effect-free terminal
+/// Context attempt. All other dispositions remain system-owned observations.
+async fn reserve_context_resume_authorization(
+    pool: &SqlitePool,
+    claim: &ClaimedRemediation,
+    permit: &codefactory_agent_loop::tool::MutationPermit,
+) -> Result<super::context_recovery::ContextRecoveryAuthorization, crate::errors::AppError> {
+    let reservation = super::context_recovery::ContextRecoveryStore::new(pool.clone())
+        .reserve_claimed_recovery(claim, permit)
+        .await
+        .map_err(|error| {
+            crate::errors::AppError::Other(format!("context recovery observation failed: {error}"))
+        })?;
+    match reservation {
+        super::context_recovery::ContextRecoveryReservation::Authorized(authorization) => {
+            Ok(authorization)
+        }
+        reservation => Err(crate::errors::AppError::Other(format!(
+            "context recovery remains observe-only: {reservation:?}"
+        ))),
     }
 }
 
@@ -795,6 +853,336 @@ mod tests {
             .pop()
             .unwrap();
         (pool, store, claim)
+    }
+
+    async fn claimed_context_recovery_authorization(
+        suffix: &str,
+    ) -> (
+        SqlitePool,
+        ObjectiveStore,
+        ClaimedRemediation,
+        codefactory_agent_loop::tool::MutationPermit,
+        crate::agent::context_recovery::ContextRecoveryAuthorization,
+    ) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective_id = format!("objective-context-{suffix}");
+        let session_id = format!("session-context-{suffix}");
+        let anchor_root = format!("turn-context-anchor-{suffix}");
+        let active_root = format!("turn-context-active-{suffix}");
+        let binding_id = format!("binding-context-{suffix}");
+        let attempt_id = format!("attempt-context-{suffix}");
+        let owner = format!("owner-context-{suffix}");
+        let objective = store
+            .create(CreateObjective {
+                id: objective_id.clone(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some(session_id.clone()),
+                root_turn_id: Some(anchor_root),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "context-p0-test".into(),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind(&active_root)
+        .bind(&session_id)
+        .bind(&objective_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, resume_cursor, created_at, updated_at)
+             VALUES (?, ?, 'chat', 'chat_root_turn', ?, 2, ?, ?, ?, ?)",
+        )
+        .bind(&binding_id)
+        .bind(&objective_id)
+        .bind(&active_root)
+        .bind(format!("sha256:{suffix}"))
+        .bind(&active_root)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let waiting = DecisionRouter::route(
+            &objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Context,
+                failure_code: "context_overflow_after_compaction".into(),
+                failure_signature: format!("sha256:context-{suffix}"),
+                next_observation_at: now - 1,
+                resume_cursor: Some(active_root.clone()),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(objective.revision, waiting)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_recovery_attempts
+             (id, objective_id, root_turn_id, delivery_run_id, domain, attempt_index,
+              failure_code, failure_class, output_started, side_effect_started,
+              queue_wait_ms, runtime_ms, process_instance, resume_owner,
+              terminal_decision, created_at)
+             VALUES (?, ?, ?, NULL, 'context', 1,
+                     'CONTEXT_OVERFLOW_AFTER_COMPACTION', 'context_capacity', 0, 0,
+                     NULL, NULL, 'prior-process', 'agent_loop', 'waiting_system', ?)",
+        )
+        .bind(&attempt_id)
+        .bind(&objective_id)
+        .bind(&active_root)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let claim = store
+            .claim_due_remediations(&owner, 1, 30_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let permit = mutation_permit(&claim, &owner);
+        let authorization =
+            match crate::agent::context_recovery::ContextRecoveryStore::new(pool.clone())
+                .reserve_claimed_recovery(&claim, &permit)
+                .await
+                .unwrap()
+            {
+                crate::agent::context_recovery::ContextRecoveryReservation::Authorized(value) => {
+                    value
+                }
+                other => panic!("expected durable Context authorization, got {other:?}"),
+            };
+        (pool, store, claim, permit, authorization)
+    }
+
+    struct AdvancingContextPolicy {
+        pool: SqlitePool,
+        objective_id: String,
+        remediation_id: String,
+        advanced: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl codefactory_agent_loop::services::ContextPolicy for AdvancingContextPolicy {
+        async fn context_window(&self, _estimated_tokens: u32) -> (u32, u32) {
+            let now = chrono::Utc::now().timestamp_millis();
+            sqlx::query(
+                "UPDATE objectives
+                 SET revision=revision+1, domain='chat', status='active',
+                     decision_type='continue', resume_cursor='turn-context-steered',
+                     remediation_id=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                     updated_at=? WHERE id=?",
+            )
+            .bind(now)
+            .bind(&self.objective_id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE objective_remediations
+                 SET status='superseded', lease_owner=NULL, lease_expires_at=NULL,
+                     updated_at=? WHERE id=?",
+            )
+            .bind(now)
+            .bind(&self.remediation_id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+            self.advanced.fetch_add(1, Ordering::SeqCst);
+            (100_000, 100_000)
+        }
+
+        async fn supports_vision(&self) -> bool {
+            true
+        }
+
+        async fn round_reasoning_effort(&self) -> String {
+            String::new()
+        }
+    }
+
+    #[derive(Default)]
+    struct NoCallContextTransport {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl codefactory_agent_loop::transport::ModelTransport for NoCallContextTransport {
+        async fn complete(
+            &self,
+            _messages: &[codefactory_agent_loop::types::ChatMessage],
+            _tools: &[codefactory_agent_loop::types::ToolDefinition],
+            _opts: &codefactory_agent_loop::transport::RoundOptions,
+        ) -> std::result::Result<
+            codefactory_agent_loop::transport::ModelResponse,
+            codefactory_agent_loop::transport::TransportError,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(codefactory_agent_loop::transport::TransportError::Fatal(
+                "provider must not be called by a stale Context runner".into(),
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingContextCompactor {
+        calls: AtomicUsize,
+    }
+
+    impl codefactory_agent_loop::services::ContextCompactor for CountingContextCompactor {
+        fn compact(
+            &self,
+            messages: Vec<codefactory_agent_loop::types::ChatMessage>,
+            _system_prompt: &str,
+            _context_limit: u32,
+            _tool_definitions: &[codefactory_agent_loop::types::ToolDefinition],
+        ) -> codefactory_agent_loop::services::CompactionOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            codefactory_agent_loop::services::CompactionOutcome {
+                messages,
+                ..Default::default()
+            }
+        }
+    }
+
+    struct NoCallContextTools;
+
+    #[async_trait::async_trait]
+    impl codefactory_agent_loop::tool::ToolBackend for NoCallContextTools {
+        async fn list_schemas(&self) -> Vec<codefactory_agent_loop::types::ToolDefinition> {
+            Vec::new()
+        }
+
+        async fn execute(
+            &self,
+            _call: &codefactory_agent_loop::types::ToolCall,
+            _args: &serde_json::Value,
+            _ctx: &codefactory_agent_loop::tool::ToolCtx,
+        ) -> std::result::Result<
+            codefactory_agent_loop::tool::ToolInvocationResult,
+            codefactory_agent_loop::tool::ToolError,
+        > {
+            panic!("tool backend must not be called by a stale Context runner")
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingContextPersistence {
+        recovery_attempts: AtomicUsize,
+        notices: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl codefactory_agent_loop::journal::Persistence for CountingContextPersistence {
+        async fn record_recovery_attempt(
+            &self,
+            _attempt: &codefactory_agent_loop::journal::RecoveryAttemptRow,
+        ) -> codefactory_agent_loop::journal::PersistResult<()> {
+            self.recovery_attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn persist_message(
+            &self,
+            _role: &str,
+            _content: &str,
+            _input_tokens: Option<i64>,
+            _output_tokens: Option<i64>,
+            _tool_calls: Option<&[codefactory_agent_loop::types::ToolCall]>,
+            _reasoning_content: Option<&str>,
+            _endpoint_id: Option<&str>,
+            _model_id: Option<&str>,
+            _usage_request_id: Option<&str>,
+        ) -> codefactory_agent_loop::journal::PersistResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn persist_gate_message(
+            &self,
+            _content: &str,
+            _state: &str,
+        ) -> codefactory_agent_loop::journal::PersistResult<()> {
+            self.notices.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn persist_gate_message_once(
+            &self,
+            _marker: &str,
+            _content: &str,
+            _state: &str,
+        ) -> codefactory_agent_loop::journal::PersistResult<bool> {
+            self.notices.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+
+        async fn mark_rejected_candidate(
+            &self,
+            _message_id: Option<&str>,
+        ) -> codefactory_agent_loop::journal::PersistResult<()> {
+            Ok(())
+        }
+
+        async fn record_tool_call_started(
+            &self,
+            _message_id: &str,
+            _tool_call: &codefactory_agent_loop::types::ToolCall,
+        ) -> codefactory_agent_loop::journal::PersistResult<()> {
+            Ok(())
+        }
+
+        async fn record_tool_call_outcome(
+            &self,
+            _tool_call: &codefactory_agent_loop::types::ToolCall,
+            _status: &str,
+            _result: Option<&str>,
+            _error: Option<&str>,
+            _duration_ms: u64,
+        ) -> codefactory_agent_loop::journal::PersistResult<()> {
+            Ok(())
+        }
+
+        async fn persist_cancelled_tool_batch(
+            &self,
+            _remaining: &[codefactory_agent_loop::types::ToolCall],
+        ) -> codefactory_agent_loop::journal::PersistResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn record_usage(
+            &self,
+            _row: codefactory_agent_loop::journal::UsageRow<'_>,
+        ) -> codefactory_agent_loop::journal::PersistResult<bool> {
+            Ok(false)
+        }
     }
 
     #[test]
@@ -1228,6 +1616,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn context_recovery_is_an_executable_registered_capability() {
+        assert!(domain_has_executable_adapter(RecoveryDomain::Context));
+        let adapter = DEFAULT_ADAPTER_REGISTRY
+            .adapter_for(RecoveryDomain::Context)
+            .unwrap();
+        assert_eq!(adapter.capability, AdapterCapability::ContextResume);
+    }
+
     #[tokio::test]
     async fn missing_domain_capability_stays_system_owned_and_reobserves_without_cta() {
         let pool = SqlitePoolOptions::new()
@@ -1243,7 +1640,7 @@ mod tests {
                 kind: ObjectiveKind::LocalMutation,
                 session_id: Some("session-provider-observe-only".into()),
                 root_turn_id: Some("turn-provider-observe-only".into()),
-                domain: RecoveryDomain::Context,
+                domain: RecoveryDomain::Browser,
                 requested_acceptance: "validated_change".into(),
                 created_surface: "test".into(),
             })
@@ -1252,7 +1649,7 @@ mod tests {
         let waiting = DecisionRouter::route(
             &objective,
             RouteSignal::TechnicalFailure {
-                domain: RecoveryDomain::Context,
+                domain: RecoveryDomain::Browser,
                 failure_code: "provider_unavailable".into(),
                 failure_signature: "sha256:provider-observe-only".into(),
                 next_observation_at: chrono::Utc::now().timestamp_millis() - 1,
@@ -1272,7 +1669,7 @@ mod tests {
             .unwrap();
         let permit = mutation_permit(&claim, "provider-owner");
         let adapter = DEFAULT_ADAPTER_REGISTRY
-            .adapter_for(RecoveryDomain::Context)
+            .adapter_for(RecoveryDomain::Browser)
             .unwrap();
         let execute_count = Arc::new(AtomicUsize::new(0));
         let attempt_count = execute_count.clone();
@@ -1384,6 +1781,363 @@ mod tests {
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].domain, RecoveryDomain::Chat);
         assert!(scheduled[0].claim_epoch > prior_claim.claim_epoch);
+    }
+
+    #[tokio::test]
+    async fn restart_context_claim_reuses_same_objective_and_authorizes_one_recompaction() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-context-restart".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some("session-context-restart".into()),
+                root_turn_id: Some("turn-context-anchor".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "context-restart-test".into(),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES ('turn-context-active', 'session-context-restart', ?)",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, resume_cursor, created_at, updated_at)
+             VALUES ('binding-context-restart', ?, 'chat', 'chat_root_turn',
+                     'turn-context-active', 2, 'sha256:context-restart',
+                     'turn-context-active', ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let waiting = DecisionRouter::route(
+            &objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Context,
+                failure_code: "context_overflow_after_compaction".into(),
+                failure_signature: "sha256:context-restart".into(),
+                next_observation_at: now - 1,
+                resume_cursor: Some("turn-context-active".into()),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(objective.revision, waiting)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_recovery_attempts
+             (id, objective_id, root_turn_id, delivery_run_id, domain, attempt_index,
+              failure_code, failure_class, output_started, side_effect_started,
+              queue_wait_ms, runtime_ms, process_instance, resume_owner,
+              terminal_decision, created_at)
+             VALUES ('attempt-context-restart', ?, 'turn-context-active', NULL, 'context', 1,
+                     'CONTEXT_OVERFLOW_AFTER_COMPACTION', 'context_capacity', 0, 0,
+                     NULL, NULL, 'prior-process', 'agent_loop', 'waiting_system', ?)",
+        )
+        .bind(&objective.id)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let prior_claim = store
+            .claim_due_remediations("prior-process", 1, 1_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        sqlx::query("UPDATE objective_remediations SET lease_expires_at=? WHERE id=?")
+            .bind(now - 1)
+            .bind(&prior_claim.remediation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objectives SET lease_expires_at=? WHERE id=?")
+            .bind(now - 1)
+            .bind(&objective.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let scheduled = Arc::new(Mutex::new(Vec::new()));
+        let scheduled_claims = scheduled.clone();
+        assert_eq!(
+            poll_once(&store, "replacement-process", 1, 30_000, move |claim| {
+                scheduled_claims.lock().unwrap().push(claim)
+            },)
+            .await
+            .unwrap(),
+            1,
+        );
+        let claim = scheduled.lock().unwrap().pop().unwrap();
+        assert_eq!(claim.objective.id, objective.id);
+        assert_eq!(
+            claim.objective.root_turn_id.as_deref(),
+            Some("turn-context-anchor")
+        );
+        assert_eq!(
+            claim.objective.resume_cursor.as_deref(),
+            Some("turn-context-active")
+        );
+        assert_eq!(claim.binding_id.as_deref(), Some("binding-context-restart"));
+        assert_eq!(claim.resource_generation, Some(2));
+        assert!(claim.claim_epoch > prior_claim.claim_epoch);
+
+        let permit = mutation_permit(&claim, "replacement-process");
+        let adapter = DEFAULT_ADAPTER_REGISTRY
+            .adapter_for(RecoveryDomain::Context)
+            .unwrap();
+        let execution_count = Arc::new(AtomicUsize::new(0));
+        let observed_count = execution_count.clone();
+        let observed_pool = pool.clone();
+        let observed_claim = claim.clone();
+        let observed_objective = claim.objective.clone();
+        let observed_permit = permit.clone();
+        drive_adapter(
+            adapter,
+            &store,
+            &claim,
+            &permit,
+            move |executor| async move {
+                assert_eq!(executor, AdapterExecutor::Context);
+                let authorization = match crate::agent::context_recovery::ContextRecoveryStore::new(
+                    observed_pool.clone(),
+                )
+                .reserve_claimed_recovery(&observed_claim, &observed_permit)
+                .await
+                .map_err(|error| crate::errors::AppError::Other(error.to_string()))?
+                {
+                    crate::agent::context_recovery::ContextRecoveryReservation::Authorized(
+                        authorization,
+                    ) => authorization,
+                    other => {
+                        return Err(crate::errors::AppError::Other(format!(
+                            "expected durable Context authorization, got {other:?}"
+                        )))
+                    }
+                };
+                assert!(crate::agent::claimed_context_compression_authorization(
+                    &observed_objective,
+                    &observed_permit,
+                    authorization,
+                )
+                .is_some());
+                observed_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(execution_count.load(Ordering::SeqCst), 1);
+
+        let expired = chrono::Utc::now().timestamp_millis() - 1;
+        sqlx::query("UPDATE objective_remediations SET lease_expires_at=? WHERE id=?")
+            .bind(expired)
+            .bind(&claim.remediation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objectives SET lease_expires_at=? WHERE id=?")
+            .bind(expired)
+            .bind(&objective.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let replacement = store
+            .claim_due_remediations("competing-process", 1, 30_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let replacement_permit = mutation_permit(&replacement, "competing-process");
+        assert!(matches!(
+            crate::agent::context_recovery::ContextRecoveryStore::new(pool.clone())
+                .reserve_claimed_recovery(&replacement, &replacement_permit)
+                .await
+                .unwrap(),
+            crate::agent::context_recovery::ContextRecoveryReservation::ObserveOnly(
+                crate::agent::context_recovery::ContextRecoveryDisposition::ObserveOnlyAuthorizationConsumed
+            )
+        ));
+        assert_eq!(
+            poll_once(&store, "third-process", 1, 30_000, |_| {})
+                .await
+                .unwrap(),
+            0,
+            "a live replacement claim must fence duplicate restart execution",
+        );
+    }
+
+    #[tokio::test]
+    async fn context_authorization_is_fenced_when_steer_advances_cursor_before_provider() {
+        let (pool, store, claim, permit, authorization) =
+            claimed_context_recovery_authorization("stale-before-provider").await;
+        assert!(
+            crate::agent::context_recovery::ContextRecoveryStore::new(pool.clone())
+                .authorization_is_current(&authorization, &permit)
+                .await
+                .unwrap()
+        );
+
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE objectives SET revision=revision+1, domain='chat', status='active',
+                    decision_type='continue', resume_cursor='turn-context-new',
+                    remediation_id=NULL, lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+             WHERE id=?",
+        )
+        .bind(now)
+        .bind(&claim.objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE objective_remediations SET status='superseded', lease_owner=NULL,
+                    lease_expires_at=NULL, updated_at=? WHERE id=?",
+        )
+        .bind(now)
+        .bind(&claim.remediation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            !crate::agent::context_recovery::ContextRecoveryStore::new(pool)
+                .authorization_is_current(&authorization, &permit)
+                .await
+                .unwrap()
+        );
+        assert!(!store.claim_is_current(&permit).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn real_agent_loop_revalidates_durable_context_claim_after_window_lookup() {
+        let (pool, _store, claim, permit, authorization) =
+            claimed_context_recovery_authorization("loop-final-fence").await;
+        let policy = Arc::new(AdvancingContextPolicy {
+            pool: pool.clone(),
+            objective_id: claim.objective.id.clone(),
+            remediation_id: claim.remediation_id.clone(),
+            advanced: AtomicUsize::new(0),
+        });
+        let transport = Arc::new(NoCallContextTransport::default());
+        let compactor = Arc::new(CountingContextCompactor::default());
+        let persistence = Arc::new(CountingContextPersistence::default());
+        let events = Arc::new(codefactory_agent_loop::events::CollectingEventSink::new());
+        let services = codefactory_agent_loop::run::LoopServices {
+            transport: transport.clone(),
+            tools: Arc::new(NoCallContextTools),
+            persistence: persistence.clone(),
+            events: events.clone(),
+            budget: Arc::new(codefactory_agent_loop::journal::NullBudget),
+            compactor: compactor.clone(),
+            context_compaction_gate: Arc::new(
+                crate::agent::context_recovery::DurableContextCompactionGate::new(
+                    pool,
+                    authorization,
+                    permit.clone(),
+                ),
+            ),
+            permission: Arc::new(codefactory_agent_loop::services::AllowAllPermissions),
+            hooks: Arc::new(codefactory_agent_loop::services::NoOpHooks),
+            context_policy: policy.clone(),
+            fact_checker: Arc::new(codefactory_agent_loop::services::NoOpFactChecker),
+            steer: Arc::new(codefactory_agent_loop::services::NoSteering),
+        };
+        let inputs = codefactory_agent_loop::run::LoopInputs {
+            messages: vec![codefactory_agent_loop::types::ChatMessage {
+                role: "user".into(),
+                content: codefactory_agent_loop::types::MessageContent::Text(
+                    "continue the exact objective".into(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            }],
+            system_prompt: "system".into(),
+            tool_defs: Vec::new(),
+            completion_instruction: "continue the exact objective".into(),
+            fact_check_instruction: String::new(),
+            audit_session_id: "audit-context-loop".into(),
+            root_turn_id: claim.objective.resume_cursor.clone(),
+            mutation_permit: Some(permit),
+            knowledge_library_ids: None,
+            cancel: None,
+        };
+        let config = codefactory_agent_loop::run::RunConfig {
+            finalization: codefactory_agent_loop::run::FinalizationPolicy::ReleaseWithWarning,
+            turn_capability: codefactory_agent_loop::run::TurnCapability::Implement,
+            gate_benchmark: false,
+            progress_window: 8,
+            recovery_limit: 0,
+            max_iterations: 1,
+            wall_budget_applies: false,
+            context_compression: true,
+            overload_backoff: false,
+            overload_retry_delays: [std::time::Duration::ZERO; 2],
+            inspection_budget: false,
+            replay_rejected_draft: false,
+            tool_heartbeat_interval: None,
+            long_tool_wait_threshold: std::time::Duration::from_secs(60),
+            tool_amplification_threshold: None,
+            session_id: "session-context-loop".into(),
+            endpoint_name: "test".into(),
+            model_id: "model".into(),
+            base_url: "http://example.invalid".into(),
+            usage_run_id: "usage-context-loop".into(),
+            surface: "interactive".into(),
+            task_id: None,
+            anonymous: false,
+            is_chatgpt: false,
+            cwd: std::path::PathBuf::from("/tmp"),
+        };
+
+        let error = codefactory_agent_loop::run::run_agent_loop(inputs, config, services)
+            .await
+            .expect_err("stale Objective must be fenced before compaction");
+
+        assert!(error.to_string().contains("CONTEXT_RECOVERY_FENCED"));
+        assert_eq!(policy.advanced.load(Ordering::SeqCst), 1);
+        assert_eq!(compactor.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(persistence.recovery_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(persistence.notices.load(Ordering::SeqCst), 0);
+        assert!(!events.events().iter().any(|event| matches!(
+            event,
+            codefactory_agent_loop::types::StreamEvent::ContextCompressed { .. }
+        )));
     }
 
     #[tokio::test]

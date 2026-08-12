@@ -2492,6 +2492,24 @@ pub(crate) async fn resume_chat_objective(
     objective: crate::agent::objective::ObjectiveSnapshot,
     mutation_permit: codefactory_agent_loop::tool::MutationPermit,
 ) -> Result<(), AppError> {
+    resume_chat_objective_inner(app, objective, mutation_permit, None).await
+}
+
+pub(crate) async fn resume_context_objective(
+    app: AppHandle,
+    objective: crate::agent::objective::ObjectiveSnapshot,
+    mutation_permit: codefactory_agent_loop::tool::MutationPermit,
+    authorization: crate::agent::context_recovery::ContextRecoveryAuthorization,
+) -> Result<(), AppError> {
+    resume_chat_objective_inner(app, objective, mutation_permit, Some(authorization)).await
+}
+
+async fn resume_chat_objective_inner(
+    app: AppHandle,
+    objective: crate::agent::objective::ObjectiveSnapshot,
+    mutation_permit: codefactory_agent_loop::tool::MutationPermit,
+    context_authorization: Option<crate::agent::context_recovery::ContextRecoveryAuthorization>,
+) -> Result<(), AppError> {
     use crate::agent::objective::{ObjectiveKind, ObjectiveStatus};
 
     if objective.status != ObjectiveStatus::WaitingSystem {
@@ -2649,8 +2667,13 @@ pub(crate) async fn resume_chat_objective(
     };
 
     let event_name = format!("stream:{session_id}");
-    let force_context_compression =
-        crate::agent::claimed_context_compression_authorization(&objective, &mutation_permit);
+    let force_context_compression = context_authorization.and_then(|authorization| {
+        crate::agent::claimed_context_compression_authorization(
+            &objective,
+            &mutation_permit,
+            authorization,
+        )
+    });
     let app_for_run = app.clone();
     let db_for_run = db.clone();
     let session_for_run = session_id.clone();

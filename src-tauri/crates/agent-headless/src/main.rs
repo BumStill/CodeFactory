@@ -256,6 +256,9 @@ where
             max_chars: MAX_CONTEXT_CHARS,
             history: history.clone(),
         }),
+        context_compaction_gate: std::sync::Arc::new(
+            codefactory_agent_loop::services::AllowAllContextCompaction,
+        ),
     };
 
     let outcome = codefactory_agent_loop::run::run_agent_loop(inputs, run_config, services).await;
