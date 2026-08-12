@@ -6263,14 +6263,15 @@ mod tests {
         let now = Utc::now().timestamp_millis();
         sqlx::query(
             "INSERT INTO chat_run_controls
-             (run_instance_id, session_id, root_turn_id, objective_id, status,
+             (run_instance_id, session_id, root_turn_id, objective_id, objective_revision, status,
               created_process_instance, cancel_requested_at, created_at, updated_at)
-             VALUES ('run-cancel-before-finished', ?, ?, ?, 'cancel_requested',
+             VALUES ('run-cancel-before-finished', ?, ?, ?, ?, 'cancel_requested',
                      'process-before-finished', ?, ?, ?)",
         )
         .bind(objective.session_id.as_deref().unwrap())
         .bind(objective.root_turn_id.as_deref().unwrap())
         .bind(&objective.id)
+        .bind(objective.revision)
         .bind(now)
         .bind(now)
         .bind(now)
