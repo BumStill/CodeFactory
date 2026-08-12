@@ -14,9 +14,9 @@
 
 ## Current State
 
-- Current phase: 第三批 composer 密度与可访问性实现完成，等待 PR、CI、release 与公开产物验收
-- Current checkpoint: R32 已实现单一内嵌工具栏、默认值渐进隐藏、思考并入模型面板和高对比 control/focus token；失败优先测试、577 项全量前端回归、production build、治理门禁均通过。真实 CodeFactoryDev 已验证草稿/活跃会话、最小约 800px 窗口、项目/匿名/模型弹层和键盘回焦；仍保持 `not live`。
-- Next owner: 在 PR CI 运行新增的 375px compact-composer headless viewport gate，随后按 `merge → release → public artifact → installed-app` 完成交付；再继续 R18、R30 的其余 VoiceOver 路径与既有 P2 backlog。
+- Current phase: 第三批 composer 密度与可访问性已随 v1.81.0 公开发布并通过正式安装产物验收
+- Current checkpoint: R32 已完成单一内嵌工具栏、默认值渐进隐藏、思考并入模型面板、高对比 control/focus token，以及 375px compact-composer viewport 门禁。PR #366、main CI、v1.81.0 macOS/Windows 构建、安装后 GUI、Windows Evolution 闭环与匿名公开 DMG GUI 均通过，状态为 `live`。
+- Next owner: 继续 R18、R30 的其余 VoiceOver 路径与既有 P2 backlog；不得用本次浏览器/发布 GUI 证据冒充尚未执行的 VoiceOver 专项验收。
 - Updated at: 2026-08-12
 
 ## Completed Items
@@ -56,7 +56,7 @@
 - [x] 第二批：R29 正文/composer 同一 880px 网格，多视口无页面级横向溢出。
 - [ ] 第二批：R30 图标命中区、VoiceOver、200% zoom 和 reduced-motion 放行。
 - [x] 第二批：R31 PR/CI/merge/release/public artifact/正式 App 完整上线证据。
-- [ ] 第三批：R32 composer 单一内嵌工具栏、默认值渐进隐藏、思考并入模型面板，以及 375px/200% zoom 密度放行。
+- [x] 第三批：R32 composer 单一内嵌工具栏、默认值渐进隐藏、思考并入模型面板，以及 375px/200% zoom 密度放行。
 - [ ] 无障碍 P2：补齐消息/工具/任务 disclosure 的 `aria-controls`，项目选择与会话菜单键盘模式，以及 ImagePreview 初始聚焦、focus trap、回焦和最小 11px 说明。
 - [ ] 测试/性能 P2：清理 Workspace `act(...)` 警告，并单独治理 Vite 既存大 chunk 提示。
 
@@ -73,6 +73,8 @@
   - PR #362：最新 head 的 `governance-baseline`、`agent-bridge-linux`、`check-frontend`、`check-rust` 与 `remote-real-app-gui` 全部通过，PR 为 `MERGEABLE/CLEAN` 且相对 `origin/main` 无落后。
   - 锁屏无关桌面证据：GitHub macOS runner 从 PR #362 精确 head 构建并启动真实 debug App，窗口状态 `ok`，尺寸 `1024×674`，截图 `1136×786`；截图可见模型入口已进入 composer footer、顶栏无旧模型/思考/权限重复控件。该证据证明 Tauri 壳与候选渲染，不冒充未执行的本机 VoiceOver、200% zoom 或 child WebView 接管路径。
   - 本机边界：CodeFactoryDev 读取被 macOS 锁屏拒绝；未请求绕过系统锁。R30 的 44px、accessible name、focus 与 overlay 契约有 component/TypeScript/build 证据；VoiceOver/200% 本机交互保持未验证，发布后由锁屏无关 headless/远端 release artifact 分层证据承接，不能互相冒充。
+  - 第三批失败优先与回归：compact composer 契约先产生 9 项预期红灯；实现及独立 review 修正 portal 焦点、键盘菜单、focus 对比度、36/44px 命中区与真实验收脚本后，最终 `pnpm test -- --reporter=dot` 为 109 files / 592 tests passed，TypeScript、production build、governance 与 `git diff --check` 通过。
+  - 第三批真实 UI：本地 CodeFactoryDev 验证草稿/活跃会话、最小约 800px 窗口、项目/匿名/模型弹层、键盘回焦和无页面级横向溢出；PR #366 精确 head 与 main merge SHA 的远端可见桌面/compact-composer headless viewport gate 均通过，覆盖 375px 和 200% 等效 CSS viewport。
   - 第二批 browser 边界：child WebView 只提供 lease 初始 URL 的独立 Phase-1 预览，与 Agent 的 `LOCAL` ChromiumDriver 不共享 Cookie、DOM、导航或控制权；不得宣称实时观察/接管。
   - `pnpm test`：89 files / 447 tests passed。
   - `pnpm build`：TypeScript + Vite production build passed。
@@ -90,6 +92,10 @@
   - Auto Release run `31489599245` 通过仅含四个版本 manifest 的 PR #363，merge/tag SHA 为 `4c2fd733`；Release run `31490295360` 的 changelog、prepare、Windows Evolution closed loop、macOS 安装产物 GUI、finalize/publish 和匿名公开 DMG GUI 复验全部通过。
   - v1.80.0 为公开非 Draft、非 prerelease latest release，精确包含 macOS DMG、Windows NSIS、Windows `.sig`、macOS updater archive、macOS `.sig` 与 `latest.json` 六个资产。`latest.json` 版本为 `1.80.0`，三个平台 URL 均指向 v1.80.0 且签名非空。
   - 发布后公开 DMG SHA-256 为 `177b855ad8c1ceb32e5e8d130558f020cce083c023ddfc0e1ef6a865c46a2a27`，与 GitHub asset digest 一致，`hdiutil verify` 通过；published release receipt 的 `app_version=1.80.0`、`build_git_sha=4c2fd733…`、`status=pass`，窗口 `1024×674`、proof tier 为 `published-release-artifact-gui`。
+  - 第三批由 PR #366 合并为 `df102ee5e8b2bb50dcfcfc42499d880cce1dc608`，main commit 保留 `Release-Urgency: immediate`；PR head 的 governance、bridge、frontend、Rust 与 remote-real-app-gui 五项门禁全部通过，合并后 main CI 再次通过完整前端、Rust、bridge、compact composer viewport 与可执行 smoke。
+  - Auto Release run `31563584525` 判定目标 `v1.81.0`，版本 PR #371 严格只改四个版本 manifest，五项门禁全绿后合并为 `bdba0957d6481ceb663b4e6633745c67f23e2bb0`；`v1.81.0` tag 与 main 精确指向该 SHA。
+  - Release run `31564024087` 全部成功：changelog、tag prepare、Windows 构建与 Evolution 闭环、macOS 构建与已安装产物 GUI、finalize/publish、匿名公开 DMG 下载后 GUI 均通过。公开 release 非 Draft、非 prerelease，六个资产齐全；`latest.json` 版本为 `1.81.0`，Windows x86_64 / NSIS 与 Darwin arm64 URL 均指向 v1.81.0 且签名非空。
+  - 匿名下载的 v1.81.0 DMG GUI receipt 为 `proof_tier=published-release-artifact-gui`、窗口 `1024×674`；功能 verification receipt 明确记录 `app_version=1.81.0`、`build_git_sha=bdba0957…`、`status=pass`，因此公开产物身份与 tag/main 闭环。
   - macOS 分发保持仓库现行兼容通道：未使用 Apple Developer ID/公证，严格 `codesign --verify` 不作为已满足声明；Tauri updater 签名与首启 Gatekeeper 边界按 README 和 `macos-release-trust` 规格如实保留。
 - Blocking evidence: 当前无。
 
@@ -98,7 +104,7 @@
 - context scope: Workspace theme、session rail、conversation、result、composer、context、task activity、delivery、Settings/Onboarding delivery copy。
 - assumptions: 第一批不修改持久化 schema；release snapshot 当前没有 live verifier 字段；外部机器人不属于产品。
 - review point: 独立 QA 先后阻止低对比 muted/status 色、嵌套交互、抽屉焦点、窄屏、9–10px、hardcoded 状态色和 reduced-motion 缺口进入交付；逐项修复后复审。
-- validation result: 第一批与两轮用户反馈均已公开发布；第二批 R17、R19–R29 已由 PR #362 合并并随 v1.80.0 上线。R32 因用户对 v1.80.0 实际 composer 密度反馈重新打开；本地失败优先测试、全量前端、build、治理与真实 CodeFactoryDev 多状态/最小窗口路径已通过，并新增 375px 浏览器几何门禁，但当前仍保持 `not live`，直到本批 PR/CI/release/public artifact 验收完成。
+- validation result: 第一批与两轮用户反馈均已公开发布；第二批 R17、R19–R29 已由 PR #362 合并并随 v1.80.0 上线。R32 因用户对 v1.80.0 实际 composer 密度反馈重新打开，现已由 PR #366 合并并随 v1.81.0 上线；失败优先测试、全量前端、build、治理、真实 CodeFactoryDev、375px 浏览器几何、正式安装产物与匿名公开 DMG GUI 均已闭环。R18 与 R30 的其余 VoiceOver/P2 工作保持独立未完成项。
 
 ## Stop Boundary
 
