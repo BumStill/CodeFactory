@@ -833,7 +833,7 @@ export function WorkspacePage({
             externalJobs={externalJobs}
           />
           <div data-testid="workspace-composer-shell" className="shrink-0 bg-surface-2 px-3 pb-3 pt-2">
-            <div className="mx-auto w-full max-w-[880px]">
+            <div className="mx-auto w-full max-w-[var(--reading-column)]">
               {queue.length > 0 && (
                 <QueueBadge queue={queue} onRemove={removeFromQueue} />
               )}

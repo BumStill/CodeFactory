@@ -71,8 +71,11 @@ describe("MessageList theme readability", () => {
       <MessageList messages={[baseMsg()]} streaming={false} cwd={null} />,
     );
 
+    // The measure is bounded by line length, not by a pixel count. A flat
+    // `max-w-[880px]` let a line hold 68 CJK characters at the 12px setting and
+    // 41 at the 20px one, because the text scaled and the column did not.
     expect(screen.getByTestId("conversation-reading-column")).toHaveClass(
-      "max-w-[880px]",
+      "max-w-[var(--reading-column)]",
     );
   });
 

@@ -54,13 +54,16 @@ describe("首屏主题引导", () => {
     // 按最后一个 `;` 截断才拿得到真正的选择器列表。
     const selectorsOf = (blob: string): string[] =>
       blob.slice(blob.lastIndexOf(";") + 1).split(",").map((selector) => selector.trim());
-    const rule = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].find((match) =>
-      selectorsOf(match[1]).includes(":root"),
-    );
-    expect(rule, "globals.css 需要一个覆盖 :root 的规则，兜住 data-theme 写入之前的那一帧").toBeDefined();
-    const body = rule?.[2] ?? "";
+    // Every :root rule counts, not just the first one. Layout metrics live in
+    // their own :root block ahead of the palette, and matching only the first
+    // hit made this assert against that block instead of the fallback.
+    const declared = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+      .filter((match) => selectorsOf(match[1]).includes(":root"))
+      .map((match) => match[2])
+      .join("\n");
+    expect(declared, "globals.css 需要一个覆盖 :root 的规则，兜住 data-theme 写入之前的那一帧").not.toBe("");
     for (const variable of ["--surface-0", "--gray-200", "--border-color", "--accent-color"]) {
-      expect(body, `:root 兜底缺少 ${variable}`).toContain(variable);
+      expect(declared, `:root 兜底缺少 ${variable}`).toContain(variable);
     }
   });
 });
