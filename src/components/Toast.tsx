@@ -38,7 +38,7 @@ function ToastItem({ notification, onView }: ToastProps) {
         onClick={() => dismissNotification(notification.id)}
         className="p-0.5 rounded text-gray-600 hover:text-gray-300 transition-colors shrink-0"
       >
-        <X size={12} />
+        <X size={14} />
       </button>
     </div>
   );

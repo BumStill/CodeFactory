@@ -309,7 +309,7 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
                 : "text-gray-600 hover:text-gray-400"
             }`}
           >
-            <Store size={10} />
+            <Store size={14} />
             市场
           </button>
         </div>
@@ -333,7 +333,7 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
                   className="p-1.5 rounded bg-accent hover:bg-accent-hover text-white disabled:opacity-50 transition-colors"
                   title="从 URL 安装技能"
                 >
-                  <Plus size={12} />
+                  <Plus size={14} />
                 </button>
                 <button
                   onClick={handleImportDir}
@@ -341,7 +341,7 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
                   className="p-1.5 rounded bg-surface-3 hover:bg-surface-2 text-gray-300 border border-border disabled:opacity-50 transition-colors"
                   title="从本地目录导入（支持 SKILL.md，如 superpowers / openspec，可整个仓库批量导入）"
                 >
-                  <FolderOpen size={12} />
+                  <FolderOpen size={14} />
                 </button>
                 <button
                   onClick={handleImportOpenClaw}
@@ -350,7 +350,7 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
                   title="一键导入 OpenClaw 技能（自动扫描 ~/.openclaw/workspace/skills 与 ~/.claude/skills，已导入的自动跳过）"
                   aria-label="一键导入 OpenClaw 技能"
                 >
-                  <Download size={12} />
+                  <Download size={14} />
                 </button>
               </div>
               <button
@@ -360,7 +360,7 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
                 }}
                 className="w-full flex items-center justify-center gap-1 px-2 py-1 rounded bg-accent/15 hover:bg-accent/25 text-accent text-label transition-colors"
               >
-                <Plus size={11} /> 新建技能
+                <Plus size={14} /> 新建技能
               </button>
               <button
                 onClick={handlePropose}
@@ -372,7 +372,7 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
                 }
                 className="w-full flex items-center justify-center gap-1 px-2 py-1 rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-700 dark:text-emerald-300 text-label transition-colors disabled:opacity-50"
               >
-                {proposing ? <Loader2 size={11} className="animate-spin" /> : <Sparkles size={11} />}
+                {proposing ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
                 从使用习惯提议技能
               </button>
               {installError && (
@@ -414,7 +414,7 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
                             handleDelete(skill.id);
                           }}
                         >
-                          <Trash2 size={10} />
+                          <Trash2 size={14} />
                         </span>
                       )}
                     </div>
@@ -480,7 +480,7 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
                             key={tag}
                             className="flex items-center gap-0.5 px-1 py-0.5 rounded bg-surface-3 text-gray-500 text-caption"
                           >
-                            <Tag size={7} />
+                            <Tag size={14} />
                             {tag}
                           </span>
                         ))}
@@ -496,7 +496,7 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
                         {installingId === skill.id ? (
                           <span className="text-caption">...</span>
                         ) : (
-                          <Download size={10} />
+                          <Download size={14} />
                         )}
                       </button>
                     )}
@@ -642,7 +642,7 @@ function SkillFormModal({
 function MarketplaceWelcome() {
   return (
     <div className="flex-1 flex flex-col items-center justify-center gap-3 text-center px-8">
-      <Store size={32} className="text-gray-700" />
+      <Store size={24} className="text-gray-700" />
       <div>
         <h2 className="text-body font-medium text-gray-400">技能市场</h2>
         <p className="text-label text-gray-700 mt-1 max-w-xs">
@@ -680,7 +680,7 @@ function SkillDetailView({
                 key={tag}
                 className="flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-surface-3 text-gray-400 text-caption"
               >
-                <Tag size={8} />
+                <Tag size={14} />
                 {tag}
               </span>
             ))}
@@ -735,7 +735,7 @@ function SkillDetailView({
                 className="flex items-start gap-3 rounded border border-border bg-surface-1 px-3 py-2"
               >
                 <div className="flex items-center gap-1 flex-shrink-0">
-                  <Terminal size={10} className="text-accent" />
+                  <Terminal size={14} className="text-accent" />
                   <code className="text-label text-accent font-mono">/{cmd.name}</code>
                 </div>
                 <div className="flex-1 min-w-0">

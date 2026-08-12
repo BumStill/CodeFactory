@@ -30,8 +30,8 @@ const TYPE_SCALE = {
   body: 14,
   reading: 15,
   title: 16,
-  heading: 20,
-  display: 24,
+  heading: 18,
+  display: 22,
 };
 
 /** The 4px grid. These must not move when the user changes text size. */
@@ -159,7 +159,18 @@ async function main() {
         const container = heading.closest('section,article,div');
         if (!container) return;
         for (const sibling of container.querySelectorAll('p,div,span')) {
-          if (heading.contains(sibling) || !sibling.textContent.trim()) continue;
+          if (heading.contains(sibling)) continue;
+          // Only elements that own their text. A wrapper `<div>` with no
+          // font-size class inherits the 14px body default while its
+          // `textContent` reports its children's copy — comparing against that
+          // flags every heading below 14px, which is a property of the
+          // wrapper, not a hierarchy defect.
+          const ownText = [...sibling.childNodes]
+            .filter((node) => node.nodeType === 3)
+            .map((node) => node.textContent.trim())
+            .join('')
+            .trim();
+          if (!ownText) continue;
           const siblingSize = parseFloat(getComputedStyle(sibling).fontSize);
           if (siblingSize > headingSize) {
             bad.push({ heading: heading.textContent.trim().slice(0, 12), headingSize, siblingSize });

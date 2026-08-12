@@ -97,7 +97,11 @@ vi.mock("../../components/MessageList", () => ({
     </div>
   ),
 }));
-vi.mock("../../components/MessageInput", () => ({ MessageInput: () => <input aria-label="任务输入" /> }));
+vi.mock("../../components/MessageInput", () => ({
+  MessageInput: ({ toolbar }: { toolbar?: React.ReactNode }) => (
+    <div><input aria-label="任务输入" />{toolbar}</div>
+  ),
+}));
 vi.mock("../../components/ContextUsageBar", () => ({ ContextUsageBar: () => null }));
 vi.mock("../../components/PermissionDialog", () => ({
   PermissionDialog: () => <div role="dialog" aria-label="需要权限">权限确认</div>,
@@ -661,7 +665,7 @@ describe("Workspace on-demand embedded browser pane", () => {
     await user.click(screen.getByRole("button", { name: /打开任务活动/ }));
     await user.click(screen.getByRole("button", { name: "调整会话权限" }));
     expect(screen.queryByTestId("workspace-auxiliary-pane")).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole("combobox", { name: "会话权限" })).toHaveFocus());
+    await waitFor(() => expect(document.getElementById("workspace-permission-mode")).toHaveFocus());
   });
 
   it("keeps task verification controls touchable on narrow panes", async () => {

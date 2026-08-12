@@ -69,7 +69,7 @@ function IssueDetail({ issue, onBack, largeTargets }: IssueDetailProps) {
           className={`inline-flex shrink-0 items-center justify-center rounded text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
           title="在浏览器中打开"
         >
-          <ExternalLink size={12} />
+          <ExternalLink size={14} />
         </button>
       </div>
 
@@ -91,7 +91,7 @@ function IssueDetail({ issue, onBack, largeTargets }: IssueDetailProps) {
               key={l}
               className="px-1.5 py-0.5 rounded bg-status-info-soft text-status-info flex items-center gap-0.5"
             >
-              <Tag size={8} />
+              <Tag size={14} />
               {l}
             </span>
           ))}
@@ -427,7 +427,7 @@ function IssuesTab({ remotes, largeTargets }: IssuesTabProps) {
             className={`inline-flex shrink-0 items-center justify-center rounded bg-surface-3 text-gray-400 transition-colors hover:text-gray-200 disabled:opacity-50 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
             title="刷新"
           >
-            <RefreshCw size={12} className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
+            <RefreshCw size={14} className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
           </button>
           <button
             onClick={() => setNewIssueOpen(true)}
@@ -436,7 +436,7 @@ function IssuesTab({ remotes, largeTargets }: IssuesTabProps) {
             className={`inline-flex shrink-0 items-center justify-center rounded bg-surface-3 text-gray-400 transition-colors hover:text-gray-200 disabled:opacity-50 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
             title="新建问题"
           >
-            <Plus size={12} />
+            <Plus size={14} />
           </button>
         </div>
       </div>
@@ -459,7 +459,7 @@ function IssuesTab({ remotes, largeTargets }: IssuesTabProps) {
           >
             <div className="flex items-start gap-2">
               <CircleDot
-                size={12}
+                size={14}
                 className={`mt-0.5 shrink-0 ${issue.state === "open" ? "text-status-progress" : "text-gray-600"}`}
               />
               <div className="flex-1 min-w-0">
@@ -581,7 +581,7 @@ function PRsTab({ remotes, currentBranch, largeTargets }: PRsTabProps) {
             className={`inline-flex shrink-0 items-center justify-center rounded bg-surface-3 text-gray-400 transition-colors hover:text-gray-200 disabled:opacity-50 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
             title="刷新"
           >
-            <RefreshCw size={12} className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
+            <RefreshCw size={14} className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
           </button>
           <button
             onClick={() => setNewPROpen(true)}
@@ -590,7 +590,7 @@ function PRsTab({ remotes, currentBranch, largeTargets }: PRsTabProps) {
             className={`inline-flex shrink-0 items-center justify-center rounded bg-surface-3 text-gray-400 transition-colors hover:text-gray-200 disabled:opacity-50 ${largeTargets ? "h-11 w-11" : "h-9 w-9"}`}
             title="创建拉取请求"
           >
-            <Plus size={12} />
+            <Plus size={14} />
           </button>
         </div>
       </div>
@@ -612,7 +612,7 @@ function PRsTab({ remotes, currentBranch, largeTargets }: PRsTabProps) {
             className="w-full text-left px-3 py-2.5 border-b border-border hover:bg-surface-2 transition-colors group"
           >
             <div className="flex items-start gap-2">
-              <GitPullRequest size={12} className={`mt-0.5 shrink-0 ${prStateColor(pr.state)}`} />
+              <GitPullRequest size={14} className={`mt-0.5 shrink-0 ${prStateColor(pr.state)}`} />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-1.5">
                   <span className="text-caption text-gray-600 font-mono shrink-0">#{pr.number}</span>
@@ -628,7 +628,7 @@ function PRsTab({ remotes, currentBranch, largeTargets }: PRsTabProps) {
                   <span className="text-caption text-gray-600">
                     {new Date(pr.created_at).toLocaleDateString()}
                   </span>
-                  <ExternalLink size={8} className="text-gray-600 opacity-0 transition-opacity group-hover:opacity-100" />
+                  <ExternalLink size={14} className="text-gray-600 opacity-0 transition-opacity group-hover:opacity-100" />
                 </div>
               </div>
             </div>
@@ -738,7 +738,7 @@ export function RemoteGitPanel({ currentBranch, onClose, embedded = false }: Rem
                 : "border-transparent text-gray-500 hover:text-gray-300"
             }`}
           >
-            {t === "issues" ? <CircleDot size={11} /> : <GitPullRequest size={11} />}
+            {t === "issues" ? <CircleDot size={14} /> : <GitPullRequest size={14} />}
             {t === "prs" ? "拉取请求" : "问题"}
           </button>
         ))}
@@ -752,7 +752,7 @@ export function RemoteGitPanel({ currentBranch, onClose, embedded = false }: Rem
           aria-labelledby={activeTabId}
           className="flex-1 flex items-center justify-center flex-col gap-2 p-6 text-center"
         >
-          <GitPullRequest size={32} className="text-gray-600" />
+          <GitPullRequest size={24} className="text-gray-600" />
           <p className="text-label text-gray-600">未配置远程仓库。</p>
           <p className="text-caption text-gray-600">在设置中添加 GitHub 或 GitLab 远程仓库。</p>
         </div>

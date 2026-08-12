@@ -13,6 +13,7 @@ function settingsWith(defaultEndpoint: string, endpoints: Settings["endpoints"])
     auto_create_pr: false,
     theme: "dark",
     font_family: "inter",
+    mono_font_family: "jetbrains-mono",
     font_size: 14,
   } as Settings;
 }

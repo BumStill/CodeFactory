@@ -113,7 +113,7 @@ export function CostDashboardSection() {
     <section>
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-label font-semibold text-gray-400 flex items-center gap-1.5">
-          <DollarSign size={12} className="text-accent" />
+          <DollarSign size={14} className="text-accent" />
           成本透视
         </h2>
         <div className="flex items-center rounded border border-border overflow-hidden text-caption">
@@ -140,7 +140,7 @@ export function CostDashboardSection() {
         <div className="rounded-lg border border-border bg-surface-1 p-3">
           <div className="text-caption text-gray-500 mb-0.5">花费</div>
           <div className="text-title font-semibold text-gray-200 font-mono">
-            {summary ? fmtUsd(summary.cost_usd) : <Loader2 size={12} className="animate-spin inline" />}
+            {summary ? fmtUsd(summary.cost_usd) : <Loader2 size={14} className="animate-spin inline" />}
           </div>
         </div>
         <div className="rounded-lg border border-border bg-surface-1 p-3">
@@ -162,7 +162,7 @@ export function CostDashboardSection() {
         <h3 className="text-caption font-medium text-gray-400 mb-1.5">按模型</h3>
         {loading && byModel.length === 0 ? (
           <p className="text-label text-gray-500 text-center py-4 flex items-center justify-center gap-2">
-            <Loader2 size={11} className="animate-spin" /> 加载中
+            <Loader2 size={14} className="animate-spin" /> 加载中
           </p>
         ) : byModel.length === 0 ? (
           <p className="text-label text-gray-500 text-center py-4">
@@ -200,7 +200,7 @@ export function CostDashboardSection() {
       {/* Recent activity */}
       <div>
         <h3 className="text-caption font-medium text-gray-400 mb-1.5 flex items-center gap-1">
-          <Activity size={10} /> 最近活动
+          <Activity size={14} /> 最近活动
           {totalCallsAllScopes > 0 && (
             <span className="text-gray-600 font-normal">· 共 {totalCallsAllScopes} 次调用</span>
           )}

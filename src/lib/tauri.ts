@@ -616,6 +616,7 @@ export interface Settings {
   remote_postmortem_enabled?: boolean;
   theme: Theme;
   font_family: string;
+  mono_font_family: string;
   font_size: number;
   /** Default reasoning effort for reasoning-capable models (chatgpt/codex
    *  Responses path). Optional for backward compat — missing → "medium". */

@@ -1,6 +1,6 @@
 {
   "name": "codefactory",
-  "version": "1.80.2",
+  "version": "1.81.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -31,10 +31,13 @@
     "test:watch": "vitest",
     "test:scrollbar:headless": "node scripts/verify-scrollbar-auto-hide-headless.mjs",
     "test:typography:headless": "node scripts/verify-typography-headless.mjs",
+    "test:hit-target:headless": "node scripts/verify-hit-target-headless.mjs",
     "ext:build": "node scripts/build-extension.mjs",
     "verify:extension": "node scripts/verify-extension-bridge.mjs"
   },
   "dependencies": {
+    "@fontsource-variable/inter": "5.3.0",
+    "@fontsource-variable/jetbrains-mono": "5.3.0",
     "@tailwindcss/typography": "^0.5.19",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",

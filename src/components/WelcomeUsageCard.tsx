@@ -62,14 +62,14 @@ export function WelcomeUsageCard({ anonymous, onOpenUsage }: Props) {
   return (
     <section role="region" aria-label="今日用量与过去 4 周趋势" className="rounded-xl border border-border bg-surface-1 p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
-        <h2 className="text-body font-medium text-gray-300">今日用量</h2>
+        <h2 className="text-note font-medium text-gray-300">今日用量</h2>
         <button
           type="button"
           aria-label="查看用量详情"
           onClick={onOpenUsage}
-          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-caption text-accent transition-colors hover:bg-accent/10 focus:outline-none focus:ring-2 focus:ring-accent/60"
+          className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-caption text-accent transition-colors hover:bg-accent/10 focus:outline-none focus:ring-2 focus:ring-accent/60"
         >
-          查看详情<ArrowRight size={11} />
+          查看详情<ArrowRight size={14} />
         </button>
       </div>
 
@@ -107,7 +107,7 @@ export function WelcomeUsageCard({ anonymous, onOpenUsage }: Props) {
       ) : failed ? (
         <p className="text-label text-gray-400">用量统计暂不可用</p>
       ) : (
-        <p className="inline-flex items-center gap-1.5 text-label text-gray-400"><Loader2 size={11} className="animate-spin motion-reduce:animate-none" />正在读取本机用量</p>
+        <p className="inline-flex items-center gap-1.5 text-label text-gray-400"><Loader2 size={14} className="animate-spin motion-reduce:animate-none" />正在读取本机用量</p>
       )}
     </section>
   );

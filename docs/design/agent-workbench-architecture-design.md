@@ -154,7 +154,9 @@ type AuxiliaryPane =
 ## 9. 顶栏与 composer 控制边界
 
 - 顶栏负责会话身份、本地工程、交付、后台作业与设置；正常状态图标优先，当前阶段/异常保留短文字。
-- composer 负责下一回合的模型、思考强度和权限；模型在运行中变更只影响下一回合，权限说明沿用现有会话作用域。
+- composer 负责下一回合的模型、思考强度和权限；`MessageInput` 持有唯一 utility-toolbar slot，Workspace 按草稿/活跃会话注入控制，不再在输入框外平行渲染 scope、shortcut 或 runtime footer。
+- `ModelPicker` 是运行策略的单一入口，思考强度在其面板内读取当前会话 endpoint/model capability；模型在运行中变更只影响下一回合，权限说明沿用现有会话作用域。
+- 展示层按风险渐进披露，但不改变 store：单一/default endpoint、`prefer`、`standard` 与匿名关闭可视觉隐藏；匿名开启、`safe`/`trusted`、异常和用户动作不得隐藏，完整语义保留在 accessible name、tooltip 与展开面板。
 - 顶栏和 composer 不重复渲染同一运行策略控件；切换会话后所有控件必须从新会话 store 重新读取，不能串台。
 - 图标只压缩展示，不改变真相源；颜色之外必须保留形状、accessible label 和 tooltip。
 

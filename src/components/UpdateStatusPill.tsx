@@ -27,7 +27,7 @@ export function UpdateStatusPill() {
         className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent/15 border border-accent/40 text-caption text-accent hover:bg-accent/25 transition-colors animate-pulse motion-reduce:animate-none"
         title={`点击下载并安装 v${phase.update.version}`}
       >
-        <Download size={11} />
+        <Download size={14} />
         更新到 v{phase.update.version}
       </button>
     );
@@ -37,7 +37,7 @@ export function UpdateStatusPill() {
     const pct = phase.total ? Math.round((phase.received / phase.total) * 100) : 0;
     return (
       <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent/10 text-caption text-accent">
-        <RefreshCw size={11} className="animate-spin motion-reduce:animate-none" />
+        <RefreshCw size={14} className="animate-spin motion-reduce:animate-none" />
         正在下载 {pct}%
       </span>
     );
@@ -57,7 +57,7 @@ export function UpdateStatusPill() {
           phase.safetyCheckError,
         ].filter(Boolean).join(" ")}
       >
-        <RefreshCw size={11} />
+        <RefreshCw size={14} />
         {observingUnknownInstall
           ? "正在核对更新结果"
           : `等待安全更新 · ${countUpdateBlockers(phase.blockers)}`}
@@ -68,7 +68,7 @@ export function UpdateStatusPill() {
   if (phase.kind === "installing" || phase.kind === "ready") {
     return (
       <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-500/15 text-caption text-emerald-800 dark:text-emerald-300">
-        <Check size={11} />
+        <Check size={14} />
         {phase.kind === "installing" ? "安装中…" : "重启中…"}
       </span>
     );
@@ -97,8 +97,8 @@ export function UpdateStatusPill() {
           : "点击检查更新。"
       }
     >
-      {errored && <AlertCircle size={10} />}
-      {phase.kind === "checking" && <RefreshCw size={10} className="animate-spin motion-reduce:animate-none" />}
+      {errored && <AlertCircle size={14} />}
+      {phase.kind === "checking" && <RefreshCw size={14} className="animate-spin motion-reduce:animate-none" />}
       {versionText}
     </button>
   );

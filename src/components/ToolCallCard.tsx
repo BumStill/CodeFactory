@@ -277,7 +277,7 @@ function KnowledgeSourcesList({ sources }: { sources: KnowledgeSource[] }) {
         {sources.map((source, i) => (
           <div key={`${source.chunk_id ?? source.document_id ?? source.path ?? "source"}-${i}`} className="rounded border border-border bg-surface-1 px-2.5 py-2">
             <div className="flex items-center gap-2 min-w-0">
-              <BookOpen size={12} className="text-status-info shrink-0" />
+              <BookOpen size={14} className="text-status-info shrink-0" />
               <span className="text-label text-gray-200 font-medium truncate" title={source.path}>
                 {sourceDisplayName(source)}
               </span>
@@ -330,17 +330,17 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
 
   const statusIcon =
     tc.status === "waiting_permission" ? (
-      <ShieldQuestion size={12} className="text-status-warning shrink-0" />
+      <ShieldQuestion size={14} className="text-status-warning shrink-0" />
     ) : tc.status === "waiting" ? (
-      <Clock3 size={12} className="text-status-info shrink-0" aria-label="等待远端" />
+      <Clock3 size={14} className="text-status-info shrink-0" aria-label="等待远端" />
     ) : tc.status === "done" && !tc.isError ? (
-      <CheckCircle size={12} className="text-status-success shrink-0" />
+      <CheckCircle size={14} className="text-status-success shrink-0" />
     ) : tc.status === "cancelled" ? (
-      <Ban size={12} className="text-gray-500 shrink-0" aria-label="已取消" />
+      <Ban size={14} className="text-gray-500 shrink-0" aria-label="已取消" />
     ) : tc.status === "blocked" ? (
-      <AlertCircle size={12} className="text-status-warning shrink-0" aria-label="已阻断" />
+      <AlertCircle size={14} className="text-status-warning shrink-0" aria-label="已阻断" />
     ) : tc.status === "error" || tc.status === "denied" || tc.isError ? (
-      <AlertCircle size={12} className="text-status-danger shrink-0" />
+      <AlertCircle size={14} className="text-status-danger shrink-0" />
     ) : (
       <span className="w-3 h-3 rounded-full border border-accent animate-pulse motion-reduce:animate-none shrink-0" />
     );
@@ -356,20 +356,20 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
       : tc.status === "waiting_permission"
         ? "rounded-r-md border-l-2 border-status-warning/40 bg-status-warning-soft/45"
         : "rounded-r-md border-l-2 border-accent/35 bg-accent/[0.025]"
-    : "rounded-md";
+    : "rounded-lg";
 
   return (
     <div className={`my-0.5 w-fit max-w-full text-note leading-5 ${shellClass}`} data-tool-status={tc.status}>
       <button
         data-density={needsAttention ? "attention" : "compact"}
         aria-label={`${toolLabel(tc.name)}${summary ? ` · ${summary}` : ""}`}
-        className={`inline-flex min-h-7 max-w-full items-center gap-1.5 rounded-md px-1.5 text-left transition-colors hover:bg-surface-3/55 ${
+        className={`inline-flex min-h-7 max-w-full items-center gap-1.5 rounded-lg px-1.5 text-left transition-colors hover:bg-surface-3/55 ${
           needsAttention ? "py-0.5" : "py-0"
         }`}
         onClick={() => setOpen((o) => !o)}
       >
-        {open ? <ChevronDown size={12} className="text-gray-600 shrink-0" /> : <ChevronRight size={12} className="text-gray-600 shrink-0" />}
-        <Icon size={12} className={`${needsAttention ? iconClass : "text-gray-600"} shrink-0`} />
+        {open ? <ChevronDown size={14} className="text-gray-600 shrink-0" /> : <ChevronRight size={14} className="text-gray-600 shrink-0" />}
+        <Icon size={14} className={`${needsAttention ? iconClass : "text-gray-600"} shrink-0`} />
         <span className={`shrink-0 ${needsAttention ? "text-gray-300" : "text-gray-500"}`}>{toolLabel(tc.name)}</span>
         {isTestMod && (
           <span className="shrink-0 rounded bg-surface-3 px-1 py-0.5 text-caption font-medium text-gray-500">
@@ -406,7 +406,7 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
           title={`打开 ${filePath}`}
           className="ml-7 flex max-w-[calc(100%-1.75rem)] items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-label text-accent transition-colors hover:bg-surface-3"
         >
-          <ExternalLink size={11} className="shrink-0" />
+          <ExternalLink size={14} className="shrink-0" />
           <span className="truncate font-mono">{basename(filePath)}</span>
           <span className="ml-auto shrink-0 text-caption text-gray-500">打开文件</span>
         </button>

@@ -52,13 +52,13 @@ export function DocumentPreview({ tab, cwd, onClose }: Props) {
           <div className="truncate font-mono text-caption text-gray-500">{preview?.relative_path ?? tab.path}</div>
         </div>
         <button type="button" className={headerActionClass} onClick={() => void navigator.clipboard?.writeText(preview?.path ?? tab.path)} aria-label={`复制路径 ${tab.title}`}>
-          <Copy size={12} />
+          <Copy size={14} />
         </button>
         <button type="button" className={headerActionClass} onClick={() => void invoke("plugin:shell|open", { path: preview?.path ?? tab.path }).catch(() => {})} aria-label={`系统打开 ${tab.title}`}>
-          <ExternalLink size={12} />
+          <ExternalLink size={14} />
         </button>
         <button type="button" className={headerActionClass} onClick={onClose} aria-label={`关闭文档 ${tab.title}`}>
-          <X size={13} />
+          <X size={14} />
         </button>
       </header>
       {error ? (

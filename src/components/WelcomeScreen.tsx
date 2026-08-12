@@ -99,7 +99,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
         {/* Hero */}
         <section role="region" aria-label="CodeFactory 欢迎" className="flex flex-wrap items-center gap-3">
           <div className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-orange-500 to-red-600 shadow-sm">
-            <GemMark size={23} />
+            <GemMark size={20} />
           </div>
           <div className="min-w-0">
             <h1 className="text-heading font-semibold leading-tight text-gray-100">CodeFactory</h1>
@@ -107,7 +107,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
           </div>
           {activeSession && (
             <div className="flex min-w-0 flex-1 basis-full items-center gap-2 rounded-lg border border-border bg-surface-1 px-3 py-2 text-caption sm:ml-auto sm:basis-auto sm:max-w-[360px]">
-              <FolderOpen size={12} className="shrink-0 text-gray-400" />
+              <FolderOpen size={14} className="shrink-0 text-gray-400" />
               <span className="min-w-0 flex-1 truncate font-mono text-gray-400" title={activeSession.cwd}>{activeSession.cwd}</span>
               <span aria-hidden className="text-gray-500">·</span>
               <span className="max-w-[120px] truncate text-gray-300" title={activeModel}>{activeModel.split("/").pop() || activeModel}</span>
@@ -128,7 +128,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
             <span>{scopeCwd ? "这次在" : "没有指定目录，不会碰任何代码。"}</span>
             {scopeCwd && (
               <span className="inline-flex items-center gap-1 text-gray-300">
-                <Folder size={11} className="text-accent" />
+                <Folder size={14} className="text-accent" />
                 <span className="max-w-[220px] truncate" title={scopeCwd}>{folderName(scopeCwd)}</span>
                 <span className="text-gray-500">里干活</span>
               </span>
@@ -137,7 +137,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
               onClick={() => void browseForProject()}
               className="inline-flex items-center gap-1 rounded text-accent transition-colors hover:underline"
             >
-              <FolderOpen size={11} />
+              <FolderOpen size={14} />
               {scopeCwd ? "换一个目录" : "要在某个目录里干活？"}
             </button>
             {scopeCwd && (
@@ -153,7 +153,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
 
         {/* Example prompts */}
         <section className="space-y-2" aria-labelledby="welcome-suggestions-title">
-          <h2 id="welcome-suggestions-title" className="px-1 text-body font-semibold text-gray-400">可以试试</h2>
+          <h2 id="welcome-suggestions-title" className="px-1 text-note font-semibold text-gray-400">可以试试</h2>
           <div className="grid grid-cols-1 gap-2 min-[520px]:grid-cols-2">
             {EXAMPLES.map((ex) => (
               <button
@@ -162,13 +162,13 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
                 className="group rounded-lg border border-border bg-surface-1 px-3 py-2.5 text-left transition-colors hover:border-accent/40 hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-accent/50"
               >
                 <div className="flex items-center justify-between gap-2">
-                  <div className="text-body font-medium text-gray-100">{ex.title}</div>
+                  <div className="text-note font-medium text-gray-100">{ex.title}</div>
                   <ArrowRight
-                    size={12}
+                    size={14}
                     className="text-gray-600 group-hover:text-accent transition-colors shrink-0"
                   />
                 </div>
-                <div className="mt-1 line-clamp-2 text-caption leading-relaxed text-gray-400">
+                <div className="mt-1 line-clamp-2 text-label leading-relaxed text-gray-400">
                   {ex.prompt}
                 </div>
               </button>
@@ -180,7 +180,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
             says so. Everything above starts something new. */}
         {onOpenSession && (scopedSessions.length > 0 || recentSessions.length > 0) && (
           <div className="space-y-2">
-            <div className="text-body text-gray-600 font-semibold px-1 flex items-center gap-1.5">
+            <div className="text-note text-gray-600 font-semibold px-1 flex items-center gap-1.5">
               <Clock size={14} />
               继续之前的会话
             </div>
@@ -190,7 +190,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
                 className="w-full rounded border border-border bg-surface-1 px-3 py-2 text-left transition-colors hover:bg-surface-2"
               >
                 <div className="flex items-center gap-2">
-                  <RotateCcw size={11} className="shrink-0 text-accent" />
+                  <RotateCcw size={14} className="shrink-0 text-accent" />
                   <span className="min-w-0 flex-1 truncate text-label text-gray-200">
                     接着上次说：{scopedSessions[0].title || "未命名会话"}
                   </span>

@@ -106,12 +106,16 @@ describe("new-session token usage summary", () => {
   it("makes missing and zero days understandable without tiny status glyphs", async () => {
     render(<WelcomeScreen />);
     const trend = await screen.findByRole("grid", { name: "过去 4 周 Token 趋势" });
+    // The gridcell is the full-height hit area; the bar inside it carries the
+    // tone. They were the same element until the bar's own 4px height made a
+    // zero-usage day a 4px click target.
+    const barOf = (cell: HTMLElement) => cell.firstElementChild as HTMLElement;
     const missing = within(trend).getByRole("gridcell", { name: /2026-07-19.*数据缺失/ });
     const zero = within(trend).getByRole("gridcell", { name: /2026-07-20.*0 Tokens.*已记录/ });
-    expect(missing).not.toHaveClass("border-dashed");
-    expect(missing).toHaveClass("bg-accent/20");
-    expect(zero).toHaveClass("bg-accent/20");
-    expect(zero).not.toHaveClass("outline");
+    expect(barOf(missing)).not.toHaveClass("border-dashed");
+    expect(barOf(missing)).toHaveClass("bg-accent/20");
+    expect(barOf(zero)).toHaveClass("bg-accent/20");
+    expect(barOf(zero)).not.toHaveClass("outline");
     expect(trend).not.toHaveTextContent(/[×·!]/);
   });
 

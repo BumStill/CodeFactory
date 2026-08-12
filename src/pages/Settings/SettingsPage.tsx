@@ -124,7 +124,7 @@ function CustomModelsEditor({
           )}
         </span>
         <ChevronDown
-          size={11}
+          size={14}
           className={`transition-transform ${expanded ? "rotate-180" : ""}`}
         />
       </button>
@@ -158,7 +158,7 @@ function CustomModelsEditor({
                 className="p-1 text-gray-600 hover:text-red-400 transition-colors"
                 title="移除"
               >
-                <Trash2 size={12} />
+                <Trash2 size={14} />
               </button>
             </div>
           ))}
@@ -168,7 +168,7 @@ function CustomModelsEditor({
             onClick={addNew}
             className="flex items-center gap-1 text-caption text-accent hover:text-accent-hover"
           >
-            <Plus size={11} /> 添加模型
+            <Plus size={14} /> 添加模型
           </button>
         </div>
       )}
@@ -239,7 +239,7 @@ function EndpointCard({
             onClick={onDelete}
             className="p-0.5 text-gray-600 hover:text-red-400 transition-colors"
           >
-            <Trash2 size={12} />
+            <Trash2 size={14} />
           </button>
         </div>
       </div>
@@ -272,7 +272,7 @@ function EndpointCard({
             className="p-1 rounded border border-border text-gray-500 hover:text-gray-300 disabled:opacity-40 disabled:hover:text-gray-500"
             title="显示/隐藏本次输入的密钥"
           >
-            {showKey ? <EyeOff size={12} /> : <Eye size={12} />}
+            {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
           </button>
         </div>
         <p className="text-caption leading-4 text-gray-600">
@@ -315,7 +315,7 @@ function EndpointCard({
             disabled={saving}
             className="flex items-center gap-1 px-3 py-1 rounded bg-accent hover:bg-accent-hover text-label text-white transition-colors disabled:opacity-50"
           >
-            {saved ? <><Check size={11} /> 已保存</> : saving ? "保存中…" : "保存"}
+            {saved ? <><Check size={14} /> 已保存</> : saving ? "保存中…" : "保存"}
           </button>
         </div>
       )}
@@ -393,7 +393,7 @@ function AddEndpointModal({
 
         {err && (
           <div className="flex items-center gap-1 text-label text-red-400">
-            <AlertCircle size={12} /> {err}
+            <AlertCircle size={14} /> {err}
           </div>
         )}
 
@@ -726,7 +726,7 @@ export function SettingsPage({
                     <span className="block text-body font-medium text-gray-100">{label}</span>
                     <span className="mt-0.5 block text-caption leading-4 text-gray-400">{description}</span>
                   </span>
-                  <ArrowRight size={13} className="shrink-0 text-gray-500 group-hover:text-accent" />
+                  <ArrowRight size={14} className="shrink-0 text-gray-500 group-hover:text-accent" />
                 </button>
               ))}
             </div>
@@ -783,7 +783,7 @@ export function SettingsPage({
                 onClick={() => setShowAddEp(true)}
                 className="flex items-center gap-1 px-2 py-1 rounded text-label text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors border border-border"
               >
-                <Plus size={11} /> 添加端点
+                <Plus size={14} /> 添加端点
               </button>
             </div>
 
@@ -1187,7 +1187,7 @@ export function SettingsPage({
                 onClick={handleSaveGeneral}
                 className="flex items-center gap-1 px-4 py-1.5 rounded bg-accent hover:bg-accent-hover text-label text-white transition-colors"
               >
-                {generalSaved ? <><Check size={11} /> 已保存</> : "保存"}
+                {generalSaved ? <><Check size={14} /> 已保存</> : "保存"}
               </button>
             </div>
 
@@ -1265,7 +1265,7 @@ function BrowserSessionsTab() {
           disabled={loading}
           className="flex items-center gap-1 rounded border border-border bg-surface-1 px-2.5 py-1.5 text-label text-gray-400 hover:text-gray-200 disabled:opacity-50"
         >
-          <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+          <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
           刷新
         </button>
       </div>
@@ -1290,7 +1290,7 @@ function BrowserSessionsTab() {
 
       {!loading && sessions.length === 0 && (
         <div className="flex items-center gap-3 rounded-xl border border-border bg-surface-1 p-4 text-body text-gray-400">
-          <PanelTop size={18} className="text-emerald-400" />
+          <PanelTop size={20} className="text-emerald-400" />
           当前没有活动的 CodeFactory 自动化浏览器。
         </div>
       )}
@@ -1394,7 +1394,7 @@ function HooksTab() {
           aria-label="打开添加钩子表单"
           className="flex items-center gap-1 px-2 py-1 rounded text-label text-gray-500 hover:text-gray-300 hover:bg-surface-3 border border-border transition-colors"
         >
-          <Plus size={11} /> 添加钩子
+          <Plus size={14} /> 添加钩子
         </button>
       </div>
 
@@ -1426,7 +1426,7 @@ function HooksTab() {
               aria-label={`删除钩子 ${hook.name}`}
               className="text-caption text-red-700 hover:text-red-400 px-1.5 py-0.5 rounded transition-colors"
             >
-              <Trash2 size={10} />
+              <Trash2 size={14} />
             </button>
           </div>
           <div className="text-caption text-gray-600 font-mono truncate">
@@ -1572,7 +1572,7 @@ function RemotesTab() {
           aria-label="打开添加远程仓库表单"
           className="flex items-center gap-1 px-2 py-1 rounded text-label text-gray-500 hover:text-gray-300 hover:bg-surface-3 border border-border transition-colors"
         >
-          <Plus size={11} /> 添加远程仓库
+          <Plus size={14} /> 添加远程仓库
         </button>
       </div>
 
@@ -1617,7 +1617,7 @@ function RemotesTab() {
               aria-label={`删除远程仓库 ${remote.name}`}
               className="text-caption text-red-700 hover:text-red-400 px-1.5 py-0.5 rounded transition-colors"
             >
-              <Trash2 size={10} />
+              <Trash2 size={14} />
             </button>
           </div>
           {testResults[remote.id] && (
@@ -1712,7 +1712,7 @@ function AddRemoteForm({
               className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
             <button onClick={() => setShowToken((v) => !v)}
               className="p-1 rounded border border-border text-gray-500 hover:text-gray-300">
-              {showToken ? <EyeOff size={12} /> : <Eye size={12} />}
+              {showToken ? <EyeOff size={14} /> : <Eye size={14} />}
             </button>
           </div>
         </div>
@@ -1740,13 +1740,15 @@ import { Moon, Sun, Monitor } from "lucide-react";
 import {
   FONT_FAMILIES,
   FONT_FAMILY_LABELS,
+  MONO_FONT_FAMILIES,
+  MONO_FONT_FAMILY_LABELS,
   FONT_SIZE_MIN,
   FONT_SIZE_MAX,
 } from "../../stores/settings";
 import type { Theme } from "../../lib/tauri";
 
 function AppearanceTab() {
-  const { settings, setTheme, setFontFamily, setFontSize } = useSettingsStore();
+  const { settings, setTheme, setFontFamily, setMonoFontFamily, setFontSize } = useSettingsStore();
   if (!settings) return null;
 
   const themeOptions: { value: Theme; Icon: React.ElementType; label: string }[] = [
@@ -1779,26 +1781,59 @@ function AppearanceTab() {
         </div>
       </div>
 
-      {/* Font family */}
+      {/* Font families — interface and monospace are separate choices. They used
+          to be one setting, which let JetBrains Mono be picked as the *UI* font;
+          it has no CJK glyphs, so the interface became monospace Latin mixed
+          with proportional Chinese. The previews below deliberately include
+          Chinese, because that is where the two stacks actually differ. */}
       <div>
-        <h2 className="text-label font-semibold text-gray-400 mb-3">字体</h2>
+        <h2 className="text-label font-semibold text-gray-400 mb-3">界面字体</h2>
         <div className="flex flex-col gap-2">
           {Object.entries(FONT_FAMILY_LABELS).map(([key, label]) => (
             <button
               key={key}
               onClick={() => setFontFamily(key)}
-              className={`flex items-center justify-between px-3 py-2 rounded-lg border text-label transition-colors ${
+              className={`flex items-center justify-between gap-3 px-3 py-2 rounded-lg border text-label transition-colors ${
                 settings.font_family === key
                   ? "border-accent bg-surface-3 text-gray-200"
                   : "border-border bg-surface-2 text-gray-400 hover:border-gray-500 hover:text-gray-300"
               }`}
             >
-              <span>{label}</span>
+              <span className="shrink-0">{label}</span>
               <span
-                className="text-gray-500"
+                className="truncate text-gray-500"
                 style={{ fontFamily: FONT_FAMILIES[key] }}
               >
-                Aa Bb Cc
+                Aa Bb Cc 中文示例 123
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Monospace font */}
+      <div>
+        <h2 className="text-label font-semibold text-gray-400 mb-3">
+          等宽字体
+          <span className="ml-2 font-normal text-gray-500">用于代码、路径和终端输出</span>
+        </h2>
+        <div className="flex flex-col gap-2">
+          {Object.entries(MONO_FONT_FAMILY_LABELS).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setMonoFontFamily(key)}
+              className={`flex items-center justify-between gap-3 px-3 py-2 rounded-lg border text-label transition-colors ${
+                settings.mono_font_family === key
+                  ? "border-accent bg-surface-3 text-gray-200"
+                  : "border-border bg-surface-2 text-gray-400 hover:border-gray-500 hover:text-gray-300"
+              }`}
+            >
+              <span className="shrink-0">{label}</span>
+              <span
+                className="truncate text-gray-500"
+                style={{ fontFamily: MONO_FONT_FAMILIES[key] }}
+              >
+                const x = 0;
               </span>
             </button>
           ))}
@@ -1929,7 +1964,7 @@ function BrowserBridgePanel() {
               「开发者模式」→ 点「加载已解压的扩展程序」→ 选下面这个目录。
             </p>
 
-            <div className="flex items-center gap-2 rounded-md border border-border/70 bg-surface-2 p-2.5">
+            <div className="flex items-center gap-2 rounded-lg border border-border/70 bg-surface-2 p-2.5">
               <span className="min-w-0 flex-1 truncate font-mono text-caption text-gray-300">
                 {state.dir}
               </span>
@@ -1963,7 +1998,7 @@ function BrowserBridgePanel() {
 
             <details className="text-label text-gray-500">
               <summary className="cursor-pointer">手动配对(一般不需要)</summary>
-              <div className="mt-2 grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded-md border border-border/70 bg-surface-2 p-2.5">
+              <div className="mt-2 grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded-lg border border-border/70 bg-surface-2 p-2.5">
                 <span className="text-gray-500">端口</span>
                 <span className="font-mono text-gray-200">{state.port}</span>
                 <button
@@ -2075,7 +2110,7 @@ function ChromiumFallbackPanel() {
         <p className="text-label text-gray-600">版本 {status.version}</p>
       ) : progress ? (
         <p className="flex items-center gap-1.5 text-label text-gray-400">
-          <RefreshCw size={11} className="animate-spin" />
+          <RefreshCw size={14} className="animate-spin" />
           {progress}
         </p>
       ) : (
@@ -2278,7 +2313,7 @@ function ChatGptLoginCard() {
               disabled={busy}
               className="flex items-center gap-1.5 rounded border border-border px-2.5 py-1 text-label text-gray-400 transition-colors hover:bg-surface-3 disabled:opacity-50"
             >
-              <LogOut size={12} /> 退出登录
+              <LogOut size={14} /> 退出登录
             </button>
           </div>
         ) : flowActive ? null : (
@@ -2287,14 +2322,14 @@ function ChatGptLoginCard() {
             disabled={busy}
             className="flex shrink-0 items-center gap-1.5 rounded bg-accent px-2.5 py-1 text-label text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
           >
-            {busy ? <RefreshCw size={12} className="animate-spin" /> : <LogIn size={12} />}
+            {busy ? <RefreshCw size={14} className="animate-spin" /> : <LogIn size={14} />}
             {busy ? "正在准备验证…" : flow?.status === "expired" ? "生成新的验证链接" : "登录"}
           </button>
         )}
       </div>
 
       {flowActive && !loggedIn && (
-        <div role="status" aria-live="polite" className="space-y-2 rounded-md border border-border/70 bg-surface-2 p-2.5">
+        <div role="status" aria-live="polite" className="space-y-2 rounded-lg border border-border/70 bg-surface-2 p-2.5">
           <div>
             <p className="text-label font-medium text-gray-200">
               {flow.status === "exchanging" ? "正在完成 ChatGPT 验证" : "在浏览器中完成 ChatGPT 验证"}
@@ -2337,7 +2372,7 @@ function ChatGptLoginCard() {
       )}
       {error && (
         <p className="flex items-start gap-1.5 text-label leading-5 text-rose-500">
-          <AlertCircle size={12} className="mt-0.5 shrink-0" /> {error}
+          <AlertCircle size={14} className="mt-0.5 shrink-0" /> {error}
         </p>
       )}
 
@@ -2347,7 +2382,7 @@ function ChatGptLoginCard() {
           works, but it is not a supported channel and can stop working without
           notice — say so where the user decides, not in a changelog. */}
       <p className="flex items-start gap-1.5 border-t border-border/70 pt-2 text-caption leading-5 text-gray-500">
-        <AlertCircle size={11} className="mt-0.5 shrink-0 text-amber-600 dark:text-amber-500" />
+        <AlertCircle size={14} className="mt-0.5 shrink-0 text-amber-600 dark:text-amber-500" />
         <span>
           这是<span className="text-gray-400">非官方通道</span>：OpenAI 只为自家 Codex
           客户端提供订阅登录，未开放给第三方应用。用量记在你自己的 ChatGPT
@@ -2382,13 +2417,13 @@ function UpdateStatusLine({
     case "checking":
       return (
         <p className="flex items-center gap-1.5 text-label text-gray-400">
-          <RefreshCw size={12} className="animate-spin" /> 正在检查最新版本…
+          <RefreshCw size={14} className="animate-spin" /> 正在检查最新版本…
         </p>
       );
     case "up_to_date":
       return (
         <p className="flex flex-wrap items-center gap-1.5 text-label text-emerald-700 dark:text-emerald-400">
-          <Check size={12} />
+          <Check size={14} />
           已是最新版本{currentVersion ? ` (v${currentVersion})` : ""}。
           <span className="text-gray-600">
             上次检查 {new Date(phase.checkedAt).toLocaleTimeString()}
@@ -2399,7 +2434,7 @@ function UpdateStatusLine({
       return (
         <div className="space-y-2">
           <p className="flex items-center gap-1.5 text-label text-accent">
-            <Download size={12} /> 发现新版本{" "}
+            <Download size={14} /> 发现新版本{" "}
             <span className="font-semibold">v{phase.update.version}</span>
           </p>
           {phase.update.body && (
@@ -2411,7 +2446,7 @@ function UpdateStatusLine({
             onClick={onInstall}
             className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-label text-white transition-colors hover:bg-accent-hover"
           >
-            <Download size={12} /> 下载并安装
+            <Download size={14} /> 下载并安装
           </button>
           <p className="text-caption text-gray-600">安装完成后应用会自动重启。</p>
         </div>
@@ -2421,7 +2456,7 @@ function UpdateStatusLine({
       return (
         <div className="space-y-1.5">
           <p className="flex items-center gap-1.5 text-label text-accent">
-            <RefreshCw size={12} className="animate-spin" />
+            <RefreshCw size={14} className="animate-spin" />
             正在下载…{" "}
             {phase.total ? `${pct}%` : `${(phase.received / 1024 / 1024).toFixed(1)} MB`}
           </p>
@@ -2437,14 +2472,14 @@ function UpdateStatusLine({
     case "installing":
       return (
         <p className="flex items-center gap-1.5 text-label text-emerald-700 dark:text-emerald-400">
-          <RefreshCw size={12} className="animate-spin" /> 正在安装…
+          <RefreshCw size={14} className="animate-spin" /> 正在安装…
         </p>
       );
     case "waiting_for_safe_restart":
       return (
         <div className="space-y-1.5 text-label text-amber-700 dark:text-amber-300">
           <p className="flex items-center gap-1.5">
-            <RefreshCw size={12} /> 更新已下载，等待本地 session 安全结束。
+            <RefreshCw size={14} /> 更新已下载，等待本地 session 安全结束。
           </p>
           <p className="text-caption text-gray-600">
             当前 {countUpdateBlockers(phase.blockers)} 项工作仍在运行；归零后自动安装并重启，无需再次点击。
@@ -2454,13 +2489,13 @@ function UpdateStatusLine({
     case "ready":
       return (
         <p className="flex items-center gap-1.5 text-label text-emerald-700 dark:text-emerald-400">
-          <Check size={12} /> 安装完成，即将重启…
+          <Check size={14} /> 安装完成，即将重启…
         </p>
       );
     case "error":
       return (
         <p className="flex items-start gap-1.5 text-label text-rose-500">
-          <AlertCircle size={12} className="mt-0.5 shrink-0" />
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
           检查更新失败：{phase.message}
         </p>
       );
@@ -2497,7 +2532,7 @@ function AboutTab() {
       {/* Identity */}
       <div className="flex items-center gap-3">
         <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-accent/15 text-accent">
-          <Package size={22} />
+          <Package size={20} />
         </div>
         <div>
           <h2 className="text-title font-semibold text-gray-100">CodeFactory</h2>
@@ -2518,7 +2553,7 @@ function AboutTab() {
             disabled={busy}
             className="flex items-center gap-1.5 rounded border border-border px-3 py-1 text-label text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
           >
-            <RefreshCw size={12} className={phase.kind === "checking" ? "animate-spin" : ""} />
+            <RefreshCw size={14} className={phase.kind === "checking" ? "animate-spin" : ""} />
             {phase.kind === "checking" ? "检查中…" : "检查更新"}
           </button>
         </div>
@@ -2538,7 +2573,7 @@ function AboutTab() {
         <Github size={14} className="text-gray-400" />
         <span className="flex-1 text-left">GitHub 项目主页</span>
         <span className="font-mono text-caption text-gray-500">BumStill/CodeFactory</span>
-        <ExternalLink size={11} className="text-gray-500" />
+        <ExternalLink size={14} className="text-gray-500" />
       </button>
 
       {/* Meta */}
@@ -2628,7 +2663,7 @@ function DataSection() {
       <div className="rounded-lg border border-border bg-surface-1 p-3 space-y-2">
         <div className="text-caption text-gray-500">存储位置</div>
         <div className="flex items-center gap-2 font-mono text-caption text-gray-300">
-          <FolderOpen size={11} className="text-gray-600 shrink-0" />
+          <FolderOpen size={14} className="text-gray-600 shrink-0" />
           <span className="truncate" title={dataDir}>{dataDir || "加载中…"}</span>
         </div>
         <p className="text-caption text-gray-600 leading-relaxed">
@@ -2644,7 +2679,7 @@ function DataSection() {
           disabled={busy !== null}
           className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded border border-border bg-surface-1 hover:bg-surface-3 text-label text-gray-200 transition-colors disabled:opacity-50"
         >
-          <DownloadIcon size={12} />
+          <DownloadIcon size={14} />
           {busy === "export" ? "导出中…" : "导出备份"}
         </button>
         <button
@@ -2652,7 +2687,7 @@ function DataSection() {
           disabled={busy !== null}
           className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded border border-border bg-surface-1 hover:bg-surface-3 text-label text-gray-200 transition-colors disabled:opacity-50"
         >
-          <UploadIcon size={12} />
+          <UploadIcon size={14} />
           {busy === "import" ? "恢复中…" : "从备份恢复"}
         </button>
       </div>

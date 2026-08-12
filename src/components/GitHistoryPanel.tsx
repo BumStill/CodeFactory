@@ -71,7 +71,7 @@ export function GitHistoryPanel({ onClose, embedded = false }: Props) {
           className={`inline-flex shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-300 ${embedded && isNarrowEmbedded ? "h-11 w-11" : "h-9 w-9"}`}
           title="刷新"
         >
-          <RefreshCw size={12} className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
+          <RefreshCw size={14} className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
         </button>
         <button
           onClick={onClose}
@@ -108,9 +108,9 @@ export function GitHistoryPanel({ onClose, embedded = false }: Props) {
                 className="w-full text-left px-3 py-2 hover:bg-surface-2 transition-colors flex items-start gap-2"
               >
                 {isExpanded ? (
-                  <ChevronDown size={12} className="text-gray-600 shrink-0 mt-0.5" />
+                  <ChevronDown size={14} className="text-gray-600 shrink-0 mt-0.5" />
                 ) : (
-                  <ChevronRight size={12} className="text-gray-600 shrink-0 mt-0.5" />
+                  <ChevronRight size={14} className="text-gray-600 shrink-0 mt-0.5" />
                 )}
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 text-caption">

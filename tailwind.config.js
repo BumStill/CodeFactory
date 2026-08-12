@@ -37,13 +37,15 @@ export default {
       body:    step(14, 22), // UI body copy, list primaries, form values
       reading: step(15, 24), // chat message body — the one long-form surface
       title:   step(16, 24), // card and panel titles
-      heading: step(20, 28), // page titles
-      display: step(24, 32), // welcome headline, headline metrics
+      heading: step(18, 26), // page titles
+      display: step(22, 30), // welcome headline, headline metrics
     },
     extend: {
+      // Both stacks come from CSS variables so the user's font settings reach
+      // every `font-sans` / `font-mono` utility, not just inherited body text.
       fontFamily: {
-        sans: ["Inter", "system-ui", "sans-serif"],
-        mono: ["JetBrains Mono", "Consolas", "Menlo", "monospace"],
+        sans: "var(--font-family)",
+        mono: "var(--font-family-mono)",
       },
       colors: {
         // Surface palette — driven by CSS vars, theme-aware
@@ -55,6 +57,7 @@ export default {
           4: themeColor("--surface-4"),
         },
         border: themeColor("--border-color"),
+        "control-border": themeColor("--control-border-color"),
         accent: themeColor("--accent-color"),
         "accent-hover": themeColor("--accent-hover-color"),
         // Semantic roles keep workflow meaning consistent across every surface.

@@ -65,8 +65,13 @@ vi.mock("../../components/CheckpointsPanel", () => ({ CheckpointsPanel: () => <s
 vi.mock("../../components/ExecutionStream", () => ({ ExecutionStream: () => <span>不应出现执行流</span> }));
 vi.mock("../../components/MessageList", () => ({ MessageList: () => <div>空白会话</div> }));
 vi.mock("../../components/MessageInput", () => ({
-  MessageInput: ({ disabled, onSend }: { disabled: boolean; onSend: (text: string) => void }) => (
-    <button disabled={disabled} onClick={() => onSend("第一条消息")}>发送第一条消息</button>
+  MessageInput: ({ disabled, onSend, toolbar }: { disabled: boolean; onSend: (text: string) => void; toolbar?: React.ReactNode }) => (
+    <div>
+      <button disabled={disabled} onClick={() => onSend("第一条消息")}>发送第一条消息</button>
+      <div role="toolbar" aria-label="输入工具" className="flex min-w-0 max-w-full flex-wrap overflow-x-clip">
+        {toolbar}
+      </div>
+    </div>
   ),
 }));
 vi.mock("../../components/ContextUsageBar", () => ({ ContextUsageBar: () => null }));
@@ -110,7 +115,13 @@ describe("Workspace virtual draft", () => {
     fireEvent.click(screen.getByRole("button", { name: "展开会话侧栏" }));
     expect(screen.getByRole("complementary", { name: "会话列表" })).toBeInTheDocument();
     const composer = screen.getByTestId("workspace-composer-shell");
-    expect(within(composer).getByRole("button", { name: "选择模型" })).toHaveTextContent("模型：model");
+    const toolbar = within(composer).getByRole("toolbar", { name: "输入工具" });
+    expect(within(composer).getAllByRole("toolbar", { name: "输入工具" })).toHaveLength(1);
+    expect(toolbar).toHaveClass("min-w-0", "max-w-full", "flex-wrap");
+    expect(toolbar.className).toMatch(/overflow-(?:x-)?(?:hidden|clip)/);
+    expect(within(toolbar).getByRole("button", { name: /选择项目/ })).toBeInTheDocument();
+    expect(within(toolbar).getByRole("button", { name: "选择模型" })).toHaveTextContent("模型：model");
+    expect(within(composer).queryByRole("group", { name: "下一回合控制" })).not.toBeInTheDocument();
     expect(within(workspaceHeader).queryByRole("button", { name: "选择模型" })).not.toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "选择模型" })).toHaveLength(1);
     expect(screen.getByRole("button", { name: "发送第一条消息" })).toBeEnabled();

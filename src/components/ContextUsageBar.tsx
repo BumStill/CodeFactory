@@ -257,7 +257,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
         ref={triggerRef}
         type="button"
         data-testid="context-usage-ring"
-        className={`inline-flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-lg px-2 text-label transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9 lg:min-w-9 ${
+        className={`inline-flex min-h-[44px] min-w-[44px] items-center justify-center gap-1.5 rounded-lg px-2 text-label transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px] lg:min-w-[36px] ${
           percent == null ? "text-gray-500" : presentation.textClass
         }`}
         aria-label={`打开上下文与用量详情，${meterText}`}
@@ -326,7 +326,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
       {showToast && toast && (
         <span
           role="status"
-          className="whitespace-nowrap rounded-md bg-status-warning-soft px-1.5 py-0.5 text-caption text-status-warning"
+          className="whitespace-nowrap rounded-lg bg-status-warning-soft px-1.5 py-0.5 text-caption text-status-warning"
           title={`释放约 ${formatContextTokens(toast.tokensFreed)} tokens`}
         >
           已压缩 {toast.elidedCount} 条
@@ -349,7 +349,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
             <button
               type="button"
               aria-label="关闭上下文与用量详情"
-              className="flex h-11 w-11 items-center justify-center rounded-lg text-gray-500 hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:h-9 lg:w-9"
+              className="flex h-[44px] w-[44px] items-center justify-center rounded-lg text-gray-500 hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:h-[36px] lg:w-[36px]"
               onClick={() => closeDetail()}
             >
               <X size={14} aria-hidden="true" />
@@ -378,7 +378,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
               {sessionId && (
                 <button
                   type="button"
-                  className="min-h-11 rounded-lg px-2 text-gray-400 hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9"
+                  className="min-h-[44px] rounded-lg px-2 text-gray-400 hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
                   onClick={() => onOpenUsage("session")}
                 >
                   查看会话统计
@@ -386,7 +386,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
               )}
               <button
                 type="button"
-                className="min-h-11 rounded-lg px-2 text-gray-400 hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9"
+                className="min-h-[44px] rounded-lg px-2 text-gray-400 hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
                 onClick={() => onOpenUsage("today")}
               >
                 查看今日统计

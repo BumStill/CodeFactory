@@ -12,9 +12,9 @@
 // never opens the project's previous conversation. Choosing where to work and
 // choosing which conversation to resume are different acts, and every surface
 // that blurred them is what made "选了项目" drop users into old history.
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Folder, FolderOpen, Check, ChevronDown, EyeOff, MessageSquare } from "lucide-react";
+import { Folder, FolderOpen, Check, ChevronDown, EyeOff, MessageSquare, MoreHorizontal, X } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { folderName, type ProjectGroup } from "../lib/projects";
 
@@ -38,35 +38,52 @@ export function DraftScopeBar({
   onPickProject,
   onToggleAnonymous,
 }: DraftScopeBarProps) {
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [openMenu, setOpenMenu] = useState<"project" | "more" | null>(null);
+  const idBase = useId().replace(/:/g, "");
+  const projectMenuId = `draft-project-menu-${idBase}`;
+  const moreDialogId = `draft-more-dialog-${idBase}`;
   const [menuPosition, setMenuPosition] = useState<{ left: number; top: number } | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
-  const buttonRef = useRef<HTMLButtonElement>(null);
+  const projectButtonRef = useRef<HTMLButtonElement>(null);
+  const moreButtonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   const updateMenuPosition = () => {
-    const rect = buttonRef.current?.getBoundingClientRect();
+    const button = openMenu === "more" ? moreButtonRef.current : projectButtonRef.current;
+    const rect = button?.getBoundingClientRect();
     if (!rect) return;
+    const composerTop = button
+      ?.closest<HTMLElement>('[data-testid="message-input-control-row"]')
+      ?.getBoundingClientRect().top;
     const menuWidth = 256;
-    const menuHeight = 180;
     const gutter = 8;
+    const menuHeight = Math.min(
+      menuRef.current?.getBoundingClientRect().height || (openMenu === "more" ? 92 : 240),
+      window.innerHeight - gutter * 2,
+    );
     const maxLeft = Math.max(gutter, window.innerWidth - menuWidth - gutter);
-    const aboveTop = rect.top - menuHeight - 4;
+    // The portal belongs above the whole composer card, not merely above its
+    // trigger in the bottom toolbar. Anchoring to the trigger lets a taller
+    // project menu cover the input row once 44px touch targets are applied.
+    const aboveTop = (composerTop ?? rect.top) - menuHeight - 4;
     setMenuPosition({
       left: Math.min(Math.max(gutter, rect.left + 4), maxLeft),
       top: Math.max(gutter, aboveTop),
     });
   };
 
-  const toggleMenu = () => {
-    setMenuOpen((open) => {
-      if (!open) updateMenuPosition();
-      return !open;
-    });
+  const toggleMenu = (kind: "project" | "more") => {
+    setOpenMenu((current) => current === kind ? null : kind);
   };
 
-  useEffect(() => {
-    if (!menuOpen) return;
+  const closeMenuAndRestoreFocus = (kind: "project" | "more" | null = openMenu) => {
+    const trigger = kind === "more" ? moreButtonRef.current : projectButtonRef.current;
+    setOpenMenu(null);
+    trigger?.focus();
+  };
+
+  useLayoutEffect(() => {
+    if (!openMenu) return;
     updateMenuPosition();
     window.addEventListener("resize", updateMenuPosition);
     window.addEventListener("scroll", updateMenuPosition, true);
@@ -74,23 +91,59 @@ export function DraftScopeBar({
       window.removeEventListener("resize", updateMenuPosition);
       window.removeEventListener("scroll", updateMenuPosition, true);
     };
-  }, [menuOpen]);
+  }, [openMenu]);
 
   useEffect(() => {
-    if (!menuOpen) return;
+    if (!openMenu) return;
+    const focusFrame = requestAnimationFrame(() => {
+      menuRef.current?.querySelector<HTMLElement>("button")?.focus();
+    });
     const onClick = (e: MouseEvent) => {
       const target = e.target as Node;
       if (rootRef.current?.contains(target) || menuRef.current?.contains(target)) return;
-      setMenuOpen(false);
+      setOpenMenu(null);
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeMenuAndRestoreFocus();
     };
     document.addEventListener("mousedown", onClick);
-    return () => document.removeEventListener("mousedown", onClick);
-  }, [menuOpen]);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(focusFrame);
+      document.removeEventListener("mousedown", onClick);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [openMenu]);
 
   const browse = async () => {
+    closeMenuAndRestoreFocus("project");
     const dir = await openDialog({ directory: true, title: "选择项目目录" });
-    setMenuOpen(false);
     if (dir) onPickProject(dir as string);
+  };
+
+  const handleProjectMenuKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Tab") {
+      event.preventDefault();
+      closeMenuAndRestoreFocus("project");
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const items = Array.from(
+      menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitemradio"], [role="menuitem"]') ?? [],
+    );
+    if (items.length === 0) return;
+    const currentIndex = items.indexOf(document.activeElement as HTMLElement);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? items.length - 1
+        : event.key === "ArrowDown"
+          ? (currentIndex + 1 + items.length) % items.length
+          : (currentIndex - 1 + items.length) % items.length;
+    items[nextIndex]?.focus();
   };
 
   const label = cwd ? folderName(cwd) : "独立任务";
@@ -104,113 +157,163 @@ export function DraftScopeBar({
 
   return (
     <div
-      className="relative flex flex-wrap items-center gap-1.5 border-b border-border/60 bg-surface-1/30 px-3 py-2"
+      className="relative flex min-w-0 max-w-full flex-1 items-center gap-1"
       ref={rootRef}
     >
-      <span className="mr-0.5 shrink-0 text-caption font-medium text-gray-600">
-        新会话
-      </span>
       <button
-        ref={buttonRef}
+        ref={projectButtonRef}
         type="button"
-        onClick={toggleMenu}
-        aria-label="选择项目"
-        aria-expanded={menuOpen}
+        onClick={() => toggleMenu("project")}
+        aria-label={`选择项目：${label}`}
+        aria-expanded={openMenu === "project"}
+        aria-controls={projectMenuId}
+        aria-haspopup="menu"
         title={cwd ?? "不使用项目，只做一个独立任务"}
-        className="flex min-h-8 max-w-[240px] items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-caption text-gray-300 transition-colors hover:border-accent/40 hover:bg-surface-3 hover:text-gray-100"
+        className="flex min-h-[44px] min-w-0 max-w-[132px] shrink items-center gap-1.5 rounded-lg px-2 text-label text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:max-w-[220px] lg:min-h-[36px]"
       >
         {cwd ? (
-          <Folder size={11} className="shrink-0 text-accent" />
+          <Folder size={14} className="shrink-0 text-accent" />
         ) : (
-          <MessageSquare size={11} className="shrink-0 text-gray-500" />
+          <MessageSquare size={14} className="shrink-0 text-gray-500" />
         )}
         <span className="truncate">{label}</span>
-        <ChevronDown size={11} className="shrink-0 text-gray-600" />
+        <ChevronDown size={14} className="shrink-0 text-gray-600" />
       </button>
 
       {modelPicker && (
         <>
-          <span aria-hidden="true" className="mx-0.5 h-4 w-px shrink-0 bg-border/70" />
-          <div data-testid="draft-model-picker" className="min-w-0 max-w-full">
+          <span aria-hidden="true" className="h-4 w-px shrink-0 bg-border/70" />
+          <div data-testid="draft-model-picker" className="min-w-0 shrink">
             {modelPicker}
           </div>
         </>
       )}
 
-      <button
-        type="button"
-        onClick={() => onToggleAnonymous(!anonymous)}
-        aria-pressed={anonymous}
-        title="匿名：这次对话不留任何记录"
-        className={`flex min-h-8 items-center gap-1.5 rounded-lg border px-2.5 text-caption transition-colors ${
-          anonymous
-            ? "border-accent/50 bg-accent/10 text-accent"
-            : "border-border bg-surface-2 text-gray-500 hover:bg-surface-3 hover:text-gray-300"
-        }`}
-      >
-        <EyeOff size={11} />
-        匿名
-      </button>
-
-      <span className="min-w-[160px] flex-1 truncate px-1 text-caption text-gray-600">
-        {anonymous
-          ? "聊完不留记录"
-          : cwd
-            ? "不会打开这个项目的历史对话"
-            : "没选项目，不会碰任何代码"}
-      </span>
-
-      {menuOpen && typeof document !== "undefined" && createPortal(
+      <span className="flex-1" />
+      {anonymous ? (
         <div
-          ref={menuRef}
-          role="menu"
-          aria-label="项目选择"
-          style={menuPosition ? { left: menuPosition.left, top: menuPosition.top } : undefined}
-          className="fixed z-[100] w-64 overflow-hidden rounded-lg border border-border bg-surface-2 py-1 shadow-2xl"
+          role="status"
+          aria-label="匿名会话已开启"
+          className="flex min-h-[44px] shrink-0 items-center gap-1 rounded-lg bg-status-warning-soft pl-2 text-label font-medium text-status-warning lg:min-h-[36px]"
+          title="匿名会话：聊完不留记录"
         >
-          <p className="px-3 py-1 text-caption font-medium text-gray-600">在哪里干活</p>
+          <EyeOff size={14} aria-hidden="true" />
+          <span>匿名</span>
           <button
             type="button"
+            onClick={() => onToggleAnonymous(false)}
+            aria-label="关闭匿名会话"
+            className="flex h-[44px] w-[44px] items-center justify-center rounded-lg hover:bg-status-warning/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:h-[36px] lg:w-[36px]"
+          >
+            <X size={14} aria-hidden="true" />
+          </button>
+        </div>
+      ) : (
+        <button
+          ref={moreButtonRef}
+          type="button"
+          onClick={() => toggleMenu("more")}
+          aria-label="更多选项"
+          aria-expanded={openMenu === "more"}
+          aria-controls={moreDialogId}
+          aria-haspopup="dialog"
+          title="更多会话设置"
+          className="flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:h-[36px] lg:w-[36px]"
+        >
+          <MoreHorizontal size={16} aria-hidden="true" />
+        </button>
+      )}
+
+      {openMenu === "project" && typeof document !== "undefined" && createPortal(
+        <div
+          ref={menuRef}
+          id={projectMenuId}
+          role="menu"
+          aria-label="项目选择"
+          onKeyDown={handleProjectMenuKeyDown}
+          style={menuPosition ? { left: menuPosition.left, top: menuPosition.top } : undefined}
+          className="fixed z-[100] max-h-[calc(100vh-1rem)] w-64 overflow-y-auto rounded-lg border border-border bg-surface-2 py-1 shadow-2xl"
+        >
+          <p role="presentation" className="px-3 py-1 text-caption font-medium text-gray-600">在哪里干活</p>
+          <button
+            type="button"
+            role="menuitemradio"
+            aria-checked={cwd === null}
             onClick={() => {
               onPickProject(null);
-              setMenuOpen(false);
+              closeMenuAndRestoreFocus("project");
             }}
-            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3"
+            className="flex min-h-[44px] w-full items-center gap-2 px-3 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent lg:min-h-[36px]"
           >
-            <MessageSquare size={11} className="shrink-0 text-gray-500" />
+            <MessageSquare size={14} className="shrink-0 text-gray-500" />
             <span className="flex-1 truncate">独立任务（不使用项目）</span>
-            {cwd === null && <Check size={11} className="shrink-0 text-accent" />}
+            {cwd === null && <Check size={14} className="shrink-0 text-accent" />}
           </button>
           {options.length > 0 && (
             <>
-              <p className="mt-1 border-t border-border px-3 pb-0.5 pt-1.5 text-caption font-medium text-gray-600">
+              <p role="presentation" className="mt-1 border-t border-border px-3 pb-0.5 pt-1.5 text-caption font-medium text-gray-600">
                 最近项目
               </p>
               {options.map((project) => (
                 <button
                   key={project.cwd}
                   type="button"
+                  role="menuitemradio"
+                  aria-checked={cwd === project.cwd}
                   onClick={() => {
                     onPickProject(project.cwd);
-                    setMenuOpen(false);
+                    closeMenuAndRestoreFocus("project");
                   }}
                   title={project.cwd}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3"
+                  className="flex min-h-[44px] w-full items-center gap-2 px-3 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent lg:min-h-[36px]"
                 >
-                  <Folder size={11} className="shrink-0 text-gray-500" />
+                  <Folder size={14} className="shrink-0 text-gray-500" />
                   <span className="flex-1 truncate">{project.name}</span>
-                  {cwd === project.cwd && <Check size={11} className="shrink-0 text-accent" />}
+                  {cwd === project.cwd && <Check size={14} className="shrink-0 text-accent" />}
                 </button>
               ))}
             </>
           )}
           <button
             type="button"
+            role="menuitem"
             onClick={() => void browse()}
-            className="mt-1 flex w-full items-center gap-2 border-t border-border px-3 py-1.5 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3"
+            className="mt-1 flex min-h-[44px] w-full items-center gap-2 border-t border-border px-3 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent lg:min-h-[36px]"
           >
-            <FolderOpen size={11} className="shrink-0 text-gray-500" />
+            <FolderOpen size={14} className="shrink-0 text-gray-500" />
             <span className="flex-1">浏览目录…</span>
+          </button>
+        </div>,
+        document.body,
+      )}
+      {openMenu === "more" && typeof document !== "undefined" && createPortal(
+        <div
+          ref={menuRef}
+          id={moreDialogId}
+          role="dialog"
+          aria-label="会话设置"
+          onKeyDown={(event) => {
+            if (event.key !== "Tab") return;
+            event.preventDefault();
+            closeMenuAndRestoreFocus("more");
+          }}
+          style={menuPosition ? { left: menuPosition.left, top: menuPosition.top } : undefined}
+          className="fixed z-[100] max-h-[calc(100vh-1rem)] w-64 overflow-y-auto rounded-lg border border-border bg-surface-2 p-1 shadow-2xl"
+        >
+          <button
+            type="button"
+            role="switch"
+            aria-label="匿名会话"
+            aria-checked="false"
+            onClick={() => {
+              closeMenuAndRestoreFocus("more");
+              onToggleAnonymous(true);
+            }}
+            className="flex min-h-[44px] w-full items-center gap-2 rounded-lg px-2 text-left text-label text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
+          >
+            <EyeOff size={14} className="shrink-0 text-gray-500" aria-hidden="true" />
+            <span className="flex-1">匿名会话</span>
+            <span className="text-caption text-gray-500">不留记录</span>
           </button>
         </div>,
         document.body,

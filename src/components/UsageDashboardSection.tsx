@@ -253,7 +253,7 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
             ))}
           </div>
           <button type="button" onClick={() => void reload()} className="flex items-center gap-1 rounded border border-border px-2 py-1 text-label text-gray-500 hover:bg-surface-2 hover:text-gray-300">
-            <RefreshCw size={11} className={loading ? "animate-spin" : ""} />刷新
+            <RefreshCw size={14} className={loading ? "animate-spin" : ""} />刷新
           </button>
         </div>
       </div>
@@ -339,7 +339,7 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
               50% / 80% / 100% 阈值提醒
             </label>
             <button type="button" onClick={() => void saveBudget()} className="flex items-center justify-center gap-1 rounded bg-accent px-3 py-1.5 text-label text-white hover:bg-accent-hover sm:col-span-2">
-              {budgetSaved ? <><Check size={11} />已保存</> : "保存预算"}
+              {budgetSaved ? <><Check size={14} />已保存</> : "保存预算"}
             </button>
           </div>
         </div>
@@ -382,7 +382,7 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
           </div>
         </div>
         {loading && !dashboard ? (
-          <div className="flex h-24 items-center justify-center gap-2 text-label text-gray-500"><Loader2 size={13} className="animate-spin" />正在读取本机用量</div>
+          <div className="flex h-24 items-center justify-center gap-2 text-label text-gray-500"><Loader2 size={14} className="animate-spin" />正在读取本机用量</div>
         ) : (
           <TokenUsageHeatmap
             days={dashboard?.heatmap ?? []}
@@ -399,9 +399,9 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
       {selectedDate && (
         <section role="region" aria-label={`${selectedDate} 用量明细`} className="rounded-lg border border-border bg-surface-1 p-3">
           <div className="mb-3 flex items-center gap-2">
-            <Activity size={12} className="text-accent" />
+            <Activity size={14} className="text-accent" />
             <h3 className="text-label font-medium text-gray-300">{selectedDate} 用量明细</h3>
-            {detailLoading && <Loader2 size={11} className="animate-spin text-gray-500" />}
+            {detailLoading && <Loader2 size={14} className="animate-spin text-gray-500" />}
           </div>
           {selectedDay?.status === "missing" && (
             <p role="status" className="mb-3 rounded border border-gray-700 bg-surface-2 px-2.5 py-2 text-label text-gray-400">

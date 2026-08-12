@@ -54,7 +54,7 @@ export function UpdaterBanner() {
               className="p-0.5 text-gray-600 hover:text-gray-300 transition-colors"
               title="忽略此版本"
             >
-              <X size={12} />
+              <X size={14} />
             </button>
           </div>
           <div className="flex border-t border-border">
@@ -77,7 +77,7 @@ export function UpdaterBanner() {
       {phase.kind === "downloading" && (
         <div className="p-3 space-y-2">
           <div className="flex items-center gap-2 text-label text-gray-300">
-            <RefreshCw size={12} className="text-accent animate-spin motion-reduce:animate-none" />
+            <RefreshCw size={14} className="text-accent animate-spin motion-reduce:animate-none" />
             <span>正在下载更新…</span>
           </div>
           <div className="h-1 bg-surface-3 rounded-full overflow-hidden">
@@ -99,7 +99,7 @@ export function UpdaterBanner() {
 
       {phase.kind === "installing" && (
         <div className="flex items-center gap-2 p-3 text-label text-gray-300">
-          <RefreshCw size={12} className="text-accent animate-spin motion-reduce:animate-none" />
+          <RefreshCw size={14} className="text-accent animate-spin motion-reduce:animate-none" />
           <span>安装中…</span>
         </div>
       )}
@@ -107,7 +107,7 @@ export function UpdaterBanner() {
       {phase.kind === "waiting_for_safe_restart" && (
         <div className="p-3 space-y-1 text-label text-amber-700 dark:text-amber-300">
           <div className="flex items-center gap-2">
-            <RefreshCw size={12} />
+            <RefreshCw size={14} />
             <span>
               {phase.blockers?.update_install_state === "observe_only"
                 ? "正在核对上次安装结果…"
@@ -136,7 +136,7 @@ export function UpdaterBanner() {
 
       {phase.kind === "ready" && (
         <div className="flex items-center gap-2 p-3 text-label text-green-400">
-          <CheckCircle size={12} />
+          <CheckCircle size={14} />
           <span>已安装，正在重启…</span>
         </div>
       )}
@@ -146,7 +146,7 @@ export function UpdaterBanner() {
           attention with a giant popup. */}
       {false && phase.kind === "error" && (
         <div className="p-3 flex items-start gap-2 text-label text-red-400">
-          <AlertCircle size={12} className="shrink-0 mt-0.5" />
+          <AlertCircle size={14} className="shrink-0 mt-0.5" />
           <span className="flex-1 break-words">更新失败</span>
         </div>
       )}
