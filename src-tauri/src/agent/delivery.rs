@@ -33,7 +33,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -349,6 +349,106 @@ fn reached_state_from_steps(steps: &[StepResult]) -> String {
 
 /// Options for a single delivery call (from the agent tool). All optional so
 /// the model can invoke `deliver_changes` with no arguments in the common case.
+#[async_trait::async_trait]
+pub trait DeliveryMutationPermitVerifier: Send + Sync {
+    /// Re-validate authority immediately before one named mutation rung.
+    async fn verify(&self, rung: &str) -> Result<(), String>;
+
+    /// Commit a durable write-ahead intent before dispatching an external
+    /// mutation. Non-durable callers return `None`; a durable caller must not
+    /// dispatch until this method has committed successfully.
+    async fn begin_external_mutation(
+        &self,
+        rung: &str,
+        _operation_key: &str,
+        _evidence: &str,
+    ) -> Result<Option<DeliveryMutationIntentToken>, String> {
+        self.verify(rung).await?;
+        Ok(None)
+    }
+
+    /// Resolve a write-ahead intent only after a definitive successful result.
+    async fn commit_external_mutation(
+        &self,
+        _intent: &DeliveryMutationIntentToken,
+        _evidence: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Any timeout, cancelled future, adapter error, or settle uncertainty is
+    /// retained as `unknown`; takeover must observe the real domain before it
+    /// can grant a later mutation permit.
+    async fn mark_external_mutation_unknown(
+        &self,
+        _intent: &DeliveryMutationIntentToken,
+        _detail: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryMutationIntentToken {
+    pub id: String,
+    pub rung: String,
+    pub operation_key: String,
+}
+
+#[derive(Clone)]
+pub struct DeliveryMutationPermit {
+    verifier: Arc<dyn DeliveryMutationPermitVerifier>,
+}
+
+impl DeliveryMutationPermit {
+    pub fn new(verifier: Arc<dyn DeliveryMutationPermitVerifier>) -> Self {
+        Self { verifier }
+    }
+
+    async fn verify(&self, rung: &str) -> Result<(), String> {
+        self.verifier.verify(rung).await
+    }
+
+    async fn begin_external_mutation(
+        &self,
+        rung: &str,
+        operation_key: &str,
+        evidence: &str,
+    ) -> Result<Option<DeliveryMutationIntentToken>, String> {
+        self.verifier
+            .begin_external_mutation(rung, operation_key, evidence)
+            .await
+    }
+
+    async fn commit_external_mutation(
+        &self,
+        intent: &DeliveryMutationIntentToken,
+        evidence: &str,
+    ) -> Result<(), String> {
+        self.verifier
+            .commit_external_mutation(intent, evidence)
+            .await
+    }
+
+    async fn mark_external_mutation_unknown(
+        &self,
+        intent: &DeliveryMutationIntentToken,
+        detail: &str,
+    ) -> Result<(), String> {
+        self.verifier
+            .mark_external_mutation_unknown(intent, detail)
+            .await
+    }
+}
+
+impl std::fmt::Debug for DeliveryMutationPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeliveryMutationPermit")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DeliverOpts {
     pub title: Option<String>,
@@ -365,6 +465,92 @@ pub struct DeliverOpts {
     /// refuses when reality disagrees, instead of silently delivering something
     /// else under the intended title.
     pub expect_branch: Option<String>,
+    /// Durable callers capture the exact repo/worktree/head/change-set before
+    /// authorizing this invocation. Re-checking it immediately before the
+    /// first local mutation prevents a stale run from committing or pushing a
+    /// different checkout under the old objective identity.
+    pub expected_identity: Option<DeliveryIdentitySnapshot>,
+    /// Durable DeliveryRuns provide a fresh database-backed fencing check at
+    /// every local or external mutation rung. Non-durable/manual callers leave
+    /// this unset and retain the legacy single-process behavior.
+    pub mutation_permit: Option<DeliveryMutationPermit>,
+}
+
+async fn verify_mutation_permit(opts: &DeliverOpts, rung: &str) -> Result<(), StepResult> {
+    let Some(permit) = opts.mutation_permit.as_ref() else {
+        return Ok(());
+    };
+    permit.verify(rung).await.map_err(|error| {
+        StepResult::blocked(
+            "mutation_permit",
+            format!(
+                "DeliveryRun fencing permit was lost before `{rung}`: {error}. The stale owner issued no later mutation."
+            ),
+        )
+    })
+}
+
+pub(crate) fn external_operation_key(rung: &str, fields: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"delivery-external-operation-v1\0");
+    hasher.update(rung.as_bytes());
+    hasher.update([0]);
+    for field in fields {
+        hasher.update(field.as_bytes());
+        hasher.update([0]);
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+async fn begin_external_mutation(
+    permit: Option<&DeliveryMutationPermit>,
+    rung: &str,
+    operation_key: &str,
+    evidence: &str,
+) -> Result<Option<DeliveryMutationIntentToken>, String> {
+    match permit {
+        Some(permit) => {
+            permit
+                .begin_external_mutation(rung, operation_key, evidence)
+                .await
+        }
+        None => Ok(None),
+    }
+}
+
+async fn fail_external_mutation(
+    permit: Option<&DeliveryMutationPermit>,
+    intent: Option<&DeliveryMutationIntentToken>,
+    error: String,
+) -> String {
+    match mark_external_mutation_unknown(permit, intent, &error).await {
+        Ok(()) => error,
+        Err(settle_error) => {
+            format!("{error}; durable mutation intent could not be marked unknown: {settle_error}")
+        }
+    }
+}
+
+async fn commit_external_mutation(
+    permit: Option<&DeliveryMutationPermit>,
+    intent: Option<&DeliveryMutationIntentToken>,
+    evidence: &str,
+) -> Result<(), String> {
+    match (permit, intent) {
+        (Some(permit), Some(intent)) => permit.commit_external_mutation(intent, evidence).await,
+        _ => Ok(()),
+    }
+}
+
+async fn mark_external_mutation_unknown(
+    permit: Option<&DeliveryMutationPermit>,
+    intent: Option<&DeliveryMutationIntentToken>,
+    detail: &str,
+) -> Result<(), String> {
+    match (permit, intent) {
+        (Some(permit), Some(intent)) => permit.mark_external_mutation_unknown(intent, detail).await,
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,6 +580,21 @@ pub struct DeliveryPr {
     pub url: String,
     pub title: String,
     pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPrState {
+    pub pr: DeliveryPr,
+    pub head_branch: String,
+    pub base_branch: String,
+    pub head_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenPrObservation {
+    Open(OpenPrState),
+    Absent,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -636,20 +837,37 @@ pub trait DeliveryRemote {
         body: &str,
         head: &str,
         base: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> impl std::future::Future<Output = Result<DeliveryPr, String>>;
+    /// Observe an open PR for a branch without creating or updating anything.
+    /// `Absent` is an observation, not proof that an earlier create request
+    /// never reached the provider; mutation-intent reconciliation therefore
+    /// accepts only a positively matching `Open` state.
+    fn observe_open_pr(
+        &self,
+        _head: &str,
+        _base: &str,
+    ) -> impl std::future::Future<Output = Result<OpenPrObservation, String>> {
+        std::future::ready(Ok(OpenPrObservation::Unsupported))
+    }
     /// Converge governance metadata on an existing PR without replacing its
     /// identity. Called only when the desired body differs from the live body.
     fn update_pr_body(
         &self,
         _number: u64,
         _body: &str,
+        _mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> impl std::future::Future<Output = Result<(), String>> {
         std::future::ready(Err("adapter cannot update an existing PR body".into()))
     }
     fn ci_status(&self, sha: &str) -> impl std::future::Future<Output = Result<CiStatus, String>>;
     /// Re-run retryable CI infrastructure failures. `false` means the adapter
     /// has no safe rerun actuator; ordinary test failures never call this.
-    fn rerun_ci(&self, _sha: &str) -> impl std::future::Future<Output = Result<bool, String>> {
+    fn rerun_ci(
+        &self,
+        _sha: &str,
+        _mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> impl std::future::Future<Output = Result<bool, String>> {
         std::future::ready(Ok(false))
     }
     fn merge_pr(
@@ -658,6 +876,7 @@ pub trait DeliveryRemote {
         method: MergeMethod,
         commit_message: Option<&MergeCommitMessage>,
         expected_head: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> impl std::future::Future<Output = Result<MergeRequestResult, String>>;
     fn observe_merge(
         &self,
@@ -666,7 +885,10 @@ pub trait DeliveryRemote {
     ) -> impl std::future::Future<Output = Result<MergeObservation, String>> {
         std::future::ready(Ok(MergeObservation::Unsupported))
     }
-    fn trigger_release(&self) -> impl std::future::Future<Output = Result<String, String>>;
+    fn trigger_release(
+        &self,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> impl std::future::Future<Output = Result<String, String>>;
 
     /// Observe the external CD platform (Zeabur, Vercel, Argo CD, etc.).
     /// Defaulting to Unsupported keeps existing built-in and test adapters
@@ -709,6 +931,8 @@ pub trait DeliveryRemote {
     fn update_pr_branch(
         &self,
         _number: u64,
+        _expected_head: &str,
+        _mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> impl std::future::Future<Output = Result<String, String>> {
         std::future::ready(Err("adapter cannot update a PR branch".to_string()))
     }
@@ -877,7 +1101,7 @@ fn write_delivery_receipt(
     Ok(raw)
 }
 
-fn sync_updated_pr_head(repo: &RepoContext, expected_head: &str) -> Result<String, String> {
+fn fetch_updated_pr_head(repo: &RepoContext, expected_head: &str) -> Result<String, String> {
     git(&repo.root, &["fetch", &repo.remote, &repo.branch])?;
     let remote_ref = format!("{}/{}", repo.remote, repo.branch);
     let fetched = git(&repo.root, &["rev-parse", &remote_ref])?;
@@ -886,7 +1110,15 @@ fn sync_updated_pr_head(repo: &RepoContext, expected_head: &str) -> Result<Strin
             "更新后的 PR head 尚未收敛: provider 返回 {expected_head}，{remote_ref} 为 {fetched}"
         ));
     }
-    git(&repo.root, &["merge", "--ff-only", &remote_ref])?;
+    Ok(remote_ref)
+}
+
+fn fast_forward_updated_pr_head(
+    repo: &RepoContext,
+    remote_ref: &str,
+    expected_head: &str,
+) -> Result<String, String> {
+    git(&repo.root, &["merge", "--ff-only", remote_ref])?;
     let local = git(&repo.root, &["rev-parse", "HEAD"])?;
     if local != expected_head {
         return Err(format!(
@@ -901,10 +1133,14 @@ async fn resume_queued_merge<R: DeliveryRemote>(
     repo: &RepoContext,
     remote: &R,
     receipt: &DeliveryReceipt,
+    opts: &DeliverOpts,
 ) -> DeliveryOutcome {
     let pr_number = receipt.pr_number;
     let mut queued = receipt.clone();
     queued.state = "merge_queued".into();
+    if let Err(step) = verify_mutation_permit(opts, "receipt_merge_queued").await {
+        return outcome.blocked_on_uncertain_side_effect(step);
+    }
     if let Err(error) = write_delivery_receipt(repo, &receipt.commit_sha, &queued) {
         return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
             "receipt",
@@ -916,7 +1152,17 @@ async fn resume_queued_merge<R: DeliveryRemote>(
 
     match remote.merge_readiness(pr_number).await {
         Ok(MergeReadiness::Behind) => {
-            let new_head = match remote.update_pr_branch(pr_number).await {
+            if let Err(step) = verify_mutation_permit(opts, "update_pr_branch").await {
+                return outcome.blocked_on_uncertain_side_effect(step);
+            }
+            let new_head = match remote
+                .update_pr_branch(
+                    pr_number,
+                    &receipt.commit_sha,
+                    opts.mutation_permit.as_ref(),
+                )
+                .await
+            {
                 Ok(head) => head,
                 Err(error) => {
                     return outcome.blocked_at(StepResult::blocked(
@@ -929,8 +1175,11 @@ async fn resume_queued_merge<R: DeliveryRemote>(
                     ))
                 }
             };
-            let local_head = match sync_updated_pr_head(repo, &new_head) {
-                Ok(head) => head,
+            if let Err(step) = verify_mutation_permit(opts, "git_fetch_updated_pr_head").await {
+                return outcome.blocked_on_uncertain_side_effect(step);
+            }
+            let remote_ref = match fetch_updated_pr_head(repo, &new_head) {
+                Ok(remote_ref) => remote_ref,
                 Err(error) => {
                     return outcome.blocked_at(StepResult::blocked(
                         "branch_sync",
@@ -942,9 +1191,27 @@ async fn resume_queued_merge<R: DeliveryRemote>(
                     ))
                 }
             };
+            if let Err(step) = verify_mutation_permit(opts, "git_ff_merge_updated_pr_head").await {
+                return outcome.blocked_on_uncertain_side_effect(step);
+            }
+            let local_head = match fast_forward_updated_pr_head(repo, &remote_ref, &new_head) {
+                Ok(head) => head,
+                Err(error) => {
+                    return outcome.blocked_at(StepResult::blocked(
+                        "branch_sync",
+                        format!(
+                            "PR #{pr_number} 已更新到 {new_head}，但本地分支快进失败: {error}。\
+系统将保留同一 PR 身份并重新观察；不要 force push 旧 head。"
+                        ),
+                    ))
+                }
+            };
             let mut rebound = queued;
             rebound.state = "pr_open".into();
             rebound.commit_sha = local_head.clone();
+            if let Err(step) = verify_mutation_permit(opts, "receipt_rebind_pr_head").await {
+                return outcome.blocked_on_uncertain_side_effect(step);
+            }
             if let Err(error) = write_delivery_receipt(repo, &local_head, &rebound) {
                 return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                     "receipt",
@@ -1010,6 +1277,220 @@ pub struct RepoContext {
     pub default_branch: String,
     pub remote: String,
     pub remote_url: Option<String>,
+}
+
+/// Objective-independent identity of the exact checkout a delivery would
+/// mutate. Both durable preflight and the mutation fence use this one capture
+/// routine so their hashing rules cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryIdentitySnapshot {
+    pub repo_identity: String,
+    pub worktree_identity: String,
+    pub head_sha: String,
+    pub change_set_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryTakeoverObservation {
+    pub identity: DeliveryIdentitySnapshot,
+    pub remote_head_sha: Option<String>,
+    pub canonical_pr_number: Option<u64>,
+    pub canonical_pr_url: Option<String>,
+    pub canonical_head_sha: Option<String>,
+}
+
+pub fn capture_delivery_identity(repo: &RepoContext) -> Result<DeliveryIdentitySnapshot, String> {
+    let repository = git2::Repository::open(&repo.root)
+        .map_err(|error| format!("cannot inspect delivery worktree: {error}"))?;
+    let head_sha = repository
+        .head()
+        .ok()
+        .and_then(|head| head.target().map(|oid| oid.to_string()))
+        .ok_or_else(|| "cannot establish the delivery worktree HEAD".to_string())?;
+
+    let repo_source = repo
+        .remote_url
+        .as_deref()
+        .unwrap_or_else(|| repo.root.to_str().unwrap_or("local-repository"));
+    let repo_identity = format!("sha256:{:x}", Sha256::digest(repo_source.as_bytes()));
+
+    let admin_path = repository
+        .path()
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize delivery worktree identity: {error}"))?;
+    let worktree_identity = format!(
+        "gitdir-sha256:{:x}",
+        Sha256::digest(admin_path.to_string_lossy().as_bytes())
+    );
+
+    let statuses = repository
+        .statuses(None)
+        .map_err(|error| format!("cannot inspect delivery changes: {error}"))?;
+    let mut entries: Vec<_> = statuses
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .path()
+                .map(|path| (path.to_owned(), entry.status().bits()))
+        })
+        .collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut change_set_hasher = Sha256::new();
+    change_set_hasher.update(head_sha.as_bytes());
+    for (path, status) in entries {
+        change_set_hasher.update(path.as_bytes());
+        change_set_hasher.update(status.to_le_bytes());
+        if let Ok(bytes) = std::fs::read(repo.root.join(&path)) {
+            change_set_hasher.update(bytes);
+        }
+    }
+
+    Ok(DeliveryIdentitySnapshot {
+        repo_identity,
+        worktree_identity,
+        head_sha,
+        change_set_digest: format!("sha256:{:x}", change_set_hasher.finalize()),
+    })
+}
+
+fn observe_remote_branch_head(repo: &RepoContext) -> Result<Option<String>, String> {
+    let reference = format!("refs/heads/{}", repo.branch);
+    let observed = git(
+        &repo.root,
+        &["ls-remote", "--heads", &repo.remote, &reference],
+    )?;
+    let mut heads = observed
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|sha| !sha.is_empty());
+    let head = heads.next().map(str::to_string);
+    if heads.next().is_some() {
+        return Err(format!(
+            "remote branch observation returned multiple heads for {reference}"
+        ));
+    }
+    Ok(head)
+}
+
+/// Reconcile a takeover without issuing a Git or provider mutation.
+///
+/// This is the mandatory bridge between a newly-incremented claim epoch and a
+/// mutation-capable permit. It accepts only the persisted or locally-observed
+/// head, and uses provider observation (never open/update/merge/release) to
+/// prove that an already-issued old-owner request did not create a conflicting
+/// canonical object.
+pub async fn observe_delivery_takeover<R: DeliveryRemote>(
+    cwd: &Path,
+    default_branch_hint: Option<&str>,
+    expected_branch: &str,
+    persisted_identity: &DeliveryIdentitySnapshot,
+    persisted_canonical_pr_number: Option<u64>,
+    persisted_canonical_pr_url: Option<&str>,
+    remote: Option<&R>,
+) -> Result<DeliveryTakeoverObservation, String> {
+    let (repo, _) = resolve_delivery_repo(cwd, default_branch_hint, Some(expected_branch))?;
+    let identity = capture_delivery_identity(&repo)?;
+    if &identity != persisted_identity {
+        return Err(
+            "observe-only takeover found repo/worktree/head/change-set state that was not durably receipted; mutation remains fenced"
+                .to_string(),
+        );
+    }
+
+    let remote_head = observe_remote_branch_head(&repo)?;
+    if remote_head
+        .as_deref()
+        .is_some_and(|head| head != persisted_identity.head_sha)
+    {
+        return Err(format!(
+            "remote branch {} moved to an unrecognized head {}; expected persisted {} or observed {}",
+            repo.branch,
+            remote_head.as_deref().unwrap_or_default(),
+            persisted_identity.head_sha,
+            persisted_identity.head_sha
+        ));
+    }
+
+    // The persisted-head key is authoritative. Looking only at a newly
+    // observed HEAD would skip an old intent_merge/intent_release receipt and
+    // allow an unreceipted local commit to erase the uncertainty boundary.
+    let local_receipt = read_delivery_receipt(&repo, &persisted_identity.head_sha)?;
+    if local_receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.state == "intent_release")
+    {
+        return Err(
+            "an intent_release receipt requires release-specific observation before mutation"
+                .into(),
+        );
+    }
+    if let (Some(expected_number), Some(receipt)) =
+        (persisted_canonical_pr_number, local_receipt.as_ref())
+    {
+        if receipt.pr_number != expected_number {
+            return Err(format!(
+                "local receipt PR #{} conflicts with persisted canonical PR #{}",
+                receipt.pr_number, expected_number
+            ));
+        }
+    }
+    if let (Some(expected_url), Some(receipt)) =
+        (persisted_canonical_pr_url, local_receipt.as_ref())
+    {
+        if receipt.pr_url != expected_url {
+            return Err("local receipt URL conflicts with persisted canonical PR URL".into());
+        }
+    }
+
+    let canonical_pr_number = local_receipt
+        .as_ref()
+        .map(|receipt| receipt.pr_number)
+        .or(persisted_canonical_pr_number);
+    let canonical_pr_url = local_receipt
+        .as_ref()
+        .map(|receipt| receipt.pr_url.clone())
+        .or_else(|| persisted_canonical_pr_url.map(str::to_string));
+    if canonical_pr_number.is_some() != canonical_pr_url.is_some() {
+        return Err("canonical PR identity is incomplete during takeover observation".into());
+    }
+    let canonical_head_sha = local_receipt
+        .as_ref()
+        .map(|receipt| receipt.commit_sha.clone())
+        .or_else(|| persisted_canonical_pr_number.map(|_| persisted_identity.head_sha.clone()));
+
+    if let Some(pr_number) = canonical_pr_number {
+        let remote = remote.ok_or_else(|| {
+            "canonical PR exists but no read-only provider observer is available".to_string()
+        })?;
+        match remote.observe_merge(pr_number, &identity.head_sha).await? {
+            MergeObservation::OpenSameHead { .. } | MergeObservation::Merged { .. } => {}
+            MergeObservation::HeadChanged { actual_head }
+                if actual_head == persisted_identity.head_sha => {}
+            MergeObservation::HeadChanged { actual_head } => {
+                return Err(format!(
+                    "canonical PR #{pr_number} moved to unrecognized head {actual_head}"
+                ))
+            }
+            MergeObservation::ClosedUnmerged => {
+                return Err(format!(
+                    "canonical PR #{pr_number} was closed without merge during takeover"
+                ))
+            }
+            MergeObservation::Unsupported => {
+                return Err(format!(
+                    "provider cannot observe canonical PR #{pr_number} during takeover"
+                ))
+            }
+        }
+    }
+
+    Ok(DeliveryTakeoverObservation {
+        identity,
+        remote_head_sha: remote_head,
+        canonical_pr_number,
+        canonical_pr_url,
+        canonical_head_sha,
+    })
 }
 
 fn default_remote(root: &Path) -> String {
@@ -1846,7 +2327,30 @@ pub async fn deliver<R: DeliveryRemote>(
         Err(blocker) => return outcome.blocked_at(blocker),
     };
 
+    if let Some(expected_identity) = opts.expected_identity.as_ref() {
+        let observed_identity = match capture_delivery_identity(&repo) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "identity",
+                    format!(
+                        "交付身份无法在副作用前复核: {error}。系统未执行 commit、push 或 PR 动作。"
+                    ),
+                ))
+            }
+        };
+        if &observed_identity != expected_identity {
+            return outcome.blocked_at(StepResult::blocked(
+                "identity",
+                "交付目标在持久化预检后发生变化；系统已在首次 git/远端副作用前拒绝本次执行。",
+            ));
+        }
+    }
+
     // ── Commit (noise-safe) ─────────────────────────────────────────────────
+    if let Err(step) = verify_mutation_permit(opts, "git_stage").await {
+        return outcome.blocked_on_uncertain_side_effect(step);
+    }
     let staged = match stage_scoped(&repo.root, &opts.extra_excludes) {
         Ok(s) => s,
         Err(e) => {
@@ -1854,6 +2358,9 @@ pub async fn deliver<R: DeliveryRemote>(
         }
     };
     if has_staged_changes(&repo.root) {
+        if let Err(step) = verify_mutation_permit(opts, "git_commit").await {
+            return outcome.blocked_on_uncertain_side_effect(step);
+        }
         let msg = append_release_urgency(
             generate_commit_message(&repo.root, &repo.branch, opts.title.as_deref()),
             opts.release_urgency,
@@ -1895,16 +2402,74 @@ pub async fn deliver<R: DeliveryRemote>(
     }
 
     // ── Push ────────────────────────────────────────────────────────────────
-    match git(&repo.root, &["push", "-u", &repo.remote, &repo.branch]) {
-        Ok(_) => outcome.steps.push(StepResult::ok(
-            "push",
-            format!("推送 {} 到 {}", repo.branch, repo.remote),
-        )),
-        Err(e) => {
-            return outcome.blocked_at(StepResult::blocked(
-                "push",
-                format!("推送失败: {e}。请确认已配置该远端的 git 凭据(或在设置里配置远端 token)。"),
+    if let Err(step) = verify_mutation_permit(opts, "git_push").await {
+        return outcome.blocked_on_uncertain_side_effect(step);
+    }
+    let push_sha = outcome.commit_sha.as_deref().unwrap_or("");
+    let remote_identity = opts
+        .expected_identity
+        .as_ref()
+        .map(|identity| identity.repo_identity.clone())
+        .unwrap_or_else(|| receipt_remote_identity(&repo));
+    let push_rung = "git_push";
+    let push_operation_key =
+        external_operation_key(push_rung, &[&remote_identity, &repo.branch, push_sha]);
+    let push_evidence = json!({
+        "remote_identity": &remote_identity,
+        "branch": &repo.branch,
+        "commit_sha": push_sha,
+    })
+    .to_string();
+    let push_intent = match begin_external_mutation(
+        opts.mutation_permit.as_ref(),
+        push_rung,
+        &push_operation_key,
+        &push_evidence,
+    )
+    .await
+    {
+        Ok(intent) => intent,
+        Err(error) => {
+            return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                "mutation_intent",
+                format!("推送前无法持久化 DeliveryRun 写入意图: {error}。未发出新的 git push。"),
             ))
+        }
+    };
+    match git(&repo.root, &["push", "-u", &repo.remote, &repo.branch]) {
+        Ok(_) => {
+            if let Err(error) = commit_external_mutation(
+                opts.mutation_permit.as_ref(),
+                push_intent.as_ref(),
+                &push_evidence,
+            )
+            .await
+            {
+                return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                    "push",
+                    format!(
+                        "git push 已返回成功，但持久化结果对账失败: {error}。系统将只读核对远端，禁止重放。"
+                    ),
+                ));
+            }
+            outcome.steps.push(StepResult::ok(
+                "push",
+                format!("推送 {} 到 {}", repo.branch, repo.remote),
+            ));
+        }
+        Err(e) => {
+            let error = fail_external_mutation(
+                opts.mutation_permit.as_ref(),
+                push_intent.as_ref(),
+                format!("git push returned an indeterminate failure: {e}"),
+            )
+            .await;
+            return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                "push",
+                format!(
+                    "推送结果不确定: {error}。系统将只读核对远端，不会直接重放或要求用户再次说继续。"
+                ),
+            ));
         }
     }
 
@@ -1927,6 +2492,11 @@ pub async fn deliver<R: DeliveryRemote>(
                 Ok(MergeObservation::Merged { merge_sha }) => {
                     let mut reconciled = receipt.clone();
                     reconciled.state = "merged".into();
+                    if let Err(step) =
+                        verify_mutation_permit(opts, "receipt_reconcile_merged").await
+                    {
+                        return outcome.blocked_on_uncertain_side_effect(step);
+                    }
                     if let Err(error) = write_delivery_receipt(&repo, &sha, &reconciled) {
                         return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                             "receipt",
@@ -1954,10 +2524,15 @@ pub async fn deliver<R: DeliveryRemote>(
                                 receipt.pr_number
                             ),
                         ));
-                        return resume_queued_merge(outcome, &repo, remote, &receipt).await;
+                        return resume_queued_merge(outcome, &repo, remote, &receipt, opts).await;
                     }
                     let mut retryable = receipt.clone();
                     retryable.state = "pr_open".into();
+                    if let Err(step) =
+                        verify_mutation_permit(opts, "receipt_reconcile_pr_open").await
+                    {
+                        return outcome.blocked_on_uncertain_side_effect(step);
+                    }
                     if let Err(error) = write_delivery_receipt(&repo, &sha, &retryable) {
                         return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                             "receipt",
@@ -2152,8 +2727,17 @@ pub async fn deliver<R: DeliveryRemote>(
         let had_pr_receipt = prior_receipt
             .as_ref()
             .is_some_and(|receipt| receipt.state == "pr_open");
+        if let Err(step) = verify_mutation_permit(opts, "open_or_get_pr").await {
+            return outcome.blocked_on_uncertain_side_effect(step);
+        }
         let remote_pr = match remote
-            .open_or_get_pr(&pr_title, &pr_body, &repo.branch, &repo.default_branch)
+            .open_or_get_pr(
+                &pr_title,
+                &pr_body,
+                &repo.branch,
+                &repo.default_branch,
+                opts.mutation_permit.as_ref(),
+            )
             .await
         {
             Ok(pr) => pr,
@@ -2182,8 +2766,15 @@ pub async fn deliver<R: DeliveryRemote>(
             }
         };
         if reconciled_body.changed {
+            if let Err(step) = verify_mutation_permit(opts, "update_pr_body").await {
+                return outcome.blocked_on_uncertain_side_effect(step);
+            }
             if let Err(error) = remote
-                .update_pr_body(pr_number, &reconciled_body.body)
+                .update_pr_body(
+                    pr_number,
+                    &reconciled_body.body,
+                    opts.mutation_permit.as_ref(),
+                )
                 .await
             {
                 return outcome.blocked_at(StepResult::blocked(
@@ -2240,6 +2831,9 @@ pub async fn deliver<R: DeliveryRemote>(
             pr_body: Some(release_policy.durable_body.clone()),
             release_detail: None,
         };
+        if let Err(step) = verify_mutation_permit(opts, "receipt_pr_open").await {
+            return outcome.blocked_on_uncertain_side_effect(step);
+        }
         if let Err(error) = write_delivery_receipt(&repo, &sha, &pr_receipt) {
             return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                 "receipt",
@@ -2255,7 +2849,10 @@ pub async fn deliver<R: DeliveryRemote>(
         }
 
         // ── Wait for CI ─────────────────────────────────────────────────────
-        let ci_wait = wait_for_ci(remote, &sha, ci_timeout_secs).await;
+        let ci_wait = wait_for_ci(remote, &sha, ci_timeout_secs, opts).await;
+        if let Some(step) = ci_wait.mutation_permit_failure {
+            return outcome.blocked_on_uncertain_side_effect(step);
+        }
         for detail in ci_wait.recoveries {
             outcome.steps.push(StepResult::ok("ci_recovery", detail));
         }
@@ -2295,8 +2892,17 @@ pub async fn deliver<R: DeliveryRemote>(
         }
 
         // ── Merge ───────────────────────────────────────────────────────────
+        if let Err(step) = verify_mutation_permit(opts, "refresh_canonical_pr").await {
+            return outcome.blocked_on_uncertain_side_effect(step);
+        }
         let refreshed_pr = match remote
-            .open_or_get_pr(&pr_title, &pr_body, &repo.branch, &repo.default_branch)
+            .open_or_get_pr(
+                &pr_title,
+                &pr_body,
+                &repo.branch,
+                &repo.default_branch,
+                opts.mutation_permit.as_ref(),
+            )
             .await
         {
             Ok(pr) if pr.number == pr_number => pr,
@@ -2332,8 +2938,15 @@ pub async fn deliver<R: DeliveryRemote>(
             }
         };
         if reconciled_body.changed {
+            if let Err(step) = verify_mutation_permit(opts, "update_pr_body_before_merge").await {
+                return outcome.blocked_on_uncertain_side_effect(step);
+            }
             if let Err(error) = remote
-                .update_pr_body(pr_number, &reconciled_body.body)
+                .update_pr_body(
+                    pr_number,
+                    &reconciled_body.body,
+                    opts.mutation_permit.as_ref(),
+                )
                 .await
             {
                 return outcome.blocked_at(StepResult::blocked(
@@ -2377,11 +2990,17 @@ pub async fn deliver<R: DeliveryRemote>(
             pr_body: Some(release_policy.durable_body.clone()),
             release_detail: None,
         };
+        if let Err(step) = verify_mutation_permit(opts, "receipt_intent_merge").await {
+            return outcome.blocked_on_uncertain_side_effect(step);
+        }
         if let Err(error) = write_delivery_receipt(&repo, &sha, &intent) {
             return outcome.blocked_at(StepResult::blocked(
                 "receipt",
                 format!("合并前无法写入本地意图回执，未执行合并: {error}"),
             ));
+        }
+        if let Err(step) = verify_mutation_permit(opts, "merge_pr").await {
+            return outcome.blocked_on_uncertain_side_effect(step);
         }
         let merge_result = match remote
             .merge_pr(
@@ -2389,6 +3008,7 @@ pub async fn deliver<R: DeliveryRemote>(
                 merge_method,
                 release_policy.merge_commit_message.as_ref(),
                 &sha,
+                opts.mutation_permit.as_ref(),
             )
             .await
         {
@@ -2403,7 +3023,7 @@ pub async fn deliver<R: DeliveryRemote>(
         if matches!(merge_result, MergeRequestResult::Queued) {
             let mut queued = intent.clone();
             queued.state = "merge_queued".into();
-            return resume_queued_merge(outcome, &repo, remote, &queued).await;
+            return resume_queued_merge(outcome, &repo, remote, &queued, opts).await;
         }
         outcome.steps.push(StepResult::ok(
             "merge",
@@ -2423,6 +3043,9 @@ pub async fn deliver<R: DeliveryRemote>(
             pr_body: Some(release_policy.durable_body.clone()),
             release_detail: None,
         };
+        if let Err(step) = verify_mutation_permit(opts, "receipt_merged").await {
+            return outcome.blocked_on_uncertain_side_effect(step);
+        }
         if let Err(error) = write_delivery_receipt(&repo, &sha, &receipt) {
             return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                 "receipt",
@@ -2478,13 +3101,19 @@ pub async fn deliver<R: DeliveryRemote>(
             pr_body: Some(release_policy.durable_body.clone()),
             release_detail: None,
         };
+        if let Err(step) = verify_mutation_permit(opts, "receipt_intent_release").await {
+            return outcome.blocked_on_uncertain_side_effect(step);
+        }
         if let Err(error) = write_delivery_receipt(&repo, &sha, &intent) {
             return outcome.blocked_at(StepResult::blocked(
                 "receipt",
                 format!("发布前无法写入本地意图回执，未触发发布: {error}"),
             ));
         }
-        match remote.trigger_release().await {
+        if let Err(step) = verify_mutation_permit(opts, "trigger_release").await {
+            return outcome.blocked_on_uncertain_side_effect(step);
+        }
+        match remote.trigger_release(opts.mutation_permit.as_ref()).await {
             Ok(detail) => {
                 outcome
                     .steps
@@ -2503,6 +3132,9 @@ pub async fn deliver<R: DeliveryRemote>(
                     pr_body: Some(release_policy.durable_body.clone()),
                     release_detail: Some(detail),
                 };
+                if let Err(step) = verify_mutation_permit(opts, "receipt_release_triggered").await {
+                    return outcome.blocked_on_uncertain_side_effect(step);
+                }
                 match write_delivery_receipt(&repo, &sha, &receipt) {
                     Ok(raw) => outcome.release_receipt = Some(raw),
                     Err(error) => {
@@ -2869,6 +3501,7 @@ fn finish(mut outcome: DeliveryOutcome, branch: &str) -> DeliveryOutcome {
 struct CiWaitOutcome {
     status: CiStatus,
     recoveries: Vec<String>,
+    mutation_permit_failure: Option<StepResult>,
 }
 
 fn ci_failure_is_retryable(detail: &str) -> bool {
@@ -2880,7 +3513,12 @@ fn ci_failure_is_retryable(detail: &str) -> bool {
     )
 }
 
-async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32) -> CiWaitOutcome {
+async fn wait_for_ci<R: DeliveryRemote>(
+    remote: &R,
+    sha: &str,
+    timeout_secs: u32,
+    opts: &DeliverOpts,
+) -> CiWaitOutcome {
     let deadline = timeout_secs.max(1);
     let mut waited = 0u32;
     let mut reruns = 0u8;
@@ -2894,7 +3532,14 @@ async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32
         match remote.ci_status(sha).await {
             Ok(CiStatus::Pending) => {}
             Ok(CiStatus::Failure(detail)) if ci_failure_is_retryable(&detail) && reruns < 1 => {
-                match remote.rerun_ci(sha).await {
+                if let Err(step) = verify_mutation_permit(opts, "rerun_ci").await {
+                    return CiWaitOutcome {
+                        status: CiStatus::Failure(detail),
+                        recoveries,
+                        mutation_permit_failure: Some(step),
+                    };
+                }
+                match remote.rerun_ci(sha, opts.mutation_permit.as_ref()).await {
                     Ok(true) => {
                         reruns += 1;
                         waited = 0;
@@ -2910,6 +3555,7 @@ async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32
                                 "{detail}; 当前 provider 没有 CI rerun 能力"
                             )),
                             recoveries,
+                            mutation_permit_failure: None,
                         }
                     }
                     Err(error) => {
@@ -2918,6 +3564,7 @@ async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32
                                 "{detail}; 自动 rerun 失败: {error}"
                             )),
                             recoveries,
+                            mutation_permit_failure: None,
                         }
                     }
                 }
@@ -2926,12 +3573,14 @@ async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32
                 return CiWaitOutcome {
                     status: other,
                     recoveries,
+                    mutation_permit_failure: None,
                 }
             }
             Err(e) => {
                 return CiWaitOutcome {
                     status: CiStatus::Unavailable(e),
                     recoveries,
+                    mutation_permit_failure: None,
                 }
             }
         }
@@ -2939,6 +3588,7 @@ async fn wait_for_ci<R: DeliveryRemote>(remote: &R, sha: &str, timeout_secs: u32
             return CiWaitOutcome {
                 status: CiStatus::Pending,
                 recoveries,
+                mutation_permit_failure: None,
             };
         }
         let sleep_secs = interval.min(deadline - waited);
@@ -3147,41 +3797,91 @@ impl DeliveryRemote for HookRemote {
         body: &str,
         head: &str,
         base: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<DeliveryPr, String> {
-        let value = self.run_json(json!({
-            "action": "open_or_get_pr",
-            "title": title,
-            "body": body,
+        let rung = "provider_pr_open_or_get";
+        let operation_key = external_operation_key(rung, &[title, body, head, base]);
+        let evidence = json!({
             "head": head,
             "base": base,
-        }))?;
-        let response: HookPrResponse = serde_json::from_value(value).map_err(|e| {
-            format!(
-                "delivery provider hook '{}' PR response invalid: {e}",
-                self.id
-            )
-        })?;
-        Ok(DeliveryPr {
-            number: response.number,
-            url: response.url,
-            title: response.title,
-            body: response.body,
+            "title_digest": external_operation_key("title", &[title]),
+            "body_digest": external_operation_key("body", &[body]),
         })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        let result = (|| {
+            let value = self.run_json(json!({
+                "action": "open_or_get_pr",
+                "title": title,
+                "body": body,
+                "head": head,
+                "base": base,
+            }))?;
+            let response: HookPrResponse = serde_json::from_value(value).map_err(|e| {
+                format!(
+                    "delivery provider hook '{}' PR response invalid: {e}",
+                    self.id
+                )
+            })?;
+            Ok(DeliveryPr {
+                number: response.number,
+                url: response.url,
+                title: response.title,
+                body: response.body,
+            })
+        })();
+        match result {
+            Ok(pr) => {
+                commit_external_mutation(
+                    mutation_permit,
+                    intent.as_ref(),
+                    &json!({ "pr_number": pr.number, "pr_url": pr.url }).to_string(),
+                )
+                .await?;
+                Ok(pr)
+            }
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
-
-    async fn update_pr_body(&self, number: u64, body: &str) -> Result<(), String> {
-        let value = self.run_json(json!({
-            "action": "update_pr_body",
-            "number": number,
-            "body": body,
-        }))?;
-        let _response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
-            format!(
-                "delivery provider hook '{}' update PR response invalid: {e}",
-                self.id
-            )
-        })?;
-        Ok(())
+    async fn update_pr_body(
+        &self,
+        number: u64,
+        body: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<(), String> {
+        let rung = "provider_pr_body_update";
+        let number_text = number.to_string();
+        let operation_key = external_operation_key(rung, &[&number_text, body]);
+        let evidence = json!({
+            "pr_number": number,
+            "body_digest": external_operation_key("body", &[body]),
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        let result = (|| {
+            let value = self.run_json(json!({
+                "action": "update_pr_body",
+                "number": number,
+                "body": body,
+            }))?;
+            let _response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
+                format!(
+                    "delivery provider hook '{}' update PR response invalid: {e}",
+                    self.id
+                )
+            })?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await,
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
     async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
@@ -3201,15 +3901,35 @@ impl DeliveryRemote for HookRemote {
         })
     }
 
-    async fn rerun_ci(&self, sha: &str) -> Result<bool, String> {
-        let value = self.run_json(json!({ "action": "rerun_ci", "sha": sha }))?;
-        let response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
-            format!(
-                "delivery provider hook '{}' rerun CI response invalid: {e}",
-                self.id
-            )
-        })?;
-        Ok(response.ok.unwrap_or(true))
+    async fn rerun_ci(
+        &self,
+        sha: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<bool, String> {
+        let rung = "provider_ci_rerun";
+        let operation_key = external_operation_key(rung, &[sha]);
+        let evidence = json!({ "sha": sha }).to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        let result = (|| {
+            let value = self.run_json(json!({ "action": "rerun_ci", "sha": sha }))?;
+            let response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
+                format!(
+                    "delivery provider hook '{}' rerun CI response invalid: {e}",
+                    self.id
+                )
+            })?;
+            Ok(response.ok.unwrap_or(true))
+        })();
+        match result {
+            Ok(rerun) => {
+                commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
+                Ok(rerun)
+            }
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
     async fn merge_pr(
@@ -3218,37 +3938,80 @@ impl DeliveryRemote for HookRemote {
         method: MergeMethod,
         commit_message: Option<&MergeCommitMessage>,
         expected_head: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<MergeRequestResult, String> {
-        let value = self.run_json(json!({
-            "action": "merge_pr",
-            "number": number,
+        let rung = "provider_pr_merge";
+        let number_text = number.to_string();
+        let operation_key =
+            external_operation_key(rung, &[&number_text, method.as_str(), expected_head]);
+        let evidence = json!({
+            "pr_number": number,
             "method": method.as_str(),
-            "commit_title": commit_message.map(|message| message.title.as_str()),
-            "commit_body": commit_message.map(|message| message.body.as_str()),
             "expected_head": expected_head,
-        }))?;
-        let _response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
-            format!(
-                "delivery provider hook '{}' merge response invalid: {e}",
-                self.id
-            )
-        })?;
-        Ok(MergeRequestResult::Merged {
-            merge_sha: String::new(),
         })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        let result = (|| {
+            let value = self.run_json(json!({
+                "action": "merge_pr",
+                "number": number,
+                "method": method.as_str(),
+                "commit_title": commit_message.map(|message| message.title.as_str()),
+                "commit_body": commit_message.map(|message| message.body.as_str()),
+                "expected_head": expected_head,
+            }))?;
+            let _response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
+                format!(
+                    "delivery provider hook '{}' merge response invalid: {e}",
+                    self.id
+                )
+            })?;
+            Ok(MergeRequestResult::Merged {
+                merge_sha: String::new(),
+            })
+        })();
+        match result {
+            Ok(outcome) => {
+                commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
-    async fn trigger_release(&self) -> Result<String, String> {
-        let value = self.run_json(json!({ "action": "trigger_release" }))?;
-        let response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
-            format!(
-                "delivery provider hook '{}' release response invalid: {e}",
-                self.id
-            )
-        })?;
-        Ok(response
-            .detail
-            .unwrap_or_else(|| format!("delivery provider hook '{}' triggered release", self.id)))
+    async fn trigger_release(
+        &self,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<String, String> {
+        let rung = "provider_release_trigger";
+        let operation_key = external_operation_key(rung, &[&self.id]);
+        let evidence = json!({ "provider": self.id }).to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        let result = (|| {
+            let value = self.run_json(json!({ "action": "trigger_release" }))?;
+            let response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
+                format!(
+                    "delivery provider hook '{}' release response invalid: {e}",
+                    self.id
+                )
+            })?;
+            Ok(response.detail.unwrap_or_else(|| {
+                format!("delivery provider hook '{}' triggered release", self.id)
+            }))
+        })();
+        match result {
+            Ok(detail) => {
+                commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
+                Ok(detail)
+            }
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
     async fn deployment_status(
@@ -3810,6 +4573,40 @@ fn parse_gh_pr_list(raw: &str) -> Result<Option<DeliveryPr>, String> {
     }))
 }
 
+fn parse_gh_open_pr_state(raw: &str, head: &str, base: &str) -> Result<OpenPrObservation, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("gh pr list returned non-JSON: {error}"))?;
+    let rows = value
+        .as_array()
+        .ok_or_else(|| "gh pr list returned JSON that is not an array".to_string())?;
+    let Some(row) = rows.first() else {
+        return Ok(OpenPrObservation::Absent);
+    };
+    let (Some(number), Some(url), Some(title), Some(body)) = (
+        row.get("number").and_then(serde_json::Value::as_u64),
+        row.get("url").and_then(serde_json::Value::as_str),
+        row.get("title").and_then(serde_json::Value::as_str),
+        row.get("body").and_then(serde_json::Value::as_str),
+    ) else {
+        return Err("gh pr list row missing number/url/title/body".into());
+    };
+    Ok(OpenPrObservation::Open(OpenPrState {
+        pr: DeliveryPr {
+            number,
+            url: url.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+        },
+        head_branch: head.to_string(),
+        base_branch: base.to_string(),
+        head_sha: row
+            .get("headRefOid")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    }))
+}
+
 impl DeliveryRemote for GhCliRemote {
     fn capabilities(&self) -> DeliveryCapabilities {
         DeliveryCapabilities {
@@ -3827,6 +4624,7 @@ impl DeliveryRemote for GhCliRemote {
         body: &str,
         head: &str,
         base: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<DeliveryPr, String> {
         // Reuse an open PR for this head first — idempotence contract.
         let existing = self.gh(&[
@@ -3846,34 +4644,99 @@ impl DeliveryRemote for GhCliRemote {
         if let Some(pr) = parse_gh_pr_list(&existing)? {
             return Ok(pr);
         }
-        self.gh(&gh_pr_create_args(title, body, head, base))?;
-        let created = self.gh(&[
-            "pr".into(),
-            "view".into(),
-            head.into(),
-            "--json".into(),
-            "number,url,title,body".into(),
-        ])?;
-        let v: serde_json::Value = serde_json::from_str(&created)
-            .map_err(|e| format!("gh pr view returned non-JSON: {e}"))?;
-        match (
-            v["number"].as_u64(),
-            v["url"].as_str(),
-            v["title"].as_str(),
-            v["body"].as_str(),
-        ) {
-            (Some(n), Some(u), Some(t), Some(b)) => Ok(DeliveryPr {
-                number: n,
-                url: u.to_string(),
-                title: t.to_string(),
-                body: b.to_string(),
-            }),
-            _ => Err("gh pr view missing number/url/title/body".into()),
+        let rung = "provider_pr_create";
+        let operation_key = external_operation_key(rung, &[title, body, head, base]);
+        let evidence = json!({
+            "head": head,
+            "base": base,
+            "title_digest": external_operation_key("title", &[title]),
+            "body_digest": external_operation_key("body", &[body]),
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        let result = (|| {
+            self.gh(&gh_pr_create_args(title, body, head, base))?;
+            let created = self.gh(&[
+                "pr".into(),
+                "view".into(),
+                head.into(),
+                "--json".into(),
+                "number,url,title,body".into(),
+            ])?;
+            let v: serde_json::Value = serde_json::from_str(&created)
+                .map_err(|e| format!("gh pr view returned non-JSON: {e}"))?;
+            match (
+                v["number"].as_u64(),
+                v["url"].as_str(),
+                v["title"].as_str(),
+                v["body"].as_str(),
+            ) {
+                (Some(n), Some(u), Some(t), Some(b)) => Ok(DeliveryPr {
+                    number: n,
+                    url: u.to_string(),
+                    title: t.to_string(),
+                    body: b.to_string(),
+                }),
+                _ => Err("gh pr view missing number/url/title/body".into()),
+            }
+        })();
+        match result {
+            Ok(pr) => {
+                commit_external_mutation(
+                    mutation_permit,
+                    intent.as_ref(),
+                    &json!({ "pr_number": pr.number, "pr_url": pr.url }).to_string(),
+                )
+                .await?;
+                Ok(pr)
+            }
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
         }
     }
 
-    async fn update_pr_body(&self, number: u64, body: &str) -> Result<(), String> {
-        self.gh(&gh_pr_edit_body_args(number, body)).map(|_| ())
+    async fn observe_open_pr(&self, head: &str, base: &str) -> Result<OpenPrObservation, String> {
+        let raw = self.gh(&[
+            "pr".into(),
+            "list".into(),
+            "--head".into(),
+            head.into(),
+            "--base".into(),
+            base.into(),
+            "--state".into(),
+            "open".into(),
+            "--json".into(),
+            "number,url,title,body,headRefOid".into(),
+            "--limit".into(),
+            "1".into(),
+        ])?;
+        parse_gh_open_pr_state(&raw, head, base)
+    }
+
+    async fn update_pr_body(
+        &self,
+        number: u64,
+        body: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<(), String> {
+        let rung = "provider_pr_body_update";
+        let number_text = number.to_string();
+        let operation_key = external_operation_key(rung, &[&number_text, body]);
+        let evidence = json!({
+            "pr_number": number,
+            "body_digest": external_operation_key("body", &[body]),
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        match self.gh(&gh_pr_edit_body_args(number, body)) {
+            Ok(_) => commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await,
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
     async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
@@ -3897,7 +4760,11 @@ impl DeliveryRemote for GhCliRemote {
         Ok(self.ci_stability.confirm(&observation.fingerprint, status))
     }
 
-    async fn rerun_ci(&self, sha: &str) -> Result<bool, String> {
+    async fn rerun_ci(
+        &self,
+        sha: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<bool, String> {
         let raw = self.gh(&[
             "run".into(),
             "list".into(),
@@ -3928,7 +4795,22 @@ impl DeliveryRemote for GhCliRemote {
             let Some(id) = run.get("databaseId").and_then(serde_json::Value::as_u64) else {
                 continue;
             };
-            self.gh(&["run".into(), "rerun".into(), id.to_string()])?;
+            let rung = "provider_ci_rerun";
+            let id_text = id.to_string();
+            let operation_key = external_operation_key(rung, &[sha, &id_text]);
+            let evidence = json!({ "sha": sha, "run_id": id }).to_string();
+            let intent =
+                begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+            match self.gh(&["run".into(), "rerun".into(), id_text]) {
+                Ok(_) => {
+                    commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?
+                }
+                Err(error) => {
+                    return Err(
+                        fail_external_mutation(mutation_permit, intent.as_ref(), error).await,
+                    )
+                }
+            }
             rerun = true;
         }
         if rerun {
@@ -3989,21 +4871,52 @@ impl DeliveryRemote for GhCliRemote {
         Ok(parse_github_merge_readiness(&value))
     }
 
-    async fn update_pr_branch(&self, number: u64) -> Result<String, String> {
-        self.gh(&["pr".into(), "update-branch".into(), number.to_string()])?;
-        let head = self.gh(&[
-            "pr".into(),
-            "view".into(),
-            number.to_string(),
-            "--json".into(),
-            "headRefOid".into(),
-            "--jq".into(),
-            ".headRefOid".into(),
-        ])?;
-        if head.trim().is_empty() {
-            Err("GitHub updated the PR branch but returned no new head SHA".into())
-        } else {
-            Ok(head.trim().to_string())
+    async fn update_pr_branch(
+        &self,
+        number: u64,
+        expected_head: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<String, String> {
+        let rung = "provider_pr_branch_update";
+        let number_text = number.to_string();
+        let operation_key = external_operation_key(rung, &[&number_text, expected_head]);
+        let evidence = json!({
+            "pr_number": number,
+            "expected_head": expected_head,
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        let result = (|| {
+            self.gh(&["pr".into(), "update-branch".into(), number_text])?;
+            let head = self.gh(&[
+                "pr".into(),
+                "view".into(),
+                number.to_string(),
+                "--json".into(),
+                "headRefOid".into(),
+                "--jq".into(),
+                ".headRefOid".into(),
+            ])?;
+            if head.trim().is_empty() {
+                Err("GitHub updated the PR branch but returned no new head SHA".into())
+            } else {
+                Ok(head.trim().to_string())
+            }
+        })();
+        match result {
+            Ok(head) => {
+                commit_external_mutation(
+                    mutation_permit,
+                    intent.as_ref(),
+                    &json!({ "pr_number": number, "head": head }).to_string(),
+                )
+                .await?;
+                Ok(head)
+            }
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
         }
     }
 
@@ -4013,38 +4926,92 @@ impl DeliveryRemote for GhCliRemote {
         method: MergeMethod,
         commit_message: Option<&MergeCommitMessage>,
         expected_head: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<MergeRequestResult, String> {
         if let MergeObservation::Merged { merge_sha } =
             self.merge_observation(number, expected_head)?
         {
             return Ok(MergeRequestResult::Merged { merge_sha });
         }
-        self.gh(&gh_pr_merge_args(
+        let rung = "provider_pr_merge";
+        let number_text = number.to_string();
+        let operation_key =
+            external_operation_key(rung, &[&number_text, method.as_str(), expected_head]);
+        let evidence = json!({
+            "pr_number": number,
+            "method": method.as_str(),
+            "expected_head": expected_head,
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        if let Err(error) = self.gh(&gh_pr_merge_args(
             number,
             method,
             commit_message,
             expected_head,
-        ))?;
-        let observation = self.merge_observation(number, expected_head)?;
+        )) {
+            return Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await);
+        }
+        let observation = match self.merge_observation(number, expected_head) {
+            Ok(observation) => observation,
+            Err(error) => {
+                return Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        };
         let merge_sha = match observation {
-            MergeObservation::Merged { merge_sha } => merge_sha,
+            MergeObservation::Merged { merge_sha } => {
+                commit_external_mutation(
+                    mutation_permit,
+                    intent.as_ref(),
+                    &json!({ "pr_number": number, "merge_sha": merge_sha }).to_string(),
+                )
+                .await?;
+                merge_sha
+            }
             MergeObservation::OpenSameHead { auto_merge: true } => {
-                return Ok(MergeRequestResult::Queued)
+                commit_external_mutation(
+                    mutation_permit,
+                    intent.as_ref(),
+                    &json!({ "pr_number": number, "queued": true }).to_string(),
+                )
+                .await?;
+                return Ok(MergeRequestResult::Queued);
             }
             MergeObservation::OpenSameHead { auto_merge: false } => {
-                return Err(
+                return Err(fail_external_mutation(
+                    mutation_permit,
+                    intent.as_ref(),
                     "GitHub accepted gh pr merge but neither merged nor registered auto-merge"
                         .into(),
                 )
+                .await)
             }
             MergeObservation::HeadChanged { actual_head } => {
-                return Err(format!(
+                return Err(fail_external_mutation(
+                    mutation_permit,
+                    intent.as_ref(),
+                    format!(
                     "PR head changed during merge: expected {expected_head}, actual {actual_head}"
-                ))
+                ),
+                )
+                .await)
             }
-            MergeObservation::ClosedUnmerged => return Err("PR closed without merge".into()),
+            MergeObservation::ClosedUnmerged => {
+                return Err(fail_external_mutation(
+                    mutation_permit,
+                    intent.as_ref(),
+                    "PR closed without merge".into(),
+                )
+                .await)
+            }
             MergeObservation::Unsupported => {
-                return Err("GitHub merge observation unexpectedly unsupported".into())
+                return Err(fail_external_mutation(
+                    mutation_permit,
+                    intent.as_ref(),
+                    "GitHub merge observation unexpectedly unsupported".into(),
+                )
+                .await)
             }
         };
         if method != MergeMethod::Squash {
@@ -4077,12 +5044,35 @@ impl DeliveryRemote for GhCliRemote {
         self.merge_observation(number, expected_head)
     }
 
-    async fn trigger_release(&self) -> Result<String, String> {
-        self.gh(&gh_workflow_run_args(
+    async fn trigger_release(
+        &self,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<String, String> {
+        let rung = "provider_release_trigger";
+        let operation_key =
+            external_operation_key(rung, &[&self.release_workflow, &self.default_branch]);
+        let evidence = json!({
+            "workflow": self.release_workflow,
+            "git_ref": self.default_branch,
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        match self.gh(&gh_workflow_run_args(
             &self.release_workflow,
             &self.default_branch,
-        ))
-        .map(|_| format!("已通过 gh 触发发布工作流 {}", self.release_workflow))
+        )) {
+            Ok(_) => {
+                commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
+                Ok(format!(
+                    "已通过 gh 触发发布工作流 {}",
+                    self.release_workflow
+                ))
+            }
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
     async fn verify_live(
@@ -4099,12 +5089,21 @@ impl DeliveryRemote for GhCliRemote {
         let release: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| format!("gh release view returned non-JSON: {e}"))?;
         github_release_live_from_value(&release, sha, |tag| {
-            git(&self.cwd, &["merge-base", "--is-ancestor", sha, tag])
-                .map(|_| true)
-                .or_else(|_| {
-                    git(&self.cwd, &["fetch", "--prune", "origin", "main", "--tags"])?;
-                    Ok(git(&self.cwd, &["merge-base", "--is-ancestor", sha, tag]).is_ok())
-                })
+            let raw = self.gh(&[
+                "api".into(),
+                format!("repos/{}/compare/{sha}...{tag}", self.repo),
+            ])?;
+            let compare: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|error| format!("GitHub compare returned non-JSON: {error}"))?;
+            let status = compare
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let behind_by = compare
+                .get("behind_by")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-1);
+            Ok(matches!(status, "identical" | "ahead") && behind_by == 0)
         })
     }
 }
@@ -4134,12 +5133,46 @@ impl DeliveryRemote for EitherRemote {
         body: &str,
         head: &str,
         base: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<DeliveryPr, String> {
         match self {
-            EitherRemote::Hook(r) => r.open_or_get_pr(title, body, head, base).await,
-            EitherRemote::Gh(r) => r.open_or_get_pr(title, body, head, base).await,
-            EitherRemote::Github(r) => r.open_or_get_pr(title, body, head, base).await,
-            EitherRemote::Gitlab(r) => r.open_or_get_pr(title, body, head, base).await,
+            EitherRemote::Hook(r) => {
+                r.open_or_get_pr(title, body, head, base, mutation_permit)
+                    .await
+            }
+            EitherRemote::Gh(r) => {
+                r.open_or_get_pr(title, body, head, base, mutation_permit)
+                    .await
+            }
+            EitherRemote::Github(r) => {
+                r.open_or_get_pr(title, body, head, base, mutation_permit)
+                    .await
+            }
+            EitherRemote::Gitlab(r) => {
+                r.open_or_get_pr(title, body, head, base, mutation_permit)
+                    .await
+            }
+        }
+    }
+    async fn observe_open_pr(&self, head: &str, base: &str) -> Result<OpenPrObservation, String> {
+        match self {
+            EitherRemote::Hook(r) => r.observe_open_pr(head, base).await,
+            EitherRemote::Gh(r) => r.observe_open_pr(head, base).await,
+            EitherRemote::Github(r) => r.observe_open_pr(head, base).await,
+            EitherRemote::Gitlab(r) => r.observe_open_pr(head, base).await,
+        }
+    }
+    async fn update_pr_body(
+        &self,
+        number: u64,
+        body: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<(), String> {
+        match self {
+            EitherRemote::Hook(r) => r.update_pr_body(number, body, mutation_permit).await,
+            EitherRemote::Gh(r) => r.update_pr_body(number, body, mutation_permit).await,
+            EitherRemote::Github(r) => r.update_pr_body(number, body, mutation_permit).await,
+            EitherRemote::Gitlab(r) => r.update_pr_body(number, body, mutation_permit).await,
         }
     }
     async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
@@ -4150,29 +5183,66 @@ impl DeliveryRemote for EitherRemote {
             EitherRemote::Gitlab(r) => r.ci_status(sha).await,
         }
     }
+    async fn rerun_ci(
+        &self,
+        sha: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<bool, String> {
+        match self {
+            EitherRemote::Hook(r) => r.rerun_ci(sha, mutation_permit).await,
+            EitherRemote::Gh(r) => r.rerun_ci(sha, mutation_permit).await,
+            EitherRemote::Github(r) => r.rerun_ci(sha, mutation_permit).await,
+            EitherRemote::Gitlab(r) => r.rerun_ci(sha, mutation_permit).await,
+        }
+    }
     async fn merge_pr(
         &self,
         number: u64,
         method: MergeMethod,
         commit_message: Option<&MergeCommitMessage>,
         expected_head: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<MergeRequestResult, String> {
         match self {
             EitherRemote::Hook(r) => {
-                r.merge_pr(number, method, commit_message, expected_head)
-                    .await
+                r.merge_pr(
+                    number,
+                    method,
+                    commit_message,
+                    expected_head,
+                    mutation_permit,
+                )
+                .await
             }
             EitherRemote::Gh(r) => {
-                r.merge_pr(number, method, commit_message, expected_head)
-                    .await
+                r.merge_pr(
+                    number,
+                    method,
+                    commit_message,
+                    expected_head,
+                    mutation_permit,
+                )
+                .await
             }
             EitherRemote::Github(r) => {
-                r.merge_pr(number, method, commit_message, expected_head)
-                    .await
+                r.merge_pr(
+                    number,
+                    method,
+                    commit_message,
+                    expected_head,
+                    mutation_permit,
+                )
+                .await
             }
             EitherRemote::Gitlab(r) => {
-                r.merge_pr(number, method, commit_message, expected_head)
-                    .await
+                r.merge_pr(
+                    number,
+                    method,
+                    commit_message,
+                    expected_head,
+                    mutation_permit,
+                )
+                .await
             }
         }
     }
@@ -4188,12 +5258,41 @@ impl DeliveryRemote for EitherRemote {
             EitherRemote::Gitlab(r) => r.observe_merge(number, expected_head).await,
         }
     }
-    async fn trigger_release(&self) -> Result<String, String> {
+    async fn trigger_release(
+        &self,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<String, String> {
         match self {
-            EitherRemote::Hook(r) => r.trigger_release().await,
-            EitherRemote::Gh(r) => r.trigger_release().await,
-            EitherRemote::Github(r) => r.trigger_release().await,
-            EitherRemote::Gitlab(r) => r.trigger_release().await,
+            EitherRemote::Hook(r) => r.trigger_release(mutation_permit).await,
+            EitherRemote::Gh(r) => r.trigger_release(mutation_permit).await,
+            EitherRemote::Github(r) => r.trigger_release(mutation_permit).await,
+            EitherRemote::Gitlab(r) => r.trigger_release(mutation_permit).await,
+        }
+    }
+
+    async fn update_pr_branch(
+        &self,
+        number: u64,
+        expected_head: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<String, String> {
+        match self {
+            EitherRemote::Hook(r) => {
+                r.update_pr_branch(number, expected_head, mutation_permit)
+                    .await
+            }
+            EitherRemote::Gh(r) => {
+                r.update_pr_branch(number, expected_head, mutation_permit)
+                    .await
+            }
+            EitherRemote::Github(r) => {
+                r.update_pr_branch(number, expected_head, mutation_permit)
+                    .await
+            }
+            EitherRemote::Gitlab(r) => {
+                r.update_pr_branch(number, expected_head, mutation_permit)
+                    .await
+            }
         }
     }
 
@@ -4556,6 +5655,7 @@ impl DeliveryRemote for GitlabRemote {
         body: &str,
         head: &str,
         base: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<DeliveryPr, String> {
         let mrs = crate::git_remote::gitlab::list_prs(&self.client, &self.repo, "open")
             .await
@@ -4568,7 +5668,18 @@ impl DeliveryRemote for GitlabRemote {
                 body: mr.body,
             });
         }
-        let mr = crate::git_remote::gitlab::create_pr(
+        let rung = "provider_pr_create";
+        let operation_key = external_operation_key(rung, &[title, body, head, base]);
+        let evidence = json!({
+            "head": head,
+            "base": base,
+            "title_digest": external_operation_key("title", &[title]),
+            "body_digest": external_operation_key("body", &[body]),
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        let result = crate::git_remote::gitlab::create_pr(
             &self.client,
             &self.repo,
             title,
@@ -4577,17 +5688,75 @@ impl DeliveryRemote for GitlabRemote {
             base,
             false,
         )
-        .await?;
-        Ok(DeliveryPr {
-            number: mr.number,
-            url: mr.url,
-            title: mr.title,
-            body: mr.body,
-        })
+        .await;
+        match result {
+            Ok(mr) => {
+                commit_external_mutation(
+                    mutation_permit,
+                    intent.as_ref(),
+                    &json!({ "pr_number": mr.number, "pr_url": mr.url }).to_string(),
+                )
+                .await?;
+                Ok(DeliveryPr {
+                    number: mr.number,
+                    url: mr.url,
+                    title: mr.title,
+                    body: mr.body,
+                })
+            }
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
-    async fn update_pr_body(&self, number: u64, body: &str) -> Result<(), String> {
-        crate::git_remote::gitlab::update_pr_body(&self.client, &self.repo, number, body).await
+    async fn observe_open_pr(&self, head: &str, base: &str) -> Result<OpenPrObservation, String> {
+        let mrs = crate::git_remote::gitlab::list_prs(&self.client, &self.repo, "open")
+            .await
+            .map_err(|error| format!("cannot observe GitLab merge requests: {error}"))?;
+        let Some(mr) = mrs
+            .into_iter()
+            .find(|mr| mr.head_branch == head && mr.base_branch == base)
+        else {
+            return Ok(OpenPrObservation::Absent);
+        };
+        Ok(OpenPrObservation::Open(OpenPrState {
+            pr: DeliveryPr {
+                number: mr.number,
+                url: mr.url,
+                title: mr.title,
+                body: mr.body,
+            },
+            head_branch: head.to_string(),
+            base_branch: base.to_string(),
+            head_sha: None,
+        }))
+    }
+
+    async fn update_pr_body(
+        &self,
+        number: u64,
+        body: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<(), String> {
+        let rung = "provider_pr_body_update";
+        let number_text = number.to_string();
+        let operation_key = external_operation_key(rung, &[&number_text, body]);
+        let evidence = json!({
+            "pr_number": number,
+            "body_digest": external_operation_key("body", &[body]),
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        match crate::git_remote::gitlab::update_pr_body(&self.client, &self.repo, number, body)
+            .await
+        {
+            Ok(()) => commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await,
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
     async fn ci_status(&self, _sha: &str) -> Result<CiStatus, String> {
@@ -4599,16 +5768,40 @@ impl DeliveryRemote for GitlabRemote {
         number: u64,
         method: MergeMethod,
         _commit_message: Option<&MergeCommitMessage>,
-        _expected_head: &str,
+        expected_head: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<MergeRequestResult, String> {
-        crate::git_remote::gitlab::merge_pr(&self.client, &self.repo, number, method.as_str())
-            .await?;
-        Ok(MergeRequestResult::Merged {
-            merge_sha: String::new(),
+        let rung = "provider_pr_merge";
+        let number_text = number.to_string();
+        let operation_key =
+            external_operation_key(rung, &[&number_text, method.as_str(), expected_head]);
+        let evidence = json!({
+            "pr_number": number,
+            "method": method.as_str(),
+            "expected_head": expected_head,
         })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        match crate::git_remote::gitlab::merge_pr(&self.client, &self.repo, number, method.as_str())
+            .await
+        {
+            Ok(()) => {
+                commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
+                Ok(MergeRequestResult::Merged {
+                    merge_sha: String::new(),
+                })
+            }
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
-    async fn trigger_release(&self) -> Result<String, String> {
+    async fn trigger_release(
+        &self,
+        _mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<String, String> {
         Err("GitLab release dispatch is not built in; configure a delivery provider hook/plugin for this repository's release pipeline.".into())
     }
 }
@@ -4630,6 +5823,7 @@ impl DeliveryRemote for GithubRemote {
         body: &str,
         head: &str,
         base: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<DeliveryPr, String> {
         // Idempotency: reuse an existing open PR for this head branch.
         let prs = crate::git_remote::github::list_prs(&self.client, &self.repo, "open")
@@ -4643,7 +5837,18 @@ impl DeliveryRemote for GithubRemote {
                 body: pr.body,
             });
         }
-        let pr = crate::git_remote::github::create_pr(
+        let rung = "provider_pr_create";
+        let operation_key = external_operation_key(rung, &[title, body, head, base]);
+        let evidence = json!({
+            "head": head,
+            "base": base,
+            "title_digest": external_operation_key("title", &[title]),
+            "body_digest": external_operation_key("body", &[body]),
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        let result = crate::git_remote::github::create_pr(
             &self.client,
             &self.repo,
             title,
@@ -4652,17 +5857,105 @@ impl DeliveryRemote for GithubRemote {
             base,
             false,
         )
-        .await?;
-        Ok(DeliveryPr {
-            number: pr.number,
-            url: pr.url,
-            title: pr.title,
-            body: pr.body,
-        })
+        .await;
+        match result {
+            Ok(pr) => {
+                commit_external_mutation(
+                    mutation_permit,
+                    intent.as_ref(),
+                    &json!({ "pr_number": pr.number, "pr_url": pr.url }).to_string(),
+                )
+                .await?;
+                Ok(DeliveryPr {
+                    number: pr.number,
+                    url: pr.url,
+                    title: pr.title,
+                    body: pr.body,
+                })
+            }
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
-    async fn update_pr_body(&self, number: u64, body: &str) -> Result<(), String> {
-        crate::git_remote::github::update_pr_body(&self.client, &self.repo, number, body).await
+    async fn observe_open_pr(&self, head: &str, base: &str) -> Result<OpenPrObservation, String> {
+        let value = self
+            .client
+            .get(&format!(
+                "/repos/{}/pulls?state=open&base={base}&per_page=100",
+                self.repo
+            ))
+            .await?;
+        let rows = value
+            .as_array()
+            .ok_or_else(|| "GitHub open PR observation returned a non-array".to_string())?;
+        let Some(row) = rows.iter().find(|row| {
+            row.get("head")
+                .and_then(|head| head.get("ref"))
+                .and_then(serde_json::Value::as_str)
+                == Some(head)
+        }) else {
+            return Ok(OpenPrObservation::Absent);
+        };
+        let number = row
+            .get("number")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "GitHub open PR observation omitted number".to_string())?;
+        let url = row
+            .get("html_url")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "GitHub open PR observation omitted URL".to_string())?;
+        Ok(OpenPrObservation::Open(OpenPrState {
+            pr: DeliveryPr {
+                number,
+                url: url.to_string(),
+                title: row
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                body: row
+                    .get("body")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            head_branch: head.to_string(),
+            base_branch: base.to_string(),
+            head_sha: row
+                .get("head")
+                .and_then(|head| head.get("sha"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        }))
+    }
+
+    async fn update_pr_body(
+        &self,
+        number: u64,
+        body: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<(), String> {
+        let rung = "provider_pr_body_update";
+        let number_text = number.to_string();
+        let operation_key = external_operation_key(rung, &[&number_text, body]);
+        let evidence = json!({
+            "pr_number": number,
+            "body_digest": external_operation_key("body", &[body]),
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        match crate::git_remote::github::update_pr_body(&self.client, &self.repo, number, body)
+            .await
+        {
+            Ok(()) => commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await,
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
     async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
@@ -4682,7 +5975,11 @@ impl DeliveryRemote for GithubRemote {
         Ok(self.ci_stability.confirm(&observation.fingerprint, status))
     }
 
-    async fn rerun_ci(&self, sha: &str) -> Result<bool, String> {
+    async fn rerun_ci(
+        &self,
+        sha: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<bool, String> {
         let value = self
             .client
             .get(&format!(
@@ -4713,12 +6010,29 @@ impl DeliveryRemote for GithubRemote {
             let Some(id) = run.get("id").and_then(serde_json::Value::as_u64) else {
                 continue;
             };
-            self.client
+            let rung = "provider_ci_rerun";
+            let id_text = id.to_string();
+            let operation_key = external_operation_key(rung, &[sha, &id_text]);
+            let evidence = json!({ "sha": sha, "run_id": id }).to_string();
+            let intent =
+                begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+            let result = self
+                .client
                 .post(
                     &format!("/repos/{}/actions/runs/{id}/rerun", self.repo),
                     serde_json::json!({}),
                 )
-                .await?;
+                .await;
+            match result {
+                Ok(_) => {
+                    commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?
+                }
+                Err(error) => {
+                    return Err(
+                        fail_external_mutation(mutation_permit, intent.as_ref(), error).await,
+                    )
+                }
+            }
             rerun = true;
         }
         if rerun {
@@ -4749,25 +6063,61 @@ impl DeliveryRemote for GithubRemote {
         ))
     }
 
-    async fn update_pr_branch(&self, number: u64) -> Result<String, String> {
-        self.client
+    async fn update_pr_branch(
+        &self,
+        number: u64,
+        expected_head: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<String, String> {
+        let rung = "provider_pr_branch_update";
+        let number_text = number.to_string();
+        let operation_key = external_operation_key(rung, &[&number_text, expected_head]);
+        let evidence = json!({
+            "pr_number": number,
+            "expected_head": expected_head,
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        let result = self
+            .client
             .put(
                 &format!("/repos/{}/pulls/{number}/update-branch", self.repo),
                 serde_json::json!({}),
             )
-            .await?;
-        let value = self
+            .await;
+        if let Err(error) = result {
+            return Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await);
+        }
+        let value = match self
             .client
             .get(&format!("/repos/{}/pulls/{number}", self.repo))
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        };
         let head = value
             .get("head")
             .and_then(|head| head.get("sha"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         if head.is_empty() {
-            Err("GitHub updated the PR branch but returned no new head SHA".into())
+            Err(fail_external_mutation(
+                mutation_permit,
+                intent.as_ref(),
+                "GitHub updated the PR branch but returned no new head SHA".into(),
+            )
+            .await)
         } else {
+            commit_external_mutation(
+                mutation_permit,
+                intent.as_ref(),
+                &json!({ "pr_number": number, "head": head }).to_string(),
+            )
+            .await?;
             Ok(head.to_string())
         }
     }
@@ -4778,8 +6128,21 @@ impl DeliveryRemote for GithubRemote {
         method: MergeMethod,
         commit_message: Option<&MergeCommitMessage>,
         expected_head: &str,
+        mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<MergeRequestResult, String> {
-        let merge_sha = crate::git_remote::github::merge_pr(
+        let rung = "provider_pr_merge";
+        let number_text = number.to_string();
+        let operation_key =
+            external_operation_key(rung, &[&number_text, method.as_str(), expected_head]);
+        let evidence = json!({
+            "pr_number": number,
+            "method": method.as_str(),
+            "expected_head": expected_head,
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        let result = crate::git_remote::github::merge_pr(
             &self.client,
             &self.repo,
             number,
@@ -4788,8 +6151,21 @@ impl DeliveryRemote for GithubRemote {
             commit_message.map(|message| message.body.as_str()),
             expected_head,
         )
-        .await?;
-        Ok(MergeRequestResult::Merged { merge_sha })
+        .await;
+        match result {
+            Ok(merge_sha) => {
+                commit_external_mutation(
+                    mutation_permit,
+                    intent.as_ref(),
+                    &json!({ "pr_number": number, "merge_sha": merge_sha }).to_string(),
+                )
+                .await?;
+                Ok(MergeRequestResult::Merged { merge_sha })
+            }
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
     async fn observe_merge(
@@ -4836,17 +6212,39 @@ impl DeliveryRemote for GithubRemote {
         }
     }
 
-    async fn trigger_release(&self) -> Result<String, String> {
+    async fn trigger_release(
+        &self,
+        mutation_permit: Option<&DeliveryMutationPermit>,
+    ) -> Result<String, String> {
         // workflow_dispatch on the repo's release workflow (needs a token with
         // the `workflow` scope; a repo-only token yields a clear 403 here).
         let path = format!(
             "/repos/{}/actions/workflows/{}/dispatches",
             self.repo, self.release_workflow
         );
-        self.client
+        let rung = "provider_release_trigger";
+        let operation_key =
+            external_operation_key(rung, &[&self.release_workflow, &self.default_branch]);
+        let evidence = json!({
+            "workflow": self.release_workflow,
+            "git_ref": self.default_branch,
+        })
+        .to_string();
+        let intent =
+            begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
+        let result = self
+            .client
             .post(&path, serde_json::json!({ "ref": self.default_branch }))
-            .await
-            .map(|_| format!("已触发发布工作流 {}", self.release_workflow))
+            .await;
+        match result {
+            Ok(_) => {
+                commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
+                Ok(format!("已触发发布工作流 {}", self.release_workflow))
+            }
+            Err(error) => {
+                Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+            }
+        }
     }
 
     async fn verify_live(
@@ -5914,7 +7312,7 @@ else:
         );
 
         let pr = remote
-            .open_or_get_pr("title", "body", "feat/x", "main")
+            .open_or_get_pr("title", "body", "feat/x", "main", None)
             .await
             .expect("hook open_or_get_pr");
         assert_eq!(pr.number, 42);
@@ -5923,11 +7321,11 @@ else:
         assert_eq!(pr.body, "body");
         assert_eq!(remote.ci_status("abc123").await.unwrap(), CiStatus::Success);
         remote
-            .merge_pr(42, MergeMethod::Squash, None, "abc123")
+            .merge_pr(42, MergeMethod::Squash, None, "abc123", None)
             .await
             .unwrap();
         assert_eq!(
-            remote.trigger_release().await.unwrap(),
+            remote.trigger_release(None).await.unwrap(),
             "corp release dispatched"
         );
         assert_eq!(
@@ -6020,6 +7418,8 @@ else:
                 requested_ceiling: None,
                 extra_excludes: vec![],
                 expect_branch: None,
+                expected_identity: None,
+                mutation_permit: None,
             },
             Some(&remote),
             Some("main"),
@@ -6151,9 +7551,15 @@ else:
             &self,
             t: &str,
             b: &str,
-            _h: &str,
-            _base: &str,
+            h: &str,
+            base: &str,
+            mutation_permit: Option<&DeliveryMutationPermit>,
         ) -> Result<DeliveryPr, String> {
+            let rung = "provider_pr_open_or_get";
+            let operation_key = external_operation_key(rung, &[t, b, h, base]);
+            let evidence = json!({ "head": h, "base": base }).to_string();
+            let intent =
+                begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
             self.calls.open_pr.fetch_add(1, Ordering::SeqCst);
             *self.calls.last_pr_body.lock().unwrap() = Some(b.to_string());
             let (number, url) = self
@@ -6167,14 +7573,59 @@ else:
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| (t.to_string(), b.to_string()));
-            Ok(DeliveryPr {
+            let pr = DeliveryPr {
                 number,
                 url,
                 title,
                 body,
-            })
+            };
+            commit_external_mutation(
+                mutation_permit,
+                intent.as_ref(),
+                &json!({ "pr_number": pr.number, "pr_url": pr.url }).to_string(),
+            )
+            .await?;
+            Ok(pr)
         }
-        async fn update_pr_body(&self, _number: u64, body: &str) -> Result<(), String> {
+        async fn observe_open_pr(
+            &self,
+            head: &str,
+            base: &str,
+        ) -> Result<OpenPrObservation, String> {
+            let Some((number, url)) = self.existing_pr.clone() else {
+                return Ok(OpenPrObservation::Absent);
+            };
+            let (title, body) = self
+                .calls
+                .remote_pr_text
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| ("fix: existing PR".into(), String::new()));
+            Ok(OpenPrObservation::Open(OpenPrState {
+                pr: DeliveryPr {
+                    number,
+                    url,
+                    title,
+                    body,
+                },
+                head_branch: head.to_string(),
+                base_branch: base.to_string(),
+                head_sha: self.calls.last_ci_sha.lock().unwrap().clone(),
+            }))
+        }
+        async fn update_pr_body(
+            &self,
+            number: u64,
+            body: &str,
+            mutation_permit: Option<&DeliveryMutationPermit>,
+        ) -> Result<(), String> {
+            let rung = "provider_pr_body_update";
+            let number_text = number.to_string();
+            let operation_key = external_operation_key(rung, &[&number_text, body]);
+            let evidence = json!({ "pr_number": number }).to_string();
+            let intent =
+                begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
             self.calls.update_pr_body.fetch_add(1, Ordering::SeqCst);
             let mut remote = self.calls.remote_pr_text.lock().unwrap();
             let title = remote
@@ -6182,7 +7633,7 @@ else:
                 .map(|(title, _)| title.clone())
                 .unwrap_or_else(|| "fix: existing PR".into());
             *remote = Some((title, body.to_string()));
-            Ok(())
+            commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await
         }
         async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
             self.calls.ci.fetch_add(1, Ordering::SeqCst);
@@ -6192,8 +7643,18 @@ else:
             }
             Ok(self.ci.clone())
         }
-        async fn rerun_ci(&self, _sha: &str) -> Result<bool, String> {
+        async fn rerun_ci(
+            &self,
+            sha: &str,
+            mutation_permit: Option<&DeliveryMutationPermit>,
+        ) -> Result<bool, String> {
+            let rung = "provider_ci_rerun";
+            let operation_key = external_operation_key(rung, &[sha]);
+            let evidence = json!({ "sha": sha }).to_string();
+            let intent =
+                begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
             self.calls.rerun_ci.fetch_add(1, Ordering::SeqCst);
+            commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
             Ok(true)
         }
         async fn merge_pr(
@@ -6201,11 +7662,17 @@ else:
             _n: u64,
             _m: MergeMethod,
             commit_message: Option<&MergeCommitMessage>,
-            _expected_head: &str,
+            expected_head: &str,
+            mutation_permit: Option<&DeliveryMutationPermit>,
         ) -> Result<MergeRequestResult, String> {
+            let rung = "provider_pr_merge";
+            let operation_key = external_operation_key(rung, &[expected_head]);
+            let evidence = json!({ "expected_head": expected_head }).to_string();
+            let intent =
+                begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
             self.calls.merge.fetch_add(1, Ordering::SeqCst);
             *self.calls.merge_commit_message.lock().unwrap() = commit_message.cloned();
-            if self.merge_queues {
+            let result = if self.merge_queues {
                 Ok(MergeRequestResult::Queued)
             } else if self.merge_ok {
                 self.calls.merged.store(true, Ordering::SeqCst);
@@ -6214,6 +7681,15 @@ else:
                 })
             } else {
                 Err("protected branch".into())
+            };
+            match result {
+                Ok(outcome) => {
+                    commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
+                    Ok(outcome)
+                }
+                Err(error) => {
+                    Err(fail_external_mutation(mutation_permit, intent.as_ref(), error).await)
+                }
             }
         }
         async fn observe_merge(
@@ -6240,17 +7716,44 @@ else:
                 .clone()
                 .unwrap_or(MergeReadiness::Unknown))
         }
-        async fn update_pr_branch(&self, _number: u64) -> Result<String, String> {
+        async fn update_pr_branch(
+            &self,
+            number: u64,
+            expected_head: &str,
+            mutation_permit: Option<&DeliveryMutationPermit>,
+        ) -> Result<String, String> {
+            let rung = "provider_pr_branch_update";
+            let number_text = number.to_string();
+            let operation_key = external_operation_key(rung, &[&number_text, expected_head]);
+            let evidence = json!({
+                "pr_number": number,
+                "expected_head": expected_head,
+            })
+            .to_string();
+            let intent =
+                begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
             self.calls.update_branch.fetch_add(1, Ordering::SeqCst);
-            self.calls
+            let head = self
+                .calls
                 .last_ci_sha
                 .lock()
                 .unwrap()
                 .clone()
-                .ok_or_else(|| "stub has not observed a head".into())
+                .ok_or_else(|| "stub has not observed a head".to_string())?;
+            commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
+            Ok(head)
         }
-        async fn trigger_release(&self) -> Result<String, String> {
+        async fn trigger_release(
+            &self,
+            mutation_permit: Option<&DeliveryMutationPermit>,
+        ) -> Result<String, String> {
+            let rung = "provider_release_trigger";
+            let operation_key = external_operation_key(rung, &["stub"]);
+            let evidence = json!({ "provider": "stub" }).to_string();
+            let intent =
+                begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
             self.calls.release.fetch_add(1, Ordering::SeqCst);
+            commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
             Ok("release workflow dispatched".into())
         }
     }
@@ -6691,6 +8194,261 @@ Release-Urgency: hold"
         );
         assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
         assert_eq!(calls.ci.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_delivery_identity_blocks_before_commit_push_or_pr() {
+        let root = feature_branch_repo("stale-identity");
+        let origin = root.parent().unwrap().join("origin.git");
+        let (repo, _) = resolve_delivery_repo(&root, Some("main"), Some("feat/x")).unwrap();
+        let expected_identity = capture_delivery_identity(&repo).unwrap();
+
+        git(&root, &["add", "feature.rs"]).unwrap();
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Concurrent Writer",
+                "-c",
+                "user.email=concurrent@example.invalid",
+                "commit",
+                "-m",
+                "intruder commit",
+            ],
+        )
+        .unwrap();
+        let intruder_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let intruder_status = git(
+            &root,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )
+        .unwrap();
+        assert!(
+            git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err(),
+            "test precondition: feature branch is not yet pushed"
+        );
+
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let outcome = deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            1,
+            &DeliverOpts {
+                expect_branch: Some("feat/x".into()),
+                expected_identity: Some(expected_identity),
+                ..DeliverOpts::default()
+            },
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(outcome.final_state, "blocked", "{:?}", outcome.steps);
+        assert_eq!(outcome.stage, "identity");
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), intruder_head);
+        assert_eq!(
+            git(
+                &root,
+                &["status", "--porcelain=v1", "--untracked-files=all"],
+            )
+            .unwrap(),
+            intruder_status,
+            "identity rejection must not stage or rewrite the concurrent commit"
+        );
+        assert!(
+            git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err(),
+            "identity rejection must not push"
+        );
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.update_pr_body.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn takeover_refuses_an_unreceipted_local_head_without_any_remote_mutation() {
+        let root = feature_branch_repo("takeover-unreceipted-head");
+        let origin = root.parent().unwrap().join("origin.git");
+        let (repo, _) = resolve_delivery_repo(&root, Some("main"), Some("feat/x")).unwrap();
+        let persisted_identity = capture_delivery_identity(&repo).unwrap();
+
+        git(&root, &["add", "feature.rs"]).unwrap();
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Unreceipted Writer",
+                "-c",
+                "user.email=unreceipted@example.invalid",
+                "commit",
+                "-m",
+                "unreceipted local head",
+            ],
+        )
+        .unwrap();
+        let unreceipted_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(unreceipted_head, persisted_identity.head_sha);
+
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let error = observe_delivery_takeover(
+            &root,
+            Some("main"),
+            "feat/x",
+            &persisted_identity,
+            None,
+            None,
+            Some(&remote),
+        )
+        .await
+        .expect_err("an unreceipted head cannot self-authorize takeover");
+
+        assert!(error.contains("not durably receipted"));
+        assert!(git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err());
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.update_pr_body.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.rerun_ci.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn matching_takeover_observation_is_strictly_read_only() {
+        let root = feature_branch_repo("takeover-read-only");
+        let origin = root.parent().unwrap().join("origin.git");
+        let (repo, _) = resolve_delivery_repo(&root, Some("main"), Some("feat/x")).unwrap();
+        let persisted_identity = capture_delivery_identity(&repo).unwrap();
+        let before_status = git(
+            &root,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )
+        .unwrap();
+        let before_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let observed = observe_delivery_takeover(
+            &root,
+            Some("main"),
+            "feat/x",
+            &persisted_identity,
+            None,
+            None,
+            Some(&remote),
+        )
+        .await
+        .expect("the exact persisted state is safe to reconcile read-only");
+
+        assert_eq!(observed.identity, persisted_identity);
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before_head);
+        assert_eq!(
+            git(
+                &root,
+                &["status", "--porcelain=v1", "--untracked-files=all"],
+            )
+            .unwrap(),
+            before_status
+        );
+        assert!(git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err());
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.update_pr_body.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.rerun_ci.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    struct FailAtMutationRung {
+        calls: AtomicUsize,
+        fail_at: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl DeliveryMutationPermitVerifier for FailAtMutationRung {
+        async fn verify(&self, rung: &str) -> Result<(), String> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call >= self.fail_at {
+                Err(format!("fenced before {rung}"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_claim_epoch_fences_every_later_mutation_rung() {
+        let root = feature_branch_repo("claim-epoch-rung-fence");
+        let origin = root.parent().unwrap().join("origin.git");
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let permit = DeliveryMutationPermit::new(Arc::new(FailAtMutationRung {
+            calls: AtomicUsize::new(0),
+            // Allow staging and the local commit, then simulate lease/epoch
+            // loss immediately before the first remote write.
+            fail_at: 3,
+        }));
+
+        let outcome = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            1,
+            &DeliverOpts {
+                mutation_permit: Some(permit),
+                expect_branch: Some("feat/x".into()),
+                ..DeliverOpts::default()
+            },
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.recovery_class,
+            RecoveryClass::ExternalStateUncertain
+        );
+        assert_eq!(outcome.stage, "mutation_permit");
+        assert!(
+            git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err(),
+            "a stale owner must not push after losing its epoch"
+        );
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.update_pr_body.load(Ordering::SeqCst), 0);
         assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
         assert_eq!(calls.release.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
@@ -7910,6 +9668,8 @@ Release-Urgency: hold"
                 requested_ceiling: None,
                 extra_excludes: vec![],
                 expect_branch: None,
+                expected_identity: None,
+                mutation_permit: None,
             },
             Some(&remote),
             Some("main"),
@@ -7947,6 +9707,8 @@ Release-Urgency: hold"
                 requested_ceiling: None,
                 extra_excludes: vec![],
                 expect_branch: None,
+                expected_identity: None,
+                mutation_permit: None,
             },
             Some(&remote),
             Some("main"),
@@ -8008,6 +9770,8 @@ Release-Urgency: hold"
                 requested_ceiling: None,
                 extra_excludes: vec![],
                 expect_branch: None,
+                expected_identity: None,
+                mutation_permit: None,
             },
             Some(&remote),
             Some("main"),
@@ -8035,6 +9799,8 @@ Release-Urgency: hold"
                 requested_ceiling: None,
                 extra_excludes: vec![],
                 expect_branch: Some("feat/wt".into()),
+                expected_identity: None,
+                mutation_permit: None,
             },
             Some(&remote),
             Some("main"),

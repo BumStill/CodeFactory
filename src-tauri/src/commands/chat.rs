@@ -490,6 +490,118 @@ struct ChatRunningSetupGuard {
     armed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatContinuationResolution {
+    AlreadyBound {
+        objective_id: String,
+    },
+    None,
+    Unique {
+        objective_id: String,
+        continuation_root_turn_id: String,
+        previous_segment_id: String,
+        driver: String,
+    },
+    Ambiguous,
+}
+
+#[derive(Debug, Clone)]
+struct ChatContinuationSetup {
+    continuation_root_turn_id: Option<String>,
+    previous_segment_id: Option<String>,
+    expected_objective_id: Option<String>,
+    driver: Option<String>,
+    ambiguous: bool,
+}
+
+/// Resolve reprompt continuity from opaque Objective state, never message
+/// keywords or a parseable id. DeliveryRun may refine the diagnostic driver
+/// only after the Objective has already been uniquely selected.
+async fn resolve_open_chat_objective_continuation(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    root_turn_id: &str,
+    current_ordinal: i64,
+) -> Result<ChatContinuationResolution, AppError> {
+    let current_binding = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT objective_id FROM chat_turn_state
+         WHERE root_turn_id=? AND session_id=?",
+    )
+    .bind(root_turn_id)
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten()
+    .filter(|value| !value.is_empty());
+    if let Some(objective_id) = current_binding {
+        return Ok(ChatContinuationResolution::AlreadyBound { objective_id });
+    }
+
+    let candidates = sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT objective.id, objective.status, turn.root_turn_id, segment.id
+         FROM objectives objective
+         JOIN chat_turn_state turn ON turn.objective_id=objective.id
+         JOIN chat_task_segments segment ON segment.id=turn.task_segment_id
+         WHERE turn.session_id=? AND turn.root_turn_id<>?
+           AND objective.status NOT IN ('completed', 'cancelled', 'legacy_orphan')
+           AND segment.ordinal<?
+           AND segment.ordinal=(
+             SELECT MAX(prior_segment.ordinal)
+             FROM chat_turn_state prior_turn
+             JOIN chat_task_segments prior_segment ON prior_segment.id=prior_turn.task_segment_id
+             WHERE prior_turn.objective_id=objective.id
+               AND prior_turn.session_id=?
+               AND prior_turn.root_turn_id<>?
+               AND prior_segment.ordinal<?
+           )
+         ORDER BY objective.id
+         LIMIT 2",
+    )
+    .bind(session_id)
+    .bind(root_turn_id)
+    .bind(current_ordinal)
+    .bind(session_id)
+    .bind(root_turn_id)
+    .bind(current_ordinal)
+    .fetch_all(pool)
+    .await?;
+    if candidates.len() > 1 {
+        return Ok(ChatContinuationResolution::Ambiguous);
+    }
+    let Some((objective_id, objective_status, continuation_root_turn_id, previous_segment_id)) =
+        candidates.into_iter().next()
+    else {
+        return Ok(ChatContinuationResolution::None);
+    };
+    let delivery_status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM delivery_runs
+         WHERE objective_id=?
+           AND status NOT IN ('completed', 'failed', 'cancelled', 'rejected')
+         ORDER BY updated_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&objective_id)
+    .fetch_optional(pool)
+    .await?;
+    let driver = match (objective_status.as_str(), delivery_status.as_deref()) {
+        ("waiting_system", Some("waiting")) => "recoverable_waiting_open",
+        ("waiting_system", Some("awaiting_completion_arbitration")) => {
+            "completion_arbitration_open"
+        }
+        ("waiting_system", _) => "system_owned_remediation_open",
+        ("waiting_core_input", _) => "core_input_response",
+        ("waiting_authorization", _) => "authorization_response",
+        ("waiting_business_decision", _) => "business_decision_response",
+        _ => "authorized_objective_still_open",
+    }
+    .to_string();
+    Ok(ChatContinuationResolution::Unique {
+        objective_id,
+        continuation_root_turn_id,
+        previous_segment_id,
+        driver,
+    })
+}
+
 impl ChatRunningSetupGuard {
     fn new(chat_cancels: crate::ChatCancelMap, session_id: String, flag: Arc<AtomicBool>) -> Self {
         Self {
@@ -589,7 +701,7 @@ pub async fn send_message(
         root_turn_id
     };
 
-    let continuation_root_turn_id = {
+    let continuation_setup = {
         let pool = state.db.read().await;
         let now = Utc::now().timestamp_millis();
         let ordinal: i64 = sqlx::query_scalar(
@@ -598,11 +710,26 @@ pub async fn send_message(
         .bind(&session_id)
         .fetch_one(&*pool)
         .await?;
-        let previous_segment_id = if crate::agent::is_contextual_approval(&content) {
-            sqlx::query_scalar::<_, String>(
-                "SELECT id FROM chat_task_segments WHERE session_id=? ORDER BY ordinal DESC LIMIT 1",
+        let resolution =
+            resolve_open_chat_objective_continuation(&pool, &session_id, &root_turn_id, ordinal)
+                .await?;
+        let legacy_continuation = if matches!(resolution, ChatContinuationResolution::None)
+            && crate::agent::is_contextual_approval(&content)
+        {
+            // Keyword inference is retained only for a pre-0006 segment whose
+            // prior root has no opaque Objective binding. All new records use
+            // Objective state above, regardless of message wording.
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT segment.id, segment.goal_root_turn_id
+                 FROM chat_task_segments segment
+                 LEFT JOIN chat_turn_state turn
+                   ON turn.root_turn_id=segment.goal_root_turn_id
+                 WHERE segment.session_id=? AND segment.ordinal<?
+                   AND (turn.objective_id IS NULL OR turn.objective_id='')
+                 ORDER BY segment.ordinal DESC LIMIT 1",
             )
             .bind(&session_id)
+            .bind(ordinal)
             .fetch_optional(&*pool)
             .await?
         } else {
@@ -624,7 +751,7 @@ pub async fn send_message(
             &title
         })
         .bind(&root_turn_id)
-        .bind(&previous_segment_id)
+        .bind(Option::<String>::None)
         .bind(now)
         .bind(now)
         .execute(&*pool)
@@ -652,60 +779,84 @@ pub async fn send_message(
         .bind(now)
         .execute(&*pool)
         .await?;
-        let continuation_root_turn_id =
-            if let Some(previous_segment_id) = previous_segment_id.as_deref() {
-                sqlx::query_scalar::<_, String>(
-                    "SELECT goal_root_turn_id FROM chat_task_segments WHERE id=? AND session_id=?",
+        match resolution {
+            ChatContinuationResolution::AlreadyBound { objective_id } => ChatContinuationSetup {
+                continuation_root_turn_id: None,
+                previous_segment_id: None,
+                expected_objective_id: Some(objective_id),
+                driver: None,
+                ambiguous: false,
+            },
+            ChatContinuationResolution::Unique {
+                objective_id,
+                continuation_root_turn_id,
+                previous_segment_id,
+                driver,
+            } => ChatContinuationSetup {
+                continuation_root_turn_id: Some(continuation_root_turn_id),
+                previous_segment_id: Some(previous_segment_id),
+                expected_objective_id: Some(objective_id),
+                driver: Some(driver),
+                ambiguous: false,
+            },
+            ChatContinuationResolution::None => ChatContinuationSetup {
+                continuation_root_turn_id: legacy_continuation
+                    .as_ref()
+                    .map(|(_, root)| root.clone()),
+                previous_segment_id: legacy_continuation.map(|(segment, _)| segment),
+                expected_objective_id: None,
+                driver: None,
+                ambiguous: false,
+            },
+            ChatContinuationResolution::Ambiguous => {
+                sqlx::query(
+                    "UPDATE chat_turn_state
+                     SET phase='recovering', status='waiting_system',
+                         recent_activity_kind='system_identity_reconciliation',
+                         recent_activity_label='系统正在核对目标身份',
+                         user_reprompt_driver='system_owned_identity_incident', updated_at=?
+                    WHERE root_turn_id=? AND session_id=?",
                 )
-                .bind(previous_segment_id)
+                .bind(now)
+                .bind(&root_turn_id)
                 .bind(&session_id)
-                .fetch_optional(&*pool)
-                .await?
-            } else {
-                None
-            };
-        if let Some(continuation_root_turn_id) = continuation_root_turn_id.as_deref() {
-            let objective_id = sqlx::query_scalar::<_, Option<String>>(
-                "SELECT objective_id FROM chat_turn_state
-                 WHERE root_turn_id=? AND session_id=?",
-            )
-            .bind(continuation_root_turn_id)
-            .bind(&session_id)
-            .fetch_optional(&*pool)
-            .await?
-            .flatten()
-            .filter(|value| !value.is_empty());
-            if let Some(objective_id) = objective_id {
-                let open_state = sqlx::query_as::<_, (String, Option<String>)>(
-                    "SELECT status, wait_class FROM delivery_runs
-                     WHERE objective_id=?
-                       AND status NOT IN ('completed', 'failed', 'cancelled', 'rejected')
-                     ORDER BY updated_at DESC LIMIT 1",
-                )
-                .bind(objective_id)
-                .fetch_optional(&*pool)
+                .execute(&*pool)
                 .await?;
-                if let Some((status, _wait_class)) = open_state {
-                    let driver = match status.as_str() {
-                        "waiting" => "recoverable_waiting_open",
-                        "platform_incident" | "agent_action_required" | "failed_internal" => {
-                            "system_owned_remediation_open"
-                        }
-                        "awaiting_completion_arbitration" => "completion_arbitration_open",
-                        _ => "authorized_objective_still_open",
-                    };
-                    sqlx::query(
-                        "UPDATE chat_turn_state SET user_reprompt_driver=? WHERE root_turn_id=?",
-                    )
-                    .bind(driver)
-                    .bind(&root_turn_id)
-                    .execute(&*pool)
-                    .await?;
+                ChatContinuationSetup {
+                    continuation_root_turn_id: None,
+                    previous_segment_id: None,
+                    expected_objective_id: None,
+                    driver: Some("system_owned_identity_incident".into()),
+                    ambiguous: true,
                 }
             }
         }
-        continuation_root_turn_id
     };
+
+    if continuation_setup.ambiguous {
+        let event_name = format!("stream:{session_id}");
+        app.emit(
+            &event_name,
+            StreamEvent::TurnActivityUpdated {
+                root_turn_id: root_turn_id.clone(),
+                revision: 1,
+                phase: "recovering".into(),
+                status: "waiting_system".into(),
+                recent_activity_kind: "system_identity_reconciliation".into(),
+                recent_activity_label: "系统正在核对目标身份".into(),
+                waiting_reason: Some("multiple_open_objectives".into()),
+                updated_at: Utc::now().timestamp_millis(),
+                terminal_reason: None,
+                objective_id: None,
+                objective_status: Some("waiting_system".into()),
+                recovery_owner: Some("objective-supervisor".into()),
+                next_observation_at: Some(Utc::now().timestamp_millis() + 5_000),
+                last_progress_at: None,
+            },
+        )
+        .ok();
+        return Ok(());
+    }
 
     // Fetch session for cwd + model
     let session = {
@@ -897,12 +1048,56 @@ pub async fn send_message(
         .ensure_or_continue_chat_objective(
             &session_id,
             &root_turn_id,
-            continuation_root_turn_id.as_deref(),
+            continuation_setup.continuation_root_turn_id.as_deref(),
             objective_kind,
             requested_acceptance(objective_kind),
         )
         .await
         .map_err(|error| AppError::Other(error.to_string()))?;
+    if continuation_setup
+        .expected_objective_id
+        .as_deref()
+        .is_some_and(|expected| expected != objective.id)
+    {
+        return Err(AppError::Other(
+            "opaque Objective identity changed during continuation reconciliation".into(),
+        ));
+    }
+    if let Some(previous_segment_id) = continuation_setup.previous_segment_id.as_deref() {
+        if previous_segment_id
+            == sqlx::query_scalar::<_, String>(
+                "SELECT task_segment_id FROM chat_turn_state WHERE root_turn_id=?",
+            )
+            .bind(&root_turn_id)
+            .fetch_one(&db)
+            .await?
+        {
+            return Err(AppError::Other(
+                "chat continuation refused a self-referential segment".into(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE chat_task_segments
+             SET previous_segment_id=?
+             WHERE session_id=? AND goal_root_turn_id=? AND previous_segment_id IS NULL",
+        )
+        .bind(previous_segment_id)
+        .bind(&session_id)
+        .bind(&root_turn_id)
+        .execute(&db)
+        .await?;
+        if let Some(driver) = continuation_setup.driver.as_deref() {
+            sqlx::query(
+                "UPDATE chat_turn_state SET user_reprompt_driver=?
+                 WHERE root_turn_id=? AND session_id=?",
+            )
+            .bind(driver)
+            .bind(&root_turn_id)
+            .bind(&session_id)
+            .execute(&db)
+            .await?;
+        }
+    }
     let objective_id = objective.id.clone();
     let settings_state = state.settings.clone();
     let settings_for_notify = state.settings.clone();
@@ -1521,7 +1716,303 @@ mod tests {
     use super::*;
     use crate::agent::failover::{ActiveRouteState, EndpointHealthRegistry};
     use crate::config::settings::{ApiStyle, Endpoint};
+    use sqlx::sqlite::SqlitePoolOptions;
     use std::time::Duration;
+
+    async fn reprompt_test_pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_task_segments (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                goal_root_turn_id TEXT NOT NULL,
+                previous_segment_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+                root_turn_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                task_segment_id TEXT,
+                user_reprompt_driver TEXT,
+                objective_id TEXT,
+                updated_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE delivery_runs (
+                id TEXT PRIMARY KEY,
+                objective_id TEXT,
+                status TEXT NOT NULL,
+                wait_class TEXT,
+                updated_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn insert_reprompt_segment(
+        pool: &sqlx::SqlitePool,
+        id: &str,
+        session_id: &str,
+        ordinal: i64,
+        root_turn_id: &str,
+        previous_segment_id: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO chat_task_segments
+             (id, session_id, ordinal, goal_root_turn_id, previous_segment_id)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(session_id)
+        .bind(ordinal)
+        .bind(root_turn_id)
+        .bind(previous_segment_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_reprompt_turn(
+        pool: &sqlx::SqlitePool,
+        session_id: &str,
+        root_turn_id: &str,
+        segment_id: &str,
+        objective_id: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, task_segment_id, user_reprompt_driver, objective_id, updated_at)
+             VALUES (?, ?, ?, NULL, ?, 1)",
+        )
+        .bind(root_turn_id)
+        .bind(session_id)
+        .bind(segment_id)
+        .bind(objective_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_open_objective(
+        pool: &sqlx::SqlitePool,
+        id: &str,
+        objective_id: &str,
+        status: &str,
+        wait_class: Option<&str>,
+        updated_at: i64,
+    ) {
+        sqlx::query("INSERT INTO objectives(id, status) VALUES (?, ?)")
+            .bind(objective_id)
+            .bind(
+                if matches!(
+                    status,
+                    "waiting" | "platform_incident" | "agent_action_required" | "failed_internal"
+                ) {
+                    "waiting_system"
+                } else {
+                    "active"
+                },
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO delivery_runs
+             (id, objective_id, status, wait_class, updated_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(objective_id)
+        .bind(status)
+        .bind(wait_class)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn arbitrary_real_user_message_links_the_unique_open_objective() {
+        let pool = reprompt_test_pool().await;
+        insert_reprompt_segment(&pool, "objective-a", "session", 1, "turn-a", None).await;
+        insert_reprompt_segment(
+            &pool,
+            "continuation-a",
+            "session",
+            2,
+            "turn-a2",
+            Some("objective-a"),
+        )
+        .await;
+        insert_reprompt_segment(&pool, "current", "session", 3, "turn-current", None).await;
+        let objective_id = "objective-opaque-a";
+        insert_reprompt_turn(
+            &pool,
+            "session",
+            "turn-a",
+            "objective-a",
+            Some(objective_id),
+        )
+        .await;
+        insert_reprompt_turn(
+            &pool,
+            "session",
+            "turn-a2",
+            "continuation-a",
+            Some(objective_id),
+        )
+        .await;
+        insert_reprompt_turn(&pool, "session", "turn-current", "current", None).await;
+        insert_open_objective(
+            &pool,
+            "run-a",
+            objective_id,
+            "waiting",
+            Some("external_state_uncertain"),
+            10,
+        )
+        .await;
+
+        let resolution =
+            resolve_open_chat_objective_continuation(&pool, "session", "turn-current", 3)
+                .await
+                .unwrap();
+        assert_eq!(
+            resolution,
+            ChatContinuationResolution::Unique {
+                objective_id: objective_id.into(),
+                continuation_root_turn_id: "turn-a2".into(),
+                previous_segment_id: "continuation-a".into(),
+                driver: "recoverable_waiting_open".into(),
+            }
+        );
+        assert!(!objective_id.starts_with("chat:"));
+    }
+
+    #[tokio::test]
+    async fn user_message_without_an_open_objective_is_not_attributed() {
+        let pool = reprompt_test_pool().await;
+        insert_reprompt_segment(&pool, "current", "session", 1, "turn-current", None).await;
+        insert_reprompt_turn(&pool, "session", "turn-current", "current", None).await;
+
+        let resolution =
+            resolve_open_chat_objective_continuation(&pool, "session", "turn-current", 1)
+                .await
+                .unwrap();
+        assert_eq!(resolution, ChatContinuationResolution::None);
+    }
+
+    #[tokio::test]
+    async fn multiple_open_objectives_fail_closed_as_a_system_owned_incident() {
+        let pool = reprompt_test_pool().await;
+        insert_reprompt_segment(&pool, "objective-a", "session", 1, "turn-a", None).await;
+        insert_reprompt_segment(&pool, "objective-b", "session", 2, "turn-b", None).await;
+        insert_reprompt_segment(&pool, "current", "session", 3, "turn-current", None).await;
+        insert_reprompt_turn(
+            &pool,
+            "session",
+            "turn-a",
+            "objective-a",
+            Some("objective-opaque-a"),
+        )
+        .await;
+        insert_reprompt_turn(
+            &pool,
+            "session",
+            "turn-b",
+            "objective-b",
+            Some("objective-opaque-b"),
+        )
+        .await;
+        insert_reprompt_turn(&pool, "session", "turn-current", "current", None).await;
+        insert_open_objective(
+            &pool,
+            "run-a",
+            "objective-opaque-a",
+            "waiting",
+            Some("wait_retryable"),
+            10,
+        )
+        .await;
+        insert_open_objective(
+            &pool,
+            "run-b",
+            "objective-opaque-b",
+            "agent_action_required",
+            Some("agent_action_required"),
+            11,
+        )
+        .await;
+
+        let resolution =
+            resolve_open_chat_objective_continuation(&pool, "session", "turn-current", 3)
+                .await
+                .unwrap();
+        assert_eq!(resolution, ChatContinuationResolution::Ambiguous);
+    }
+
+    #[tokio::test]
+    async fn already_bound_current_root_is_idempotent_and_cannot_self_link() {
+        let pool = reprompt_test_pool().await;
+        insert_reprompt_segment(&pool, "prior", "session", 1, "turn-prior", None).await;
+        insert_reprompt_segment(&pool, "current", "session", 2, "turn-current", None).await;
+        sqlx::query("INSERT INTO objectives(id, status) VALUES ('objective-opaque', 'active')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_reprompt_turn(
+            &pool,
+            "session",
+            "turn-prior",
+            "prior",
+            Some("objective-opaque"),
+        )
+        .await;
+        insert_reprompt_turn(
+            &pool,
+            "session",
+            "turn-current",
+            "current",
+            Some("objective-opaque"),
+        )
+        .await;
+
+        let resolution =
+            resolve_open_chat_objective_continuation(&pool, "session", "turn-current", 2)
+                .await
+                .unwrap();
+        assert_eq!(
+            resolution,
+            ChatContinuationResolution::AlreadyBound {
+                objective_id: "objective-opaque".into()
+            }
+        );
+    }
 
     #[tokio::test]
     async fn completed_chat_only_clears_its_own_running_flag() {

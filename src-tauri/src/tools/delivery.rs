@@ -7,19 +7,28 @@
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 
 #[cfg(test)]
 use super::ToolExecutionStatus;
 use super::{ExecCtx, ToolOutput};
-use crate::agent::delivery::{self, DeliverOpts, ReleaseUrgency};
-use crate::agent::delivery_run::{
-    self, CoreInputRequest, DeliveryObservation, NewDeliveryRun, ProcessIdentity,
+use crate::agent::delivery::{
+    self, DeliverOpts, DeliveryIdentitySnapshot, DeliveryMutationIntentToken,
+    DeliveryMutationPermit, DeliveryMutationPermitVerifier, DeliveryRemote, MergeObservation,
+    ObservationStatus, OpenPrObservation, ReleaseUrgency,
 };
+use crate::agent::delivery_run::{
+    self, CoreInputRequest, DeliveryIdentityRevision, DeliveryObservation, NewDeliveryRun,
+    ProcessIdentity,
+};
+use crate::agent::objective::ObjectiveStore;
 use crate::config::settings::DeliveryCeiling;
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
 const RECOVERY_SUPERVISOR_POLL_MS: u64 = 15_000;
+const DELIVERY_LEASE_HEARTBEAT_MS: u64 = 20_000;
+const DELIVERY_LEASE_TTL_MS: i64 = 90_000;
 
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
@@ -97,9 +106,11 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(String::from),
+        expected_identity: None,
+        mutation_permit: None,
     };
 
-    let durable = match prepare_durable_run(
+    let mut durable = match prepare_durable_run(
         &args,
         ctx,
         settings.delivery_ceiling,
@@ -127,16 +138,39 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                 "reached_state": "local"
             })));
         }
+        Err(error) if error.to_string().contains("active invocation") => {
+            return Ok(ToolOutput::waiting(
+                "同一 objective 已有一条交付执行持有 worktree lease；当前调用已附着等待，未并发执行 stage/commit/push。",
+            )
+            .with_metadata(json!({
+                "status": "recovering",
+                "delivery_state": "waiting",
+                "stage": "lease",
+                "code": "delivery_operation_already_running",
+                "recoverable": true,
+                "recovery_class": "agent_action_required",
+                "decision_type": "system_owned",
+                "requires_user_continue": false,
+                "retry_after_ms": 1_000,
+                "next_action": "attach_existing_delivery_run",
+                "requested_ceiling": requested_ceiling.map(ceiling_label).unwrap_or_else(|| ceiling_label(settings.delivery_ceiling)),
+                "reached_state": "local"
+            })));
+        }
         Err(error) => return Err(error),
     };
     if opts.expect_branch.is_none() {
         opts.expect_branch = durable.as_ref().map(|run| run.head_branch.clone());
     }
+    opts.expected_identity = durable.as_ref().map(PreparedDurableRun::identity_snapshot);
+    opts.mutation_permit = durable
+        .as_ref()
+        .and_then(|run| ctx.db.as_ref().map(|db| run.mutation_permit(db)));
 
     let remote = delivery::resolve_delivery_remote(&ctx.cwd, &settings);
 
     loop {
-        let outcome = delivery::deliver(
+        let delivery_future = delivery::deliver(
             &ctx.cwd,
             settings.delivery_ceiling,
             settings.delivery_merge_method,
@@ -144,14 +178,19 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             &opts,
             remote.as_ref(),
             None,
-        )
-        .await;
+        );
+        let outcome = if let (Some(db), Some(durable)) = (ctx.db.as_ref(), durable.as_ref()) {
+            await_delivery_with_lease_heartbeat(db, durable, delivery_future).await?
+        } else {
+            delivery_future.await
+        };
 
         if let (Some(db), Some(session_id)) = (ctx.db.as_ref(), ctx.session_id.as_deref()) {
             persist_delivery_ref(db, session_id, &outcome).await?;
         }
-        if let (Some(db), Some(durable)) = (ctx.db.as_ref(), durable.as_ref()) {
+        if let (Some(db), Some(durable)) = (ctx.db.as_ref(), durable.as_mut()) {
             persist_durable_outcome(db, durable, &outcome).await?;
+            opts.expected_identity = Some(durable.identity_snapshot());
         }
 
         if outcome.validate_contract().is_err() {
@@ -173,8 +212,282 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 struct PreparedDurableRun {
     id: String,
     process: ProcessIdentity,
+    claim_epoch: i64,
+    objective_id: String,
+    workspace_path: std::path::PathBuf,
+    worktree_identity: String,
+    repo_identity: String,
+    change_set_digest: String,
     expected_head_sha: String,
     head_branch: String,
+}
+
+impl PreparedDurableRun {
+    fn identity_snapshot(&self) -> DeliveryIdentitySnapshot {
+        DeliveryIdentitySnapshot {
+            repo_identity: self.repo_identity.clone(),
+            worktree_identity: self.worktree_identity.clone(),
+            head_sha: self.expected_head_sha.clone(),
+            change_set_digest: self.change_set_digest.clone(),
+        }
+    }
+
+    fn mutation_permit(&self, db: &sqlx::SqlitePool) -> DeliveryMutationPermit {
+        DeliveryMutationPermit::new(std::sync::Arc::new(DurableDeliveryMutationPermit {
+            db: db.clone(),
+            run_id: self.id.clone(),
+            process: self.process.clone(),
+            claim_epoch: self.claim_epoch,
+        }))
+    }
+}
+
+struct DurableDeliveryMutationPermit {
+    db: sqlx::SqlitePool,
+    run_id: String,
+    process: ProcessIdentity,
+    claim_epoch: i64,
+}
+
+#[async_trait::async_trait]
+impl DeliveryMutationPermitVerifier for DurableDeliveryMutationPermit {
+    async fn verify(&self, rung: &str) -> std::result::Result<(), String> {
+        match delivery_run::verify_delivery_mutation_permit(
+            &self.db,
+            &self.run_id,
+            &self.process,
+            self.claim_epoch,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!(
+                "run {} owner {} epoch {} is no longer authorized for {rung}",
+                self.run_id, self.process.instance_id, self.claim_epoch
+            )),
+            Err(error) => Err(format!(
+                "run {} epoch {} permit could not be verified before {rung}: {error}",
+                self.run_id, self.claim_epoch
+            )),
+        }
+    }
+
+    async fn begin_external_mutation(
+        &self,
+        rung: &str,
+        operation_key: &str,
+        evidence: &str,
+    ) -> std::result::Result<Option<DeliveryMutationIntentToken>, String> {
+        let intent_id = uuid::Uuid::new_v4().to_string();
+        let evidence = normalize_mutation_evidence(evidence);
+        match delivery_run::begin_delivery_mutation_intent(
+            &self.db,
+            &intent_id,
+            &self.run_id,
+            &self.process,
+            self.claim_epoch,
+            rung,
+            operation_key,
+            Some(&evidence),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        {
+            Ok(true) => Ok(Some(DeliveryMutationIntentToken {
+                id: intent_id,
+                rung: rung.to_string(),
+                operation_key: operation_key.to_string(),
+            })),
+            Ok(false) => Err(format!(
+                "run {} owner {} epoch {} could not durably begin external mutation {rung}; the effect was not dispatched",
+                self.run_id, self.process.instance_id, self.claim_epoch
+            )),
+            Err(error) => Err(format!(
+                "run {} epoch {} failed to persist external mutation intent {rung}: {error}; the effect was not dispatched",
+                self.run_id, self.claim_epoch
+            )),
+        }
+    }
+
+    async fn commit_external_mutation(
+        &self,
+        intent: &DeliveryMutationIntentToken,
+        evidence: &str,
+    ) -> std::result::Result<(), String> {
+        let evidence = normalize_mutation_evidence(evidence);
+        match delivery_run::resolve_delivery_mutation_intent_committed(
+            &self.db,
+            &intent.id,
+            &self.process,
+            self.claim_epoch,
+            Some(&evidence),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!(
+                "external mutation {} completed but its durable intent {} could not be committed",
+                intent.rung, intent.id
+            )),
+            Err(error) => Err(format!(
+                "external mutation {} completed but durable intent settlement failed: {error}",
+                intent.rung
+            )),
+        }
+    }
+
+    async fn mark_external_mutation_unknown(
+        &self,
+        intent: &DeliveryMutationIntentToken,
+        detail: &str,
+    ) -> std::result::Result<(), String> {
+        let evidence = json!({
+            "detail_digest": format!("sha256:{:x}", Sha256::digest(detail.as_bytes())),
+            "classification": "external_result_uncertain",
+        })
+        .to_string();
+        match delivery_run::mark_delivery_mutation_intent_unknown(
+            &self.db,
+            &intent.id,
+            &self.process,
+            self.claim_epoch,
+            Some(&evidence),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!(
+                "durable intent {} could not be marked unknown",
+                intent.id
+            )),
+            Err(error) => Err(format!(
+                "durable intent {} unknown settlement failed: {error}",
+                intent.id
+            )),
+        }
+    }
+}
+
+fn normalize_mutation_evidence(evidence: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(evidence)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| {
+            json!({
+                "detail_digest": format!("sha256:{:x}", Sha256::digest(evidence.as_bytes())),
+            })
+            .to_string()
+        })
+}
+
+async fn drive_delivery_with_lease_heartbeat<F, T, Tick, TickFuture, Clock>(
+    db: &sqlx::SqlitePool,
+    run_id: &str,
+    process: &ProcessIdentity,
+    claim_epoch: i64,
+    operation: F,
+    mut next_tick: Tick,
+    mut clock: Clock,
+    lease_ttl_ms: i64,
+) -> Result<T>
+where
+    F: Future<Output = T>,
+    Tick: FnMut() -> TickFuture,
+    TickFuture: Future<Output = ()>,
+    Clock: FnMut() -> i64,
+{
+    let initial_now = clock();
+    if !delivery_run::renew_delivery_lease(
+        db,
+        run_id,
+        process,
+        claim_epoch,
+        initial_now,
+        lease_ttl_ms,
+    )
+    .await?
+    {
+        return Err(crate::errors::AppError::Other(
+            "delivery lease was lost before the in-flight operation started; no new delivery operation was polled"
+                .into(),
+        ));
+    }
+    let mut last_confirmed_expiry = initial_now.saturating_add(lease_ttl_ms);
+
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            result = operation.as_mut() => return Ok(result),
+            _ = next_tick() => {
+                let heartbeat_now = clock();
+                match delivery_run::renew_delivery_lease(
+                    db,
+                    run_id,
+                    process,
+                    claim_epoch,
+                    heartbeat_now,
+                    lease_ttl_ms,
+                ).await {
+                    Ok(true) => {
+                        last_confirmed_expiry = heartbeat_now.saturating_add(lease_ttl_ms);
+                    }
+                    Ok(false) => {
+                        tracing::error!(
+                            run_id,
+                            owner = %process.instance_id,
+                            claim_epoch,
+                            "delivery lease heartbeat lost ownership; dropping the stale operation before it can cross another mutation rung"
+                        );
+                        return Err(crate::errors::AppError::Other(
+                            "delivery lease ownership changed while an operation was in flight; external state is uncertain and requires observe-only reconciliation"
+                                .into(),
+                        ));
+                    }
+                    Err(error) => {
+                        // A transient SQLite failure may be retried only while the
+                        // last positively-confirmed lease is still live. Once that
+                        // boundary is crossed, continuing would let a competitor
+                        // claim the run while this future can still mutate.
+                        if heartbeat_now >= last_confirmed_expiry {
+                            tracing::error!(run_id, claim_epoch, %error, "delivery lease became uncertain at expiry; dropping the stale operation for observe-only reconciliation");
+                            return Err(crate::errors::AppError::Other(
+                                "delivery lease could not be renewed before its confirmed expiry; external state is uncertain and requires observe-only reconciliation"
+                                    .into(),
+                            ));
+                        }
+                        tracing::warn!(run_id, claim_epoch, %error, last_confirmed_expiry, "delivery lease heartbeat failed transiently before confirmed expiry");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn await_delivery_with_lease_heartbeat<F, T>(
+    db: &sqlx::SqlitePool,
+    durable: &PreparedDurableRun,
+    operation: F,
+) -> Result<T>
+where
+    F: Future<Output = T>,
+{
+    drive_delivery_with_lease_heartbeat(
+        db,
+        &durable.id,
+        &durable.process,
+        durable.claim_epoch,
+        operation,
+        || {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                DELIVERY_LEASE_HEARTBEAT_MS,
+            ))
+        },
+        || chrono::Utc::now().timestamp_millis(),
+        DELIVERY_LEASE_TTL_MS,
+    )
+    .await
 }
 
 async fn prepare_durable_run(
@@ -194,28 +507,14 @@ async fn prepare_durable_run(
     let (repo, _) = delivery::resolve_delivery_repo(&ctx.cwd, None, expected_branch)
         .map_err(crate::errors::AppError::Other)?;
     let (objective_id, task_segment_id) = durable_objective_identity(db, ctx).await?;
-    let repo_identity = durable_repo_identity(&repo);
-    let expected_head_sha = git2::Repository::open(&repo.root)
-        .ok()
-        .and_then(|repository| repository.head().ok()?.target().map(|oid| oid.to_string()))
-        .ok_or_else(|| {
-            crate::errors::AppError::Other(
-                "deliver_changes could not establish the expected git head before mutation".into(),
-            )
-        })?;
-    let change_set_digest = durable_change_set_digest(&repo.root, &expected_head_sha)?;
-    let worktree_identity = durable_worktree_identity(&repo.root)?;
+    let identity =
+        delivery::capture_delivery_identity(&repo).map_err(crate::errors::AppError::Other)?;
+    let repo_identity = identity.repo_identity;
+    let expected_head_sha = identity.head_sha;
+    let change_set_digest = identity.change_set_digest;
+    let worktree_identity = identity.worktree_identity;
     let id = durable_run_id(&objective_id, &repo_identity);
-    let process = ProcessIdentity::new(
-        format!(
-            "{}:{}",
-            std::process::id(),
-            crate::storage::db::current_process_start_token()
-                .unwrap_or_else(|| "unknown-start".into())
-        ),
-        env!("CARGO_PKG_VERSION"),
-        option_env!("CODEFACTORY_BUILD_NUMBER").unwrap_or(env!("CARGO_PKG_VERSION")),
-    );
+    let process = foreground_delivery_process_identity();
     let selected_ceiling = requested_ceiling
         .map(|requested| configured_ceiling.clamp_request(requested))
         .unwrap_or(configured_ceiling);
@@ -247,7 +546,7 @@ async fn prepare_durable_run(
         next_action_authorized: true,
         autonomous_completion: autonomous_completion_from_args(args),
     };
-    delivery_run::create_delivery_run(
+    let claim_epoch = delivery_run::create_delivery_run(
         db,
         &run,
         &process,
@@ -258,9 +557,29 @@ async fn prepare_durable_run(
     Ok(Some(PreparedDurableRun {
         id,
         process,
+        claim_epoch,
+        objective_id: run.objective_id,
+        workspace_path: repo.root,
+        worktree_identity: run.worktree_identity,
+        repo_identity: run.repo_identity,
+        change_set_digest: run.change_set_digest,
         expected_head_sha,
         head_branch,
     }))
+}
+
+fn foreground_delivery_process_identity() -> ProcessIdentity {
+    ProcessIdentity::new(
+        format!(
+            "{}:{}:delivery:{}",
+            std::process::id(),
+            crate::storage::db::current_process_start_token()
+                .unwrap_or_else(|| "unknown-start".into()),
+            uuid::Uuid::new_v4(),
+        ),
+        env!("CARGO_PKG_VERSION"),
+        option_env!("CODEFACTORY_BUILD_NUMBER").unwrap_or(env!("CARGO_PKG_VERSION")),
+    )
 }
 
 fn autonomous_completion_from_args(args: &Value) -> bool {
@@ -274,12 +593,11 @@ fn autonomous_completion_from_args(args: &Value) -> bool {
 
 async fn persist_durable_outcome(
     db: &sqlx::SqlitePool,
-    durable: &PreparedDurableRun,
+    durable: &mut PreparedDurableRun,
     outcome: &delivery::DeliveryOutcome,
 ) -> Result<()> {
     let core_input = core_input_request_for_outcome(outcome);
     let status = match outcome.final_state.as_str() {
-        "delivered" if delivery_completion_evidence_satisfied(outcome) => "completed",
         "delivered" | "noop" => "awaiting_completion_arbitration",
         "waiting" => "waiting",
         _ if core_input.is_some() => "core_input_required",
@@ -296,6 +614,31 @@ async fn persist_durable_outcome(
         .commit_sha
         .clone()
         .unwrap_or_else(|| durable.expected_head_sha.clone());
+    let identity_revision = if expected_head_sha != durable.expected_head_sha {
+        let (observed_repo, _) = delivery::resolve_delivery_repo(
+            &durable.workspace_path,
+            None,
+            Some(&durable.head_branch),
+        )
+        .map_err(crate::errors::AppError::Other)?;
+        let observed_identity = delivery::capture_delivery_identity(&observed_repo)
+            .map_err(crate::errors::AppError::Other)?;
+        if observed_identity.head_sha != expected_head_sha {
+            return Err(crate::errors::AppError::Other(format!(
+                "delivery outcome head {} does not match observed workspace head {}",
+                expected_head_sha, observed_identity.head_sha
+            )));
+        }
+        build_delivery_identity_revision(
+            durable,
+            &observed_identity.repo_identity,
+            &observed_identity.worktree_identity,
+            &observed_identity.head_sha,
+            &observed_identity.change_set_digest,
+        )?
+    } else {
+        None
+    };
     let observation = DeliveryObservation {
         head_branch: outcome
             .branch
@@ -313,11 +656,13 @@ async fn persist_durable_outcome(
         failure_signature: (outcome.final_state != "delivered" && outcome.final_state != "noop")
             .then(|| outcome.code.clone()),
         core_input,
+        identity_revision: identity_revision.clone(),
     };
     delivery_run::record_delivery_observation(
         db,
         &durable.id,
         &durable.process,
+        durable.claim_epoch,
         &observation,
         chrono::Utc::now().timestamp_millis(),
         outcome
@@ -326,41 +671,50 @@ async fn persist_durable_outcome(
             .saturating_add(60_000) as i64,
     )
     .await?;
+    if let Some(revision) = identity_revision {
+        durable.expected_head_sha = revision.next_expected_head_sha;
+        durable.change_set_digest = revision.next_change_set_digest;
+    }
     Ok(())
 }
 
-fn delivery_completion_evidence_satisfied(outcome: &delivery::DeliveryOutcome) -> bool {
-    if outcome.final_state != "delivered" {
-        return false;
+fn build_delivery_identity_revision(
+    durable: &PreparedDurableRun,
+    observed_repo_identity: &str,
+    observed_worktree_identity: &str,
+    observed_head_sha: &str,
+    observed_change_set_digest: &str,
+) -> Result<Option<DeliveryIdentityRevision>> {
+    if observed_repo_identity != durable.repo_identity
+        || observed_worktree_identity != durable.worktree_identity
+    {
+        return Err(crate::errors::AppError::Other(
+            "delivery identity revision observed a different repo/worktree; refused before persistence"
+                .into(),
+        ));
     }
-    let reached = match outcome.reached_state.as_str() {
-        "local" => 0,
-        "committed" => 1,
-        "pushed" => 2,
-        "pr_open" => 3,
-        "ci_green" => 4,
-        "merge_queued" => 5,
-        "merged" => 6,
-        "release_triggered" => 7,
-        "deployment_succeeded" => 8,
-        "live_verified" => 9,
-        _ => return false,
+    if observed_head_sha == durable.expected_head_sha {
+        return Ok(None);
+    }
+    if observed_head_sha.is_empty() || observed_change_set_digest.is_empty() {
+        return Err(crate::errors::AppError::Other(
+            "delivery identity revision requires a resolved head and change-set digest".into(),
+        ));
+    }
+
+    let mut revision = DeliveryIdentityRevision {
+        receipt_id: String::new(),
+        objective_id: durable.objective_id.clone(),
+        repo_identity: durable.repo_identity.clone(),
+        worktree_identity: durable.worktree_identity.clone(),
+        previous_expected_head_sha: durable.expected_head_sha.clone(),
+        previous_change_set_digest: durable.change_set_digest.clone(),
+        next_expected_head_sha: observed_head_sha.into(),
+        next_change_set_digest: observed_change_set_digest.into(),
     };
-    let required = match outcome.requested_ceiling.as_str() {
-        "off" => return false,
-        "pr_only" => 3,
-        "through_ci_green" => 4,
-        "through_merge" => 6,
-        "through_release" => 9,
-        _ => return false,
-    };
-    let remote_identity_present = required < 3
-        || (outcome.pr_number.is_some()
-            && outcome
-                .commit_sha
-                .as_deref()
-                .is_some_and(|sha| !sha.is_empty()));
-    reached >= required && remote_identity_present
+    revision.receipt_id =
+        delivery_run::delivery_identity_revision_receipt_id(&durable.id, &revision);
+    Ok(Some(revision))
 }
 
 fn core_input_request_for_outcome(outcome: &delivery::DeliveryOutcome) -> Option<CoreInputRequest> {
@@ -396,6 +750,266 @@ fn core_input_request_for_outcome(outcome: &delivery::DeliveryOutcome) -> Option
     })
 }
 
+async fn reconcile_unresolved_delivery_mutation_intents<R: DeliveryRemote>(
+    db: &sqlx::SqlitePool,
+    claimed: &delivery_run::ClaimedRecovery,
+    process: &ProcessIdentity,
+    remote: Option<&R>,
+    takeover: &mut delivery::DeliveryTakeoverObservation,
+) -> Result<()> {
+    let intents =
+        delivery_run::list_unresolved_delivery_mutation_intents(db, &claimed.run_id).await?;
+    for intent in intents {
+        let confirmation = match intent.rung.as_str() {
+            "git_push" => {
+                if takeover.remote_head_sha.as_deref() != Some(claimed.expected_head_sha.as_str()) {
+                    return Err(crate::errors::AppError::Other(format!(
+                        "unresolved git push {} has no positive matching remote-head observation",
+                        intent.intent_id
+                    )));
+                }
+                let expected_key = delivery::external_operation_key(
+                    "git_push",
+                    &[
+                        &claimed.repo_identity,
+                        &claimed.head_branch,
+                        &claimed.expected_head_sha,
+                    ],
+                );
+                if expected_key != intent.operation_key {
+                    return Err(crate::errors::AppError::Other(
+                        "unresolved git push operation identity does not match the durable run"
+                            .into(),
+                    ));
+                }
+                json!({
+                    "confirmation": "remote_head_matches",
+                    "remote_head_sha": claimed.expected_head_sha,
+                })
+            }
+            "provider_pr_create" | "provider_pr_open_or_get" => {
+                let remote = remote.ok_or_else(|| {
+                    crate::errors::AppError::Other(
+                        "unresolved PR creation has no read-only provider observer".into(),
+                    )
+                })?;
+                let state = match remote
+                    .observe_open_pr(&claimed.head_branch, &claimed.base_branch)
+                    .await
+                    .map_err(crate::errors::AppError::Other)?
+                {
+                    OpenPrObservation::Open(state) => state,
+                    OpenPrObservation::Absent | OpenPrObservation::Unsupported => {
+                        return Err(crate::errors::AppError::Other(
+                            "unresolved PR creation is not positively visible yet; absence is not replay authority"
+                                .into(),
+                        ))
+                    }
+                };
+                if takeover.remote_head_sha.as_deref() != Some(claimed.expected_head_sha.as_str())
+                    && state.head_sha.as_deref() != Some(claimed.expected_head_sha.as_str())
+                {
+                    return Err(crate::errors::AppError::Other(
+                        "observed PR does not prove the persisted delivery head".into(),
+                    ));
+                }
+                let expected_key = delivery::external_operation_key(
+                    &intent.rung,
+                    &[
+                        &state.pr.title,
+                        &state.pr.body,
+                        &claimed.head_branch,
+                        &claimed.base_branch,
+                    ],
+                );
+                if expected_key != intent.operation_key {
+                    return Err(crate::errors::AppError::Other(
+                        "observed PR title/body/head/base does not match the unresolved operation"
+                            .into(),
+                    ));
+                }
+                if takeover.canonical_pr_number.is_some()
+                    && takeover.canonical_pr_number != Some(state.pr.number)
+                {
+                    return Err(crate::errors::AppError::Other(
+                        "observed PR conflicts with the durable canonical PR number".into(),
+                    ));
+                }
+                if takeover.canonical_pr_url.is_some()
+                    && takeover.canonical_pr_url.as_deref() != Some(state.pr.url.as_str())
+                {
+                    return Err(crate::errors::AppError::Other(
+                        "observed PR conflicts with the durable canonical PR URL".into(),
+                    ));
+                }
+                takeover.canonical_pr_number = Some(state.pr.number);
+                takeover.canonical_pr_url = Some(state.pr.url.clone());
+                takeover.canonical_head_sha = Some(claimed.expected_head_sha.clone());
+                json!({
+                    "confirmation": "open_pr_matches",
+                    "pr_number": state.pr.number,
+                    "pr_url": state.pr.url,
+                    "head_sha": claimed.expected_head_sha,
+                })
+            }
+            "provider_pr_body_update" => {
+                let remote = remote.ok_or_else(|| {
+                    crate::errors::AppError::Other(
+                        "unresolved PR body update has no read-only provider observer".into(),
+                    )
+                })?;
+                let state = match remote
+                    .observe_open_pr(&claimed.head_branch, &claimed.base_branch)
+                    .await
+                    .map_err(crate::errors::AppError::Other)?
+                {
+                    OpenPrObservation::Open(state) => state,
+                    OpenPrObservation::Absent | OpenPrObservation::Unsupported => {
+                        return Err(crate::errors::AppError::Other(
+                            "unresolved PR body update is not positively observable".into(),
+                        ))
+                    }
+                };
+                let number_text = state.pr.number.to_string();
+                let expected_key = delivery::external_operation_key(
+                    "provider_pr_body_update",
+                    &[&number_text, &state.pr.body],
+                );
+                if expected_key != intent.operation_key
+                    || claimed.canonical_pr_number != Some(state.pr.number as i64)
+                {
+                    return Err(crate::errors::AppError::Other(
+                        "observed PR body does not match the unresolved update".into(),
+                    ));
+                }
+                json!({
+                    "confirmation": "pr_body_matches",
+                    "pr_number": state.pr.number,
+                    "body_digest": delivery::external_operation_key("body", &[&state.pr.body]),
+                })
+            }
+            "provider_pr_merge" => {
+                let remote = remote.ok_or_else(|| {
+                    crate::errors::AppError::Other(
+                        "unresolved PR merge has no read-only provider observer".into(),
+                    )
+                })?;
+                let evidence: serde_json::Value = intent
+                    .evidence_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str(value).ok())
+                    .ok_or_else(|| {
+                        crate::errors::AppError::Other(
+                            "unresolved PR merge lacks its durable operation envelope".into(),
+                        )
+                    })?;
+                let number = evidence
+                    .get("pr_number")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        crate::errors::AppError::Other(
+                            "unresolved PR merge lacks its PR number".into(),
+                        )
+                    })?;
+                let method = evidence
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let expected_head = evidence
+                    .get("expected_head")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let number_text = number.to_string();
+                let expected_key = delivery::external_operation_key(
+                    "provider_pr_merge",
+                    &[&number_text, method, expected_head],
+                );
+                if expected_key != intent.operation_key
+                    || expected_head != claimed.expected_head_sha
+                    || claimed.canonical_pr_number != Some(number as i64)
+                {
+                    return Err(crate::errors::AppError::Other(
+                        "unresolved PR merge identity does not match the durable run".into(),
+                    ));
+                }
+                match remote
+                    .observe_merge(number, expected_head)
+                    .await
+                    .map_err(crate::errors::AppError::Other)?
+                {
+                    MergeObservation::Merged { merge_sha } => json!({
+                        "confirmation": "merge_observed",
+                        "pr_number": number,
+                        "merge_sha": merge_sha,
+                    }),
+                    MergeObservation::OpenSameHead { auto_merge: true } => json!({
+                        "confirmation": "auto_merge_observed",
+                        "pr_number": number,
+                        "head_sha": expected_head,
+                    }),
+                    _ => {
+                        return Err(crate::errors::AppError::Other(
+                            "unresolved PR merge has no positive merged/queued observation".into(),
+                        ))
+                    }
+                }
+            }
+            "provider_release_trigger" => {
+                let remote = remote.ok_or_else(|| {
+                    crate::errors::AppError::Other(
+                        "unresolved release trigger has no read-only release observer".into(),
+                    )
+                })?;
+                match remote
+                    .verify_live(&claimed.expected_head_sha, None)
+                    .await
+                    .map_err(crate::errors::AppError::Other)?
+                {
+                    ObservationStatus::Success(detail) => json!({
+                        "confirmation": "release_observed",
+                        "head_sha": claimed.expected_head_sha,
+                        "detail_digest": format!("sha256:{:x}", Sha256::digest(detail.as_bytes())),
+                    }),
+                    _ => {
+                        return Err(crate::errors::AppError::Other(
+                            "unresolved release trigger has no positive live release observation"
+                                .into(),
+                        ))
+                    }
+                }
+            }
+            _ => {
+                return Err(crate::errors::AppError::Other(format!(
+                "unresolved delivery mutation rung {} has no safe positive reconciliation adapter",
+                intent.rung
+            )))
+            }
+        };
+        let evidence = json!({
+            "rung": intent.rung,
+            "operation_key": intent.operation_key,
+            "observation": confirmation,
+        })
+        .to_string();
+        if !delivery_run::mark_delivery_mutation_intent_reconciled_committed(
+            db,
+            &intent.intent_id,
+            process,
+            claimed.claim_epoch,
+            Some(&evidence),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await?
+        {
+            return Err(crate::errors::AppError::Other(format!(
+                "delivery mutation intent {} lost its takeover epoch before reconciliation",
+                intent.intent_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Resume an expired recoverable wait after startup. The durable lease was
 /// claimed before this function is called; only already-authorized autonomous
 /// waits are eligible. `deliver` begins with local/remote reconciliation and is
@@ -416,23 +1030,196 @@ pub(crate) async fn resume_claimed_delivery(
         )));
     };
     let cwd = std::path::PathBuf::from(&claimed.workspace_path);
-    let opts = DeliverOpts {
+    let persisted_identity = DeliveryIdentitySnapshot {
+        repo_identity: claimed.repo_identity.clone(),
+        worktree_identity: claimed.worktree_identity.clone(),
+        head_sha: claimed.expected_head_sha.clone(),
+        change_set_digest: claimed.change_set_digest.clone(),
+    };
+    let mut opts = DeliverOpts {
         title: None,
         body: None,
         release_urgency: None,
         requested_ceiling: Some(requested_ceiling),
         extra_excludes: settings.delivery_exclude_globs.clone(),
         expect_branch: Some(claimed.head_branch.clone()),
+        expected_identity: Some(DeliveryIdentitySnapshot {
+            repo_identity: claimed.repo_identity.clone(),
+            worktree_identity: claimed.worktree_identity.clone(),
+            head_sha: claimed.expected_head_sha.clone(),
+            change_set_digest: claimed.change_set_digest.clone(),
+        }),
+        mutation_permit: None,
     };
     let remote = delivery::resolve_delivery_remote(&cwd, &settings);
-    let prepared = PreparedDurableRun {
-        id: claimed.run_id,
-        process,
-        expected_head_sha: claimed.expected_head_sha,
-        head_branch: claimed.head_branch,
+    let mut prepared = PreparedDurableRun {
+        id: claimed.run_id.clone(),
+        process: process.clone(),
+        claim_epoch: claimed.claim_epoch,
+        objective_id: claimed.objective_id.clone(),
+        workspace_path: cwd.clone(),
+        worktree_identity: claimed.worktree_identity.clone(),
+        repo_identity: claimed.repo_identity.clone(),
+        change_set_digest: claimed.change_set_digest.clone(),
+        expected_head_sha: claimed.expected_head_sha.clone(),
+        head_branch: claimed.head_branch.clone(),
     };
+
+    let mut takeover = match delivery::observe_delivery_takeover(
+        &cwd,
+        Some(&claimed.base_branch),
+        &claimed.head_branch,
+        &persisted_identity,
+        claimed.canonical_pr_number.map(|number| number as u64),
+        claimed.canonical_pr_url.as_deref(),
+        remote.as_ref(),
+    )
+    .await
+    {
+        Ok(observation) => observation,
+        Err(error) => {
+            let failure = DeliveryObservation {
+                head_branch: claimed.head_branch.clone(),
+                stage: "takeover_reconciliation".into(),
+                status: "platform_incident".into(),
+                wait_class: Some("external_state_uncertain".into()),
+                next_action: Some("observe_only_reconcile".into()),
+                reached_ceiling: claimed.reached_ceiling.clone(),
+                expected_head_sha: claimed.expected_head_sha.clone(),
+                canonical_pr_number: claimed.canonical_pr_number,
+                canonical_pr_url: claimed.canonical_pr_url.clone(),
+                canonical_head_sha: claimed.canonical_head_sha.clone(),
+                failure_signature: Some(format!("takeover_reconciliation:{error}")),
+                core_input: None,
+                identity_revision: None,
+            };
+            let _ = delivery_run::record_delivery_observation(
+                &db,
+                &claimed.run_id,
+                &process,
+                claimed.claim_epoch,
+                &failure,
+                chrono::Utc::now().timestamp_millis(),
+                DELIVERY_LEASE_TTL_MS,
+            )
+            .await;
+            return Err(crate::errors::AppError::Other(format!(
+                "delivery takeover remains observe-only: {error}"
+            )));
+        }
+    };
+
+    if let Err(error) = reconcile_unresolved_delivery_mutation_intents(
+        &db,
+        &claimed,
+        &process,
+        remote.as_ref(),
+        &mut takeover,
+    )
+    .await
+    {
+        let failure = DeliveryObservation {
+            head_branch: claimed.head_branch.clone(),
+            stage: "takeover_mutation_reconciliation".into(),
+            status: "platform_incident".into(),
+            wait_class: Some("external_state_uncertain".into()),
+            next_action: Some("observe_only_reconcile".into()),
+            reached_ceiling: claimed.reached_ceiling.clone(),
+            expected_head_sha: claimed.expected_head_sha.clone(),
+            canonical_pr_number: claimed.canonical_pr_number,
+            canonical_pr_url: claimed.canonical_pr_url.clone(),
+            canonical_head_sha: claimed.canonical_head_sha.clone(),
+            failure_signature: Some(format!("mutation_intent_reconciliation:{error}")),
+            core_input: None,
+            identity_revision: None,
+        };
+        let _ = delivery_run::record_delivery_observation(
+            &db,
+            &claimed.run_id,
+            &process,
+            claimed.claim_epoch,
+            &failure,
+            chrono::Utc::now().timestamp_millis(),
+            DELIVERY_LEASE_TTL_MS,
+        )
+        .await;
+        return Err(crate::errors::AppError::Other(format!(
+            "delivery takeover remains observe-only: {error}"
+        )));
+    }
+
+    let identity_revision = build_delivery_identity_revision(
+        &prepared,
+        &takeover.identity.repo_identity,
+        &takeover.identity.worktree_identity,
+        &takeover.identity.head_sha,
+        &takeover.identity.change_set_digest,
+    )?;
+    let canonical_head_sha = takeover
+        .canonical_head_sha
+        .clone()
+        .filter(|head| head == &takeover.identity.head_sha);
+    let reconciled_observation = DeliveryObservation {
+        head_branch: claimed.head_branch.clone(),
+        stage: claimed.stage.clone(),
+        status: claimed.status.clone(),
+        wait_class: claimed.wait_class.clone(),
+        next_action: claimed.next_action.clone(),
+        reached_ceiling: claimed.reached_ceiling.clone(),
+        expected_head_sha: takeover.identity.head_sha.clone(),
+        canonical_pr_number: takeover.canonical_pr_number.map(|number| number as i64),
+        canonical_pr_url: takeover.canonical_pr_url.clone(),
+        canonical_head_sha,
+        failure_signature: claimed.failure_signature.clone(),
+        core_input: None,
+        identity_revision: identity_revision.clone(),
+    };
+    delivery_run::record_delivery_observation(
+        &db,
+        &claimed.run_id,
+        &process,
+        claimed.claim_epoch,
+        &reconciled_observation,
+        chrono::Utc::now().timestamp_millis(),
+        DELIVERY_LEASE_TTL_MS,
+    )
+    .await?;
+    if let Some(revision) = identity_revision {
+        prepared.expected_head_sha = revision.next_expected_head_sha;
+        prepared.change_set_digest = revision.next_change_set_digest;
+    }
+    if !delivery_run::mark_delivery_claim_reconciled(
+        &db,
+        &claimed.run_id,
+        &process,
+        claimed.claim_epoch,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?
+    {
+        return Err(crate::errors::AppError::Other(
+            "delivery takeover lost its epoch before reconciliation completed".into(),
+        ));
+    }
+    if claimed.status == "awaiting_completion_arbitration" {
+        ObjectiveStore::new(db.clone())
+            .settle_reconciled_delivery_after_takeover(
+                &claimed.run_id,
+                claimed.claim_epoch,
+                &process.instance_id,
+            )
+            .await
+            .map_err(|error| {
+                crate::errors::AppError::Other(format!(
+                    "delivery takeover could not settle its durable completion evidence: {error}"
+                ))
+            })?;
+        return Ok(());
+    }
+    opts.expected_identity = Some(prepared.identity_snapshot());
+    opts.mutation_permit = Some(prepared.mutation_permit(&db));
     loop {
-        let outcome = delivery::deliver(
+        let delivery_future = delivery::deliver(
             &cwd,
             requested_ceiling,
             settings.delivery_merge_method,
@@ -440,9 +1227,10 @@ pub(crate) async fn resume_claimed_delivery(
             &opts,
             remote.as_ref(),
             Some(&claimed.base_branch),
-        )
-        .await;
-        persist_durable_outcome(&db, &prepared, &outcome).await?;
+        );
+        let outcome = await_delivery_with_lease_heartbeat(&db, &prepared, delivery_future).await?;
+        persist_durable_outcome(&db, &mut prepared, &outcome).await?;
+        opts.expected_identity = Some(prepared.identity_snapshot());
         if outcome.final_state != "waiting" {
             return Ok(());
         }
@@ -538,32 +1326,6 @@ fn ceiling_label(ceiling: DeliveryCeiling) -> &'static str {
     }
 }
 
-fn durable_repo_identity(repo: &delivery::RepoContext) -> String {
-    let source = repo
-        .remote_url
-        .as_deref()
-        .unwrap_or_else(|| repo.root.to_str().unwrap_or("local-repository"));
-    let mut hasher = Sha256::new();
-    hasher.update(source.as_bytes());
-    format!("sha256:{:x}", hasher.finalize())
-}
-
-fn durable_worktree_identity(root: &std::path::Path) -> Result<String> {
-    let repository = git2::Repository::open(root).map_err(|error| {
-        crate::errors::AppError::Other(format!(
-            "cannot resolve delivery worktree identity: {error}"
-        ))
-    })?;
-    let admin_path = repository.path().canonicalize().map_err(|error| {
-        crate::errors::AppError::Other(format!(
-            "cannot canonicalize delivery worktree identity: {error}"
-        ))
-    })?;
-    let mut hasher = Sha256::new();
-    hasher.update(admin_path.to_string_lossy().as_bytes());
-    Ok(format!("gitdir-sha256:{:x}", hasher.finalize()))
-}
-
 async fn durable_objective_identity(
     db: &sqlx::SqlitePool,
     ctx: &ExecCtx,
@@ -621,34 +1383,6 @@ fn durable_run_id(source_identity: &str, repo_identity: &str) -> String {
     hasher.update([0]);
     hasher.update(repo_identity.as_bytes());
     format!("delivery-{:x}", hasher.finalize())
-}
-
-fn durable_change_set_digest(root: &std::path::Path, head: &str) -> Result<String> {
-    let repository = git2::Repository::open(root).map_err(|error| {
-        crate::errors::AppError::Other(format!("cannot inspect delivery worktree: {error}"))
-    })?;
-    let statuses = repository.statuses(None).map_err(|error| {
-        crate::errors::AppError::Other(format!("cannot inspect delivery changes: {error}"))
-    })?;
-    let mut entries: Vec<_> = statuses
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .path()
-                .map(|path| (path.to_owned(), entry.status().bits()))
-        })
-        .collect();
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut hasher = Sha256::new();
-    hasher.update(head.as_bytes());
-    for (path, status) in entries {
-        hasher.update(path.as_bytes());
-        hasher.update(status.to_le_bytes());
-        if let Ok(bytes) = std::fs::read(root.join(&path)) {
-            hasher.update(bytes);
-        }
-    }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn tool_output_for_outcome(outcome: &delivery::DeliveryOutcome) -> ToolOutput {
@@ -908,6 +1642,15 @@ mod tests {
     use super::*;
     use crate::agent::delivery::{DeliveryOutcome, RecoveryClass, StepResult};
 
+    #[test]
+    fn foreground_delivery_lease_owner_is_unique_per_invocation() {
+        let first = foreground_delivery_process_identity();
+        let second = foreground_delivery_process_identity();
+        assert_ne!(first.instance_id, second.instance_id);
+        assert!(first.instance_id.contains(":delivery:"));
+        assert!(second.instance_id.contains(":delivery:"));
+    }
+
     fn outcome(final_state: &str) -> DeliveryOutcome {
         DeliveryOutcome {
             steps: vec![StepResult {
@@ -1127,7 +1870,7 @@ mod tests {
         let process = ProcessIdentity::new("process", "1.79.1", "17901");
         let run = NewDeliveryRun {
             id: "arbiter-run".into(),
-            objective_id: "chat:arbiter".into(),
+            objective_id: "objective-opaque-arbiter".into(),
             run_kind: "chat_delivery".into(),
             session_id: Some("session".into()),
             root_turn_id: Some("turn".into()),
@@ -1137,7 +1880,7 @@ mod tests {
             worktree_identity: "worktree:arbiter".into(),
             repo_identity: "repo".into(),
             base_branch: "main".into(),
-            head_branch: "feature".into(),
+            head_branch: "feature/x".into(),
             change_set_digest: "digest".into(),
             expected_head_sha: "abc".into(),
             canonical_pr_number: None,
@@ -1152,20 +1895,32 @@ mod tests {
             next_action_authorized: true,
             autonomous_completion: true,
         };
-        delivery_run::create_delivery_run(&pool, &run, &process, 100, 30)
-            .await
-            .unwrap();
-        let prepared = PreparedDurableRun {
+        let claim_epoch = delivery_run::create_delivery_run(
+            &pool,
+            &run,
+            &process,
+            chrono::Utc::now().timestamp_millis(),
+            DELIVERY_LEASE_TTL_MS,
+        )
+        .await
+        .unwrap();
+        let mut prepared = PreparedDurableRun {
             id: run.id,
             process,
+            claim_epoch,
+            objective_id: run.objective_id,
+            workspace_path: run.workspace_path.into(),
+            worktree_identity: run.worktree_identity,
+            repo_identity: run.repo_identity,
+            change_set_digest: run.change_set_digest,
             expected_head_sha: "abc".into(),
-            head_branch: "feature".into(),
+            head_branch: "feature/x".into(),
         };
 
         let mut incomplete = outcome("delivered");
         incomplete.requested_ceiling = "through_release".into();
         incomplete.reached_state = "local".into();
-        persist_durable_outcome(&pool, &prepared, &incomplete)
+        persist_durable_outcome(&pool, &mut prepared, &incomplete)
             .await
             .unwrap();
         let status: String =
@@ -1175,10 +1930,29 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "awaiting_completion_arbitration");
 
+        let mut evidence_candidate = outcome("delivered");
+        evidence_candidate.requested_ceiling = "through_release".into();
+        evidence_candidate.reached_state = "live_verified".into();
+        evidence_candidate.commit_sha = Some("abc".into());
+        evidence_candidate.pr_number = Some(42);
+        evidence_candidate.pr_url = Some("https://example.invalid/pr/42".into());
+        persist_durable_outcome(&pool, &mut prepared, &evidence_candidate)
+            .await
+            .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM delivery_runs WHERE id='arbiter-run'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "awaiting_completion_arbitration",
+            "DeliveryRun may project evidence but only CompletionArbiter may complete the Objective"
+        );
+
         let mut noop = outcome("noop");
         noop.requested_ceiling = "through_release".into();
         noop.reached_state = "local".into();
-        persist_durable_outcome(&pool, &prepared, &noop)
+        persist_durable_outcome(&pool, &mut prepared, &noop)
             .await
             .unwrap();
         let status: String =
@@ -1187,6 +1961,128 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(status, "awaiting_completion_arbitration");
+    }
+
+    #[tokio::test]
+    async fn external_state_uncertainty_remains_system_owned_in_durable_projection() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        delivery_run::ensure_schema(&pool).await.unwrap();
+        let process = ProcessIdentity::new("process", "1.79.2", "17902");
+        let run = NewDeliveryRun {
+            id: "external-uncertainty-run".into(),
+            objective_id: "objective-opaque-external-uncertainty".into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:external-uncertainty".into(),
+            repo_identity: "repo:external-uncertainty".into(),
+            base_branch: "main".into(),
+            head_branch: "feature/x".into(),
+            change_set_digest: "digest".into(),
+            expected_head_sha: "abc".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "delivery".into(),
+            status: "running".into(),
+            wait_class: None,
+            next_action: Some("observe_only_reconcile".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let claim_epoch = delivery_run::create_delivery_run(&pool, &run, &process, now, 60_000)
+            .await
+            .unwrap();
+        let mut prepared = PreparedDurableRun {
+            id: run.id,
+            process,
+            claim_epoch,
+            objective_id: run.objective_id,
+            workspace_path: run.workspace_path.into(),
+            worktree_identity: run.worktree_identity,
+            repo_identity: run.repo_identity,
+            change_set_digest: run.change_set_digest,
+            expected_head_sha: run.expected_head_sha,
+            head_branch: run.head_branch,
+        };
+        let mut uncertain = outcome("waiting");
+        uncertain.recovery_class = RecoveryClass::ExternalStateUncertain;
+        uncertain.code = "delivery_mutation_uncertain".into();
+        uncertain.next_action = Some("observe_only_reconcile".into());
+
+        persist_durable_outcome(&pool, &mut prepared, &uncertain)
+            .await
+            .unwrap();
+        let (status, wait_class, next_action): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, wait_class, next_action FROM delivery_runs
+                 WHERE id='external-uncertainty-run'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "waiting");
+        assert_eq!(wait_class.as_deref(), Some("external_state_uncertain"));
+        assert_eq!(next_action.as_deref(), Some("observe_only_reconcile"));
+    }
+
+    #[test]
+    fn identity_revision_receipt_binds_stable_repo_and_worktree() {
+        let prepared = PreparedDurableRun {
+            id: "run".into(),
+            process: ProcessIdentity::new("process", "1.79.2", "17902"),
+            claim_epoch: 1,
+            objective_id: "objective-opaque-revision".into(),
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:a".into(),
+            repo_identity: "repo:a".into(),
+            change_set_digest: "digest-before".into(),
+            expected_head_sha: "aaa".into(),
+            head_branch: "feature".into(),
+        };
+
+        assert!(build_delivery_identity_revision(
+            &prepared,
+            "repo:a",
+            "worktree:a",
+            "aaa",
+            "digest-before",
+        )
+        .unwrap()
+        .is_none());
+        assert!(build_delivery_identity_revision(
+            &prepared,
+            "repo:b",
+            "worktree:a",
+            "bbb",
+            "digest-after",
+        )
+        .is_err());
+
+        let receipt = build_delivery_identity_revision(
+            &prepared,
+            "repo:a",
+            "worktree:a",
+            "bbb",
+            "digest-after",
+        )
+        .unwrap()
+        .expect("a new observed head requires a receipt");
+        assert_eq!(receipt.objective_id, "objective-opaque-revision");
+        assert_eq!(receipt.previous_expected_head_sha, "aaa");
+        assert_eq!(receipt.next_expected_head_sha, "bbb");
+        assert_eq!(receipt.next_change_set_digest, "digest-after");
+        assert!(receipt.receipt_id.starts_with("sha256:"));
     }
 
     /// Gating `gh --watch` only works if the sanctioned alternative is
@@ -1211,7 +2107,10 @@ mod tests {
     fn startup_resumes_authorized_system_owned_states_without_requiring_autonomous_flag() {
         let claimed = |status: &str, authorized: bool| delivery_run::ClaimedRecovery {
             run_id: "run".into(),
+            claim_epoch: 1,
+            objective_id: "objective-opaque-supervisor".into(),
             workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:run".into(),
             repo_identity: "repo".into(),
             base_branch: "main".into(),
             head_branch: "feature".into(),
@@ -1220,7 +2119,9 @@ mod tests {
             requested_ceiling: "through_release".into(),
             autonomous_completion: false,
             canonical_pr_number: Some(1),
+            canonical_pr_url: Some("https://example.invalid/pr/1".into()),
             canonical_head_sha: Some("abc".into()),
+            reached_ceiling: "pr_open".into(),
             stage: "ci".into(),
             status: status.into(),
             wait_class: Some("wait_retryable".into()),
@@ -1267,6 +2168,446 @@ mod tests {
     #[test]
     fn recovery_supervisor_reclaims_within_product_slo() {
         assert!(recovery_supervisor_poll_interval() <= std::time::Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn in_flight_heartbeat_prevents_competing_recovery_across_original_lease() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        delivery_run::ensure_schema(&pool).await.unwrap();
+        let owner = ProcessIdentity::new("process-owner", "1.79.2", "17902");
+        let competitor = ProcessIdentity::new("process-competitor", "1.79.2", "17902");
+        let run = NewDeliveryRun {
+            id: "heartbeat-wrapper-run".into(),
+            objective_id: "objective-opaque-heartbeat".into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:heartbeat".into(),
+            repo_identity: "repo:heartbeat".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest".into(),
+            expected_head_sha: "abc".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "delivery".into(),
+            status: "waiting".into(),
+            wait_class: Some("wait_retryable".into()),
+            next_action: Some("observe_ci".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        let claim_epoch = delivery_run::create_delivery_run(&pool, &run, &owner, 100, 10)
+            .await
+            .unwrap();
+
+        let ticks = std::sync::Arc::new(tokio::sync::Notify::new());
+        let clock = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            100_i64, 120, 140,
+        ])));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+        let heartbeat_task = {
+            let pool = pool.clone();
+            let owner = owner.clone();
+            let ticks_for_driver = ticks.clone();
+            let clock_for_driver = clock.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                drive_delivery_with_lease_heartbeat(
+                    &pool,
+                    "heartbeat-wrapper-run",
+                    &owner,
+                    claim_epoch,
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        finish_rx.await.unwrap();
+                        "finished"
+                    },
+                    move || {
+                        let ticks = ticks_for_driver.clone();
+                        async move { ticks.notified().await }
+                    },
+                    move || {
+                        clock_for_driver
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .expect("one timestamp per heartbeat")
+                    },
+                    30,
+                )
+                .await
+            })
+        };
+
+        async fn wait_for_lease(pool: &sqlx::SqlitePool, expected: i64) {
+            for _ in 0..100 {
+                let observed: i64 = sqlx::query_scalar(
+                    "SELECT lease_expires_at FROM delivery_runs WHERE id='heartbeat-wrapper-run'",
+                )
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if observed == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("heartbeat did not advance lease to {expected}");
+        }
+
+        wait_for_lease(&pool, 130).await;
+        ticks.notify_one();
+        wait_for_lease(&pool, 150).await;
+        let first_competing_claim =
+            delivery_run::plan_startup_recovery(&pool, &competitor, 140, 30)
+                .await
+                .unwrap();
+        assert!(first_competing_claim.claimed.is_empty());
+
+        ticks.notify_one();
+        wait_for_lease(&pool, 170).await;
+        let second_competing_claim =
+            delivery_run::plan_startup_recovery(&pool, &competitor, 160, 30)
+                .await
+                .unwrap();
+        assert!(second_competing_claim.claimed.is_empty());
+
+        finish_tx.send(()).unwrap();
+        assert_eq!(heartbeat_task.await.unwrap().unwrap(), "finished");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut revision = DeliveryIdentityRevision {
+            receipt_id: String::new(),
+            objective_id: run.objective_id.clone(),
+            repo_identity: "repo:heartbeat".into(),
+            worktree_identity: "worktree:heartbeat".into(),
+            previous_expected_head_sha: "abc".into(),
+            previous_change_set_digest: "digest".into(),
+            next_expected_head_sha: "def".into(),
+            next_change_set_digest: "digest-after".into(),
+        };
+        revision.receipt_id =
+            delivery_run::delivery_identity_revision_receipt_id("heartbeat-wrapper-run", &revision);
+        let observation = DeliveryObservation {
+            head_branch: "feature".into(),
+            stage: "commit".into(),
+            status: "waiting".into(),
+            wait_class: Some("wait_retryable".into()),
+            next_action: Some("push".into()),
+            reached_ceiling: "committed".into(),
+            expected_head_sha: "def".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            failure_signature: None,
+            core_input: None,
+            identity_revision: Some(revision),
+        };
+        assert!(delivery_run::record_delivery_observation(
+            &pool,
+            "heartbeat-wrapper-run",
+            &owner,
+            claim_epoch,
+            &observation,
+            165,
+            30,
+        )
+        .await
+        .unwrap());
+        let persisted_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_identity_revisions
+             WHERE run_id='heartbeat-wrapper-run'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted_receipts, 1);
+    }
+
+    #[tokio::test]
+    async fn lost_heartbeat_drops_old_future_and_takeover_stays_observe_only() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        delivery_run::ensure_schema(&pool).await.unwrap();
+        let owner = ProcessIdentity::new("process-owner", "1.79.2", "17902");
+        let competitor = ProcessIdentity::new("process-competitor", "1.79.2", "17902");
+        let run = NewDeliveryRun {
+            id: "heartbeat-loss-run".into(),
+            objective_id: "objective-opaque-heartbeat-loss".into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:heartbeat-loss".into(),
+            repo_identity: "repo:heartbeat-loss".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest".into(),
+            expected_head_sha: "abc".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "delivery".into(),
+            status: "waiting".into(),
+            wait_class: Some("wait_retryable".into()),
+            next_action: Some("observe_ci".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        let owner_epoch = delivery_run::create_delivery_run(&pool, &run, &owner, 100, 10)
+            .await
+            .unwrap();
+        let ticks = std::sync::Arc::new(tokio::sync::Notify::new());
+        let clock = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            100_i64, 132,
+        ])));
+        let mutations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (allow_mutation_tx, allow_mutation_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = {
+            let pool = pool.clone();
+            let owner = owner.clone();
+            let ticks_for_driver = ticks.clone();
+            let clock_for_driver = clock.clone();
+            let mutations = mutations.clone();
+            tokio::spawn(async move {
+                drive_delivery_with_lease_heartbeat(
+                    &pool,
+                    "heartbeat-loss-run",
+                    &owner,
+                    owner_epoch,
+                    async move {
+                        let _ = allow_mutation_rx.await;
+                        mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    },
+                    move || {
+                        let ticks = ticks_for_driver.clone();
+                        async move { ticks.notified().await }
+                    },
+                    move || {
+                        clock_for_driver
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .expect("one timestamp per heartbeat")
+                    },
+                    30,
+                )
+                .await
+            })
+        };
+
+        for _ in 0..100 {
+            let expires: i64 = sqlx::query_scalar(
+                "SELECT lease_expires_at FROM delivery_runs WHERE id='heartbeat-loss-run'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if expires == 130 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let takeover = delivery_run::plan_startup_recovery(&pool, &competitor, 131, 30)
+            .await
+            .unwrap()
+            .claimed
+            .pop()
+            .expect("competitor claims the expired epoch");
+        ticks.notify_one();
+        let error = task.await.unwrap().expect_err("old owner must be dropped");
+        assert!(error.to_string().contains("external state is uncertain"));
+        assert!(
+            allow_mutation_tx.send(()).is_err(),
+            "old future was dropped"
+        );
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!delivery_run::verify_delivery_mutation_permit(
+            &pool,
+            "heartbeat-loss-run",
+            &competitor,
+            takeover.claim_epoch,
+            132,
+        )
+        .await
+        .unwrap());
+        assert!(delivery_run::mark_delivery_claim_reconciled(
+            &pool,
+            "heartbeat-loss-run",
+            &competitor,
+            takeover.claim_epoch,
+            132,
+        )
+        .await
+        .unwrap());
+        assert!(delivery_run::verify_delivery_mutation_permit(
+            &pool,
+            "heartbeat-loss-run",
+            &competitor,
+            takeover.claim_epoch,
+            132,
+        )
+        .await
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn takeover_requires_and_consumes_positive_push_observation_before_new_permit() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        delivery_run::ensure_schema(&pool).await.unwrap();
+        let owner = ProcessIdentity::new("process-owner", "1.79.2", "17902");
+        let competitor = ProcessIdentity::new("process-competitor", "1.79.2", "17902");
+        let now = chrono::Utc::now().timestamp_millis();
+        let run = NewDeliveryRun {
+            id: "push-takeover-run".into(),
+            objective_id: "objective-opaque-push-takeover".into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:push-takeover".into(),
+            repo_identity: "repo:push-takeover".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest".into(),
+            expected_head_sha: "abc".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "push".into(),
+            status: "waiting".into(),
+            wait_class: Some("external_state_uncertain".into()),
+            next_action: Some("observe_only_reconcile".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        let epoch = delivery_run::create_delivery_run(&pool, &run, &owner, now, 60_000)
+            .await
+            .unwrap();
+        let operation_key = delivery::external_operation_key(
+            "git_push",
+            &[&run.repo_identity, &run.head_branch, &run.expected_head_sha],
+        );
+        assert!(delivery_run::begin_delivery_mutation_intent(
+            &pool,
+            "push-intent",
+            &run.id,
+            &owner,
+            epoch,
+            "git_push",
+            &operation_key,
+            Some(r#"{"commit_sha":"abc"}"#),
+            now + 1,
+        )
+        .await
+        .unwrap());
+        assert!(delivery_run::mark_delivery_mutation_intent_unknown(
+            &pool,
+            "push-intent",
+            &owner,
+            epoch,
+            Some(r#"{"classification":"timeout"}"#),
+            now + 2,
+        )
+        .await
+        .unwrap());
+        sqlx::query("UPDATE delivery_runs SET lease_expires_at=? WHERE id=?")
+            .bind(now - 1)
+            .bind(&run.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let plan = delivery_run::plan_startup_recovery(&pool, &competitor, now + 3, 60_000)
+            .await
+            .unwrap();
+        let claimed = plan.claimed.into_iter().next().unwrap();
+        let mut absent = delivery::DeliveryTakeoverObservation {
+            identity: DeliveryIdentitySnapshot {
+                repo_identity: run.repo_identity.clone(),
+                worktree_identity: run.worktree_identity.clone(),
+                head_sha: run.expected_head_sha.clone(),
+                change_set_digest: run.change_set_digest.clone(),
+            },
+            remote_head_sha: None,
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+        };
+        assert!(reconcile_unresolved_delivery_mutation_intents(
+            &pool,
+            &claimed,
+            &competitor,
+            None::<&delivery::EitherRemote>,
+            &mut absent,
+        )
+        .await
+        .is_err());
+        assert!(!delivery_run::mark_delivery_claim_reconciled(
+            &pool,
+            &run.id,
+            &competitor,
+            claimed.claim_epoch,
+            now + 4,
+        )
+        .await
+        .unwrap());
+
+        absent.remote_head_sha = Some("abc".into());
+        reconcile_unresolved_delivery_mutation_intents(
+            &pool,
+            &claimed,
+            &competitor,
+            None::<&delivery::EitherRemote>,
+            &mut absent,
+        )
+        .await
+        .unwrap();
+        assert!(delivery_run::mark_delivery_claim_reconciled(
+            &pool,
+            &run.id,
+            &competitor,
+            claimed.claim_epoch,
+            now + 5,
+        )
+        .await
+        .unwrap());
+        assert!(delivery_run::verify_delivery_mutation_permit(
+            &pool,
+            &run.id,
+            &competitor,
+            claimed.claim_epoch,
+            now + 6,
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]

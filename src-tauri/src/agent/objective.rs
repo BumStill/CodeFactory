@@ -779,6 +779,63 @@ pub struct ObjectiveStore {
 }
 
 #[derive(Debug, Clone)]
+struct DeliveryCompletionCandidate {
+    run_id: String,
+    binding_id: String,
+    resource_generation: i64,
+    stage: String,
+    claim_epoch: i64,
+    repo_identity: String,
+    worktree_identity: String,
+    expected_head_sha: String,
+    change_set_digest: String,
+    requested_ceiling: String,
+    reached_ceiling: String,
+    canonical_pr_number: i64,
+    canonical_pr_url: String,
+    action_signature: String,
+    reconciliation_receipt_id: String,
+    already_terminal: bool,
+    takeover_lease_owner: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DeliveryTakeoverSettlement {
+    run_id: String,
+    claim_epoch: i64,
+    lease_owner: String,
+    binding_id: String,
+    resource_generation: i64,
+    action_signature: String,
+}
+
+fn delivery_ceiling_rank(value: &str) -> Option<i64> {
+    match value {
+        "local" => Some(0),
+        "committed" => Some(1),
+        "pushed" => Some(2),
+        "pr_open" => Some(3),
+        "ci_green" => Some(4),
+        "merge_queued" => Some(5),
+        "merged" => Some(6),
+        "release_triggered" => Some(7),
+        "deployment_succeeded" => Some(8),
+        "live_verified" => Some(9),
+        _ => None,
+    }
+}
+
+fn requested_delivery_ceiling_rank(value: &str) -> Option<i64> {
+    match value {
+        "pr_only" => Some(3),
+        "through_ci_green" => Some(4),
+        "through_merge" => Some(6),
+        "through_release" => Some(9),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ClaimedRemediation {
     pub objective: ObjectiveSnapshot,
     pub remediation_id: String,
@@ -1685,7 +1742,7 @@ impl ObjectiveStore {
         expected_revision: i64,
         decision: DecisionEnvelope,
     ) -> anyhow::Result<ObjectiveSnapshot> {
-        self.apply_decision_inner(expected_revision, decision, None)
+        self.apply_decision_inner(expected_revision, decision, None, None)
             .await
     }
 
@@ -1699,8 +1756,336 @@ impl ObjectiveStore {
         decision: DecisionEnvelope,
         permit: &codefactory_agent_loop::tool::MutationPermit,
     ) -> anyhow::Result<ObjectiveSnapshot> {
-        self.apply_decision_inner(expected_revision, decision, Some(permit))
+        self.apply_decision_inner(expected_revision, decision, Some(permit), None)
             .await
+    }
+
+    /// Combine newly-observed evidence with the typed durable evidence already
+    /// accepted for this Objective. This is what lets a Live Objective resume
+    /// after DeliveryRun settlement and later complete from a real live
+    /// observation without replaying delivery or fabricating that observation
+    /// from `reached_ceiling`.
+    pub async fn completion_decision_with_persisted_evidence(
+        &self,
+        objective: &ObjectiveSnapshot,
+        mut newly_observed: Vec<ObjectiveEvidence>,
+    ) -> anyhow::Result<DecisionEnvelope> {
+        let current = self
+            .get(&objective.id)
+            .await?
+            .ok_or_else(|| anyhow!("objective not found"))?;
+        if current.revision != objective.revision || current.status != objective.status {
+            bail!("objective changed before persisted completion evidence was combined");
+        }
+        let rows = sqlx::query(
+            "SELECT id, kind, scope, digest, evidence_ref, observed_at
+             FROM objective_evidence WHERE objective_id=? ORDER BY observed_at, created_at, id",
+        )
+        .bind(&objective.id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut evidence = Vec::with_capacity(rows.len() + newly_observed.len());
+        for row in rows {
+            evidence.push(ObjectiveEvidence {
+                id: row.try_get("id")?,
+                kind: EvidenceKind::parse(row.try_get::<String, _>("kind")?.as_str())?,
+                scope: row.try_get("scope")?,
+                digest: row.try_get("digest")?,
+                evidence_ref: row.try_get("evidence_ref")?,
+                observed_at: row.try_get("observed_at")?,
+                reached_acceptance: objective.requested_acceptance.clone(),
+            });
+        }
+        evidence.append(&mut newly_observed);
+        CompletionArbiter::decide(objective, &evidence)
+    }
+
+    /// Settle a DeliveryRun whose external effects were already positively
+    /// reconciled by takeover. This function performs no provider or git I/O;
+    /// it only consumes the exact pointed run/epoch ledger and advances the
+    /// provider-replay rows, generic receipt, DeliveryRun and Objective in one
+    /// SQLite transaction.
+    pub async fn settle_reconciled_delivery_after_takeover(
+        &self,
+        run_id: &str,
+        claim_epoch: i64,
+        lease_owner: &str,
+    ) -> anyhow::Result<ObjectiveSnapshot> {
+        if claim_epoch <= 0 {
+            bail!("delivery takeover claim epoch must be positive");
+        }
+        if lease_owner.trim().is_empty() {
+            bail!("delivery takeover lease owner must be explicit");
+        }
+        let objective_id = sqlx::query_scalar::<_, String>(
+            "SELECT objective.id
+             FROM objectives objective
+             JOIN delivery_runs run
+               ON run.id=objective.delivery_run_id AND run.objective_id=objective.id
+             WHERE run.id=?",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow!("delivery takeover has no exact pointed Objective"))?;
+        let current = self
+            .get(&objective_id)
+            .await?
+            .ok_or_else(|| anyhow!("pointed delivery Objective disappeared"))?;
+
+        if current.status.is_terminal()
+            || (current.kind == ObjectiveKind::Live
+                && current.status == ObjectiveStatus::WaitingSystem)
+        {
+            let settled: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)
+                 FROM delivery_runs run
+                 JOIN objectives objective
+                   ON objective.id=run.objective_id AND objective.delivery_run_id=run.id
+                 WHERE run.id=? AND run.claim_epoch=?
+                   AND run.reconciled_claim_epoch=run.claim_epoch
+                   AND run.status='completed'
+                   AND EXISTS (
+                     SELECT 1 FROM side_effect_receipts receipt
+                     WHERE receipt.objective_id=objective.id
+                       AND receipt.status='reconciled'
+                       AND json_extract(receipt.summary_json, '$.delivery_run_id')=run.id
+                   )
+                   AND EXISTS (
+                     SELECT 1 FROM objective_evidence evidence
+                     WHERE evidence.objective_id=objective.id
+                       AND evidence.kind='delivery_receipt'
+                   )",
+            )
+            .bind(run_id)
+            .bind(claim_epoch)
+            .fetch_one(&self.pool)
+            .await?;
+            if settled == 1 {
+                return Ok(current);
+            }
+            if current.status.is_terminal() {
+                bail!("terminal Objective has no exact reconciled DeliveryRun receipt");
+            }
+        }
+
+        if !matches!(current.kind, ObjectiveKind::Delivery | ObjectiveKind::Live) {
+            bail!("pointed DeliveryRun cannot settle a non-delivery Objective kind");
+        }
+        if !current.status.is_system_owned() {
+            bail!("DeliveryRun settlement requires a system-owned Objective");
+        }
+        let run = sqlx::query(
+            "SELECT run.status, run.stage, run.claim_epoch, run.reconciled_claim_epoch,
+                    run.next_action_authorized, run.autonomous_completion,
+                    run.requested_ceiling, run.reached_ceiling,
+                    run.repo_identity, run.worktree_identity,
+                    run.expected_head_sha, run.change_set_digest,
+                    run.canonical_pr_number, run.canonical_pr_url,
+                    run.canonical_head_sha, run.root_turn_id, run.task_id,
+                    run.lease_owner, run.lease_expires_at
+             FROM delivery_runs run
+             JOIN objectives objective
+               ON objective.id=run.objective_id AND objective.delivery_run_id=run.id
+             WHERE run.id=? AND run.objective_id=?",
+        )
+        .bind(run_id)
+        .bind(&current.id)
+        .fetch_one(&self.pool)
+        .await?;
+        let run_status: String = run.try_get("status")?;
+        if run_status != "awaiting_completion_arbitration" {
+            bail!("delivery takeover is not awaiting completion arbitration");
+        }
+        let stage: String = run.try_get("stage")?;
+        if stage != "complete" {
+            bail!("delivery takeover has not reached its complete stage");
+        }
+        let persisted_claim_epoch: i64 = run.try_get("claim_epoch")?;
+        let reconciled_claim_epoch: i64 = run.try_get("reconciled_claim_epoch")?;
+        if persisted_claim_epoch != claim_epoch || reconciled_claim_epoch != claim_epoch {
+            bail!("delivery takeover claim epoch is stale or unreconciled");
+        }
+        let next_action_authorized: i64 = run.try_get("next_action_authorized")?;
+        let autonomous_completion: i64 = run.try_get("autonomous_completion")?;
+        if next_action_authorized != 1 || autonomous_completion != 1 {
+            bail!("delivery takeover lacks autonomous completion authority");
+        }
+        let persisted_lease_owner: Option<String> = run.try_get("lease_owner")?;
+        let lease_expires_at: Option<i64> = run.try_get("lease_expires_at")?;
+        if persisted_lease_owner.as_deref() != Some(lease_owner)
+            || lease_expires_at.is_none_or(|expires_at| expires_at <= Utc::now().timestamp_millis())
+        {
+            bail!("delivery takeover lease expired or changed before settlement");
+        }
+        let requested_ceiling: String = run.try_get("requested_ceiling")?;
+        let reached_ceiling: String = run.try_get("reached_ceiling")?;
+        let requested_rank = requested_delivery_ceiling_rank(&requested_ceiling)
+            .ok_or_else(|| anyhow!("delivery takeover has an invalid requested ceiling"))?;
+        let reached_rank = delivery_ceiling_rank(&reached_ceiling)
+            .ok_or_else(|| anyhow!("delivery takeover has an invalid reached ceiling"))?;
+        if reached_rank < requested_rank {
+            bail!("delivery takeover has not reached its requested ceiling");
+        }
+        let repo_identity: String = run.try_get("repo_identity")?;
+        let worktree_identity: String = run.try_get("worktree_identity")?;
+        let expected_head_sha: String = run.try_get("expected_head_sha")?;
+        let change_set_digest: String = run.try_get("change_set_digest")?;
+        if [
+            repo_identity.as_str(),
+            worktree_identity.as_str(),
+            expected_head_sha.as_str(),
+            change_set_digest.as_str(),
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+        {
+            bail!("delivery takeover has incomplete durable identity");
+        }
+        let canonical_pr_number: Option<i64> = run.try_get("canonical_pr_number")?;
+        let canonical_pr_url: Option<String> = run.try_get("canonical_pr_url")?;
+        let canonical_head_sha: Option<String> = run.try_get("canonical_head_sha")?;
+        if canonical_pr_number.is_none()
+            || canonical_pr_url
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            || canonical_head_sha.as_deref() != Some(expected_head_sha.as_str())
+        {
+            bail!("delivery takeover canonical PR/head identity is incomplete or inconsistent");
+        }
+        let unresolved_intents: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_mutation_intents
+             WHERE run_id=? AND status IN ('started','unknown')",
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if unresolved_intents != 0 {
+            bail!("delivery takeover has an unresolved mutation intent");
+        }
+        let (resource_kind, resource_id) = match (
+            run.try_get::<Option<String>, _>("root_turn_id")?,
+            run.try_get::<Option<String>, _>("task_id")?,
+        ) {
+            (Some(root_turn_id), None) => ("chat_root_turn", root_turn_id),
+            (None, Some(task_id)) => ("task_run", task_id),
+            _ => bail!("delivery takeover cannot prove one authoritative resource"),
+        };
+        let binding = sqlx::query(
+            "SELECT id, resource_generation FROM objective_bindings
+             WHERE objective_id=? AND resource_kind=? AND resource_id=?
+             ORDER BY resource_generation DESC, updated_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(&current.id)
+        .bind(resource_kind)
+        .bind(&resource_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow!("delivery takeover has no current binding"))?;
+        let binding_id: String = binding.try_get("id")?;
+        let resource_generation: i64 = binding.try_get("resource_generation")?;
+        let action_signatures: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT action_signature FROM tool_calls
+             WHERE objective_id=? AND binding_id=? AND resource_generation=?
+               AND tool_name='deliver_changes'
+               AND NULLIF(TRIM(action_signature), '') IS NOT NULL
+             ORDER BY action_signature",
+        )
+        .bind(&current.id)
+        .bind(&binding_id)
+        .bind(resource_generation)
+        .fetch_all(&self.pool)
+        .await?;
+        if action_signatures.len() != 1 {
+            bail!("delivery takeover requires one stable action signature on its current binding");
+        }
+        let action_signature = action_signatures[0].clone();
+        let tool_call_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tool_calls
+             WHERE objective_id=? AND binding_id=? AND resource_generation=?
+               AND tool_name='deliver_changes' AND action_signature=?",
+        )
+        .bind(&current.id)
+        .bind(&binding_id)
+        .bind(resource_generation)
+        .bind(&action_signature)
+        .fetch_one(&self.pool)
+        .await?;
+        if tool_call_count == 0 {
+            bail!("delivery takeover has no exact normalized action to settle");
+        }
+        let now = Utc::now().timestamp_millis();
+        let scope = current
+            .root_turn_id
+            .clone()
+            .or(current.task_id.clone())
+            .unwrap_or_else(|| current.id.clone());
+        let delivery_evidence = ObjectiveEvidence {
+            id: format!(
+                "sha256:{:x}",
+                Sha256::digest(
+                    format!(
+                        "delivery_takeover_evidence\0{}\0{}\0{}",
+                        current.id, run_id, claim_epoch
+                    )
+                    .as_bytes()
+                )
+            ),
+            kind: EvidenceKind::DeliveryReceipt,
+            scope,
+            digest: format!(
+                "sha256:{:x}",
+                Sha256::digest(format!("{run_id}\0{claim_epoch}").as_bytes())
+            ),
+            evidence_ref: format!("delivery-run:{run_id}:epoch:{claim_epoch}"),
+            observed_at: now,
+            reached_acceptance: current.requested_acceptance.clone(),
+        };
+        let mut decision = if current.kind == ObjectiveKind::Delivery {
+            CompletionArbiter::decide(&current, &[delivery_evidence.clone()])?
+        } else {
+            let continuation_domain = if current.task_id.is_some() {
+                RecoveryDomain::Task
+            } else if current.root_turn_id.is_some() {
+                RecoveryDomain::Chat
+            } else {
+                RecoveryDomain::Delivery
+            };
+            DecisionRouter::route(
+                &current,
+                RouteSignal::TechnicalFailure {
+                    domain: continuation_domain,
+                    failure_code: "live_verification_pending_after_delivery".into(),
+                    failure_signature: format!(
+                        "sha256:{:x}",
+                        Sha256::digest(
+                            format!("{}\0{}\0{}", current.id, run_id, claim_epoch).as_bytes()
+                        )
+                    ),
+                    next_observation_at: now,
+                    resume_cursor: current.root_turn_id.clone().or(current.task_id.clone()),
+                },
+            )?
+        };
+        // Waiting decisions may carry accepted non-terminal evidence. It is
+        // persisted now, while CompletionArbiter still requires a separate
+        // LiveVerification before it can ever emit `complete`.
+        decision.evidence = Some(delivery_evidence);
+        self.apply_decision_inner(
+            current.revision,
+            decision,
+            None,
+            Some(DeliveryTakeoverSettlement {
+                run_id: run_id.to_string(),
+                claim_epoch,
+                lease_owner: lease_owner.to_string(),
+                binding_id,
+                resource_generation,
+                action_signature,
+            }),
+        )
+        .await
     }
 
     async fn apply_decision_inner(
@@ -1708,6 +2093,7 @@ impl ObjectiveStore {
         expected_revision: i64,
         decision: DecisionEnvelope,
         permit: Option<&codefactory_agent_loop::tool::MutationPermit>,
+        delivery_takeover: Option<DeliveryTakeoverSettlement>,
     ) -> anyhow::Result<ObjectiveSnapshot> {
         let current = self
             .get(&decision.objective_id)
@@ -1727,6 +2113,7 @@ impl ObjectiveStore {
             .evidence
             .as_ref()
             .map(|evidence| evidence.evidence_ref.clone());
+        let mut delivery_run_to_complete: Option<DeliveryCompletionCandidate> = None;
         let mut tx = self.pool.begin().await?;
         if let Some(permit) = permit {
             if permit.objective_id != decision.objective_id {
@@ -1764,7 +2151,130 @@ impl ObjectiveStore {
                 bail!("objective claim expired or changed before settlement");
             }
         }
-        if decision.status == ObjectiveStatus::Completed {
+        if decision.status == ObjectiveStatus::Completed || delivery_takeover.is_some() {
+            let pointed_delivery_run_id: Option<String> = sqlx::query_scalar(
+                "SELECT delivery_run_id FROM objectives WHERE id=? AND revision=?",
+            )
+            .bind(&decision.objective_id)
+            .bind(expected_revision)
+            .fetch_one(&mut *tx)
+            .await?;
+            if let Some(takeover) = delivery_takeover.as_ref() {
+                if pointed_delivery_run_id.as_deref() != Some(takeover.run_id.as_str()) {
+                    bail!("delivery takeover does not match the authoritative Objective pointer");
+                }
+                let pending_calls: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM tool_calls tool
+                     JOIN objective_bindings binding
+                       ON binding.id=tool.binding_id AND binding.objective_id=tool.objective_id
+                     JOIN delivery_runs run
+                       ON run.objective_id=tool.objective_id
+                     WHERE run.id=? AND run.objective_id=?
+                       AND run.claim_epoch=? AND run.reconciled_claim_epoch=run.claim_epoch
+                       AND run.status='awaiting_completion_arbitration'
+                       AND tool.tool_name='deliver_changes'
+                       AND tool.status='pending'
+                       AND tool.binding_id=?
+                       AND tool.resource_generation=?
+                       AND tool.action_signature=?
+                       AND tool.resource_generation=binding.resource_generation
+                       AND (
+                         (binding.resource_kind='chat_root_turn'
+                          AND binding.resource_id=run.root_turn_id)
+                         OR
+                         (binding.resource_kind='task_run'
+                          AND binding.resource_id=run.task_id)
+                       )",
+                )
+                .bind(&takeover.run_id)
+                .bind(&decision.objective_id)
+                .bind(takeover.claim_epoch)
+                .bind(&takeover.binding_id)
+                .bind(takeover.resource_generation)
+                .bind(&takeover.action_signature)
+                .fetch_one(&mut *tx)
+                .await?;
+                if pending_calls == 0 {
+                    bail!("delivery takeover has no crash-left pending tool call to settle");
+                }
+                let result_json = serde_json::json!({
+                    "status": "done",
+                    "delivery_run_id": takeover.run_id,
+                    "claim_epoch": takeover.claim_epoch,
+                    "reconciled_after_takeover": true,
+                })
+                .to_string();
+                let tool_rows = sqlx::query(
+                    "SELECT tool.id, message.session_id
+                     FROM tool_calls tool
+                     JOIN messages message ON message.id=tool.message_id
+                     JOIN objective_bindings binding
+                       ON binding.id=tool.binding_id AND binding.objective_id=tool.objective_id
+                     JOIN delivery_runs run ON run.objective_id=tool.objective_id
+                     WHERE run.id=? AND run.objective_id=?
+                       AND run.claim_epoch=? AND run.reconciled_claim_epoch=run.claim_epoch
+                       AND tool.tool_name='deliver_changes' AND tool.status='pending'
+                       AND tool.binding_id=?
+                       AND tool.resource_generation=?
+                       AND tool.action_signature=?
+                       AND tool.resource_generation=binding.resource_generation
+                       AND (
+                         (binding.resource_kind='chat_root_turn'
+                          AND binding.resource_id=run.root_turn_id)
+                         OR
+                         (binding.resource_kind='task_run'
+                          AND binding.resource_id=run.task_id)
+                       )",
+                )
+                .bind(&takeover.run_id)
+                .bind(&decision.objective_id)
+                .bind(takeover.claim_epoch)
+                .bind(&takeover.binding_id)
+                .bind(takeover.resource_generation)
+                .bind(&takeover.action_signature)
+                .fetch_all(&mut *tx)
+                .await?;
+                for row in tool_rows {
+                    let trace_id: String = row.try_get("id")?;
+                    let session_id: String = row.try_get("session_id")?;
+                    let provider_tool_call_id = trace_id
+                        .strip_prefix(&format!("{session_id}:"))
+                        .ok_or_else(|| {
+                            anyhow!("normalized delivery tool call identity is malformed")
+                        })?;
+                    let updated = sqlx::query(
+                        "UPDATE tool_calls
+                         SET status='done', result=?, error=NULL, duration_ms=COALESCE(duration_ms, 0)
+                         WHERE id=? AND status='pending'",
+                    )
+                    .bind(&result_json)
+                    .bind(&trace_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    if updated.rows_affected() != 1 {
+                        bail!("delivery tool call changed during takeover settlement");
+                    }
+                    let replay_message_id = format!("{trace_id}:result");
+                    let replay_content = serde_json::json!({
+                        "tool_call_id": provider_tool_call_id,
+                        "content": result_json.clone(),
+                        "status": "done",
+                    })
+                    .to_string();
+                    sqlx::query(
+                        "INSERT INTO messages (id, session_id, role, content, created_at)
+                         VALUES (?, ?, 'tool', ?, ?)
+                         ON CONFLICT(id) DO UPDATE SET
+                           session_id=excluded.session_id, role='tool', content=excluded.content",
+                    )
+                    .bind(replay_message_id)
+                    .bind(session_id)
+                    .bind(replay_content)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
             let unresolved_receipts: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM side_effect_receipts
                  WHERE objective_id=? AND status IN ('not_started','started','unknown')",
@@ -1834,7 +2344,10 @@ impl ObjectiveStore {
             let binding_side_effect_started = current_binding
                 .as_ref()
                 .is_some_and(|(_, _, started)| *started != 0);
-            if objective_side_effect_started != 0 || binding_side_effect_started {
+            if pointed_delivery_run_id.is_some()
+                || objective_side_effect_started != 0
+                || binding_side_effect_started
+            {
                 let Some((binding_id, resource_generation, _)) = current_binding else {
                     bail!(
                         "objective completion refused because a side effect started without a current Objective binding"
@@ -1847,10 +2360,11 @@ impl ObjectiveStore {
                 }
                 let attributed_actions: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM tool_calls
-                     WHERE objective_id=? AND resource_generation=?
+                     WHERE objective_id=? AND binding_id=? AND resource_generation=?
                        AND NULLIF(TRIM(action_signature), '') IS NOT NULL",
                 )
                 .bind(&decision.objective_id)
+                .bind(&binding_id)
                 .bind(resource_generation)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -1859,9 +2373,247 @@ impl ObjectiveStore {
                         "objective completion refused because a side effect started without a trustworthy current attributed receipt"
                     );
                 }
+                let delivery_signatures: Vec<String> = sqlx::query_scalar(
+                    "SELECT DISTINCT action_signature FROM tool_calls
+                     WHERE objective_id=? AND binding_id=? AND resource_generation=?
+                       AND tool_name='deliver_changes'
+                       AND NULLIF(TRIM(action_signature), '') IS NOT NULL
+                     ORDER BY action_signature",
+                )
+                .bind(&decision.objective_id)
+                .bind(&binding_id)
+                .bind(resource_generation)
+                .fetch_all(&mut *tx)
+                .await?;
+                if pointed_delivery_run_id.is_some() && delivery_signatures.is_empty() {
+                    bail!(
+                        "objective completion refused because its pointed DeliveryRun lacks a completed current deliver_changes action"
+                    );
+                }
+                if delivery_signatures.len() > 1 {
+                    bail!(
+                        "objective completion refused because current deliver_changes actions do not have one stable action signature"
+                    );
+                }
+                if let Some(action_signature) = delivery_signatures.first() {
+                    let completed_action_rows: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM tool_calls
+                         WHERE objective_id=? AND binding_id=? AND resource_generation=?
+                           AND tool_name='deliver_changes' AND status='done'
+                           AND action_signature=?",
+                    )
+                    .bind(&decision.objective_id)
+                    .bind(&binding_id)
+                    .bind(resource_generation)
+                    .bind(action_signature)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if completed_action_rows == 0 {
+                        bail!(
+                            "objective completion refused because deliver_changes has no completed current action"
+                        );
+                    }
+
+                    let candidate_rows = sqlx::query(
+                        "SELECT run.id, run.stage, run.claim_epoch,
+                                run.repo_identity, run.worktree_identity,
+                                run.expected_head_sha, run.change_set_digest,
+                                run.requested_ceiling, run.reached_ceiling,
+                                run.canonical_pr_number, run.canonical_pr_url
+                         FROM delivery_runs AS run
+                         JOIN objective_bindings AS binding
+                           ON binding.id=? AND binding.objective_id=run.objective_id
+                         JOIN objectives AS objective
+                           ON objective.id=run.objective_id
+                          AND objective.delivery_run_id=run.id
+                         WHERE run.objective_id=?
+                           AND run.run_kind='deliver_changes'
+                           AND run.status IN ('awaiting_completion_arbitration','completed')
+                           AND run.stage='complete'
+                           AND run.claim_epoch>0
+                           AND run.reconciled_claim_epoch=run.claim_epoch
+                           AND (
+                             (run.status='awaiting_completion_arbitration'
+                              AND run.next_action_authorized=1)
+                             OR
+                             (run.status='completed'
+                              AND run.next_action_authorized=0)
+                           )
+                           AND COALESCE(run.next_action, '')=''
+                           AND COALESCE(run.failure_signature, '')=''
+                           AND COALESCE(run.wait_class, 'none')='none'
+                           AND NULLIF(TRIM(run.repo_identity), '') IS NOT NULL
+                           AND NULLIF(TRIM(run.worktree_identity), '') IS NOT NULL
+                           AND NULLIF(TRIM(run.expected_head_sha), '') IS NOT NULL
+                           AND NULLIF(TRIM(run.change_set_digest), '') IS NOT NULL
+                           AND (
+                             (binding.resource_kind='chat_root_turn'
+                              AND run.root_turn_id=binding.resource_id)
+                             OR
+                             (binding.resource_kind='task_run'
+                              AND run.task_id=binding.resource_id)
+                           )
+                           AND CASE run.reached_ceiling
+                             WHEN 'local' THEN 0
+                             WHEN 'committed' THEN 1
+                             WHEN 'pushed' THEN 2
+                             WHEN 'pr_open' THEN 3
+                             WHEN 'ci_green' THEN 4
+                             WHEN 'merge_queued' THEN 5
+                             WHEN 'merged' THEN 6
+                             WHEN 'release_triggered' THEN 7
+                             WHEN 'deployment_succeeded' THEN 8
+                             WHEN 'live_verified' THEN 9
+                             ELSE -1
+                           END >= CASE run.requested_ceiling
+                             WHEN 'pr_only' THEN 3
+                             WHEN 'through_ci_green' THEN 4
+                             WHEN 'through_merge' THEN 6
+                             WHEN 'through_release' THEN 9
+                             ELSE 100
+                           END
+                           AND run.canonical_pr_number IS NOT NULL
+                           AND NULLIF(TRIM(run.canonical_pr_url), '') IS NOT NULL
+                           AND run.canonical_head_sha=run.expected_head_sha
+                           AND NOT EXISTS (
+                             SELECT 1 FROM delivery_mutation_intents AS intent
+                             WHERE intent.run_id=run.id
+                               AND intent.status IN ('started','unknown')
+                           )",
+                    )
+                    .bind(&binding_id)
+                    .bind(&decision.objective_id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    if candidate_rows.len() != 1 {
+                        bail!(
+                            "objective completion refused because deliver_changes requires exactly one pointed receipt-backed DeliveryRun at its requested ceiling"
+                        );
+                    }
+                    let candidate = &candidate_rows[0];
+                    let run_id: String = candidate.try_get("id")?;
+                    let stage: String = candidate.try_get("stage")?;
+                    let claim_epoch: i64 = candidate.try_get("claim_epoch")?;
+                    let repo_identity: String = candidate.try_get("repo_identity")?;
+                    let worktree_identity: String = candidate.try_get("worktree_identity")?;
+                    let expected_head_sha: String = candidate.try_get("expected_head_sha")?;
+                    let change_set_digest: String = candidate.try_get("change_set_digest")?;
+                    let requested_ceiling: String = candidate.try_get("requested_ceiling")?;
+                    let reached_ceiling: String = candidate.try_get("reached_ceiling")?;
+                    let canonical_pr_number: i64 = candidate.try_get("canonical_pr_number")?;
+                    let canonical_pr_url: String = candidate.try_get("canonical_pr_url")?;
+                    let already_terminal: bool = sqlx::query_scalar::<_, String>(
+                        "SELECT status FROM delivery_runs WHERE id=?",
+                    )
+                    .bind(&run_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                        == "completed";
+                    let identity_material = serde_json::json!({
+                        "objective_id": decision.objective_id,
+                        "delivery_run_id": run_id,
+                        "claim_epoch": claim_epoch,
+                        "repo_identity": repo_identity,
+                        "worktree_identity": worktree_identity,
+                        "expected_head_sha": expected_head_sha,
+                        "change_set_digest": change_set_digest,
+                        "requested_ceiling": requested_ceiling,
+                        "reached_ceiling": reached_ceiling,
+                        "canonical_pr_number": canonical_pr_number,
+                        "canonical_pr_url": canonical_pr_url,
+                    })
+                    .to_string();
+                    let external_identity_digest =
+                        format!("sha256:{:x}", Sha256::digest(identity_material.as_bytes()));
+                    let idempotency_material = format!(
+                        "delivery_completion\0{}\0{}\0{}\0{}",
+                        decision.objective_id, binding_id, action_signature, run_id,
+                    );
+                    let idempotency_key = format!(
+                        "sha256:{:x}",
+                        Sha256::digest(idempotency_material.as_bytes())
+                    );
+                    let reconciliation_receipt_id = format!(
+                        "sha256:{:x}",
+                        Sha256::digest(
+                            format!("side_effect_receipt\0{idempotency_key}").as_bytes()
+                        )
+                    );
+                    let summary_json = serde_json::json!({
+                        "delivery_run_id": run_id,
+                        "claim_epoch": claim_epoch,
+                        "requested_ceiling": requested_ceiling,
+                        "reached_ceiling": reached_ceiling,
+                    })
+                    .to_string();
+                    let mut exact_receipt: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM side_effect_receipts
+                         WHERE id=? AND objective_id=? AND binding_id=?
+                           AND action_fingerprint=? AND idempotency_key=?
+                           AND status='reconciled' AND external_identity_digest=?",
+                    )
+                    .bind(&reconciliation_receipt_id)
+                    .bind(&decision.objective_id)
+                    .bind(&binding_id)
+                    .bind(action_signature)
+                    .bind(&idempotency_key)
+                    .bind(&external_identity_digest)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if exact_receipt == 0 {
+                        sqlx::query(
+                            "INSERT INTO side_effect_receipts
+                             (id, objective_id, binding_id, revision, action_fingerprint,
+                              idempotency_key, status, external_identity_digest,
+                              summary_json, created_at, observed_at)
+                             VALUES (?, ?, ?, ?, ?, ?, 'reconciled', ?, ?, ?, ?)",
+                        )
+                        .bind(&reconciliation_receipt_id)
+                        .bind(&decision.objective_id)
+                        .bind(&binding_id)
+                        .bind(expected_revision)
+                        .bind(action_signature)
+                        .bind(&idempotency_key)
+                        .bind(&external_identity_digest)
+                        .bind(summary_json)
+                        .bind(now)
+                        .bind(now)
+                        .execute(&mut *tx)
+                        .await?;
+                        exact_receipt = 1;
+                    }
+                    if exact_receipt != 1 {
+                        bail!(
+                            "objective completion refused because the DeliveryRun reconciliation receipt conflicted"
+                        );
+                    }
+                    delivery_run_to_complete = Some(DeliveryCompletionCandidate {
+                        run_id,
+                        binding_id: binding_id.clone(),
+                        resource_generation,
+                        stage,
+                        claim_epoch,
+                        repo_identity,
+                        worktree_identity,
+                        expected_head_sha,
+                        change_set_digest,
+                        requested_ceiling,
+                        reached_ceiling,
+                        canonical_pr_number,
+                        canonical_pr_url,
+                        action_signature: action_signature.clone(),
+                        reconciliation_receipt_id,
+                        already_terminal,
+                        takeover_lease_owner: delivery_takeover
+                            .as_ref()
+                            .map(|takeover| takeover.lease_owner.clone()),
+                    });
+                }
+
                 let unmatched_actions: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM tool_calls AS tool
-                     WHERE tool.objective_id=? AND tool.resource_generation=?
+                     WHERE tool.objective_id=? AND tool.binding_id=?
+                       AND tool.resource_generation=?
                        AND NULLIF(TRIM(tool.action_signature), '') IS NOT NULL
                        AND NOT EXISTS (
                            SELECT 1 FROM side_effect_receipts AS receipt
@@ -1872,6 +2624,7 @@ impl ObjectiveStore {
                        )",
                 )
                 .bind(&decision.objective_id)
+                .bind(&binding_id)
                 .bind(resource_generation)
                 .bind(&binding_id)
                 .fetch_one(&mut *tx)
@@ -1960,6 +2713,195 @@ impl ObjectiveStore {
         .await?;
         if result.rows_affected() != 1 {
             bail!("objective revision changed while applying decision");
+        }
+
+        if decision.status == ObjectiveStatus::Cancelled {
+            let cancelled_run = sqlx::query(
+                "UPDATE delivery_runs
+                 SET status='cancelled', next_action=NULL, next_action_authorized=0,
+                     wait_class=NULL, failure_signature=NULL, failure_code=NULL,
+                     failure_class=NULL, remediation_id=NULL,
+                     business_decision_key=NULL, decision_options_json=NULL,
+                     recommended_option=NULL, safe_default_action=NULL,
+                     decision_reason=NULL, core_input_request_key=NULL,
+                     core_inputs_json=NULL, core_input_attempts_json=NULL,
+                     core_input_resume_stage=NULL, core_input_request_count=0,
+                     lease_owner=NULL, lease_expires_at=NULL,
+                     last_progress_at=?, progress_revision=progress_revision+1,
+                     updated_at=?
+                 WHERE objective_id=?
+                   AND id=(SELECT delivery_run_id FROM objectives WHERE id=?)
+                   AND status NOT IN ('completed','failed','cancelled','rejected')
+                 RETURNING id, stage",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(&decision.objective_id)
+            .bind(&decision.objective_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(run) = cancelled_run {
+                let run_id: String = run.try_get("id")?;
+                let stage: String = run.try_get("stage")?;
+                sqlx::query(
+                    "INSERT INTO delivery_run_events
+                     (id, run_id, event_kind, stage, status, wait_class,
+                      detail_json, process_instance, created_at)
+                     VALUES (?, ?, 'objective_cancelled', ?, 'cancelled', NULL, ?, ?, ?)",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(run_id)
+                .bind(stage)
+                .bind(
+                    serde_json::json!({
+                        "objective_id": decision.objective_id,
+                        "objective_revision": decision.revision,
+                        "cancellation_provenance": decision.cancellation_provenance,
+                    })
+                    .to_string(),
+                )
+                .bind(&process_instance)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        if let Some(candidate) = &delivery_run_to_complete {
+            let completed_rows = if candidate.already_terminal {
+                let exact_terminal: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM delivery_runs
+                     WHERE id=? AND objective_id=? AND status='completed'
+                       AND stage=? AND claim_epoch=?
+                       AND reconciled_claim_epoch=claim_epoch
+                       AND repo_identity=? AND worktree_identity=?
+                       AND expected_head_sha=? AND change_set_digest=?
+                       AND requested_ceiling=? AND reached_ceiling=?
+                       AND canonical_pr_number=? AND canonical_pr_url=?
+                       AND canonical_head_sha=expected_head_sha
+                       AND next_action_authorized=0
+                       AND lease_owner IS NULL AND lease_expires_at IS NULL",
+                )
+                .bind(&candidate.run_id)
+                .bind(&decision.objective_id)
+                .bind(&candidate.stage)
+                .bind(candidate.claim_epoch)
+                .bind(&candidate.repo_identity)
+                .bind(&candidate.worktree_identity)
+                .bind(&candidate.expected_head_sha)
+                .bind(&candidate.change_set_digest)
+                .bind(&candidate.requested_ceiling)
+                .bind(&candidate.reached_ceiling)
+                .bind(candidate.canonical_pr_number)
+                .bind(&candidate.canonical_pr_url)
+                .fetch_one(&mut *tx)
+                .await?;
+                exact_terminal
+            } else {
+                sqlx::query(
+                    "UPDATE delivery_runs
+                 SET status='completed', next_action=NULL, next_action_authorized=0,
+                     wait_class=NULL, failure_signature=NULL, failure_code=NULL,
+                     failure_class=NULL, remediation_id=NULL,
+                     business_decision_key=NULL, decision_options_json=NULL,
+                     recommended_option=NULL, safe_default_action=NULL,
+                     decision_reason=NULL, core_input_request_key=NULL,
+                     core_inputs_json=NULL, core_input_attempts_json=NULL,
+                     core_input_resume_stage=NULL, core_input_request_count=0,
+                     lease_owner=NULL, lease_expires_at=NULL,
+                     last_progress_at=?, progress_revision=progress_revision+1,
+                     updated_at=?
+                 WHERE id=? AND objective_id=?
+                   AND run_kind='deliver_changes'
+                   AND status='awaiting_completion_arbitration'
+                   AND stage=? AND claim_epoch=?
+                   AND reconciled_claim_epoch=claim_epoch
+                   AND repo_identity=? AND worktree_identity=?
+                   AND expected_head_sha=? AND change_set_digest=?
+                   AND requested_ceiling=? AND reached_ceiling=?
+                   AND canonical_pr_number=? AND canonical_pr_url=?
+                   AND canonical_head_sha=expected_head_sha
+                   AND next_action_authorized=1
+                   AND (? IS NULL OR (lease_owner=? AND lease_expires_at>?))
+                   AND COALESCE(next_action, '')=''
+                   AND COALESCE(failure_signature, '')=''
+                   AND COALESCE(wait_class, 'none')='none'
+                   AND EXISTS (
+                     SELECT 1 FROM objectives AS objective
+                     WHERE objective.id=delivery_runs.objective_id
+                       AND objective.delivery_run_id=delivery_runs.id
+                   )
+                   AND EXISTS (
+                     SELECT 1 FROM objective_bindings AS binding
+                     WHERE binding.id=?
+                       AND binding.objective_id=delivery_runs.objective_id
+                       AND binding.resource_generation=?
+                       AND (
+                         (binding.resource_kind='chat_root_turn'
+                          AND delivery_runs.root_turn_id=binding.resource_id)
+                         OR
+                         (binding.resource_kind='task_run'
+                          AND delivery_runs.task_id=binding.resource_id)
+                       )
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM delivery_mutation_intents AS intent
+                     WHERE intent.run_id=delivery_runs.id
+                       AND intent.status IN ('started','unknown')
+                   )",
+                )
+                .bind(now)
+                .bind(now)
+                .bind(&candidate.run_id)
+                .bind(&decision.objective_id)
+                .bind(&candidate.stage)
+                .bind(candidate.claim_epoch)
+                .bind(&candidate.repo_identity)
+                .bind(&candidate.worktree_identity)
+                .bind(&candidate.expected_head_sha)
+                .bind(&candidate.change_set_digest)
+                .bind(&candidate.requested_ceiling)
+                .bind(&candidate.reached_ceiling)
+                .bind(candidate.canonical_pr_number)
+                .bind(&candidate.canonical_pr_url)
+                .bind(&candidate.takeover_lease_owner)
+                .bind(&candidate.takeover_lease_owner)
+                .bind(now)
+                .bind(&candidate.binding_id)
+                .bind(candidate.resource_generation)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected() as i64
+            };
+            if completed_rows != 1 {
+                bail!("DeliveryRun completion proof changed during Objective arbitration");
+            }
+            if !candidate.already_terminal {
+                sqlx::query(
+                    "INSERT INTO delivery_run_events
+                 (id, run_id, event_kind, stage, status, wait_class,
+                  detail_json, process_instance, created_at)
+                 VALUES (?, ?, 'objective_completed', ?, 'completed', ?, ?, ?, ?)",
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&candidate.run_id)
+                .bind(&candidate.stage)
+                .bind(Option::<String>::None)
+                .bind(
+                    serde_json::json!({
+                        "objective_id": decision.objective_id,
+                        "objective_revision": decision.revision,
+                        "binding_id": authoritative_binding_id,
+                        "action_signature": candidate.action_signature,
+                        "reconciliation_receipt_id": candidate.reconciliation_receipt_id,
+                    })
+                    .to_string(),
+                )
+                .bind(&process_instance)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
 
         if let Some(evidence) = &decision.evidence {
@@ -2159,6 +3101,7 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         ("task_runs", "next_observation_at", "INTEGER"),
         ("task_attempts", "objective_id", "TEXT"),
         ("tool_calls", "objective_id", "TEXT"),
+        ("tool_calls", "binding_id", "TEXT"),
         ("tool_calls", "action_signature", "TEXT"),
         (
             "tool_calls",
@@ -2185,7 +3128,8 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         ),
         (
             "tool_calls",
-            "CREATE INDEX IF NOT EXISTS idx_tool_calls_objective ON tool_calls(objective_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tool_calls_objective_binding
+             ON tool_calls(objective_id, binding_id, resource_generation)",
         ),
     ] {
         if table_exists(pool, table).await? {
@@ -2401,7 +3345,9 @@ mod tests {
             "CREATE TABLE tool_calls (
                id TEXT PRIMARY KEY,
                objective_id TEXT,
+               tool_name TEXT NOT NULL,
                status TEXT NOT NULL,
+               binding_id TEXT,
                action_signature TEXT,
                resource_generation INTEGER NOT NULL
              )",
@@ -2455,11 +3401,13 @@ mod tests {
             .unwrap();
         sqlx::query(
             "INSERT INTO tool_calls
-             (id, objective_id, status, action_signature, resource_generation)
-             VALUES (?, ?, 'done', ?, 2)",
+             (id, objective_id, tool_name, status, binding_id,
+              action_signature, resource_generation)
+             VALUES (?, ?, 'bash', 'done', ?, ?, 2)",
         )
         .bind(format!("tool-{test_id}"))
         .bind(&objective.id)
+        .bind(&current_binding_id)
         .bind(CURRENT_ACTION_SIGNATURE)
         .execute(&pool)
         .await
@@ -2878,6 +3826,1081 @@ mod tests {
                 .unwrap();
             assert_eq!(completed.status, ObjectiveStatus::Completed, "{status}");
         }
+    }
+
+    async fn persist_delivery_completion_candidate(
+        fixture: &GenericReceiptCompletionFixture,
+        run_id: &str,
+        reached_ceiling: &str,
+    ) {
+        crate::agent::delivery_run::ensure_schema(&fixture.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tool_calls SET tool_name='deliver_changes' WHERE objective_id=?")
+            .bind(&fixture.objective.id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        let process = crate::agent::delivery_run::ProcessIdentity::new(
+            format!("process-{run_id}"),
+            "test",
+            "test",
+        );
+        let run = crate::agent::delivery_run::NewDeliveryRun {
+            id: run_id.into(),
+            objective_id: fixture.objective.id.clone(),
+            run_kind: "deliver_changes".into(),
+            session_id: fixture.objective.session_id.clone(),
+            root_turn_id: fixture.objective.root_turn_id.clone(),
+            task_segment_id: None,
+            task_id: None,
+            workspace_path: format!("/tmp/{run_id}"),
+            worktree_identity: format!("worktree-{run_id}"),
+            repo_identity: format!("repo-{run_id}"),
+            base_branch: "main".into(),
+            head_branch: format!("codex/{run_id}"),
+            change_set_digest: format!("sha256:change-set-{run_id}"),
+            expected_head_sha: format!("head-{run_id}"),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "preflight".into(),
+            status: "running".into(),
+            wait_class: None,
+            next_action: Some("deliver".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        let claim_epoch = crate::agent::delivery_run::create_delivery_run(
+            &fixture.pool,
+            &run,
+            &process,
+            fixture.now,
+            90_000,
+        )
+        .await
+        .unwrap();
+        let pointer: String =
+            sqlx::query_scalar("SELECT delivery_run_id FROM objectives WHERE id=?")
+                .bind(&fixture.objective.id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert_eq!(pointer, run_id);
+        crate::agent::delivery_run::record_delivery_observation(
+            &fixture.pool,
+            run_id,
+            &process,
+            claim_epoch,
+            &crate::agent::delivery_run::DeliveryObservation {
+                head_branch: run.head_branch,
+                stage: "complete".into(),
+                status: "awaiting_completion_arbitration".into(),
+                wait_class: Some("none".into()),
+                next_action: None,
+                reached_ceiling: reached_ceiling.into(),
+                expected_head_sha: run.expected_head_sha.clone(),
+                canonical_pr_number: Some(42),
+                canonical_pr_url: Some("https://example.invalid/pull/42".into()),
+                canonical_head_sha: Some(run.expected_head_sha),
+                failure_signature: None,
+                core_input: None,
+                identity_revision: None,
+            },
+            fixture.now + 1,
+            90_000,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn receipt_backed_delivery_completion_atomically_completes_run_and_objective() {
+        let fixture = generic_receipt_completion_fixture("delivery-ledger-bridge").await;
+        persist_delivery_completion_candidate(
+            &fixture,
+            "delivery-ledger-bridge-run",
+            "live_verified",
+        )
+        .await;
+
+        let completed = fixture
+            .store
+            .apply_decision(fixture.objective.revision, completion_decision(&fixture))
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ObjectiveStatus::Completed);
+        let run_status: String = sqlx::query_scalar(
+            "SELECT status FROM delivery_runs WHERE id='delivery-ledger-bridge-run'",
+        )
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(run_status, "completed");
+        let terminal_projection: (
+            i64,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT next_action_authorized, lease_owner, lease_expires_at,
+                        wait_class, failure_signature
+                 FROM delivery_runs WHERE id='delivery-ledger-bridge-run'",
+        )
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(terminal_projection, (0, None, None, None, None));
+        let receipt: (String, String) = sqlx::query_as(
+            "SELECT status, summary_json FROM side_effect_receipts
+             WHERE objective_id=? AND binding_id=?
+               AND action_fingerprint=?",
+        )
+        .bind(&fixture.objective.id)
+        .bind(&fixture.current_binding_id)
+        .bind(CURRENT_ACTION_SIGNATURE)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt.0, "reconciled");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&receipt.1).unwrap()["delivery_run_id"],
+            "delivery-ledger-bridge-run"
+        );
+        let completion_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_run_events
+             WHERE run_id='delivery-ledger-bridge-run'
+               AND event_kind='objective_completed' AND status='completed'",
+        )
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(completion_events, 1);
+    }
+
+    async fn crash_left_delivery_fixture(
+        test_id: &str,
+        kind: ObjectiveKind,
+    ) -> GenericReceiptCompletionFixture {
+        let fixture = generic_receipt_completion_fixture(test_id).await;
+        sqlx::query("ALTER TABLE tool_calls ADD COLUMN message_id TEXT")
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE tool_calls ADD COLUMN result TEXT")
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE tool_calls ADD COLUMN error TEXT")
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE tool_calls ADD COLUMN duration_ms INTEGER")
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               role TEXT NOT NULL,
+               content TEXT NOT NULL,
+               created_at INTEGER NOT NULL
+             )",
+        )
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE objectives
+             SET kind=?, domain='delivery', requested_acceptance=?
+             WHERE id=?",
+        )
+        .bind(kind.as_str())
+        .bind(if kind == ObjectiveKind::Live {
+            "live_verification"
+        } else {
+            "delivery_receipt"
+        })
+        .bind(&fixture.objective.id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        persist_delivery_completion_candidate(&fixture, &format!("{test_id}-run"), "live_verified")
+            .await;
+        let assistant_message_id = format!("assistant-{test_id}");
+        sqlx::query(
+            "INSERT INTO messages(id, session_id, role, content, created_at)
+             VALUES (?, ?, 'assistant', '', ?)",
+        )
+        .bind(&assistant_message_id)
+        .bind(fixture.objective.session_id.as_deref().unwrap())
+        .bind(fixture.now)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE tool_calls
+             SET id=?, message_id=?, status='pending'
+             WHERE objective_id=?",
+        )
+        .bind(format!(
+            "{}:provider-delivery-before-crash",
+            fixture.objective.session_id.as_deref().unwrap()
+        ))
+        .bind(&assistant_message_id)
+        .bind(&fixture.objective.id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_calls
+             (id, message_id, objective_id, tool_name, status, binding_id,
+              action_signature, resource_generation)
+             VALUES (?, ?, ?, 'deliver_changes', 'pending', ?, ?, 2)",
+        )
+        .bind(format!(
+            "{}:provider-delivery-after-reprompt",
+            fixture.objective.session_id.as_deref().unwrap()
+        ))
+        .bind(&assistant_message_id)
+        .bind(&fixture.objective.id)
+        .bind(&fixture.current_binding_id)
+        .bind(CURRENT_ACTION_SIGNATURE)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+        // The authoritative DeliveryRun pointer, not these legacy latches,
+        // decides whether the completion bridge is mandatory.
+        sqlx::query("UPDATE objectives SET side_effect_started=0 WHERE id=?")
+            .bind(&fixture.objective.id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objective_bindings SET side_effect_started=0 WHERE objective_id=?")
+            .bind(&fixture.objective.id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        fixture
+    }
+
+    #[tokio::test]
+    async fn takeover_terminalizes_crash_left_delivery_and_provider_replay_atomically() {
+        let fixture =
+            crash_left_delivery_fixture("delivery-crash-convergence", ObjectiveKind::Delivery)
+                .await;
+        let run_id = "delivery-crash-convergence-run";
+        let claim_epoch: i64 =
+            sqlx::query_scalar("SELECT claim_epoch FROM delivery_runs WHERE id=?")
+                .bind(run_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+
+        let completed = fixture
+            .store
+            .settle_reconciled_delivery_after_takeover(
+                run_id,
+                claim_epoch,
+                &format!("process-{run_id}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ObjectiveStatus::Completed);
+        let projection: (String, String, i64, i64) = sqlx::query_as(
+            "SELECT objective.status, run.status,
+                    run.next_action_authorized, run.autonomous_completion
+             FROM objectives objective
+             JOIN delivery_runs run ON run.id=objective.delivery_run_id
+             WHERE objective.id=?",
+        )
+        .bind(&fixture.objective.id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(projection, ("completed".into(), "completed".into(), 0, 1));
+        let calls: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT status, result, error FROM tool_calls
+             WHERE objective_id=? ORDER BY id",
+        )
+        .bind(&fixture.objective.id)
+        .fetch_all(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|(status, result, error)| {
+            status == "done"
+                && result
+                    .as_deref()
+                    .is_some_and(|value| value.contains(run_id))
+                && error.is_none()
+        }));
+        let replay_messages: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages
+             WHERE role='tool' AND content LIKE '%provider-delivery-%'
+               AND content LIKE '%done%'",
+        )
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(replay_messages, 2);
+        let receipt_evidence: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_evidence
+             WHERE objective_id=? AND kind='delivery_receipt'",
+        )
+        .bind(&fixture.objective.id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt_evidence, 1);
+
+        let revision = completed.revision;
+        let events_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM delivery_run_events WHERE run_id=?")
+                .bind(run_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        let replay_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='tool'")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        let idempotent = fixture
+            .store
+            .settle_reconciled_delivery_after_takeover(
+                run_id,
+                claim_epoch,
+                &format!("process-{run_id}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(idempotent.revision, revision);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM delivery_run_events WHERE run_id=?")
+                .bind(run_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            events_before
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='tool'")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            replay_before
+        );
+    }
+
+    #[tokio::test]
+    async fn live_takeover_keeps_system_ownership_until_real_live_verification() {
+        let fixture =
+            crash_left_delivery_fixture("live-crash-convergence", ObjectiveKind::Live).await;
+        let run_id = "live-crash-convergence-run";
+        let claim_epoch: i64 =
+            sqlx::query_scalar("SELECT claim_epoch FROM delivery_runs WHERE id=?")
+                .bind(run_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+
+        let waiting = fixture
+            .store
+            .settle_reconciled_delivery_after_takeover(
+                run_id,
+                claim_epoch,
+                &format!("process-{run_id}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(waiting.status, ObjectiveStatus::WaitingSystem);
+        assert!(!waiting.requires_user_action);
+        assert_eq!(
+            waiting.recovery_owner.as_deref(),
+            Some("objective-supervisor:chat")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM delivery_runs WHERE id=?")
+                .bind(run_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            "completed"
+        );
+        let evidence_kinds: Vec<String> = sqlx::query_scalar(
+            "SELECT kind FROM objective_evidence WHERE objective_id=? ORDER BY kind",
+        )
+        .bind(&fixture.objective.id)
+        .fetch_all(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(evidence_kinds, vec!["delivery_receipt"]);
+
+        let live_evidence = ObjectiveEvidence {
+            id: "live-observation-after-delivery".into(),
+            kind: EvidenceKind::LiveVerification,
+            scope: fixture.objective.root_turn_id.clone().unwrap(),
+            digest: "sha256:real-live-observation".into(),
+            evidence_ref: "live-observer:exact-public-artifact".into(),
+            observed_at: fixture.now + 10,
+            reached_acceptance: "live_verification".into(),
+        };
+        let decision = fixture
+            .store
+            .completion_decision_with_persisted_evidence(&waiting, vec![live_evidence])
+            .await
+            .unwrap();
+        let completed = fixture
+            .store
+            .apply_decision(waiting.revision, decision)
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ObjectiveStatus::Completed);
+        let delivery_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_run_events
+             WHERE run_id=? AND event_kind='objective_completed'",
+        )
+        .bind(run_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(delivery_events, 1, "later Live settlement is idempotent");
+    }
+
+    #[tokio::test]
+    async fn takeover_delivery_completion_fails_closed_on_identity_or_authority_drift() {
+        for (suffix, mutation, expected_error) in [
+            ("wrong-binding", "wrong_binding", "current binding"),
+            ("multi-action", "multi_action", "stable action signature"),
+            ("stale-epoch", "stale_epoch", "claim epoch"),
+            (
+                "unresolved-intent",
+                "unresolved_intent",
+                "unresolved mutation intent",
+            ),
+            ("below-ceiling", "below_ceiling", "requested ceiling"),
+            ("flags-zero", "flags_zero", "autonomous completion"),
+        ] {
+            let fixture = crash_left_delivery_fixture(
+                &format!("delivery-crash-negative-{suffix}"),
+                ObjectiveKind::Delivery,
+            )
+            .await;
+            let run_id = format!("delivery-crash-negative-{suffix}-run");
+            let mut claim_epoch: i64 =
+                sqlx::query_scalar("SELECT claim_epoch FROM delivery_runs WHERE id=?")
+                    .bind(&run_id)
+                    .fetch_one(&fixture.pool)
+                    .await
+                    .unwrap();
+            match mutation {
+                "wrong_binding" => {
+                    sqlx::query("UPDATE tool_calls SET binding_id=? WHERE objective_id=?")
+                        .bind(&fixture.old_binding_id)
+                        .bind(&fixture.objective.id)
+                        .execute(&fixture.pool)
+                        .await
+                        .unwrap();
+                }
+                "multi_action" => {
+                    sqlx::query(
+                        "UPDATE tool_calls SET action_signature='sha256:second-action'
+                         WHERE id LIKE '%after-reprompt'",
+                    )
+                    .execute(&fixture.pool)
+                    .await
+                    .unwrap();
+                }
+                "stale_epoch" => claim_epoch += 1,
+                "unresolved_intent" => {
+                    sqlx::query(
+                        "INSERT INTO delivery_mutation_intents
+                         (intent_id, run_id, claim_epoch, rung, operation_key, status,
+                          process_instance, started_at, updated_at)
+                         VALUES (?, ?, ?, 'provider_release_trigger', 'release:key',
+                                 'unknown', 'crashed-process', ?, ?)",
+                    )
+                    .bind(format!("intent-{suffix}"))
+                    .bind(&run_id)
+                    .bind(claim_epoch)
+                    .bind(fixture.now)
+                    .bind(fixture.now)
+                    .execute(&fixture.pool)
+                    .await
+                    .unwrap();
+                }
+                "below_ceiling" => {
+                    sqlx::query("UPDATE delivery_runs SET reached_ceiling='merged' WHERE id=?")
+                        .bind(&run_id)
+                        .execute(&fixture.pool)
+                        .await
+                        .unwrap();
+                }
+                "flags_zero" => {
+                    sqlx::query(
+                        "UPDATE delivery_runs
+                         SET next_action_authorized=0, autonomous_completion=0 WHERE id=?",
+                    )
+                    .bind(&run_id)
+                    .execute(&fixture.pool)
+                    .await
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let error = fixture
+                .store
+                .settle_reconciled_delivery_after_takeover(
+                    &run_id,
+                    claim_epoch,
+                    &format!("process-{run_id}"),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected_error), "{suffix}: {error}");
+            let state: (String, String) = sqlx::query_as(
+                "SELECT objective.status, run.status
+                 FROM objectives objective
+                 JOIN delivery_runs run ON run.id=objective.delivery_run_id
+                 WHERE objective.id=?",
+            )
+            .bind(&fixture.objective.id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                state,
+                ("active".into(), "awaiting_completion_arbitration".into()),
+                "{suffix}"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM side_effect_receipts WHERE objective_id=?"
+                )
+                .bind(&fixture.objective.id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+                0,
+                "{suffix}"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM tool_calls
+                     WHERE objective_id=? AND status='pending'"
+                )
+                .bind(&fixture.objective.id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+                2,
+                "{suffix}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn takeover_refuses_to_hide_an_unrelated_pending_tool_call_and_rolls_back() {
+        let fixture = crash_left_delivery_fixture(
+            "delivery-crash-unrelated-pending",
+            ObjectiveKind::Delivery,
+        )
+        .await;
+        let run_id = "delivery-crash-unrelated-pending-run";
+        let claim_epoch: i64 =
+            sqlx::query_scalar("SELECT claim_epoch FROM delivery_runs WHERE id=?")
+                .bind(run_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_calls
+             (id, message_id, objective_id, tool_name, status, binding_id,
+              action_signature, resource_generation)
+             VALUES (?, ?, ?, 'bash', 'pending', ?, 'sha256:unrelated-action', 2)",
+        )
+        .bind(format!(
+            "{}:provider-unrelated-before-crash",
+            fixture.objective.session_id.as_deref().unwrap()
+        ))
+        .bind("assistant-delivery-crash-unrelated-pending")
+        .bind(&fixture.objective.id)
+        .bind(&fixture.current_binding_id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+        let error = fixture
+            .store
+            .settle_reconciled_delivery_after_takeover(
+                run_id,
+                claim_epoch,
+                &format!("process-{run_id}"),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unresolved tool call"), "{error}");
+        let state: (String, String, i64, i64) = sqlx::query_as(
+            "SELECT objective.status, run.status,
+                    (SELECT COUNT(*) FROM tool_calls
+                     WHERE objective_id=objective.id AND status='pending'),
+                    (SELECT COUNT(*) FROM side_effect_receipts
+                     WHERE objective_id=objective.id)
+             FROM objectives objective
+             JOIN delivery_runs run ON run.id=objective.delivery_run_id
+             WHERE objective.id=?",
+        )
+        .bind(&fixture.objective.id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            state,
+            (
+                "active".into(),
+                "awaiting_completion_arbitration".into(),
+                3,
+                0,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn takeover_requires_the_exact_live_delivery_lease_owner() {
+        let fixture =
+            crash_left_delivery_fixture("delivery-crash-lease-fence", ObjectiveKind::Delivery)
+                .await;
+        let run_id = "delivery-crash-lease-fence-run";
+        let claim_epoch: i64 =
+            sqlx::query_scalar("SELECT claim_epoch FROM delivery_runs WHERE id=?")
+                .bind(run_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        let wrong_owner = fixture
+            .store
+            .settle_reconciled_delivery_after_takeover(run_id, claim_epoch, "replacement-owner")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            wrong_owner.contains("lease expired or changed"),
+            "{wrong_owner}"
+        );
+        sqlx::query("UPDATE delivery_runs SET lease_expires_at=0 WHERE id=?")
+            .bind(run_id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        let expired = fixture
+            .store
+            .settle_reconciled_delivery_after_takeover(
+                run_id,
+                claim_epoch,
+                &format!("process-{run_id}"),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(expired.contains("lease expired or changed"), "{expired}");
+        let state: (String, String, i64) = sqlx::query_as(
+            "SELECT objective.status, run.status,
+                    (SELECT COUNT(*) FROM side_effect_receipts
+                     WHERE objective_id=objective.id)
+             FROM objectives objective
+             JOIN delivery_runs run ON run.id=objective.delivery_run_id
+             WHERE objective.id=?",
+        )
+        .bind(&fixture.objective.id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            state,
+            ("active".into(), "awaiting_completion_arbitration".into(), 0)
+        );
+    }
+
+    async fn assert_delivery_completion_refused_and_rolled_back(
+        fixture: &GenericReceiptCompletionFixture,
+        run_id: &str,
+        error_fragment: &str,
+    ) {
+        let error = fixture
+            .store
+            .apply_decision(fixture.objective.revision, completion_decision(fixture))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(error_fragment), "unexpected error: {error}");
+        let objective_status: String =
+            sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
+                .bind(&fixture.objective.id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert_eq!(objective_status, "active");
+        let run_status: String = sqlx::query_scalar("SELECT status FROM delivery_runs WHERE id=?")
+            .bind(run_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_status, "awaiting_completion_arbitration");
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM side_effect_receipts
+             WHERE objective_id=? AND action_fingerprint=?",
+        )
+        .bind(&fixture.objective.id)
+        .bind(CURRENT_ACTION_SIGNATURE)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(receipts, 0, "failed arbitration must roll back its receipt");
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_run_events
+             WHERE run_id=? AND event_kind='objective_completed'",
+        )
+        .bind(run_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 0, "failed arbitration must roll back its event");
+    }
+
+    #[tokio::test]
+    async fn delivery_completion_rejects_missing_authoritative_run_pointer() {
+        let fixture = generic_receipt_completion_fixture("delivery-pointer-missing").await;
+        let run_id = "delivery-pointer-missing-run";
+        persist_delivery_completion_candidate(&fixture, run_id, "live_verified").await;
+        sqlx::query("UPDATE objectives SET delivery_run_id=NULL WHERE id=?")
+            .bind(&fixture.objective.id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+
+        assert_delivery_completion_refused_and_rolled_back(
+            &fixture,
+            run_id,
+            "exactly one pointed receipt-backed DeliveryRun",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delivery_completion_rejects_non_done_or_multiple_current_actions() {
+        let fixture = generic_receipt_completion_fixture("delivery-action-not-done").await;
+        let run_id = "delivery-action-not-done-run";
+        persist_delivery_completion_candidate(&fixture, run_id, "live_verified").await;
+        sqlx::query("UPDATE tool_calls SET status='waiting' WHERE objective_id=?")
+            .bind(&fixture.objective.id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        assert_delivery_completion_refused_and_rolled_back(
+            &fixture,
+            run_id,
+            "no completed current action",
+        )
+        .await;
+
+        let fixture = generic_receipt_completion_fixture("delivery-action-ambiguous").await;
+        let run_id = "delivery-action-ambiguous-run";
+        persist_delivery_completion_candidate(&fixture, run_id, "live_verified").await;
+        sqlx::query(
+            "INSERT INTO tool_calls
+             (id, objective_id, tool_name, status, binding_id,
+              action_signature, resource_generation)
+             VALUES ('tool-delivery-action-ambiguous-2', ?, 'deliver_changes',
+                     'done', ?, 'sha256:second-delivery-action', 2)",
+        )
+        .bind(&fixture.objective.id)
+        .bind(&fixture.current_binding_id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        assert_delivery_completion_refused_and_rolled_back(
+            &fixture,
+            run_id,
+            "one stable action signature",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delivery_completion_rejects_stale_epoch_or_unresolved_mutation_intent() {
+        let fixture = generic_receipt_completion_fixture("delivery-stale-epoch").await;
+        let run_id = "delivery-stale-epoch-run";
+        persist_delivery_completion_candidate(&fixture, run_id, "live_verified").await;
+        sqlx::query("UPDATE delivery_runs SET reconciled_claim_epoch=0 WHERE id=?")
+            .bind(run_id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        assert_delivery_completion_refused_and_rolled_back(
+            &fixture,
+            run_id,
+            "exactly one pointed receipt-backed DeliveryRun",
+        )
+        .await;
+
+        let fixture = generic_receipt_completion_fixture("delivery-intent-unknown").await;
+        let run_id = "delivery-intent-unknown-run";
+        persist_delivery_completion_candidate(&fixture, run_id, "live_verified").await;
+        sqlx::query(
+            "INSERT INTO delivery_mutation_intents
+             (intent_id, run_id, claim_epoch, rung, operation_key, status,
+              process_instance, started_at, updated_at)
+             VALUES ('intent-delivery-unknown', ?, 1, 'release', 'release:1',
+                     'unknown', 'process-test', ?, ?)",
+        )
+        .bind(run_id)
+        .bind(fixture.now)
+        .bind(fixture.now)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        assert_delivery_completion_refused_and_rolled_back(
+            &fixture,
+            run_id,
+            "exactly one pointed receipt-backed DeliveryRun",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delivery_completion_rejects_below_ceiling_or_wrong_canonical_head() {
+        let fixture = generic_receipt_completion_fixture("delivery-below-ceiling").await;
+        let run_id = "delivery-below-ceiling-run";
+        persist_delivery_completion_candidate(&fixture, run_id, "merged").await;
+        assert_delivery_completion_refused_and_rolled_back(
+            &fixture,
+            run_id,
+            "exactly one pointed receipt-backed DeliveryRun",
+        )
+        .await;
+
+        let fixture = generic_receipt_completion_fixture("delivery-wrong-head").await;
+        let run_id = "delivery-wrong-head-run";
+        persist_delivery_completion_candidate(&fixture, run_id, "live_verified").await;
+        sqlx::query("UPDATE delivery_runs SET canonical_head_sha='other-head' WHERE id=?")
+            .bind(run_id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        assert_delivery_completion_refused_and_rolled_back(
+            &fixture,
+            run_id,
+            "exactly one pointed receipt-backed DeliveryRun",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn valid_delivery_cannot_hide_an_unreceipted_generic_side_effect() {
+        let fixture = generic_receipt_completion_fixture("delivery-plus-generic").await;
+        let run_id = "delivery-plus-generic-run";
+        persist_delivery_completion_candidate(&fixture, run_id, "live_verified").await;
+        sqlx::query(
+            "INSERT INTO tool_calls
+             (id, objective_id, tool_name, status, binding_id,
+              action_signature, resource_generation)
+             VALUES ('tool-delivery-plus-generic-2', ?, 'bash', 'done',
+                     ?, 'sha256:unreceipted-generic-action', 2)",
+        )
+        .bind(&fixture.objective.id)
+        .bind(&fixture.current_binding_id)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+        assert_delivery_completion_refused_and_rolled_back(
+            &fixture,
+            run_id,
+            "lacking a matching committed receipt",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pointed_delivery_run_cannot_be_bypassed_by_only_generic_receipts() {
+        let fixture = generic_receipt_completion_fixture("pointed-delivery-bypass").await;
+        let run_id = "pointed-delivery-bypass-run";
+        persist_delivery_completion_candidate(&fixture, run_id, "live_verified").await;
+        sqlx::query("UPDATE tool_calls SET tool_name='bash' WHERE objective_id=?")
+            .bind(&fixture.objective.id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        insert_generic_receipt(
+            &fixture,
+            "receipt-pointed-delivery-bypass",
+            &fixture.objective.id,
+            &fixture.current_binding_id,
+            CURRENT_ACTION_SIGNATURE,
+            "committed",
+        )
+        .await;
+
+        let error = fixture
+            .store
+            .apply_decision(fixture.objective.revision, completion_decision(&fixture))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pointed DeliveryRun"), "{error}");
+        let state: (String, String) = sqlx::query_as(
+            "SELECT objective.status, run.status
+             FROM objectives objective
+             JOIN delivery_runs run ON run.id=objective.delivery_run_id
+             WHERE objective.id=?",
+        )
+        .bind(&fixture.objective.id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            state,
+            ("active".into(), "awaiting_completion_arbitration".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_cancel_atomically_fences_pointed_delivery_from_recovery() {
+        let fixture = generic_receipt_completion_fixture("cancel-pointed-delivery").await;
+        let run_id = "cancel-pointed-delivery-run";
+        persist_delivery_completion_candidate(&fixture, run_id, "live_verified").await;
+        sqlx::query("UPDATE delivery_runs SET lease_expires_at=? WHERE id=?")
+            .bind(fixture.now - 1)
+            .bind(run_id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        let cancelled = DecisionRouter::route(
+            &fixture.objective,
+            RouteSignal::Cancelled {
+                domain: RecoveryDomain::Delivery,
+                provenance: "explicit_cancel".into(),
+            },
+        )
+        .unwrap();
+        let objective = fixture
+            .store
+            .apply_decision(fixture.objective.revision, cancelled)
+            .await
+            .unwrap();
+        assert_eq!(objective.status, ObjectiveStatus::Cancelled);
+        let run_projection: (String, i64, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT status, next_action_authorized, lease_owner, lease_expires_at
+             FROM delivery_runs WHERE id=?",
+        )
+        .bind(run_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(run_projection, ("cancelled".into(), 0, None, None));
+        let recovery = crate::agent::delivery_run::plan_startup_recovery(
+            &fixture.pool,
+            &crate::agent::delivery_run::ProcessIdentity::new(
+                "process-after-explicit-cancel",
+                "test",
+                "test",
+            ),
+            fixture.now + 2,
+            90_000,
+        )
+        .await
+        .unwrap();
+        assert!(recovery.claimed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_attributes_actions_to_exact_binding_not_same_numbered_generation() {
+        let fixture = generic_receipt_completion_fixture("exact-binding-attribution").await;
+        let old_binding_id = "binding-exact-old-root";
+        let current_binding_id = "binding-exact-current-root";
+        sqlx::query("DELETE FROM tool_calls WHERE objective_id=?")
+            .bind(&fixture.objective.id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM objective_bindings WHERE objective_id=?")
+            .bind(&fixture.objective.id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, side_effect_started,
+              created_at, updated_at)
+             VALUES
+               (?, ?, 'tool', 'chat_root_turn', 'turn-exact-old-root',
+                1, 'sha256:binding-exact-old-root', 1, ?, ?),
+               (?, ?, 'tool', 'chat_root_turn', 'turn-exact-current-root',
+                1, 'sha256:binding-exact-current-root', 1, ?, ?)",
+        )
+        .bind(old_binding_id)
+        .bind(&fixture.objective.id)
+        .bind(fixture.now)
+        .bind(fixture.now)
+        .bind(current_binding_id)
+        .bind(&fixture.objective.id)
+        .bind(fixture.now + 100)
+        .bind(fixture.now + 100)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_calls
+             (id, objective_id, tool_name, status, binding_id,
+              action_signature, resource_generation)
+             VALUES
+               ('tool-exact-old-root', ?, 'bash', 'done', ?,
+                'sha256:old-root-action', 1),
+               ('tool-exact-current-root', ?, 'bash', 'done', ?, ?, 1)",
+        )
+        .bind(&fixture.objective.id)
+        .bind(old_binding_id)
+        .bind(&fixture.objective.id)
+        .bind(current_binding_id)
+        .bind(CURRENT_ACTION_SIGNATURE)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        insert_generic_receipt(
+            &fixture,
+            "receipt-exact-current-root",
+            &fixture.objective.id,
+            current_binding_id,
+            CURRENT_ACTION_SIGNATURE,
+            "committed",
+        )
+        .await;
+
+        let completed = fixture
+            .store
+            .apply_decision(fixture.objective.revision, completion_decision(&fixture))
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ObjectiveStatus::Completed);
+        let old_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM side_effect_receipts
+             WHERE binding_id=? AND action_fingerprint='sha256:old-root-action'",
+        )
+        .bind(old_binding_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(old_receipts, 0);
     }
 
     #[tokio::test]

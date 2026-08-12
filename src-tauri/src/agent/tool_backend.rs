@@ -374,17 +374,20 @@ impl DesktopToolBackend {
         let trace_id = crate::trajectory::trace_record_id(trajectory_session_id, &call.id);
         let attributed = sqlx::query(
             "UPDATE tool_calls
-             SET objective_id=?, action_signature=?, resource_generation=?
+             SET objective_id=?, binding_id=?, action_signature=?, resource_generation=?
              WHERE id=?
                AND (objective_id IS NULL OR objective_id=?)
+               AND (binding_id IS NULL OR binding_id=?)
                AND (action_signature IS NULL OR action_signature=?)
                AND (resource_generation IS NULL OR resource_generation=?)",
         )
         .bind(&objective_id)
+        .bind(&binding_id)
         .bind(&action_fingerprint)
         .bind(resource_generation)
         .bind(&trace_id)
         .bind(&objective_id)
+        .bind(&binding_id)
         .bind(&action_fingerprint)
         .bind(resource_generation)
         .execute(&mut *tx)
@@ -846,6 +849,7 @@ mod tests {
                  duration_ms INTEGER,
                  created_at INTEGER NOT NULL,
                  objective_id TEXT,
+                 binding_id TEXT,
                  action_signature TEXT,
                  resource_generation INTEGER
              );",
@@ -1357,26 +1361,28 @@ mod tests {
             .expect("the permitted mutation itself is not fatal");
         assert!(!out.is_error, "mutation output: {}", out.content);
 
-        let attribution: (Option<String>, Option<String>, Option<i64>) = sqlx::query_as(
-            "SELECT objective_id, action_signature, resource_generation
+        let attribution: (Option<String>, Option<String>, Option<String>, Option<i64>) =
+            sqlx::query_as(
+                "SELECT objective_id, binding_id, action_signature, resource_generation
              FROM tool_calls WHERE id=?",
-        )
-        .bind(crate::trajectory::trace_record_id(
-            TEST_SESSION_ID,
-            &tool_call.id,
-        ))
-        .fetch_one(&backend.db)
-        .await
-        .unwrap();
+            )
+            .bind(crate::trajectory::trace_record_id(
+                TEST_SESSION_ID,
+                &tool_call.id,
+            ))
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
         assert_eq!(attribution.0.as_deref(), Some(TEST_OBJECTIVE_ID));
+        assert_eq!(attribution.1.as_deref(), Some(TEST_BINDING_ID));
         assert!(
             attribution
-                .1
+                .2
                 .as_deref()
                 .is_some_and(|signature| signature.starts_with("sha256:")),
             "a mutation must carry a canonical, opaque action signature"
         );
-        assert_eq!(attribution.2, Some(1));
+        assert_eq!(attribution.3, Some(1));
 
         let receipt: (String, String, String) = sqlx::query_as(
             "SELECT objective_id, status, action_fingerprint
@@ -1387,7 +1393,7 @@ mod tests {
         .expect("a receipt must be durable before success is returned");
         assert_eq!(receipt.0, TEST_OBJECTIVE_ID);
         assert_eq!(receipt.1, "committed");
-        assert_eq!(Some(receipt.2.as_str()), attribution.1.as_deref());
+        assert_eq!(Some(receipt.2.as_str()), attribution.2.as_deref());
     }
 
     #[tokio::test]

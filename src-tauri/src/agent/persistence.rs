@@ -1373,4 +1373,213 @@ mod tests {
             .unwrap();
         assert_eq!(attempts, 0);
     }
+
+    #[tokio::test]
+    async fn forced_reprompt_preserves_one_opaque_objective_across_four_projections() {
+        use crate::agent::delivery_run::{
+            self, DeliveryIdentityRevision, DeliveryObservation, NewDeliveryRun, ProcessIdentity,
+        };
+        use crate::agent::objective::{ObjectiveKind, ObjectiveStore};
+
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&db).await.unwrap();
+        // Match the production startup order: sqlx versions the additive
+        // migrations, then both recovery stores idempotently install their
+        // compatibility projections for historical databases.
+        crate::agent::objective::ensure_schema(&db).await.unwrap();
+        delivery_run::ensure_schema(&db).await.unwrap();
+        sqlx::query(
+            "INSERT INTO sessions(id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('session-objective-chain', 'test', '/workspace', 'model', 1, 1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_task_segments
+             (id, session_id, ordinal, title, status, goal_root_turn_id,
+              previous_segment_id, created_at, updated_at)
+             VALUES
+             ('segment-original', 'session-objective-chain', 1, 'original', 'active',
+              'turn-original', NULL, 1, 1),
+             ('segment-reprompt', 'session-objective-chain', 2, 'reprompt', 'active',
+              'turn-reprompt', 'segment-original', 2, 2)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, task_segment_id, revision, phase, status,
+              recovery_attempt, started_at, updated_at)
+             VALUES
+             ('turn-original', 'session-objective-chain', 'segment-original', 1,
+              'executing', 'active', 0, 1, 1),
+             ('turn-reprompt', 'session-objective-chain', 'segment-reprompt', 1,
+              'executing', 'active', 0, 2, 2)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let store = ObjectiveStore::new(db.clone());
+        let original = store
+            .ensure_chat_objective(
+                "session-objective-chain",
+                "turn-original",
+                ObjectiveKind::Delivery,
+                "through_release",
+            )
+            .await
+            .unwrap();
+        assert!(!original.id.starts_with("chat:"));
+        assert!(!original.id.starts_with("chat-turn:"));
+        assert!(!original.id.starts_with("task:"));
+        let continued = store
+            .ensure_or_continue_chat_objective(
+                "session-objective-chain",
+                "turn-reprompt",
+                Some("turn-original"),
+                ObjectiveKind::Delivery,
+                "through_release",
+            )
+            .await
+            .unwrap();
+        assert_eq!(continued.id, original.id);
+
+        let persistence = SqlitePersistence {
+            db: db.clone(),
+            session_id: "session-objective-chain".into(),
+            anonymous: false,
+        };
+        persistence
+            .record_recovery_attempt(&RecoveryAttemptRow {
+                root_turn_id: "turn-reprompt".into(),
+                domain: "provider".into(),
+                attempt_index: 1,
+                failure_code: "PROVIDER_OVERLOADED".into(),
+                failure_class: "transient_provider".into(),
+                output_started: false,
+                side_effect_started: false,
+                terminal_decision: "continue".into(),
+            })
+            .await
+            .unwrap();
+
+        let process = ProcessIdentity::new("process-chain", "1.79.2", "17902");
+        let run = NewDeliveryRun {
+            id: "delivery-chain-run".into(),
+            objective_id: original.id.clone(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session-objective-chain".into()),
+            root_turn_id: Some("turn-reprompt".into()),
+            task_segment_id: Some("segment-reprompt".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:chain".into(),
+            repo_identity: "repo:chain".into(),
+            base_branch: "main".into(),
+            head_branch: "feature/chain".into(),
+            change_set_digest: "digest-before".into(),
+            expected_head_sha: "aaa".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "delivery".into(),
+            status: "waiting".into(),
+            wait_class: Some("wait_retryable".into()),
+            next_action: Some("continue".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        let now = Utc::now().timestamp_millis();
+        let epoch = delivery_run::create_delivery_run(&db, &run, &process, now, 60_000)
+            .await
+            .unwrap();
+        let mut revision = DeliveryIdentityRevision {
+            receipt_id: String::new(),
+            objective_id: original.id.clone(),
+            repo_identity: run.repo_identity.clone(),
+            worktree_identity: run.worktree_identity.clone(),
+            previous_expected_head_sha: "aaa".into(),
+            previous_change_set_digest: "digest-before".into(),
+            next_expected_head_sha: "bbb".into(),
+            next_change_set_digest: "digest-after".into(),
+        };
+        revision.receipt_id =
+            delivery_run::delivery_identity_revision_receipt_id(&run.id, &revision);
+        delivery_run::record_delivery_observation(
+            &db,
+            &run.id,
+            &process,
+            epoch,
+            &DeliveryObservation {
+                head_branch: run.head_branch.clone(),
+                stage: "push".into(),
+                status: "waiting".into(),
+                wait_class: Some("wait_retryable".into()),
+                next_action: Some("observe_ci".into()),
+                reached_ceiling: "pushed".into(),
+                expected_head_sha: "bbb".into(),
+                canonical_pr_number: None,
+                canonical_pr_url: None,
+                canonical_head_sha: None,
+                failure_signature: None,
+                core_input: None,
+                identity_revision: Some(revision),
+            },
+            now + 1,
+            60_000,
+        )
+        .await
+        .unwrap();
+
+        let projection: (i64, i64, String, String) = sqlx::query_as(
+            "WITH identity_projection(objective_id) AS (
+               SELECT objective_id FROM chat_turn_state
+                WHERE root_turn_id IN ('turn-original','turn-reprompt')
+               UNION ALL
+               SELECT objective_id FROM objective_recovery_attempts
+                WHERE root_turn_id='turn-reprompt'
+               UNION ALL
+               SELECT objective_id FROM delivery_runs
+                WHERE root_turn_id='turn-reprompt'
+               UNION ALL
+               SELECT objective_id FROM delivery_identity_revisions
+                WHERE run_id='delivery-chain-run'
+             )
+             SELECT COUNT(*), COUNT(DISTINCT objective_id),
+                    MIN(objective_id), MAX(objective_id)
+             FROM identity_projection",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(projection.0, 5);
+        assert_eq!(projection.1, 1);
+        assert_eq!(projection.2, original.id);
+        assert_eq!(projection.3, original.id);
+        let objective_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objectives")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let run_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM delivery_runs WHERE objective_id=?")
+                .bind(&continued.id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        let receipt_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM delivery_identity_revisions")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!((objective_count, run_count, receipt_count), (1, 1, 1));
+    }
 }
