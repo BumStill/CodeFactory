@@ -22,6 +22,7 @@ const UNHANDLED_REOBSERVE_MS: i64 = 15_000;
 enum AdapterExecutor {
     Chat,
     Context,
+    Tool,
     Task,
     Permission,
     Provider,
@@ -34,6 +35,7 @@ enum AdapterExecutor {
 enum AdapterCapability {
     ChatResume,
     ContextResume,
+    ToolResume,
     TaskResume,
     PermissionResume,
     ProviderResume,
@@ -113,6 +115,18 @@ impl ObjectiveDomainAdapter for RegisteredDomainAdapter {
             }
             AdapterCapability::ContextResume => {
                 DomainObservation::IdentityIncomplete("context_identity_incomplete")
+            }
+            AdapterCapability::ToolResume
+                if claim.objective.session_id.is_some()
+                    && (claim.objective.root_turn_id.is_some()
+                        || claim.objective.task_id.is_some())
+                    && claim.binding_id.is_some()
+                    && claim.resource_generation.is_some() =>
+            {
+                DomainObservation::Ready(AdapterExecutor::Tool)
+            }
+            AdapterCapability::ToolResume => {
+                DomainObservation::IdentityIncomplete("tool_identity_incomplete")
             }
             AdapterCapability::TaskResume
                 if claim.objective.session_id.is_some() && claim.objective.task_id.is_some() =>
@@ -260,7 +274,7 @@ static DOMAIN_ADAPTERS: [RegisteredDomainAdapter; 12] = [
     },
     RegisteredDomainAdapter {
         domain: RecoveryDomain::Tool,
-        capability: AdapterCapability::ObserveOnly,
+        capability: AdapterCapability::ToolResume,
     },
     RegisteredDomainAdapter {
         domain: RecoveryDomain::Permission,
@@ -602,6 +616,16 @@ async fn process_claim(
                                 )
                                 .await
                             }
+                            AdapterExecutor::Tool => {
+                                resume_tool_objective(
+                                    app,
+                                    pool,
+                                    execution_claim,
+                                    objective,
+                                    execution_permit,
+                                )
+                                .await
+                            }
                             AdapterExecutor::Task => {
                                 crate::commands::tasks::resume_task_objective(
                                     app,
@@ -692,6 +716,52 @@ async fn process_claim(
                 "remediation was advanced before defer"
             );
         }
+    }
+}
+
+/// Reconcile the exact durable Tool side effect before creating another model
+/// run.  The store may grant one same-receipt retry, settle a changed resource
+/// for replanning, or prove that the prior failure happened before any receipt.
+/// It never guesses from the domain or falls back to Chat identity alone.
+async fn resume_tool_objective(
+    app: AppHandle,
+    pool: SqlitePool,
+    claim: ClaimedRemediation,
+    objective: super::objective::ObjectiveSnapshot,
+    permit: codefactory_agent_loop::tool::MutationPermit,
+) -> Result<(), crate::errors::AppError> {
+    use super::tool_recovery::ToolRecoveryDisposition;
+
+    let disposition = super::tool_recovery::ToolRecoveryStore::new(pool.clone())
+        .reconcile_claimed(&claim, &permit)
+        .await
+        .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+    match disposition {
+        ToolRecoveryDisposition::RetryExact
+        | ToolRecoveryDisposition::ReplanCurrentState
+        | ToolRecoveryDisposition::ResumeWithoutReceipt => {
+            if !super::objective::ObjectiveStore::new(pool)
+                .claim_is_current(&permit)
+                .await
+                .map_err(|error| crate::errors::AppError::Other(error.to_string()))?
+            {
+                return Err(crate::errors::AppError::Other(
+                    "Tool recovery claim changed before resume".into(),
+                ));
+            }
+            if objective.task_id.is_some() {
+                crate::commands::tasks::resume_task_objective(app, objective, permit).await
+            } else if objective.root_turn_id.is_some() {
+                crate::commands::chat::resume_chat_objective(app, objective, permit).await
+            } else {
+                Err(crate::errors::AppError::Other(
+                    "Tool recovery objective has no exact Chat or Task cursor".into(),
+                ))
+            }
+        }
+        ToolRecoveryDisposition::ObserveOnly => Err(crate::errors::AppError::Other(
+            "Tool recovery evidence remains externally uncertain".into(),
+        )),
     }
 }
 
@@ -957,6 +1027,7 @@ mod tests {
             objective,
             remediation_id: "remediation-adapter".into(),
             domain,
+            failure_code: "platform_incident".into(),
             claim_epoch: 1,
             binding_id: None,
             resource_generation: None,
@@ -1812,6 +1883,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tool_recovery_is_executable_only_with_exact_objective_binding_identity() {
+        assert!(domain_has_executable_adapter(RecoveryDomain::Tool));
+        let mut objective = ObjectiveSnapshot::new(
+            "objective-tool-adapter",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Tool,
+            "validated_change",
+        );
+        objective.session_id = Some("session-tool-adapter".into());
+        objective.root_turn_id = Some("turn-tool-adapter".into());
+        let adapter = DEFAULT_ADAPTER_REGISTRY
+            .adapter_for(RecoveryDomain::Tool)
+            .unwrap();
+
+        let incomplete = claim_for(RecoveryDomain::Tool, objective);
+        assert!(matches!(
+            adapter.reconcile(adapter.observe(&incomplete)).action,
+            ReconciledAction::ReobserveOnly(_)
+        ));
+
+        let mut complete = incomplete;
+        complete.binding_id = Some("binding-tool-adapter".into());
+        complete.resource_generation = Some(1);
+        assert_eq!(
+            adapter.reconcile(adapter.observe(&complete)),
+            ReconciledPlan {
+                action: ReconciledAction::Execute(AdapterExecutor::Tool)
+            }
+        );
+        assert_ne!(
+            adapter.capability,
+            AdapterCapability::ChatResume,
+            "Tool recovery must reconcile the exact durable receipt before Chat/Task resume",
+        );
+    }
+
     #[tokio::test]
     async fn missing_domain_capability_stays_system_owned_and_reobserves_without_cta() {
         let pool = SqlitePoolOptions::new()
@@ -2661,7 +2769,7 @@ mod tests {
             .await
             .unwrap();
         let claim = store
-            .claim_due_remediations("short-heartbeat-owner", 1, 400)
+            .claim_due_remediations("short-heartbeat-owner", 1, 2_000)
             .await
             .unwrap()
             .pop()
@@ -2675,12 +2783,12 @@ mod tests {
             &store,
             &claim,
             "short-heartbeat-owner",
-            400,
-            Duration::from_millis(50),
+            2_000,
+            Duration::from_millis(100),
             async move {
                 // Cross more than two original TTLs. Without the adapter being
                 // awaited by the heartbeat owner, this claim is necessarily stale.
-                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                tokio::time::sleep(Duration::from_millis(4_500)).await;
                 assert!(adapter_store.claim_is_current(&permit).await.unwrap());
                 let retry = DecisionRouter::route(
                     &adapter_objective,

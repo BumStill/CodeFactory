@@ -393,7 +393,7 @@ pub async fn execute_edit(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             return Ok(ToolOutput::err(format!("mkdir failed: {e}")));
         }
     }
-    if let Err(e) = std::fs::write(&out_path, &bytes) {
+    if let Err(e) = super::file_lock::atomic_write(&out_path, &bytes).await {
         return Ok(ToolOutput::err(format!("write failed: {e}")));
     }
 
@@ -835,7 +835,7 @@ pub async fn execute_format(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             return Ok(ToolOutput::err(format!("mkdir failed: {e}")));
         }
     }
-    if let Err(e) = std::fs::write(&out_path, &bytes) {
+    if let Err(e) = super::file_lock::atomic_write(&out_path, &bytes).await {
         return Ok(ToolOutput::err(format!("write failed: {e}")));
     }
 

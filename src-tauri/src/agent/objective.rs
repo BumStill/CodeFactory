@@ -811,7 +811,10 @@ pub fn decision_for_run_outcome_with_reason(
                 RecoveryDomain::Browser,
             )
         }
-        StopReason::PlatformIncident => ("platform_incident", RecoveryDomain::Tool),
+        StopReason::PlatformIncident => (
+            terminal_reason.unwrap_or("platform_incident"),
+            RecoveryDomain::Tool,
+        ),
         StopReason::FailedInternal => ("failed_internal", RecoveryDomain::Chat),
         StopReason::BudgetExhausted => ("run_budget_exhausted", RecoveryDomain::Chat),
         StopReason::IterationCeiling => ("iteration_ceiling", RecoveryDomain::Chat),
@@ -832,7 +835,10 @@ pub fn decision_for_run_outcome_with_reason(
                 terminal_reason.unwrap_or("none")
             ),
             next_observation_at: Utc::now().timestamp_millis() + 5_000,
-            resume_cursor: if matches!(domain, RecoveryDomain::Context | RecoveryDomain::Browser) {
+            resume_cursor: if matches!(
+                domain,
+                RecoveryDomain::Context | RecoveryDomain::Browser | RecoveryDomain::Tool
+            ) {
                 objective
                     .resume_cursor
                     .clone()
@@ -911,6 +917,7 @@ pub struct ClaimedRemediation {
     pub objective: ObjectiveSnapshot,
     pub remediation_id: String,
     pub domain: RecoveryDomain,
+    pub failure_code: String,
     /// Monotonic claim generation. Owner strings are process-scoped and can
     /// reclaim the same row after expiry; the epoch is what fences an older
     /// future owned by that same process.
@@ -1722,16 +1729,17 @@ impl ObjectiveStore {
                 tx.rollback().await?;
                 continue;
             }
-            let (claim_epoch, binding_id): (i64, Option<String>) = sqlx::query_as(
-                "SELECT attempt_index, binding_id FROM objective_remediations
+            let (claim_epoch, binding_id, failure_code): (i64, Option<String>, String) =
+                sqlx::query_as(
+                    "SELECT attempt_index, binding_id, failure_code FROM objective_remediations
                  WHERE id=? AND objective_id=? AND status='claimed'
                    AND lease_owner=?",
-            )
-            .bind(&remediation_id)
-            .bind(&objective_id)
-            .bind(owner)
-            .fetch_one(&mut *tx)
-            .await?;
+                )
+                .bind(&remediation_id)
+                .bind(&objective_id)
+                .bind(owner)
+                .fetch_one(&mut *tx)
+                .await?;
             let resource_generation = if let Some(binding_id) = binding_id.as_deref() {
                 Some(
                     sqlx::query_scalar::<_, i64>(
@@ -1752,6 +1760,7 @@ impl ObjectiveStore {
                     objective,
                     remediation_id,
                     domain,
+                    failure_code,
                     claim_epoch,
                     binding_id,
                     resource_generation,
@@ -2958,10 +2967,21 @@ impl ObjectiveStore {
                        AND NULLIF(TRIM(tool.action_signature), '') IS NOT NULL
                        AND NOT EXISTS (
                            SELECT 1 FROM side_effect_receipts AS receipt
+                           LEFT JOIN tool_recovery_call_links exact_link
+                             ON exact_link.receipt_id=receipt.id
                            WHERE receipt.objective_id=tool.objective_id
                              AND receipt.binding_id=?
-                             AND receipt.action_fingerprint=tool.action_signature
                              AND receipt.status IN ('committed','reconciled')
+                             AND (
+                               exact_link.tool_call_id=tool.id
+                               OR (
+                                 NOT EXISTS (
+                                   SELECT 1 FROM tool_recovery_call_links own_link
+                                   WHERE own_link.tool_call_id=tool.id
+                                 )
+                                 AND receipt.action_fingerprint=tool.action_signature
+                               )
+                             )
                        )",
                 )
                 .bind(&decision.objective_id)
@@ -3404,6 +3424,11 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     .await?;
     sqlx::raw_sql(include_str!(
         "../../migrations/0014_browser_recovery_contracts.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0015_tool_recovery_contracts.sql"
     ))
     .execute(pool)
     .await?;
@@ -6363,6 +6388,40 @@ mod tests {
             .request_key
             .as_deref()
             .is_some_and(|key| key.starts_with("browser-pairing:")));
+    }
+
+    #[test]
+    fn typed_tool_transport_outcomes_preserve_the_exact_recovery_reason() {
+        let mut objective = ObjectiveSnapshot::new(
+            "objective-tool-interruption",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Chat,
+            "validated_change",
+        );
+        objective.root_turn_id = Some("turn-tool-anchor".into());
+        objective.resume_cursor = Some("turn-tool-active".into());
+        let outcome = RunOutcome {
+            final_text: String::new(),
+            completion_evidence: CompletionEvidence::default(),
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: StopReason::PlatformIncident,
+        };
+
+        for reason in [
+            "external_state_uncertain",
+            "tool_observation_conflict",
+            "tool_observation_contract_missing",
+            "mutation_permit_lost",
+        ] {
+            let decision =
+                decision_for_run_outcome_with_reason(&objective, &outcome, Some(reason)).unwrap();
+            assert_eq!(decision.domain, RecoveryDomain::Tool);
+            assert_eq!(decision.status, ObjectiveStatus::WaitingSystem);
+            assert_eq!(decision.failure_code.as_deref(), Some(reason));
+            assert_eq!(decision.resume_cursor.as_deref(), Some("turn-tool-active"));
+            assert!(!decision.requires_user_action);
+        }
     }
 
     #[tokio::test]

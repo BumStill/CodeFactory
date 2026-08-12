@@ -286,7 +286,16 @@ pub async fn execute_edit(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         }
     }
 
-    if let Err(e) = book.save(&path) {
+    let bytes = match book.save_to_buffer() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Ok(ToolOutput::err(format!(
+                "序列化 {} 失败: {e}",
+                path.display()
+            )))
+        }
+    };
+    if let Err(e) = super::file_lock::atomic_write(&path, &bytes).await {
         return Ok(ToolOutput::err(format!("保存 {} 失败: {e}", path.display())));
     }
     let cells = parsed

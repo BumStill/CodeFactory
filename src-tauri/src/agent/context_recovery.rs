@@ -526,6 +526,7 @@ mod tests {
             objective,
             remediation_id: "remediation-context".into(),
             domain: RecoveryDomain::Context,
+            failure_code: "context_overflow_after_compaction".into(),
             claim_epoch: 1,
             binding_id: Some("binding-context".into()),
             resource_generation: Some(3),

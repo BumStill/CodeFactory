@@ -22,6 +22,8 @@ use std::collections::HashSet;
 use std::path::{Component, Path};
 
 use crate::openrouter::types::{ToolCall, ToolDefinition};
+#[cfg(test)]
+use crate::util::no_window::NoWindow;
 
 enum MutationAdmission {
     Unbound,
@@ -124,44 +126,6 @@ fn bytes_digest(bytes: &[u8]) -> String {
 
 fn absent_file_digest() -> String {
     opaque_digest(&["file_content_sha256_v1", "absent"])
-}
-
-fn bash_has_unobservable_external_mutation(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    let words = lower
-        .split(|character: char| character.is_whitespace() || matches!(character, ';' | '|' | '&'))
-        .map(|word| word.trim_matches(['\'', '"']))
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    let mutating_kubectl = words
-        .iter()
-        .position(|word| *word == "kubectl")
-        .is_some_and(|kubectl| {
-            words[kubectl + 1..].iter().any(|word| {
-                matches!(
-                    *word,
-                    "apply"
-                        | "create"
-                        | "delete"
-                        | "patch"
-                        | "replace"
-                        | "scale"
-                        | "set"
-                        | "annotate"
-                        | "label"
-                        | "taint"
-                        | "exec"
-                        | "cp"
-                        | "restart"
-                        | "undo"
-                )
-            })
-        });
-    let trimmed = lower.trim_end();
-    let background = lower.contains("nohup ")
-        || lower.contains("start-process ")
-        || (trimmed.ends_with('&') && !trimmed.ends_with("&&"));
-    bash_has_explicit_external_mutation(command) || mutating_kubectl || background
 }
 
 fn has_safe_relative_components(path: &Path) -> bool {
@@ -586,8 +550,22 @@ fn browser_observation_plan(
 }
 
 fn waiting_result(command: &str, kind: ToolKind, code: &str) -> ToolInvocationResult {
+    let (content, next_action) = match code {
+        "tool_observation_contract_missing" => (
+            "该外部操作缺少可验证的观察契约，系统未执行；将改用可观察的专用工具或当前状态重新规划。",
+            "replan_observable_tool",
+        ),
+        "mutation_permit_lost" => (
+            "旧执行权已失效，操作未发出；系统将使用当前目标租约继续。",
+            "resume_current_objective",
+        ),
+        _ => (
+            "外部变更未再次发出；系统将核对持久化状态后自动继续。",
+            "observe_only_reconcile",
+        ),
+    };
     ToolInvocationResult {
-        content: "外部变更未再次发出；系统将核对持久化状态后自动继续。".into(),
+        content: content.into(),
         is_error: false,
         status: ToolExecutionStatus::Waiting,
         command: command.to_string(),
@@ -599,7 +577,7 @@ fn waiting_result(command: &str, kind: ToolKind, code: &str) -> ToolInvocationRe
         metadata: Some(serde_json::json!({
             "code": code,
             "recoverable": true,
-            "next_action": "observe_only_reconcile",
+            "next_action": next_action,
             "system_owned": true,
         })),
         next_working_directory: None,
@@ -693,6 +671,11 @@ impl DesktopToolBackend {
         .map_err(|error| ToolError {
             message: format!("ensure browser recovery schema: {error}"),
         })?;
+        super::tool_recovery::ToolRecoveryStore::ensure_schema(&self.db)
+            .await
+            .map_err(|error| ToolError {
+                message: format!("ensure generic tool recovery schema: {error}"),
+            })?;
         Ok(())
     }
 
@@ -713,21 +696,29 @@ impl DesktopToolBackend {
                 "browser_observation_contract_required",
             )));
         }
-        let lacks_external_observer = is_mcp_tool
-            || (call.function.name == "bash"
-                && args
-                    .get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(bash_has_unobservable_external_mutation));
-        if lacks_external_observer {
-            return Ok(MutationAdmission::Waiting(waiting_result(
-                command,
-                kind,
-                "tool_observation_contract_missing",
-            )));
-        }
         let file_observation =
             prepare_file_observation(&call.function.name, args, &ctx.working_directory).await;
+        let generic_observation = if is_mcp_tool {
+            None
+        } else {
+            match super::tool_recovery::ToolRecoveryStore::new(self.db.clone())
+                .prepare(
+                    &call.function.name,
+                    args,
+                    &ctx.working_directory,
+                    ctx.session_id.as_deref(),
+                    ctx.root_turn_id.as_deref(),
+                )
+                .await
+            {
+                Ok(plan) => plan,
+                Err(_) => None,
+            }
+        };
+        let specialized = matches!(
+            call.function.name.as_str(),
+            "browser_session" | "deliver_changes"
+        );
         let resource = if let Some(task_id) = ctx.task_id.as_deref() {
             Some(("task", "task_run", task_id, true))
         } else {
@@ -942,41 +933,19 @@ impl DesktopToolBackend {
             }
         }
 
-        let objective_started = sqlx::query(
-            "UPDATE objectives SET side_effect_started=1
-             WHERE id=? AND revision=?",
-        )
-        .bind(&objective_id)
-        .bind(revision)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| ToolError {
-            message: format!("mark Objective side effect started: {error}"),
-        })?;
-        let binding_started = sqlx::query(
-            "UPDATE objective_bindings SET side_effect_started=1, updated_at=?
-             WHERE id=? AND objective_id=? AND resource_generation=?",
-        )
-        .bind(chrono::Utc::now().timestamp_millis())
-        .bind(&binding_id)
-        .bind(&objective_id)
-        .bind(resource_generation)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| ToolError {
-            message: format!("mark Objective binding side effect started: {error}"),
-        })?;
-        if objective_started.rows_affected() != 1 || binding_started.rows_affected() != 1 {
-            return Err(ToolError {
-                message: "Objective identity changed before mutation dispatch".into(),
-            });
-        }
-
         // DeliveryRun owns its own epoch, mutation rung and revision receipts.
         // Wrapping it in the generic ledger would turn a legitimate durable
         // Waiting result into `unknown` and block its observation loop. It
         // still receives the exact Objective attribution and permit check above.
         if call.function.name == "deliver_changes" {
+            mark_side_effect_started_in_tx(
+                &mut tx,
+                &objective_id,
+                revision,
+                &binding_id,
+                resource_generation,
+            )
+            .await?;
             tx.commit().await.map_err(|error| ToolError {
                 message: format!("commit delivery Objective attribution: {error}"),
             })?;
@@ -1006,6 +975,35 @@ impl DesktopToolBackend {
         })? {
             let existing_receipt_id: String = existing.get("id");
             let status: String = existing.get("status");
+            sqlx::query(
+                "INSERT OR IGNORE INTO tool_recovery_call_links
+                 (receipt_id, tool_call_id, created_at) VALUES (?, ?, ?)",
+            )
+            .bind(&existing_receipt_id)
+            .bind(&trace_id)
+            .bind(chrono::Utc::now().timestamp_millis())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| ToolError {
+                message: format!("link replayed Tool call to durable receipt: {error}"),
+            })?;
+            let exact_link: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM tool_recovery_call_links
+                 WHERE receipt_id=? AND tool_call_id=?",
+            )
+            .bind(&existing_receipt_id)
+            .bind(&trace_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| ToolError {
+                message: format!("verify replayed Tool call link: {error}"),
+            })?;
+            if exact_link != 1 {
+                return Err(ToolError {
+                    message: "provider Tool call identity is already linked to another receipt"
+                        .into(),
+                });
+            }
             if matches!(status.as_str(), "committed" | "reconciled") {
                 let summary_json: Option<String> = existing.get("summary_json");
                 let summary = summary_json
@@ -1263,6 +1261,66 @@ impl DesktopToolBackend {
                         }
                     }
                 }
+                if let Some(contract) = sqlx::query(
+                    "SELECT state, dispatch_claim_epoch
+                     FROM tool_recovery_contracts WHERE receipt_id=?",
+                )
+                .bind(&existing_receipt_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| ToolError {
+                    message: format!("load generic Tool recovery contract: {error}"),
+                })? {
+                    let state: String = contract.get("state");
+                    let dispatch_claim_epoch: i64 = contract.get("dispatch_claim_epoch");
+                    let Some(permit) = ctx.mutation_permit.as_ref() else {
+                        tx.commit().await.map_err(|error| ToolError {
+                            message: format!("commit unowned Tool recovery observation: {error}"),
+                        })?;
+                        return Ok(MutationAdmission::Waiting(waiting_result(
+                            command,
+                            kind,
+                            "external_state_uncertain",
+                        )));
+                    };
+                    if state == "observed_unchanged" && dispatch_claim_epoch == permit.claim_epoch {
+                        let now = chrono::Utc::now().timestamp_millis();
+                        let admitted = sqlx::query(
+                            "UPDATE tool_recovery_contracts
+                             SET state='dispatching', dispatch_generation=dispatch_generation+1,
+                                 dispatch_started_at=?, updated_at=?
+                             WHERE receipt_id=? AND state='observed_unchanged'
+                               AND dispatch_owner=? AND dispatch_claim_epoch=?",
+                        )
+                        .bind(now)
+                        .bind(now)
+                        .bind(&existing_receipt_id)
+                        .bind(&permit.owner)
+                        .bind(permit.claim_epoch)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|error| ToolError {
+                            message: format!("admit exact Tool retry: {error}"),
+                        })?;
+                        if admitted.rows_affected() == 1 {
+                            tx.commit().await.map_err(|error| ToolError {
+                                message: format!("commit exact Tool retry: {error}"),
+                            })?;
+                            return Ok(MutationAdmission::Dispatch {
+                                receipt_id: Some(existing_receipt_id),
+                                browser_execution: None,
+                            });
+                        }
+                    }
+                    tx.commit().await.map_err(|error| ToolError {
+                        message: format!("commit fenced Tool retry: {error}"),
+                    })?;
+                    return Ok(MutationAdmission::Waiting(waiting_result(
+                        command,
+                        kind,
+                        "external_state_uncertain",
+                    )));
+                }
             }
         }
 
@@ -1289,6 +1347,32 @@ impl DesktopToolBackend {
             )));
         }
 
+        // Existing receipts are authoritative even when the original
+        // precondition (for example edit_file.old_text) can no longer be
+        // reconstructed after the effect. Only a genuinely new dispatch must
+        // present an observer before side_effect_started is persisted.
+        if is_mcp_tool
+            || (!specialized && file_observation.is_none() && generic_observation.is_none())
+        {
+            tx.commit().await.map_err(|error| ToolError {
+                message: format!("commit missing Tool observer attribution: {error}"),
+            })?;
+            return Ok(MutationAdmission::Waiting(waiting_result(
+                command,
+                kind,
+                "tool_observation_contract_missing",
+            )));
+        }
+
+        mark_side_effect_started_in_tx(
+            &mut tx,
+            &objective_id,
+            revision,
+            &binding_id,
+            resource_generation,
+        )
+        .await?;
+
         // The primary key is deliberately deterministic. It gives every new
         // writer a database-enforced cross-revision collision even on schemas
         // whose older composite UNIQUE constraint still included `revision`.
@@ -1312,6 +1396,18 @@ impl DesktopToolBackend {
         .await
         .map_err(|error| ToolError {
             message: format!("persist started mutation receipt: {error}"),
+        })?;
+        sqlx::query(
+            "INSERT INTO tool_recovery_call_links (receipt_id, tool_call_id, created_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(&receipt_id)
+        .bind(&trace_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| ToolError {
+            message: format!("persist Tool receipt call link: {error}"),
         })?;
         let browser_execution = if call.function.name == "browser_session" {
             let plan =
@@ -1380,6 +1476,30 @@ impl DesktopToolBackend {
             .map_err(|error| ToolError {
                 message: format!("persist file observation contract: {error}"),
             })?;
+        } else if let Some(observation) = generic_observation {
+            super::tool_recovery::ToolRecoveryStore::create_contract_in_tx(
+                &mut tx,
+                &receipt_id,
+                &objective_id,
+                revision,
+                &binding_id,
+                resource_generation,
+                &action_fingerprint,
+                &trace_id,
+                observation,
+                ctx.mutation_permit
+                    .as_ref()
+                    .map(|permit| permit.owner.as_str()),
+                ctx.mutation_permit
+                    .as_ref()
+                    .map(|permit| permit.claim_epoch)
+                    .unwrap_or(0),
+                now,
+            )
+            .await
+            .map_err(|error| ToolError {
+                message: format!("persist Tool recovery contract: {error}"),
+            })?;
         }
         tx.commit().await.map_err(|error| ToolError {
             message: format!("commit started mutation receipt: {error}"),
@@ -1396,6 +1516,17 @@ impl DesktopToolBackend {
         result: Option<&ToolInvocationResult>,
         ctx: &ToolCtx,
     ) -> Result<(), ToolError> {
+        let succeeded = result
+            .is_some_and(|result| result.status == ToolExecutionStatus::Done && !result.is_error);
+        if super::tool_recovery::ToolRecoveryStore::new(self.db.clone())
+            .settle_foreground(receipt_id, &ctx.working_directory, succeeded)
+            .await
+            .map_err(|error| ToolError {
+                message: format!("settle generic Tool recovery contract: {error}"),
+            })?
+        {
+            return Ok(());
+        }
         let browser_contract: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM browser_recovery_contracts WHERE receipt_id=?",
         )
@@ -1518,6 +1649,43 @@ impl DesktopToolBackend {
     }
 }
 
+async fn mark_side_effect_started_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    objective_id: &str,
+    revision: i64,
+    binding_id: &str,
+    resource_generation: i64,
+) -> Result<(), ToolError> {
+    let objective_started =
+        sqlx::query("UPDATE objectives SET side_effect_started=1 WHERE id=? AND revision=?")
+            .bind(objective_id)
+            .bind(revision)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| ToolError {
+                message: format!("mark Objective side effect started: {error}"),
+            })?;
+    let binding_started = sqlx::query(
+        "UPDATE objective_bindings SET side_effect_started=1, updated_at=?
+         WHERE id=? AND objective_id=? AND resource_generation=?",
+    )
+    .bind(chrono::Utc::now().timestamp_millis())
+    .bind(binding_id)
+    .bind(objective_id)
+    .bind(resource_generation)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| ToolError {
+        message: format!("mark Objective binding side effect started: {error}"),
+    })?;
+    if objective_started.rows_affected() != 1 || binding_started.rows_affected() != 1 {
+        return Err(ToolError {
+            message: "Objective identity changed before mutation dispatch".into(),
+        });
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl ToolBackend for DesktopToolBackend {
     async fn list_schemas(&self) -> Vec<ToolDefinition> {
@@ -1554,8 +1722,12 @@ impl ToolBackend for DesktopToolBackend {
         } else {
             native_kind
         };
-        let requires_receipt =
-            is_mcp_tool || native_requires_mutation_receipt(&call.function.name, args, &kind);
+        let native_tool_known = crate::tools::all_definitions()
+            .iter()
+            .any(|definition| definition.function.name == call.function.name);
+        let requires_receipt = is_mcp_tool
+            || (native_tool_known
+                && native_requires_mutation_receipt(&call.function.name, args, &kind));
         let admission = if requires_receipt {
             self.mutation_preflight(call, args, ctx, &command, kind.clone(), is_mcp_tool)
                 .await?
@@ -1683,7 +1855,22 @@ mod tests {
         .await
         .unwrap();
         sqlx::raw_sql(
-            "CREATE TABLE chat_turn_state (
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY,
+                 cwd TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE TABLE task_runs (
+                 id TEXT PRIMARY KEY,
+                 cwd TEXT NOT NULL
+             );
+             CREATE TABLE chat_turn_state (
                  root_turn_id TEXT PRIMARY KEY,
                  session_id TEXT NOT NULL,
                  objective_id TEXT,
@@ -1711,6 +1898,27 @@ mod tests {
         .unwrap();
 
         let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("INSERT INTO sessions (id, cwd) VALUES (?, '.')")
+            .bind(TEST_SESSION_ID)
+            .execute(&backend.db)
+            .await
+            .unwrap();
+        for (id, role) in [
+            (TEST_ROOT_TURN_ID, "user"),
+            ("assistant-message", "assistant"),
+        ] {
+            sqlx::query(
+                "INSERT INTO messages (id, session_id, role, content, created_at)
+                 VALUES (?, ?, ?, '{}', ?)",
+            )
+            .bind(id)
+            .bind(TEST_SESSION_ID)
+            .bind(role)
+            .bind(now)
+            .execute(&backend.db)
+            .await
+            .unwrap();
+        }
         let status = if waiting_with_foreign_lease {
             "waiting_system"
         } else {
@@ -1921,6 +2129,25 @@ mod tests {
         .unwrap();
     }
 
+    async fn claimed_tool_recovery(
+        backend: &DesktopToolBackend,
+        claim_epoch: i64,
+    ) -> super::super::objective::ClaimedRemediation {
+        super::super::objective::ClaimedRemediation {
+            objective: super::super::objective::ObjectiveStore::new(backend.db.clone())
+                .get(TEST_OBJECTIVE_ID)
+                .await
+                .unwrap()
+                .unwrap(),
+            remediation_id: "remediation-tool-fencing".into(),
+            domain: super::super::objective::RecoveryDomain::Tool,
+            failure_code: "external_state_uncertain".into(),
+            claim_epoch,
+            binding_id: Some(TEST_BINDING_ID.into()),
+            resource_generation: Some(1),
+        }
+    }
+
     async fn assert_objective_bound_call_starts_receipt(
         tool_name: &str,
         call_id: &str,
@@ -2082,13 +2309,498 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skill_fetch_is_fenced_as_a_mutation_and_starts_a_receipt() {
-        assert_objective_bound_call_starts_receipt(
-            "skill_fetch",
-            "skill-fetch-mutation",
-            &serde_json::json!({"name": "workspace-maintenance"}),
+    async fn native_mutation_without_observer_fails_before_receipt_or_dispatch() {
+        let backend = objective_backend(false).await;
+        let args = serde_json::json!({
+            "command": "curl -X POST https://example.invalid/hooks -d secret"
+        });
+        let call = call_with_args("bash-without-observer", "bash", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+
+        let admission = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(std::path::Path::new(".")),
+                &command,
+                kind,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let MutationAdmission::Waiting(outcome) = admission else {
+            panic!("an unobservable native mutation must fail before dispatch");
+        };
+        assert_eq!(outcome.status, ToolExecutionStatus::Waiting);
+        assert_eq!(
+            outcome
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("tool_observation_contract_missing")
+        );
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+        assert_eq!(receipts, 0);
+        let side_effect_started: i64 =
+            sqlx::query_scalar("SELECT side_effect_started FROM objectives WHERE id=?")
+                .bind(TEST_OBJECTIVE_ID)
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(side_effect_started, 0);
+    }
+
+    #[tokio::test]
+    async fn powershell_local_file_mutation_gets_a_workspace_observer() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        sqlx::query("UPDATE sessions SET cwd=? WHERE id=?")
+            .bind(dir.path().to_string_lossy().as_ref())
+            .bind(TEST_SESSION_ID)
+            .execute(&backend.db)
+            .await
+            .unwrap();
+        let args = serde_json::json!({
+            "command": "Add-Content -Path effect.log -Value once"
+        });
+        let call = call_with_args("powershell-local-mutation", "bash", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+        let admission = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(dir.path()),
+                &command,
+                kind,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(admission, MutationAdmission::Dispatch { .. }));
+        let resource_kind: String =
+            sqlx::query_scalar("SELECT resource_kind FROM tool_recovery_contracts")
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(resource_kind, "workspace_file");
+    }
+
+    #[tokio::test]
+    async fn append_retry_contract_rejects_absolute_and_compound_external_commands() {
+        for (call_id, command) in [
+            (
+                "powershell-absolute-append",
+                "Add-Content -Path C:\\Temp\\effect.log -Value once",
+            ),
+            (
+                "powershell-compound-external",
+                "Add-Content -Path effect.log -Value once; Invoke-WebRequest https://example.invalid/hook",
+            ),
+            (
+                "powershell-nested-external",
+                "Add-Content -Path effect.log -Value (Invoke-WebRequest https://example.invalid/hook)",
+            ),
+            (
+                "shell-compound-external",
+                "printf 'once\\n' >> effect.log && curl -X POST https://example.invalid/hook",
+            ),
+            ("shell-parent-escape", "rm ../outside.txt"),
+            ("shell-absolute-path", "rm /tmp/outside.txt"),
+        ] {
+            let backend = objective_backend(false).await;
+            let dir = tempfile::tempdir().unwrap();
+            let args = serde_json::json!({"command": command});
+            let call = call_with_args(call_id, "bash", &args);
+            register_tool_call(&backend, &call, &args).await;
+            let (classified, kind) = backend.classify(&call, &args);
+            let admission = backend
+                .mutation_preflight(
+                    &call,
+                    &args,
+                    &objective_ctx(dir.path()),
+                    &classified,
+                    kind,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(admission, MutationAdmission::Waiting(_)),
+                "{call_id} unexpectedly reached dispatch"
+            );
+            let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+            assert_eq!(receipts, 0, "{call_id} must fail before dispatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_mutation_has_a_redacted_tree_observer_before_dispatch() {
+        let backend = objective_backend(false).await;
+        let args = serde_json::json!({"name": "workspace-maintenance"});
+        let call = call_with_args("skill-create-observed", "skill_create", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+        let admission = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(std::path::Path::new(".")),
+                &command,
+                kind,
+                false,
+            )
+            .await
+            .unwrap();
+        let MutationAdmission::Dispatch {
+            receipt_id: Some(receipt_id),
+            ..
+        } = admission
+        else {
+            panic!("a skill mutation must have a durable observer");
+        };
+        let (kind, locator): (String, String) = sqlx::query_as(
+            "SELECT resource_kind, safe_locator_json FROM tool_recovery_contracts WHERE receipt_id=?",
         )
-        .await;
+        .bind(receipt_id)
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        assert_eq!(kind, "user_skills");
+        assert_eq!(locator, "{}");
+        assert!(!locator.contains("workspace-maintenance"));
+    }
+
+    #[tokio::test]
+    async fn crash_before_generic_dispatch_grants_one_exact_retry_to_the_new_claim() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        sqlx::query("UPDATE sessions SET cwd=? WHERE id=?")
+            .bind(dir.path().to_string_lossy().as_ref())
+            .bind(TEST_SESSION_ID)
+            .execute(&backend.db)
+            .await
+            .unwrap();
+        let args = serde_json::json!({"path": "report.docx", "blocks": []});
+        let call = call_with_args("docx-before-crash", "write_docx", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+        let first = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(dir.path()),
+                &command,
+                kind.clone(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(first, MutationAdmission::Dispatch { .. }));
+
+        claim_file_recovery(&backend, 2).await;
+        let claim = claimed_tool_recovery(&backend, 2).await;
+        let permit = current_permit(2);
+        let recovery = super::super::tool_recovery::ToolRecoveryStore::new(backend.db.clone());
+        assert_eq!(
+            recovery.reconcile_claimed(&claim, &permit).await.unwrap(),
+            super::super::tool_recovery::ToolRecoveryDisposition::RetryExact
+        );
+        assert_eq!(
+            recovery.reconcile_claimed(&claim, &permit).await.unwrap(),
+            super::super::tool_recovery::ToolRecoveryDisposition::RetryExact,
+            "a crash after reconciliation must preserve the same decision"
+        );
+
+        let retry = call_with_args("docx-after-takeover", "write_docx", &args);
+        register_tool_call(&backend, &retry, &args).await;
+        let mut retry_ctx = objective_ctx(dir.path());
+        retry_ctx.mutation_permit = Some(permit);
+        let admitted = backend
+            .mutation_preflight(&retry, &args, &retry_ctx, &command, kind, false)
+            .await
+            .unwrap();
+        assert!(matches!(admitted, MutationAdmission::Dispatch { .. }));
+        let second = backend
+            .mutation_preflight(
+                &retry,
+                &args,
+                &retry_ctx,
+                &command,
+                ToolKind::Mutation,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(second, MutationAdmission::Waiting(_)));
+    }
+
+    #[tokio::test]
+    async fn crash_after_generic_effect_reconciles_and_never_replays_the_old_action() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        sqlx::query("UPDATE sessions SET cwd=? WHERE id=?")
+            .bind(dir.path().to_string_lossy().as_ref())
+            .bind(TEST_SESSION_ID)
+            .execute(&backend.db)
+            .await
+            .unwrap();
+        let args = serde_json::json!({"path": "report.docx", "blocks": []});
+        let call = call_with_args("docx-effect-before-crash", "write_docx", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+        let admission = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(dir.path()),
+                &command,
+                kind,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(admission, MutationAdmission::Dispatch { .. }));
+        std::fs::write(dir.path().join("report.docx"), b"complete-after-crash").unwrap();
+
+        claim_file_recovery(&backend, 2).await;
+        let claim = claimed_tool_recovery(&backend, 2).await;
+        let permit = current_permit(2);
+        let recovery = super::super::tool_recovery::ToolRecoveryStore::new(backend.db.clone());
+        for _ in 0..2 {
+            assert_eq!(
+                recovery.reconcile_claimed(&claim, &permit).await.unwrap(),
+                super::super::tool_recovery::ToolRecoveryDisposition::ReplanCurrentState
+            );
+        }
+        let receipt_status: String =
+            sqlx::query_scalar("SELECT status FROM side_effect_receipts WHERE objective_id=?")
+                .bind(TEST_OBJECTIVE_ID)
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(receipt_status, "reconciled");
+        assert_eq!(
+            std::fs::read(dir.path().join("report.docx")).unwrap(),
+            b"complete-after-crash"
+        );
+        let reconciliations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tool_recovery_reconciliations WHERE remediation_id='remediation-tool-fencing'",
+        )
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        assert_eq!(reconciliations, 1);
+    }
+
+    #[tokio::test]
+    async fn replacement_after_retry_success_adopts_terminal_receipt_without_replay() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        sqlx::query("UPDATE sessions SET cwd=? WHERE id=?")
+            .bind(dir.path().to_string_lossy().as_ref())
+            .bind(TEST_SESSION_ID)
+            .execute(&backend.db)
+            .await
+            .unwrap();
+        let args = serde_json::json!({"path": "report.docx", "blocks": []});
+        let first = call_with_args("docx-first-dispatch", "write_docx", &args);
+        register_tool_call(&backend, &first, &args).await;
+        let (command, kind) = backend.classify(&first, &args);
+        let MutationAdmission::Dispatch {
+            receipt_id: Some(receipt_id),
+            ..
+        } = backend
+            .mutation_preflight(
+                &first,
+                &args,
+                &objective_ctx(dir.path()),
+                &command,
+                kind.clone(),
+                false,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("first dispatch must write its receipt")
+        };
+
+        claim_file_recovery(&backend, 2).await;
+        let claim2 = claimed_tool_recovery(&backend, 2).await;
+        let permit2 = current_permit(2);
+        let recovery = super::super::tool_recovery::ToolRecoveryStore::new(backend.db.clone());
+        assert_eq!(
+            recovery.reconcile_claimed(&claim2, &permit2).await.unwrap(),
+            super::super::tool_recovery::ToolRecoveryDisposition::RetryExact
+        );
+        let retry = call_with_args("docx-exact-retry", "write_docx", &args);
+        register_tool_call(&backend, &retry, &args).await;
+        let mut retry_ctx = objective_ctx(dir.path());
+        retry_ctx.mutation_permit = Some(permit2);
+        assert!(matches!(
+            backend
+                .mutation_preflight(&retry, &args, &retry_ctx, &command, kind, false)
+                .await
+                .unwrap(),
+            MutationAdmission::Dispatch { .. }
+        ));
+        std::fs::write(dir.path().join("report.docx"), b"one-complete-retry").unwrap();
+        assert!(recovery
+            .settle_foreground(&receipt_id, dir.path(), true)
+            .await
+            .unwrap());
+        let settled_statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM tool_calls WHERE id IN (?, ?) ORDER BY id")
+                .bind(crate::trajectory::trace_record_id(
+                    TEST_SESSION_ID,
+                    &first.id,
+                ))
+                .bind(crate::trajectory::trace_record_id(
+                    TEST_SESSION_ID,
+                    &retry.id,
+                ))
+                .fetch_all(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(settled_statuses, vec!["done", "done"]);
+
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE objective_remediations SET attempt_index=3, lease_expires_at=?
+             WHERE id='remediation-tool-fencing'",
+        )
+        .bind(now + 60_000)
+        .execute(&backend.db)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE objectives SET lease_expires_at=? WHERE id=?")
+            .bind(now + 60_000)
+            .bind(TEST_OBJECTIVE_ID)
+            .execute(&backend.db)
+            .await
+            .unwrap();
+        let claim3 = claimed_tool_recovery(&backend, 3).await;
+        assert_eq!(
+            recovery
+                .reconcile_claimed(&claim3, &current_permit(3))
+                .await
+                .unwrap(),
+            super::super::tool_recovery::ToolRecoveryDisposition::ReplanCurrentState
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("report.docx")).unwrap(),
+            b"one-complete-retry"
+        );
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM tool_calls WHERE id IN (?, ?) ORDER BY id")
+                .bind(crate::trajectory::trace_record_id(
+                    TEST_SESSION_ID,
+                    &first.id,
+                ))
+                .bind(crate::trajectory::trace_record_id(
+                    TEST_SESSION_ID,
+                    &retry.id,
+                ))
+                .fetch_all(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(statuses, vec!["done", "done"]);
+    }
+
+    #[tokio::test]
+    async fn workspace_observer_detects_tracked_deletion_and_index_only_changes() {
+        for (call_id, command, prepare, mutate) in [
+            (
+                "bash-remove-tracked",
+                "rm tracked.txt",
+                None,
+                "rm tracked.txt",
+            ),
+            (
+                "bash-stage-only",
+                "git add tracked.txt",
+                Some("changed before staging"),
+                "git add tracked.txt",
+            ),
+        ] {
+            let backend = objective_backend(false).await;
+            let dir = tempfile::tempdir().unwrap();
+            let run = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .no_window()
+                    .args(args)
+                    .current_dir(dir.path())
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "git {:?} failed", args);
+            };
+            run(&["init", "-q"]);
+            std::fs::write(dir.path().join("tracked.txt"), b"original").unwrap();
+            run(&["add", "tracked.txt"]);
+            run(&[
+                "-c",
+                "user.name=CodeFactory Test",
+                "-c",
+                "user.email=codefactory@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ]);
+            if let Some(contents) = prepare {
+                std::fs::write(dir.path().join("tracked.txt"), contents).unwrap();
+            }
+            sqlx::query("UPDATE sessions SET cwd=? WHERE id=?")
+                .bind(dir.path().to_string_lossy().as_ref())
+                .bind(TEST_SESSION_ID)
+                .execute(&backend.db)
+                .await
+                .unwrap();
+            let args = serde_json::json!({"command": command});
+            let call = call_with_args(call_id, "bash", &args);
+            register_tool_call(&backend, &call, &args).await;
+            let (classified, kind) = backend.classify(&call, &args);
+            assert!(matches!(
+                backend
+                    .mutation_preflight(
+                        &call,
+                        &args,
+                        &objective_ctx(dir.path()),
+                        &classified,
+                        kind,
+                        false,
+                    )
+                    .await
+                    .unwrap(),
+                MutationAdmission::Dispatch { .. }
+            ));
+            let effect = std::process::Command::new("sh")
+                .no_window()
+                .args(["-c", mutate])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(effect.status.success());
+
+            claim_file_recovery(&backend, 2).await;
+            let claim = claimed_tool_recovery(&backend, 2).await;
+            assert_eq!(
+                super::super::tool_recovery::ToolRecoveryStore::new(backend.db.clone())
+                    .reconcile_claimed(&claim, &current_permit(2))
+                    .await
+                    .unwrap(),
+                super::super::tool_recovery::ToolRecoveryDisposition::ReplanCurrentState,
+                "{call_id} must be observed as already applied"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2130,13 +2842,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conservative_local_bash_mutation_still_enters_generic_receipt_fence() {
-        assert_objective_bound_call_starts_receipt(
-            "bash",
-            "bash-read-prefix-lookalike",
-            &serde_json::json!({"command": "lsmalware --perform-side-effect"}),
-        )
-        .await;
+    async fn unknown_executable_mutation_fails_closed_without_a_named_observer() {
+        let backend = objective_backend(false).await;
+        let args = serde_json::json!({"command": "lsmalware --perform-side-effect"});
+        let call = call_with_args("bash-read-prefix-lookalike", "bash", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let outcome = backend
+            .execute(&call, &args, &objective_ctx(std::path::Path::new(".")))
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ToolExecutionStatus::Waiting);
+        assert_eq!(
+            outcome
+                .metadata
+                .and_then(|value| value.get("code").cloned()),
+            Some(serde_json::json!("tool_observation_contract_missing"))
+        );
     }
 
     #[tokio::test]
@@ -2635,18 +3356,6 @@ mod tests {
     #[tokio::test]
     async fn waiting_tool_outcome_is_persisted_as_waiting_not_trajectory_error() {
         let backend = objective_backend(false).await;
-        sqlx::query(
-            "CREATE TABLE messages (
-               id TEXT PRIMARY KEY,
-               session_id TEXT NOT NULL,
-               role TEXT NOT NULL,
-               content TEXT NOT NULL,
-               created_at INTEGER NOT NULL
-             )",
-        )
-        .execute(&backend.db)
-        .await
-        .unwrap();
         let args = append_once_args();
         let call = call_with_args("waiting-trajectory", "bash", &args);
         register_tool_call(&backend, &call, &args).await;
