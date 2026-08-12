@@ -106,8 +106,14 @@ pub struct Settings {
     pub remote_postmortem_enabled: bool,
     #[serde(default)]
     pub theme: Theme,
+    /// UI typeface. Monospace is a separate setting: JetBrains Mono used to be
+    /// offered here, but it has no CJK glyphs, so picking it turned a zh-CN
+    /// interface into monospace Latin mixed with proportional Chinese.
     #[serde(default = "default_font_family")]
     pub font_family: String,
+    /// Typeface for code, paths and terminal output.
+    #[serde(default = "default_mono_font_family")]
+    pub mono_font_family: String,
     #[serde(default = "default_font_size")]
     pub font_size: u8,
     /// True once the user has either finished or explicitly skipped the
@@ -440,6 +446,10 @@ fn default_font_family() -> String {
     "inter".into()
 }
 
+fn default_mono_font_family() -> String {
+    "jetbrains-mono".into()
+}
+
 fn default_font_size() -> u8 {
     14
 }
@@ -593,6 +603,7 @@ impl Default for Settings {
             remote_postmortem_enabled: false,
             theme: Theme::Dark,
             font_family: default_font_family(),
+            mono_font_family: default_mono_font_family(),
             font_size: default_font_size(),
             onboarded: false,
             reasoning_effort: ReasoningEffort::Medium,

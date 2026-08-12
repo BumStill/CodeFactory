@@ -91,7 +91,7 @@ Tailwind 的 **字号、间距、圆角、宽高全部是 rem**。`1rem` 等于 
 
 ### 2.3 规范：语义化字号 token
 
-停止在业务代码里写 `text-xs` / `text-[Npx]`。定义 7 档语义 token（默认正文 14px，随用户设置整体位移）：
+停止在业务代码里写 `text-xs` / `text-[Npx]`。定义 8 档语义 token（随用户字号设置整体位移）：
 
 | Token | 字号 / 行高 | 用途 |
 |---|---|---|
@@ -101,8 +101,8 @@ Tailwind 的 **字号、间距、圆角、宽高全部是 rem**。`1rem` 等于 
 | `text-body` | 14 / 22 | 界面正文、列表主文案、表单值、分组小标题 |
 | `text-reading` | 15 / 24 | 会话消息正文（唯一的长文阅读流） |
 | `text-title` | 16 / 24 | 卡片与面板标题 |
-| `text-heading` | 20 / 28 | 页面标题 |
-| `text-display` | 24 / 32 | 欢迎页主标题、大数字指标 |
+| `text-heading` | 18 / 26 | 页面标题 |
+| `text-display` | 22 / 30 | 欢迎页主标题、大数字指标 |
 
 代码不单列 token：等宽字体在同一 px 下视觉比无衬线大，`text-note` 的 13px 配在
 15px 的 `text-reading` 正文旁刚好，一个档位同时满足「代码不缩水」和「代码不喧宾夺主」。
@@ -170,11 +170,20 @@ UI:   Inter, -apple-system, "PingFang SC", "Microsoft YaHei UI", system-ui, sans
 Mono: "JetBrains Mono", "SF Mono", Consolas, Menlo, monospace
 ```
 
-- Inter 与 JetBrains Mono **必须随应用打包**（`.woff2` + `@font-face`，`font-display: swap`），
-  否则从选项里移除，只保留 System UI。桌面应用没有理由让排版依赖用户机器上碰巧装了什么。
+- Inter 与 JetBrains Mono **随应用打包**：`globals.css` 引入
+  `@fontsource-variable/inter/wght.css` 与 `@fontsource-variable/jetbrains-mono/wght.css`
+  （可变字体，仅正体；斜体在本产品只出现在引用块，合成倾斜足够）。
+  产物 12 个 woff2 合计 312KB，浏览器按 `unicode-range` 只取用得上的子集。
+  桌面应用没有理由让排版依赖用户机器上碰巧装了什么。
+- **字体引入写在 `globals.css` 而不是 `main.tsx`**：`src/acceptance/` 下的验收入口
+  各有自己的 entry，不经过 `main.tsx`。放在 entry 里会让验收页渲染出一套没有
+  自带字体的界面——第一版就是这样，实测 `document.fonts` 为空。
 - 中文族显式写进栈里，不依赖 `system-ui` 兜底。
-- 字体设置项的作用域改为 **UI 字体**；等宽字体是独立设置项，只作用于代码与终端。
-- 数字对齐场景（用量、成本、token 计数）加 `font-variant-numeric: tabular-nums`，避免数字跳动。
+- 字体设置拆成两项：**界面字体**（Inter / 系统默认）与**等宽字体**
+  （JetBrains Mono / 系统等宽）。等宽族不再出现在界面字体选项里。
+  旧配置里 `font_family: "jetbrains-mono"` 的用户，界面字体回落到 Inter，
+  等宽字体保留 JetBrains Mono——意图落在它说得通的那个轴上。
+- 数字对齐场景（用量、成本、token 计数）用 `tabular-nums` 工具类，避免数字跳动。
 
 ---
 
@@ -249,8 +258,13 @@ Mono: "JetBrains Mono", "SF Mono", Consolas, Menlo, monospace
 4 (gap-1) · 6 (gap-1.5) · 8 (gap-2) · 12 (gap-3) · 16 (gap-4) · 24 (gap-6) · 32 (gap-8)
 ```
 
-不使用 `gap-2.5`、`px-2.5`、`py-2.5` 等 10px 档——现状里 `px-2.5` 47 处、`py-2.5` 18 处，
-它们是在半像素基准下试图找回视觉平衡的产物，基准修好后应归并到 8 或 12。
+半档（`gap-1.5` = 6px、`px-2.5` = 10px）是**允许**的，Tailwind 原生就有 2.5/3.5。
+
+初审曾判定要删掉 `*-2.5`，理由是它们「在半像素基准下试图找回视觉平衡」——这条**作废**。
+当时 `px-2.5` 渲染成 8.75px 才是问题；rem 基准修好后它就是干净的 10px，
+而本规范自己的控件密度表（`lg` = 16/10）本来就用着 10px。机械收敛只会是无收益的改动。
+
+真正剩下的问题不是某个档位，而是**20 种 `px-* py-*` 组合缺乏密度规范**，见下一节。
 
 ### 5.2 内边距组合
 
@@ -419,13 +433,33 @@ Token 消耗地图的日历格子）无法在不破坏可视化的前提下让�
    趋势图与热力图的宽度按 Essential 例外登记在案。
 3. **圆角**：`rounded-md` 25 处并入 `rounded-lg`；`rounded-2xl` 经复核后保留。
 
-### P3 — 尚未做
+### P3 — 字体与比例尺回调 ✅ 已完成
 
-1. **字体**（需要产品决策，见第三节）：打包 Inter / JetBrains Mono，
-   或移除 Inter 选项只留 System UI；字体栈补中文族；
-   UI 字体与等宽字体设置拆分。
-2. 间距档位收敛（并掉 `px-2.5` / `py-2.5` 等 10px 档）。
-3. 热力图的 `text-[7px]` / `text-[6px]` 状态记号改为图形。
+1. **字体打包**：Inter Variable 与 JetBrains Mono Variable 随应用发布，
+   字体栈补中文族，界面字体与等宽字体拆成两项设置。
+2. **热力图状态记号改为图形**：7px 的 `×`、6px 的 `·`、7px 的 `!` 换成 CSS 图形，
+   字号门禁的亚 11px 豁免名单**已清空**。
+3. **比例尺顶部回调**：`heading` 20→18、`display` 24→22，
+   并把迁移时放大过头的几处拉回（卡片标题 14→13、卡片正文 11→12、
+   分组标题 14→13）。原因见下。
+4. 间距档位收敛**作废**——理由随 rem 基准修复一起消失了，见 5.1。
+
+#### 为什么要回调
+
+第一轮迁移把「等值改名」和「层级修复」混在一起做，结果层级修复用力过猛：
+
+| 位置 | 原渲染 | 第一轮 | 回调后 |
+|---|---|---|---|
+| `text-lg`（h1 级） | 15.75px | 20px (+27%) | 18px |
+| 欢迎页卡片标题 | 10.5px | 14px (+33%) | 13px |
+| 欢迎页卡片正文 | 11px | 11px | 12px |
+| 分组标题 | 11px | 14px (+27%) | 13px |
+
+叠加 rem 修复本身的全局 +14.3%，观感就是「很多地方偏大、大小差距太大」。
+**修倒挂只需要标题 ≥ 正文，不需要标题远大于正文**——把正文抬一档比把标题抬三档好。
+
+回调后欢迎页实际渲染为 11 / 12 / 13 / 18 / 22，主体收在 11–13；
+全产品 1042 处 token 用法里 891 处（85%）落在 11–12px。
 
 ---
 
@@ -445,6 +479,7 @@ Token 消耗地图的日历格子）无法在不破坏可视化的前提下让�
 | `themeBootstrapAudit.test.ts` | `index.html` 首帧带 `data-theme`、无失效 `class="dark"`；`:root` 有变量兜底 |
 | `iconScaleAudit.test.ts` | `size={N}` 只允许 14/16/20/24；`globals.css` 有统一描边规则 |
 | `radiusScaleAudit.test.ts` | 不出现被淘汰的 `rounded-md` / `rounded-sm` / `rounded-3xl` |
+| `fontStackAudit.test.ts` | 字体栈含中文族；被提供的选项确实随应用打包；界面字体不是等宽族 |
 
 真实渲染值只有真浏览器能给，补了两个 headless 脚本（都需先起 dev server）：
 
@@ -465,8 +500,7 @@ Token 消耗地图的日历格子）无法在不破坏可视化的前提下让�
 
 | 测试 | 断言 |
 |---|---|
-| `spacingScaleAudit.test.ts` | 不出现 `*-2.5` 这类 10px 档 |
-| `fontStackAudit.test.ts` | 字体栈含中文族；被提供的字体选项确实随应用打包 |
+| `paddingDensityAudit.test.ts` | 控件 padding 落在 5 种密度预设上（当前 20 种组合，约 350 个按钮，需逐一判断） |
 
 ### 实地验证的边界
 

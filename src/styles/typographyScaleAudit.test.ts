@@ -33,16 +33,13 @@ export const TYPOGRAPHY_TOKENS = [
 ] as const;
 
 /**
- * 允许保留的亚 11px 装饰性文字。
+ * 亚 11px 装饰性文字的豁免名单——目前为空，且应当保持为空。
  *
- * 这些不是给人读的文案，而是画在 7px 热力图格子里的状态记号（缺失 `×`、零值 `·`、
- * 超预算 `!`）。规范要求它们最终改成图形而不是文字，在那之前显式登记在这里，
- * 不允许新增。
+ * 曾经登记过热力图格子里的状态记号（缺失 `×` 7px、零值 `·` 6px、超预算 `!` 7px）。
+ * 它们已经改成 CSS 图形：在那个尺寸下字体已经无话可说，画出来比排出来清楚，
+ * 而状态本身由格子的 aria-label 承载。新增条目前先想想能不能画。
  */
-const DECORATIVE_ALLOWLIST: { file: string; className: string }[] = [
-  { file: "components/TokenUsageHeatmap.tsx", className: "text-[7px]" },
-  { file: "components/TokenUsageHeatmap.tsx", className: "text-[6px]" },
-];
+const DECORATIVE_ALLOWLIST: { file: string; className: string }[] = [];
 
 const RAW_SCALE = /\btext-(xs|sm|base|lg|xl|[2-9]xl)\b/g;
 const ARBITRARY = /\btext-\[[0-9.]+(?:px|rem|em)\]/g;

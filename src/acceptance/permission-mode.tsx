@@ -43,6 +43,7 @@ const settings = {
   auto_create_pr: false,
   theme: "dark" as const,
   font_family: "inter",
+  mono_font_family: "jetbrains-mono",
   font_size: 14,
   reasoning_effort: "medium" as const,
   onboarded: true,
