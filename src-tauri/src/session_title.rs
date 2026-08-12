@@ -311,7 +311,10 @@ pub(crate) fn normalize_generated_title(raw: &str, prompt: &str) -> Option<Strin
 }
 
 fn safe_local_fallback(prompt: &str) -> String {
-    let lower = redact_metadata_text(prompt, MAX_INPUT_CHARS).to_ascii_lowercase();
+    // This fallback only selects from fixed, non-sensitive labels and never
+    // copies prompt text into the title. Classify the local raw prompt so an
+    // aggressively redacted URL/token cannot erase adjacent topic keywords.
+    let lower = prompt.to_ascii_lowercase();
     let title = if (lower.contains("session") || lower.contains("会话"))
         && (lower.contains("标题") || lower.contains("名字") || lower.contains("命名"))
     {
@@ -856,6 +859,12 @@ mod tests {
             "登录问题排查"
         );
         assert_eq!(safe_local_fallback("谈谈今天"), PLACEHOLDER_TITLE);
+        assert_eq!(
+            safe_local_fallback(
+                "排查联系qa@example.com处理https://private.example继续以及AKIAIOSFODNN7EXAMPLE配置导致的登录问题"
+            ),
+            "登录问题排查"
+        );
     }
 
     #[test]
