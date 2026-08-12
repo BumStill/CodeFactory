@@ -73,6 +73,7 @@ const settings: Settings = {
   auto_create_pr: false,
   theme: "dark",
   font_family: "inter",
+  mono_font_family: "jetbrains-mono",
   font_size: 14,
   usage_budget: {
     daily_token_limit: 100_000,

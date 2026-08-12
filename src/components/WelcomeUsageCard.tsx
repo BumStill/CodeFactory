@@ -62,7 +62,7 @@ export function WelcomeUsageCard({ anonymous, onOpenUsage }: Props) {
   return (
     <section role="region" aria-label="今日用量与过去 4 周趋势" className="rounded-xl border border-border bg-surface-1 p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
-        <h2 className="text-body font-medium text-gray-300">今日用量</h2>
+        <h2 className="text-note font-medium text-gray-300">今日用量</h2>
         <button
           type="button"
           aria-label="查看用量详情"

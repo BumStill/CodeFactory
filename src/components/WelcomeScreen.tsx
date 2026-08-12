@@ -153,7 +153,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
 
         {/* Example prompts */}
         <section className="space-y-2" aria-labelledby="welcome-suggestions-title">
-          <h2 id="welcome-suggestions-title" className="px-1 text-body font-semibold text-gray-400">可以试试</h2>
+          <h2 id="welcome-suggestions-title" className="px-1 text-note font-semibold text-gray-400">可以试试</h2>
           <div className="grid grid-cols-1 gap-2 min-[520px]:grid-cols-2">
             {EXAMPLES.map((ex) => (
               <button
@@ -162,13 +162,13 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
                 className="group rounded-lg border border-border bg-surface-1 px-3 py-2.5 text-left transition-colors hover:border-accent/40 hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-accent/50"
               >
                 <div className="flex items-center justify-between gap-2">
-                  <div className="text-body font-medium text-gray-100">{ex.title}</div>
+                  <div className="text-note font-medium text-gray-100">{ex.title}</div>
                   <ArrowRight
                     size={14}
                     className="text-gray-600 group-hover:text-accent transition-colors shrink-0"
                   />
                 </div>
-                <div className="mt-1 line-clamp-2 text-caption leading-relaxed text-gray-400">
+                <div className="mt-1 line-clamp-2 text-label leading-relaxed text-gray-400">
                   {ex.prompt}
                 </div>
               </button>
@@ -180,7 +180,7 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
             says so. Everything above starts something new. */}
         {onOpenSession && (scopedSessions.length > 0 || recentSessions.length > 0) && (
           <div className="space-y-2">
-            <div className="text-body text-gray-600 font-semibold px-1 flex items-center gap-1.5">
+            <div className="text-note text-gray-600 font-semibold px-1 flex items-center gap-1.5">
               <Clock size={14} />
               继续之前的会话
             </div>

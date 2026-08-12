@@ -195,6 +195,7 @@ const settings = {
   default_model: session.model_id,
   theme: "dark",
   font_family: "inter",
+  mono_font_family: "jetbrains-mono",
   font_size: 14,
   permissions: { allow: [], ask: [], deny: [], full_access: false },
   shell: { shell: "/bin/zsh" },

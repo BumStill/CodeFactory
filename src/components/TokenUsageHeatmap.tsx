@@ -162,21 +162,30 @@ export function TokenUsageHeatmap({
                   : `${metricIntensityClass(metricValue, max, metric)} border-transparent`
               } ${selected ? "ring-2 ring-accent ring-offset-1 ring-offset-surface-1" : ""} ${today ? "outline outline-1 outline-white/70" : ""} ${overBudget ? "border-amber-400" : ""}`}
             >
+              {/* Cell state is drawn, not lettered. These were a 7px "×", a 6px
+                  "·" and a 7px "!" — glyphs below the readable floor, rendered
+                  at sizes where a typeface has nothing left to say. The state
+                  each one encoded still reaches assistive tech through the
+                  cell's aria-label. */}
               {missing && (
-                <span aria-hidden className="absolute inset-0 flex items-center justify-center text-[7px] text-gray-500">
-                  ×
+                <span aria-hidden className="absolute inset-0 flex items-center justify-center">
+                  <span className="h-px w-1/2 rotate-45 rounded-full bg-gray-500" />
+                  <span className="absolute h-px w-1/2 -rotate-45 rounded-full bg-gray-500" />
                 </span>
               )}
               {zero && (
-                <span aria-hidden className="absolute inset-0 flex items-center justify-center text-[6px] text-gray-600">
-                  ·
+                <span aria-hidden className="absolute inset-0 flex items-center justify-center">
+                  <span className="h-0.5 w-0.5 rounded-full bg-gray-600" />
                 </span>
               )}
               {day.status === "partial" && (
                 <span aria-hidden className="absolute right-0 top-0 h-1 w-1 rounded-full bg-amber-400" />
               )}
               {overBudget && (
-                <span aria-hidden className="absolute -right-0.5 -top-1 text-[7px] font-bold text-amber-700 dark:text-amber-300">!</span>
+                <span
+                  aria-hidden
+                  className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-700 ring-1 ring-surface-1 dark:bg-amber-300"
+                />
               )}
             </button>
           );

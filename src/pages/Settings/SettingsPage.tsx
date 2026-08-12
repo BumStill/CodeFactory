@@ -1740,13 +1740,15 @@ import { Moon, Sun, Monitor } from "lucide-react";
 import {
   FONT_FAMILIES,
   FONT_FAMILY_LABELS,
+  MONO_FONT_FAMILIES,
+  MONO_FONT_FAMILY_LABELS,
   FONT_SIZE_MIN,
   FONT_SIZE_MAX,
 } from "../../stores/settings";
 import type { Theme } from "../../lib/tauri";
 
 function AppearanceTab() {
-  const { settings, setTheme, setFontFamily, setFontSize } = useSettingsStore();
+  const { settings, setTheme, setFontFamily, setMonoFontFamily, setFontSize } = useSettingsStore();
   if (!settings) return null;
 
   const themeOptions: { value: Theme; Icon: React.ElementType; label: string }[] = [
@@ -1779,26 +1781,59 @@ function AppearanceTab() {
         </div>
       </div>
 
-      {/* Font family */}
+      {/* Font families — interface and monospace are separate choices. They used
+          to be one setting, which let JetBrains Mono be picked as the *UI* font;
+          it has no CJK glyphs, so the interface became monospace Latin mixed
+          with proportional Chinese. The previews below deliberately include
+          Chinese, because that is where the two stacks actually differ. */}
       <div>
-        <h2 className="text-label font-semibold text-gray-400 mb-3">字体</h2>
+        <h2 className="text-label font-semibold text-gray-400 mb-3">界面字体</h2>
         <div className="flex flex-col gap-2">
           {Object.entries(FONT_FAMILY_LABELS).map(([key, label]) => (
             <button
               key={key}
               onClick={() => setFontFamily(key)}
-              className={`flex items-center justify-between px-3 py-2 rounded-lg border text-label transition-colors ${
+              className={`flex items-center justify-between gap-3 px-3 py-2 rounded-lg border text-label transition-colors ${
                 settings.font_family === key
                   ? "border-accent bg-surface-3 text-gray-200"
                   : "border-border bg-surface-2 text-gray-400 hover:border-gray-500 hover:text-gray-300"
               }`}
             >
-              <span>{label}</span>
+              <span className="shrink-0">{label}</span>
               <span
-                className="text-gray-500"
+                className="truncate text-gray-500"
                 style={{ fontFamily: FONT_FAMILIES[key] }}
               >
-                Aa Bb Cc
+                Aa Bb Cc 中文示例 123
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Monospace font */}
+      <div>
+        <h2 className="text-label font-semibold text-gray-400 mb-3">
+          等宽字体
+          <span className="ml-2 font-normal text-gray-500">用于代码、路径和终端输出</span>
+        </h2>
+        <div className="flex flex-col gap-2">
+          {Object.entries(MONO_FONT_FAMILY_LABELS).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setMonoFontFamily(key)}
+              className={`flex items-center justify-between gap-3 px-3 py-2 rounded-lg border text-label transition-colors ${
+                settings.mono_font_family === key
+                  ? "border-accent bg-surface-3 text-gray-200"
+                  : "border-border bg-surface-2 text-gray-400 hover:border-gray-500 hover:text-gray-300"
+              }`}
+            >
+              <span className="shrink-0">{label}</span>
+              <span
+                className="truncate text-gray-500"
+                style={{ fontFamily: MONO_FONT_FAMILIES[key] }}
+              >
+                const x = 0;
               </span>
             </button>
           ))}

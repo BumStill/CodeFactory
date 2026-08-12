@@ -1,3 +1,21 @@
+/*
+ * Typefaces ship with the app instead of being hoped for on the user's machine.
+ * The settings panel has always offered "Inter", but nothing ever shipped it —
+ * no woff2, no @font-face. On any machine without Inter installed, which is
+ * nearly every Windows machine, the option silently fell through to system-ui,
+ * making it identical to the "System UI" option down to the preview text.
+ *
+ * Imported here rather than from main.tsx so that every entry point which
+ * pulls in this stylesheet gets the fonts — the acceptance harnesses under
+ * src/acceptance mount real components through their own entries, and font
+ * loading is part of what they are meant to reproduce.
+ *
+ * Upright weights only: italic appears in blockquotes and little else, and a
+ * synthesised oblique costs nothing where a whole extra face would.
+ */
+@import "@fontsource-variable/inter/wght.css";
+@import "@fontsource-variable/jetbrains-mono/wght.css";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -129,7 +147,12 @@
     padding: 0;
     background-color: rgb(var(--surface-0));
     color: rgb(var(--gray-200));
-    font-family: var(--font-family, Inter, system-ui, sans-serif);
+    /*
+     * Fallbacks matter here: these apply for the frame before settings load,
+     * and the CJK families are named explicitly because a zh-CN product cannot
+     * leave Chinese to whatever `system-ui` happens to resolve to per platform.
+     */
+    font-family: var(--font-family, "Inter Variable", -apple-system, "PingFang SC", "Microsoft YaHei UI", system-ui, sans-serif);
     -webkit-font-smoothing: antialiased;
   }
 

@@ -6,16 +6,41 @@ import type { Settings, Theme } from "../lib/tauri";
 
 // ── Font family map ──────────────────────────────────────────────────────────
 
+/**
+ * UI typefaces.
+ *
+ * The CJK families are named explicitly rather than left to `system-ui`. This
+ * is a `lang="zh-CN"` product, and letting the platform pick meant Chinese
+ * rendered in whatever each OS happened to fall back to.
+ *
+ * "Inter Variable" is the family fontsource registers; it ships with the app
+ * (see main.tsx), so this option is no longer a wish.
+ */
 export const FONT_FAMILIES: Record<string, string> = {
-  inter:          "Inter, system-ui, sans-serif",
-  system:         "system-ui, -apple-system, sans-serif",
-  "jetbrains-mono": "'JetBrains Mono', Consolas, Menlo, monospace",
+  inter:  "'Inter Variable', -apple-system, 'PingFang SC', 'Microsoft YaHei UI', system-ui, sans-serif",
+  system: "-apple-system, system-ui, 'PingFang SC', 'Microsoft YaHei UI', sans-serif",
 };
 
 export const FONT_FAMILY_LABELS: Record<string, string> = {
-  inter:            "Inter",
-  system:           "System UI",
+  inter:  "Inter",
+  system: "系统默认",
+};
+
+/**
+ * Monospace typefaces — code, paths, terminal output.
+ *
+ * Separate from the UI font on purpose. JetBrains Mono used to be offered as
+ * an *interface* font, and it has no CJK glyphs: choosing it turned the app
+ * into monospace Latin mixed with proportional Chinese.
+ */
+export const MONO_FONT_FAMILIES: Record<string, string> = {
+  "jetbrains-mono": "'JetBrains Mono Variable', ui-monospace, 'SF Mono', Consolas, Menlo, monospace",
+  system:           "ui-monospace, 'SF Mono', Consolas, Menlo, monospace",
+};
+
+export const MONO_FONT_FAMILY_LABELS: Record<string, string> = {
   "jetbrains-mono": "JetBrains Mono",
+  system:           "系统等宽",
 };
 
 export const FONT_SIZE_MIN = 12;
@@ -91,8 +116,11 @@ export function applyTheme(settings: Settings) {
   }
 
   // ── Apply font ──────────────────────────────────────────────────────────
-  const fontStack = FONT_FAMILIES[settings.font_family] ?? FONT_FAMILIES.inter;
-  html.style.setProperty("--font-family", fontStack);
+  html.style.setProperty("--font-family", FONT_FAMILIES[settings.font_family] ?? FONT_FAMILIES.inter);
+  html.style.setProperty(
+    "--font-family-mono",
+    MONO_FONT_FAMILIES[settings.mono_font_family] ?? MONO_FONT_FAMILIES["jetbrains-mono"],
+  );
   // Text size drives a scale factor, never the rem baseline. Writing the user's
   // size onto `html { font-size }` used to resize spacing, radii and icon boxes
   // along with the text, because Tailwind expresses all of them in rem — while
@@ -108,6 +136,7 @@ interface SettingsStore {
   save: (s: Settings) => Promise<void>;
   setTheme: (theme: Theme) => Promise<void>;
   setFontFamily: (family: string) => Promise<void>;
+  setMonoFontFamily: (family: string) => Promise<void>;
   setFontSize: (size: number) => Promise<void>;
   saveApiKey: (keyRef: string, value: string) => Promise<void>;
 }
@@ -125,7 +154,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     const merged: Settings = {
       ...s,
       theme: s.theme ?? "dark",
-      font_family: s.font_family ?? "inter",
+      // "jetbrains-mono" used to be a valid UI font. Anyone carrying that
+      // setting forward gets the intent honoured on the axis where it makes
+      // sense — monospace for code — instead of an unresolvable UI stack.
+      font_family: s.font_family === "jetbrains-mono" ? "inter" : s.font_family ?? "inter",
+      mono_font_family: s.mono_font_family ?? "jetbrains-mono",
       font_size: s.font_size ?? 14,
       remote_postmortem_enabled: s.remote_postmortem_enabled ?? false,
       default_model_policy: s.default_model_policy ?? "prefer",
@@ -150,6 +183,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     const { settings, save } = get();
     if (!settings) return;
     await save({ ...settings, font_family });
+  },
+
+  setMonoFontFamily: async (mono_font_family) => {
+    const { settings, save } = get();
+    if (!settings) return;
+    await save({ ...settings, mono_font_family });
   },
 
   setFontSize: async (font_size) => {
